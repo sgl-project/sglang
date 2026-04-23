@@ -16,6 +16,7 @@ tag: NEW
 - **Agent Swarms Elevated**: Scales to 300 parallel sub-agents executing 4,000 coordinated steps per run. One prompt, 100+ files.
 - **Proactive Agents**: Powers OpenClaw, Hermes Agent, and other autonomous frameworks for 5-day continuous operation.
 - **Native Multimodality**: Pre-trained on vision–language tokens with MoonViT (400M parameters) for visual understanding, cross-modal reasoning, and agentic tool use grounded in visual inputs.
+- **Speculative Decoding**: EAGLE-based speculative decoding support for lower latency.
 
 **Benchmarks (Open-Source SOTA):**
 
@@ -469,6 +470,28 @@ Let me search for this product and similar items for you.
   Arguments: {"query":"Auntie Anne's Cinnamon Sugar Pretzel"}
 ```
 
+#### 4.2.5 Speculative Decoding
+
+**Nvidia**
+
+Deploy Kimi-K2.6 with the following command (H200/B200, all features enabled):
+
+```shell Command
+SGLANG_ENABLE_SPEC_V2=1 sglang serve \
+  --model-path moonshotai/Kimi-K2.6 \
+  --tp 8 \
+  --reasoning-parser kimi_k2 \
+  --tool-call-parser kimi_k2 \
+  --speculative-algorithm=EAGLE3 \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --speculative-draft-model-path lightseekorg/kimi-k2.6-eagle3 \
+  --speculative-draft-attention-backend trtllm_mha \
+  --trust-remote-code \
+  --host 0.0.0.0 \
+  --port 30000
+```
 
 ## 5. Benchmark
 

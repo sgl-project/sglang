@@ -1,5 +1,6 @@
 export const KimiK26Deployment = () => {
   // Config mirrors sgl-cookbook src/components/autoregressive/KimiK26ConfigGenerator/index.js.
+  // Speculative decoding is only supported on H200 and B300.
   const options = {
     hardware: {
       name: 'hardware',
@@ -35,6 +36,15 @@ export const KimiK26Deployment = () => {
       items: [
         { id: 'disabled', label: 'Disabled', subtitle: 'Low Latency', default: true },
         { id: 'enabled', label: 'Enabled', subtitle: 'High Throughput', default: false },
+      ],
+    },
+    speculative: {
+      name: 'speculative',
+      title: 'Speculative Decoding',
+      condition: (values) => values.hardware === 'h200' || values.hardware === 'b300',
+      items: [
+        { id: 'disabled', label: 'Disabled', default: true },
+        { id: 'enabled', label: 'Enabled', default: false },
       ],
     },
   };
@@ -88,15 +98,31 @@ export const KimiK26Deployment = () => {
   };
 
   const generateCommand = () => {
-    const { hardware, reasoning, toolcall, dpattention } = values;
+    const { hardware, reasoning, toolcall, dpattention, speculative } = values;
     const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi350x' || hardware === 'mi355x';
     const hwConfig = modelConfigs[hardware];
     const tpValue = hwConfig.tp;
 
+    // Speculative decoding only supported on H200 and B300
+    if (speculative === 'enabled' && hardware !== 'h200' && hardware !== 'b300') {
+      return '# Speculative Decoding for Kimi-K2.6 is only supported on H200 and B300';
+    }
+
     let cmd = '';
 
+    // AMD ROCm environment variables
     if (isAMD) {
-      cmd += 'SGLANG_USE_AITER=1 SGLANG_ROCM_FUSED_DECODE_MLA=0 \\\n';
+      cmd += 'SGLANG_USE_AITER=1 SGLANG_ROCM_FUSED_DECODE_MLA=0 ';
+    }
+
+    // Speculative decoding env var
+    if (speculative === 'enabled') {
+      cmd += 'SGLANG_ENABLE_SPEC_V2=1 ';
+    }
+
+    // If we added any env vars above, break to a new line for readability
+    if (isAMD || speculative === 'enabled') {
+      cmd += '\\\n';
     }
 
     cmd += 'sglang serve \\\n';
@@ -117,6 +143,11 @@ export const KimiK26Deployment = () => {
 
     if (toolcall === 'enabled') {
       cmd += ' \\\n  --tool-call-parser kimi_k2';
+    }
+
+    // Speculative decoding (EAGLE3)
+    if (speculative === 'enabled') {
+      cmd += ' \\\n  --speculative-algorithm EAGLE3 \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --speculative-draft-model-path lightseekorg/kimi-k2.6-eagle3 \\\n  --speculative-draft-attention-backend trtllm_mha';
     }
 
     if (isAMD) {
