@@ -56,9 +56,6 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
 
-if _is_npu:
-    import torch_npu
-
 if _is_cuda:
     from sglang.jit_kernel.awq_dequantize import awq_dequantize
     from sglang.jit_kernel.awq_marlin_repack import (
@@ -83,9 +80,12 @@ elif _is_xpu:
     from sgl_kernel import awq_dequantize
 
     warnings.warn(f"XPU does not support fused_marlin_moe currently.")
-else:
-    warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
 
+elif is_npu:
+    import torch_npu
+
+else:
+    warnings.warn(f"Only CUDA, HIP, XPU and NPU support AWQ currently.")
 logger = logging.getLogger(__name__)
 
 
