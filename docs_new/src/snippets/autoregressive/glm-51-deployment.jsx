@@ -24,7 +24,7 @@ export const GLM51Deployment = () => {
       title: 'Quantization',
       getDynamicItems: (values) => {
         const hw = values.hardware;
-        const isAMD = hw === 'mi300x' || hw === 'mi325x' || hw === 'mi355x';
+        const isAMD = ['mi300x', 'mi325x', 'mi355x'].includes(hw);
         const isGB300 = hw === 'gb300';
         return [
           { id: 'bf16', label: 'BF16', subtitle: 'Full Weights',    default: isAMD,  disabled: isGB300, disabledReason: isGB300 ? 'BF16 is not recommended on GB300 for GLM-5.1' : '' },
@@ -59,7 +59,7 @@ export const GLM51Deployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding',
-      condition: (values) => values.hardware !== 'mi300x' && values.hardware !== 'mi325x' && values.hardware !== 'mi355x',
+      condition: (values) => !['mi300x', 'mi325x', 'mi355x'].includes(values.hardware),
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true  }
@@ -131,7 +131,7 @@ export const GLM51Deployment = () => {
 
   const generateCommand = () => {
     const { hardware, quantization } = values;
-    const isAMD = hardware === 'mi300x' || hardware === 'mi325x' || hardware === 'mi355x';
+    const isAMD = ['mi300x', 'mi325x', 'mi355x'].includes(hardware);
     const isGB300 = hardware === 'gb300';
     const effectiveQuant = isAMD ? 'bf16' : (isGB300 && quantization === 'bf16' ? 'fp8' : quantization);
     const suffix = effectiveQuant === 'fp8' ? '-FP8' : '';
