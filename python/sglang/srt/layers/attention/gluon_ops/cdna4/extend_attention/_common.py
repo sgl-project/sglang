@@ -9,9 +9,6 @@ Supports D=64/128/256, causal/non-causal, logit cap, sliding window, custom mask
 FP8 KV dequant (k_scale/v_scale), and XAI temperature.
 """
 
-import math
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -121,18 +118,6 @@ def make_padded_smem(shape, offset_bases, padding_pairs):
         interval_padding_pairs=padding_pairs,
         offset_bases=offset_bases,
         cga_layout=[],
-        shape=shape,
-    )
-
-
-@gluon.constexpr_function
-def make_dll(shape, reg_bases, lane_bases, warp_bases):
-    """Async DMA layout (DistributedLinearLayout) for K^T / V / KPE tiles."""
-    return DistributedLinearLayout(
-        reg_bases=reg_bases,
-        lane_bases=lane_bases,
-        warp_bases=warp_bases,
-        block_bases=[],
         shape=shape,
     )
 

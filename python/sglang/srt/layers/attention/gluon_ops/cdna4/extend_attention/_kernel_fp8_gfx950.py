@@ -97,7 +97,6 @@ def gluon_extend_attn_fwd(
     actual_batch_size,  # int32 scalar -- batch count (upper bound for per-CTA inline scan)
     IS_PERSISTENT: gl.constexpr = False,  #
     SPLIT_K: gl.constexpr = 1,  #
-    PREFIX_MASK_MODE: gl.constexpr = 0,  # 0=auto (scalar on persistent, pipelined on basic), 1=force scalar_mask, 2=force pipelined
 ):
     num_warps: gl.constexpr = gl.num_warps()
     PFX_SMEM_TY: gl.constexpr = K_Buffer.dtype.element_ty
@@ -130,7 +129,6 @@ def gluon_extend_attn_fwd(
         )
 
     # layouts
-    threads_per_warp: gl.constexpr = 64
     _mfma: gl.constexpr = make_mfma_dot_layouts(num_warps, 16, 16, 32, 8, 4)
     mma_layout: gl.constexpr = _mfma[0]
     q_dot_layout: gl.constexpr = _mfma[1]
@@ -980,14 +978,11 @@ def gluon_extend_attn_fwd(
             # pingpong helper floor-aligns internally and runs a one-block
             # masked tail when needed. Persistent path's pfx_seq_len is
             # BLOCK_N-aligned by split-K, so the tail is a runtime no-op.
-            # PREFIX_MASK_MODE: 0=auto, 1=force scalar_mask, 2=force pipelined.
-            # Auto picks scalar on persistent (parity-to-wins with FP8
-            # per bench_scalar_mask.py --fp8 Apr 2026), pipelined on
-            # basic (near-identical but pipelined has a tiny edge).
+            # Scalar-mask on the persistent path (parity-to-wins on FP8
+            # per bench_scalar_mask.py --fp8 Apr 2026); pipelined load-gate
+            # on basic (near-identical but pipelined has a tiny edge).
             n_full_prefix = pfx_seq_len // BLOCK_N
-            _use_scalar_mask: gl.constexpr = (PREFIX_MASK_MODE == 1) or (
-                PREFIX_MASK_MODE == 0 and IS_PERSISTENT
-            )
+            _use_scalar_mask: gl.constexpr = IS_PERSISTENT
             if n_full_prefix >= NUM_STAGES:
                 acc, l_i, m_i = attn_fwd_inner_prefix_pingpong_8w(
                     acc,

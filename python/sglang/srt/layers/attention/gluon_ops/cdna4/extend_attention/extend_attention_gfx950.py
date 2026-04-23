@@ -96,9 +96,6 @@ def _ensure_dummies(device, mi_size, wkvo_size):
 _FP8_KV_FORCE_BF16 = int(os.getenv("SGLANG_GLUON_FP8_KV_FORCE_BF16", "0")) != 0
 
 
-_cached_num_xcds = {}
-
-
 # ===-----------------------------------------------------------------------===#
 # Persistent / split-K launch helpers
 # ===-----------------------------------------------------------------------===#
@@ -272,18 +269,16 @@ def _launch_persistent(
     v_scale=1.0,
     sm_scale=None,
     logit_cap=0.0,
-    skip_prefix_custom_mask=True,
     sliding_window_size=-1,
     sinks=None,
     window_kv_offsets=None,
     xai_temperature_len=-1,
-    enable_mask_split=True,
     enable_prefix_unmasked=True,
     min_len_extend=None,
     total_prefix_len=None,
+    skip_prefix_custom_mask=True,  # accepted for FP8-symmetric dispatch; BF16 kernel hardcodes this True
 ):
     Lq = q_extend.shape[-1]
-    Lv = v_extend.shape[-1]
     BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
     USE_CUSTOM_MASK = custom_mask is not None
@@ -474,7 +469,6 @@ def _launch_persistent(
         actual_batch_size=batch_size,
         IS_PERSISTENT=True,
         SPLIT_K=SPLIT_K,
-        PREFIX_MASK_MODE=0,
         num_warps=num_warps,
         num_stages=1,
         waves_per_eu=2,
@@ -605,7 +599,6 @@ def _launch_splitk(
         tile_done=tile_done,
         actual_batch_size=batch_size,
         IS_PERSISTENT=True, SPLIT_K=SPLIT_K,
-        PREFIX_MASK_MODE=0,
         num_warps=num_warps, num_stages=1,
         waves_per_eu=2,
         matrix_instr_nonkdim=32,
@@ -615,16 +608,6 @@ def _launch_splitk(
 # ===-----------------------------------------------------------------------===#
 # Basic-path tile-config heuristics
 # ===-----------------------------------------------------------------------===#
-
-
-def _get_num_xcds(device):
-    idx = device.index if hasattr(device, 'index') and device.index is not None else 0
-    if idx not in _cached_num_xcds:
-        num_CUs = torch.cuda.get_device_properties(device).multi_processor_count
-        # 38 CUs/XCD on MI300X (304/8); MI350X has 32 CUs/XCD (256/8) but
-        # both divide cleanly enough here to not need special-casing.
-        _cached_num_xcds[idx] = max(1, num_CUs // 38)
-    return _cached_num_xcds[idx]
 
 
 def _select_d256_dispatch(
@@ -990,7 +973,6 @@ def gluon_extend_attention_fwd(
     min_len_extend=None,
     total_prefix_len=None,
     total_extend_len=None,
-    use_rfidx_prefix=False,
 ):
     global _LOGGED_FP8_KV_MODE
     # Cache shape tuples once; downstream accesses use tuple indexing.
@@ -999,7 +981,6 @@ def gluon_extend_attention_fwd(
     Lv = v_extend.shape[-1]
     _kb_dtype = k_buffer.dtype
     _kv_is_fp8 = _kb_dtype is torch.float8_e4m3fn or _kb_dtype is torch.float8_e4m3fnuz
-    _kv_was_fp8 = _kv_is_fp8
     if _kv_is_fp8:
         # gfx950 MFMA expects OCP FP8 (bias=7); FNUZ (bias=8) silently
         # doubles values on this hardware.
@@ -1335,7 +1316,6 @@ def gluon_extend_attention_fwd(
             tile_done=_dummy_tile_done,
             actual_batch_size=0,
             IS_PERSISTENT=False, SPLIT_K=1,
-            PREFIX_MASK_MODE=0,
             num_warps=_NW, num_stages=1, waves_per_eu=2,
             matrix_instr_nonkdim=32,
         )
@@ -1477,25 +1457,9 @@ def gluon_extend_attention_fwd(
     else:
         NUM_STAGES = 4
 
-    if _kv_is_fp8:
-        if BLOCK_DMODEL < 128:
-            # D<128 FP8: only the NW=4 NS=1 serial path is wired up.
-            NUM_STAGES = 1
-            num_warps = 4
-            if batch_size >= 16 and max_len_extend <= 128:
-                BLOCK_M = 64
-            else:
-                BLOCK_M = 128
-        else:
-            # D>=128 FP8 basic fallback (het / custom mask). NS>=2 is
-            # required by the 8-warp pipelined path below, but NS=1 is
-            # safe for BM=64 small batches.
-            NUM_STAGES = 1
-            num_warps = 8
-            if batch_size == 1 and max_len_extend <= 256:
-                BLOCK_M = 64
-            else:
-                BLOCK_M = 128
+    # FP8 never reaches this BF16 basic path: the dispatcher either splits
+    # (Lq<=128, no custom_mask), routes to _launch_basic_fp8 on custom_mask
+    # (via the FP8-specific full path), or raises on D=256 / D<=128+custom_mask.
     EXT_NUM_STAGES = NUM_STAGES
 
     # Correctness guards (D=64 NW=8 BM=256 is nondeterministic at NS!=2;
@@ -1560,7 +1524,6 @@ def gluon_extend_attention_fwd(
         tile_done=_dummy_tile_done,
         actual_batch_size=0,
         IS_PERSISTENT=False, SPLIT_K=1,
-        PREFIX_MASK_MODE=0,
         num_warps=num_warps, num_stages=1,
         waves_per_eu=2,
         matrix_instr_nonkdim=32,
@@ -1785,7 +1748,6 @@ def _launch_persistent_fp8(
         actual_batch_size=batch_size,
         IS_PERSISTENT=True,
         SPLIT_K=SPLIT_K,
-        PREFIX_MASK_MODE=0,
         num_warps=num_warps,
         num_stages=1,
         waves_per_eu=2,
