@@ -962,6 +962,7 @@ class LTX2TwoStageHQPipeline(LTX2TwoStagePipeline):
     STAGE_1_DISTILLED_LORA_STRENGTH = 0.25
     STAGE_2_DISTILLED_LORA_STRENGTH = 0.5
     STAGE_1_DENOISING_SAMPLER_NAME = "res2s"
+    STAGE_2_DENOISING_SAMPLER_NAME = "res2s"
 
 
 EntryClass = [LTX2Pipeline, LTX2TwoStagePipeline, LTX2TwoStageHQPipeline]
