@@ -545,7 +545,7 @@ class MossVLImageProcessor(SGLangBaseProcessor):
                         )
                         if isinstance(available_slice, torch.Tensor):
                             available_slice.copy_(
-                                item.feature.view(torch.int8).view(-1),
+                                item.feature.reshape(-1).view(torch.int8),
                                 non_blocking=True,
                             )
                             item.feature = CudaIpcTensorTransportProxy(
@@ -563,8 +563,9 @@ class MossVLImageProcessor(SGLangBaseProcessor):
                             )
                         )
                         if isinstance(available_slice, torch.Tensor):
+                            flattened = item.precomputed_embeddings.reshape(-1)
                             available_slice.copy_(
-                                item.precomputed_embeddings.view(torch.int8).view(-1),
+                                flattened.view(torch.int8),
                                 non_blocking=True,
                             )
                             item.precomputed_embeddings = CudaIpcTensorTransportProxy(

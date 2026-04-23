@@ -6,7 +6,6 @@ import logging
 from functools import partial
 from typing import Iterable, List, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 from einops import rearrange
@@ -324,81 +323,73 @@ class MossVLVisionModel(nn.Module):
 
     def fast_pos_embed_interpolate(self, grid_thw: torch.Tensor) -> torch.Tensor:
         num_grid_per_side = int(self.num_position_embeddings ** 0.5)
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
+        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+        device = self.pos_embed.weight.device
+        dtype = self.pos_embed.weight.dtype
 
-        for t, h, w in grid_thw:
-            h_idxs = np.linspace(0, num_grid_per_side - 1, h)
-            w_idxs = np.linspace(0, num_grid_per_side - 1, w)
+        idx_parts = [[] for _ in range(4)]
+        weight_parts = [[] for _ in range(4)]
 
-            h_idxs_floor = h_idxs.astype(int)
-            w_idxs_floor = w_idxs.astype(int)
-            h_idxs_ceil = (h_idxs.astype(int) + 1).clip(max=num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs.astype(int) + 1).clip(max=num_grid_per_side - 1)
+        for _, h, w in zip(grid_ts, grid_hs, grid_ws):
+            h_int, w_int = int(h.item()), int(w.item())
+            h_idxs = torch.linspace(0, num_grid_per_side - 1, h_int, device=device)
+            w_idxs = torch.linspace(0, num_grid_per_side - 1, w_int, device=device)
+
+            h_idxs_floor = h_idxs.int()
+            w_idxs_floor = w_idxs.int()
+            h_idxs_ceil = (h_idxs.int() + 1).clip(max=num_grid_per_side - 1)
+            w_idxs_ceil = (w_idxs.int() + 1).clip(max=num_grid_per_side - 1)
 
             dh = h_idxs - h_idxs_floor
             dw = w_idxs - w_idxs_floor
 
-            idx_list[0].extend(
-                ((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_floor[None])
-                .flatten().tolist() * t
-            )
-            idx_list[1].extend(
-                ((h_idxs_floor * num_grid_per_side)[None].T + w_idxs_ceil[None])
-                .flatten().tolist() * t
-            )
-            idx_list[2].extend(
-                ((h_idxs_ceil * num_grid_per_side)[None].T + w_idxs_floor[None])
-                .flatten().tolist() * t
-            )
-            idx_list[3].extend(
-                ((h_idxs_ceil * num_grid_per_side)[None].T + w_idxs_ceil[None])
-                .flatten().tolist() * t
-            )
+            base_h = h_idxs_floor * num_grid_per_side
+            base_h_ceil = h_idxs_ceil * num_grid_per_side
 
-            weight_list[0].extend(
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten().tolist() * t
-            )
-            weight_list[1].extend(((1 - dh)[None].T * dw[None]).flatten().tolist() * t)
-            weight_list[2].extend((dh[None].T * (1 - dw)[None]).flatten().tolist() * t)
-            weight_list[3].extend((dh[None].T * dw[None]).flatten().tolist() * t)
+            indices = [
+                (base_h[None].T + w_idxs_floor[None]).flatten(),
+                (base_h[None].T + w_idxs_ceil[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
+                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
+            ]
 
-        device = self.pos_embed.weight.device
-        dtype = self.pos_embed.weight.dtype
+            weights = [
+                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
+                ((1 - dh)[None].T * dw[None]).flatten(),
+                (dh[None].T * (1 - dw)[None]).flatten(),
+                (dh[None].T * dw[None]).flatten(),
+            ]
 
-        p0 = (
-            self.pos_embed(torch.tensor(idx_list[0], dtype=torch.long, device=device))
-            * torch.tensor(weight_list[0], dtype=dtype, device=device)[:, None]
-        )
-        p1 = (
-            self.pos_embed(torch.tensor(idx_list[1], dtype=torch.long, device=device))
-            * torch.tensor(weight_list[1], dtype=dtype, device=device)[:, None]
-        )
-        p2 = (
-            self.pos_embed(torch.tensor(idx_list[2], dtype=torch.long, device=device))
-            * torch.tensor(weight_list[2], dtype=dtype, device=device)[:, None]
-        )
-        p3 = (
-            self.pos_embed(torch.tensor(idx_list[3], dtype=torch.long, device=device))
-            * torch.tensor(weight_list[3], dtype=dtype, device=device)[:, None]
-        )
+            for i in range(4):
+                idx_parts[i].append(indices[i])
+                weight_parts[i].append(weights[i])
 
-        patch_pos_embeds = p0 + p1 + p2 + p3
+        idx_tensor = torch.stack(
+            [torch.cat(parts) for parts in idx_parts]
+        ).to(dtype=torch.long)
+        weight_tensor = torch.stack(
+            [torch.cat(parts) for parts in weight_parts]
+        ).to(dtype=dtype)
+        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
+        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
+
         patch_pos_embeds = patch_pos_embeds.split(
-            [t * h * w for t, h, w in grid_thw]
+            [int((h * w).item()) for h, w in zip(grid_hs, grid_ws)]
         )
 
         m_size = self.spatial_merge_size
         patch_pos_embeds_permute = []
-        for pos_embed, (t, h, w) in zip(patch_pos_embeds, grid_thw):
+        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
+            t, h, w = int(t.item()), int(h.item()), int(w.item())
             pos_embed = (
-                pos_embed.view(t, h // m_size, m_size, w // m_size, m_size, -1)
+                pos_embed.repeat(t, 1)
+                .view(t, h // m_size, m_size, w // m_size, m_size, -1)
                 .permute(0, 1, 3, 2, 4, 5)
                 .flatten(0, 4)
             )
             patch_pos_embeds_permute.append(pos_embed)
-        patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
-        return patch_pos_embeds
+
+        return torch.cat(patch_pos_embeds_permute)
 
     def forward(
         self,
@@ -1216,36 +1207,24 @@ class MossVLForConditionalGeneration(nn.Module):
         hidden_size = hidden_states.shape[-1]
         separator = self.separator_token.to(hidden_states.dtype)
 
-        total_output_len = 0
-        for i in range(grid_thw.shape[0]):
-            num_tokens = tokens_per_media[i].item()
-            num_frames = grid_thw[i, 0].item()
-            total_output_len += num_tokens + num_frames  # +1 separator per frame
-
-        output = torch.empty(
-            total_output_len, hidden_size,
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
-
+        output_parts = []
         src_offset = 0
-        dst_offset = 0
         for i in range(grid_thw.shape[0]):
             num_tokens = tokens_per_media[i].item()
             num_frames = grid_thw[i, 0].item()
             tokens_per_frame = num_tokens // num_frames
+            media_hidden_states = hidden_states[
+                src_offset : src_offset + num_tokens
+            ].view(num_frames, tokens_per_frame, hidden_size)
+            separators = separator.view(1, 1, hidden_size).expand(
+                num_frames, 1, hidden_size
+            )
+            output_parts.append(
+                torch.cat([media_hidden_states, separators], dim=1).flatten(0, 1)
+            )
+            src_offset += num_tokens
 
-            for _ in range(num_frames):
-                # Copy vision tokens for this frame
-                src_end = src_offset + tokens_per_frame
-                dst_end = dst_offset + tokens_per_frame
-                output[dst_offset:dst_end] = hidden_states[src_offset:src_end]
-                # Insert separator
-                output[dst_end] = separator
-                src_offset = src_end
-                dst_offset = dst_end + 1
-
-        return output
+        return torch.cat(output_parts, dim=0)
 
     def flat_encoder_result(
         self,
@@ -1271,12 +1250,23 @@ class MossVLForConditionalGeneration(nn.Module):
         dst_offset = 0
         for encoder_len in encoder_lens_need:
             if encoder_len > 0:
-                actual_len = min(encoder_len, cross_attention_states.shape[0] - src_offset)
-                result[dst_offset : dst_offset + actual_len] = (
-                    cross_attention_states[src_offset : src_offset + actual_len]
+                if src_offset + encoder_len > cross_attention_states.shape[0]:
+                    raise RuntimeError(
+                        "Encoder length mismatch: expected "
+                        f"{encoder_len} tokens, but only "
+                        f"{cross_attention_states.shape[0] - src_offset} remaining."
+                    )
+                result[dst_offset : dst_offset + encoder_len] = (
+                    cross_attention_states[src_offset : src_offset + encoder_len]
                 )
             src_offset += encoder_len
             dst_offset += encoder_len
+
+        if src_offset != cross_attention_states.shape[0]:
+            raise RuntimeError(
+                "Encoder length mismatch: produced "
+                f"{cross_attention_states.shape[0]} tokens, expected {src_offset}."
+            )
 
         return result
 
