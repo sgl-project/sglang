@@ -447,6 +447,12 @@ def _get_precomputed_embedding(
             raise NotImplementedError(
                 "MM inputs where only some items are precomputed."
             )
+        # Filter out empty chunks to avoid device mismatch: in chunked-prefill,
+        # requests whose mm tokens are fully covered in prior chunks produce
+        # empty tensors that may reside on CPU, while new requests may have non-empty CUDA tensors.
+        precomputed_embeddings = [t for t in precomputed_embeddings if t.numel() > 0]
+        if not precomputed_embeddings:
+            return None
         result = torch.concat(precomputed_embeddings)
         # some models embedding is 3-dim, reshape it to 2-dim (similar to get_embedding_chunk)
         result = result.reshape(-1, result.shape[-1])
@@ -1073,13 +1079,31 @@ def general_mm_embed_routine(
             # if a cache miss occurs in subsequent chunks, while still freeing up
             # critical GPU memory.
             if mm_inputs_list:
-                for mm_input_obj in mm_inputs_list:
+                for idx, mm_input_obj in enumerate(mm_inputs_list):
                     if mm_input_obj and hasattr(mm_input_obj, "mm_items"):
+                        # Check if all mm tokens for this request have been
+                        # fully covered by chunks so far. Only offload to CPU
+                        # when no subsequent chunk will need them, avoiding
+                        # device mismatch with new CUDA requests in later batches.
+                        chunk_end = extend_prefix_lens[idx] + extend_seq_lens[idx]
+                        max_mm_end = max(
+                            (
+                                end
+                                for mm_item in mm_input_obj.mm_items
+                                if mm_item is not None
+                                for _, end in getattr(mm_item, "offsets", [])
+                            ),
+                            default=0,
+                        )
+                        mm_fully_covered = chunk_end > max_mm_end
                         for mm_item in mm_input_obj.mm_items:
                             feature = getattr(mm_item, "feature", None)
                             if isinstance(feature, torch.Tensor) and feature.is_cuda:
                                 mm_item.feature = feature.to("cpu", non_blocking=True)
-                            if get_global_server_args().language_only:
+                            if (
+                                get_global_server_args().language_only
+                                and mm_fully_covered
+                            ):
                                 precomputed_embeddings = getattr(
                                     mm_item, "precomputed_embeddings", None
                                 )
