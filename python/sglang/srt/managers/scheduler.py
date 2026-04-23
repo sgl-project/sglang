@@ -2353,6 +2353,20 @@ class Scheduler(
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
+            # Filter finished requests from running_batch before merging.
+            # In overlap-schedule mode, requests from a previous batch may have
+            # been processed (marked finished, KV freed) by pop_and_process()
+            # while the current get_next_batch_to_run is running.  Without this
+            # filter, those zombie entries accumulate in running_batch whenever
+            # the scheduler is under continuous prefill load, because
+            # update_running_batch (the other filter path) is only reached on
+            # the decode branch.
+            if not self.running_batch.is_empty():
+                running_bs = self.running_batch.batch_size()
+                self.running_batch.filter_batch()
+                if self.running_batch.batch_size() < running_bs:
+                    self.running_batch.batch_is_full = False
+
             # Merge the new batch into the running batch.
             if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
