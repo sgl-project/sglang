@@ -1,0 +1,257 @@
+---
+title: "Quantization on Ascend"
+metatags:
+    description: "Load, export, and serve quantized models on Ascend NPUs with SGLang."
+---
+To load already quantized models, simply load the model weights and config. Again, if the model has been quantized offline, there's no need to add `--quantization` argument when starting the engine. The quantization method will be automatically parsed from the downloaded `quant_model_description.json` or `config.json` config.
+
+SGLang support **mix-bits** quantization (independently defines and loads each layer depending on the type of quantification specified in the `quant_model_description'.json`). [Advanced mix-bits for MoE](https://github.com/sgl-project/sglang/pull/17361) in progress, will add independent quantization determination for the w13 (up-gate) and w2 (down) layers.
+
+[ModelSlim on Ascend support](https://github.com/sgl-project/sglang/pull/14504)
+<table>
+  <thead>
+    <tr>
+      <th>Quantization scheme</th>
+      <th>Layer type</th>
+      <th>A2 Supported</th>
+      <th>A3 Supported</th>
+      <th>A5 Supported</th>
+      <th>Diffusion models</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>W4A4 dynamic</td>
+      <td>Linear</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td>W8A8 static</td>
+      <td>Linear</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td>W8A8 dynamic</td>
+      <td>Linear</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/sgl-project/sglang/pull/20922">MXFP8</a></td>
+      <td>Linear</td>
+      <td><strong>&lt;span style="color: red;"&gt;x&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: red;"&gt;x&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: blue;"&gt;WIP&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: blue;"&gt;WIP&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td>W4A4 dynamic</td>
+      <td>MoE</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: red;"&gt;x&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td>W4A8 dynamic</td>
+      <td>MoE</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: red;"&gt;x&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td>W8A8 dynamic</td>
+      <td>MoE</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: red;"&gt;x&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/sgl-project/sglang/pull/20922">MXFP8</a></td>
+      <td>MoE</td>
+      <td><strong>&lt;span style="color: red;"&gt;x&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: red;"&gt;x&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: blue;"&gt;WIP&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: red;"&gt;x&lt;/span&gt;</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+[AWQ on Ascend support](https://github.com/sgl-project/sglang/pull/10158):
+<table>
+  <thead>
+    <tr>
+      <th>Quantization scheme</th>
+      <th>Layer type</th>
+      <th>A2 Supported</th>
+      <th>A3 Supported</th>
+      <th>A5 Supported</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>W4A16</td>
+      <td>Linear</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td>W8A16</td>
+      <td>Linear</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td>W4A16</td>
+      <td>MoE</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+GPTQ on Ascend support
+<table>
+  <thead>
+    <tr>
+      <th>Quantization scheme</th>
+      <th>Layer type</th>
+      <th>A2 Supported</th>
+      <th>A3 Supported</th>
+      <th>A5 Supported</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><a href="https://github.com/sgl-project/sglang/pull/15203">W4A16</a></td>
+      <td>Linear</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/sgl-project/sglang/pull/15203">W8A16</a></td>
+      <td>Linear</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/sgl-project/sglang/pull/16364">W4A16 MOE</a></td>
+      <td>MoE</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/sgl-project/sglang/pull/16364">W8A16 MOE</a></td>
+      <td>MoE</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+[Auto-round on Ascend support](https://github.com/sgl-project/sglang/pull/16699)
+<table>
+  <thead>
+    <tr>
+      <th>Quantization scheme</th>
+      <th>Layer type</th>
+      <th>A2 Supported</th>
+      <th>A3 Supported</th>
+      <th>A5 Supported</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>W4A16</td>
+      <td>Linear</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td>W8A16</td>
+      <td>Linear</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td>W4A16</td>
+      <td>MoE</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td>W8A16</td>
+      <td>MoE</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+Compressed-tensors (LLM Compressor) on Ascend support:
+<table>
+  <thead>
+    <tr>
+      <th>Quantization scheme</th>
+      <th>Layer type</th>
+      <th>A2 Supported</th>
+      <th>A3 Supported</th>
+      <th>A5 Supported</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><a href="https://github.com/sgl-project/sglang/pull/14504">W8A8 dynamic</a></td>
+      <td>Linear</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/sgl-project/sglang/pull/14736">W4A8 dynamic with/without activation clip</a></td>
+      <td>MoE</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/sgl-project/sglang/pull/12759">W4A16 MOE</a></td>
+      <td>MoE</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+    <tr>
+      <td><a href="https://github.com/sgl-project/sglang/pull/14504">W8A8 dynamic</a></td>
+      <td>MoE</td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: green;"&gt;√&lt;/span&gt;</strong></td>
+      <td><strong>&lt;span style="color: yellow;"&gt;TBD&lt;/span&gt;</strong></td>
+    </tr>
+  </tbody>
+</table>
+
+[GGUF on Ascend support](https://github.com/sgl-project/sglang/pull/17883)
+
+in progress

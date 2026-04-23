@@ -54,6 +54,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -387,6 +388,28 @@ class MambaPool:
             return None
         self.copy_from(src_index, dst_index)
         return dst_index
+
+    def get_cpu_copy(self, indices, **kwargs):
+        torch.cuda.synchronize()
+        conv_cpu = [
+            conv[:, indices].to("cpu", non_blocking=True)
+            for conv in self.mamba_cache.conv
+        ]
+        temporal_cpu = self.mamba_cache.temporal[:, indices].to(
+            "cpu", non_blocking=True
+        )
+        torch.cuda.synchronize()
+        return conv_cpu, temporal_cpu
+
+    def load_cpu_copy(self, mamba_cache_cpu, indices, **kwargs):
+        conv_cpu, temporal_cpu = mamba_cache_cpu
+        torch.cuda.synchronize()
+        for i, conv in enumerate(self.mamba_cache.conv):
+            conv[:, indices] = conv_cpu[i].to(conv.device, non_blocking=True)
+        self.mamba_cache.temporal[:, indices] = temporal_cpu.to(
+            self.mamba_cache.temporal.device, non_blocking=True
+        )
+        torch.cuda.synchronize()
 
     def get_contiguous_buf_infos(self):
         """
@@ -728,10 +751,10 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, **kwargs):
         raise NotImplementedError()
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
+    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
         raise NotImplementedError()
 
     def maybe_get_custom_mem_pool(self):
@@ -780,8 +803,12 @@ class MHATokenToKVPool(KVCache):
         self._create_buffers()
 
         self.device_module = torch.get_device_module(self.device)
+
+        _use_alt_stream = _is_cuda or current_platform.is_cuda_alike()
         self.alt_stream = (
-            self.device_module.Stream() if _is_cuda and enable_alt_stream else None
+            self.device_module.Stream()
+            if _use_alt_stream and enable_alt_stream
+            else None
         )
 
         if enable_kv_cache_copy:
@@ -929,7 +956,7 @@ class MHATokenToKVPool(KVCache):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, **kwargs):
         torch.cuda.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -947,7 +974,7 @@ class MHATokenToKVPool(KVCache):
         torch.cuda.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
+    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -1262,7 +1289,9 @@ class HybridLinearKVPool(KVCache):
 
             TokenToKVPoolClass = MHATokenToKVPool
 
-            if _is_npu:
+            if current_platform.is_out_of_tree():
+                TokenToKVPoolClass = current_platform.get_mha_kv_pool_cls()
+            elif _is_npu:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMHATokenToKVPool,
                 )
@@ -1283,7 +1312,9 @@ class HybridLinearKVPool(KVCache):
 
             TokenToKVPoolClass = MLATokenToKVPool
 
-            if _is_npu:
+            if current_platform.is_out_of_tree():
+                TokenToKVPoolClass = current_platform.get_mla_kv_pool_cls()
+            elif _is_npu:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
                 )
@@ -1408,6 +1439,21 @@ class HybridLinearKVPool(KVCache):
 
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
+
+    def get_cpu_copy(self, indices, mamba_indices=None, **kwargs):
+        kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
+        mamba_cpu = (
+            self.mamba_pool.get_cpu_copy(mamba_indices)
+            if mamba_indices is not None
+            else None
+        )
+        return kv_cpu, mamba_cpu
+
+    def load_cpu_copy(self, cache_cpu, indices, mamba_indices=None, **kwargs):
+        kv_cpu, mamba_cpu = cache_cpu
+        self.full_kv_pool.load_cpu_copy(kv_cpu, indices)
+        if mamba_cpu is not None and mamba_indices is not None:
+            self.mamba_pool.load_cpu_copy(mamba_cpu, mamba_indices)
 
     def get_v_head_dim(self):
         return self.full_kv_pool.get_value_buffer(0).shape[-1]
@@ -1640,7 +1686,7 @@ class MLATokenToKVPool(KVCache):
         get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, **kwargs):
         torch.cuda.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -1655,7 +1701,7 @@ class MLATokenToKVPool(KVCache):
         torch.cuda.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
+    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -1967,96 +2013,6 @@ class NSATokenToKVPool(MLATokenToKVPool):
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
-
-
-class DoubleSparseTokenToKVPool(KVCache):
-    def __init__(
-        self,
-        size: int,
-        page_size: int,
-        dtype: torch.dtype,
-        head_num: int,
-        head_dim: int,
-        layer_num: int,
-        device: str,
-        heavy_channel_num: int,
-        enable_memory_saver: bool,
-        start_layer: Optional[int] = None,
-        end_layer: Optional[int] = None,
-    ):
-        super().__init__(
-            size,
-            page_size,
-            dtype,
-            layer_num,
-            device,
-            enable_memory_saver,
-            start_layer,
-            end_layer,
-        )
-
-        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            with (
-                torch.cuda.use_mem_pool(self.custom_mem_pool)
-                if self.enable_custom_mem_pool
-                else nullcontext()
-            ):
-                # [size, head_num, head_dim] for each layer
-                self.k_buffer = [
-                    torch.zeros(
-                        (size + page_size, head_num, head_dim),
-                        dtype=dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
-                self.v_buffer = [
-                    torch.zeros(
-                        (size + page_size, head_num, head_dim),
-                        dtype=dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
-
-                # [size, head_num, heavy_channel_num] for each layer
-                self.label_buffer = [
-                    torch.zeros(
-                        (size + 1, head_num, heavy_channel_num),
-                        dtype=dtype,
-                        device=device,
-                    )
-                    for _ in range(layer_num)
-                ]
-
-    def get_key_buffer(self, layer_id: int):
-        return self.k_buffer[layer_id - self.start_layer]
-
-    def get_value_buffer(self, layer_id: int):
-        return self.v_buffer[layer_id - self.start_layer]
-
-    def get_label_buffer(self, layer_id: int):
-        return self.label_buffer[layer_id - self.start_layer]
-
-    def get_kv_buffer(self, layer_id: int):
-        return (
-            self.k_buffer[layer_id - self.start_layer],
-            self.v_buffer[layer_id - self.start_layer],
-        )
-
-    def set_kv_buffer(
-        self,
-        layer: RadixAttention,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
-        cache_label: torch.Tensor,
-    ):
-        # NOTE(Andy): ignore the dtype check
-        layer_id = layer.layer_id
-        self.k_buffer[layer_id - self.start_layer][loc] = cache_k
-        self.v_buffer[layer_id - self.start_layer][loc] = cache_v
-        self.label_buffer[layer_id - self.start_layer][loc] = cache_label
 
 
 def move_kv_cache_native(
