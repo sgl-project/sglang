@@ -948,10 +948,6 @@ def run_benchmark_internal(
         print(f"{skip_max_running_requests_threshold=}")
         print(f"{skip_token_capacity_threshold=}")
 
-    # HACK: skip capacity check when cache_hit_rate is high (shared prefix)
-    if bench_args.cache_hit_rate > 0:
-        skip_token_capacity_threshold = float("inf")
-
     # Under --enable-multi-batch the client intentionally sends more prompts
     # than the server's running cap; surplus requests are queued (no KV
     # reservation) and promoted batch-by-batch. Peak live KV footprint is
