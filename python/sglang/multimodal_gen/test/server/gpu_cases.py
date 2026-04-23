@@ -533,7 +533,6 @@ TWO_GPU_CASES_A = [
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             ulysses_degree=2,
-            dit_layerwise_offload=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original"
             ],
@@ -556,7 +555,6 @@ TWO_GPU_CASES_B = [
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             ulysses_degree=2,
-            dit_layerwise_offload=True,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
                 "--ltx2-two-stage-device-mode original",
@@ -640,7 +638,6 @@ TWO_GPU_CASES_B = [
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
             ulysses_degree=2,
-            dit_layerwise_offload=True,
         ),
         TI2V_sampling_params,
     ),
