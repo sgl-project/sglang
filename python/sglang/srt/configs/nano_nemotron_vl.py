@@ -38,6 +38,7 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         self,
         vision_config=None,
         llm_config=None,
+        sound_config=None,
         force_image_size: int = 512,
         patch_size: int = 16,
         downsample_ratio=0.5,
@@ -51,6 +52,9 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         img_context_token: str = "<image>",
         img_start_token: str = "<img>",
         img_end_token: str = "</img>",
+        audio_context_token: str = "<so_embedding>",
+        audio_start_token: str = "<so_start>",
+        audio_end_token: str = "<so_end>",
         norm_mean: tuple[float, float, float] | list[float] = IMAGENET_MEAN,
         norm_std: tuple[float, float, float] | list[float] = IMAGENET_STD,
         use_thumbnail: bool = True,
@@ -67,6 +71,12 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
             assert vision_config is None
             self.llm_config = NemotronHConfig()
             self.raw_vision_config = {}
+
+        # Audio (Parakeet) config: stored as a PretrainedConfig sub-object
+        if sound_config is not None and isinstance(sound_config, dict):
+            self.sound_config = PretrainedConfig.from_dict(sound_config)
+        else:
+            self.sound_config = sound_config
 
         # Assign configuration values
         vision_image_size = self.raw_vision_config.get("image_size", force_image_size)
@@ -97,6 +107,9 @@ class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
         self.use_thumbnail = use_thumbnail
         self.img_start_token = img_start_token
         self.img_end_token = img_end_token
+        self.audio_context_token = audio_context_token
+        self.audio_start_token = audio_start_token
+        self.audio_end_token = audio_end_token
 
     def create_radio_config(self):
         config = self.raw_vision_config
