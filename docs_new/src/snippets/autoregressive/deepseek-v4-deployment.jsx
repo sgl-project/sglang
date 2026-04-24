@@ -42,11 +42,11 @@ export const DeepSeekV4Deployment = () => {
       name: "recipe",
       title: "Recipe",
       items: [
-        { id: "low-latency",    label: "Low-Latency",      default: true,  subtitle: "MTP 3/4" },
-        { id: "balanced",       label: "Balanced",         default: false, subtitle: "MTP 1/2 + DeepEP" },
-        { id: "max-throughput", label: "Max-Throughput",   default: false, subtitle: "DP + DeepEP" },
-        { id: "cp",             label: "Context-Parallel", default: false, subtitle: "long prompts" },
-        { id: "pd-disagg",      label: "PD-Disagg",        default: false, subtitle: "1P + 1D + router" },
+        { id: "low-latency",    label: "Low-Latency",      default: true  },
+        { id: "balanced",       label: "Balanced",         default: false },
+        { id: "max-throughput", label: "Max-Throughput",   default: false },
+        { id: "cp",             label: "Context-Parallel", default: false },
+        { id: "pd-disagg",      label: "PD-Disagg",        default: false },
       ],
     },
     reasoningParser: {
