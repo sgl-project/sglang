@@ -600,9 +600,12 @@ class SchedulerPPMixin:
                     batch.global_num_tokens = global_num_tokens
                     batch.global_num_tokens_for_logprob = global_num_tokens
 
+                hs = getattr(
+                    model_config, "hc_hidden_size", model_config.hidden_size
+                )
                 proxy_tensors = {
                     "hidden_states": torch.zeros(
-                        (current_seq_len, model_config.hidden_size),
+                        (current_seq_len, hs),
                         dtype=model_config.dtype,
                         device="cuda",
                     ),

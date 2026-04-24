@@ -349,6 +349,7 @@ class CudaGraphRunner:
             num_tokens_per_bs=self.num_tokens_per_bs,
             cache_loc_dtype=self._cache_loc_dtype(),
             enable_mamba_track=enable_mamba_track,
+            hc_hidden_size=getattr(self.model_runner.model_config, "hc_hidden_size", None),
         )
 
         self.tbo_plugin = TboCudaGraphRunnerPlugin()

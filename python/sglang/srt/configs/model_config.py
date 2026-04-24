@@ -650,6 +650,10 @@ class ModelConfig:
             and envs.SGLANG_DSV4_MODE.get() == "2604"
             else self.hidden_size
         )
+        # Effective hidden size after mHC flattening: hc_mult * hidden_size.
+        # For non-mHC models this equals hidden_size.
+        # Same value as spec_hidden_size; TODO: unify into one field.
+        self.hc_hidden_size = self.spec_hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
