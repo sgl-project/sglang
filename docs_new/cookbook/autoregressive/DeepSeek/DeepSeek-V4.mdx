@@ -107,16 +107,7 @@ curl http://localhost:30000/v1/chat/completions \
 
 #### 4.2.1 Reasoning Parser
 
-Enable the `deepseek-v4` reasoning parser to separate thinking from the final answer into `reasoning_content` vs `content`.
-
-```shell Command
-sglang serve \
-  --model-path deepseek-ai/DeepSeek-V4-Flash \
-  --reasoning-parser deepseek-v4 \
-  --tp 4 \
-  --host 0.0.0.0 \
-  --port 30000
-```
+Enable the `deepseek-v4` reasoning parser (check the box in the [command panel above](#3-model-deployment)) to separate thinking from the final answer into `reasoning_content` vs `content`.
 
 **Streaming with Thinking Process:**
 
@@ -171,19 +162,7 @@ Pending update — replace with real server output after deployment.
 
 #### 4.2.2 Tool Calling
 
-Enable the `deepseekv4` tool-call parser to surface structured tool calls via `message.tool_calls`.
-
-**Deployment Command:**
-
-```shell Command
-sglang serve \
-  --model-path deepseek-ai/DeepSeek-V4-Flash \
-  --tool-call-parser deepseekv4 \
-  --reasoning-parser deepseek-v4 \
-  --tp 4 \
-  --host 0.0.0.0 \
-  --port 30000
-```
+Enable the `deepseekv4` tool-call parser (check the box in the [command panel above](#3-model-deployment)) to surface structured tool calls via `message.tool_calls`.
 
 **Python Example (with Thinking Process):**
 
@@ -282,7 +261,7 @@ We use SGLang's built-in benchmarking tool to conduct performance evaluation on 
 
 #### 5.1.1 Latency-Sensitive Benchmark
 
-- **Model Deployment Command:** use the [Interactive Command Generator](#3-model-deployment) with Hardware = **B200**, Model Variant = **Flash**, Recipe = **low-latency**.
+- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
 
 - Benchmark Command:
 
@@ -306,7 +285,7 @@ Pending update — replace with real bench_serving output after the latency run.
 
 #### 5.1.2 Throughput-Sensitive Benchmark
 
-- **Model Deployment Command:** use the [Interactive Command Generator](#3-model-deployment) with Hardware = **B200**, Model Variant = **Flash**, Recipe = **max-throughput**.
+- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
 
 - Benchmark Command:
 
@@ -379,7 +358,7 @@ python3 benchmark/mmlu/bench_sglang.py --nsub 10 --port 30000
 
 #### 5.3.1 Latency-Sensitive Benchmark
 
-- **Model Deployment Command:** use the [Interactive Command Generator](#3-model-deployment) with Hardware = **H200**, Model Variant = **Flash**, Recipe = **low-latency**.
+- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
 
 - Benchmark Command:
 
@@ -403,7 +382,7 @@ Pending update — replace with real bench_serving output after the latency run.
 
 #### 5.3.2 Throughput-Sensitive Benchmark
 
-- **Model Deployment Command:** use the [Interactive Command Generator](#3-model-deployment) with Hardware = **H200**, Model Variant = **Flash**, Recipe = **max-throughput**.
+- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
 
 - Benchmark Command:
 
