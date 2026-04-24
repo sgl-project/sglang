@@ -38,6 +38,7 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import get_int_env_var
+from sglang.srt.utils.ib import get_ib_devices_for_gpu
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -198,8 +199,9 @@ class MoriKVManager(CommonKVManager):
             self._start_decode_thread()
 
     def _init_engine(self) -> IOEngine:
-        if self.kv_args.ib_device:
-            os.environ["MORI_RDMA_DEVICES"] = self.kv_args.ib_device
+        ib_device = get_ib_devices_for_gpu(self.kv_args.ib_device, self.kv_args.gpu_id)
+        if ib_device:
+            os.environ["MORI_RDMA_DEVICES"] = ib_device
 
         self.local_ip = get_local_ip_auto()
         config = IOEngineConfig(host=self.local_ip, port=0)

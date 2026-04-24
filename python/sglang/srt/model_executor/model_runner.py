@@ -182,6 +182,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.ib import get_ib_devices_for_gpu
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.offloader import (
@@ -782,7 +783,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def remote_instance_init_transfer_engine(self):
         try:
             from mooncake.engine import TransferEngine
-        except ImportError as e:
+        except ImportError:
             logger.warning(
                 "Please install mooncake for using remote instance transfer engine: pip install mooncake"
             )
@@ -999,12 +1000,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         backend = get_default_distributed_backend(self.device)
         if self.device == "cuda" and self.server_args.elastic_ep_backend == "mooncake":
             backend = "mooncake"
-            if self.server_args.mooncake_ib_device:
-                mooncake_ib_device = self.server_args.mooncake_ib_device.split(",")
+            ib_devices_str = get_ib_devices_for_gpu(
+                self.server_args.mooncake_ib_device, self.gpu_id
+            )
+            if ib_devices_str:
                 try:
                     from mooncake import ep as mooncake_ep
 
-                    mooncake_ep.set_device_filter(mooncake_ib_device)
+                    mooncake_ep.set_device_filter(ib_devices_str.split(","))
                 except:
                     pass  # A warning will be raised in `init_distributed_environment`
 
@@ -1747,7 +1750,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
             reconstructed_tensors = bucket.reconstruct_tensors()
             self.model.load_weights(reconstructed_tensors)
-            return True, f"Succeeded to update parameter online."
+            return True, "Succeeded to update parameter online."
         except Exception as e:
             error_msg = (
                 f"Failed to update parameter online: {e}. "
@@ -2061,10 +2064,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         elif self.server_args.kv_cache_dtype == "fp4_e2m1":
             if hasattr(torch, "float4_e2m1fn_x2"):
                 self.kv_cache_dtype = torch.float4_e2m1fn_x2
-                logger.warning(f"FP4 (E2M1) KV Cache might lead to a accuracy drop!")
+                logger.warning("FP4 (E2M1) KV Cache might lead to a accuracy drop!")
             else:
                 logger.warning(
-                    f"--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
+                    "--kv-cache-dtype falls back to 'auto' because this torch version does not support torch.float4_e2m1fn_x2"
                 )
                 self.kv_cache_dtype = self.dtype
         else:

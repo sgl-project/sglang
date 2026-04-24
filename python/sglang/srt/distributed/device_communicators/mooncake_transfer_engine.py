@@ -1,93 +1,14 @@
-import json
 import logging
-import os
 from typing import List, Optional
 
 from sglang.srt.environ import envs
+from sglang.srt.utils.ib import get_ib_devices_for_gpu
 from sglang.srt.utils.network import NetworkAddress, get_free_port
 
 logger = logging.getLogger(__name__)
 
 # Module-level shared engine instance, set by init_mooncake_transfer_engine().
 _mooncake_transfer_engine: Optional["MooncakeTransferEngine"] = None
-
-
-def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optional[str]:
-    """
-    Parse IB device string and get IB devices for a specific GPU ID.
-
-    Supports all the following formats:
-    1. Old format: "ib0, ib1, ib2"
-    2. New format: {0: "ib0, ib1", 1: "ib2, ib3", 2: "ib4"}
-    3. JSON file: path to a JSON file containing the mapping
-
-    Args:
-        ib_device_str: The original IB device string or path to JSON file
-        gpu_id: The GPU ID to get devices for
-
-    Returns:
-        IB devices string for the GPU, or None if not available
-    """
-    if ib_device_str is None or not ib_device_str.strip():
-        return None
-
-    ib_device_str = ib_device_str.strip()
-
-    # Check if it's a JSON file first and load its content
-    is_json_file = ib_device_str.endswith(".json")
-    if is_json_file:
-        try:
-            if os.path.isfile(ib_device_str):
-                with open(ib_device_str, "r") as f:
-                    ib_device_str = f.read()
-            else:
-                # File doesn't exist, treat as old format
-                raise RuntimeError(f"File {ib_device_str} does not exist.")
-        except (IOError, OSError) as e:
-            # File reading failed, raise exception
-            raise RuntimeError(f"Failed to read JSON file {ib_device_str}: {e}") from e
-
-    # Check if it's JSON format (new format)
-    try:
-        parsed_json = json.loads(ib_device_str)
-        if isinstance(parsed_json, dict):
-            # Validate format - keys should be integers (or string rep), values should be strings
-            gpu_mapping = {}
-            for gpu_key, ib_devices in parsed_json.items():
-                if (
-                    isinstance(gpu_key, str)
-                    and gpu_key.isdigit()
-                    and isinstance(ib_devices, str)
-                ):
-                    gpu_mapping[int(gpu_key)] = ib_devices.strip()
-                elif isinstance(gpu_key, int) and isinstance(ib_devices, str):
-                    gpu_mapping[gpu_key] = ib_devices.strip()
-                else:
-                    raise ValueError(
-                        "Invalid format: keys must be integers (or string "
-                        "representations of integers) and values must be strings"
-                    )
-
-            if not gpu_mapping:
-                raise ValueError("No valid GPU mappings found in JSON")
-
-            # Return devices for specific GPU
-            if gpu_id in gpu_mapping:
-                return gpu_mapping[gpu_id]
-            else:
-                raise ValueError(
-                    f"No IB devices configured for GPU {gpu_id}. "
-                    f"Available GPUs: {list(gpu_mapping.keys())}"
-                )
-
-    except json.JSONDecodeError:
-        if is_json_file:
-            # It was supposed to be a JSON file but failed to parse
-            raise RuntimeError(
-                f"Failed to parse JSON content from file {ib_device_str}"
-            )
-        # Not JSON format, treat as old format - return same devices for all GPUs
-        return ib_device_str
 
 
 class MooncakeTransferEngine:
