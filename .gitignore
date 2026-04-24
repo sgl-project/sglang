@@ -281,3 +281,4 @@ sgl-kernel/csrc/**/*_musa/
 
 # Worktrees
 .worktrees/
+.claude/

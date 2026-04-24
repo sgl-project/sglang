@@ -1,0 +1,37 @@
+# SuperGPQA, thinking mode ON, temperature=0 (greedy/deterministic).
+# Compute-budget note: full sweep (26,529 prompts × 66 cells) is ~1,300
+# GPU-hours at Qwen3-30B-A3B on 8×A100. Scope down via sweep.num_prompts
+# or MC_LIST/VARIANTS env overrides for the initial exploration run.
+task: supergpqa
+variant: det
+
+dataset:
+  limit: 0                    # 0 = all 26,529 prompts
+  seed: 1234
+
+sampling:
+  enable_thinking: true
+  max_tokens: 8192
+  temperature: 0              # greedy decoding — deterministic
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5
+  frequency_penalty: 0.5
+
+calibration:
+  num_prompts: 256
+  mc: 128
+  gpu: 0                      # calib on GPU 0 (supergpqa pool 0-3)
+  port: 31320
+  nccl_port: 41320
+
+sweep:
+  mc_list: [8, 16, 32, 64, 128, 256]
+  variants: [hot0, hot20, hot40, hot60, hot80, hot100,
+             thr32, thr64, thr128, thr256, thr512]
+  gpus: [0, 1, 2, 3]          # split pool — lcb_v6_det runs on 4-7
+  num_prompts: 0
+
+scoring:
+  enabled: true
+  extra_args: []

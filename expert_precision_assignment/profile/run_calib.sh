@@ -3,25 +3,28 @@
 # so the measured output-length distribution and accuracy are a clean
 # baseline, independent of any heter-precision policy.
 #
-# Dispatches on $TASK:
-#   sharegpt     → bench_serving --output-details (JSONL has input_lens/
-#                  output_lens directly)
-#   <anything>   → bench_eval --output-file (merged report JSONL; this
-#                  script adds input_lens/output_lens at top level via
-#                  report.merge_report, and also reports accuracy)
+# Dispatches on $TASK (three modes, auto-detected):
+#   sharegpt                    → MODE=sharegpt   (bench_serving --dataset-name sharegpt)
+#   prompts/<task>.jsonl exists → MODE=openai     (bench_serving --dataset-name openai,
+#                                                  for user-prepared prompts e.g. supergpqa,
+#                                                  ifbench, livecodebench_v6 — scoring is
+#                                                  offline via scoring/score_traces_<task>.py)
+#   else                        → MODE=bench_eval (lm-eval-harness tasks like gsm8k, mmlu*)
 #
-# Then invokes calib_kv.py --bench_details_jsonl on the produced JSONL
-# to emit kv_calib/<task>.json with μ/σ of total_len.
+# All three modes write a JSONL with top-level `input_lens`/`output_lens` arrays
+# that calib_kv.py consumes to emit kv_calib/<task>.json with μ/σ of total_len.
 # gen_heter_configs.py --calib_json consumes that file.
 #
 # Usage:
 #   bash run_calib.sh sharegpt
 #   bash run_calib.sh gsm8k
+#   bash run_calib.sh supergpqa            # after `python prompts/prepare_prompts_supergpqa.py`
 #   NUM_PROMPTS=512 bash run_calib.sh sharegpt
 #   CALIB_MC=64 MAX_GEN_TOKS=512 bash run_calib.sh gsm8k
 #   FEWSHOT_AS_MULTITURN=0 bash run_calib.sh gsm8k   # disable multiturn wrap
 #   CALIB_LIMIT=256 bash run_calib.sh gsm8k          # use 256 docs instead of 128
 #   CALIB_LIMIT= bash run_calib.sh gsm8k             # full task (no cap)
+#   NUM_PROMPTS=128 bash run_calib.sh supergpqa      # calib on first 128 prompts
 set -uo pipefail
 
 TASK="${1:-}"
@@ -33,10 +36,23 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 POLICY_DIR="$(cd "$SCRIPT_DIR/../policy/heter_assign" && pwd)"
 OUT_DIR="$SCRIPT_DIR/kv_calib"
+PROMPTS_DIR="$SCRIPT_DIR/prompts"
+PROMPTS_JSONL="$PROMPTS_DIR/${TASK}.jsonl"
 mkdir -p "$OUT_DIR"
 
-BF16_MODEL="/data/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
-HOST="127.0.0.1"
+if [ "$TASK" = "sharegpt" ]; then
+    MODE="sharegpt"
+elif [ -f "$PROMPTS_JSONL" ]; then
+    MODE="openai"
+else
+    MODE="bench_eval"
+fi
+
+# Runtime knobs — precedence: explicit env > recipe's runtime.* > hardcoded default.
+# Recipe vars (RECIPE_RUNTIME__*) are set by run_pipeline.sh when called via
+# recipe; standalone `bash run_calib.sh <task>` falls through to the defaults.
+BF16_MODEL="${BF16_MODEL:-${RECIPE_RUNTIME__MODEL_PATH:-/data/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39}}"
+HOST="${HOST:-${RECIPE_RUNTIME__HOST:-127.0.0.1}}"
 PORT="${CALIB_PORT:-31304}"
 NCCL_PORT="${CALIB_NCCL_PORT:-41304}"
 GPU="${CALIB_GPU:-4}"
@@ -75,27 +91,55 @@ if [ -z "${SYSTEM_INSTRUCTION+x}" ]; then
     esac
 fi
 
-# shellcheck disable=SC1091
-eval "$(conda shell.bash hook 2>/dev/null)" || true
-conda activate sglang 2>/dev/null || source activate sglang
-
-if [ "$TASK" = "sharegpt" ]; then
-    DETAILS_JSONL="$OUT_DIR/calib_sharegpt_n${NUM_PROMPTS}.jsonl"
-else
-    DETAILS_JSONL="$OUT_DIR/calib_${TASK}_mc${CALIB_MC}.jsonl"
+# Resolve Python: explicit $PYTHON > recipe's runtime.python > hardcoded default.
+# Hard-fail if the chosen interpreter can't import sglang — the previous silent
+# fallback to system python3 created a trap where the server died with
+# ModuleNotFoundError only after 60+ seconds of startup.
+PYTHON="${PYTHON:-${RECIPE_RUNTIME__PYTHON:-/data/junzhou/.venv-bfcl/bin/python}}"
+if [ ! -x "$PYTHON" ]; then
+    echo "ERROR: runtime python not executable: $PYTHON" >&2
+    echo "  Fix: set PYTHON=/path/to/venv/bin/python, or runtime.python in the recipe." >&2
+    exit 1
 fi
+if ! "$PYTHON" -c "import sglang" >/dev/null 2>&1; then
+    echo "ERROR: sglang not importable under $PYTHON" >&2
+    echo "  Fix: set PYTHON=/path/to/venv with sglang, or runtime.python in the recipe." >&2
+    exit 1
+fi
+# Put the venv's bin dir on PATH so FlashInfer's JIT can find `ninja`.
+PYTHON_BIN_DIR="$(dirname "$PYTHON")"
+case ":$PATH:" in *":$PYTHON_BIN_DIR:"*) ;; *) export PATH="$PYTHON_BIN_DIR:$PATH" ;; esac
+
+case "$MODE" in
+    sharegpt)
+        DETAILS_JSONL="$OUT_DIR/calib_sharegpt_n${NUM_PROMPTS}.jsonl"
+        ;;
+    openai)
+        DETAILS_JSONL="$OUT_DIR/calib_${TASK}_n${NUM_PROMPTS}.jsonl"
+        ;;
+    bench_eval)
+        DETAILS_JSONL="$OUT_DIR/calib_${TASK}_mc${CALIB_MC}.jsonl"
+        ;;
+esac
 CALIB_JSON="$OUT_DIR/${TASK}.json"
 SERVER_LOG="$OUT_DIR/server_${TASK}_bf16.log"
 
 echo "============================================================"
-echo "  KV calibration — task=$TASK  (FULL BF16, no heter config)"
-if [ "$TASK" = "sharegpt" ]; then
-    echo "  bench_serving mc=$CALIB_MC num_prompts=$NUM_PROMPTS"
-else
-    echo "  bench_eval mc=$CALIB_MC fewshot=$NUM_FEWSHOT max_gen=$MAX_GEN_TOKS T=$TEMPERATURE limit=${CALIB_LIMIT:-full}"
-    echo "  apply_chat_template=$APPLY_CHAT_TEMPLATE  fewshot_as_multiturn=$FEWSHOT_AS_MULTITURN"
-    [ -n "$SYSTEM_INSTRUCTION" ] && echo "  sys_instr: $SYSTEM_INSTRUCTION"
-fi
+echo "  KV calibration — task=$TASK  mode=$MODE  (FULL BF16, no heter config)"
+case "$MODE" in
+    sharegpt)
+        echo "  bench_serving mc=$CALIB_MC num_prompts=$NUM_PROMPTS"
+        ;;
+    openai)
+        echo "  bench_serving --dataset-name openai --dataset-path $PROMPTS_JSONL"
+        echo "  num_prompts=$NUM_PROMPTS mc=$CALIB_MC (scoring is offline)"
+        ;;
+    bench_eval)
+        echo "  bench_eval mc=$CALIB_MC fewshot=$NUM_FEWSHOT max_gen=$MAX_GEN_TOKS T=$TEMPERATURE limit=${CALIB_LIMIT:-full}"
+        echo "  apply_chat_template=$APPLY_CHAT_TEMPLATE  fewshot_as_multiturn=$FEWSHOT_AS_MULTITURN"
+        [ -n "$SYSTEM_INSTRUCTION" ] && echo "  sys_instr: $SYSTEM_INSTRUCTION"
+        ;;
+esac
 echo "  server: gpu=$GPU port=$PORT"
 echo "  → $DETAILS_JSONL"
 echo "  → $CALIB_JSON"
@@ -104,7 +148,7 @@ echo "============================================================"
 # 1. Launch server (full BF16 — no --heter-precision-config).
 rm -f "$DETAILS_JSONL"
 echo "Launching server..."
-CUDA_VISIBLE_DEVICES="$GPU" python3 -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" -m sglang.launch_server \
     --model-path "$BF16_MODEL" \
     --host "$HOST" --port "$PORT" \
     --nccl-port "$NCCL_PORT" \
@@ -141,57 +185,72 @@ done
 echo "Server ready after ${elapsed}s"
 
 # 3. Run bench pass with per-request input_lens / output_lens capture.
-if [ "$TASK" = "sharegpt" ]; then
-    echo "Running bench_serving (n=$NUM_PROMPTS)..."
-    python3 -m sglang.bench_serving \
-        --backend sglang \
-        --base-url "http://${HOST}:${PORT}" \
-        --dataset-name sharegpt \
-        --sharegpt-context-len "$SHAREGPT_CONTEXT_LEN" \
-        --num-prompts "$NUM_PROMPTS" \
-        --max-concurrency "$CALIB_MC" \
-        --output-details \
-        --output-file "$DETAILS_JSONL"
-else
-    ct_flag=()
-    [ "$APPLY_CHAT_TEMPLATE" = "1" ] && ct_flag=(--apply-chat-template)
-    mt_flag=()
-    [ "$FEWSHOT_AS_MULTITURN" = "1" ] && mt_flag=(--fewshot-as-multiturn)
-    sys_flag=()
-    [ -n "$SYSTEM_INSTRUCTION" ] && sys_flag=(--system-instruction "$SYSTEM_INSTRUCTION")
-    lim_flag=()
-    [ -n "$CALIB_LIMIT" ] && lim_flag=(--limit "$CALIB_LIMIT")
-    echo "Running bench_eval (task=$TASK) with per-doc output..."
-    python3 -m sglang.bench_eval \
-        --task "$TASK" \
-        --base-url "http://${HOST}:${PORT}" \
-        --backend sglang-oai \
-        --model "$BF16_MODEL" \
-        --tokenizer "$BF16_MODEL" \
-        --num-fewshot "$NUM_FEWSHOT" \
-        --max-gen-toks "$MAX_GEN_TOKS" \
-        --request-rate inf \
-        --max-concurrency "$CALIB_MC" \
-        --temperature "$TEMPERATURE" \
-        --include-per-doc \
-        "${ct_flag[@]}" \
-        "${mt_flag[@]}" \
-        "${sys_flag[@]}" \
-        "${lim_flag[@]}" \
-        --output-file "$DETAILS_JSONL"
-fi
+case "$MODE" in
+    sharegpt)
+        echo "Running bench_serving (sharegpt, n=$NUM_PROMPTS)..."
+        "$PYTHON" -m sglang.bench_serving \
+            --backend sglang \
+            --base-url "http://${HOST}:${PORT}" \
+            --dataset-name sharegpt \
+            --sharegpt-context-len "$SHAREGPT_CONTEXT_LEN" \
+            --num-prompts "$NUM_PROMPTS" \
+            --max-concurrency "$CALIB_MC" \
+            --output-details \
+            --output-file "$DETAILS_JSONL"
+        ;;
+    openai)
+        echo "Running bench_serving (openai, dataset-path=$PROMPTS_JSONL, n=$NUM_PROMPTS)..."
+        "$PYTHON" -m sglang.bench_serving \
+            --backend sglang-oai-chat \
+            --base-url "http://${HOST}:${PORT}" \
+            --dataset-name openai \
+            --dataset-path "$PROMPTS_JSONL" \
+            --num-prompts "$NUM_PROMPTS" \
+            --max-concurrency "$CALIB_MC" \
+            --output-details \
+            --output-file "$DETAILS_JSONL"
+        ;;
+    bench_eval)
+        ct_flag=()
+        [ "$APPLY_CHAT_TEMPLATE" = "1" ] && ct_flag=(--apply-chat-template)
+        mt_flag=()
+        [ "$FEWSHOT_AS_MULTITURN" = "1" ] && mt_flag=(--fewshot-as-multiturn)
+        sys_flag=()
+        [ -n "$SYSTEM_INSTRUCTION" ] && sys_flag=(--system-instruction "$SYSTEM_INSTRUCTION")
+        lim_flag=()
+        [ -n "$CALIB_LIMIT" ] && lim_flag=(--limit "$CALIB_LIMIT")
+        echo "Running bench_eval (task=$TASK) with per-doc output..."
+        "$PYTHON" -m sglang.bench_eval \
+            --task "$TASK" \
+            --base-url "http://${HOST}:${PORT}" \
+            --backend sglang-oai \
+            --model "$BF16_MODEL" \
+            --tokenizer "$BF16_MODEL" \
+            --num-fewshot "$NUM_FEWSHOT" \
+            --max-gen-toks "$MAX_GEN_TOKS" \
+            --request-rate inf \
+            --max-concurrency "$CALIB_MC" \
+            --temperature "$TEMPERATURE" \
+            --include-per-doc \
+            "${ct_flag[@]}" \
+            "${mt_flag[@]}" \
+            "${sys_flag[@]}" \
+            "${lim_flag[@]}" \
+            --output-file "$DETAILS_JSONL"
+        ;;
+esac
 
 # 4. Run calib_kv to parse μ/σ of total_len (input+output) from the
 #    per-request arrays.
 echo "Running calib_kv..."
-python3 "$POLICY_DIR/calib_kv.py" \
+"$PYTHON" "$POLICY_DIR/calib_kv.py" \
     --bench_details_jsonl "$DETAILS_JSONL" \
     --out_file "$CALIB_JSON"
 
-if [ "$TASK" != "sharegpt" ]; then
+if [ "$MODE" = "bench_eval" ]; then
     echo ""
     echo "Accuracy from bench_eval (BF16 baseline):"
-    python3 -c "
+    "$PYTHON" -c "
 import json, sys
 with open('$DETAILS_JSONL') as f:
     rec = json.loads(f.readline())
@@ -202,6 +261,10 @@ for k, v in acc.items():
 if n:
     print(f'  n_samples: {n}')
 "
+elif [ "$MODE" = "openai" ]; then
+    echo ""
+    echo "Note: accuracy for MODE=openai is computed offline via scoring/score_traces_${TASK}.py"
+    echo "      against $DETAILS_JSONL + prompts/${TASK}.meta.jsonl"
 fi
 
 echo "============================================================"

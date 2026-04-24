@@ -11,3 +11,5 @@ profile/kv_calib/server_*.log
 # Python caches
 __pycache__/
 *.pyc
+*.pkl
+*.json
