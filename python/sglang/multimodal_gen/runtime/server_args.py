@@ -282,6 +282,10 @@ class ServerArgs(DisaggArgsMixin):
     log_level: str = "info"
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
 
+    # Tracing
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
+
     # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
     @property
@@ -1094,6 +1098,20 @@ class ServerArgs(DisaggArgsMixin):
             type=str,
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
+        )
+
+        # Tracing
+        parser.add_argument(
+            "--enable-trace",
+            action="store_true",
+            default=False,
+            help="Enable OpenTelemetry tracing.",
+        )
+        parser.add_argument(
+            "--otlp-traces-endpoint",
+            type=str,
+            default=ServerArgs.otlp_traces_endpoint,
+            help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
         )
         parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",

@@ -1,36 +1,20 @@
-export const GLM51Deployment = () => {
-  // Config mirrors sgl-cookbook src/components/autoregressive/GLM51ConfigGenerator/index.js.
-  //
-  // Supported quantization per hardware:
-  //   H100 / H200 / B200 → BF16 + FP8
-  //   GB300 → FP8 only
-  //   MI300X/MI325X/MI355X → BF16 (FP8 not verified on AMD)
+export const Hunyuan3PreviewDeployment = () => {
+  // Hunyuan 3 Preview (~276B total / ~20B active MoE) — BF16 only.
+  // ~552GB weights; 80GB-class GPUs (A100/H100) cannot fit single-node.
+  //   H200 (141GB): tp=8
+  //   B200 (180GB): tp=8
+  //   B300 (275GB): tp=4
+  //   GB300 (275GB, 4-GPU node): tp=4
   const options = {
     hardware: {
       name: 'hardware',
       title: 'Hardware Platform',
       items: [
-        { id: 'h200',   label: 'H200',          default: true  },
-        { id: 'b200',   label: 'B200',          default: false },
-        { id: 'gb300',  label: 'GB300',         default: false },
-        { id: 'h100',   label: 'H100',          default: false },
-        { id: 'mi300x', label: 'MI300X',        default: false },
-        { id: 'mi325x', label: 'MI325X',        default: false },
-        { id: 'mi355x', label: 'MI355X',        default: false }
+        { id: 'h200',  label: 'H200',  default: true  },
+        { id: 'b200',  label: 'B200',  default: false },
+        { id: 'b300',  label: 'B300',  default: false },
+        { id: 'gb300', label: 'GB300', default: false }
       ]
-    },
-    quantization: {
-      name: 'quantization',
-      title: 'Quantization',
-      getDynamicItems: (values) => {
-        const hw = values.hardware;
-        const isAMD = ['mi300x', 'mi325x', 'mi355x'].includes(hw);
-        const isGB300 = hw === 'gb300';
-        return [
-          { id: 'bf16', label: 'BF16', subtitle: 'Full Weights',    default: isAMD,  disabled: isGB300, disabledReason: isGB300 ? 'BF16 is not recommended on GB300 for GLM-5.1' : '' },
-          { id: 'fp8',  label: 'FP8',  subtitle: 'High Throughput', default: !isAMD, disabled: isAMD,   disabledReason: isAMD ? 'FP8 not verified on AMD' : '' }
-        ];
-      }
     },
     reasoning: {
       name: 'reasoning',
@@ -48,33 +32,21 @@ export const GLM51Deployment = () => {
         { id: 'enabled',  label: 'Enabled',  default: true  }
       ]
     },
-    dpattention: {
-      name: 'dpattention',
-      title: 'DP Attention',
-      items: [
-        { id: 'disabled', label: 'Disabled', subtitle: 'Low Latency',     default: true  },
-        { id: 'enabled',  label: 'Enabled',  subtitle: 'High Throughput', default: false }
-      ]
-    },
     speculative: {
       name: 'speculative',
-      title: 'Speculative Decoding',
-      condition: (values) => !['mi300x', 'mi325x', 'mi355x'].includes(values.hardware),
+      title: 'Speculative Decoding (MTP)',
       items: [
-        { id: 'disabled', label: 'Disabled', default: false },
-        { id: 'enabled',  label: 'Enabled',  default: true  }
+        { id: 'disabled', label: 'Disabled', default: true  },
+        { id: 'enabled',  label: 'Enabled',  subtitle: 'Low Latency', default: false }
       ]
     }
   };
 
   const modelConfigs = {
-    h100:   { fp8: { tp: 16, mem: 0.85 }, bf16: { tp: 32, mem: 0.85 } },
-    h200:   { fp8: { tp: 8,  mem: 0.85 }, bf16: { tp: 16, mem: 0.85 } },
-    b200:   { fp8: { tp: 8,  mem: 0.9  }, bf16: { tp: 16, mem: 0.9  } },
-    gb300:  { fp8: { tp: 4,  mem: 0.9  } },
-    mi300x: { bf16: { tp: 8, mem: 0.80 } },
-    mi325x: { bf16: { tp: 8, mem: 0.80 } },
-    mi355x: { bf16: { tp: 8, mem: 0.80 } }
+    h200:  { tp: 8, mem: 0.9 },
+    b200:  { tp: 8, mem: 0.9 },
+    b300:  { tp: 4, mem: 0.9 },
+    gb300: { tp: 4, mem: 0.9 }
   };
 
   const resolveItems = (option, values) => {
@@ -109,37 +81,17 @@ export const GLM51Deployment = () => {
     return () => observer.disconnect();
   }, []);
 
-  useEffect(() => {
-    setValues(prev => {
-      const next = { ...prev };
-      for (const [key, option] of Object.entries(options)) {
-        if (typeof option.getDynamicItems !== 'function') continue;
-        const items = option.getDynamicItems(next);
-        const current = items.find(i => i.id === next[key]);
-        if (!current || current.disabled) {
-          const fallback = items.find(i => i.default && !i.disabled) || items.find(i => !i.disabled);
-          if (fallback) next[key] = fallback.id;
-        }
-      }
-      return next;
-    });
-  }, [values.hardware]);
-
   const handleRadioChange = (optionName, value) => {
     setValues(prev => ({ ...prev, [optionName]: value }));
   };
 
   const generateCommand = () => {
-    const { hardware, quantization } = values;
-    const isAMD = ['mi300x', 'mi325x', 'mi355x'].includes(hardware);
-    const isGB300 = hardware === 'gb300';
-    const effectiveQuant = isAMD ? 'bf16' : (isGB300 && quantization === 'bf16' ? 'fp8' : quantization);
-    const suffix = effectiveQuant === 'fp8' ? '-FP8' : '';
-    const modelName = `zai-org/GLM-5.1${suffix}`;
+    const { hardware } = values;
+    const isBlackwell = hardware === 'b200' || hardware === 'b300' || hardware === 'gb300';
+    const hwConfig = modelConfigs[hardware];
+    if (!hwConfig) return '# Configuration not available for the selected hardware.';
 
-    const hwConfig = modelConfigs[hardware][effectiveQuant];
-    if (!hwConfig) return '# Configuration not available for the selected hardware and quantization.';
-
+    const modelName = 'tencent/Hy3-preview';
     const tpValue = hwConfig.tp;
     const memFraction = hwConfig.mem;
     const enableSpec = values.speculative === 'enabled';
@@ -150,19 +102,8 @@ export const GLM51Deployment = () => {
     cmd += `  --model-path ${modelName}`;
     cmd += ` \\\n  --tp ${tpValue}`;
 
-    if (isAMD) {
-      cmd += ' \\\n  --trust-remote-code';
-      cmd += ' \\\n  --nsa-prefill-backend tilelang';
-      cmd += ' \\\n  --nsa-decode-backend tilelang';
-      cmd += ' \\\n  --chunked-prefill-size 131072';
-      cmd += ' \\\n  --watchdog-timeout 1200';
-    }
-
-    if (values.dpattention === 'enabled') {
-      cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
-    }
-    if (values.reasoning === 'enabled') cmd += ' \\\n  --reasoning-parser glm45';
-    if (values.toolcall  === 'enabled') cmd += ' \\\n  --tool-call-parser glm47';
+    if (values.reasoning === 'enabled') cmd += ' \\\n  --reasoning-parser hunyuan';
+    if (values.toolcall  === 'enabled') cmd += ' \\\n  --tool-call-parser hunyuan';
     if (enableSpec) {
       cmd += ' \\\n  --speculative-algorithm EAGLE';
       cmd += ' \\\n  --speculative-num-steps 3';
@@ -170,11 +111,14 @@ export const GLM51Deployment = () => {
       cmd += ' \\\n  --speculative-num-draft-tokens 4';
     }
 
+    cmd += ' \\\n  --trust-remote-code';
     cmd += ` \\\n  --mem-fraction-static ${memFraction}`;
+
+    if (isBlackwell) cmd += ' \\\n  --attention-backend trtllm_mha';
+
     return cmd;
   };
 
-  // Styles
   const containerStyle = { maxWidth: '900px', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '4px' };
   const cardStyle = { padding: '8px 12px', border: `1px solid ${isDark ? '#374151' : '#e5e7eb'}`, borderLeft: `3px solid ${isDark ? '#E85D4D' : '#D45D44'}`, borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '12px', background: isDark ? '#1f2937' : '#fff' };
   const titleStyle = { fontSize: '13px', fontWeight: '600', minWidth: '140px', flexShrink: 0, color: isDark ? '#e5e7eb' : 'inherit' };

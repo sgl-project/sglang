@@ -618,7 +618,7 @@ def _fused_moe_kernel_sequence(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        not apply_router_weight_on_input,
+        not apply_router_weight_on_input and not no_combine,
         1,
         down_config or config,
         compute_type=compute_type,
