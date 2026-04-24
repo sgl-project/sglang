@@ -154,15 +154,24 @@ export const DeepSeekV4Deployment = () => {
     "h200|big":    { tp: 16, multinode: true, nnodes: 2 },
   };
   // Recipes that have been end-to-end verified on the latest (Flash/Pro) HF
-  // checkpoints. Every cell NOT listed here gets a "being verified" header
-  // comment prepended to its output. To mark a cell verified, add its
-  // "hardware|modelSize|recipe" string to this set and the banner disappears.
+  // checkpoints. Every cell NOT listed here is emitted with its entire body
+  // commented out (every line prefixed with `# `) plus a "being verified"
+  // banner on top — so copy-pasting an unverified command is a no-op in shell.
+  // To mark a cell verified, add its "hardware|modelSize|recipe" string here
+  // and the cell renders as a normal, runnable command.
   // pd-disagg is verified as a single unit (both prefill and decode together).
   const VERIFIED_RECIPES = new Set([
     // e.g. "b200|small|low-latency",
   ]);
   const BEING_VERIFIED_NOTE =
     "# NOTE: this recipe is being verified on the latest checkpoint";
+
+  // Prefix every line with "# " so the whole command becomes a shell no-op.
+  const commentOutCommand = (cmd) =>
+    cmd
+      .split("\n")
+      .map((line) => (line.length ? `# ${line}` : "#"))
+      .join("\n");
 
   // DeepEP large SMS flag (allinone _DEEPEP_LARGE_SMS_FLAG).
   const DEEPEP_LARGE_SMS_FLAG =
@@ -370,7 +379,7 @@ export const DeepSeekV4Deployment = () => {
     const verifyKey = `${hardware}|${modelSize}|${recipe}`;
     return VERIFIED_RECIPES.has(verifyKey)
       ? withMultinode
-      : `${BEING_VERIFIED_NOTE}\n${withMultinode}`;
+      : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(withMultinode)}`;
   };
 
   // ============================================================================
@@ -457,7 +466,7 @@ python3 -m sglang_router.launch_router \\
     const verifyKey = `${hardware}|${modelSize}|pd-disagg`;
     return VERIFIED_RECIPES.has(verifyKey)
       ? full
-      : `${BEING_VERIFIED_NOTE}\n${full}`;
+      : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(full)}`;
   };
 
   // ---- styles ----
