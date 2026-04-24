@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from numbers import Integral
 from typing import Any, List, Optional, Tuple
@@ -104,12 +105,15 @@ def scale_kv_cell_size_per_token_for_dflash(
 _aiter_top_k_renorm_probs = None
 _aiter_top_p_renorm_probs = None
 _aiter_chain_speculative_sampling = None
-try:
-    from aiter.ops.sampling import top_k_renorm_probs as _aiter_top_k_renorm_probs
-    from aiter.ops.sampling import top_p_renorm_probs as _aiter_top_p_renorm_probs
-    from aiter.ops.sampling import chain_speculative_sampling as _aiter_chain_speculative_sampling
-except ImportError:
-    pass
+if not os.environ.get("SGLANG_DISABLE_AITER_SAMPLING"):
+    try:
+        from aiter.ops.sampling import top_k_renorm_probs as _aiter_top_k_renorm_probs
+        from aiter.ops.sampling import top_p_renorm_probs as _aiter_top_p_renorm_probs
+        from aiter.ops.sampling import (
+            chain_speculative_sampling as _aiter_chain_speculative_sampling,
+        )
+    except ImportError:
+        pass
 
 
 def _top_k_renorm_prob_torch(

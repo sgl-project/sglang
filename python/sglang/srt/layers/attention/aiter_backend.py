@@ -1251,10 +1251,13 @@ class AiterAttnBackend(AttentionBackend):
                     )
 
                     custom_mask = spec_info.custom_mask
-                    seq_mask_len = draft_num * (forward_batch.seq_lens + draft_num)
-                    mask_indptr = self.mask_indptr
-                    mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
-                    mask_indptr = mask_indptr[: bs + 1]
+                    if custom_mask is not None:
+                        seq_mask_len = draft_num * (forward_batch.seq_lens + draft_num)
+                        mask_indptr = self.mask_indptr
+                        mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
+                        mask_indptr = mask_indptr[: bs + 1]
+                    else:
+                        mask_indptr = None
 
                     self.forward_metadata = ForwardMetadata(
                         kv_indptr,
@@ -1716,14 +1719,20 @@ class AiterAttnBackend(AttentionBackend):
                         swa_page_table=_swa_page_table,
                     )
                 else:
-                    custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
-                    seq_mask_len = max_q_len * (seq_lens + max_q_len)
-                    mask_indptr = self.mask_indptr
-                    mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
-                    mask_indptr = mask_indptr[: bs + 1]
+                    if spec_info.custom_mask is not None:
+                        custom_mask = self.cuda_graph_custom_mask
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
+                        seq_mask_len = max_q_len * (seq_lens + max_q_len)
+                        mask_indptr = self.mask_indptr
+                        mask_indptr[1 : bs + 1] = torch.cumsum(
+                            seq_mask_len[:bs], dim=0
+                        )
+                        mask_indptr = mask_indptr[: bs + 1]
+                    else:
+                        custom_mask = None
+                        mask_indptr = None
 
                     self.forward_metadata = ForwardMetadata(
                         kv_indptr,
@@ -2151,13 +2160,17 @@ class AiterAttnBackend(AttentionBackend):
                         swa_page_table=_swa_page_table,
                     )
                 else:
-                    custom_mask = self.cuda_graph_custom_mask
-                    custom_mask[: spec_info.custom_mask.shape[0]] = (
-                        spec_info.custom_mask
-                    )
-                    seq_mask_len = max_q_len * (seq_lens + max_q_len)
-                    mask_indptr = self.mask_indptr[: bs + 1]
-                    mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+                    if spec_info.custom_mask is not None:
+                        custom_mask = self.cuda_graph_custom_mask
+                        custom_mask[: spec_info.custom_mask.shape[0]] = (
+                            spec_info.custom_mask
+                        )
+                        seq_mask_len = max_q_len * (seq_lens + max_q_len)
+                        mask_indptr = self.mask_indptr[: bs + 1]
+                        mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+                    else:
+                        custom_mask = None
+                        mask_indptr = None
 
                     self.forward_metadata = ForwardMetadata(
                         kv_indptr,
