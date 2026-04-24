@@ -170,6 +170,7 @@ export const DeepSeekV4Deployment = () => {
     "b200|big|cp",
     "h200|small|low-latency",
     "h200|small|balanced",
+    "h200|small|max-throughput",
   ]);
   const BEING_VERIFIED_NOTE =
     "# NOTE: this recipe is being verified on the latest checkpoint";
