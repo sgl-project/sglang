@@ -27,8 +27,6 @@ concurrency:
 jobs:
   nightly-test-cpu:
     runs-on: xeon-gnr
-    env:
-      HF_HOME: /home/sdp/.cache/huggingface
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -52,7 +50,7 @@ jobs:
         run: |
           docker run -dt \
             -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
-            -v ${HF_HOME}:/root/.cache/huggingface \
+            -v $HOME/.cache/huggingface:/root/.cache/huggingface \
             --name ci_sglang_xeon_nightly \
             sglang_xeon_nightly
 

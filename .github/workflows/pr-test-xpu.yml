@@ -74,8 +74,6 @@ jobs:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: sglang-bmg
-    env:
-      HF_HOME: /home/sdp/.cache/huggingface
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -97,24 +95,45 @@ jobs:
             BRANCH="${{ github.ref_name }}"
           fi
           echo "Building with REPO=$REPO, BRANCH=$BRANCH"
+          # RUNNER_SLOT defaults to empty (single-runner hosts) -> tag "bmg"
+          TAG="bmg${RUNNER_SLOT:+-s$RUNNER_SLOT}"
           docker build \
             --build-arg SG_LANG_REPO=$REPO \
             --build-arg SG_LANG_BRANCH=$BRANCH \
-            --no-cache --progress=plain -f docker/xpu.Dockerfile -t xpu_sglang_main:bmg .
+            --no-cache --progress=plain -f docker/xpu.Dockerfile -t xpu_sglang_main:${TAG} .
 
       - name: Run container
         id: start_container
         run: |
+          TAG="bmg${RUNNER_SLOT:+-s$RUNNER_SLOT}"
+          # Build --device args from GPU_RENDER_DEVICES / GPU_CARD_DEVICES (set via runner .env).
+          # On single-runner hosts where these are empty, fall back to mounting all of /dev/dri.
+          DEVICE_ARGS=""
+          if [[ -n "${GPU_RENDER_DEVICES}${GPU_CARD_DEVICES}" ]]; then
+            for d in ${GPU_RENDER_DEVICES//,/ } ${GPU_CARD_DEVICES//,/ }; do
+              DEVICE_ARGS="$DEVICE_ARGS --device $d"
+            done
+          else
+            DEVICE_ARGS="--device /dev/dri"
+          fi
+          # CPU / memory pinning (empty -> no pinning on single-runner hosts)
+          CPUSET_ARGS=""
+          [[ -n "$CPU_CORES" ]] && CPUSET_ARGS="$CPUSET_ARGS --cpuset-cpus=$CPU_CORES"
+          [[ -n "$NUMA_NODE" ]] && CPUSET_ARGS="$CPUSET_ARGS --cpuset-mems=$NUMA_NODE"
+
           container_id=$(docker run -dt \
+            --name ci_sglang_xpu${RUNNER_SLOT:+_s$RUNNER_SLOT} \
+            $CPUSET_ARGS \
             --group-add 992 \
             --group-add $(getent group video | cut -d: -f3) \
             --group-add $(getent group render | cut -d: -f3) \
-            -v ${HF_HOME}:/home/sdp/.cache/huggingface \
-            --device /dev/dri \
+            -v $HOME/.cache/huggingface:/home/sdp/.cache/huggingface \
+            $DEVICE_ARGS \
             -v /dev/dri/by-path:/dev/dri/by-path \
             --ipc=host \
+            -e ZE_AFFINITY_MASK=0,1,2,3 \
             -e HF_TOKEN="$(cat ~/huggingface_token.txt)" \
-            xpu_sglang_main:bmg)
+            xpu_sglang_main:${TAG})
           echo "Started container: $container_id"
           echo "container_id=$container_id" >> "$GITHUB_OUTPUT"
 

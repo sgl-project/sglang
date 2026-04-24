@@ -73,8 +73,6 @@ jobs:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
     runs-on: xeon-gnr
-    env:
-      HF_HOME: /home/sdp/.cache/huggingface
     strategy:
       matrix:
         build_type: ['all']
@@ -103,7 +101,7 @@ jobs:
         run: |
           docker run -dt \
             -v ${{ github.workspace }}:/sglang-checkout/ --ipc=host \
-            -v ${HF_HOME}:/root/.cache/huggingface \
+            -v $HOME/.cache/huggingface:/root/.cache/huggingface \
             --name ci_sglang_xeon \
             sglang_xeon
 
