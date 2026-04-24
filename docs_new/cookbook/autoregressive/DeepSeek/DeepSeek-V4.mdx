@@ -95,7 +95,23 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
   </tbody>
 </table>
 
-For how to actually launch one of these images, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker).
+For how to actually launch one of these images, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the image tag for your platform and the inner `sglang serve ...` with whatever the [command generator](#3-model-deployment) below produces):
+
+```bash Command
+docker run --gpus all \
+    --shm-size 32g \
+    -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=<your-hf-token>" \
+    --ipc=host \
+    lmsysorg/sglang:deepseek-v4-blackwell \
+    sglang serve \
+        --model-path deepseek-ai/DeepSeek-V4-Flash \
+        --tp 4 \
+        --tool-call-parser deepseekv4 \
+        --reasoning-parser deepseek-v4 \
+        --host 0.0.0.0 --port 30000
+```
 
 ## 3. Model Deployment
 
