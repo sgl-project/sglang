@@ -1892,9 +1892,6 @@ class ServerArgs:
                     logger.warning(
                         "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
                     )
-                    assert (
-                        self.tp_size == 8
-                    ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
                     # Only auto-fill attn_cp_size when the user didn't set it
                     # via --attn-cp-size / --attention-context-parallel-size,
                     # so topologies like (tp=8, dp=1, attn_cp=4, attn_tp=2) are
