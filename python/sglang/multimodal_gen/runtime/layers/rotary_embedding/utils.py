@@ -3,11 +3,14 @@
 from typing import Optional, Tuple
 
 import torch
+import logging
 
 from sglang.jit_kernel.diffusion.triton.rotary import apply_rotary_embedding
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.utils.custom_op import register_custom_op_from_extern
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = current_platform.is_cuda()
 if _is_cuda:
@@ -142,10 +145,7 @@ def apply_flashinfer_rope_qk_inplace(
 
 @torch.compiler.assume_constant_result
 def _maybe_warn_about_missing_flashinfer():
-    import warnings
-
-    warnings.warn(
+    logger.info_once(
         "FlashInfer not available, using Triton fallback for RoPE",
-        stacklevel=2,
     )
-    return None
+
