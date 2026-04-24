@@ -112,6 +112,18 @@ def _looks_like_zimage_diffusers(state_dict: Mapping[str, torch.Tensor]) -> bool
     key with `transformer.`, giving patterns like:
         transformer.layers.{N}.attention.to_q.lora_{A,B}.weight
         transformer.{noise,context}_refiner.{N}.feed_forward.w{1,2,3}.lora_{A,B}.weight
+
+    We require Z-Image specific fingerprints on top of the prefix + lora_A/B
+    check to avoid false-positives on other diffusers LoRAs that also carry a
+    `transformer.` prefix (Qwen-Image, ErnieImage, etc). Two fingerprints
+    cover the realistic target_modules combinations:
+      - `noise_refiner` or `context_refiner` branch — unique to Z-Image.
+      - `feed_forward.w1/w2/w3` — Z-Image's Gated-MLP naming (Ernie uses `mlp`,
+        Qwen uses `transformer_blocks.*.ff`, etc).
+    Either signal is sufficient. Pure attention-only LoRAs without any FFN or
+    refiner coverage remain undetectable by keys alone — left as an explicit
+    gap rather than widening to `transformer.layers.*` which would misfire on
+    ErnieImage attention-only LoRAs (same key shape after PEFT export).
     """
     keys = list(state_dict.keys())
     if not keys:
@@ -120,10 +132,17 @@ def _looks_like_zimage_diffusers(state_dict: Mapping[str, torch.Tensor]) -> bool
     has_lora_ab = _has_substring_key(keys, ".lora_A") or _has_substring_key(
         keys, ".lora_B"
     )
+    if not (has_prefix and has_lora_ab):
+        return False
     has_refiner = _has_prefix_key(
         keys, "transformer.noise_refiner."
     ) or _has_prefix_key(keys, "transformer.context_refiner.")
-    return has_prefix and has_lora_ab and has_refiner
+    has_gated_ffn = (
+        _has_substring_key(keys, ".feed_forward.w1.")
+        or _has_substring_key(keys, ".feed_forward.w2.")
+        or _has_substring_key(keys, ".feed_forward.w3.")
+    )
+    return has_refiner or has_gated_ffn
 
 
 def _looks_like_ai_toolkit_flux_lora(state_dict: Mapping[str, torch.Tensor]) -> bool:
