@@ -494,18 +494,24 @@ class LTX2TwoStageDeviceManager:
         if "stage2" in self._phase_ready_events:
             return
         if self._snapshot_low_vram_mode:
-            stage1_module = self.pipeline.get_module("transformer")
-            stage1_param = (
-                next(stage1_module.parameters(), None)
-                if stage1_module is not None
-                else None
-            )
-            if stage1_param is not None and stage1_param.device.type == "cuda":
-                self._release_module_to_cpu_snapshot("transformer")
+            self._release_stage1_for_low_vram()
 
         self._schedule_phase_prefetch(
             "stage2", self.pipeline.get_module("transformer_2")
         )
+
+    def prepare_upsample_after_stage1(self) -> bool:
+        if (
+            not self.should_use_premerged
+            or self.mode != "snapshot"
+            or not self.server_args.dit_cpu_offload
+            or not self._snapshot_low_vram_mode
+        ):
+            return False
+        if "stage2" in self._phase_ready_events:
+            return False
+        self._release_stage1_for_low_vram()
+        return True
 
     def ensure_phase_ready(self, phase: str | None) -> None:
         if not self.should_use_premerged or phase not in ("stage1", "stage2"):
@@ -615,6 +621,16 @@ class LTX2TwoStageDeviceManager:
 
         phase = "stage2" if module_name == "transformer_2" else "stage1"
         self._phase_ready_events.pop(phase, None)
+
+    def _release_stage1_for_low_vram(self) -> None:
+        stage1_module = self.pipeline.get_module("transformer")
+        stage1_param = (
+            next(stage1_module.parameters(), None)
+            if stage1_module is not None
+            else None
+        )
+        if stage1_param is not None and stage1_param.device.type == "cuda":
+            self._release_module_to_cpu_snapshot("transformer")
 
     def _ensure_on_gpu(self, module_name: str) -> None:
         module = self.pipeline.get_module(module_name)
@@ -806,6 +822,9 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
 
     def prefetch_ltx2_stage2_after_stage1(self) -> None:
         self._device_manager.prefetch_stage2_after_stage1()
+
+    def prepare_ltx2_upsample_after_stage1(self) -> bool:
+        return self._device_manager.prepare_upsample_after_stage1()
 
     def should_skip_ltx2_lora_switch_stage(self) -> bool:
         return self._use_premerged_stage2_transformer and self._device_manager.mode in (
