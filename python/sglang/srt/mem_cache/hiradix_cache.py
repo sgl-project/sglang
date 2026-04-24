@@ -53,7 +53,6 @@ from sglang.srt.mem_cache.radix_cache import (
     compute_node_hash_values,
     split_node_hash_value,
 )
-from sglang.srt.mem_cache.utils import convert_to_bigram_key
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
@@ -1171,12 +1170,13 @@ class HiRadixCache(RadixCache):
             )
             min_completed_tokens = completed_tokens_tensor.item()
         fetched_token_ids = token_ids[:min_completed_tokens]
+        fetched_key = self._normalize_storage_radix_key(
+            fetched_token_ids, extra_key=last_host_node.key.extra_key
+        )
         written_indices = host_indices[:min_completed_tokens]
         matched_length = self._insert_helper_host(
             last_host_node,
-            RadixKey(
-                token_ids=fetched_token_ids, extra_key=last_host_node.key.extra_key
-            ),
+            fetched_key,
             written_indices,
             hash_value[: min_completed_tokens // self.page_size],
         )
@@ -1259,16 +1259,12 @@ class HiRadixCache(RadixCache):
         last_hash: Optional[str] = None,
         prefix_keys: Optional[List[str]] = None,
     ):
-        new_input_tokens = (
-            convert_to_bigram_key(new_input_tokens)
-            if self.is_eagle
-            else new_input_tokens
+        prefetch_key = self._normalize_storage_radix_key(
+            new_input_tokens, extra_key=last_host_node.key.extra_key
         )
         # align the number of fetching tokens to the page size
-        prefetch_length = len(new_input_tokens) - (
-            len(new_input_tokens) % self.page_size
-        )
-        new_input_tokens = new_input_tokens[:prefetch_length]
+        prefetch_key = prefetch_key.page_aligned(self.page_size)
+        prefetch_length = len(prefetch_key)
         if (
             not self.enable_storage
             or prefetch_length < self.prefetch_threshold
@@ -1288,18 +1284,31 @@ class HiRadixCache(RadixCache):
         operation = self.cache_controller.prefetch(
             req_id,
             host_indices,
-            new_input_tokens,
+            prefetch_key,
             last_hash,
             prefix_keys,
             **self._get_extra_pools(),
         )
         self.ongoing_prefetch[req_id] = (
             last_host_node,
-            new_input_tokens,
+            prefetch_key,
             host_indices,
             operation,
         )
-        self.cache_controller.prefetch_tokens_occupied += len(new_input_tokens)
+        self.cache_controller.prefetch_tokens_occupied += len(prefetch_key)
+
+    def _normalize_storage_radix_key(
+        self, token_ids, extra_key: Optional[str] = None
+    ) -> RadixKey:
+        if isinstance(token_ids, RadixKey):
+            if (
+                token_ids.is_bigram == self.is_eagle
+                and token_ids.extra_key == extra_key
+            ):
+                return token_ids
+            token_ids = token_ids.token_ids
+
+        return RadixKey(token_ids, extra_key=extra_key, is_bigram=self.is_eagle)
 
     def _insert_helper_host(
         self, node: TreeNode, key: RadixKey, host_value, hash_value
