@@ -11,7 +11,7 @@ metatags:
 | Variant                                                                          | Total params | Active (MoE) | Use                                                  |
 | -------------------------------------------------------------------------------- | -----------: | -----------: | ---------------------------------------------------- |
 | **[DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)**    | **284B**     | 13B          | single-node serving: B200 / GB300 / H200 on 4 GPUs   |
-| **[DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)**        | **1.6T**     | 49B          | high-capacity: B200 8 GPU / GB300 4 GPU / **H200 16 GPU (2 nodes)** |
+| **[DeepSeek-V4-Pro](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)**        | **1.6T**     | 49B          | high-capacity: B200 8 GPU / GB300 4 GPU / H200 16 GPU (2 nodes)      |
 
 The Instruct repos ship **FP4 MoE experts + FP8 attention / dense** (one mixed-precision checkpoint covers all GPUs that support FP4). The Base (pre-trained only) variants — `DeepSeek-V4-Flash-Base`, `DeepSeek-V4-Pro-Base` — ship pure FP8 mixed and are **not** for chat / tool calling.
 
@@ -39,29 +39,17 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
 
 **Docker Images by Hardware Platform:**
 
-| Hardware Platform                | Docker Image                                   |
-| -------------------------------- | ---------------------------------------------- |
-| NVIDIA B200 / GB300 (Blackwell)  | `lmsysorg/sglang:deepseek-v4-blackwell`        |
-| NVIDIA H200 (Hopper)             | Pending — no V4-specific image published yet   |
+| Hardware Platform  | Docker Image                                              |
+| ------------------ | --------------------------------------------------------- |
+| NVIDIA B200        | `lmsysorg/sglang:deepseek-v4-blackwell`                   |
+| NVIDIA GB300       | Being pushed — tag not yet public                         |
+| NVIDIA H200        | Being pushed — tag not yet public (see Hopper note below) |
 
-The `deepseek-v4-blackwell` tag is the pre-release image prepared for DeepSeek-V4 on Blackwell. It contains all the patched kernels / grammars needed for the DSML tool-call format, the `flashinfer_mxfp4` MoE runner, DeepEP, and MTP. For Hopper, there is no V4-specific published image yet — see [Hopper deployment note](#hopper-note) below.
+The `deepseek-v4-blackwell` tag is the pre-release image for DeepSeek-V4 on B200. It contains all the patched kernels / grammars needed for the DSML tool-call format, the `flashinfer_mxfp4` MoE runner, DeepEP, and MTP. GB300 and H200 images are in the pipeline; for now, follow the internal `optimize` branch for those deployments.
 
 ## 3. Model Deployment
 
-DeepSeek-V4 on SGLang has **three main serving recipes** with different latency/throughput trade-offs, plus specialized recipes for long-context (**Context Parallel**) and prefill/decode disaggregation (**PD-Disagg**).
-
-| Recipe              | Latency | Throughput | MTP | DP-Attn | DeepEP  | Use When                                                        |
-| ------------------- | ------- | ---------- | --- | ------- | ------- | --------------------------------------------------------------- |
-| **low-latency**     | best    | lowest     | 3/4 | H200-Pro† | H200-Pro† | single-stream / small batch, latency-critical                 |
-| **balanced**        | medium  | medium     | 1/2 | yes     | yes     | general serving, moderate batch                                 |
-| **max-throughput**  | worst   | best       | no  | yes     | yes     | offline / bulk / high-QPS serving                               |
-| **cp**              | —       | —          | no  | no      | yes     | very long prompts (prefill context-parallel)                    |
-| **pd-disagg**       | best    | good       | —   | yes     | B/GB    | latency-SLA serving where prefill / decode need separate tuning |
-
-Notes:
-- MTP `3/4` = `--speculative-num-steps 3 --speculative-num-draft-tokens 4`; `1/2` = steps 1, draft 2.
-- Blackwell = B200 + GB300; on Blackwell low-latency, the MoE path is `--moe-runner-backend flashinfer_mxfp4` (no DeepEP).
-- † H200-Pro low-latency is the one exception: because pure TP-16 on H200 FP8 hits block-size divisibility issues, that cell turns on `--enable-dp-attention` + `--moe-a2a-backend deepep` even though the row is otherwise "no".
+SGLang supports three main serving recipes for DeepSeek-V4 with different latency/throughput trade-offs (`low-latency`, `balanced`, `max-throughput`), plus specialized recipes for long-context (`cp`, prefill context-parallel) and prefill/decode disaggregation (`pd-disagg`). The interactive generator below emits the exact launch command for any `(hardware, variant, recipe)` combination.
 
 ### 3.1 Basic Configuration
 
@@ -85,11 +73,11 @@ import { DeepSeekV4Deployment } from "/src/snippets/autoregressive/deepseek-v4-d
 | Model Size | B200 | GB300 | H200                |
 | ---------- | ---- | ----- | ------------------- |
 | Flash      | TP=4 | TP=4  | TP=4                |
-| Pro (1.6T) | TP=8 | TP=4  | **TP=16 (2-node)**  |
+| Pro (1.6T) | TP=8 | TP=4  | TP=16 (2-node)      |
 
 - `--dp` commonly matches `--tp` when `--enable-dp-attention` is set.
 - PD-disagg TP sizing (per role) is smaller than non-PD: B200 Flash PD = TP=2 per role; otherwise same as non-PD.
-- **H200 Pro is multi-node**: run the **same command** on each of the 2 nodes with `<node-rank>` set to `0` on the head node, `1` on the second; `<node0-ip>` is the head node's IP (reachable from both). The generator emits these as placeholders.
+- H200 Pro is multi-node: run the same command on each of the 2 nodes with `<node-rank>` set to `0` on the head node, `1` on the second; `<node0-ip>` is the head node's IP (reachable from both). The generator emits these as placeholders.
 
 **MTP (Multi-Token Prediction, EAGLE)**
 
@@ -111,7 +99,7 @@ import { DeepSeekV4Deployment } from "/src/snippets/autoregressive/deepseek-v4-d
 
 **GB300 specifics**
 
-- GB300 uses the same `lmsysorg/sglang:deepseek-v4-blackwell` image as B200 (CUDA 13 already baked in).
+- GB300 image is not yet on Docker Hub (being pushed). Once published it is expected to be a separate tag from B200's `deepseek-v4-blackwell` due to the CUDA-13 / Grace-Blackwell userland differences.
 - For PD-disagg over MNNVL (mooncake-over-NVLink): export `SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True` (see [PD Disaggregation docs](../../../docs/advanced_features/pd_disaggregation) for supported values) and drop the `--disaggregation-ib-device` flag. Additional NCCL / transport knobs may be required depending on your cluster's NVLink topology.
 - DRA `compute-domain-channel` claim is required; without it, DeepEP CUDA-graph capture fails with `operation not permitted`.
 
@@ -119,7 +107,7 @@ import { DeepSeekV4Deployment } from "/src/snippets/autoregressive/deepseek-v4-d
 
 **Hopper (H200) note — open item**
 
-The public `deepseek-ai/DeepSeek-V4-Flash` / `-Pro` repos ship with **MoE experts in FP4** (plus FP8 for the rest). Hopper GPUs don't have FP4 MoE kernels, so running these repos directly on H200 is **not yet supported by the published SGLang image** — there is no `deepseek-v4-hopper` tag at this time. Internally we use a converted FP8-only checkpoint (`DeepSeek-V4-HF-FP8-cvt` in the allinone paths); a public H200 path will need either (a) SGLang to auto-dequantize FP4 experts to FP8 on load, or (b) a separate HF upload of an FP8-only Instruct checkpoint. Until that lands, the H200 recipes in this cookbook are **pre-release reference** — commands are verified against the internal source of truth but the public user journey on H200 is open.
+The public `deepseek-ai/DeepSeek-V4-Flash` / `-Pro` repos ship with **MoE experts in FP4** (plus FP8 for the rest). Hopper GPUs don't have FP4 MoE kernels, so the public path on H200 depends on either (a) SGLang auto-dequantizing FP4 experts to FP8 on load, or (b) a separate HF upload of an FP8-only Instruct checkpoint. The H200 Docker image is currently being pushed but not yet public. Internally we use a converted FP8-only checkpoint (`DeepSeek-V4-HF-FP8-cvt` in the sunrise-nda allinone paths). Until the H200 tag is live, the H200 recipes in this cookbook are **pre-release reference** — commands are verified against the internal source of truth, but the public user journey on H200 is not yet complete.
 
 ## 4. Model Invocation
 
