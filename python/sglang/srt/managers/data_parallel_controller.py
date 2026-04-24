@@ -412,6 +412,12 @@ class DataParallelController:
                     worker_socket.setsockopt(
                         zmq.SNDTIMEO, self.elastic_ep_send_timeout_ms
                     )
+                logger.debug(
+                    "Assigned port %s to worker %s on host %s",
+                    worker_port,
+                    dp_rank,
+                    bind_host,
+                )
 
         broadcasted_ports = self._broadcast_worker_ports(
             server_args, worker_ports if worker_ports else None
@@ -552,7 +558,7 @@ class DataParallelController:
 
         while True:
             if self.status[self.round_robin_counter]:
-                logger.info(f"Choose worker {self.round_robin_counter}")
+                logger.debug(f"Choose worker {self.round_robin_counter}")
                 try:
                     self.workers[self.round_robin_counter].send_pyobj(req)
                 except zmq.Again:
