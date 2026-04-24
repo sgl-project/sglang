@@ -153,6 +153,17 @@ export const DeepSeekV4Deployment = () => {
     "h200|small":  { tp: 4,  multinode: false },
     "h200|big":    { tp: 16, multinode: true, nnodes: 2 },
   };
+  // Recipes that have been end-to-end verified on the latest (Flash/Pro) HF
+  // checkpoints. Every cell NOT listed here gets a "being verified" header
+  // comment prepended to its output. To mark a cell verified, add its
+  // "hardware|modelSize|recipe" string to this set and the banner disappears.
+  // pd-disagg is verified as a single unit (both prefill and decode together).
+  const VERIFIED_RECIPES = new Set([
+    // e.g. "b200|small|low-latency",
+  ]);
+  const BEING_VERIFIED_NOTE =
+    "# NOTE: this recipe is being verified on the latest checkpoint";
+
   // DeepEP large SMS flag (allinone _DEEPEP_LARGE_SMS_FLAG).
   const DEEPEP_LARGE_SMS_FLAG =
     `  --deepep-config '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'`;
@@ -355,7 +366,11 @@ export const DeepSeekV4Deployment = () => {
     const envAll = [...HW_ENV, ...recipeEnv, ...COMMON_ENV];
     const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
     const base = `${envBlock}sglang serve \\\n${flags.join(" \\\n")}`;
-    return multinode ? prependMultiNodeNote(base, nnodes) : base;
+    const withMultinode = multinode ? prependMultiNodeNote(base, nnodes) : base;
+    const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+    return VERIFIED_RECIPES.has(verifyKey)
+      ? withMultinode
+      : `${BEING_VERIFIED_NOTE}\n${withMultinode}`;
   };
 
   // ============================================================================
@@ -438,7 +453,11 @@ python3 -m sglang_router.launch_router \\
   --disable-circuit-breaker \\
   --health-check-interval-secs 999999`;
 
-    return `${prefill}\n\n${decode}\n\n${router}`;
+    const full = `${prefill}\n\n${decode}\n\n${router}`;
+    const verifyKey = `${hardware}|${modelSize}|pd-disagg`;
+    return VERIFIED_RECIPES.has(verifyKey)
+      ? full
+      : `${BEING_VERIFIED_NOTE}\n${full}`;
   };
 
   // ---- styles ----
