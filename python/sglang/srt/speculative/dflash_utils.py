@@ -13,6 +13,7 @@ from sglang.srt.utils import is_cuda, is_cuda_alike, is_musa
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 
 _DFLASH_SAMPLING_VERIFY_AVAILABLE = False
+_DFLASH_SAMPLING_VERIFY_USE_KERNEL = False
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
     {
@@ -42,10 +43,13 @@ if is_cuda_alike() or is_musa():
             raise AttributeError("sgl_kernel speculative ops not registered")
 
         _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
+        _DFLASH_SAMPLING_VERIFY_USE_KERNEL = True
     except Exception:
         top_k_renorm_prob = None
         top_p_renorm_prob = None
         tree_speculative_sampling_target_only = None
+        # Enable PyTorch fallback for sampling verify on ROCm/HIP
+        _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
 else:
     top_k_renorm_prob = None
     top_p_renorm_prob = None
@@ -95,6 +99,103 @@ def scale_kv_cell_size_per_token_for_dflash(
     return (
         int(target_cell_size_per_token) * int(total_layers) + int(target_num_layers) - 1
     ) // int(target_num_layers)
+
+
+def _top_k_renorm_prob_torch(
+    probs: torch.Tensor, top_k: torch.Tensor
+) -> torch.Tensor:
+    """Pure PyTorch top-k renormalization fallback for ROCm."""
+    top_k = top_k.to(dtype=torch.int64, device=probs.device)
+    max_k = int(top_k.max().item())
+    vocab_size = probs.shape[-1]
+    if max_k >= vocab_size:
+        return probs
+    sorted_probs, _ = torch.sort(probs, dim=-1, descending=True)
+    kth_vals = sorted_probs.gather(1, (top_k - 1).clamp(min=0).unsqueeze(1))
+    mask = probs >= kth_vals
+    masked = probs * mask
+    return masked / masked.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+
+def _top_p_renorm_prob_torch(
+    probs: torch.Tensor, top_p: torch.Tensor
+) -> torch.Tensor:
+    """Pure PyTorch top-p (nucleus) renormalization fallback for ROCm."""
+    top_p = top_p.to(dtype=probs.dtype, device=probs.device)
+    sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
+    cumsum = torch.cumsum(sorted_probs, dim=-1)
+    # Mask tokens whose cumulative prob exceeds top_p (keep at least 1 token)
+    mask = cumsum - sorted_probs <= top_p.unsqueeze(1)
+    sorted_probs = sorted_probs * mask
+    # Scatter back and renormalize
+    probs_out = torch.zeros_like(probs)
+    probs_out.scatter_(1, sorted_indices, sorted_probs)
+    return probs_out / probs_out.sum(dim=-1, keepdim=True).clamp(min=1e-8)
+
+
+def _dflash_chain_sampling_verify_torch(
+    *,
+    candidates: torch.Tensor,
+    target_probs: torch.Tensor,
+    uniform_samples: torch.Tensor,
+    uniform_samples_for_final_sampling: torch.Tensor,
+    threshold_single: float,
+    threshold_acc: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pure PyTorch chain speculative sampling for DFlash (topk=1, linear chain).
+
+    For each request, walk the chain:
+      - At position j, check if draft token candidates[:, j] is accepted by
+        comparing its target probability against a threshold.
+      - If rejected, sample the bonus token from modified target distribution.
+    """
+    bs, draft_token_num = candidates.shape
+    device = candidates.device
+
+    accept_len = torch.zeros(bs, dtype=torch.int32, device=device)
+    bonus = torch.zeros(bs, dtype=torch.int64, device=device)
+
+    for i in range(bs):
+        prob_acc = 0.0
+        coin = float(uniform_samples[i, 0].item())
+        n_accepted = 0
+
+        for j in range(1, draft_token_num):
+            draft_token_id = int(candidates[i, j].item())
+            target_prob = float(target_probs[i, j - 1, draft_token_id].item())
+            prob_acc += target_prob
+
+            if coin <= prob_acc / threshold_acc or target_prob >= threshold_single:
+                n_accepted += 1
+                coin = float(uniform_samples[i, j].item())
+                prob_acc = 0.0
+            else:
+                # Rejected: sample from relu(target - draft) at position j-1
+                # For DFlash draft_probs are zero, so it's just target_probs
+                tp = target_probs[i, j - 1].clone()
+                tp[draft_token_id] = F.relu(tp[draft_token_id] - 0.0)
+                tp_sum = tp.sum()
+                if tp_sum > 0:
+                    tp = tp / tp_sum
+                    u = float(uniform_samples_for_final_sampling[i].item())
+                    cdf = torch.cumsum(tp, dim=0)
+                    bonus[i] = int((cdf >= u).nonzero(as_tuple=True)[0][0].item())
+                else:
+                    bonus[i] = int(torch.argmax(target_probs[i, j - 1]).item())
+                break
+        else:
+            # All draft tokens accepted, sample bonus from last position
+            tp = target_probs[i, draft_token_num - 1]
+            u = float(uniform_samples_for_final_sampling[i].item())
+            cdf = torch.cumsum(tp, dim=0)
+            nonzero = (cdf >= u).nonzero(as_tuple=True)[0]
+            bonus[i] = int(nonzero[0].item()) if len(nonzero) > 0 else int(
+                torch.argmax(tp).item()
+            )
+
+        accept_len[i] = n_accepted
+
+    return accept_len, bonus
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
@@ -562,6 +663,10 @@ def compute_dflash_sampling_accept_len_and_bonus(
     scaled_logits = next_token_logits / expanded_temperature
     sparse_topk_applied = False
 
+    # Select renorm functions: kernel or PyTorch fallback
+    _top_k_fn = top_k_renorm_prob if _DFLASH_SAMPLING_VERIFY_USE_KERNEL else _top_k_renorm_prob_torch
+    _top_p_fn = top_p_renorm_prob if _DFLASH_SAMPLING_VERIFY_USE_KERNEL else _top_p_renorm_prob_torch
+
     if use_sparse_topk and need_top_k:
         repeated_top_ks = torch.repeat_interleave(
             sampling_info.top_ks, draft_token_num, dim=0
@@ -585,7 +690,7 @@ def compute_dflash_sampling_accept_len_and_bonus(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
-                topk_probs = top_p_renorm_prob(topk_probs, repeated_top_ps)
+                topk_probs = _top_p_fn(topk_probs, repeated_top_ps)
 
             target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
             target_probs.scatter_(1, topk_indices, topk_probs)
@@ -594,53 +699,65 @@ def compute_dflash_sampling_accept_len_and_bonus(
     if not sparse_topk_applied:
         target_probs = F.softmax(scaled_logits, dim=-1)
         if need_top_k:
-            target_probs = top_k_renorm_prob(
+            target_probs = _top_k_fn(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ks, draft_token_num, dim=0),
             )
         if need_top_p:
-            target_probs = top_p_renorm_prob(
+            target_probs = _top_p_fn(
                 target_probs,
                 torch.repeat_interleave(sampling_info.top_ps, draft_token_num, dim=0),
             )
     target_probs = target_probs.view(bs, draft_token_num, -1).contiguous()
-    draft_probs = torch.zeros_like(target_probs)
 
-    (
-        retrieve_index,
-        retrieve_next_token,
-        retrieve_next_sibling,
-        predicts,
-        accept_index,
-        accept_token_num,
-    ) = _get_or_create_chain_verify_buffers(
-        bs=bs,
-        draft_token_num=draft_token_num,
-        device=device,
-    )
-    candidates_i64 = (
-        candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
-    )
-    tree_speculative_sampling_target_only(
-        predicts=predicts,
-        accept_index=accept_index,
-        accept_token_num=accept_token_num,
-        candidates=candidates_i64,
-        # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
-        retrive_index=retrieve_index,
-        retrive_next_token=retrieve_next_token,
-        retrive_next_sibling=retrieve_next_sibling,
-        uniform_samples=uniform_samples,
-        uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
-        target_probs=target_probs,
-        draft_probs=draft_probs,
-        threshold_single=threshold_single,
-        threshold_acc=threshold_acc,
-        deterministic=True,
-    )
+    if _DFLASH_SAMPLING_VERIFY_USE_KERNEL:
+        draft_probs = torch.zeros_like(target_probs)
 
-    accept_len = accept_token_num
-    row_ids = torch.arange(bs, dtype=torch.long, device=device)
-    accept_pos = accept_index[row_ids, accept_len.to(torch.long)].to(torch.long)
-    bonus = predicts[accept_pos].to(torch.int64)
+        (
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            predicts,
+            accept_index,
+            accept_token_num,
+        ) = _get_or_create_chain_verify_buffers(
+            bs=bs,
+            draft_token_num=draft_token_num,
+            device=device,
+        )
+        candidates_i64 = (
+            candidates if candidates.dtype == torch.int64 else candidates.to(torch.int64)
+        )
+        tree_speculative_sampling_target_only(
+            predicts=predicts,
+            accept_index=accept_index,
+            accept_token_num=accept_token_num,
+            candidates=candidates_i64,
+            retrive_index=retrieve_index,
+            retrive_next_token=retrieve_next_token,
+            retrive_next_sibling=retrieve_next_sibling,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            target_probs=target_probs,
+            draft_probs=draft_probs,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+            deterministic=True,
+        )
+
+        accept_len = accept_token_num
+        row_ids = torch.arange(bs, dtype=torch.long, device=device)
+        accept_pos = accept_index[row_ids, accept_len.to(torch.long)].to(torch.long)
+        bonus = predicts[accept_pos].to(torch.int64)
+    else:
+        # Pure PyTorch fallback for ROCm (chain-only DFlash verification)
+        accept_len, bonus = _dflash_chain_sampling_verify_torch(
+            candidates=candidates,
+            target_probs=target_probs,
+            uniform_samples=uniform_samples,
+            uniform_samples_for_final_sampling=uniform_samples_for_final_sampling,
+            threshold_single=threshold_single,
+            threshold_acc=threshold_acc,
+        )
+
     return accept_len, bonus
