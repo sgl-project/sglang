@@ -99,7 +99,6 @@ class NunchakuSVDQuantArgs:
         return normalized
 
     def _validate(self) -> None:
-        # TODO: warn if the served model doesn't support nunchaku
         if not self.enable_svdquant:
             return
 

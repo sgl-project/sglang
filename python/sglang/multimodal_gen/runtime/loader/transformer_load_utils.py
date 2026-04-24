@@ -97,6 +97,17 @@ class _NunchakuQuantAdapter(_TransformerQuantAdapter):
 
     def prepare(self) -> None:
         self.nunchaku_config.model_cls = self.model_cls
+
+        # Warn if the model doesn't explicitly support Nunchaku
+        quant_rules = getattr(self.model_cls, "get_nunchaku_quant_rules", None)
+        if quant_rules is None or not quant_rules():
+            logger.warning(
+                "Model %s does not explicitly support Nunchaku (SVDQuant). "
+                "Default quantization rules will be applied, which may "
+                "not be optimal.",
+                self.model_cls.__name__,
+            )
+
         _NunchakuQuantAdapter._validate_nunchaku_checkpoint_matches_model(
             nunchaku_config=self.nunchaku_config,
             model_cls=self.model_cls,
