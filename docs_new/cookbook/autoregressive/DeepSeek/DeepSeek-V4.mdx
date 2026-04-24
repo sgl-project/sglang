@@ -63,17 +63,6 @@ import { DeepSeekV4Deployment } from "/src/snippets/autoregressive/deepseek-v4-d
 
 {/* TODO: expand this section as more recipes are validated end-to-end. */}
 
-**TP / DP sizing**
-
-| Model Size | B200 | GB300 | H200                |
-| ---------- | ---- | ----- | ------------------- |
-| Flash      | TP=4 | TP=4  | TP=4                |
-| Pro (1.6T) | TP=8 | TP=4  | TP=16 (2-node)      |
-
-- `--dp` commonly matches `--tp` when `--enable-dp-attention` is set.
-- PD-disagg TP sizing (per role) is smaller than non-PD: B200 Flash PD = TP=2 per role; otherwise same as non-PD.
-- H200 Pro is multi-node: run the same command on each of the 2 nodes with `<node-rank>` set to `0` on the head node, `1` on the second; `<node0-ip>` is the head node's IP (reachable from both). The generator emits these as placeholders.
-
 **Concurrency & DeepEP dispatch buffer**
 
 Must hold: `max-running-requests × MTP_draft_tokens ≤ SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`. Violating it blows DeepEP's dispatch buffer at steady-state load (`deep_ep.cpp:1105`). When tuning, move `--cuda-graph-max-bs`, `--max-running-requests`, and the env together. The generator picks safe values automatically.
