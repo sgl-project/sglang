@@ -9,6 +9,7 @@ This module defines the base class for pipelines that are composed of multiple s
 
 import os
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from typing import Any, Callable, Literal, cast
 
 import torch
@@ -42,7 +43,10 @@ from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
     maybe_download_model,
     verify_model_config_and_directory,
 )
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.runtime.utils.logging_utils import (
+    init_logger,
+    suppress_torch_compile_noise,
+)
 
 logger = init_logger(__name__)
 
@@ -91,6 +95,7 @@ class ComposedPipelineBase(ABC):
         self.model_path: str = model_path
         self._stages: list[PipelineStage] = []
         self._stage_name_mapping: dict[str, PipelineStage] = {}
+        self._torch_compile_first_run_done = False
         self.executor = executor or self.build_executor(server_args=server_args)
 
         if required_config_modules is not None:
@@ -738,4 +743,14 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
-        return self.executor.execute_with_profiling(self.stages, batch, server_args)
+        should_suppress = (
+            server_args.enable_torch_compile
+            and not self._torch_compile_first_run_done
+        )
+        if should_suppress:
+            self._torch_compile_first_run_done = True
+
+        with suppress_torch_compile_noise() if should_suppress else nullcontext():
+            return self.executor.execute_with_profiling(
+                self.stages, batch, server_args
+            )
