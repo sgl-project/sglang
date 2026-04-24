@@ -33,6 +33,14 @@ if is_cuda_alike() or is_musa():
             tree_speculative_sampling_target_only,
         )
 
+        # Verify the underlying C++ ops are actually registered (they may be
+        # absent in ROCm sgl-kernel builds where speculative_sampling.cu is
+        # not compiled).  The Python wrappers import fine but dispatch fails.
+        if not hasattr(torch.ops, "sgl_kernel") or not hasattr(
+            torch.ops.sgl_kernel, "tree_speculative_sampling_target_only"
+        ):
+            raise AttributeError("sgl_kernel speculative ops not registered")
+
         _DFLASH_SAMPLING_VERIFY_AVAILABLE = True
     except Exception:
         top_k_renorm_prob = None
