@@ -29,7 +29,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
-from sglang.srt.lora.layers import BaseLayerWithLoRA, get_lora_layer
+from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
@@ -335,6 +335,33 @@ class LoRAManager:
         """
         for layer_id, layer_modules in enumerate(self.lora_modules):
             for module_name, module in layer_modules.items():
+                if isinstance(module, FusedMoEWithLoRA):
+                    gate_up_key = (
+                        "gate_up_proj_moe"
+                        if "gate_up_proj_moe" in self.memory_pool.A_buffer
+                        else "gate_up_proj"
+                    )
+                    down_key = (
+                        "down_proj_moe"
+                        if "down_proj_moe" in self.memory_pool.A_buffer
+                        else "down_proj"
+                    )
+                    module.set_lora_info(
+                        gate_up_lora_a_weights=self.memory_pool.get_tensor(
+                            gate_up_key, layer_id, LoRAType.LORA_A
+                        ),
+                        gate_up_lora_b_weights=self.memory_pool.get_tensor(
+                            gate_up_key, layer_id, LoRAType.LORA_B
+                        ),
+                        down_lora_a_weights=self.memory_pool.get_tensor(
+                            down_key, layer_id, LoRAType.LORA_A
+                        ),
+                        down_lora_b_weights=self.memory_pool.get_tensor(
+                            down_key, layer_id, LoRAType.LORA_B
+                        ),
+                    )
+                    continue
+
                 target_module = get_target_module_name(
                     module_name, self.memory_pool.target_modules
                 )
@@ -725,12 +752,19 @@ class LoRAManager:
                 # independently.
                 self.base_model.lm_head = untied_lm_head
 
-        # MoE models have dense MLP in early layers or shared experts —
-        # mem_pool allocates separate MoE buffers for those, so we must skip
-        # wrapping the dense gate_up_proj / down_proj modules here to avoid
-        # a shape mismatch between the shared-expert-sized buffer and the
-        # actual MoE expert linear dimensions.
+        # MoE models have both dense shared-expert gate_up_proj/down_proj
+        # AND per-expert weights inside FusedMoE. mem_pool allocates separate
+        # 3D buffers (shared expert) and 4D buffers (MoE expert) for them.
+        # We must skip wrapping the dense shared-expert modules here because
+        # they use different buffer dimensions than the MoE experts.
         has_moe = any(isinstance(m, FusedMoE) for m in self.base_model.modules())
+        cfg = self.base_hf_config
+        if hasattr(cfg, "get_text_config"):
+            cfg = cfg.get_text_config()
+        has_shared_experts = (
+            hasattr(cfg, "shared_expert_intermediate_size")
+            and cfg.shared_expert_intermediate_size > 0
+        ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
         dense_mlp_modules = {"gate_up_proj", "down_proj"} if has_moe else set()
 
         for module_name, module in self.base_model.named_modules():
@@ -787,11 +821,15 @@ class LoRAManager:
                 )
                 continue
 
-            # FusedMoE expert LoRA is handled separately by models that
-            # provide their own NVFP4/flashinfer execution path (e.g. the Kimi
-            # branch).  The upstream default lora_moe_runners path does not
-            # support all MoE configurations yet, so skip wrapping here to
-            # avoid illegal-memory-access crashes.  MoE experts will run
-            # without LoRA; all other target modules (attention, shared
-            # expert, embeddings) are still wrapped normally.
-            pass
+            if isinstance(module, FusedMoE) and all(
+                x in self.target_modules for x in ["gate_up_proj", "down_proj"]
+            ):
+                layer_id = get_layer_id(module_name)
+                if layer_id is None:
+                    continue
+                lora_module = self.set_lora_module(module_name, module)
+                lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
+                lora_module.lora_use_virtual_experts = (
+                    self.lora_use_virtual_experts or has_shared_experts
+                )
+                self.lora_modules[layer_id][module_name] = lora_module

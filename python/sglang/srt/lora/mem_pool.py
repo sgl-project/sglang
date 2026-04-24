@@ -743,6 +743,7 @@ class LoRAMemoryPool:
                         temp_B_buffer[target_module] = weights
 
             cur_layer_modules = lora_modules[layer_id]
+            active_target_modules: Set[str] = set()
             for module_name, module in cur_layer_modules.items():
                 # TODO (Jonahcb): check if the code can be refactored to avoid the special handling for FusedMoEWithLoRA
                 # Handle FusedMoEWithLoRA specially - it contains multiple target modules
@@ -751,6 +752,7 @@ class LoRAMemoryPool:
                 if isinstance(module, FusedMoEWithLoRA):
                     moe_target_modules = ["gate_up_proj_moe", "down_proj_moe"]
                     for target_module in moe_target_modules:
+                        active_target_modules.add(target_module)
                         if temp_A_buffer.get(target_module) is not None:
                             temp_A_buffer[target_module] = (
                                 module.slice_moe_lora_a_weights(
@@ -772,6 +774,7 @@ class LoRAMemoryPool:
 
                 # Handle regular modules
                 target_module = get_target_module_name(module_name, self.target_modules)
+                active_target_modules.add(target_module)
 
                 if temp_A_buffer[target_module] is None:
                     # Skip weight slicing if the weight is not present in the adapter
@@ -786,6 +789,8 @@ class LoRAMemoryPool:
                 )
 
             for name, weights in temp_A_buffer.items():
+                if name not in active_target_modules:
+                    continue
                 c = get_stacked_multiply(name)
                 max_r = self.max_lora_rank
                 target_buffer = self.A_buffer[name][layer_id]
@@ -874,6 +879,8 @@ class LoRAMemoryPool:
                     load_lora_weight_tensor(buffer_view, weights)
 
             for name, weights in temp_B_buffer.items():
+                if name not in active_target_modules:
+                    continue
                 target_buffer = self.B_buffer[name][layer_id]
 
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:

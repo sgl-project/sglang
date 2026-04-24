@@ -46,7 +46,12 @@ def _fused_virtual_topk_ids_kernel(
     safe_lora = tl.maximum(lora_id, 0)
 
     base = tl.load(topk_ids_ptr + offs, mask=valid, other=0)
-    result = base + safe_lora * num_experts_for_weight
+    # Preserve negative sentinel IDs (e.g., -1 for non-local experts after
+    # EP dispatch). Mapping them via `base + safe_lora * num_experts` would
+    # collide with real virtual expert IDs in another adapter slot and trigger
+    # OOB reads in downstream LoRA kernels.
+    shifted = base + safe_lora * num_experts_for_weight
+    result = tl.where(base < 0, base, shifted)
     tl.store(virtual_topk_ids_ptr + offs, result, mask=valid)
 
     # Write mask once per row (at first k position)
@@ -302,16 +307,32 @@ def _align_block_size_torch(
     """Pure-PyTorch align_block_size for num_experts > 1024, compiled via torch.compile."""
     device = topk_ids.device
     flat_topk_ids = topk_ids.reshape(-1).to(torch.int64)
-    num_valid_tokens = flat_topk_ids.numel()
+    num_total_tokens = flat_topk_ids.numel()
+
+    # Mask out expert IDs outside [0, num_experts). After EP remap, topk_ids
+    # can contain -1 for non-local experts; the virtual-experts kernel can
+    # also produce values >= num_experts when combined with non-local IDs.
+    # These would otherwise OOB-index `padded_offsets` / `counts_offsets`.
+    valid_mask = (flat_topk_ids >= 0) & (flat_topk_ids < num_experts)
+    sentinel = num_experts  # routes invalid IDs to a separate padded bucket
+    safe_topk_ids = torch.where(
+        valid_mask,
+        flat_topk_ids,
+        torch.full_like(flat_topk_ids, sentinel),
+    )
+
+    # Allocate space for ``num_experts + 1`` buckets so the sentinel bucket
+    # gets its own padded region and never collides with real experts.
+    bucket_count = num_experts + 1
     max_total_padded_tokens = (
-        (num_valid_tokens + num_experts * (block_size - 1) + block_size - 1)
+        (num_total_tokens + bucket_count * (block_size - 1) + block_size - 1)
         // block_size
     ) * block_size
     max_num_blocks = max_total_padded_tokens // block_size
 
     sorted_token_ids = torch.full(
         (max_total_padded_tokens,),
-        num_valid_tokens,
+        num_total_tokens,
         dtype=torch.int32,
         device=device,
     )
@@ -322,13 +343,13 @@ def _align_block_size_torch(
         device=device,
     )
 
-    if num_valid_tokens == 0:
+    if num_total_tokens == 0:
         num_tokens_post_padded = torch.zeros((1,), dtype=torch.int32, device=device)
         return sorted_token_ids, expert_ids, num_tokens_post_padded
 
-    sorted_order = torch.argsort(flat_topk_ids)
-    sorted_expert_ids = flat_topk_ids[sorted_order]
-    expert_range = torch.arange(num_experts, device=device, dtype=torch.int64)
+    sorted_order = torch.argsort(safe_topk_ids)
+    sorted_expert_ids = safe_topk_ids[sorted_order]
+    expert_range = torch.arange(bucket_count, device=device, dtype=torch.int64)
     counts_offsets = torch.searchsorted(sorted_expert_ids, expert_range, right=False)
     counts_end = torch.searchsorted(sorted_expert_ids, expert_range, right=True)
     counts = counts_end - counts_offsets
@@ -337,7 +358,7 @@ def _align_block_size_torch(
     padded_offsets = torch.cumsum(padded_counts, dim=0) - padded_counts
 
     token_ranks = (
-        torch.arange(num_valid_tokens, device=device, dtype=torch.int64)
+        torch.arange(num_total_tokens, device=device, dtype=torch.int64)
         - counts_offsets[sorted_expert_ids]
     )
     output_positions = padded_offsets[sorted_expert_ids] + token_ranks
@@ -348,12 +369,16 @@ def _align_block_size_torch(
     )
 
     block_counts = padded_counts // block_size
-    actual_num_blocks = block_counts.sum()
+    # Mark the sentinel bucket's blocks so they get expert_id == -1 instead
+    # of being assigned to a real expert via searchsorted.
+    real_block_counts = block_counts.clone()
+    real_block_counts[num_experts] = 0
+    actual_num_blocks = real_block_counts.sum()
 
     if max_num_blocks <= 0:
         return sorted_token_ids, expert_ids, total_padded_tokens
 
-    block_offsets = torch.cumsum(block_counts, dim=0)
+    block_offsets = torch.cumsum(real_block_counts, dim=0)
     all_block_positions = torch.arange(max_num_blocks, device=device, dtype=torch.int64)
     assigned_experts = torch.searchsorted(
         block_offsets, all_block_positions, right=True
