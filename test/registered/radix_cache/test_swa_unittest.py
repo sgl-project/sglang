@@ -2,6 +2,7 @@ import unittest
 
 import torch
 
+from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     EvictResult,
@@ -27,6 +28,154 @@ class TestSWA(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pass
+
+    def _create_swa_radix_cache(
+        self,
+        page_size=1,
+        sliding_window_size=4,
+        enable_kv_cache_events=False,
+    ):
+        req_size = 10
+        max_context_len = 128
+        kv_size = 128
+        kv_size_swa = 64
+        head_num = 8
+        head_dim = 128
+        num_layers = 48
+        global_interval = 4
+        dtype = torch.bfloat16
+        device = "cuda"
+        full_attention_layer_ids = [i for i in range(0, num_layers, global_interval)]
+        full_attention_layer_ids_set = set(full_attention_layer_ids)
+        swa_attention_layer_ids = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids_set
+        ]
+        req_to_token_pool = ReqToTokenPool(
+            size=req_size,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=False,
+        )
+        kv_pool = SWAKVPool(
+            size=kv_size,
+            size_swa=kv_size_swa,
+            page_size=page_size,
+            dtype=dtype,
+            head_num=head_num,
+            head_dim=head_dim,
+            swa_attention_layer_ids=swa_attention_layer_ids,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+        )
+        allocator = SWATokenToKVPoolAllocator(
+            size=kv_size,
+            size_swa=kv_size_swa,
+            page_size=page_size,
+            dtype=dtype,
+            device=device,
+            kvcache=kv_pool,
+            need_sort=False,
+        )
+        tree = SWARadixCache(
+            params=CacheInitParams(
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                disable=False,
+                page_size=page_size,
+                sliding_window_size=sliding_window_size,
+                enable_kv_cache_events=enable_kv_cache_events,
+            ),
+        )
+        return tree, allocator
+
+    def _insert_allocated(self, tree, allocator, token_ids):
+        kv_indices = allocator.alloc(len(token_ids))
+        self.assertIsNotNone(kv_indices)
+        tree.insert(InsertParams(key=RadixKey(token_ids), value=kv_indices))
+
+    def test_swa_kv_cache_events_store(self):
+        tree, _ = self._create_swa_radix_cache(
+            page_size=2,
+            enable_kv_cache_events=True,
+        )
+        tree.take_events()
+
+        tree.insert(
+            InsertParams(
+                key=RadixKey([1, 2, 3, 4]),
+                value=torch.tensor([10, 11, 12, 13], dtype=torch.int64, device="cuda"),
+            )
+        )
+
+        events = tree.take_events()
+        stored_events = [e for e in events if isinstance(e, BlockStored)]
+        self.assertEqual(len(stored_events), 2)
+        self.assertEqual(stored_events[0].token_ids, [1, 2])
+        self.assertEqual(stored_events[1].token_ids, [3, 4])
+        self.assertIsNone(stored_events[0].parent_block_hash)
+        self.assertEqual(
+            stored_events[1].parent_block_hash,
+            stored_events[0].block_hashes[0],
+        )
+
+    def test_swa_kv_cache_events_ignore_swa_tombstone(self):
+        tree, allocator = self._create_swa_radix_cache(enable_kv_cache_events=True)
+        tree.take_events()
+
+        self._insert_allocated(tree, allocator, [1, 2, 3, 4])
+        self._insert_allocated(tree, allocator, [1, 2, 3, 4, 5, 6])
+        tree.take_events()
+
+        result = tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+
+        self.assertEqual(result.num_tokens_evicted, 0)
+        self.assertGreaterEqual(result.swa_num_tokens_evicted, 1)
+        events = tree.take_events()
+        self.assertEqual([e for e in events if isinstance(e, BlockRemoved)], [])
+
+    def test_swa_kv_cache_events_full_eviction_removes(self):
+        tree, allocator = self._create_swa_radix_cache(enable_kv_cache_events=True)
+        tree.take_events()
+
+        self._insert_allocated(tree, allocator, [10, 11, 12, 13])
+        stored_hashes = [
+            e.block_hashes[0] for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+
+        result = tree.evict(EvictParams(num_tokens=1, swa_num_tokens=0))
+
+        self.assertGreaterEqual(result.num_tokens_evicted, 1)
+        removed_hashes = [
+            e.block_hashes[0] for e in tree.take_events() if isinstance(e, BlockRemoved)
+        ]
+        self.assertEqual(removed_hashes, stored_hashes)
+
+    def test_swa_kv_cache_events_tombstone_cleanup_removes(self):
+        tree, allocator = self._create_swa_radix_cache(enable_kv_cache_events=True)
+        tree.take_events()
+
+        self._insert_allocated(tree, allocator, [1, 2, 3, 4])
+        self._insert_allocated(tree, allocator, [1, 2, 3, 4, 5, 6])
+        stored_by_tokens = {
+            tuple(e.token_ids): e.block_hashes[0]
+            for e in tree.take_events()
+            if isinstance(e, BlockStored)
+        }
+
+        tree.evict(EvictParams(num_tokens=0, swa_num_tokens=1))
+        events = tree.take_events()
+        self.assertEqual([e for e in events if isinstance(e, BlockRemoved)], [])
+
+        tree.evict(EvictParams(num_tokens=1, swa_num_tokens=0))
+
+        removed_hashes = [
+            e.block_hashes[0] for e in tree.take_events() if isinstance(e, BlockRemoved)
+        ]
+        self.assertIn(stored_by_tokens[(5,)], removed_hashes)
+        self.assertIn(stored_by_tokens[(6,)], removed_hashes)
+        for token_id in [1, 2, 3, 4]:
+            self.assertIn(stored_by_tokens[(token_id,)], removed_hashes)
 
     def test_swa_memory_pool(self):
         size = 16

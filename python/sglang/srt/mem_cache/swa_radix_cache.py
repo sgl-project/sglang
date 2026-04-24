@@ -28,6 +28,11 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -39,11 +44,14 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.hicache_storage import hash_str_to_int64
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
     _key_match_paged,
+    compute_node_hash_values,
     get_child_key,
+    split_node_hash_value,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
@@ -80,6 +88,8 @@ class TreeNode:
         self.hit_count = 0
         # store the host indices of KV cache
         self.host_value = None
+        # store hash values of each page
+        self.hash_value: Optional[List[str]] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -345,6 +355,8 @@ class SWARadixCache(BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.is_eagle = params.is_eagle
+        self.enable_kv_cache_events = params.enable_kv_cache_events
+        self.kv_event_queue = []
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -381,6 +393,7 @@ class SWARadixCache(BasePrefixCache):
         self.root_node = TreeNode()
         self.root_node.key = []
         self.root_node.value = []
+        self.root_node.hash_value = []
         self.root_node.full_lock_ref = 1
         self.root_node.swa_lock_ref = 1
         self.full_evictable_size_ = 0
@@ -390,6 +403,7 @@ class SWARadixCache(BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(is_swa_list=False)
         self.swa_lru_list = LRUList(is_swa_list=True)
+        self._record_all_cleared_event()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -634,6 +648,7 @@ class SWARadixCache(BasePrefixCache):
                 assert x.full_lock_ref == 0, f"node is in use, {x.id=}"
 
                 # 1. free node kv indices, evict full and swa tokens
+                self._record_remove_event(x)
                 self.token_to_kv_pool_allocator.free(x.value)
                 full_num_evicted += len(x.value)
                 swa_num_evicted += len(x.value)
@@ -683,6 +698,7 @@ class SWARadixCache(BasePrefixCache):
                         x.full_lock_ref == 0
                     ), f"leaf node with full lock must also have swa lock, {x.id=}"
                     # 1. a leaf node, free full and swa tokens
+                    self._record_remove_event(x)
                     self.token_to_kv_pool_allocator.free(x.value)
                     full_num_evicted += len(x.value)
                     swa_num_evicted += len(x.value)
@@ -930,6 +946,11 @@ class SWARadixCache(BasePrefixCache):
             if child.swa_uuid is not None:
                 node.swa_uuid = child.swa_uuid
 
+            if node.hash_value is not None and child.hash_value is not None:
+                node.hash_value = list(node.hash_value) + list(child.hash_value)
+            else:
+                node.hash_value = None
+
             self.full_lru_list.remove_node(child)
             if not child.swa_tombstone:
                 self.swa_lru_list.remove_node(child)
@@ -960,6 +981,10 @@ class SWARadixCache(BasePrefixCache):
         assert len(child.key) > 0, f"child.key should not be empty"
         child.value = child.value[split_len:].clone()
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
+
+        new_node.hash_value, child.hash_value = split_node_hash_value(
+            child.hash_value, split_len, self.page_size
+        )
 
         # insert the new node and child into the lru lists, insert
         # parent first so that parent is after child in the lru list
@@ -1059,7 +1084,6 @@ class SWARadixCache(BasePrefixCache):
                 f"Has Additional Node: len(key)={len(key)}, total_prefix_length={total_prefix_length}, swa_evicted_seqlen={swa_evicted_seqlen}, len(value)={len(value)}"
             )
 
-
             if swa_evicted_seqlen == total_prefix_length + len(key):
                 self.token_to_kv_pool_allocator.free(value)
                 return total_prefix_length
@@ -1100,6 +1124,7 @@ class SWARadixCache(BasePrefixCache):
         if not swa_tombstone:
             self.swa_lru_list.insert_mru(new_node)
             self.swa_evictable_size_ += len(value)
+        self._record_store_event(new_node)
         return new_node
 
     def _iteratively_delete_tombstone_leaf(
@@ -1107,21 +1132,23 @@ class SWARadixCache(BasePrefixCache):
     ) -> Tuple[TreeNode, int]:
         full_num_evicted = 0
         while node.parent.swa_tombstone and len(node.parent.children) == 0:
+            parent = node.parent
             # root node is not evictable
-            if node.parent == self.root_node:
+            if parent == self.root_node:
                 break
             # if locked, means node is in use, skip
-            if node.parent.full_lock_ref > 0:
+            if parent.full_lock_ref > 0:
                 break
             assert (
-                node.parent.swa_lock_ref == 0
-            ), f"tombstone swa_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.swa_lock_ref=}, {node.parent.id=}"
+                parent.swa_lock_ref == 0
+            ), f"tombstone swa_lock_ref should always be 0, {parent.full_lock_ref=}, {parent.swa_lock_ref=}, {parent.id=}"
             # delete tombstone node evicts full tokens
-            self.token_to_kv_pool_allocator.free(node.parent.value)
-            full_num_evicted += len(node.parent.value)
-            self.full_lru_list.remove_node(node.parent)
-            self._delete_tombstone_leaf(node.parent)
-            node = node.parent
+            self._record_remove_event(parent)
+            self.token_to_kv_pool_allocator.free(parent.value)
+            full_num_evicted += len(parent.value)
+            self.full_lru_list.remove_node(parent)
+            self._delete_tombstone_leaf(parent)
+            node = parent
 
         return node, full_num_evicted
 
@@ -1185,6 +1212,71 @@ class SWARadixCache(BasePrefixCache):
             ret_list.append(cur_node)
             stack.extend(cur_node.children.values())
         return ret_list
+
+    def _ensure_hash_value(self, node: Optional[TreeNode]) -> None:
+        if node is None or node.hash_value is not None:
+            return
+        self._ensure_hash_value(node.parent)
+        node.hash_value = compute_node_hash_values(node, self.page_size)
+
+    def _record_store_event(self, node: TreeNode) -> None:
+        if not self.enable_kv_cache_events:
+            return
+
+        self._ensure_hash_value(node.parent)
+        self._ensure_hash_value(node)
+
+        parent_block_hash = None
+        if node.parent is not None and node.parent != self.root_node:
+            if node.parent.hash_value is not None and len(node.parent.hash_value) > 0:
+                parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
+
+        page_index = 0
+        for start in range(0, len(node.key), self.page_size):
+            page_tokens = node.key.token_ids[start : start + self.page_size]
+            if not page_tokens:
+                continue
+
+            block_hash = hash_str_to_int64(node.hash_value[page_index])
+            self.kv_event_queue.append(
+                BlockStored(
+                    block_hashes=[block_hash],
+                    parent_block_hash=parent_block_hash,
+                    token_ids=page_tokens,
+                    block_size=len(page_tokens),
+                    lora_id=None,
+                )
+            )
+
+            parent_block_hash = block_hash
+            page_index += 1
+
+    def _record_remove_event(self, node: TreeNode) -> None:
+        if not self.enable_kv_cache_events:
+            return
+
+        self._ensure_hash_value(node)
+
+        page_index = 0
+        for start in range(0, len(node.key), self.page_size):
+            page_tokens = node.key.token_ids[start : start + self.page_size]
+            if not page_tokens:
+                continue
+
+            block_hash = hash_str_to_int64(node.hash_value[page_index])
+            self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
+            page_index += 1
+
+    def _record_all_cleared_event(self) -> None:
+        if self.enable_kv_cache_events:
+            self.kv_event_queue.append(AllBlocksCleared())
+
+    def take_events(self):
+        if not self.enable_kv_cache_events:
+            return []
+        events = self.kv_event_queue
+        self.kv_event_queue = []
+        return events
 
     def _print_helper(self, node: TreeNode, indent: int) -> None:
         """Prints the radix tree in a human-readable format."""
