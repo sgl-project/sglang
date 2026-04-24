@@ -2,6 +2,18 @@
 
 This guide outlines the requirements for contributing to the SGLang Diffusion module (`sglang.multimodal_gen`).
 
+## Contributor Guides
+
+- [Support New Models](support_new_models.md): implementation guide for adding new diffusion pipelines
+- [CI Performance](ci_perf.md): update and regenerate perf baselines
+
+```{toctree}
+:maxdepth: 1
+
+support_new_models
+ci_perf
+```
+
 ## On AI-Assisted ("Vibe Coding") PRs
 
 Vibe-coded PRs are welcome — we judge code quality, not how it was produced. The bar is the same for all PRs:

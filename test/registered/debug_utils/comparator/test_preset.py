@@ -3,7 +3,7 @@ import pytest
 from sglang.srt.debug_utils.comparator.preset import PRESETS, expand_preset
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="default", nightly=True)
+register_cpu_ci(est_time=5, suite="stage-a-test-cpu", nightly=True)
 
 
 class TestExpandPreset:
@@ -42,3 +42,9 @@ class TestExpandPreset:
         """Unknown preset name raises ValueError."""
         with pytest.raises(ValueError, match="Unknown value for --preset"):
             expand_preset(["--preset", "nonexistent"], presets=PRESETS)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

@@ -20,6 +20,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
     is_dp_attention_enabled,
+    set_is_extend_in_batch,
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.utils import (
@@ -142,7 +143,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
-                self.self_check_during_idle()
+                self.on_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_prefill(self: Scheduler):
@@ -318,7 +319,7 @@ class SchedulerPPMixin:
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle and len(self.disagg_prefill_inflight_queue) == 0:
-                self.self_check_during_idle()
+                self.on_idle()
 
     @DynamicGradMode()
     def event_loop_pp_disagg_decode(self: Scheduler):
@@ -508,7 +509,7 @@ class SchedulerPPMixin:
                 queue_size += len(self.decode_offload_manager.ongoing_offload)
 
             if server_is_idle and queue_size == 0:
-                self.self_check_during_idle()
+                self.on_idle()
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = self.pp_size + self.server_args.pp_async_batch_depth
@@ -631,6 +632,8 @@ class SchedulerPPMixin:
                 model_worker_batch = batch.get_model_worker_batch()
 
                 forward_batch = ForwardBatch.init_new(model_worker_batch, model_runner)
+                set_is_extend_in_batch(batch.forward_mode.is_extend())
+
                 _ = model_runner.forward(
                     forward_batch=forward_batch, pp_proxy_tensors=pp_proxy
                 )
