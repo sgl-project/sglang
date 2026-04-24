@@ -1,0 +1,283 @@
+name: Build and Publish Multi-Arch Docker Images
+
+# Reusable workflow: builds CUDA 12 + CUDA 13 images for amd64 and arm64,
+# then creates multi-arch manifests with caller-specified tags.
+
+on:
+  workflow_call:
+    inputs:
+      docker_target:
+        description: "Dockerfile target stage (framework or runtime)"
+        required: true
+        type: string
+      sgl_version:
+        description: "Version string passed as SGL_VERSION build arg (empty to skip)"
+        required: false
+        type: string
+        default: ""
+      extra_build_args:
+        description: "Additional --build-arg flags appended to docker buildx build"
+        required: false
+        type: string
+        default: ""
+      checkout_ref:
+        description: "Git ref to checkout (empty for default)"
+        required: false
+        type: string
+        default: ""
+      tag_config:
+        description: 'JSON array of {"cuda":"cu129|cu130","tags":["tag1","tag2"]}. Tags support {version} substitution.'
+        required: true
+        type: string
+      use_environment:
+        description: "GitHub environment name (e.g. prod) or empty for none"
+        required: false
+        type: string
+        default: ""
+      image_repo:
+        description: "Docker Hub repo to push to (e.g. lmsysorg/sglang-staging for testing)"
+        required: false
+        type: string
+        default: "lmsysorg/sglang"
+
+jobs:
+  build-x86:
+    if: github.repository == 'sgl-project/sglang'
+    environment: ${{ inputs.use_environment || null }}
+    runs-on: x64-docker-build-node
+    outputs:
+      digest-cu129: ${{ steps.build-cu129.outputs.digest }}
+      digest-cu130: ${{ steps.build-cu130.outputs.digest }}
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          docker-images: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Prune Docker to reclaim disk space
+        run: |
+          docker buildx prune --filter "until=72h" -f
+          docker system prune -af --filter "until=72h"
+          docker volume prune -af
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push AMD64 image (CUDA 12)
+        id: build-cu129
+        run: |
+          VERSION_ARG=""
+          if [ -n "${{ inputs.sgl_version }}" ]; then
+            VERSION_ARG="--build-arg SGL_VERSION=${{ inputs.sgl_version }}"
+          fi
+
+          docker buildx build \
+            --target ${{ inputs.docker_target }} \
+            --platform linux/amd64 \
+            --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=12.9.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            ${VERSION_ARG} \
+            ${{ inputs.extra_build_args }} \
+            --metadata-file /tmp/metadata-cu129.json \
+            --no-cache \
+            .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129.json'))['containerimage.digest'])")
+          echo "Pushed digest: ${DIGEST}"
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Build and push AMD64 image (CUDA 13)
+        id: build-cu130
+        run: |
+          VERSION_ARG=""
+          if [ -n "${{ inputs.sgl_version }}" ]; then
+            VERSION_ARG="--build-arg SGL_VERSION=${{ inputs.sgl_version }}"
+          fi
+
+          docker buildx build \
+            --target ${{ inputs.docker_target }} \
+            --platform linux/amd64 \
+            --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=0 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            ${VERSION_ARG} \
+            ${{ inputs.extra_build_args }} \
+            --metadata-file /tmp/metadata-cu130.json \
+            --no-cache \
+            .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130.json'))['containerimage.digest'])")
+          echo "Pushed digest: ${DIGEST}"
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+  build-arm64:
+    if: github.repository == 'sgl-project/sglang'
+    environment: ${{ inputs.use_environment || null }}
+    runs-on: arm-docker-build-node
+    outputs:
+      digest-cu129: ${{ steps.build-cu129.outputs.digest }}
+      digest-cu130: ${{ steps.build-cu130.outputs.digest }}
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.checkout_ref || github.ref }}
+
+      - name: Prune Docker to reclaim disk space
+        run: |
+          docker buildx prune --filter "until=72h" -f
+          docker system prune -af --filter "until=72h"
+          docker volume prune -af
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push ARM64 image (CUDA 12)
+        id: build-cu129
+        run: |
+          VERSION_ARG=""
+          if [ -n "${{ inputs.sgl_version }}" ]; then
+            VERSION_ARG="--build-arg SGL_VERSION=${{ inputs.sgl_version }}"
+          fi
+
+          docker buildx build \
+            --target ${{ inputs.docker_target }} \
+            --platform linux/arm64 \
+            --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=12.9.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=1 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            ${VERSION_ARG} \
+            ${{ inputs.extra_build_args }} \
+            --metadata-file /tmp/metadata-cu129.json \
+            --no-cache \
+            .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu129.json'))['containerimage.digest'])")
+          echo "Pushed digest: ${DIGEST}"
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+      - name: Build and push ARM64 image (CUDA 13)
+        id: build-cu130
+        run: |
+          VERSION_ARG=""
+          if [ -n "${{ inputs.sgl_version }}" ]; then
+            VERSION_ARG="--build-arg SGL_VERSION=${{ inputs.sgl_version }}"
+          fi
+
+          docker buildx build \
+            --target ${{ inputs.docker_target }} \
+            --platform linux/arm64 \
+            --output type=image,name=${{ inputs.image_repo }},push-by-digest=true,name-canonical=true,push=true \
+            -f docker/Dockerfile \
+            --build-arg CUDA_VERSION=13.0.1 \
+            --build-arg BUILD_TYPE=all \
+            --build-arg GRACE_BLACKWELL=1 \
+            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
+            ${VERSION_ARG} \
+            ${{ inputs.extra_build_args }} \
+            --metadata-file /tmp/metadata-cu130.json \
+            --no-cache \
+            .
+
+          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata-cu130.json'))['containerimage.digest'])")
+          echo "Pushed digest: ${DIGEST}"
+          echo "digest=${DIGEST}" >> $GITHUB_OUTPUT
+
+  create-manifests:
+    runs-on: ubuntu-latest
+    needs: [build-x86, build-arm64]
+    if: github.repository == 'sgl-project/sglang'
+    environment: ${{ inputs.use_environment || null }}
+    steps:
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Create multi-arch manifests
+        env:
+          TAG_CONFIG: ${{ inputs.tag_config }}
+          SGL_VERSION: ${{ inputs.sgl_version }}
+          IMAGE_REPO: ${{ inputs.image_repo }}
+          X86_CU129: ${{ needs.build-x86.outputs.digest-cu129 }}
+          X86_CU130: ${{ needs.build-x86.outputs.digest-cu130 }}
+          ARM64_CU129: ${{ needs.build-arm64.outputs.digest-cu129 }}
+          ARM64_CU130: ${{ needs.build-arm64.outputs.digest-cu130 }}
+          SHORT_SHA: ${{ github.sha }}
+        run: |
+          echo "${TAG_CONFIG}" | jq -c '.[]' | while read -r entry; do
+            CUDA=$(echo "${entry}" | jq -r '.cuda')
+
+            if [ "${CUDA}" = "cu129" ]; then
+              X86_DIGEST="${X86_CU129}"
+              ARM64_DIGEST="${ARM64_CU129}"
+            else
+              X86_DIGEST="${X86_CU130}"
+              ARM64_DIGEST="${ARM64_CU130}"
+            fi
+
+            TAG_ARGS=""
+            for tag in $(echo "${entry}" | jq -r '.tags[]'); do
+              # Substitute template variables
+              tag=$(echo "${tag}" | sed "s/{version}/${SGL_VERSION}/g")
+              tag=$(echo "${tag}" | sed "s/{date}/$(date +%Y%m%d)/g")
+              tag=$(echo "${tag}" | sed "s/{short_sha}/${SHORT_SHA:0:8}/g")
+              TAG_ARGS="${TAG_ARGS} -t ${IMAGE_REPO}:${tag}"
+            done
+
+            docker buildx imagetools create \
+              ${TAG_ARGS} \
+              ${IMAGE_REPO}@${X86_DIGEST} \
+              ${IMAGE_REPO}@${ARM64_DIGEST}
+
+            echo "Published:${TAG_ARGS}"
+          done

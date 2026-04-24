@@ -6,9 +6,11 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
+    LTX2PipelineConfig,
     is_ltx23_native_variant,
     sync_ltx23_runtime_vae_markers,
 )
+from sglang.multimodal_gen.configs.sample.ltx_2 import LTX23HQSamplingParams
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
@@ -120,12 +122,18 @@ def build_official_ltx2_sigmas(
     stretch: bool = True,
     terminal: float = 0.1,
     default_number_of_tokens: int = MAX_SHIFT_ANCHOR,
+    number_of_tokens: int | None = None,
 ) -> list[float]:
     sigmas = torch.linspace(1.0, 0.0, steps + 1, dtype=torch.float32)
 
     mm = (max_shift - base_shift) / (MAX_SHIFT_ANCHOR - BASE_SHIFT_ANCHOR)
     b = base_shift - mm * BASE_SHIFT_ANCHOR
-    sigma_shift = float(default_number_of_tokens) * mm + b
+    tokens = (
+        int(number_of_tokens)
+        if number_of_tokens is not None
+        else int(default_number_of_tokens)
+    )
+    sigma_shift = float(tokens) * mm + b
 
     non_zero_mask = sigmas != 0
     shifted = torch.where(
@@ -136,8 +144,9 @@ def build_official_ltx2_sigmas(
 
     if stretch:
         one_minus_z = 1.0 - shifted[non_zero_mask]
-        scale_factor = one_minus_z[-1] / (1.0 - terminal)
-        shifted[non_zero_mask] = 1.0 - (one_minus_z / scale_factor)
+        if bool(torch.any(one_minus_z != 0)):
+            scale_factor = one_minus_z[-1] / (1.0 - terminal)
+            shifted[non_zero_mask] = 1.0 - (one_minus_z / scale_factor)
 
     return shifted[:-1].tolist()
 
@@ -148,7 +157,37 @@ class LTX2SigmaPreparationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         batch.extra["ltx2_phase"] = "stage1"
         if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
-            batch.sigmas = build_official_ltx2_sigmas(int(batch.num_inference_steps))
+            # Gate on pipeline class to mirror the three official entry points:
+            # - HQ (`ti2vid_two_stages_hq.py:164`) calls
+            #   `LTX2Scheduler.execute(latent=empty_latent, ...)` where
+            #   `empty_latent` is built from the **half-resolution** stage-1
+            #   shape → resolution-aware sigma shift.
+            # - Non-HQ two-stage (`ti2vid_two_stages.py:145`) and
+            #   one-stage (`ti2vid_one_stage.py:138`) call
+            #   `LTX2Scheduler.execute(steps=...)` with no `latent` →
+            #   falls back to `default_number_of_tokens = MAX_SHIFT_ANCHOR
+            #   = 4096` → constant-anchor sigma shift.
+            if server_args.pipeline_class_name == "LTX2TwoStageHQPipeline":
+                # batch.height/width have already been halved by
+                # LTX2HalveResolutionStage, so these latents are the
+                # half-resolution stage-1 shape (matches `empty_latent`).
+                latent_num_frames = (int(batch.num_frames) - 1) // int(
+                    server_args.pipeline_config.vae_temporal_compression
+                ) + 1
+                latent_height = int(batch.height) // int(
+                    server_args.pipeline_config.vae_scale_factor
+                )
+                latent_width = int(batch.width) // int(
+                    server_args.pipeline_config.vae_scale_factor
+                )
+                batch.sigmas = build_official_ltx2_sigmas(
+                    int(batch.num_inference_steps),
+                    number_of_tokens=latent_num_frames * latent_height * latent_width,
+                )
+            else:
+                batch.sigmas = build_official_ltx2_sigmas(
+                    int(batch.num_inference_steps)
+                )
         else:
             batch.sigmas = np.linspace(
                 1.0,
@@ -171,7 +210,11 @@ def _add_ltx2_front_stages(pipeline: ComposedPipelineBase):
     )
 
 
-def _add_ltx2_stage1_generation_stages(pipeline: ComposedPipelineBase):
+def _add_ltx2_stage1_generation_stages(
+    pipeline: ComposedPipelineBase,
+    *,
+    denoising_sampler_name: str = "euler",
+):
     pipeline.add_stage(LTX2SigmaPreparationStage())
     pipeline.add_standard_timestep_preparation_stage(
         prepare_extra_kwargs=[prepare_ltx2_mu]
@@ -191,6 +234,7 @@ def _add_ltx2_stage1_generation_stages(pipeline: ComposedPipelineBase):
                 scheduler=pipeline.get_module("scheduler"),
                 vae=pipeline.get_module("vae"),
                 audio_vae=pipeline.get_module("audio_vae"),
+                sampler_name=denoising_sampler_name,
                 pipeline=pipeline,
             ),
         ]
@@ -542,18 +586,25 @@ class LTX2TwoStageDeviceManager:
             module.to("cpu")
             return
 
+        pin_memory = bool(
+            self.server_args.pin_cpu_memory and torch.get_device_module().is_available()
+        )
         for name, param in module.named_parameters():
             snapshot = param_snapshots.get(name)
             if snapshot is None:
-                raise KeyError(
-                    f"Missing CPU parameter snapshot for {module_name}.{name}"
+                snapshot = self._clone_cpu_tensor_snapshot(
+                    param.data, pin_memory=pin_memory
                 )
+                param_snapshots[name] = snapshot
             param.data = snapshot
 
         for name, buffer in module.named_buffers():
             snapshot = buffer_snapshots.get(name)
             if snapshot is None:
-                raise KeyError(f"Missing CPU buffer snapshot for {module_name}.{name}")
+                snapshot = self._clone_cpu_tensor_snapshot(
+                    buffer.data, pin_memory=pin_memory
+                )
+                buffer_snapshots[name] = snapshot
             # Preserve runtime-updated buffers (e.g., lazily built caches) when
             # releasing back to CPU snapshots.
             if buffer.device.type == "cuda":
@@ -666,6 +717,10 @@ class LTX2TwoStageDeviceManager:
 class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
     pipeline_name = "LTX2TwoStagePipeline"
     STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
+    STAGE_1_DISTILLED_LORA_STRENGTH = 0.0
+    STAGE_2_DISTILLED_LORA_STRENGTH = 1.0
+    STAGE_1_DENOISING_SAMPLER_NAME = "euler"
+    STAGE_2_DENOISING_SAMPLER_NAME = "euler"
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -690,7 +745,7 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         upsampler_path = server_args.component_paths.get("spatial_upsampler")
         if not upsampler_path:
             raise ValueError(
-                "LTX2TwoStagePipeline requires --spatial-upsampler-path "
+                f"{self.pipeline_name} requires --spatial-upsampler-path "
                 "(component_paths['spatial_upsampler'])."
             )
         module, memory_usage = PipelineComponentLoader.load_component(
@@ -705,13 +760,14 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         distilled_lora_path = server_args.component_paths.get("distilled_lora")
         if not distilled_lora_path:
             raise ValueError(
-                "LTX2TwoStagePipeline requires --distilled-lora-path "
+                f"{self.pipeline_name} requires --distilled-lora-path "
                 "(component_paths['distilled_lora'])."
             )
         self._distilled_lora_path = distilled_lora_path
         self._stage1_lora_path = server_args.lora_path
         self._stage1_lora_scale = float(server_args.lora_scale)
         self._active_lora_phase = None
+        self._active_lora_signature = None
         self._use_premerged_stage2_transformer = False
 
     def _initialize_premerged_stage2_transformer(self, server_args: ServerArgs) -> None:
@@ -733,13 +789,17 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             lora_nickname="ltx2_stage2_distilled",
             lora_path=self._distilled_lora_path,
             target="transformer_2",
-            strength=1.0,
+            strength=self.STAGE_2_DISTILLED_LORA_STRENGTH,
             merge_weights=True,
         )
 
     def release_premerged_transformers_to_cpu_snapshots(self) -> None:
         """Release inactive premerged DiTs according to the selected device mode."""
         self._device_manager.release_premerged_transformers()
+
+    def release_ltx2_phase_state(self, phase: str | None) -> None:
+        if phase == "stage2":
+            self.release_premerged_transformers_to_cpu_snapshots()
 
     def ensure_ltx2_phase_ready(self, phase: str | None) -> None:
         self._device_manager.ensure_phase_ready(phase)
@@ -753,57 +813,121 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             "resident",
         )
 
-    def switch_lora_phase(self, phase: str) -> None:
-        if phase == self._active_lora_phase:
-            return
+    def _get_stage_distilled_lora_strength(
+        self, phase: str, batch: Req | None
+    ) -> float:
+        if phase == "stage1":
+            default_strength = self.STAGE_1_DISTILLED_LORA_STRENGTH
+            extra_key = "ltx2_distilled_lora_strength_stage_1"
+        elif phase == "stage2":
+            default_strength = self.STAGE_2_DISTILLED_LORA_STRENGTH
+            extra_key = "ltx2_distilled_lora_strength_stage_2"
+        else:
+            raise ValueError(f"Unknown LTX2 two-stage LoRA phase: {phase}")
 
-        if self._device_manager.switch_phase(phase):
-            self._active_lora_phase = phase
-            return
+        if batch is None:
+            return float(default_strength)
+
+        request_strength = batch.extra.get(extra_key)
+        if request_strength is None:
+            return float(default_strength)
+        return float(request_strength)
+
+    def _can_short_circuit_lora_switch(
+        self, phase: str, batch: Req | None = None
+    ) -> bool:
+        distilled_lora_strength = self._get_stage_distilled_lora_strength(phase, batch)
+        if phase == "stage1":
+            return (
+                self._use_premerged_stage2_transformer
+                and self._stage1_lora_path is None
+                and distilled_lora_strength == 0.0
+            )
+        if phase == "stage2":
+            return (
+                self._use_premerged_stage2_transformer
+                and self._stage1_lora_path is None
+                and distilled_lora_strength == self.STAGE_2_DISTILLED_LORA_STRENGTH
+            )
+        return False
+
+    def _build_lora_switch_spec(
+        self, phase: str, batch: Req | None = None
+    ) -> tuple[list[str], list[str], list[float], list[str]]:
+        distilled_lora_strength = self._get_stage_distilled_lora_strength(phase, batch)
+        lora_nicknames: list[str] = []
+        lora_paths: list[str] = []
+        lora_strengths: list[float] = []
+        lora_targets: list[str] = []
 
         if phase == "stage1":
-            if self._stage1_lora_path:
-                self.set_lora(
-                    lora_nickname="ltx2_stage1_base",
-                    lora_path=self._stage1_lora_path,
-                    target="transformer",
-                    strength=self._stage1_lora_scale,
-                )
-            else:
-                # Stage 1 must run on the base transformer weights. If stage 2 left the
-                # distilled adapter active, stage 1 quality drifts away from the official
-                # two-stage pipeline immediately.
-                self.deactivate_lora_weights(target="transformer")
-        elif phase == "stage2":
-            lora_nicknames = []
-            lora_paths = []
-            lora_strengths = []
-            lora_targets = []
             if self._stage1_lora_path:
                 lora_nicknames.append("ltx2_stage1_base")
                 lora_paths.append(self._stage1_lora_path)
                 lora_strengths.append(self._stage1_lora_scale)
                 lora_targets.append("transformer")
-            lora_nicknames.append("ltx2_stage2_distilled")
-            lora_paths.append(self._distilled_lora_path)
-            lora_strengths.append(1.0)
-            lora_targets.append("transformer")
-            self.set_lora(
+            if distilled_lora_strength != 0.0:
+                lora_nicknames.append("ltx2_stage1_distilled")
+                lora_paths.append(self._distilled_lora_path)
+                lora_strengths.append(distilled_lora_strength)
+                lora_targets.append("transformer")
+        elif phase == "stage2":
+            if self._stage1_lora_path:
+                lora_nicknames.append("ltx2_stage1_base")
+                lora_paths.append(self._stage1_lora_path)
+                lora_strengths.append(self._stage1_lora_scale)
+                lora_targets.append("transformer")
+            if distilled_lora_strength != 0.0:
+                lora_nicknames.append("ltx2_stage2_distilled")
+                lora_paths.append(self._distilled_lora_path)
+                lora_strengths.append(distilled_lora_strength)
+                lora_targets.append("transformer")
+        else:
+            raise ValueError(f"Unknown LTX2 two-stage LoRA phase: {phase}")
+
+        return lora_nicknames, lora_paths, lora_strengths, lora_targets
+
+    def switch_lora_phase(self, phase: str, batch: Req | None = None) -> None:
+        distilled_lora_strength = self._get_stage_distilled_lora_strength(phase, batch)
+        phase_signature = (phase, distilled_lora_strength)
+        if phase_signature == self._active_lora_signature:
+            return
+
+        if self._device_manager.switch_phase(
+            phase
+        ) and self._can_short_circuit_lora_switch(phase, batch):
+            self._active_lora_phase = phase
+            self._active_lora_signature = phase_signature
+            return
+
+        lora_nicknames, lora_paths, lora_strengths, lora_targets = (
+            self._build_lora_switch_spec(phase, batch)
+        )
+        if lora_nicknames:
+            set_lora_kwargs = dict(
                 lora_nickname=lora_nicknames,
                 lora_path=lora_paths,
                 target=lora_targets,
                 strength=lora_strengths,
+            )
+            if phase == "stage2":
                 # Official LTX-2.3 two-stage builds stage 2 with distilled LoRA fused
                 # into the transformer weights. Legacy LTX-2 should keep the
                 # preexisting unmerged behavior to avoid regressing stage 2 quality.
-                merge_weights=self._should_merge_stage2_distilled_lora(
-                    self.server_args
-                ),
+                set_lora_kwargs["merge_weights"] = (
+                    self._should_merge_stage2_distilled_lora(self.server_args)
+                )
+            self.set_lora(
+                **set_lora_kwargs,
             )
         else:
-            raise ValueError(f"Unknown LTX2 two-stage LoRA phase: {phase}")
+            # Stage 1 must run on the base transformer weights. If stage 2 left the
+            # distilled adapter active, stage 1 quality drifts away from the official
+            # two-stage pipeline immediately.
+            self.deactivate_lora_weights(target="transformer")
 
         self._active_lora_phase = phase
+        self._active_lora_signature = phase_signature
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         _add_ltx2_front_stages(self)
@@ -811,7 +935,10 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
         self.add_stage(
             LTX2LoRASwitchStage(pipeline=self, phase="stage1"),
         )
-        _add_ltx2_stage1_generation_stages(self)
+        _add_ltx2_stage1_generation_stages(
+            self,
+            denoising_sampler_name=self.STAGE_1_DENOISING_SAMPLER_NAME,
+        )
         self.add_stages(
             [
                 LTX2UpsampleStage(
@@ -837,10 +964,21 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                     vae=self.get_module("vae"),
                     audio_vae=self.get_module("audio_vae"),
                     pipeline=self,
+                    sampler_name=self.STAGE_2_DENOISING_SAMPLER_NAME,
                 ),
             ]
         )
         _add_ltx2_decoding_stage(self)
 
 
-EntryClass = [LTX2Pipeline, LTX2TwoStagePipeline]
+class LTX2TwoStageHQPipeline(LTX2TwoStagePipeline):
+    pipeline_name = "LTX2TwoStageHQPipeline"
+    pipeline_config_cls = LTX2PipelineConfig
+    sampling_params_cls = LTX23HQSamplingParams
+    STAGE_1_DISTILLED_LORA_STRENGTH = 0.25
+    STAGE_2_DISTILLED_LORA_STRENGTH = 0.5
+    STAGE_1_DENOISING_SAMPLER_NAME = "res2s"
+    STAGE_2_DENOISING_SAMPLER_NAME = "res2s"
+
+
+EntryClass = [LTX2Pipeline, LTX2TwoStagePipeline, LTX2TwoStageHQPipeline]

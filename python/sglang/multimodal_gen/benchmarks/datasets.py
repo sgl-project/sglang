@@ -1,6 +1,7 @@
 import glob
 import json
 import os
+import random
 import re
 import subprocess
 import uuid
@@ -286,16 +287,39 @@ class RandomDataset(BaseDataset):
         super().__init__(args, api_url, model)
         self.num_prompts = args.num_prompts or 100
 
+        self.random_request_config = args.random_request_config
+        if self.random_request_config:
+            self.random_request_config = json.loads(self.random_request_config)
+            weights = [p.pop("weight") for p in self.random_request_config]
+            seed = args.random_request_seed
+            rng = random.Random(seed)
+            self._sampled_requests = rng.choices(
+                self.random_request_config, weights=weights, k=self.num_prompts
+            )
+        else:
+            self._sampled_requests = None
+
+    def get_sampling_params(self, idx: int) -> dict:
+        """Return the per-request sampling profile dict, or empty dict if not mix-diffusion."""
+        if self._sampled_requests:
+            return self._sampled_requests[idx]
+        return {}
+
     def __len__(self) -> int:
         return self.num_prompts
 
     def __getitem__(self, idx: int) -> RequestFuncInput:
+        profile = self._sampled_requests[idx] if self._sampled_requests else {}
+
         return RequestFuncInput(
             prompt=f"Random prompt {idx} for benchmarking diffusion models",
             api_url=self.api_url,
             model=self.model,
-            width=self.args.width,
-            height=self.args.height,
-            num_frames=self.args.num_frames,
-            fps=self.args.fps,
+            width=profile.get("width", self.args.width),
+            height=profile.get("height", self.args.height),
+            num_frames=profile.get("num_frames", self.args.num_frames),
+            num_inference_steps=profile.get(
+                "num_inference_steps", self.args.num_inference_steps
+            ),
+            fps=profile.get("fps", self.args.fps),
         )

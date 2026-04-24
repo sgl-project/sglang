@@ -36,6 +36,9 @@ from sglang.multimodal_gen.utils import get_mixed_precision_state
 torch._dynamo.config.recompile_limit = 64
 
 
+LORA_MERGE_CHUNK_BYTES = 32 * 1024 * 1024
+
+
 class BaseLayerWithLoRA(nn.Module):
 
     def __init__(
@@ -176,16 +179,48 @@ class BaseLayerWithLoRA(nn.Module):
         """
         # Merge all LoRA adapters in order
         for lora_A, lora_B, _, lora_strength in lora_list:
-            lora_delta = self.slice_lora_b_weights(
-                lora_B.to(data)
-            ) @ self.slice_lora_a_weights(lora_A.to(data))
-            # Apply lora_alpha / lora_rank scaling for consistency with forward()
-            if self.lora_alpha is not None and self.lora_rank is not None:
-                if self.lora_alpha != self.lora_rank:
-                    lora_delta = lora_delta * (self.lora_alpha / self.lora_rank)
-            if lora_delta.dim() > 2:
-                lora_delta = lora_delta.reshape(-1, lora_delta.shape[-1])
-            data += lora_strength * lora_delta
+            lora_A_sliced = self.slice_lora_a_weights(lora_A.to(data))
+            lora_B_sliced = self.slice_lora_b_weights(lora_B.to(data))
+
+            scale = lora_strength
+            if (
+                self.lora_alpha is not None
+                and self.lora_rank is not None
+                and self.lora_alpha != self.lora_rank
+            ):
+                scale *= self.lora_alpha / self.lora_rank
+
+            if not isinstance(lora_B_sliced, torch.Tensor):
+                lora_delta = lora_B_sliced @ lora_A_sliced
+                if isinstance(lora_delta, torch.Tensor) and lora_delta.dim() > 2:
+                    lora_delta = lora_delta.reshape(-1, lora_delta.shape[-1])
+                data.add_(lora_delta, alpha=scale)
+                continue
+
+            if lora_A_sliced.dim() > 2 or lora_B_sliced.dim() > 2:
+                lora_delta = lora_B_sliced @ lora_A_sliced
+                if lora_delta.dim() > 2:
+                    lora_delta = lora_delta.reshape(-1, lora_delta.shape[-1])
+                data_2d = data.reshape(-1, data.shape[-1]) if data.dim() > 2 else data
+                data_2d.add_(lora_delta, alpha=scale)
+                continue
+
+            data_2d = data.reshape(-1, data.shape[-1]) if data.dim() > 2 else data
+            lora_B_2d = (
+                lora_B_sliced.reshape(-1, lora_B_sliced.shape[-1])
+                if lora_B_sliced.dim() > 2
+                else lora_B_sliced
+            )
+
+            chunk_rows = max(
+                1,
+                LORA_MERGE_CHUNK_BYTES
+                // (data_2d.shape[-1] * max(1, data_2d.element_size())),
+            )
+            for start in range(0, lora_B_2d.shape[0], chunk_rows):
+                end = min(start + chunk_rows, lora_B_2d.shape[0])
+                chunk_delta = lora_B_2d[start:end] @ lora_A_sliced
+                data_2d[start:end].add_(chunk_delta, alpha=scale)
 
     @torch.no_grad()
     def merge_lora_weights(self, strength: float | None = None) -> None:

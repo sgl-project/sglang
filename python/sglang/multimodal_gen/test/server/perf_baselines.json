@@ -664,28 +664,27 @@
         },
         "zimage_image_t2i_2_gpus": {
             "stages_ms": {
-                "TimestepPreparationStage": 35.17,
-                "DecodingStage": 9.73,
-                "TextEncodingStage": 307.62,
-                "LatentPreparationStage": 0.13,
                 "InputValidationStage": 0.05,
-                "DenoisingStage": 525.42
+                "TextEncodingStage": 309.68,
+                "LatentPreparationStage": 0.14,
+                "TimestepPreparationStage": 37.19,
+                "DenoisingStage": 525.39,
+                "DecodingStage": 10.18
             },
             "denoise_step_ms": {
-                "0": 19.97,
-                "1": 32.53,
-                "2": 62.6,
-                "3": 62.67,
-                "4": 63.03,
-                "5": 62.83,
-                "6": 62.73,
-                "7": 63.16,
-                "8": 62.63
+                "0": 40.09,
+                "1": 38.17,
+                "2": 54.71,
+                "3": 64.29,
+                "4": 65.0,
+                "5": 65.56,
+                "6": 64.61,
+                "7": 64.76,
+                "8": 64.35
             },
-            "expected_e2e_ms": 957.78,
-            "expected_avg_denoise_ms": 57.99,
-            "expected_median_denoise_ms": 64.64,
-            "estimated_full_test_time_s": 121.0
+            "expected_e2e_ms": 961.86,
+            "expected_avg_denoise_ms": 57.95,
+            "expected_median_denoise_ms": 64.35
         },
         "qwen_image_edit_ti2i": {
             "stages_ms": {
@@ -2630,6 +2629,48 @@
             "expected_avg_denoise_ms": 890.17,
             "expected_median_denoise_ms": 896.09,
             "estimated_full_test_time_s": 155.3
+        },
+        "ltx_2_3_hq_pipeline": {
+            "stages_ms": {
+                "InputValidationStage": 0.09,
+                "TextEncodingStage": 987.02,
+                "LTX2TextConnectorStage": 31.22,
+                "LTX2HalveResolutionStage": 0.12,
+                "LTX2LoRASwitchStage": 0.03,
+                "LTX2SigmaPreparationStage": 0.56,
+                "TimestepPreparationStage": 24.77,
+                "LTX2AVLatentPreparationStage": 0.33,
+                "LTX2ImageEncodingStage": 0.04,
+                "LTX2AVDenoisingStage": 25873.2,
+                "LTX2UpsampleStage": 216.72,
+                "LTX2RefinementStage": 2553.3,
+                "LTX2AVDecodingStage": 585.0,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 1512.13,
+                "1": 1506.38,
+                "2": 1523.98,
+                "3": 1533.71,
+                "4": 1569.51,
+                "5": 1546.87,
+                "6": 1545.47,
+                "7": 1528.27,
+                "8": 1550.64,
+                "9": 1548.24,
+                "10": 1531.65,
+                "11": 2211.84,
+                "12": 2306.24,
+                "13": 2270.41,
+                "14": 1143.7,
+                "15": 839.75,
+                "16": 808.41,
+                "17": 806.56
+            },
+            "expected_e2e_ms": 30848.37,
+            "expected_avg_denoise_ms": 1515.76,
+            "expected_median_denoise_ms": 1532.68,
+            "estimated_full_test_time_s": 363.2
         }
     }
 }
