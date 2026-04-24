@@ -100,6 +100,7 @@ fi
 
 # ---- Configurable parameters --------------------------------
 MODEL_PATH="${MODEL_PATH:-/nfs/DeepSeek-V3}"
+USE_DUMMY_WEIGHTS="${USE_DUMMY_WEIGHTS:-false}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-8}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
@@ -567,6 +568,9 @@ launch_pd_server() {
 
     # Append any extra args forwarded from EXTRA_SERVER_ARGS env (safe under
     # `set -u` even when the array is empty).
+    if bool_is_true "$USE_DUMMY_WEIGHTS"; then
+        cmd+=(--load-format dummy)
+    fi
     cmd+=(${EXTRA_SERVER_ARGS_ARR[@]+"${EXTRA_SERVER_ARGS_ARR[@]}"})
 
     "${cmd[@]}"
