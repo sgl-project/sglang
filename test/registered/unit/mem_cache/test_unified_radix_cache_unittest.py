@@ -632,7 +632,7 @@ class UnifiedRadixCacheSuite:
             self.skipTest("page_size > 1 only")
         tree, _, _ = build_fixture(self.cfg)
         key = RadixKey(self._make_seq(1, 1))
-        child_key = tree.get_child_key_fn(key)
+        child_key = key.child_key(tree.page_size)
         self.assertIsInstance(child_key, tuple)
 
     def test_paged_match_truncates_unaligned_key(self):

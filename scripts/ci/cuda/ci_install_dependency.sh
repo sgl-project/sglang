@@ -314,10 +314,17 @@ if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" = "true" ] && [ -d "sgl-kernel/dist" ]; then
     else
         WHEEL_ARCH="x86_64"
     fi
-    # Wheel may have +cuXYZ suffix (e.g. sglang_kernel-0.4.0+cu130-...) depending on CUDA version
-    KERNEL_WHL=$(ls sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}*-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1)
+    # Wheel filenames carry a +cuXYZ local version tag (e.g. sglang_kernel-0.4.0+cu130-...).
+    # Pick the one matching the test runner's $CU_VERSION; any other tag (or an untagged
+    # wheel of unknown CUDA origin) would at best hit the PyPI-reinstall branch below and
+    # silently replace the PR-built wheel with the public main-branch wheel, and at worst
+    # ABI-crash at cuInit. Better to fail loudly — the error message + dist/ listing below
+    # makes the diagnosis obvious.
+    # `|| true` swallows `ls`'s exit-2-on-no-match so `set -o pipefail` doesn't abort the
+    # script before we reach the explicit error check.
+    KERNEL_WHL=$(ls sgl-kernel/dist/sglang_kernel-${SGL_KERNEL_VERSION_FROM_KERNEL}+${CU_VERSION}-cp310-abi3-manylinux2014_${WHEEL_ARCH}.whl 2>/dev/null | head -1 || true)
     if [ -z "$KERNEL_WHL" ]; then
-        echo "ERROR: No matching sgl-kernel wheel found in sgl-kernel/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH}"
+        echo "ERROR: No matching sgl-kernel wheel found in sgl-kernel/dist/ for version ${SGL_KERNEL_VERSION_FROM_KERNEL} arch ${WHEEL_ARCH} cuda ${CU_VERSION}"
         ls -alh sgl-kernel/dist/
         exit 1
     fi
@@ -457,10 +464,10 @@ fi
 # parse the first two digits of CU_VERSION (pytorch convention is cu{major}{minor}
 # with a single-digit minor, e.g. cu126, cu129, cu130).
 if [ "$CU_MAJOR" = "13" ]; then
-    MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post1"
+    MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post2"
     EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
 else
-    MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post1"
+    MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post2"
     EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
 fi
 $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX

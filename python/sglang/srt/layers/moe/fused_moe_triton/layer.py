@@ -213,8 +213,6 @@ class FusedMoE(torch.nn.Module):
         self.num_local_experts = self._num_local_routed + num_fused_shared_experts
         self._has_fused_shared = num_fused_shared_experts > 0
 
-        self.expert_mask_gpu = None
-
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
         self.reduce_results = reduce_results
@@ -1009,16 +1007,6 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
-
-        if _use_aiter and self.dispatcher.local_expert_mapping is not None:
-            self.expert_mask_gpu = (
-                (
-                    (self.dispatcher.local_expert_mapping >= 0)
-                    & (self.dispatcher.local_expert_mapping < self.num_local_experts)
-                )
-                .to(torch.int32)
-                .to(device="cuda")
-            )
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,

@@ -548,7 +548,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self._discard_from_leaf_sets(node)
 
         parent = node.parent
-        key = self.get_child_key_fn(node.key)
+        key = node.key.child_key(self.page_size)
         v = parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
@@ -584,7 +584,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self._discard_from_leaf_sets(node)
         parent = node.parent
-        key = self.get_child_key_fn(node.key)
+        key = node.key.child_key(self.page_size)
         v = parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
@@ -598,7 +598,7 @@ class HiMambaRadixCache(MambaRadixCache):
         assert node.mamba_host_value is None, f"has mamba host value, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         parent = node.parent
-        key = self.get_child_key_fn(node.key)
+        key = node.key.child_key(self.page_size)
         v = parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
@@ -824,7 +824,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if len(key) == 0:
             return 0, True
 
-        child_key = self.get_child_key_fn(key)
+        child_key = key.child_key(self.page_size)
 
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
@@ -836,7 +836,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
 
-            prefix_len = self.key_match_fn(node.key, key)
+            prefix_len = node.key.match(key, page_size=self.page_size)
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -855,7 +855,7 @@ class HiMambaRadixCache(MambaRadixCache):
             value = value[prefix_len:]
 
             if len(key):
-                child_key = self.get_child_key_fn(key)
+                child_key = key.child_key(self.page_size)
 
         mamba_value_exist = False
         if len(key):
@@ -884,7 +884,7 @@ class HiMambaRadixCache(MambaRadixCache):
         value: torch.Tensor,
         mamba_value: torch.Tensor,
     ) -> TreeNode:
-        child_key = self.get_child_key_fn(key)
+        child_key = key.child_key(self.page_size)
         new_node = TreeNode()
         new_node.parent = parent
         new_node.key = key
@@ -924,7 +924,7 @@ class HiMambaRadixCache(MambaRadixCache):
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:
         """Walk tree to find best_last_node (mamba boundary)."""
         node = self.root_node
-        child_key = self.get_child_key_fn(key)
+        child_key = key.child_key(self.page_size)
 
         value: List[torch.Tensor] = []
         best_value_len = 0
@@ -940,7 +940,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 best_value_len = len(value)
                 best_last_node = node
 
-            prefix_len = self.key_match_fn(child.key, key)
+            prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:
@@ -953,7 +953,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 node = child
                 key = key[prefix_len:]
                 if len(key):
-                    child_key = self.get_child_key_fn(key)
+                    child_key = key.child_key(self.page_size)
 
         if node.mamba_value is not None or node.mamba_backuped:
             best_value_len = len(value)
@@ -1074,7 +1074,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self.evictable_full_host_leaves.discard(child)
 
         new_node = TreeNode()
-        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
+        new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.value = None
         new_node.mamba_value = None
@@ -1095,7 +1095,7 @@ class HiMambaRadixCache(MambaRadixCache):
             self.mamba_lru_list.remove_node(child)
         child.parent = new_node
         child.key = child.key[split_len:]
-        new_node.parent.children[self.get_child_key_fn(key)] = new_node
+        new_node.parent.children[key.child_key(self.page_size)] = new_node
         if child.mamba_value is not None:
             self.mamba_lru_list.insert_mru(child)
 
@@ -1836,7 +1836,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if len(key) == 0:
             return 0
 
-        child_key = self.get_child_key_fn(key)
+        child_key = key.child_key(self.page_size)
 
         matched_length = 0
         while len(key) > 0 and child_key in node.children.keys():
@@ -1844,7 +1844,7 @@ class HiMambaRadixCache(MambaRadixCache):
             node.last_access_time = get_last_access_time()
             if node != self.root_node and node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
-            prefix_len = self.key_match_fn(node.key, key)
+            prefix_len = node.key.match(key, page_size=self.page_size)
 
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
@@ -1856,7 +1856,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 node = new_node
 
             if len(key):
-                child_key = self.get_child_key_fn(key)
+                child_key = key.child_key(self.page_size)
 
         leaf_node: Optional[TreeNode] = None
         if len(key):

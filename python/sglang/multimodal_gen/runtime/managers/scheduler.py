@@ -31,6 +31,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ShutdownReq,
     UnmergeLoraWeightsReq,
 )
+from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -42,10 +43,18 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 
 logger = init_logger(__name__)
 
 MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
+
+# Placeholder negative_prompt used in synthesized warmup Reqs when
+# --enable-cfg-parallel is on. A non-empty, real word (vs "" or " ") so
+# every tokenizer backend emits a predictable, non-degenerate token
+# sequence — rank 1's uncond branch then produces a valid tensor for
+# _combine_cfg_parallel's all-reduce.
+DEFAULT_PLACEHOLDER_PROMPT = "warmup"
 
 
 class Scheduler(SchedulerDisaggMixin):
@@ -86,8 +95,10 @@ class Scheduler(SchedulerDisaggMixin):
             logger.info(f"Scheduler bind at endpoint: {actual_endpoint}")
         else:
             self.receiver = None
+        from sglang.multimodal_gen.runtime.platforms import current_platform
 
-        worker = GPUWorker(
+        Exec_worker = CPUWorker if current_platform.is_cpu() else GPUWorker
+        worker = Exec_worker(
             local_rank=local_rank,
             master_port=port_args.master_port,
             rank=gpu_id,
@@ -195,7 +206,16 @@ class Scheduler(SchedulerDisaggMixin):
             else:
                 logger.info("Processing warmup req...")
 
-        return self.worker.execute_forward(reqs)
+        # Diffusion dispatches one generation request at a time, so reqs[0]
+        # always carries the trace context for the entire batch.
+        req = reqs[0]
+        req.trace_ctx.rebuild_thread_context()
+        with trace_slice(
+            req.trace_ctx,
+            DiffStage.SCHEDULER_DISPATCH,
+            thread_finish_flag=True,
+        ):
+            return self.worker.execute_forward(reqs)
 
     def return_result(
         self,
@@ -238,22 +258,25 @@ class Scheduler(SchedulerDisaggMixin):
             for resolution in self.server_args.warmup_resolutions:
                 width, height = _parse_size(resolution)
 
+                # CFG-parallel splits cond/uncond across ranks, so rank 1
+                # needs a real uncond pass. Force do_classifier_free_guidance
+                # + non-empty negative_prompt when cfg-parallel is on, so the
+                # synthesized warmup Req exercises both ranks' denoising paths.
+                # When cfg-parallel is off, the Req construction is
+                # byte-identical to the pre-fix behavior.
+                req_kwargs = dict(
+                    data_type=task_type.data_type(),
+                    width=width,
+                    height=height,
+                    prompt="",
+                )
                 if requires_warmup_image:
-                    req = Req(
-                        data_type=task_type.data_type(),
-                        width=width,
-                        height=height,
-                        prompt="",
-                        negative_prompt="",
-                        image_path=[warmup_input_path],
-                    )
-                else:
-                    req = Req(
-                        data_type=task_type.data_type(),
-                        width=width,
-                        height=height,
-                        prompt="",
-                    )
+                    req_kwargs["negative_prompt"] = ""
+                    req_kwargs["image_path"] = [warmup_input_path]
+                if self.server_args.enable_cfg_parallel:
+                    req_kwargs["negative_prompt"] = DEFAULT_PLACEHOLDER_PROMPT
+                    req_kwargs["do_classifier_free_guidance"] = True
+                req = Req(**req_kwargs)
                 req.set_as_warmup(self.server_args.warmup_steps)
                 self.waiting_queue.append((None, req))
             # if server is warmed-up, set this flag to avoid req-based warmup

@@ -19,8 +19,8 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.7.post3
-ARG MOONCAKE_VERSION=0.3.9
+ARG FLASHINFER_VERSION=0.6.8.post1
+ARG MOONCAKE_VERSION=0.3.10.post2
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -502,17 +502,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 RUN --mount=type=cache,target=/root/.cache/pip \
     CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
     if [ "$CUDA_MAJOR" -ge 13 ]; then \
-        echo "CUDA >= 13, installing mooncake-transfer-engine from source code"; \
-        git clone --branch v${MOONCAKE_VERSION} --depth 1 https://github.com/kvcache-ai/Mooncake.git && \
-        cd Mooncake && \
-        bash dependencies.sh && \
-        mkdir -p build && \
-        cd build && \
-        cmake .. ${MOONCAKE_COMPILE_ARG} && \
-        make -j$(nproc) && \
-        make install; \
+        python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
     else \
-        echo "CUDA < 13, installing mooncake-transfer-engine from pip"; \
         python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
     fi
 

@@ -73,7 +73,7 @@ logger = init_logger(__name__)
 # GPUs on the faster no-offload default while preserving some headroom.
 WAN_LAYERWISE_OFFLOAD_AUTO_DISABLE_MEM_GB = 130
 LTX2_TWO_STAGE_DEVICE_MODES = ("original", "snapshot", "resident")
-LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline",)
+LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 
@@ -282,6 +282,10 @@ class ServerArgs(DisaggArgsMixin):
     log_level: str = "info"
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
 
+    # Tracing
+    enable_trace: bool = False
+    otlp_traces_endpoint: str = "localhost:4317"
+
     # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
     @property
@@ -318,7 +322,8 @@ class ServerArgs(DisaggArgsMixin):
         """check consistency and raise errors for invalid configs"""
         self._validate_pipeline()
         self._validate_offload()
-        self._validate_parallelism()
+        if not current_platform.is_cpu():
+            self._validate_parallelism()
         self._validate_cfg_parallel()
 
     def _adjust_save_paths(self):
@@ -365,6 +370,10 @@ class ServerArgs(DisaggArgsMixin):
             )
 
     def _adjust_offload(self):
+        if current_platform.is_cpu():
+            # CPU platform does not need offload
+            return
+
         # TODO: to be handled by each platform
         if current_platform.get_device_total_memory() / BYTES_PER_GB < 30:
             logger.info("Enabling all offloading for GPU with low device memory")
@@ -548,6 +557,10 @@ class ServerArgs(DisaggArgsMixin):
         ulysses_unspecified = self.ulysses_degree is None
         ring_unspecified = self.ring_degree is None
         cfg_unspecified = self.enable_cfg_parallel is None
+
+        if current_platform.is_cpu() and self.tp_size > 1:
+            # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
+            self.num_gpus = self.tp_size
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
@@ -1085,6 +1098,20 @@ class ServerArgs(DisaggArgsMixin):
             type=str,
             default=ServerArgs.log_level,
             help="The logging level of all loggers.",
+        )
+
+        # Tracing
+        parser.add_argument(
+            "--enable-trace",
+            action="store_true",
+            default=False,
+            help="Enable OpenTelemetry tracing.",
+        )
+        parser.add_argument(
+            "--otlp-traces-endpoint",
+            type=str,
+            default=ServerArgs.otlp_traces_endpoint,
+            help="OTLP collector endpoint when --enable-trace is set. Format: <host>:<port>",
         )
         parser.add_argument(
             "--uvicorn-access-log-exclude-prefixes",
