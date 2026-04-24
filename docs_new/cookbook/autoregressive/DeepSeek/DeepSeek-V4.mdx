@@ -74,6 +74,34 @@ import { DeepSeekV4Deployment } from "/src/snippets/autoregressive/deepseek-v4-d
 - PD-disagg TP sizing (per role) is smaller than non-PD: B200 Flash PD = TP=2 per role; otherwise same as non-PD.
 - H200 Pro is multi-node: run the same command on each of the 2 nodes with `<node-rank>` set to `0` on the head node, `1` on the second; `<node0-ip>` is the head node's IP (reachable from both). The generator emits these as placeholders.
 
+**Concurrency & DeepEP dispatch buffer**
+
+Three knobs are coupled and must satisfy one invariant:
+
+- `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` — DeepEP per-rank dispatch-buffer capacity (tokens). Too small → `deep_ep.cpp:1105` assertion fires. Too big → wasted NVSHMEM symm-alloc VRAM.
+- `--cuda-graph-max-bs` — largest batch size CUDA graphs get captured for. Caps the CG replay pool; batches above this fall back to non-CG.
+- `--max-running-requests` — scheduler ceiling on concurrent in-flight requests.
+
+**Invariant (must hold):**
+
+```
+max-running-requests × MTP_draft_tokens  ≤  SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+```
+
+where `MTP_draft_tokens` = `--speculative-num-draft-tokens` (4 for low-latency, 2 for balanced, 1 for max-throughput / recipes without MTP). Violating the invariant blows the DeepEP dispatch buffer at steady-state load.
+
+Typical configurations (all picked by the generator automatically):
+
+| Recipe           | MTP draft | env (dispatch cap) | cg-max-bs | max-running-reqs |
+| ---------------- | --------: | -----------------: | --------: | ---------------: |
+| low-latency (H200 Pro)   | 4 | 128  | 32  | 64   |
+| balanced (H200)  |         2 | 256                | 128       | 128              |
+| balanced (Blackwell Flash) | 2 | 1024            | sglang default | sglang default |
+| max-throughput (H200)    | 1 | 256  | 128 | 256  |
+| max-throughput (Blackwell Flash) | 1 | 1024    | sglang default | sglang default |
+
+If you tune these yourself, move all three together — changing one without the others is how you hit either the `deep_ep.cpp:1105` crash (too-small env) or OOM during CG capture (too-large env).
+
 **MTP (Multi-Token Prediction, EAGLE)**
 
 - `low-latency`: steps=3, draft-tokens=4 → largest win at bs=1.
