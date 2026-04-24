@@ -29,7 +29,13 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
 from sglang.srt.lora.backend.lora_registry import get_backend_from_name
-from sglang.srt.lora.layers import BaseLayerWithLoRA, FusedMoEWithLoRA, get_lora_layer
+from sglang.srt.lora.layers import (
+    BaseLayerWithLoRA,
+    FusedMoEWithLoRA,
+    GatedQKVParallelLinearWithLoRA,
+    LinearAttnInProjQKVZWithLoRA,
+    get_lora_layer,
+)
 from sglang.srt.lora.lora import LoRAAdapter
 from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
@@ -690,8 +696,6 @@ class LoRAManager:
     def set_lora_module(self, module_name, module):
         """Wrap any module (standard or MoE) with LoRA support."""
         if module_name.endswith("linear_attn.in_proj_qkvz"):
-            from sglang.srt.lora.layers import LinearAttnInProjQKVZWithLoRA
-
             lora_module = LinearAttnInProjQKVZWithLoRA(module, self.lora_backend)
         elif module_name.endswith("self_attn.qkv_proj") and (
             getattr(self.base_hf_config, "attn_output_gate", False)
@@ -701,8 +705,6 @@ class LoRAManager:
                 False,
             )
         ):
-            from sglang.srt.lora.layers import GatedQKVParallelLinearWithLoRA
-
             lora_module = GatedQKVParallelLinearWithLoRA(module, self.lora_backend)
         else:
             lora_module = get_lora_layer(module, self.lora_backend)

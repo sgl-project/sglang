@@ -24,6 +24,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.torch_backend import (
+    TorchNativeLoRABackend,
+    TorchNativeLoRABatchInfo,
+)
 from sglang.srt.lora.utils import LoRABatchInfo, get_lm_head_lora_b_shard_size
 
 
@@ -616,8 +620,6 @@ class GatedQKVParallelLinearWithLoRA(QKVParallelLinearWithLoRA):
         lora_backend: BaseLoRABackend,
     ) -> None:
         super().__init__(base_layer, lora_backend)
-        from sglang.srt.lora.backend.torch_backend import TorchNativeLoRABackend
-
         self.fallback_backend = TorchNativeLoRABackend(
             lora_backend.max_loras_per_batch,
             next(base_layer.parameters()).device,
@@ -644,8 +646,6 @@ class GatedQKVParallelLinearWithLoRA(QKVParallelLinearWithLoRA):
         converted batch info on the shared ``lora_backend`` so all GatedQKV
         layers in the same batch reuse the same CPU copies.
         """
-        from sglang.srt.lora.backend.torch_backend import TorchNativeLoRABatchInfo
-
         batch_info = self.lora_backend.batch_info
         if isinstance(batch_info, TorchNativeLoRABatchInfo):
             return batch_info
