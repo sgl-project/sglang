@@ -333,8 +333,7 @@ def _pack_topk_for_flashinfer_routed(
     packed_ids = topk_ids.to(torch.int32)
     packed_weights = topk_weights.to(torch.bfloat16)
     packed = (packed_ids << 16) | packed_weights.view(torch.int16).to(torch.int32)
-    # SGLang can mark padded tokens with -1 expert ids.
-    return packed.masked_fill_(packed_ids < 0, 0)
+    return packed
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp8(
