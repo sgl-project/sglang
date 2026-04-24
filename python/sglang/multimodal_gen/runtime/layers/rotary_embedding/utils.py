@@ -97,7 +97,7 @@ def apply_flashinfer_rope_qk_inplace(
     if flashinfer_apply_rope_inplace is None:
         # Triton fallback for AMD/ROCm where FlashInfer is not available
 
-        _maybe_warn_about_missing_flashinfer()
+        _warn_about_missing_flashinfer()
 
         half_size = cos_sin_cache.shape[-1] // 2
         if positions is None:
@@ -144,7 +144,11 @@ def apply_flashinfer_rope_qk_inplace(
 
 
 @torch.compiler.assume_constant_result
-def _maybe_warn_about_missing_flashinfer():
+def _warn_about_missing_flashinfer():
+    """
+    Function to warn about the missing FlashInfer.
+    Exists to not cause a graph break during the compilation.
+    """
     logger.info_once(
         "FlashInfer not available, using Triton fallback for RoPE",
     )
