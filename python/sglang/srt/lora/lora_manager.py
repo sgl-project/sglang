@@ -705,7 +705,23 @@ class LoRAManager:
 
     def set_lora_module(self, module_name, module):
         """Wrap any module (standard or MoE) with LoRA support."""
-        lora_module = get_lora_layer(module, self.lora_backend)
+        if module_name.endswith("linear_attn.in_proj_qkvz"):
+            from sglang.srt.lora.layers import LinearAttnInProjQKVZWithLoRA
+
+            lora_module = LinearAttnInProjQKVZWithLoRA(module, self.lora_backend)
+        elif module_name.endswith("self_attn.qkv_proj") and (
+            getattr(self.base_hf_config, "model_type", "")
+            in {"qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
+            or getattr(
+                getattr(self.base_hf_config, "text_config", None), "model_type", ""
+            )
+            in {"qwen3_5_text", "qwen3_5_moe_text"}
+        ):
+            from sglang.srt.lora.layers import Qwen35QKVParallelLinearWithLoRA
+
+            lora_module = Qwen35QKVParallelLinearWithLoRA(module, self.lora_backend)
+        else:
+            lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
         return lora_module
 

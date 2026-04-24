@@ -600,6 +600,90 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
 
 
+class Qwen35QKVParallelLinearWithLoRA(QKVParallelLinearWithLoRA):
+    """Route Qwen3.5's gated qkv LoRA through the torch backend."""
+
+    def __init__(
+        self,
+        base_layer: QKVParallelLinear,
+        lora_backend: BaseLoRABackend,
+    ) -> None:
+        super().__init__(base_layer, lora_backend)
+        from sglang.srt.lora.backend.torch_backend import TorchNativeLoRABackend
+
+        self.fallback_backend = TorchNativeLoRABackend(
+            lora_backend.max_loras_per_batch,
+            next(base_layer.parameters()).device,
+        )
+
+    def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+        from sglang.srt.lora.backend.torch_backend import TorchNativeLoRABatchInfo
+
+        batch_info = self.lora_backend.batch_info
+        if isinstance(batch_info, TorchNativeLoRABatchInfo):
+            self.fallback_backend.batch_info = batch_info
+        else:
+            self.fallback_backend.batch_info = TorchNativeLoRABatchInfo(
+                use_cuda_graph=batch_info.use_cuda_graph,
+                bs=batch_info.bs,
+                num_segments=batch_info.num_segments,
+                seg_indptr=batch_info.seg_indptr,
+                seg_lens=batch_info.seg_lens,
+                weight_indices=batch_info.weight_indices,
+                lora_ranks=batch_info.lora_ranks,
+                scalings=batch_info.scalings,
+                max_len=batch_info.max_len,
+                permutation=batch_info.permutation,
+                seg_indptr_cpu=batch_info.seg_indptr.cpu(),
+                seg_lens_cpu=(
+                    batch_info.seg_lens.cpu()
+                    if batch_info.seg_lens is not None
+                    else None
+                ),
+                weight_indices_cpu=batch_info.weight_indices.cpu(),
+                lora_ranks_cpu=batch_info.lora_ranks.cpu(),
+            )
+
+        return self.fallback_backend.run_qkv_lora(
+            x=x,
+            qkv_lora_a=self.A_buffer_qkv,
+            qkv_lora_b=self.B_buffer_qkv,
+            output_offset=self.output_offset,
+            output_offset_cpu=self.output_offset_cpu,
+            max_qkv_out_dim=self.max_qkv_out_dim,
+            base_output=base_output,
+        )
+
+
+class LinearAttnInProjQKVZWithLoRA(ColumnParallelLinearWithLoRA):
+    """LoRA wrapper for Qwen3.5 linear-attn input projections."""
+
+    def __init__(self, base_layer, lora_backend) -> None:
+        super().__init__(base_layer, lora_backend)
+        total_shard = sum(self.base_layer.output_partition_sizes)
+        self.output_offset = torch.tensor(
+            [0, total_shard],
+            dtype=torch.int32,
+            device=next(self.base_layer.parameters()).device,
+        )
+
+    def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
+        return A
+
+    def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int) -> torch.Tensor:
+        output_sizes = self.base_layer.output_sizes
+        output_partition_sizes = self.base_layer.output_partition_sizes
+
+        start = 0
+        shards = []
+        for full_size, shard_size in zip(output_sizes, output_partition_sizes):
+            shard_start = start + tp_rank * shard_size
+            shard_end = shard_start + shard_size
+            shards.append(B[shard_start:shard_end, :])
+            start += full_size
+        return torch.cat(shards, dim=0).contiguous()
+
+
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
     def __init__(
         self,

@@ -79,9 +79,40 @@ def get_hidden_dim(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
         if module_name == "qkv_proj":
+            attn_output_gate = getattr(config, "attn_output_gate", False)
+            q_multiplier = 2 if attn_output_gate else 1
             return config.hidden_size, head_dim * (
-                config.num_attention_heads + config.num_key_value_heads * 2
+                config.num_attention_heads * q_multiplier
+                + config.num_key_value_heads * 2
             )
+        elif module_name == "in_proj_qkvz":
+            linear_key_head_dim = getattr(config, "linear_key_head_dim", None)
+            linear_value_head_dim = getattr(config, "linear_value_head_dim", None)
+            linear_num_key_heads = getattr(config, "linear_num_key_heads", None)
+            linear_num_value_heads = getattr(config, "linear_num_value_heads", None)
+            if (
+                linear_key_head_dim is None
+                or linear_value_head_dim is None
+                or linear_num_key_heads is None
+                or linear_num_value_heads is None
+            ):
+                raise NotImplementedError(
+                    "in_proj_qkvz requires linear_key_head_dim, linear_value_head_dim, "
+                    "linear_num_key_heads, and linear_num_value_heads in the model config"
+                )
+            key_dim = linear_key_head_dim * linear_num_key_heads
+            value_dim = linear_value_head_dim * linear_num_value_heads
+            return config.hidden_size, key_dim * 2 + value_dim * 2
+        elif module_name == "out_proj":
+            linear_value_head_dim = getattr(config, "linear_value_head_dim", None)
+            linear_num_value_heads = getattr(config, "linear_num_value_heads", None)
+            if linear_value_head_dim is None or linear_num_value_heads is None:
+                raise NotImplementedError(
+                    "out_proj requires linear_value_head_dim and linear_num_value_heads "
+                    "in the model config"
+                )
+            value_dim = linear_value_head_dim * linear_num_value_heads
+            return value_dim, config.hidden_size
         elif module_name == "o_proj":
             o_head_dim = getattr(config, "v_head_dim", None) or head_dim
             return (
@@ -175,6 +206,10 @@ def get_normalized_target_modules(
         "q_proj": "qkv_proj",
         "k_proj": "qkv_proj",
         "v_proj": "qkv_proj",
+        "in_proj_q": "in_proj_qkvz",
+        "in_proj_k": "in_proj_qkvz",
+        "in_proj_v": "in_proj_qkvz",
+        "in_proj_z": "in_proj_qkvz",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
         "embed_tokens": "embed_tokens",
@@ -216,16 +251,21 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
     If there is a target module name in target_modules that can match full_module_name, return this name
     Else raise ValueError.
     """
-    for target_module in target_modules:
-        if target_module in full_module_name:
-            return target_module
+    matches = [m for m in target_modules if m in full_module_name]
+    if matches:
+        return max(matches, key=len)
     raise ValueError(
         f"Cannot find target module name for {full_module_name} in {target_modules}"
     )
 
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
-ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj", "down_proj_moe"]
+ROW_PARALLELISM_LINEAR_LORA_NAMES = [
+    "o_proj",
+    "out_proj",
+    "down_proj",
+    "down_proj_moe",
+]
 REPLICATED_LINEAR_LORA_NAMES = ["fused_qkv_a_proj_with_mqa"]
 
 # Normalized module names that the LoRA system fully supports
@@ -234,6 +274,8 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
     {
         "qkv_proj",
         "o_proj",
+        "in_proj_qkvz",
+        "out_proj",
         "gate_up_proj",
         "down_proj",
         "embed_tokens",
