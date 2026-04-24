@@ -19,7 +19,7 @@ import os
 import signal
 import sys
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -448,6 +448,10 @@ class Scheduler(
         # Init profiler
         self.init_profiler()
 
+        # LRU cache for history token cost (max 1024 entries to prevent memory leak)
+        self.history_token_cost = OrderedDict()
+        self.history_token_cost_max_size = 1024
+
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
 
@@ -849,21 +853,6 @@ class Scheduler(
                 self.tp_worker.register_hicache_layer_transfer_counter(
                     self.tree_cache.cache_controller.layer_done_counter
                 )
-            elif envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get():
-                from sglang.srt.mem_cache.unified_cache_components import (
-                    ComponentType,
-                )
-                from sglang.srt.mem_cache.unified_radix_cache import (
-                    UnifiedRadixCache,
-                )
-
-                tree_components = [ComponentType.FULL]
-                if self.is_hybrid_swa or self.is_hybrid_ssm:
-                    tree_components.append(
-                        ComponentType.SWA if self.is_hybrid_swa else ComponentType.MAMBA
-                    )
-                params.tree_components = tuple(tree_components)
-                self.tree_cache = UnifiedRadixCache(params)
             elif self.is_hybrid_swa:
                 from sglang.srt.mem_cache.swa_radix_cache import SWARadixCache
 
@@ -2479,6 +2468,14 @@ class Scheduler(
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue, self.running_batch)
 
+        if self.server_args.enable_history_req_lens_db:
+            for req in self.waiting_queue:
+                key = hash(tuple(req.origin_input_ids))
+                if key in self.history_token_cost:
+                    costs = self.history_token_cost[key]
+                    req.last_decode_len = sum(costs) / len(costs)
+            self.waiting_queue.sort(key=lambda x: (-x.last_decode_len))
+
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
             # TEST_RETRACT_NO_PREFILL_BS, we skip the prefill to keep the requests
@@ -2768,6 +2765,19 @@ class Scheduler(
         batch.prepare_for_decode()
         return batch
 
+    def append_last_decode_len_cost(self, session_id, v):
+        key = hash(tuple(session_id))
+        if key in self.history_token_cost:
+            self.history_token_cost.move_to_end(key)
+            if len(self.history_token_cost[key]) >= 6:
+                self.history_token_cost[key].pop(0)
+            self.history_token_cost[key].append(v)
+        else:
+            # Evict oldest entry if at capacity
+            if len(self.history_token_cost) >= self.history_token_cost_max_size:
+                self.history_token_cost.popitem(last=False)
+            self.history_token_cost[key] = [v]
+
     def record_batch_in_overlap(self, model_worker_batch: ModelWorkerBatch):
         # FIXME(lsyin): hacky way to keep a reference to avoid GPU tensors being freed by torch GC
         # NOTE: More Reliable: record all tensors into the forward stream
@@ -2967,6 +2977,11 @@ class Scheduler(
     ):
         if batch.forward_mode.is_decode():
             self.process_batch_result_decode(batch, result)
+            for req in batch.reqs:
+                if self.server_args.enable_history_req_lens_db and req.finished():
+                    self.append_last_decode_len_cost(
+                        req.origin_input_ids, len(req.output_ids)
+                    )
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)

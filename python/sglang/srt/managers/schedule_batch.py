@@ -765,6 +765,8 @@ class Req(ReqDllmMixin):
         self.return_logprob = return_logprob
         # Start index to compute logprob from.
         self.logprob_start_len = 0
+
+        self.last_decode_len = 0
         self.top_logprobs_num = top_logprobs_num
         self.token_ids_logprob = token_ids_logprob
         self.temp_scaled_logprobs = False
@@ -2150,6 +2152,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 ),
                 reverse=True,
             )
+            if server_args.enable_history_req_lens_db:
+                sorted_indices = self.cal_kvcache_free_req(sorted_indices)
 
         retracted_reqs = []
         first_iter = True
@@ -2219,6 +2223,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         evict_from_tree_cache(self.tree_cache, num_tokens)
 
         req.reset_for_retract()
+
+    def cal_kvcache_free_req(self, sorted_indices):
+        reqs_percent_list = []
+        for index in enumerate(sorted_indices):
+            req = self.reqs[index]
+            current_decode_len = len(req.output_ids) - len(req.origin_input_ids)
+            reqs_percent_list.append(
+                {
+                    "idx": index,
+                    "per_token_num": max(req.last_decode_len, current_decode_len),
+                }
+            )
+        reqs_percent_list.sort(key=lambda x: (-x["per_token_num"]))
+        sorted_list = []
+        for req in reqs_percent_list:
+            sorted_list.append(req["idx"])
+        return sorted_list
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status

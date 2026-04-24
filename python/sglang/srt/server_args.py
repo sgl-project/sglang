@@ -751,6 +751,7 @@ class ServerArgs:
     mm_process_config: Optional[Dict[str, Any]] = None
     limit_mm_data_per_request: Optional[Union[str, Dict[str, int]]] = None
     enable_mm_global_cache: bool = False
+    enable_history_req_lens_db: bool = False
 
     # For checkpoint decryption
     decrypted_config_file: Optional[str] = None
@@ -6493,6 +6494,13 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
+        )
+
+        parser.add_argument(
+            "--enable-history-req-lens-db",
+            action="store_true",
+            default=ServerArgs.enable_history_req_lens_db,
+            help="Enable the historical request lengths database for predicting prefill-decode scheduling.",
         )
 
     @classmethod

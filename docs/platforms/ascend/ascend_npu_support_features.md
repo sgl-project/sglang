@@ -78,6 +78,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--prefill-delayer-forward-passes-buckets`          | `None`   | List[float]                    |      A2, A3      |
 | `--prefill-delayer-wait-seconds-buckets`            | `None`   | List[float]                    |      A2, A3      |
 | `--abort-on-priority-`<br/>`when-disabled`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-history-req-lens-db`                      | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--enable-dynamic-chunking`                         | `False`  | bool flag<br/> (set to enable) |   Experimental   |
 
 ## Runtime options

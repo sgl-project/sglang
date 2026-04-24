@@ -146,6 +146,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--prefill-delayer-token-usage-low-watermark` | Token usage low watermark for prefill delayer. | `None` | Type: float |
 | `--prefill-delayer-forward-passes-buckets` | Custom buckets for prefill delayer forward passes histogram. 0 and max_delay_passes-1 will be auto-added. | `None` | List[float] |
 | `--prefill-delayer-wait-seconds-buckets` | Custom buckets for prefill delayer wait seconds histogram. 0 will be auto-added. | `None` | List[float] |
+| `--enable-history-req-lens-db` | Enable the historical request lengths database for predicting prefill-decode scheduling. | `False` | bool flag (set to enable) |
 
 ## Runtime options
 | Argument | Description | Defaults | Options |
