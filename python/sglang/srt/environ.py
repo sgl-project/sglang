@@ -206,7 +206,7 @@ class Envs:
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
-    SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
+    SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
@@ -266,6 +266,12 @@ class Envs:
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
     SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER = EnvFloat(1.0)
+    # For non-streaming requests, the scheduler still flushes intermediate
+    # output batches to the tokenizer manager every N decoded tokens so that
+    # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
+    # an accurate TTFT for benchmarking; the upstream default of 50 trades
+    # off some TTFT-metric accuracy for less IPC overhead.
+    SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -390,6 +396,7 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+    SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
 
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)

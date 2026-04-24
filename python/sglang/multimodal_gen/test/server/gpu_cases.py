@@ -46,7 +46,7 @@ from sglang.multimodal_gen.test.test_utils import (
 
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
-ONE_GPU_CASES_A: list[DiffusionTestCase] = [
+ONE_GPU_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
     DiffusionTestCase(
         "qwen_image_t2i",
@@ -167,9 +167,6 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             extras={"enable_upscaling": True, "upscaling_scale": 4},
         ),
     ),
-]
-
-ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
     DiffusionTestCase(
         "wan2_1_t2v_1.3b",
@@ -339,7 +336,7 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
 
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
 if not current_platform.is_hip():
-    ONE_GPU_CASES_B.append(
+    ONE_GPU_CASES.append(
         DiffusionTestCase(
             "hunyuan3d_shape_gen",
             DiffusionServerArgs(
@@ -352,7 +349,7 @@ if not current_platform.is_hip():
     )
 # Skip turbowan on AMD: Triton requires 81920 shared memory, but AMD only has 65536.
 if not current_platform.is_hip():
-    ONE_GPU_CASES_B.append(
+    ONE_GPU_CASES.append(
         DiffusionTestCase(
             "turbo_wan2_1_t2v_1.3b",
             DiffusionServerArgs(
@@ -364,9 +361,9 @@ if not current_platform.is_hip():
 # Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
 # on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only)
 if current_platform.is_hip():
-    ONE_GPU_CASES_C = []
+    ONE_GPU_MODELOPT_CASES = []
 else:
-    ONE_GPU_CASES_C = [
+    ONE_GPU_MODELOPT_CASES = [
         _make_modelopt_ci_case(
             "flux1_modelopt_fp8_t2i",
             model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
@@ -414,7 +411,7 @@ else:
         ),
     ]
 
-TWO_GPU_CASES_A = [
+TWO_GPU_CASES = [
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(
@@ -528,9 +525,6 @@ TWO_GPU_CASES_A = [
         ),
         TI2V_sampling_params,
     ),
-]
-
-TWO_GPU_CASES_B = [
     DiffusionTestCase(
         "wan2_1_i2v_14b_480P_2gpu",
         DiffusionServerArgs(
@@ -632,7 +626,7 @@ TWO_GPU_CASES_B = [
 
 if not current_platform.is_hip():
     # Flux2 multi-image edit with cache-dit, regression test
-    ONE_GPU_CASES_B.append(
+    ONE_GPU_CASES.append(
         DiffusionTestCase(
             "flux_2_ti2i_multi_image_cache_dit",
             DiffusionServerArgs(
@@ -643,7 +637,5 @@ if not current_platform.is_hip():
         )
     )
 
-ONE_GPU_CASES = [*ONE_GPU_CASES_A, *ONE_GPU_CASES_B, *ONE_GPU_CASES_C]
-TWO_GPU_CASES_A = _with_default_num_gpus(TWO_GPU_CASES_A, 2)
-TWO_GPU_CASES_B = _with_default_num_gpus(TWO_GPU_CASES_B, 2)
-TWO_GPU_CASES = [*TWO_GPU_CASES_A, *TWO_GPU_CASES_B]
+ONE_GPU_CASES += ONE_GPU_MODELOPT_CASES
+TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)
