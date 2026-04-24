@@ -151,6 +151,47 @@ class TestSWA(unittest.TestCase):
         ]
         self.assertEqual(removed_hashes, stored_hashes)
 
+    def test_swa_kv_cache_events_split_preserves_remove_hashes(self):
+        tree, allocator = self._create_swa_radix_cache(enable_kv_cache_events=True)
+        tree.take_events()
+
+        self._insert_allocated(tree, allocator, [1, 2, 3, 4])
+        first_stored_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        first_hashes = [e.block_hashes[0] for e in first_stored_events]
+        self.assertIn(1, tree.root_node.children)
+        original_node = tree.root_node.children[1]
+        original_hash_value = list(original_node.hash_value)
+
+        self._insert_allocated(tree, allocator, [1, 2, 9, 10])
+        second_stored_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        second_hashes = [e.block_hashes[0] for e in second_stored_events]
+
+        shared_node = tree.root_node.children[1]
+        self.assertEqual(shared_node.key.token_ids, [1, 2])
+        self.assertEqual(shared_node.hash_value, original_hash_value[:2])
+        self.assertIn(3, shared_node.children)
+        self.assertIn(9, shared_node.children)
+
+        old_child = shared_node.children[3]
+        new_child = shared_node.children[9]
+        self.assertEqual(old_child.key.token_ids, [3, 4])
+        self.assertEqual(old_child.hash_value, original_hash_value[2:])
+        self.assertEqual(new_child.key.token_ids, [9, 10])
+        self.assertEqual(second_stored_events[0].parent_block_hash, first_hashes[1])
+
+        tree.evict(EvictParams(num_tokens=100, swa_num_tokens=0))
+
+        removed_hashes = [
+            e.block_hashes[0] for e in tree.take_events() if isinstance(e, BlockRemoved)
+        ]
+        self.assertEqual(len(removed_hashes), len(first_hashes) + len(second_hashes))
+        for block_hash in first_hashes + second_hashes:
+            self.assertIn(block_hash, removed_hashes)
+
     def test_swa_kv_cache_events_tombstone_cleanup_removes(self):
         tree, allocator = self._create_swa_radix_cache(enable_kv_cache_events=True)
         tree.take_events()
