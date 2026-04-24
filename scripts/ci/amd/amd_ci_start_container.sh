@@ -23,7 +23,7 @@ fi
 ROCM_VERSION="rocm700"
 DEFAULT_MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
 DEFAULT_MI35X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi35x"
-LOCAL_DOCKER_REGISTRY="172.29.8.23:5000"
+LOCAL_DOCKER_REGISTRY="10.245.143.50:5000"
 
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
@@ -158,7 +158,7 @@ find_latest_image() {
   # We intentionally do not probe ${LOCAL_DOCKER_REGISTRY} here with
   # `docker manifest inspect --insecure` because that command runs in the
   # runner pod's network namespace, which on every observed AMD scale set
-  # cannot reach 172.29.8.23:5000 (every probe either fast-fails with TLS
+  # cannot reach 10.245.143.50:5000 (every probe either fast-fails with TLS
   # reject or hits a 30s TCP timeout, multiplied across 7 daily candidates).
   # The actual local-registry pull still happens in the call site below via
   # `docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}"`, which goes through the
