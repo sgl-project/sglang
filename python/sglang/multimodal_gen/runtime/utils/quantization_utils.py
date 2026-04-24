@@ -111,9 +111,9 @@ def find_quant_modelslim_config(model_config, component_model_path):
     return quant_cfg
 
 
-def resolve_runtime_quant_config(quantization_method: str) -> QuantizationConfig:
+def resolve_online_quant_config(quantization_method: str) -> QuantizationConfig:
     if quantization_method == "fp8":
-        logger.info("Runtime FP8 quantization enabled.")
+        logger.info("Online FP8 quantization enabled.")
         return Fp8Config(
             is_checkpoint_fp8_serialized=False,
             activation_scheme="dynamic",
@@ -137,7 +137,7 @@ def get_quant_config(
 ) -> QuantizationConfig:
 
     if server_args and server_args.quantization:
-        return resolve_runtime_quant_config(server_args.quantization)
+        return resolve_online_quant_config(server_args.quantization)
 
     quant_cfg = find_quant_modelslim_config(model_config, component_model_path)
     if quant_cfg is not None:

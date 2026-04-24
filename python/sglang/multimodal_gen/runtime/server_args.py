@@ -180,7 +180,7 @@ class ServerArgs(DisaggArgsMixin):
 
     # path to pre-quantized transformer weights (single .safetensors or directory).
     transformer_weights_path: str | None = None
-    # runtime quantization method to apply
+    # Online quantization method to apply
     quantization: str | None = None
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
@@ -998,7 +998,7 @@ class ServerArgs(DisaggArgsMixin):
             type=str,
             default=ServerArgs.quantization,
             choices=["fp8"],
-            help="Apply runtime quantization to model weights. "
+            help="Apply online quantization to model weights. "
             "Quantizes weights on-the-fly at load time, no pre-converted checkpoint needed.",
         )
 
