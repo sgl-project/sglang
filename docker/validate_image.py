@@ -8,7 +8,7 @@ Run inside a built image by the docker release workflow:
 Fails the release if:
 - torch's CUDA build doesn't match the image's CUDA_VERSION
 - bundled NVIDIA libs (cudnn, nccl) diverge from torch's compiled-in versions
-- NVIDIA packages we hard-pin (cuda-python, nvidia-cublas) got silently bumped
+- NVIDIA packages we hard-pin (cuda-python) got silently bumped
 - critical Python imports fail (sglang, sgl_kernel, flashinfer, etc.)
 """
 
@@ -19,15 +19,14 @@ import re
 import sys
 from importlib.metadata import PackageNotFoundError, version
 
-# Source of truth: Dockerfile's "Patching packages for CUDA 12/13 compatibility"
-# block. Update HARD_PINS whenever that block changes pinned versions.
+# Source of truth: Dockerfile's per-CUDA-major package install block.
+# Update HARD_PINS whenever that block changes pinned versions.
 HARD_PINS: dict[str, dict[str, str]] = {
     "12": {
         "cuda-python": "12.9",
     },
     "13": {
         "cuda-python": "13.2.0",
-        "nvidia-cublas": "13.1.0.3",
     },
 }
 

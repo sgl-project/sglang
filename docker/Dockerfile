@@ -528,7 +528,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     uv \
     wheel \
     scikit-build-core \
-    nixl \
     py-spy \
     cubloaty \
     google-cloud-storage \
@@ -538,21 +537,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-   python3 -m pip install "nvidia-cutlass-dsl==4.4.2" "nvidia-cutlass-dsl-libs-base==4.4.2" --force-reinstall --no-deps;
-
-# Patching packages for CUDA 12/13 compatibility
-# TODO: Remove when torch version covers these packages
-# NOTE: cuda-python (both majors) and nvidia-cublas (CUDA 13 only) pins are
-# also asserted by docker/validate_image.py — keep them in sync.
+# Per-CUDA-major package installs. nixl ships as nixl-cu12 / nixl-cu13 binaries;
+# the `nixl` stub package unconditionally pulls nixl-cu12, so we install the
+# matching variant directly to avoid duplicating ~49 MB of wrong-CUDA binaries
+# on cu13 images. cuda-python pins are asserted by docker/validate_image.py —
+# keep in sync.
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-    python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
+    python3 -m pip install nixl-cu12 --no-deps ; \
     python3 -m pip install cuda-python==12.9 ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-    python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cudnn-cu13==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.2.0 ; \
 fi
