@@ -66,6 +66,8 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+SCHEDULER_PIDS_ARG = "scheduler_pids"
+
 
 class LoadBalanceMethod(Enum):
     """Load balance method."""
@@ -559,16 +561,6 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        # Set default bootstrap_room if in FAKE auto mode and room is None
-        if (
-            req.bootstrap_room is None
-            and self.server_args.disaggregation_transfer_backend == "fake"
-        ):
-            req.bootstrap_room = self.round_robin_counter
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(
-                self.workers
-            )
-
         assert req.bootstrap_room is not None, (
             "req.bootstrap_room should not be None. Do not send requests directly to "
             "prefill or decode instances; send to the router instead."
@@ -627,11 +619,15 @@ def run_data_parallel_controller_process(
         controller = DataParallelController(
             server_args, port_args, run_scheduler_process_func
         )
+        scheduler_pids = [
+            proc.pid for proc in controller.scheduler_procs if proc is not None
+        ]
         pipe_writer.send(
             {
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )
         if server_args.node_rank == 0:

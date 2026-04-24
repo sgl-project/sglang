@@ -1140,10 +1140,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         # pre-step value. Gated on batch.rollout to keep the
                         # non-rollout path strictly untouched.
                         if batch.rollout:
+                            batch._rollout_loop_step_index = step_index
                             self._maybe_append_dit_trajectory_step(
                                 batch=batch,
                                 latents=ctx.latents,
                                 timestep_value=step.t_host,
+                                step_index=step_index,
                             )
                         self._run_denoising_step(ctx, step, batch, server_args)
                         self._record_trajectory(ctx, step, batch, server_args)
@@ -1174,6 +1176,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             self._postprocess_rollout_outputs(
                 batch=batch,
                 latents=ctx.latents,
+                num_inference_steps=num_timesteps,
+                final_timestep=timesteps_cpu.new_zeros(()),
                 server_args=server_args,
             )
         self._finalize_denoising_loop(ctx, batch, server_args)

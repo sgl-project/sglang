@@ -366,6 +366,10 @@ class ModelConfig:
             self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] == "HYV3ForCausalLM":
+            self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
+            self.hf_config.num_nextn_predict_layers = 1
+
     def _derive_hybrid_model(self):
         # Use self.context_len after it has been initialized to prevent using context_len which may be None.
         self.is_hybrid_swa = (
@@ -381,12 +385,33 @@ class ModelConfig:
                 )
             )
 
+        self.has_attention_sinks = self._detect_attention_sinks()
+
         self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
             "MiMoV2FlashForCausalLM",
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
         ]
+
+    def _detect_attention_sinks(self) -> bool:
+        """Check whether the model uses learned attention sinks.
+
+        Attention sinks are per-head scalars added to the softmax denominator
+        to compensate for evicted KV-cache entries under sliding-window
+        attention.  Not every hybrid-SWA model uses them.
+        """
+        archs = self.hf_config.architectures or []
+        # GptOss always creates sinks unconditionally.
+        if "GptOssForCausalLM" in archs:
+            return True
+
+        # MiMoV2 creates sinks only when the config flags are set.
+        if any(a in archs for a in ("MiMoV2FlashForCausalLM", "MiMoV2MTP")):
+            return getattr(
+                self.hf_text_config, "add_swa_attention_sink_bias", False
+            ) or getattr(self.hf_text_config, "add_full_attention_sink_bias", False)
+        return False
 
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
@@ -1339,6 +1364,7 @@ multimodal_model_archs = [
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
+    "MossVLForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
@@ -1406,6 +1432,7 @@ def is_encoder_decoder_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
         "MllamaForConditionalGeneration",
+        "MossVLForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 
@@ -1421,6 +1448,7 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
         "Grok1AForCausalLM",
         "LlavaLlamaForCausalLM",
         "MllamaForConditionalGeneration",
+        "MossVLForConditionalGeneration",
         "CLIPModel",
     ]
     if any(multi_model_arch in unsupported for multi_model_arch in model_architectures):
