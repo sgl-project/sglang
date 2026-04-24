@@ -46,6 +46,9 @@ from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
     fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3,
 )
 from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import HisaNSATokenToKVPool
+from sglang.srt.layers.attention.nsa.hisa_triton.orchestrator import (
+    fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v4,
+)
 from sglang.srt.layers.attention.nsa.hisa.triton_kernel import hisa_coord_transform
 from sglang.srt.layers.attention.nsa.utils import (
     cp_all_gather_rerange_output,
@@ -472,29 +475,36 @@ class HisaIndexer(MultiPlatformOp):
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
 
         # ---- hisa kernel ----
+        # Three-way dispatch between the paged-pool-cache orchestrators:
+        #   v4 (default)  — paged pool cache + triton hotspot kernels
+        #   v3            — paged pool cache + tilelang (set SGLANG_HISA_DISABLE_TRITON=1)
+        #   v1 (no cache) — fresh mean-pool every step, tilelang (happens when
+        #                   HisaNSATokenToKVPool isn't installed, e.g. via
+        #                   SGLANG_HISA_DISABLE_POOL_CACHE=1 in the pool ctor)
         kv_pool = forward_batch.token_to_kv_pool
         use_pool_cache = isinstance(kv_pool, HisaNSATokenToKVPool)
         if use_pool_cache:
-            # Paged v3 path: pool rows live in pool_k_pages with the same
-            # paged layout as the main KV cache. block_mqa reads them via
-            # TMA — no gather, no scratch, no tail scratch.
+            use_triton = os.environ.get("SGLANG_HISA_DISABLE_TRITON") != "1"
             pool_k_pages = kv_pool.get_pool_k_pages(layer_id)
             pool_page_tables = kv_pool.get_pool_page_tables(
                 forward_batch.req_pool_indices,
             )  # [B, max_pool_pages_per_req] int32 (full col cap)
-            block_sparse_logits, topk_block_indices = (
-                fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3(
-                    q_fp8=q_fp8[:q_offset],
-                    kv_cache_fp8=kv_cache_fp8,
-                    pool_k_pages=pool_k_pages,
-                    pool_page_tables=pool_page_tables[:q_offset].contiguous(),
-                    weights=weights[:q_offset],
-                    context_lens=seqlens_32[:q_offset],
-                    block_tables=block_tables[:q_offset],
-                    k_block_size=self.hisa_k_block_size,
-                    pool_page_size=kv_pool.pool_page_size,
-                    block_topk=self.hisa_block_topk,
-                )
+            orch = (
+                fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v4
+                if use_triton
+                else fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3
+            )
+            block_sparse_logits, topk_block_indices = orch(
+                q_fp8=q_fp8[:q_offset],
+                kv_cache_fp8=kv_cache_fp8,
+                pool_k_pages=pool_k_pages,
+                pool_page_tables=pool_page_tables[:q_offset].contiguous(),
+                weights=weights[:q_offset],
+                context_lens=seqlens_32[:q_offset],
+                block_tables=block_tables[:q_offset],
+                k_block_size=self.hisa_k_block_size,
+                pool_page_size=kv_pool.pool_page_size,
+                block_topk=self.hisa_block_topk,
             )
         else:
             block_sparse_logits, topk_block_indices = (

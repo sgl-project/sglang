@@ -6,6 +6,23 @@ Legend: `[ ]` pending, `[/]` in progress, `[x]` done, `[?]` needs investigation.
 
 ---
 
+## P0 — Kernel-level perf (attack the sparse_paged 80% hotspot)
+
+Microbench says `sparse_paged + topk + coord_transform` is 82-86% of a v3 indexer call across all (B, ctx). The target kernel is `fp8_native_paged_block_sparse_mqa_attn_return_logits`. Ordered by ROI / effort:
+
+1. `[ ]` **Pipeline stages** — current `num_stages=1` everywhere. Try 2 and 3 on the hot kernel; check smem fits. **1-line change, ~30 min, probably 10-30% win for the kernel if memory-bound.**
+
+2. `[ ]` **`nsys profile` on one real workload** to determine memory- vs compute-bound. Numbers we need: HBM throughput (GB/s vs H200's 4.8 TB/s peak), SM occupancy, L2 hit rate. Informs all downstream moves.
+
+3. `[ ]` **Read DeepGEMM's `fp8_paged_mqa_logits` source** — it's the baseline we lose to in decode. Understand: does it TMA-load paged K? How deep is its pipeline? Does it warp-specialize? Cluster-launch? Persistent-kernel?
+    - `fp8_paged_mqa_logits` is the closest-in-spirit kernel to our sparse_paged_mqa. Any trick that works there likely applies here.
+
+4. `[ ]` **Warp specialization (producer/consumer warps)** — split warps: some do TMA loads, others do GEMM. mbarrier sync. FlashMLA / DeepGEMM use this pattern. Potentially 30-50% win on memory-bound paths. Tilelang has `T.warp_specialize` primitive. **Biggest single improvement likely, but steepest learning curve.**
+
+5. `[ ]` **Persistent kernel for `sparse_paged_mqa`** — current grid is (B, seq_len). For B < 132 (H200 SMs), many SMs idle. Persistent-kernel pattern: launch 132 blocks, each drains a work queue. FlashMLA does this. Eliminates launch overhead + raises SM utilization.
+
+6. `[ ]` **Cluster launch for shared-Q broadcast** — H100+ cluster feature. Two or more SMs share smem; Q (which is per-batch, shared across topk iterations) loaded once and multicasted. May save ~5-10% bandwidth.
+
 ## P0 — Correctness (should fix before declaring Phase-2 "done")
 
 - [/] **Prefix cache + pool_k_pages stale-data bug** — current mitigation: `_store_index_k_cache` sets `prev_seq_lens=0` on every extend, forcing `update_pool` to re-pool `[0, new_complete)`. Works (samsum stable at ~0.40 across runs) but redundant for same-request chunked prefill.
@@ -55,8 +72,86 @@ Each of these attacks a specific overhead identified in the stages microbench. P
 
 - [ ] Document the pool-K page layout + allocator in the hisa dir's docstring or a short README so the next reader doesn't have to piece it together.
 
-## Notes / reference
+## How to run each version
 
-- Current default code path: **v3** (paged pool_k_pages, ~55 MB per 61-layer model). Env `SGLANG_HISA_DISABLE_POOL_CACHE=1` flips back to **v1** (no cache, fresh mean-pool). See commit TBD.
-- Bench scripts live at `/data/sglang_scripts/` — `serve_baseline.sh`, `serve_hisa.sh` (v3 default), `serve_hisa_nocache.sh` (v1), `bench_serving.sh`, `eval_samsum.sh`.
-- Bench history in memory: `project_hisa_bench_v1_v3.md` — baseline vs v1 vs v3 numbers at 2026-04-22, H200×8, 10×65K.
+All commands below assume you're in the repo root. Before switching, kill any running server:
+```bash
+pkill -9 -f "sglang.launch_server"; sleep 3
+```
+
+### **v4** — default (paged pool cache + triton hotspots)
+```bash
+bash /data/sglang_scripts/serve_hisa.sh
+```
+The script sets `SGLANG_NSA_FUSE_TOPK=0` and passes `use_hisa=true, hisa_k_block_size=128, hisa_block_topk=64` via `--json-model-override-args`. Serves as `deepseek-v32-hisa` on `127.0.0.1:30000`.
+
+### **v3** — paged pool cache + tilelang (triton disabled)
+```bash
+SGLANG_HISA_DISABLE_TRITON=1 bash /data/sglang_scripts/serve_hisa.sh
+```
+Same pool-K-pages layout as v4, but keeps tilelang for `sparse_paged_mqa` + `batch_decode_pool_mqa_v3`. Useful for A/B comparing just the triton swap.
+
+### **v1** — hisa indexer, NO pool cache (pre-Phase-2)
+```bash
+bash /data/sglang_scripts/serve_hisa_nocache.sh
+```
+The script sets `SGLANG_HISA_DISABLE_POOL_CACHE=1` which makes `model_runner_kv_cache_mixin.py` skip `HisaNSATokenToKVPool` and create a plain `NSATokenToKVPool`. The indexer's `isinstance` check flips to False → falls through to the v1 fresh mean-pool path. Served as `deepseek-v32-hisa-v1`.
+
+### **Baseline** — stock sglang, no hisa
+```bash
+bash /data/sglang_scripts/serve_baseline.sh
+```
+No `use_hisa` override; plain DeepSeek-V3.2 with deep_gemm's `fp8_paged_mqa_logits`. Served as `deepseek-v32`.
+
+### With verify overlay (any of the hisa variants)
+```bash
+SGLANG_HISA_VERIFY=1 bash /data/sglang_scripts/serve_hisa.sh
+```
+At every indexer call (outside cuda graph capture), also runs v1 fresh as reference and prints rows where:
+  - logits abs diff > `SGLANG_HISA_VERIFY_LOGITS_ABS` (default 0.01)
+  - logits rel diff > `SGLANG_HISA_VERIFY_LOGITS_REL` (default 0.05)
+  - topk IoU < `SGLANG_HISA_VERIFY_IOU` (default 0.95)
+
+Adds ~30-50% TTFT overhead. Remove for production.
+
+---
+
+## Env var reference
+
+| Var | Effect | Production? |
+|---|---|:-:|
+| *(none)* | v4 default — paged pool cache + triton hotspots | ✅ |
+| `SGLANG_HISA_DISABLE_TRITON=1` | v3 — same pool layout, tilelang kernels | A/B |
+| `SGLANG_HISA_DISABLE_POOL_CACHE=1` | v1 — no cache, fresh mean-pool | A/B |
+| `SGLANG_HISA_VERIFY=1` | Inline v1 reference compare, prints divergence | Debug |
+| `SGLANG_HISA_VERIFY_LOGITS_ABS=<f>` | abs diff threshold for verify (default 0.01) | Debug |
+| `SGLANG_HISA_VERIFY_LOGITS_REL=<f>` | rel diff threshold for verify (default 0.05) | Debug |
+| `SGLANG_HISA_VERIFY_IOU=<f>` | topk IoU threshold for verify (default 0.95) | Debug |
+| `SGLANG_NSA_FUSE_TOPK=0` | required by HisaIndexer (asserts this at init) | ✅ (set by serve_hisa.sh) |
+
+Cannot mix `DISABLE_TRITON=1` with `DISABLE_POOL_CACHE=1` meaningfully — the latter short-circuits by choosing a non-hisa pool, making the first irrelevant.
+
+## Bench / eval
+
+After any server is up:
+```bash
+# Throughput + TTFT/TPOT/ITL — ~90s
+bash /data/sglang_scripts/bench_serving.sh
+
+# Samsum ROUGE — ~25s, auto-reads `deepseek-v32-hisa` by default
+bash /data/sglang_scripts/eval_samsum.sh
+
+# Samsum against other models
+bash /data/sglang_scripts/eval_samsum.sh deepseek-v32          # baseline
+bash /data/sglang_scripts/eval_samsum.sh deepseek-v32-hisa-v1  # v1
+```
+
+## Code layout
+
+- `python/sglang/srt/layers/attention/nsa/hisa/` — tilelang kernels + pool_k_cache + hierarchy_indexer
+- `python/sglang/srt/layers/attention/nsa/hisa_triton/` — triton ports: `kernels.py`, `orchestrator.py` (v4), `benchmark.py`, `test_precision.py`
+
+## Bench history
+
+- In memory `project_hisa_bench_v1_v3.md` — baseline vs v1 vs v3 numbers at 2026-04-22, H200×8, 10×65K.
+- v4 e2e bench result (2026-04-23, same bench): TPOT median 58.6 ms, ITL median 19.3 ms — v4 closes the gap to baseline to within 5-6%.
