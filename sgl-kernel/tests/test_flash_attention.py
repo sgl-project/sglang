@@ -3,6 +3,7 @@ import itertools
 import math
 import sys
 from typing import Optional
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -1363,6 +1364,47 @@ def test_flash_attn_varlen_output(
         assert (dv - dv_ref).abs().max().item() <= rtol * (
             dv_pt - dv_ref
         ).abs().max().item() + dv_atol
+
+
+def test_flash_attn_varlen_sparse_mask_fine():
+    from sgl_kernel.flash_attn import flash_attn_varlen_func
+
+    q = torch.randn(4, 2, 64, dtype=torch.bfloat16)
+    k = torch.randn(6, 2, 64, dtype=torch.bfloat16)
+    v = torch.randn(6, 2, 64, dtype=torch.bfloat16)
+    cu_seqlens_q = torch.tensor([0, 2, 4], dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, 3, 6], dtype=torch.int32)
+    seqused_q = torch.tensor([2, 2], dtype=torch.int32)
+    seqused_k = torch.tensor([3, 3], dtype=torch.int32)
+    sparse_mask_fine = torch.ones((4, 32, 4), dtype=torch.int32)
+
+    mock_out = torch.zeros_like(q)
+    mock_lse = torch.zeros((2, 4), dtype=torch.float32)
+
+    with patch("sgl_kernel.flash_attn.is_fa3_supported", return_value=True):
+        with patch(
+            "torch.ops.sgl_kernel.fwd.default", return_value=(mock_out, mock_lse)
+        ) as mock_fwd:
+            out, lse, *_ = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q=2,
+                max_seqlen_k=3,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
+                causal=True,
+                sparse_mask_fine=sparse_mask_fine,
+                return_softmax_lse=True,
+            )
+
+    assert out is mock_out
+    assert lse is mock_lse
+    assert mock_fwd.called
+    assert mock_fwd.call_args.args[24] is False
+    assert mock_fwd.call_args.args[35] is sparse_mask_fine
 
 
 if __name__ == "__main__":

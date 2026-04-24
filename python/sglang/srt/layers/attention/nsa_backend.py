@@ -34,6 +34,7 @@ from sglang.srt.layers.attention.utils import (
     mla_quantize_and_rope_for_fp8,
     seqlens_expand_triton,
 )
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
@@ -1473,6 +1474,9 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
                 page_size=1,
+                metadata=metadata,
+                topk_indices=topk_indices,
+                is_prefill = True,
             )
         elif nsa_impl == "aiter":
             if q_rope is not None:
@@ -1620,6 +1624,9 @@ class NativeSparseAttnBackend(
                 sm_scale=layer.scaling,
                 logit_cap=layer.logit_cap,
                 page_size=1,
+                metadata=metadata,
+                topk_indices=topk_indices,
+                is_prefill=False,
             )
         elif self.nsa_decode_impl == "aiter":
             if q_rope is not None:
@@ -1636,6 +1643,98 @@ class NativeSparseAttnBackend(
         else:
             assert False, f"Unsupported {self.nsa_decode_impl = }"
 
+    def _nsa_fa3_k_block_n(self, q_rope: torch.Tensor, v_head_dim: int) -> int:
+        hd = q_rope.shape[-1]
+        dv = v_head_dim
+        if hd <= 64:
+            if dv == 512:
+                return 64
+            if dv == 256:
+                return 96
+            return 128
+        if hd <= 96:
+            return 128
+        return 128
+
+    def _build_nsa_fa3_sparse_mask_fine(
+        self,
+        topk_indices: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        k_block_n: int,
+        max_kv: int,
+    ) -> torch.Tensor:
+        num_words = (k_block_n + 31) // 32
+        total_q = topk_indices.shape[0]
+        max_k_blocks = (max_kv + k_block_n - 1) // k_block_n
+        while (max_k_blocks * num_words) % 32 != 0:
+            max_k_blocks += 1
+        device = topk_indices.device
+
+        mask = torch.zeros(
+            (total_q, max_k_blocks * num_words), dtype=torch.int32, device=device
+        )
+
+        # Work on full (total_q, topk) at once — no Python loop
+        valid = (topk_indices >= 0) & (topk_indices < cache_seqlens.unsqueeze(1))          # (total_q, topk)
+
+        topk_indices_l = topk_indices.long()
+        blk = topk_indices_l // k_block_n
+        w = (topk_indices_l % k_block_n) // 32
+        bit = topk_indices_l % 32
+        bits = (1 << bit).to(torch.int32)
+
+        # Row indices: (total_q, topk)
+        rows = torch.arange(total_q, device=device, dtype=torch.long).unsqueeze(
+            1
+        ).expand_as(topk_indices_l)
+
+        # Flatten valid entries
+        rows_v = rows[valid]
+        blk_v = blk[valid]
+        w_v = w[valid]
+        bits_v = bits[valid]
+
+        # Linear index into the flattened (total_q, max_k_blocks * num_words) tensor
+        linear_idx = rows_v * (max_k_blocks * num_words) + blk_v * num_words + w_v
+
+        mask.view(-1).scatter_add_(0, linear_idx, bits_v)
+
+        return mask.view(total_q, max_k_blocks, num_words)
+
+    # def _build_nsa_fa3_sparse_mask_fine(
+    #     self,
+    #     topk_indices: torch.Tensor,
+    #     cache_seqlens: torch.Tensor,
+    #     k_block_n: int,
+    # ) -> torch.Tensor:
+    #     num_words = (k_block_n + 31) // 32
+    #     total_q = topk_indices.shape[0]
+    #     topk = topk_indices.shape[1]
+    #     max_kv = int(cache_seqlens.max().item())
+    #     max_k_blocks = (max_kv + k_block_n - 1) // k_block_n
+    #     while (max_k_blocks * num_words) % 32 != 0:
+    #         max_k_blocks += 1
+    #     device = topk_indices.device
+    #     mask = torch.zeros(
+    #         (total_q, max_k_blocks, num_words), dtype=torch.int32, device=device
+    #     )
+    #     cs = cache_seqlens.to(device=device, dtype=torch.int32)
+    #     rows = torch.arange(total_q, device=device)
+    #     for c in range(topk):
+    #         pos = topk_indices[:, c]
+    #         valid = (pos >= 0) & (pos < cs)
+    #         if not valid.any():
+    #             continue
+    #         pos_l = pos.long()
+    #         blk = pos_l // k_block_n
+    #         rel = pos_l - blk * k_block_n
+    #         w = rel // 32
+    #         bit = rel % 32
+    #         bits = (1 << bit).to(torch.int32)
+    #         r = rows[valid]
+    #         mask[r, blk[valid], w[valid]] |= bits[valid]
+    #     return mask
+
     def _forward_fa3(
         self,
         q_rope: torch.Tensor,
@@ -1650,12 +1749,26 @@ class NativeSparseAttnBackend(
         sm_scale: float,
         logit_cap: float,
         page_size: int,
+        metadata: NSAMetadata,
+        topk_indices: Optional[torch.Tensor],
+        is_prefill: bool,
     ) -> torch.Tensor:
         k_rope_cache = kv_cache[:, :, v_head_dim:]
         c_kv_cache = kv_cache[:, :, :v_head_dim]
         qk_rope_dim = k_rope_cache.shape[-1]
         k_rope_cache = k_rope_cache.view(-1, page_size, 1, qk_rope_dim)
         c_kv_cache = c_kv_cache.view(-1, page_size, 1, v_head_dim)
+        ntok = q_rope.shape[0]
+        sparse_mask_fine = None
+        if envs.SGLANG_NSA_FA3_SPARSE_MASK.get() and topk_indices is not None and is_prefill:
+            cs = metadata.cache_seqlens_int32[:ntok]
+            cu_k = metadata.cu_seqlens_k[: ntok + 1]
+            pt = metadata.page_table_1[:ntok]
+            kbn = self._nsa_fa3_k_block_n(q_rope, v_head_dim)
+            sparse_mask_fine = self._build_nsa_fa3_sparse_mask_fine(
+                topk_indices, cs, kbn, metadata.max_seq_len_k
+            )
+            cache_seqlens, cu_seqlens_k, page_table = cs, cu_k, pt
         o = flash_attn_with_kvcache(
             q=q_rope,
             k_cache=k_rope_cache,
@@ -1671,6 +1784,7 @@ class NativeSparseAttnBackend(
             softcap=logit_cap,
             return_softmax_lse=False,
             num_splits=self.num_splits,
+            sparse_mask_fine=sparse_mask_fine,
         )
         return o  # type: ignore
 

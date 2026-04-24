@@ -57,7 +57,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    int      num_splits,"
       "    bool?    pack_gqa,"
       "    int      sm_margin,"
-      "    Tensor?  sinks"
+      "    Tensor?  sinks,"
+      "    Tensor?  sparse_mask_fine"
       ") -> (Tensor, Tensor, Tensor, Tensor)");  // NEW return type: tuple of 4 tensors
 
   m.impl("fwd", torch::kCUDA, make_pytorch_shim(&mha_fwd));

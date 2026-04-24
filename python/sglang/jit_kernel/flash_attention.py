@@ -40,6 +40,7 @@ def flash_attn_with_kvcache(
     sinks=None,
     score_mod=None,
     aux_tensors=None,
+    sparse_mask_fine=None,
     ver=3,
 ):
     """
@@ -164,6 +165,7 @@ def flash_attn_with_kvcache(
             sm_margin=sm_margin,
             return_softmax_lse=return_softmax_lse,
             sinks=sinks,
+            sparse_mask_fine=sparse_mask_fine,
         )
     elif ver == 4:
         from .flash_attention_v4 import (
@@ -231,6 +233,7 @@ def flash_attn_varlen_func(
     sinks=None,
     score_mod=None,
     aux_tensors=None,
+    sparse_mask_fine=None,
     ver=3,
 ):
 
@@ -260,6 +263,7 @@ def flash_attn_varlen_func(
             sm_margin=sm_margin,
             return_softmax_lse=return_softmax_lse,
             sinks=sinks,
+            sparse_mask_fine=sparse_mask_fine,
         )
     elif ver == 4:
         from .flash_attention_v4 import (

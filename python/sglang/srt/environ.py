@@ -416,6 +416,8 @@ class Envs:
     SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
+    # Use FA3 hopper sparse_mask_fine for NSA MLA (full KV length + bitmap) when compatible.
+    SGLANG_NSA_FA3_SPARSE_MASK = EnvBool(True)
 
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
