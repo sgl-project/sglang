@@ -440,13 +440,15 @@ def _apply_qwen3_next_mlp(
     if isinstance(layer.mlp, Qwen2MoeSparseMoeBlock):
         hidden_states = layer.mlp(
             hidden_states,
-            forward_batch,
-            use_reduce_scatter,
-            should_allreduce_fusion,
+            forward_batch=forward_batch,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         )
     else:
         hidden_states = layer.mlp(
-            hidden_states, should_allreduce_fusion, use_reduce_scatter
+            hidden_states,
+            should_allreduce_fusion=should_allreduce_fusion,
+            use_reduce_scatter=use_reduce_scatter,
         )
 
     if should_allreduce_fusion:
