@@ -161,7 +161,13 @@ export const DeepSeekV4Deployment = () => {
   // pd-disagg is verified as a single unit (both prefill and decode together).
   const VERIFIED_RECIPES = new Set([
     "b200|small|low-latency",
+    "b200|small|balanced",
+    "b200|small|max-throughput",
+    "b200|small|cp",
     "b200|big|low-latency",
+    "b200|big|balanced",
+    "b200|big|max-throughput",
+    "b200|big|cp",
   ]);
   const BEING_VERIFIED_NOTE =
     "# NOTE: this recipe is being verified on the latest checkpoint";
