@@ -2629,6 +2629,47 @@
             "expected_avg_denoise_ms": 890.17,
             "expected_median_denoise_ms": 896.09,
             "estimated_full_test_time_s": 155.3
+        },
+        "ltx_2_3_hq_pipeline": {
+            "stages_ms": {
+                "InputValidationStage": 0.11,
+                "TextEncodingStage": 984.78,
+                "LTX2TextConnectorStage": 30.42,
+                "LTX2HalveResolutionStage": 0.1,
+                "LTX2LoRASwitchStage": 0.01,
+                "LTX2SigmaPreparationStage": 0.36,
+                "TimestepPreparationStage": 21.28,
+                "LTX2AVLatentPreparationStage": 0.13,
+                "LTX2ImageEncodingStage": 0.03,
+                "LTX2AVDenoisingStage": 20227.05,
+                "LTX2UpsampleStage": 157.73,
+                "LTX2RefinementStage": 1676.07,
+                "LTX2AVDecodingStage": 521.04,
+                "per_frame_generation": null
+            },
+            "denoise_step_ms": {
+                "0": 1406.0,
+                "1": 1362.75,
+                "2": 1306.18,
+                "3": 1299.65,
+                "4": 1282.16,
+                "5": 1290.32,
+                "6": 1284.64,
+                "7": 1265.01,
+                "8": 1304.06,
+                "9": 1246.21,
+                "10": 1102.19,
+                "11": 1379.4,
+                "12": 1467.28,
+                "13": 1469.49,
+                "14": 734.96,
+                "15": 547.19,
+                "16": 543.27,
+                "17": 539.0
+            },
+            "expected_e2e_ms": 24150.97,
+            "expected_avg_denoise_ms": 1157.21,
+            "expected_median_denoise_ms": 1287.48
         }
     }
 }
