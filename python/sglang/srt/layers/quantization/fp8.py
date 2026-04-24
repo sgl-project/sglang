@@ -383,6 +383,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 output_partition_sizes,
                 skip_block_quant_check,
             )
+        # TODO: IS_KIMI is_checkpoint_fp8_serialized = False, as para input
 
         # Create the weight
         weight_dtype = (

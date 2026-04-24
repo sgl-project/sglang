@@ -82,12 +82,33 @@ class W4AFp8Config(QuantizationConfig):
         linear_activation_scheme = "dynamic"
         moe_activation_scheme = "static"
         weight_block_size = [128, 128]
+        group_size = 128
+
+        # TODO : need load para from config.json
+        from sglang.srt.utils import get_bool_env_var
+        _is_kimi = get_bool_env_var("IS_KIMI", False)
+        if _is_kimi:
+            group_size = 32
+            is_checkpoint_fp8_serialized = False
+            is_checkpoint_w4afp8_serialized = True
+            weight_block_size = None
+            ignored_layers = [
+                "lm_head",
+                "self_attn",
+                "shared_experts",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.gate_up_proj",
+                "mlp.down_proj",
+            ]
         return cls(
             is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
             is_checkpoint_w4afp8_serialized=is_checkpoint_w4afp8_serialized,
             linear_activation_scheme=linear_activation_scheme,
             moe_activation_scheme=moe_activation_scheme,
             weight_block_size=weight_block_size,
+            group_size=group_size,
+            ignored_layers=ignored_layers
         )
 
     def get_quant_method(
