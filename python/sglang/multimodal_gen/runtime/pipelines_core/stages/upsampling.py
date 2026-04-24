@@ -84,8 +84,8 @@ class LTX2UpsampleStage(PipelineStage):
             device=device, dtype=latents.dtype
         )
         latents = self.spatial_upsampler(latents)
-        if server_args.vae_cpu_offload:
-            self.spatial_upsampler = self.spatial_upsampler.to("cpu")
+        # Keep the small spatial upsampler resident after warmup; moving it
+        # every request dominates the measured two-stage upsample latency.
         latents = (latents - vae_mean) / vae_std
         return latents
 
