@@ -3485,7 +3485,8 @@ class DeepseekV4ForCausalLM(nn.Module):
 
                 if "rotary_emb.inv_freq" in name:
                     continue
-
+                if ".scale" in name:
+                    name = name.replace(".scale", ".weight_scale")
                 if "experts." in name:
                     # logger.warning(f"3786 {weight_name=}, {param_name=}, {expert_id=}, {shard_id=}, {name=}")
                     if "w1.weight" in name:

@@ -523,12 +523,14 @@ class Envs:
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
+    SGLANG_ENABLE_THINKING = EnvBool(False)
+    # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
+    # Accepts "", "max", "high" (empty string means unset). Other values filtered to None.
+    SGLANG_REASONING_EFFORT = EnvStr("")
+
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
-
-    # Chat Template
-    SGLANG_ENABLE_THINKING = EnvBool(False)
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
