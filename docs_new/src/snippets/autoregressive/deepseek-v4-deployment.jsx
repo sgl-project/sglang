@@ -361,13 +361,14 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --nsa-prefill-cp-mode round-robin-split");
       flags.push("  --chunked-prefill-size 16384");
       flags.push("  --mem-fraction-static 0.78");
-      flags.push("  --max-running-requests 1024");
+      // allinone _CP_FLAGS has --max-running-requests 1024; Blackwell big cp overrides
+      // to 256. Human directed (2026-04-24) to emit only one value — keep 256 override
+      // for big Blackwell, else the default 1024.
       if (isBig && hardware !== "h200") {
-        // Blackwell big cp: extra overrides. allinone emits --mem-fraction-static 0.70
-        // after _CP_FLAGS' 0.78, but human directed (2026-04-24) to keep the 0.78 value
-        // so we drop the 0.70 override here. The cg/max-run overrides stay.
         flags.push("  --cuda-graph-max-bs 256");
         flags.push("  --max-running-requests 256");
+      } else {
+        flags.push("  --max-running-requests 1024");
       }
       // H200 CP gates DEEPEP_LARGE_SMS_FLAG on !multinode; Blackwell always gets it.
       if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
