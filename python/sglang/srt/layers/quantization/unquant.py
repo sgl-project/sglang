@@ -127,7 +127,7 @@ def _maybe_apply_hip_external_llmm1(
     if n != 1 or m % 4 != 0 or k > 8192:
         return None
 
-    key = (n, m, k, str(x.dtype))
+    key = (n, m, k, x.dtype)
     if key not in _hip_external_llmm1_logged_shapes:
         logger.info(
             "Routing shape=%s through HIP external LLMM1 fast path with rows_per_block=%d",
