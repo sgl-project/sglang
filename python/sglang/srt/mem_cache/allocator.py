@@ -161,10 +161,10 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_pages = torch.cat((self.free_pages, batch))
 
     def alloc(self, need_size: int):
-        self._flush_pending_free()
-
-        if self.need_sort and need_size > len(self.free_pages):
-            self.merge_and_sort_free()
+        if need_size > len(self.free_pages):
+            self._flush_pending_free()
+            if self.need_sort:
+                self.merge_and_sort_free()
 
         if need_size > len(self.free_pages):
             return None

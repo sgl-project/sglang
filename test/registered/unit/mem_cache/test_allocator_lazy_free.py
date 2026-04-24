@@ -4,7 +4,7 @@ Unit tests for TokenToKVPoolAllocator lazy-free optimization.
 Verifies that the pending-free buffer:
   1. Returns correct slots (functional correctness)
   2. Reports available_size() accurately while slots are pending
-  3. Flushes before alloc so new requests get the freed slots
+  3. Flushes before alloc when free_pages is insufficient
   4. Handles edge cases: empty free, single free, free_group interop
 
 Usage:
@@ -46,28 +46,41 @@ class TestLazyFreeCorrectness(unittest.TestCase):
         # pending — not yet in free_pages
         self.assertEqual(alloc._pending_free_count, 5)
 
-        # alloc triggers flush: freed slots become available
+        # free_pages still has 5 — alloc serves without flushing
         new_slots = alloc.alloc(5)
         self.assertIsNotNone(new_slots)
         self.assertEqual(len(new_slots), 5)
 
     def test_multiple_frees_batched_into_one_flush(self):
         alloc = _make_allocator(size=20)
-        a = alloc.alloc(5)
-        b = alloc.alloc(5)
+        a = alloc.alloc(10)
+        b = alloc.alloc(10)
         alloc.free(a)
         alloc.free(b)
 
         self.assertEqual(len(alloc._pending_free), 2)
-        self.assertEqual(alloc._pending_free_count, 10)
+        self.assertEqual(alloc._pending_free_count, 20)
 
-        # flush on alloc
+        # free_pages is empty → alloc must flush pending
         result = alloc.alloc(10)
         self.assertIsNotNone(result)
         self.assertEqual(len(result), 10)
         # pending cleared after flush
         self.assertEqual(alloc._pending_free_count, 0)
         self.assertEqual(len(alloc._pending_free), 0)
+
+    def test_alloc_skips_flush_when_free_pages_sufficient(self):
+        """alloc() must NOT flush pending when free_pages already has enough slots."""
+        alloc = _make_allocator(size=20)
+        a = alloc.alloc(5)
+        alloc.free(a)
+        # free_pages=15, pending=5 — alloc(10) can serve from free_pages alone
+        result = alloc.alloc(10)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(result), 10)
+        # pending stays untouched (skip torch.cat when not needed)
+        self.assertEqual(alloc._pending_free_count, 5)
+        self.assertEqual(len(alloc._pending_free), 1)
 
     def test_slot_values_preserved_through_pending(self):
         # After free+alloc the recovered slots must be valid (in [1..size])
@@ -100,10 +113,11 @@ class TestAvailableSize(unittest.TestCase):
 
     def test_available_size_after_flush(self):
         alloc = _make_allocator(size=10)
-        slots = alloc.alloc(4)
+        slots = alloc.alloc(10)  # drain — force flush on next alloc
         alloc.free(slots)
-        alloc.alloc(1)  # triggers flush
+        alloc.alloc(1)  # free_pages empty → flush triggered
         self.assertEqual(alloc.available_size(), 10 - 1)
+        self.assertEqual(alloc._pending_free_count, 0)
 
 
 class TestEdgeCases(unittest.TestCase):
