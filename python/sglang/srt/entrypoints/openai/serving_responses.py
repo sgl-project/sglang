@@ -611,13 +611,21 @@ class OpenAIServingResponses(OpenAIServingChat):
                 # NOTE: We skip the reasoning output of the previous response
                 if isinstance(output_item, ResponseReasoningItem):
                     continue
+                # Only assistant messages carry chat-style content here;
+                # skip tool calls and other output item types, which don't
+                # map to a simple {role, content} message.
+                if not isinstance(output_item, ResponseOutputMessage):
+                    continue
                 for content in output_item.content:
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": request.instructions,
-                        }
-                    )
+                    # Skip refusal parts; only textual assistant output is
+                    # replayed as conversation history.
+                    if isinstance(content, ResponseOutputText):
+                        messages.append(
+                            {
+                                "role": "assistant",
+                                "content": content.text,
+                            }
+                        )
 
         # Append the new input
         # Responses API supports simple text inputs without chat format
