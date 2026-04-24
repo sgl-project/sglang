@@ -139,9 +139,9 @@ export const DeepSeekV4Deployment = () => {
     "gb300|big":   { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 4,  multinode: false },
     // H200 needs an FP8-only Instruct ckpt (deepseek-ai's Flash/Pro repos ship
     // FP4-mixed weights that Hopper can't run). sgl-project publishes FP8
-    // repackagings; Flash is public, Pro is still being uploaded.
+    // repackagings for both variants.
     "h200|small":  { slug: "sgl-project/DeepSeek-V4-Flash-FP8",        tp: 4,  multinode: false },
-    "h200|big":    { slug: "<TO_BE_UPLOADED_DeepSeek-V4-Pro-FP8>",     tp: 16, multinode: true, nnodes: 2 },
+    "h200|big":    { slug: "sgl-project/DeepSeek-V4-Pro-FP8",          tp: 16, multinode: true, nnodes: 2 },
   };
   // Per (hardware, modelSize) PD role TP (from allinone _PD_SPEC).
   const PD_TP_SPEC = {
