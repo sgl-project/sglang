@@ -245,10 +245,7 @@ class LTX2PipelineConfig(PipelineConfig):
         # Adapted from diffusers_pipeline.py _get_gemma_prompt_embeds
         # But we only need tokenization here, the embedding happens in TextEncodingStage
         # Official LTX Gemma tokenizer trims surrounding whitespace before
-        # tokenization. This matters for multiline script-style prompts (e.g.,
-        # the PR #23366 SpongeBob storyboard) where leading/trailing newlines
-        # or indentation would otherwise shift the entire left-padded sequence
-        # and drift HQ output ~3-4 dB against the official canonical.
+        # tokenization.
         prompt = [text.strip() for text in prompt]
 
         # Gemma expects left padding for chat-style prompts
