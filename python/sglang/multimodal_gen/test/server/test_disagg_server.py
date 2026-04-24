@@ -202,6 +202,10 @@ class DisaggCluster:
     def _launch_server_head(self) -> None:
         log = _LOG_DIR / f"disagg_{self.name}_server.log"
         self._logs["server"] = log
+        # Role processes register their transfer work_endpoint with the
+        # derived value ``tcp://0.0.0.0:<port>`` (see disagg_args.py). The
+        # server head must advertise the same literal so ``_handle_register``'s
+        # endpoint_to_idx exact-string match succeeds.
         cmd = [
             "sglang",
             "serve",
@@ -210,11 +214,11 @@ class DisaggCluster:
             "--disagg-role",
             "server",
             "--encoder-urls",
-            f"tcp://{HOST}:{self._role_ports['encoder']}",
+            f"tcp://0.0.0.0:{self._role_ports['encoder']}",
             "--denoiser-urls",
-            f"tcp://{HOST}:{self._role_ports['denoiser']}",
+            f"tcp://0.0.0.0:{self._role_ports['denoiser']}",
             "--decoder-urls",
-            f"tcp://{HOST}:{self._role_ports['decoder']}",
+            f"tcp://0.0.0.0:{self._role_ports['decoder']}",
             "--scheduler-port",
             str(self.base_port),
             "--port",
@@ -225,6 +229,7 @@ class DisaggCluster:
             "120",
             "--log-level",
             "info",
+            *self.extra_role_args.get("server", []),
         ]
         self._start_proc(cmd, log)
         try:
@@ -382,6 +387,172 @@ class TestDisaggZImage2RankDenoiser(_DisaggTestBase):
         assert self.cluster is not None
         img = _generate_image(self.cluster.api_port, self.model)
         self.assertGreater(len(img), 1_000, f"image too small: {len(img)} bytes")
+
+
+# ---------------------------------------------------------------------------
+# Disagg + OTel tracing
+# ---------------------------------------------------------------------------
+
+
+def _generate_image_with_traceparent(
+    api_port: int, model: str, trace_id_hex: str, span_id_hex: str
+) -> tuple[int, bytes]:
+    """Same as :func:`_generate_image` but seeds a known W3C traceparent.
+
+    Returns ``(status_code, image_bytes)``. Kept separate so the tracing test
+    can tolerate non-200 responses while still reporting useful diagnostics.
+    """
+    traceparent = f"00-{trace_id_hex}-{span_id_hex}-01"
+    resp = requests.post(
+        f"http://{HOST}:{api_port}/v1/images/generations",
+        headers={"traceparent": traceparent},
+        json={
+            "model": model,
+            "prompt": "A sunset over mountains",
+            "n": 1,
+            "size": "1024x1024",
+            "response_format": "b64_json",
+        },
+        timeout=600,
+    )
+    if resp.status_code != 200:
+        return resp.status_code, b""
+    return resp.status_code, base64.b64decode(resp.json()["data"][0]["b64_json"])
+
+
+def _as_hex(v) -> str:
+    """OTLP span trace_id/span_id/parent_span_id come back as raw bytes over
+    gRPC and as hex strings over HTTP; normalize to lowercase hex."""
+    if isinstance(v, (bytes, bytearray)):
+        return v.hex()
+    if isinstance(v, str):
+        return v.lower()
+    return ""
+
+
+class TestDisaggZImageTracing(_DisaggTestBase):
+    """End-to-end verification of OTel trace propagation across disagg roles.
+
+    Spins up the same 1-rank cluster as :class:`TestDisaggZImage1Rank` with
+    ``--enable-trace`` wired to an in-process OTLP collector on every role and
+    the server head, sends one image-generation request with a controlled
+    ``traceparent``, and asserts the server head plus all three role worker
+    processes emit per-role ``scheduler_dispatch``/``gpu_forward`` spans under
+    the same trace_id. This is the regression guard for trace-context
+    propagation over the encoder→denoiser→decoder JSON hops.
+    """
+
+    cluster_name = "zimage_trace"
+    required_gpus = 2
+    gpu_layout = {
+        "encoder": [0],
+        "denoiser": [1],
+        "decoder": [0],
+    }
+
+    # Populated in setUpClass so the collector port is known before
+    # DisaggCluster launches.
+    collector = None
+    collector_port: int = 0
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Fast batch-span-processor flush so the test doesn't wait for the
+        # default 5s schedule. Must be set before sglang imports OTel.
+        os.environ.setdefault("SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS", "50")
+        os.environ.setdefault("SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE", "4")
+
+        from sglang.test.otel_collector import LightweightOtlpCollector
+
+        cls.collector_port = find_free_port(HOST)
+        cls.collector = LightweightOtlpCollector(port=cls.collector_port)
+        cls.collector.start()
+
+        trace_args = [
+            "--enable-trace",
+            "--otlp-traces-endpoint",
+            f"127.0.0.1:{cls.collector_port}",
+        ]
+        cls.extra_role_args = {
+            "encoder": list(trace_args),
+            "denoiser": list(trace_args),
+            "decoder": list(trace_args),
+            "server": list(trace_args),
+        }
+
+        # If super().setUpClass() raises, CustomTestCase's safe-setUpClass
+        # wrapper will invoke tearDownClass, which stops the collector.
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            super().tearDownClass()
+        finally:
+            if cls.collector is not None:
+                cls.collector.stop()
+                cls.collector = None
+
+    def test_disagg_spans_share_trace_id(self) -> None:
+        assert self.cluster is not None
+        assert self.collector is not None
+
+        trace_id = os.urandom(16).hex()
+        span_id = os.urandom(8).hex()
+
+        # Warmup was sent (without traceparent) by DisaggCluster.__enter__;
+        # clear those spans so the assertions only consider this request.
+        self.collector.clear()
+
+        status, img = _generate_image_with_traceparent(
+            self.cluster.api_port, self.model, trace_id, span_id
+        )
+        self.assertEqual(status, 200, "request did not complete cleanly")
+        self.assertGreater(len(img), 1_000, f"image too small: {len(img)} bytes")
+
+        # Spans flush asynchronously from each role's BatchSpanProcessor. Poll
+        # briefly until we see the expected shape.
+        deadline = time.time() + 30
+        spans = []
+        while time.time() < deadline:
+            spans = [
+                s for s in self.collector.get_spans() if _as_hex(s.trace_id) == trace_id
+            ]
+            # Expect: root Req span + >=3 scheduler_dispatch + >=3 gpu_forward
+            n_dispatch = sum(1 for s in spans if s.name == "scheduler_dispatch")
+            n_forward = sum(1 for s in spans if s.name == "gpu_forward")
+            if n_dispatch >= 3 and n_forward >= 3:
+                break
+            time.sleep(1)
+
+        names = [s.name for s in spans]
+        self.assertGreaterEqual(
+            sum(1 for n in names if n == "scheduler_dispatch"),
+            3,
+            f"expected >=3 scheduler_dispatch spans (one per disagg role), "
+            f"got names={names!r}",
+        )
+        self.assertGreaterEqual(
+            sum(1 for n in names if n == "gpu_forward"),
+            3,
+            f"expected >=3 gpu_forward spans (one per disagg role), "
+            f"got names={names!r}",
+        )
+
+        # All spans we saw must share the propagated trace_id. This is the
+        # actual regression guard for this PR: it proves the W3C carrier
+        # survives encoder→denoiser→decoder JSON hops (via ``_trace_state``).
+        # The HTTP-level carrier extraction (root Req parented under the
+        # client's span_id) is already covered by ``test_tracing.py`` in
+        # monolithic mode and asserting it here is flaky — the server head's
+        # BatchSpanProcessor may not flush the Req span before role spans
+        # reach the collector, since the role spans close first.
+        trace_ids = {_as_hex(s.trace_id) for s in spans}
+        self.assertEqual(
+            trace_ids,
+            {trace_id},
+            f"spans split across multiple traces: {trace_ids}",
+        )
 
 
 if __name__ == "__main__":

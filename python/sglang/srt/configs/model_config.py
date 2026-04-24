@@ -1360,6 +1360,7 @@ multimodal_model_archs = [
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
+    "MossVLForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
@@ -1427,6 +1428,7 @@ def is_encoder_decoder_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
         "MllamaForConditionalGeneration",
+        "MossVLForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 
@@ -1442,6 +1444,7 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
         "Grok1AForCausalLM",
         "LlavaLlamaForCausalLM",
         "MllamaForConditionalGeneration",
+        "MossVLForConditionalGeneration",
         "CLIPModel",
     ]
     if any(multi_model_arch in unsupported for multi_model_arch in model_architectures):
