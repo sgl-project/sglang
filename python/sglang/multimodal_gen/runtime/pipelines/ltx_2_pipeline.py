@@ -157,12 +157,6 @@ class LTX2SigmaPreparationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         batch.extra["ltx2_phase"] = "stage1"
         if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
-            # Resolution-aware sigma shift is the canonical flow-matching form
-            # and matches both official LTX-2.3 and the
-            # `calculate_ltx2_shift(image_seq_len=...)` path used by
-            # `prepare_ltx2_mu` for every non-LTX-2.3 LTX model. The prior
-            # HQ-only gate was only preserving post-squash bit-perfect non-HQ
-            # CI baselines; see notes/ltx23-hq-codepath-audit-2026-04-24.md.
             latent_num_frames = (int(batch.num_frames) - 1) // int(
                 server_args.pipeline_config.vae_temporal_compression
             ) + 1

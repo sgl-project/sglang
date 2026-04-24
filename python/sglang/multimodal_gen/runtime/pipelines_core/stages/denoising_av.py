@@ -234,13 +234,6 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         if self._should_reset_stage2_generators(server_args):
             self._reset_stage2_generators(batch)
         noise_scale = float(self.distilled_sigmas[0].item())
-        # LTX-2.3 (both HQ and legacy two-stage) uses a dedicated, deterministic
-        # renoise generator seeded from the request seed and advanced by
-        # stage-1 packed shapes to match the official fresh `GaussianNoiser`
-        # at stage-2 entry, plus fp32 mix math for numerical stability. LTX-2
-        # (non-2.3) two-stage was baselined against the `batch.generator`-based
-        # randn with bf16 mix, so it keeps that legacy path. See
-        # notes/ltx23-hq-codepath-audit-2026-04-24.md for the rationale.
         is_ltx23 = is_ltx23_native_variant(
             server_args.pipeline_config.vae_config.arch_config
         )
