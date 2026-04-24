@@ -307,6 +307,9 @@ class _SinglePassGatherer(ABC):
                 server_args, expert_location_metadata, rank
             )
 
+        if server_args.moe_a2a_backend == "mori":
+            return _DeepepLowLatencySinglePassGatherer(expert_location_metadata, rank)
+
         if server_args.expert_distribution_recorder_mode == "stat_approx":
             if server_args.moe_a2a_backend != "none" and (
                 server_args.deepep_mode == "normal"
@@ -322,6 +325,8 @@ class _SinglePassGatherer(ABC):
                 return _DeepepLowLatencySinglePassGatherer(
                     expert_location_metadata, rank
                 )
+            elif server_args.deepep_mode == "auto":
+                return _SelectExpertsSinglePassGatherer(expert_location_metadata, rank)
             else:
                 raise NotImplementedError
 

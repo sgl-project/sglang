@@ -761,6 +761,7 @@ class MoriEPMoE(DeepEPMoE):
                 quant_type = QuantType.per_128x128
 
         # [KK TODO] should to call the apply of quant method to handle fused moe
+
         hidden_states = fused_moe(
             hidden_states=dispatch_a1,
             w1=w13_weight,

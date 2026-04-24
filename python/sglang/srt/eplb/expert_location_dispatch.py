@@ -89,7 +89,9 @@ def topk_ids_logical_to_physical(
 def _topk_ids_logical_to_physical_static(
     topk_ids: torch.Tensor, info: Optional[ExpertLocationDispatchInfo]
 ) -> torch.Tensor:
-    return info.partial_logical_to_rank_dispatch_physical_map[topk_ids]
+    return info.partial_logical_to_rank_dispatch_physical_map[topk_ids].to(
+        topk_ids.dtype
+    )
 
 
 def _topk_ids_logical_to_physical_dynamic(
@@ -103,7 +105,9 @@ def _topk_ids_logical_to_physical_dynamic(
         torch.randint(0, 65536, topk_ids.shape, dtype=torch.int32, device=device)
         % info.partial_logical_to_all_physical_map_num_valid[topk_ids]
     )
-    topk_ids = info.partial_logical_to_all_physical_map[topk_ids, chosen_dispatch_index]
+    topk_ids = info.partial_logical_to_all_physical_map[
+        topk_ids, chosen_dispatch_index
+    ].to(topk_ids.dtype)
 
     topk_ids = topk_ids.view(topk_ids_original_shape)
     return topk_ids

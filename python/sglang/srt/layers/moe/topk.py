@@ -1018,7 +1018,10 @@ def _post_process_topk_ids(
         layer_id=layer_id,
         topk_ids=topk_ids,
     )
-    if _is_cuda:
+    if _is_hip:
+        topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
+        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    elif _is_cuda:
         # When shared experts are fused (appended as extra columns in topk_ids),
         # EPLB dispatch must only remap the routed expert columns.
         # The shared expert column (value = n_routed_experts) would be out-of-bounds
