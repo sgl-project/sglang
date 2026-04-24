@@ -37,6 +37,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_sm100_supported,
     is_sm120_supported,
     log_info_on_rank0,
@@ -47,11 +48,12 @@ from sglang.srt.utils.patch_torch import register_fake_if_exists
 _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_cpu = is_cpu()
+_is_musa = is_musa()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-if _is_cuda:
+if _is_cuda or _is_musa:
     from sgl_kernel import sgl_per_token_quant_fp8
 
     from sglang.jit_kernel.per_tensor_quant_fp8 import (
@@ -324,10 +326,6 @@ def _per_token_group_quant_8bit_raw(
     return x_q, x_s
 
 
-# backward compatibility
-per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
-
-
 def _per_token_group_quant_8bit_fuse_silu_and_mul(
     x: torch.Tensor,
     group_size: int,
@@ -507,6 +505,11 @@ def sglang_per_token_group_quant_fp8(
         scale_ue8m0=scale_ue8m0,
     )
 
+    # Enable v2 kernel by default on supported group sizes
+    _V2_KERNEL_SUPPORTED_GROUP_SIZES = [16, 32, 64, 128]
+    if enable_v2 is None:
+        enable_v2 = group_size in _V2_KERNEL_SUPPORTED_GROUP_SIZES or _is_musa
+
     if x.shape[0] > 0:
         # Temporary
         if enable_sgl_per_token_group_quant_8bit:
@@ -604,6 +607,12 @@ def sglang_per_token_quant_fp8(
     sgl_per_token_quant_fp8(x, x_q, x_s)
 
     return x_q, x_s
+
+
+if _is_cuda:
+    per_token_group_quant_fp8 = sglang_per_token_group_quant_fp8
+else:
+    per_token_group_quant_fp8 = _per_token_group_quant_8bit_raw
 
 
 @triton.jit
@@ -1103,6 +1112,11 @@ def w8a8_block_fp8_matmul_deepgemm(
 
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+
+    if _is_musa:
+        # XXX (MUSA): `deep_gemm_fp8_fp8_bf16_nt` on MUSA requires contiguous tensors
+        As = As.contiguous()
+        Bs = Bs.contiguous()
 
     deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
 

@@ -27,6 +27,7 @@ from sglang.test.test_utils import (
 register_amd_ci(est_time=3600, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 KIMI_K25_MXFP4_MODEL_PATH = "amd/Kimi-K2.5-MXFP4"
+KIMI_K25_MXFP4_REVISION = "b071bc6f8eb042e093e14f3b8bdbad71c18e09d3"
 SERVER_LAUNCH_TIMEOUT = 3600
 
 
@@ -36,6 +37,8 @@ class TestKimiK25MXFP4(CustomTestCase):
         cls.model = KIMI_K25_MXFP4_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
+            "--revision",
+            KIMI_K25_MXFP4_REVISION,
             "--tp",
             "8",
             "--attention-backend",

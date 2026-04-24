@@ -290,3 +290,9 @@ class TestApplyEdits:
         ]
         result = apply_edits(source=source, edits=edits)
         assert result == ("def foo():\n" "    x = 1\n" "    y = 20\n" "    return x\n")
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

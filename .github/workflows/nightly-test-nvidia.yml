@@ -71,12 +71,14 @@ jobs:
 
       - name: Run test
         timeout-minutes: 60
+        env:
+          RUNAI_STREAMER_MEMORY_LIMIT: 0
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-1-gpu --nightly --continue-on-error
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # JIT kernel full unit tests (expanded parameter ranges via SGLANG_JIT_KERNEL_RUN_FULL_TESTS)
   nightly-test-kernel-1-gpu-h100:
@@ -110,7 +112,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-kernel-1-gpu --nightly --continue-on-error
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   nightly-test-kernel-8-gpu-h200:
     if: github.repository == 'sgl-project/sglang' && (inputs.job_filter == '' || inputs.job_filter == 'all' || inputs.job_filter == 'nightly-test-kernel-8-gpu-h200')
@@ -140,7 +142,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-kernel-8-gpu-h200 --nightly --continue-on-error
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # General tests - 4 GPU H100
   nightly-test-general-4-gpu-h100:
@@ -165,7 +167,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-4-gpu --nightly --continue-on-error
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # General tests - 8 GPU H200
   nightly-test-general-8-gpu-h200:
@@ -249,7 +251,7 @@ jobs:
           if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
 
@@ -280,7 +282,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-h20 --nightly --continue-on-error
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # General tests - 8 GPU B200
   nightly-test-general-8-gpu-b200:
@@ -353,7 +355,7 @@ jobs:
           if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.partition }}
 
@@ -380,7 +382,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-eval-text-2-gpu --nightly --continue-on-error --timeout-per-file 4500
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # Text model performance tests
   nightly-test-text-perf-2-gpu-h100:
@@ -418,7 +420,7 @@ jobs:
           python3 scripts/ci/utils/publish_traces.py --traces-dir test/performance_profiles_text_models
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # VLM accuracy tests
   nightly-test-vlm-accuracy-2-gpu-h100:
@@ -443,7 +445,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-eval-vlm-2-gpu --nightly --continue-on-error --timeout-per-file 9000
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # VLM performance tests
   nightly-test-vlm-perf-2-gpu-h100:
@@ -481,7 +483,7 @@ jobs:
           python3 scripts/ci/utils/publish_traces.py --traces-dir test/performance_profiles_vlms
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # diffusion performance tests
   nightly-test-multimodal-server-1-gpu:
@@ -538,7 +540,7 @@ jobs:
           if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -596,7 +598,7 @@ jobs:
           if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
         with:
           artifact-suffix: ${{ matrix.part }}
 
@@ -623,7 +625,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-4-gpu-b200 --nightly --continue-on-error --timeout-per-file 12000
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # Specialized B200 tests - 8 GPU, for specific backends and configs
   nightly-test-specialized-8-gpu-b200:
@@ -652,7 +654,7 @@ jobs:
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-b200 --nightly --continue-on-error --timeout-per-file 2400
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # Diffusion cross-framework comparison
   nightly-test-diffusion-comparison:
@@ -716,7 +718,7 @@ jobs:
           if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
+        if: failure()
 
   # Consolidate performance metrics from all jobs
   consolidate-metrics:

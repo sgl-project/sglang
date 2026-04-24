@@ -15,12 +15,10 @@ from urllib.parse import urlparse
 
 import requests
 
-# Import the lightweight collector from the main tracing test module
-from test_tracing import LightweightOtlpCollector
-
 from sglang.srt.observability.req_time_stats import RequestStage
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.otel_collector import LightweightOtlpCollector
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
@@ -35,7 +33,7 @@ from sglang.utils import wait_for_http_ready
 logger = logging.getLogger(__name__)
 
 # CI registration - PD disaggregation requires 2 GPUs
-register_cuda_ci(est_time=45, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=48, suite="stage-b-test-2-gpu-large")
 
 
 class TestTraceDisaggregation(CustomTestCase):

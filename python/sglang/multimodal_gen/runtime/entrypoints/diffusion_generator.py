@@ -41,6 +41,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_batch_completion,
     log_generation_timer,
 )
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
+from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 
 logger = init_logger(__name__)
 
@@ -119,6 +121,10 @@ class DiffGenerator:
         instance = cls(
             server_args=server_args,
         )
+        if server_args.enable_trace:
+            process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
+            trace_set_thread_info("DiffGenerator")
+
         logger.info(f"Local mode: {local_mode}")
         if local_mode:
             instance.local_scheduler_process = instance._start_local_server_if_needed()
@@ -176,6 +182,7 @@ class DiffGenerator:
     def generate(
         self,
         sampling_params_kwargs: dict | None = None,
+        external_trace_header: dict[str, str] | None = None,
     ) -> GenerationResult | list[GenerationResult] | None:
         """Generate image(s)/video(s) based on the given prompt(s).
 
@@ -217,6 +224,7 @@ class DiffGenerator:
             req = prepare_request(
                 server_args=self.server_args,
                 sampling_params=sampling_params,
+                external_trace_header=external_trace_header,
             )
             requests.append(req)
 
@@ -227,7 +235,7 @@ class DiffGenerator:
         # TODO: send batch when supported
         for request_idx, req in enumerate(requests):
             try:
-                with log_generation_timer(
+                with trace_req(req.trace_ctx), log_generation_timer(
                     logger, req.prompt, request_idx + 1, len(requests)
                 ) as timer:
                     output_batch = self._send_to_scheduler_and_wait_for_response([req])
@@ -256,6 +264,7 @@ class DiffGenerator:
                         ),
                         trajectory_latents=output_batch.trajectory_latents,
                         trajectory_timesteps=output_batch.trajectory_timesteps,
+                        rollout_trajectory_data=output_batch.rollout_trajectory_data,
                         trajectory_decoded=output_batch.trajectory_decoded,
                     )
 

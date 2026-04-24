@@ -140,6 +140,7 @@ def register_fake_ops():
         "causal_conv1d_fwd_cpu",
         "gemma_rmsnorm_cpu",
         "gemma3_rmsnorm_cpu",
+        "gemma4_rmsnorm_cpu",
     ]:
 
         @torch.library.register_fake(f"sgl_kernel::{op}")
@@ -222,6 +223,7 @@ def register_fake_ops():
         use_fp8_w8a16,
         qkv_a_proj_scale,
         q_b_proj_scale,
+        w_scale,
         is_vnni,
         block_size,
         q_lora_rank,
@@ -840,10 +842,10 @@ class CPUGraphRunner:
                     draft_token=None,
                     custom_mask=self.custom_mask,
                     positions=None,
-                    retrive_index=None,
-                    retrive_next_token=None,
-                    retrive_next_sibling=None,
-                    retrive_cum_len=None,
+                    retrieve_index=None,
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
+                    retrieve_cum_len=None,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,

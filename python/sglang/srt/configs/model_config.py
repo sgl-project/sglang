@@ -196,8 +196,16 @@ class ModelConfig:
         self.is_image_understandable_model = enable_multimodal and hasattr(
             self.hf_config, "vision_config"
         )
-        self.is_audio_understandable_model = enable_multimodal and hasattr(
-            self.hf_config, "audio_config"
+
+        # Models expose audio_config at different nesting levels:
+        #   - top-level audio_config: e.g. Qwen2Audio
+        #   - thinker_config.audio_config: Qwen3-Omni, Qwen3-ASR (nested thinker arch)
+        #   - is_audio_model(): Whisper, Qwen3-ASR (architecture-based fallback)\
+        # TODO: Handle this more robustly by standardizing the config structure in the future
+        self.is_audio_understandable_model = enable_multimodal and (
+            hasattr(self.hf_config, "audio_config")
+            or hasattr(getattr(self.hf_config, "thinker_config", None), "audio_config")
+            or is_audio_model(self.hf_config.architectures)
         )
 
         self.is_multimodal_chunked_prefill_supported = (
@@ -373,12 +381,33 @@ class ModelConfig:
                 )
             )
 
+        self.has_attention_sinks = self._detect_attention_sinks()
+
         self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
             "MiMoV2FlashForCausalLM",
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
         ]
+
+    def _detect_attention_sinks(self) -> bool:
+        """Check whether the model uses learned attention sinks.
+
+        Attention sinks are per-head scalars added to the softmax denominator
+        to compensate for evicted KV-cache entries under sliding-window
+        attention.  Not every hybrid-SWA model uses them.
+        """
+        archs = self.hf_config.architectures or []
+        # GptOss always creates sinks unconditionally.
+        if "GptOssForCausalLM" in archs:
+            return True
+
+        # MiMoV2 creates sinks only when the config flags are set.
+        if any(a in archs for a in ("MiMoV2FlashForCausalLM", "MiMoV2MTP")):
+            return getattr(
+                self.hf_text_config, "add_swa_attention_sink_bias", False
+            ) or getattr(self.hf_text_config, "add_full_attention_sink_bias", False)
+        return False
 
     def _derive_context_length(self, context_length: int):
         is_draft_model = self.is_draft_model
@@ -566,6 +595,12 @@ class ModelConfig:
         self.num_attention_heads = self.hf_text_config.num_attention_heads
         self.num_key_value_heads = getattr(
             self.hf_text_config, "num_key_value_heads", None
+        )
+        self.first_k_dense_replace = getattr(
+            self.hf_text_config, "first_k_dense_replace", None
+        )
+        self.full_attention_interval = getattr(
+            self.hf_text_config, "full_attention_interval", None
         )
 
         # for Dbrx and MPT models
@@ -1057,8 +1092,10 @@ class ModelConfig:
                     f"supported in ROCm."
                 )
             if self.quantization not in optimized_quantization_methods:
-                # Don't warn for MXFP4 on SM100 since it has optimized kernels
-                if not (self.quantization == "mxfp4" and is_sm100_supported()):
+                # Don't warn for MXFP4/MXFP8 on SM100 since they have optimized kernels
+                if not (
+                    self.quantization in ["mxfp4", "mxfp8"] and is_sm100_supported()
+                ):
                     logger.warning(
                         "%s quantization is not fully "
                         "optimized yet. The speed can be slower than "
@@ -1323,6 +1360,7 @@ multimodal_model_archs = [
     "Mistral3ForConditionalGeneration",
     "MultiModalityCausalLM",
     "MllamaForConditionalGeneration",
+    "MossVLForConditionalGeneration",
     "NemotronH_Nano_VL_V2",
     "PixtralForConditionalGeneration",
     "Qwen2AudioForConditionalGeneration",
@@ -1332,6 +1370,7 @@ multimodal_model_archs = [
     "Qwen3VLMoeForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
+    "Qwen3ASRForConditionalGeneration",
     "Qwen3OmniMoeForConditionalGeneration",
     "KimiVLForConditionalGeneration",
     "InternVLChatModel",
@@ -1380,6 +1419,7 @@ def is_multimodal_model(model_architectures: List[str]):
 def is_audio_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
+        "Qwen3ASRForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 
@@ -1388,6 +1428,7 @@ def is_encoder_decoder_model(model_architectures: List[str]):
     models = [
         "WhisperForConditionalGeneration",
         "MllamaForConditionalGeneration",
+        "MossVLForConditionalGeneration",
     ]
     return any(model in model_architectures for model in models)
 
@@ -1403,6 +1444,7 @@ def is_multimodal_chunked_prefill_supported(model_architectures: List[str]):
         "Grok1AForCausalLM",
         "LlavaLlamaForCausalLM",
         "MllamaForConditionalGeneration",
+        "MossVLForConditionalGeneration",
         "CLIPModel",
     ]
     if any(multi_model_arch in unsupported for multi_model_arch in model_architectures):
@@ -1416,6 +1458,17 @@ def is_piecewise_cuda_graph_disabled_model(model_architectures: List[str]):
         arch in piecewise_cuda_graph_disabled_model_archs
         for arch in model_architectures
     )
+
+
+# SequenceClassification models that use CrossEncodingPooler
+_cross_encoding_pooler_archs = [
+    "BertForSequenceClassification",
+    "XLMRobertaForSequenceClassification",
+]
+
+
+def is_cross_encoding_pooler_model(model_architectures: List[str]) -> bool:
+    return any(arch in _cross_encoding_pooler_archs for arch in model_architectures)
 
 
 def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:

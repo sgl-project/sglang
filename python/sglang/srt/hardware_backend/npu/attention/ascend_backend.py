@@ -389,16 +389,19 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        total_context_len = self.max_context_len + self.page_size - 1
+        if self.speculative_num_draft_tokens is not None:
+            total_context_len += self.speculative_num_draft_tokens
         self.graph_metadata = {
             "block_tables": torch.empty(
-                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+                (max_bs, total_context_len // self.page_size),
                 dtype=torch.int32,
                 device=self.device,
             ),
         }
         if self.is_hybrid_swa:
             self.graph_metadata["block_tables_swa"] = torch.empty(
-                (max_bs, (self.max_context_len + self.page_size - 1) // self.page_size),
+                (max_bs, total_context_len // self.page_size),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -807,7 +810,7 @@ class AscendAttnBackend(AttentionBackend):
         if (
             is_prefill
             and is_nsa_enable_prefill_cp()
-            and forward_batch.nsa_cp_metadata is not None
+            and forward_batch.attn_cp_metadata is not None
         ):
             attn_out = self.do_cp_balance_attn(
                 q_nope,
@@ -860,7 +863,7 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
-        if is_mla_preprocess_enabled():
+        if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO and MLAPROLOG do save kv_cache
             save_kv_cache = False
         if self.is_dllm_model:
@@ -1773,7 +1776,7 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         slopes: Optional[torch.Tensor] = None,
     ):
-        if is_mla_preprocess_enabled():
+        if is_mla_preprocess_enabled() and self.use_mla:
             # MLAPO does saving kv_cache
             save_kv_cache = False
         if topk_indices is not None:
