@@ -597,6 +597,15 @@ class ServerArgs:
     expert_offload_memory_headroom: int = (
         2  # GiB of GPU memory reserved for UVM page swapping
     )
+    expert_offload_draft_model: bool = (
+        False  # whether expert offload also applies to speculative draft workers
+    )
+    runtime_is_draft_worker: bool = dataclasses.field(
+        default=False,
+        init=False,
+        repr=False,
+        compare=False,
+    )  # runtime-only: set by ModelRunner
 
     # Diffusion LLM
     dllm_algorithm: Optional[str] = None
@@ -2847,7 +2856,8 @@ class ServerArgs:
         logger.info(
             f"[ExpertOffload] Enabled (UVM): num_resident={self.expert_offload_num_resident}, "
             f"resident_selection={self.expert_offload_resident_selection!r}, "
-            f"memory_headroom={self.expert_offload_memory_headroom} GiB. "
+            f"memory_headroom={self.expert_offload_memory_headroom} GiB, "
+            f"draft_model={'enabled' if self.expert_offload_draft_model else 'disabled'}. "
             "Expert weights stored in CUDA Unified Memory. "
             "Resident experts stay on GPU (VRAM speed). "
             "Offloaded experts accessible via PCIe read-through (no quality loss). "
@@ -5260,6 +5270,14 @@ class ServerArgs:
             "expert routing patterns. Higher values are safer but reduce KV cache "
             "capacity. Default 2 GiB. Set to 0 to disable.",
         )
+        parser.add_argument(
+            "--expert-offload-draft-model",
+            action="store_true",
+            default=ServerArgs.expert_offload_draft_model,
+            help="Also enable expert offloading for speculative draft-model MoE layers. "
+            "By default, draft workers skip expert offload even when the target "
+            "model uses it, which makes A/B comparison against target-only offload easier.",
+        )
 
         # Diffusion LLM
         parser.add_argument(
@@ -5991,7 +6009,7 @@ class ServerArgs:
         args.dp_size = args.data_parallel_size
         args.ep_size = args.expert_parallel_size
 
-        attrs = [attr.name for attr in dataclasses.fields(cls)]
+        attrs = [attr.name for attr in dataclasses.fields(cls) if attr.init]
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def url(self):

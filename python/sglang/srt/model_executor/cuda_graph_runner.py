@@ -571,9 +571,14 @@ class CudaGraphRunner:
         if KTRANSFORMERS_AVAILABLE:
             KTMoEWrapper.set_capture_batch_sizes(self.capture_bs)
         if model_runner.server_args.expert_offload_num_resident >= 0:
+            expert_offload_prefix = (
+                "[ExpertOffload][draft]"
+                if model_runner.is_draft_worker
+                else "[ExpertOffload][target]"
+            )
             log_info_on_rank0(
                 logger,
-                "[ExpertOffload] CUDA graph mode enabled. Offloaded experts will be accessed "
+                f"{expert_offload_prefix} CUDA graph mode enabled. Offloaded experts will be accessed "
                 "transparently via PCIe, ensuring full decode quality.",
             )
 

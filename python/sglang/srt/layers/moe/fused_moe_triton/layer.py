@@ -284,7 +284,10 @@ class FusedMoE(torch.nn.Module):
                 )
             # Wrap with expert offloading if enabled (mutually exclusive with KT).
             offload_config = create_expert_offload_config_from_server_args(
-                server_args, layer_id, self.num_local_experts
+                server_args,
+                layer_id,
+                self.num_local_experts,
+                is_draft_worker=getattr(server_args, "runtime_is_draft_worker", False),
             )
             if offload_config is not None:
                 self.quant_method = ExpertOffloadWrapperMethod(

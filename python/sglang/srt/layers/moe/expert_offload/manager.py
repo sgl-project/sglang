@@ -120,7 +120,7 @@ class ExpertOffloadManager:
         ]
 
         logger.debug(
-            f"[ExpertOffload] Layer {cfg.layer_idx}: "
+            f"{cfg.log_prefix} Layer {cfg.layer_idx}: "
             f"{len(self.resident_expert_ids)} resident, "
             f"{len(self.offloaded_expert_ids)} offloaded (UVM)"
         )
@@ -165,7 +165,7 @@ class ExpertOffloadManager:
         if total_bytes > 0:
             register_uvm_evictable_memory(self.device_id, total_bytes)
             logger.debug(
-                f"[ExpertOffload] Layer {self.config.layer_idx}: "
+                f"{self.config.log_prefix} Layer {self.config.layer_idx}: "
                 f"registered {total_bytes / (1 << 20):.1f} MiB offloaded UVM "
                 f"as evictable for memory reporting (device {self.device_id})"
             )
@@ -329,7 +329,7 @@ class ExpertOffloadManager:
             self._prefetch_slices.append(param_slices)
 
         logger.debug(
-            f"[ExpertOffload] Layer {self.config.layer_idx}: "
+            f"{self.config.log_prefix} Layer {self.config.layer_idx}: "
             f"prefetch cache built for {len(hot_ids)} hot offloaded experts "
             f"({len(ranges)} coalesced ranges)"
         )
@@ -479,7 +479,7 @@ class ExpertOffloadManager:
 
         if not promoted and not demoted:
             logger.info(
-                f"[ExpertOffload] Layer {self.config.layer_idx}: "
+                f"{self.config.log_prefix} Layer {self.config.layer_idx}: "
                 f"warmup complete, resident set unchanged"
             )
             # Build prefetch cache before clearing frequency data.
@@ -489,7 +489,7 @@ class ExpertOffloadManager:
             return
 
         logger.info(
-            f"[ExpertOffload] Layer {self.config.layer_idx}: "
+            f"{self.config.log_prefix} Layer {self.config.layer_idx}: "
             f"readvised {len(promoted)} promoted, {len(demoted)} demoted "
             f"(new residents: {new_resident_ids})"
         )
@@ -558,19 +558,19 @@ class ExpertOffloadManager:
         ExpertOffloadManager._numa_bound = True
 
         if not is_numa_available():
-            logger.debug("[ExpertOffload] NUMA not available, skipping bind")
+            logger.debug("%s NUMA not available, skipping bind", self.config.log_prefix)
             return
 
         try:
             numa_node = get_current_device_numa_node_cuda()
             numa_bind_to_node(numa_node)
             logger.info(
-                f"[ExpertOffload] Bound to NUMA node {numa_node} "
+                f"{self.config.log_prefix} Bound to NUMA node {numa_node} "
                 f"for GPU {self.device_id}"
             )
         except Exception as e:
             logger.warning(
-                f"[ExpertOffload] Failed to bind NUMA node for GPU "
+                f"{self.config.log_prefix} Failed to bind NUMA node for GPU "
                 f"{self.device_id}: {e}"
             )
 

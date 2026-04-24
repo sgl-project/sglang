@@ -34,6 +34,16 @@ python3 -m sglang.launch_server --model-path /models/GLM-5-FP8 \
 
 In this example, each MoE layer has 257 local experts. 200 are kept resident in GPU VRAM (accessed at full bandwidth), and the remaining 57 are offloaded to CPU DRAM (accessed via PCIe).
 
+### Draft Model Behavior
+
+When speculative decoding is enabled, SGLang can run a separate draft worker with its own MoE layers. By default, expert offload is applied only to the target model. Draft workers skip expert offload unless you explicitly enable:
+
+```bash
+--expert-offload-draft-model
+```
+
+This is useful for A/B comparisons when you want to isolate whether expert offload on the draft model is hurting speculative decode performance.
+
 ## Resident Expert Selection
 
 The `--expert-offload-resident-selection` flag controls how the resident set is chosen.
@@ -147,3 +157,4 @@ With depth D, after layer i's MoE kernel, prefetch is issued for layers i+1, i+2
 | `--expert-offload-resident-ids` | Comma-separated expert IDs for `manual` selection mode. | `None` |
 | `--expert-offload-prefetch-num` | Number of hot offloaded experts to prefetch per target layer on a background stream. `0` disables. | `0` |
 | `--expert-offload-prefetch-depth` | How many layers ahead to prefetch. `1` = next layer only. Higher values give more overlap. | `1` |
+| `--expert-offload-draft-model` | Also enable expert offload for speculative draft-model MoE layers. By default, draft workers skip expert offload. | `False` |

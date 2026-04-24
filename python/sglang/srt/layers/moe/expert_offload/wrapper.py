@@ -121,7 +121,7 @@ class ExpertOffloadWrapperMethod(FusedMoEMethodBase):
         register_manager(self.config.layer_idx, self.manager, layer)
 
         logger.info(
-            f"[ExpertOffload] Layer {self.config.layer_idx}: "
+            f"{self.config.log_prefix} Layer {self.config.layer_idx}: "
             f"{self.config.num_resident_experts}/{self.config.num_local_experts} resident "
             f"({self.config.num_offloaded_experts} offloaded via UVM)"
         )
@@ -157,9 +157,13 @@ class ExpertOffloadWrapperMethod(FusedMoEMethodBase):
         tracing = _eo_mod._tracing_prefill
         if tracing and self.manager is not None:
             layer_idx = self.manager.config.layer_idx
-            num_tokens = dispatch_output.hidden_states.shape[0] if hasattr(dispatch_output, 'hidden_states') else -1
+            num_tokens = (
+                dispatch_output.hidden_states.shape[0]
+                if hasattr(dispatch_output, "hidden_states")
+                else -1
+            )
             logger.info(
-                f"[ExpertOffload] Layer {layer_idx}: entering MoE kernel "
+                f"{self.manager.config.log_prefix} Layer {layer_idx}: entering MoE kernel "
                 f"(tokens={num_tokens})"
             )
 
@@ -170,7 +174,7 @@ class ExpertOffloadWrapperMethod(FusedMoEMethodBase):
         if self.manager is not None:
             if tracing or elapsed > 1.0:
                 logger.info(
-                    f"[ExpertOffload] Layer {self.manager.config.layer_idx}: "
+                    f"{self.manager.config.log_prefix} Layer {self.manager.config.layer_idx}: "
                     f"MoE kernel done in {elapsed:.3f}s"
                 )
 
@@ -188,7 +192,7 @@ class ExpertOffloadWrapperMethod(FusedMoEMethodBase):
                 if tracing:
                     free, total = torch.cuda.mem_get_info()
                     logger.info(
-                        f"[ExpertOffload] Post-MoE sync done. "
+                        f"{self.manager.config.log_prefix} Post-MoE sync done. "
                         f"GPU mem: {free / (1 << 30):.2f} GiB free"
                     )
 

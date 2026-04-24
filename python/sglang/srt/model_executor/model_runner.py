@@ -326,6 +326,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.server_args.runtime_is_draft_worker = is_draft_worker
         self.memory_pool_config = memory_pool_config
         self.is_generation = model_config.is_generation
         self.is_multimodal = model_config.is_multimodal
@@ -346,6 +347,26 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
+        expert_offload_prefix = (
+            "[ExpertOffload][draft]" if self.is_draft_worker else "[ExpertOffload][target]"
+        )
+        if (
+            self.server_args.expert_offload_num_resident >= 0
+            and (self.draft_model_idx in (None, 0))
+        ):
+            if self.is_draft_worker:
+                logger.info(
+                    "%s %s expert offload for MoE layers.",
+                    expert_offload_prefix,
+                    "enabled"
+                    if self.server_args.expert_offload_draft_model
+                    else "skipping",
+                )
+            else:
+                logger.info(
+                    "%s expert offload enabled for MoE layers.",
+                    expert_offload_prefix,
+                )
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -2745,8 +2766,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
 
                 prepare_for_new_prefill()
+                expert_offload_prefix = (
+                    "[ExpertOffload][draft]"
+                    if self.is_draft_worker
+                    else "[ExpertOffload][target]"
+                )
                 logger.info(
-                    f"[ExpertOffload] Starting forward_extend "
+                    f"{expert_offload_prefix} Starting forward_extend "
                     f"(batch_size={forward_batch.batch_size})"
                 )
             ret, can_run_graph = self.forward_extend(

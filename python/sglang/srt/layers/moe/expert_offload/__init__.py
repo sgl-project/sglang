@@ -79,6 +79,12 @@ _decode_since_last_reset: bool = False
 _tracing_prefill: bool = False
 
 
+def _log_prefix() -> str:
+    if _all_managers:
+        return _all_managers[0][0].config.log_prefix
+    return "[ExpertOffload]"
+
+
 def register_manager(
     layer_idx: int, manager: "ExpertOffloadManager", layer: "torch.nn.Module"
 ) -> None:
@@ -151,7 +157,7 @@ def prepare_for_new_prefill() -> None:
     used_gb = (total - free) / (1 << 30)
     free_gb = free / (1 << 30)
     logger.info(
-        f"[ExpertOffload] prepare_for_new_prefill: "
+        f"{_log_prefix()} prepare_for_new_prefill: "
         f"decode->prefill transition "
         f"(GPU mem: {used_gb:.2f} GiB used, {free_gb:.2f} GiB free)"
     )
@@ -177,6 +183,6 @@ def restore_after_prefill() -> None:
     t1 = time.monotonic()
 
     logger.info(
-        f"[ExpertOffload] restore_after_prefill: "
+        f"{_log_prefix()} restore_after_prefill: "
         f"re-set ACCESSED_BY in {t1 - t0:.3f}s"
     )

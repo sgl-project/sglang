@@ -15,11 +15,15 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -43,19 +47,35 @@ class ExpertOffloadConfig:
     prefetch_num: int = 0  # 0 = disabled; N = prefetch top-N hot offloaded experts
     prefetch_depth: int = 1  # how many layers ahead to prefetch (1 = next layer only)
     memory_headroom_gib: int = 2  # GiB reserved for UVM page swapping
+    is_draft_worker: bool = False
 
     @property
     def num_offloaded_experts(self) -> int:
         return self.num_local_experts - self.num_resident_experts
+
+    @property
+    def worker_role(self) -> str:
+        return "draft" if self.is_draft_worker else "target"
+
+    @property
+    def log_prefix(self) -> str:
+        return f"[ExpertOffload][{self.worker_role}]"
 
 
 def create_expert_offload_config_from_server_args(
     server_args: "ServerArgs",
     layer_id: int,
     num_local_experts: int,
+    is_draft_worker: bool = False,
 ) -> Optional[ExpertOffloadConfig]:
     """Return an ExpertOffloadConfig if expert offloading is enabled, else None."""
     if server_args.expert_offload_num_resident < 0:
+        return None
+    if is_draft_worker and not server_args.expert_offload_draft_model:
+        logger.debug(
+            "[ExpertOffload][draft] Skipping draft-model expert offload for layer %s",
+            layer_id,
+        )
         return None
 
     num_resident = min(server_args.expert_offload_num_resident, num_local_experts)
@@ -80,4 +100,5 @@ def create_expert_offload_config_from_server_args(
         prefetch_num=server_args.expert_offload_prefetch_num,
         prefetch_depth=server_args.expert_offload_prefetch_depth,
         memory_headroom_gib=server_args.expert_offload_memory_headroom,
+        is_draft_worker=is_draft_worker,
     )
