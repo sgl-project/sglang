@@ -1221,7 +1221,9 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
 
     def _scale_timestep_for_adaln(self, timestep: torch.Tensor) -> torch.Tensor:
         ltx_variant = str(getattr(self.config.arch_config, "ltx_variant", "ltx_2"))
-        if ltx_variant == "ltx_2_3":
+        if ltx_variant == "ltx_2_3" and bool(
+            getattr(self, "_sglang_use_ltx23_hq_timestep_semantics", False)
+        ):
             return timestep * float(self.timestep_scale_multiplier)
         return timestep
 

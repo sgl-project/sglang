@@ -1,4 +1,5 @@
 import copy
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 import torch
@@ -46,6 +47,7 @@ class LTX2DenoisingContext(DenoisingContext):
     last_denoised_audio: torch.Tensor | None = None
     trajectory_audio_latents: list[torch.Tensor] = field(default_factory=list)
     use_native_hq_res2s_sde_noise: bool = False
+    use_ltx23_hq_timestep_semantics: bool = False
     res2s_step_noise_generator: torch.Generator | None = None
     res2s_substep_noise_generator: torch.Generator | None = None
 
@@ -696,9 +698,7 @@ class LTX2DenoisingStage(DenoisingStage):
             )
 
         batch_size = int(latent_model_input.shape[0])
-        use_raw_sigma_timestep = (
-            ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage
-        )
+        use_raw_sigma_timestep = ctx.use_ltx23_hq_timestep_semantics
         timestep = (
             sigma.to(device=ctx.latents.device, dtype=torch.float32).expand(batch_size)
             if use_raw_sigma_timestep
@@ -730,7 +730,7 @@ class LTX2DenoisingStage(DenoisingStage):
 
         prompt_timestep_video = None
         prompt_timestep_audio = None
-        if ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage:
+        if ctx.use_ltx23_hq_timestep_semantics:
             prompt_timestep_video = sigma.to(
                 device=ctx.latents.device, dtype=torch.float32
             ).expand(batch_size)
@@ -913,6 +913,35 @@ class LTX2DenoisingStage(DenoisingStage):
     def _should_use_native_hq_res2s_sde_noise(server_args: ServerArgs) -> bool:
         return server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
 
+    @staticmethod
+    def _should_use_ltx23_hq_timestep_semantics(server_args: ServerArgs) -> bool:
+        return server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
+
+    @staticmethod
+    @contextmanager
+    def _temporary_ltx23_hq_timestep_semantics(model, enabled: bool):
+        attr = "_sglang_use_ltx23_hq_timestep_semantics"
+        previous = bool(getattr(model, attr, False))
+        setattr(model, attr, enabled)
+        try:
+            yield
+        finally:
+            setattr(model, attr, previous)
+
+    @contextmanager
+    def _ltx2_model_forward_context(
+        self,
+        ctx: LTX2DenoisingContext,
+        step: DenoisingStepState,
+    ):
+        with self._temporary_ltx23_hq_timestep_semantics(
+            step.current_model, ctx.use_ltx23_hq_timestep_semantics
+        ):
+            with set_forward_context(
+                current_timestep=step.step_index, attn_metadata=step.attn_metadata
+            ):
+                yield
+
     def _prepare_denoising_loop(
         self,
         batch: Req,
@@ -932,6 +961,10 @@ class LTX2DenoisingStage(DenoisingStage):
         ctx.use_native_hq_res2s_sde_noise = (
             ctx.is_ltx23_variant
             and self._should_use_native_hq_res2s_sde_noise(server_args)
+        )
+        ctx.use_ltx23_hq_timestep_semantics = (
+            ctx.is_ltx23_variant
+            and self._should_use_ltx23_hq_timestep_semantics(server_args)
         )
         ctx.stage = (
             phase
@@ -1130,9 +1163,7 @@ class LTX2DenoisingStage(DenoisingStage):
                         repeated_attention_mask
                     )
 
-            with set_forward_context(
-                current_timestep=step.step_index, attn_metadata=step.attn_metadata
-            ):
+            with self._ltx2_model_forward_context(ctx, step):
                 model_video, model_audio = step.current_model(**model_kwargs)
 
             model_video = model_video.float()
@@ -1219,10 +1250,7 @@ class LTX2DenoisingStage(DenoisingStage):
                                     repeated_attention_mask
                                 )
 
-                        with set_forward_context(
-                            current_timestep=step.step_index,
-                            attn_metadata=step.attn_metadata,
-                        ):
+                        with self._ltx2_model_forward_context(ctx, step):
                             mid_v, mid_a = step.current_model(**model_kwargs_local)
 
                         mid_v = mid_v.float()
@@ -1322,10 +1350,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 )
 
                 if ctx.use_ltx23_legacy_one_stage:
-                    with set_forward_context(
-                        current_timestep=step.step_index,
-                        attn_metadata=step.attn_metadata,
-                    ):
+                    with self._ltx2_model_forward_context(ctx, step):
                         v_pos, a_v_pos = step.current_model(
                             **self._build_ltx2_model_kwargs(
                                 ctx,
@@ -1353,10 +1378,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     v_ptb = None
                     a_v_ptb = None
                     if need_perturbed:
-                        with set_forward_context(
-                            current_timestep=step.step_index,
-                            attn_metadata=step.attn_metadata,
-                        ):
+                        with self._ltx2_model_forward_context(ctx, step):
                             v_ptb, a_v_ptb = step.current_model(
                                 **self._build_ltx2_model_kwargs(
                                     ctx,
@@ -1378,10 +1400,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     v_mod = None
                     a_v_mod = None
                     if need_modality:
-                        with set_forward_context(
-                            current_timestep=step.step_index,
-                            attn_metadata=step.attn_metadata,
-                        ):
+                        with self._ltx2_model_forward_context(ctx, step):
                             v_mod, a_v_mod = step.current_model(
                                 **self._build_ltx2_model_kwargs(
                                     ctx,
@@ -1480,10 +1499,7 @@ class LTX2DenoisingStage(DenoisingStage):
                         split_sizes = [1] * expanded_batch_size
                         batched_video_chunks = []
                         batched_audio_chunks = []
-                        with set_forward_context(
-                            current_timestep=step.step_index,
-                            attn_metadata=step.attn_metadata,
-                        ):
+                        with self._ltx2_model_forward_context(ctx, step):
                             for model_kwargs_chunk, perturbation_config in zip(
                                 self._split_ltx2_model_kwargs(
                                     batched_model_kwargs, split_sizes
@@ -1503,10 +1519,7 @@ class LTX2DenoisingStage(DenoisingStage):
                         batched_video = torch.cat(batched_video_chunks, dim=0)
                         batched_audio = torch.cat(batched_audio_chunks, dim=0)
                     else:
-                        with set_forward_context(
-                            current_timestep=step.step_index,
-                            attn_metadata=step.attn_metadata,
-                        ):
+                        with self._ltx2_model_forward_context(ctx, step):
                             batched_video, batched_audio = step.current_model(
                                 **batched_model_kwargs,
                                 perturbation_configs=perturbation_configs,
