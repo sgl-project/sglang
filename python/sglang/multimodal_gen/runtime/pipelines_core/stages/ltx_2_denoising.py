@@ -699,6 +699,9 @@ class LTX2DenoisingStage(DenoisingStage):
 
         batch_size = int(latent_model_input.shape[0])
         use_raw_sigma_timestep = ctx.use_ltx23_hq_timestep_semantics
+        use_ltx23_two_stage_prompt_timestep = (
+            ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage
+        )
         timestep = (
             sigma.to(device=ctx.latents.device, dtype=torch.float32).expand(batch_size)
             if use_raw_sigma_timestep
@@ -718,12 +721,20 @@ class LTX2DenoisingStage(DenoisingStage):
             timestep_video = timestep.view(batch_size, 1, 1).expand(
                 batch_size, int(latent_model_input.shape[1]), 1
             )
+        elif use_ltx23_two_stage_prompt_timestep:
+            timestep_video = timestep.view(batch_size, 1).expand(
+                batch_size, int(latent_model_input.shape[1])
+            )
         else:
             timestep_video = timestep
 
         if use_raw_sigma_timestep and audio_latent_model_input.ndim == 3:
             timestep_audio = timestep.view(batch_size, 1, 1).expand(
                 batch_size, int(audio_latent_model_input.shape[1]), 1
+            )
+        elif use_ltx23_two_stage_prompt_timestep and audio_latent_model_input.ndim == 3:
+            timestep_audio = timestep.view(batch_size, 1).expand(
+                batch_size, int(audio_latent_model_input.shape[1])
             )
         else:
             timestep_audio = timestep
@@ -736,6 +747,18 @@ class LTX2DenoisingStage(DenoisingStage):
             ).expand(batch_size)
             prompt_timestep_audio = sigma.to(
                 device=ctx.audio_latents.device, dtype=torch.float32
+            ).expand(batch_size)
+        elif use_ltx23_two_stage_prompt_timestep:
+            timestep_scale_multiplier = float(
+                getattr(step.current_model, "timestep_scale_multiplier", 1000)
+            )
+            prompt_timestep_video = (
+                sigma.to(device=latent_model_input.device, dtype=torch.float32)
+                * timestep_scale_multiplier
+            ).expand(batch_size)
+            prompt_timestep_audio = (
+                sigma.to(device=audio_latent_model_input.device, dtype=torch.float32)
+                * timestep_scale_multiplier
             ).expand(batch_size)
 
         if ctx.use_ltx23_legacy_one_stage:
