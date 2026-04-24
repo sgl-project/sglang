@@ -335,10 +335,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         # exact injection (samplers.py:262); official `euler_denoising_loop`
         # does NOT — it uses `sigma_next` directly. So gate on the active
         # sampler, not on the model variant.
-        if (
-            self.sampler_name == "res2s"
-            and self.distilled_sigmas[-1].item() == 0.0
-        ):
+        if self.sampler_name == "res2s" and self.distilled_sigmas[-1].item() == 0.0:
             scheduler_sigmas = torch.cat(
                 [
                     self.distilled_sigmas[:-1],
