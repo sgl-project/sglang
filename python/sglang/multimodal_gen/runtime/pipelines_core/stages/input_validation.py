@@ -313,6 +313,34 @@ class InputValidationStage(PipelineStage):
                 f"Guidance scale must be positive, but got {batch.guidance_scale}"
             )
 
+        # Reject requests that do not enable CFG on a server launched with
+        # --enable-cfg-parallel. CFG-parallel splits cond/uncond across ranks,
+        # so rank 1 has no work and returns None for noise_pred, which crashes
+        # scheduler.step() ~30 minutes later under a gloo broadcast timeout.
+        # Earlier, field-specific checks above (negative_prompt missing,
+        # guidance_scale < 0) fire first and produce better messages for those
+        # cases; this is the catch-all for any combination that still leaves
+        # do_classifier_free_guidance=False under cfg-parallel.
+        if server_args.enable_cfg_parallel and not batch.do_classifier_free_guidance:
+            neg_prompt_state = (
+                "not set"
+                if batch.negative_prompt is None
+                else "empty" if batch.negative_prompt == "" else "set"
+            )
+            raise ValueError(
+                f"Server was launched with --enable-cfg-parallel but this "
+                f"request does not use classifier-free guidance "
+                f"(do_classifier_free_guidance={batch.do_classifier_free_guidance}, "
+                f"guidance_scale={batch.guidance_scale}, "
+                f"true_cfg_scale={batch.true_cfg_scale}, "
+                f"negative_prompt={neg_prompt_state}). "
+                f"CFG-parallel splits cond/uncond across ranks and requires "
+                f"both to be active. Either disable --enable-cfg-parallel or "
+                f"ensure the request enables CFG (set guidance_scale > 1.0 or "
+                f"true_cfg_scale > 1.0, with a non-empty negative_prompt or "
+                f"negative_prompt_embeds)."
+            )
+
         # for i2v, get image from image_path
         # @TODO(Wei) hard-coded for wan2.2 5b ti2v for now. Should put this in image_encoding stage
         if batch.image_path is not None:

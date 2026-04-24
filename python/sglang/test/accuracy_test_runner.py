@@ -30,6 +30,7 @@ class AccuracyTestParams:
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     repeat: Optional[int] = None
+    api: Optional[str] = None  # "chat" or "completion"; defaults to "chat" in run_eval
 
 
 @dataclass
@@ -87,6 +88,7 @@ def _run_simple_eval(
     top_p: Optional[float] = None,
     top_k: Optional[int] = None,
     repeat: Optional[int] = None,
+    api: Optional[str] = None,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run evaluation using simple_eval backend (run_eval.py).
 
@@ -110,6 +112,9 @@ def _run_simple_eval(
             num_examples=num_examples,
             num_threads=num_threads or 1024,
         )
+
+        if api is not None:
+            args.api = api
 
         if max_tokens is not None:
             args.max_tokens = max_tokens
@@ -489,6 +494,7 @@ def run_accuracy_test(
             top_p=params.top_p,
             top_k=params.top_k,
             repeat=params.repeat,
+            api=params.api,
         )
 
     if not success:
