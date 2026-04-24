@@ -137,8 +137,12 @@ export const DeepSeekV4Deployment = () => {
     "b200|big":    { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 8,  multinode: false },
     "gb300|small": { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4,  multinode: false },
     "gb300|big":   { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 4,  multinode: false },
-    "h200|small":  { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4,  multinode: false },
-    "h200|big":    { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 16, multinode: true, nnodes: 2 },
+    // H200 needs a separate FP8-only Instruct ckpt (Flash / Pro public repos
+    // ship FP4-mixed weights). That ckpt is still being uploaded, so we emit a
+    // placeholder that fails loudly on copy-paste instead of silently pulling
+    // the wrong weights. Replace with the real slug once Hopper ckpts are public.
+    "h200|small":  { slug: "<TO_BE_UPLOADED_DeepSeek-V4-Flash-hopper>", tp: 4,  multinode: false },
+    "h200|big":    { slug: "<TO_BE_UPLOADED_DeepSeek-V4-Pro-hopper>",   tp: 16, multinode: true, nnodes: 2 },
   };
   // Per (hardware, modelSize) PD role TP (from allinone _PD_SPEC).
   const PD_TP_SPEC = {
