@@ -27,6 +27,12 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
+from sglang.srt.disaggregation.kv_events import (
+    AllBlocksCleared,
+    BlockRemoved,
+    BlockStored,
+    StorageMedium,
+)
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
@@ -46,7 +52,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.radix_cache import (
+    RadixKey,
+    compute_node_hash_values,
+    split_node_hash_value,
+)
+from sglang.srt.mem_cache.utils import hash_str_to_int64
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
@@ -425,7 +436,9 @@ class MambaRadixCache(BasePrefixCache):
 
         self.page_size = params.page_size
         self.disable = params.disable
+        self.enable_kv_cache_events = params.enable_kv_cache_events
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
+        self.kv_event_queue = []
 
         if not self.enable_mamba_extra_buffer:
             assert (
@@ -451,6 +464,7 @@ class MambaRadixCache(BasePrefixCache):
         self.root_node = TreeNode()
         self.root_node.key = RadixKey([], None)
         self.root_node.value = []
+        self.root_node.hash_value = []
         self.root_node.full_lock_ref = 1
         self.root_node.mamba_lock_ref = 1
         self.full_evictable_size_ = 0
@@ -460,6 +474,7 @@ class MambaRadixCache(BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
+        self._record_all_cleared_event()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -724,6 +739,7 @@ class MambaRadixCache(BasePrefixCache):
 
         assert x.mamba_value is not None, f"leaf node mamba value is not None, {x.id=}"
         # 1. a leaf node, free full tokens and mamba
+        self._record_remove_event(x)
         self.token_to_kv_pool_allocator.free(x.value)
         full_num_evicted = len(x.value)
         self.req_to_token_pool.mamba_pool.free(x.mamba_value)
@@ -1088,6 +1104,9 @@ class MambaRadixCache(BasePrefixCache):
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
         new_node.parent.children[key.child_key(self.page_size)] = new_node
+        new_node.hash_value, child.hash_value = split_node_hash_value(
+            child.hash_value, split_len, self.page_size
+        )
 
         # insert the new node and child into the lru lists, insert
         # parent first so that parent is after child in the lru list
@@ -1155,6 +1174,7 @@ class MambaRadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
+            self._record_store_event(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
@@ -1184,6 +1204,7 @@ class MambaRadixCache(BasePrefixCache):
                 node.parent.mamba_lock_ref == 0
             ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
+            self._record_remove_event(node.parent)
             self.token_to_kv_pool_allocator.free(node.parent.value)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)
@@ -1219,6 +1240,87 @@ class MambaRadixCache(BasePrefixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self.full_evictable_size_ -= len(node.key)
+
+    def _record_store_event(self, node: TreeNode, medium=None):
+        # Mamba cache events intentionally track only the full-attention KV blocks.
+        if self.enable_kv_cache_events:
+            if medium is None:
+                medium = StorageMedium.GPU
+
+            if node.hash_value is None:
+                node.hash_value = compute_node_hash_values(node, self.page_size)
+
+            parent_block_hash = None
+            if node.parent is not None and node.parent != self.root_node:
+                if (
+                    node.parent.hash_value is not None
+                    and len(node.parent.hash_value) > 0
+                ):
+                    parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
+
+            page_index = 0
+            logical_len = len(node.key)
+            is_bigram = node.key.is_bigram
+            raw = node.key.token_ids
+            for start in range(0, logical_len, self.page_size):
+                end = min(start + self.page_size, logical_len)
+                if end <= start:
+                    continue
+
+                if is_bigram:
+                    page_tokens = [(raw[j], raw[j + 1]) for j in range(start, end)]
+                else:
+                    page_tokens = raw[start:end]
+
+                block_hash = hash_str_to_int64(node.hash_value[page_index])
+
+                self.kv_event_queue.append(
+                    BlockStored(
+                        block_hashes=[block_hash],
+                        parent_block_hash=parent_block_hash,
+                        token_ids=page_tokens,
+                        block_size=len(page_tokens),
+                        lora_id=None,
+                        medium=medium,
+                    )
+                )
+
+                parent_block_hash = block_hash
+                page_index += 1
+
+    def _record_remove_event(self, node: TreeNode, medium=None):
+        # Mamba-only state eviction is not reported; callers invoke this only
+        # when full-attention KV blocks leave the cache.
+        if self.enable_kv_cache_events:
+            if medium is None:
+                medium = StorageMedium.GPU
+
+            if node.hash_value is None:
+                node.hash_value = compute_node_hash_values(node, self.page_size)
+
+            page_index = 0
+            logical_len = len(node.key)
+            for start in range(0, logical_len, self.page_size):
+                end = min(start + self.page_size, logical_len)
+                if end <= start:
+                    continue
+
+                block_hash = hash_str_to_int64(node.hash_value[page_index])
+                self.kv_event_queue.append(
+                    BlockRemoved(block_hashes=[block_hash], medium=medium)
+                )
+                page_index += 1
+
+    def _record_all_cleared_event(self):
+        if self.enable_kv_cache_events:
+            self.kv_event_queue.append(AllBlocksCleared())
+
+    def take_events(self):
+        if not self.enable_kv_cache_events:
+            return []
+        events = self.kv_event_queue
+        self.kv_event_queue = []
+        return events
 
     def _collect_nontombstone_nodes(self) -> List[TreeNode]:
         ret_list = []
