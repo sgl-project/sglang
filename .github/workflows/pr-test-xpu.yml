@@ -110,17 +110,17 @@ jobs:
         timeout-minutes: 20
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install --upgrade pip
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip install pytest expecttest ray huggingface_hub
-          docker exec "$cid" /home/sdp/miniforge3/envs/py3.10/bin/python3 -m pip uninstall -y flashinfer-python
-          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.10/bin/hf auth login --token ${HF_TOKEN} '
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.12/bin/python3 -m pip install --upgrade pip
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.12/bin/python3 -m pip install pytest expecttest ray huggingface_hub
+          docker exec "$cid" /home/sdp/miniforge3/envs/py3.12/bin/python3 -m pip uninstall -y flashinfer-python
+          docker exec "$cid" /bin/bash -c '/home/sdp/miniforge3/envs/py3.12/bin/hf auth login --token ${HF_TOKEN} '
 
 
       - name: Run E2E Bfloat16 tests
         timeout-minutes: 20
         run: |
           cid="${{ steps.start_container.outputs.container_id }}"
-          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.10 && cd /home/sdp/sglang/test/srt && python3 run_suite.py --suite per-commit-xpu"
+          docker exec "$cid" bash -c "source /home/sdp/miniforge3/bin/activate && conda activate py3.12 && cd /home/sdp/sglang/test/srt && python3 run_suite.py --suite per-commit-xpu"
       - name: Cleanup container
         if: always()
         run: |
