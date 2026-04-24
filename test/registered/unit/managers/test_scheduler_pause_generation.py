@@ -7,6 +7,7 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import PauseGenerationReqInput
 from sglang.srt.managers.scheduler import Scheduler
 
@@ -21,6 +22,7 @@ class TestSchedulerPauseGeneration(unittest.TestCase):
         scheduler.last_batch = None
         scheduler.cur_batch = None
         scheduler.chunked_req = None
+        scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.reqs = []
         scheduler.running_batch.is_empty.return_value = True

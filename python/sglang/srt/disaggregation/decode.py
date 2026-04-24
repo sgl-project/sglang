@@ -1158,6 +1158,8 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
             # polling and allocating kv cache
             self.process_decode_queue()
 
@@ -1185,6 +1187,8 @@ class SchedulerDisaggregationDecodeMixin:
             # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
+            if self._engine_paused:
+                continue
             # polling and allocating kv cache
             self.process_decode_queue()
 

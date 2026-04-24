@@ -3315,6 +3315,20 @@ class Scheduler(
         raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
+        # PD disaggregation: `retract` has no decode-to-prefill rebootstrap path,
+        # so retracted decode-side requests cannot be re-prefilled under new
+        # weights. Fail fast before mutating any scheduler state to avoid
+        # leaving the engine in a half-paused / inconsistent state that later
+        # crashes inside radix-cache cleanup on flush_cache.
+        assert not (
+            recv_req.mode == "retract"
+            and self.disaggregation_mode != DisaggregationMode.NULL
+        ), (
+            "pause_generation(mode='retract') is not supported in PD "
+            "disaggregation mode yet. Decode-side retracted requests need "
+            "a rebootstrap path back to prefill."
+        )
+
         self._engine_paused = True
 
         if recv_req.mode == "in_place":
