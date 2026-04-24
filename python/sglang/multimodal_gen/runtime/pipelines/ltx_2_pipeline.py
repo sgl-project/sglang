@@ -157,19 +157,37 @@ class LTX2SigmaPreparationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         batch.extra["ltx2_phase"] = "stage1"
         if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
-            latent_num_frames = (int(batch.num_frames) - 1) // int(
-                server_args.pipeline_config.vae_temporal_compression
-            ) + 1
-            latent_height = int(batch.height) // int(
-                server_args.pipeline_config.vae_scale_factor
-            )
-            latent_width = int(batch.width) // int(
-                server_args.pipeline_config.vae_scale_factor
-            )
-            batch.sigmas = build_official_ltx2_sigmas(
-                int(batch.num_inference_steps),
-                number_of_tokens=latent_num_frames * latent_height * latent_width,
-            )
+            # Gate on pipeline class to mirror the three official entry points:
+            # - HQ (`ti2vid_two_stages_hq.py:164`) calls
+            #   `LTX2Scheduler.execute(latent=empty_latent, ...)` where
+            #   `empty_latent` is built from the **half-resolution** stage-1
+            #   shape → resolution-aware sigma shift.
+            # - Non-HQ two-stage (`ti2vid_two_stages.py:145`) and
+            #   one-stage (`ti2vid_one_stage.py:138`) call
+            #   `LTX2Scheduler.execute(steps=...)` with no `latent` →
+            #   falls back to `default_number_of_tokens = MAX_SHIFT_ANCHOR
+            #   = 4096` → constant-anchor sigma shift.
+            if server_args.pipeline_class_name == "LTX2TwoStageHQPipeline":
+                # batch.height/width have already been halved by
+                # LTX2HalveResolutionStage, so these latents are the
+                # half-resolution stage-1 shape (matches `empty_latent`).
+                latent_num_frames = (int(batch.num_frames) - 1) // int(
+                    server_args.pipeline_config.vae_temporal_compression
+                ) + 1
+                latent_height = int(batch.height) // int(
+                    server_args.pipeline_config.vae_scale_factor
+                )
+                latent_width = int(batch.width) // int(
+                    server_args.pipeline_config.vae_scale_factor
+                )
+                batch.sigmas = build_official_ltx2_sigmas(
+                    int(batch.num_inference_steps),
+                    number_of_tokens=latent_num_frames * latent_height * latent_width,
+                )
+            else:
+                batch.sigmas = build_official_ltx2_sigmas(
+                    int(batch.num_inference_steps)
+                )
         else:
             batch.sigmas = np.linspace(
                 1.0,
