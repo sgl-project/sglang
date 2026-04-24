@@ -1,6 +1,6 @@
 # Quantization
 
-SGLang-Diffusion supports quantized transformer checkpoints. In most cases, keep
+SGLang-Diffusion supports quantized transformer checkpoints and online quantization. In most cases, keep
 the base model and the quantized transformer override separate.
 
 ## Quick Reference
@@ -47,6 +47,7 @@ backend.
 | `modelopt-nvfp4`  | Mixed transformer directory/repo with `config.json`, or raw NVFP4 safetensors export/repo | `--transformer-path` for mixed overrides; `--transformer-weights-path` for raw exports | FLUX.1, FLUX.2, Wan2.2                  | None                                  | Mixed override repos keep the base model separate; raw exports such as `black-forest-labs/FLUX.2-dev-NVFP4` still use the weights-path flow |
 | `nunchaku-svdq`   | Pre-quantized Nunchaku transformer weights, usually named `svdq-{int4\|fp4}_r{rank}-...`   | `--transformer-weights-path`                                           | Model-specific support such as Qwen-Image, FLUX, and Z-Image | `nunchaku`                            | SGLang can infer precision and rank from the filename and supports both `int4` and `nvfp4`                                             |
 | `msmodelslim`     | Pre-quantized msmodelslim transformer weights                                              | `--model-path`                                                         | Wan2.2 family                           | None                                  | Currently only compatible with the Ascend NPU family and supports both `w8a8` and `w4a4`                                               |
+| `fp8 (online)`   | Any unquantized BF16 checkpoint                                                            | `--quantization fp8`                                                   | ALL                                     | None                                  | Online FP8 weight quantization at load time with dynamic activations                           |
 
 ## Validated ModelOpt Checkpoints
 
@@ -281,6 +282,37 @@ sglang generate \
   as `4` or `8`.
 - Current runtime validation only allows Nunchaku on NVIDIA CUDA Ampere (SM8x)
   or SM12x GPUs. Hopper (SM90) is currently rejected.
+
+## Online Quantization
+
+SGLang-Diffusion supports online quantization of model weights at load
+time via the `--quantization` flag. This lets you run quantized inference
+from any BF16 checkpoint without a pre-converted or calibrated checkpoint.
+
+### Supported Methods
+
+| value | precision |
+|------------------------|-----------|
+| `fp8`                  | FP8 (E4M3) |
+
+### Usage Examples
+
+Apply online FP8 quantization to a FLUX model:
+
+```bash
+sglang generate \
+  --model-path black-forest-labs/FLUX.1-dev \
+  --quantization fp8 \
+  --prompt "A small cat" \
+  --save-output
+```
+
+### Notes
+
+- `--quantization` is independent of the checkpoint-based quantization.
+  It does not require `--transformer-path` or `--transformer-weights-path`.
+- When `--quantization` is set, it takes precedence over any quantization
+  config found in the checkpoint metadata.
 
 ## [ModelSlim](https://gitcode.com/Ascend/msmodelslim)
 MindStudio-ModelSlim (msModelSlim) is a model offline quantization compression tool launched by MindStudio and optimized for Ascend hardware.
