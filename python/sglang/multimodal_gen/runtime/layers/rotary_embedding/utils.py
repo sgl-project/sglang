@@ -1,6 +1,5 @@
 """Primitive RoPE ops: rotate helpers and apply_rotary_emb utilities."""
 
-import logging
 from typing import Optional, Tuple
 
 import torch
