@@ -702,15 +702,16 @@ class LTX2DenoisingStage(DenoisingStage):
         timestep = (
             sigma.to(device=ctx.latents.device, dtype=torch.float32).expand(batch_size)
             if use_raw_sigma_timestep
-            else step.t_device.to(device=ctx.latents.device, dtype=torch.float32).expand(
-                batch_size
-            )
+            else step.t_device.to(
+                device=ctx.latents.device, dtype=torch.float32
+            ).expand(batch_size)
         )
         if ctx.denoise_mask is not None:
             if use_raw_sigma_timestep:
-                timestep_video = timestep.view(
-                    batch_size, *([1] * (ctx.denoise_mask.ndim - 1))
-                ) * ctx.denoise_mask
+                timestep_video = (
+                    timestep.view(batch_size, *([1] * (ctx.denoise_mask.ndim - 1)))
+                    * ctx.denoise_mask
+                )
             else:
                 timestep_video = timestep.unsqueeze(-1) * ctx.denoise_mask.squeeze(-1)
         elif use_raw_sigma_timestep:
@@ -1229,12 +1230,8 @@ class LTX2DenoisingStage(DenoisingStage):
                         if batch.do_classifier_free_guidance:
                             mid_v_u, mid_v_t = mid_v.chunk(2)
                             mid_a_u, mid_a_t = mid_a.chunk(2)
-                            mid_v = mid_v_u + batch.guidance_scale * (
-                                mid_v_t - mid_v_u
-                            )
-                            mid_a = mid_a_u + batch.guidance_scale * (
-                                mid_a_t - mid_a_u
-                            )
+                            mid_v = mid_v_u + batch.guidance_scale * (mid_v_t - mid_v_u)
+                            mid_a = mid_a_u + batch.guidance_scale * (mid_a_t - mid_a_u)
                         return mid_v, mid_a
                     finally:
                         ctx.latents = original_video_latents
