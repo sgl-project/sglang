@@ -304,26 +304,7 @@ We use SGLang's built-in benchmarking tool to conduct performance evaluation on 
 
 #### 5.1.1 Latency-Sensitive Benchmark
 
-- Model Deployment Command:
-
-```shell Command
-SGLANG_ENABLE_SPEC_V2=1 \
-SGLANG_ENABLE_THINKING=1 \
-SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 \
-sglang serve \
-  --trust-remote-code \
-  --model-path deepseek-ai/DeepSeek-V4-Flash \
-  --tp 4 \
-  --moe-runner-backend flashinfer_mxfp4 \
-  --speculative-algo EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --chunked-prefill-size 4096 \
-  --disable-flashinfer-autotune \
-  --host 0.0.0.0 \
-  --port 30000
-```
+- **Model Deployment Command:** use the [Interactive Command Generator](#3-model-deployment) with Hardware = **B200**, Model Variant = **Flash**, Recipe = **low-latency**.
 
 - Benchmark Command:
 
@@ -347,23 +328,7 @@ Pending update — replace with real bench_serving output after the latency run.
 
 #### 5.1.2 Throughput-Sensitive Benchmark
 
-- Model Deployment Command:
-
-```shell Command
-SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024 \
-SGLANG_ENABLE_THINKING=1 \
-SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 \
-sglang serve \
-  --trust-remote-code \
-  --model-path deepseek-ai/DeepSeek-V4-Flash \
-  --tp 4 \
-  --dp 4 \
-  --enable-dp-attention \
-  --moe-a2a-backend deepep \
-  --deepep-config '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}' \
-  --host 0.0.0.0 \
-  --port 30000
-```
+- **Model Deployment Command:** use the [Interactive Command Generator](#3-model-deployment) with Hardware = **B200**, Model Variant = **Flash**, Recipe = **max-throughput**.
 
 - Benchmark Command:
 
@@ -436,24 +401,7 @@ python3 benchmark/mmlu/bench_sglang.py --nsub 10 --port 30000
 
 #### 5.3.1 Latency-Sensitive Benchmark
 
-- Model Deployment Command:
-
-```shell Command
-SGLANG_DSV4_FP4_EXPERTS=0 \
-SGLANG_ENABLE_SPEC_V2=1 \
-SGLANG_ENABLE_THINKING=1 \
-SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 \
-sglang serve \
-  --trust-remote-code \
-  --model-path deepseek-ai/DeepSeek-V4-Flash \
-  --tp 4 \
-  --speculative-algo EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --host 0.0.0.0 \
-  --port 30000
-```
+- **Model Deployment Command:** use the [Interactive Command Generator](#3-model-deployment) with Hardware = **H200**, Model Variant = **Flash**, Recipe = **low-latency**.
 
 - Benchmark Command:
 
@@ -477,26 +425,7 @@ Pending update — replace with real bench_serving output after the latency run.
 
 #### 5.3.2 Throughput-Sensitive Benchmark
 
-- Model Deployment Command:
-
-```shell Command
-SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256 \
-SGLANG_DSV4_FP4_EXPERTS=0 \
-SGLANG_ENABLE_THINKING=1 \
-SGLANG_JIT_DEEPGEMM_PRECOMPILE=0 \
-sglang serve \
-  --trust-remote-code \
-  --model-path deepseek-ai/DeepSeek-V4-Flash \
-  --tp 4 \
-  --dp 4 \
-  --enable-dp-attention \
-  --moe-a2a-backend deepep \
-  --cuda-graph-max-bs 128 \
-  --max-running-requests 256 \
-  --deepep-config '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}' \
-  --host 0.0.0.0 \
-  --port 30000
-```
+- **Model Deployment Command:** use the [Interactive Command Generator](#3-model-deployment) with Hardware = **H200**, Model Variant = **Flash**, Recipe = **max-throughput**.
 
 - Benchmark Command:
 
