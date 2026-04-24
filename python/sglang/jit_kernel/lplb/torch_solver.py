@@ -1,15 +1,97 @@
 """
-IPM LP Solver — Pure PyTorch reference implementation.
+IPM LP Solver — dispatches to the fused cuBLASDx+cuSolverDx kernel when
+available, falls back to a pure-PyTorch reference implementation otherwise.
 
 Solves: min c^T x  subject to  Ax = b, x >= 0
 using a barrier (interior point) method with 5 iterations.
 
-This mirrors the CUDA kernel in csrc/minilp.cu but runs entirely
-in PyTorch for testing, prototyping, and as a fallback when the
-CUDA kernel is not available.
+The torch fallback mirrors the CUDA kernel in csrc/minilp.cu. Both backends
+expose the same 4-argument signature so users (e.g. LPLBSolver._solve_torch)
+get the fused kernel automatically without code changes.
 """
 
+import logging
+
 import torch
+
+logger = logging.getLogger(__name__)
+
+
+# Backend dispatch state (checked on first call, cached afterwards)
+_BACKEND_CHECKED = False
+_FUSED_AVAILABLE = False
+_FUSED_SOLVE_IPM = None  # type: ignore[assignment]
+_FUSED_WARMUP = None  # type: ignore[assignment]
+_FUSED_ASSERT_FITS = None  # type: ignore[assignment]
+_FUSED_REJECTED_SHAPES: set = set()  # (nc, nv) shapes that don't fit / failed
+
+
+def _init_fused_backend() -> None:
+    """Resolve the fused backend once. Records WHY it's disabled when it is."""
+    global _BACKEND_CHECKED, _FUSED_AVAILABLE
+    global _FUSED_SOLVE_IPM, _FUSED_WARMUP, _FUSED_ASSERT_FITS
+
+    if _BACKEND_CHECKED:
+        return
+    _BACKEND_CHECKED = True
+
+    if not torch.cuda.is_available():
+        logger.info("LPLB fused solver disabled: CUDA not available")
+        return
+
+    cap = torch.cuda.get_device_capability()
+    if cap[0] < 9:
+        logger.info(
+            f"LPLB fused solver disabled: GPU SM {cap[0]}.{cap[1]} < 9.0 "
+            "(requires Hopper or newer)"
+        )
+        return
+
+    try:
+        from sglang.jit_kernel.lplb.cublasdx_solver import (
+            solve_ipm as fused_solve_ipm,
+            warmup as fused_warmup,
+        )
+        from sglang.jit_kernel.lplb.shmem_budget import assert_fits
+    except ImportError as e:
+        logger.info(
+            f"LPLB fused solver disabled: {e}. "
+            "Install with: pip install 'nvmath-python[cu12-dx]==0.9.0' 'numba-cuda>=0.28.1'"
+        )
+        return
+
+    _FUSED_SOLVE_IPM = fused_solve_ipm
+    _FUSED_WARMUP = fused_warmup
+    _FUSED_ASSERT_FITS = assert_fits
+    _FUSED_AVAILABLE = True
+    logger.info("LPLB fused solver enabled (cuBLASDx + cuSolverDx)")
+
+
+def warmup(nc: int, nv: int, num_iters: int = 5, device: str = "cuda") -> None:
+    """Pre-JIT-compile the fused kernel for a given (NC, NV) shape.
+
+    Call this once per unique shape at solver construction time to hide the
+    20-40s JIT compilation cost. Safe to call even when the fused backend
+    is unavailable — becomes a no-op.
+    """
+    _init_fused_backend()
+    if not _FUSED_AVAILABLE:
+        return
+    try:
+        _FUSED_ASSERT_FITS(nc, nv, gpu="h100")
+    except ValueError as e:
+        logger.info(f"LPLB fused solver: shape (NC={nc}, NV={nv}) rejected: {e}")
+        _FUSED_REJECTED_SHAPES.add((nc, nv))
+        return
+    try:
+        _FUSED_WARMUP(nc, nv, num_iters=num_iters, device=device)
+        logger.info(f"LPLB fused solver: warmed up for (NC={nc}, NV={nv})")
+    except Exception as e:  # pragma: no cover
+        logger.warning(
+            f"LPLB fused solver: warmup failed for (NC={nc}, NV={nv}): {e}. "
+            "Falling back to torch IPM for this shape."
+        )
+        _FUSED_REJECTED_SHAPES.add((nc, nv))
 
 
 def solve_ipm(
@@ -20,6 +102,10 @@ def solve_ipm(
 ) -> torch.Tensor:
     """
     Barrier-method Interior Point solver for standard-form LP.
+
+    Dispatches to the fused cuBLASDx+cuSolverDx kernel when available
+    (Hopper+ GPU with nvmath-python[cu12-dx] installed, shape fits in shmem).
+    Falls back to the PyTorch reference implementation otherwise.
 
     Args:
         A: Constraint matrix, shape (NC, NV), float32, on CUDA.
@@ -36,6 +122,33 @@ def solve_ipm(
     assert b.shape == (nc,), f"b shape mismatch: {b.shape} vs ({nc},)"
     assert c.shape == (nv,), f"c shape mismatch: {c.shape} vs ({nv},)"
 
+    _init_fused_backend()
+    if (
+        _FUSED_AVAILABLE
+        and A.is_cuda
+        and A.dtype == torch.float32
+        and (nc, nv) not in _FUSED_REJECTED_SHAPES
+    ):
+        try:
+            return _FUSED_SOLVE_IPM(A, b, c, num_iters=num_iters)
+        except Exception as e:  # pragma: no cover
+            logger.warning(
+                f"LPLB fused solver: runtime failure for (NC={nc}, NV={nv}): {e}. "
+                "Falling back to torch IPM for this shape."
+            )
+            _FUSED_REJECTED_SHAPES.add((nc, nv))
+
+    return _solve_ipm_torch(A, b, c, num_iters=num_iters)
+
+
+def _solve_ipm_torch(
+    A: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    num_iters: int = 5,
+) -> torch.Tensor:
+    """Pure-PyTorch reference IPM — fallback when the fused backend is unavailable."""
+    nc, nv = A.shape
     x = torch.ones(nv, device=A.device, dtype=torch.float32)
 
     for _ in range(num_iters):
