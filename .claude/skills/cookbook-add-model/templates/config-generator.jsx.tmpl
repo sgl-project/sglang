@@ -615,7 +615,7 @@ export const __COMPONENT_NAME__ = () => {
                     locked && hwId !== h.id,
                     () => setHwId(h.id),
                     isVerified ? `${h.label} - verified by contributor` : h.label,
-                    undefined,
+                    h.vramGB ? `${h.vramGB}GB` : undefined,
                     isVerified,
                   );
                 })}

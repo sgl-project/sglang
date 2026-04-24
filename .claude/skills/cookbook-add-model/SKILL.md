@@ -196,7 +196,7 @@ Stamp from [templates/config-generator.jsx.tmpl](templates/config-generator.jsx.
 
 Template behavior:
 
-- Row 1: all 11 GPUs grouped by NVIDIA / AMD. Green dot means verified. Unverified combos have no dot and no warning banner.
+- Row 1: all 11 GPUs grouped by NVIDIA / AMD. Each hardware option should show its VRAM subtitle from the hardware reference table (for example `80GB`, `141GB`, `275GB`). Green dot means verified. Unverified combos have no dot and no warning banner.
 - Row 2: model variant buttons only. Do not mix quantization into the variant label unless the model itself is quantization-specific.
 - Row 3: quantization buttons for the selected model variant. Quantization choices come from the HuggingFace model card / linked repos. BF16 is the default when available.
 - Row 4: strategy checkboxes. TP is required. EP shows only for applicable MoE configs. MTP shows only when confirmed by the selected variant/quantization. Optimized appears here, not in features, and is enabled only when the selected strategy profile has a matching verbatim optimized command. PP is intentionally hidden for now.
@@ -300,6 +300,7 @@ Can be triggered with `/cookbook-add-model review`.
 - [ ] No bare module imports.
 - [ ] All CONFIG, helpers, styles, and render code are closure-scoped inside the component.
 - [ ] All 11 GPUs are present and grouped NVIDIA / AMD.
+- [ ] Hardware options display the correct VRAM subtitle from the hardware reference.
 - [ ] Every variant has a parsed `reference` command.
 - [ ] `verified` covers only tested combos.
 - [ ] Optional env prefixes are preserved only where confirmed.
