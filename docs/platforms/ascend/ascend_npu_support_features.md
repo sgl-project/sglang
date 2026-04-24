@@ -305,7 +305,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--offload-group-size`    | `-1`     | Type: int (DeepSeek only)  |      A2, A3      |
 | `--offload-num-in-group`  | `1`      | Type: int (DeepSeek only)  |      A2, A3      |
 | `--offload-prefetch-step` | `1`      | Type: int (DeepSeek only)  |      A2, A3      |
-| `--offload-mode`          | `cpu`    | `cpu` (DeepSeek only) <br/>`meta` (DeepSeek only) <br/>`sharded_gpu` (DeepSeek only) |      A2, A3      |
+| `--offload-mode`          | `cpu`    | `cpu` (DeepSeek only) <br/>`meta` (DeepSeek only) <br/>`sharded_gpu` (DeepSeek only, only support tp=1 dp>1) |      A2, A3      |
 
 ## Args for multi-item scoring
 

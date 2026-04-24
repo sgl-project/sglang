@@ -6,7 +6,16 @@ import os
 import time
 from typing import List, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Path, Query, UploadFile
+from fastapi import (
+    APIRouter,
+    File,
+    Form,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi.responses import FileResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
@@ -31,6 +40,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.observability.trace import extract_trace_headers
 
 router = APIRouter(prefix="/v1/images", tags=["images"])
 logger = init_logger(__name__)
@@ -118,6 +128,7 @@ def _build_image_response_kwargs(
 @router.post("/generations", response_model=ImageResponse)
 async def generations(
     request: ImageGenerationsRequest,
+    raw_request: Request,
 ):
     request_id = generate_request_id()
     server_args = get_global_server_args()
@@ -148,9 +159,11 @@ async def generations(
             perf_dump_path=request.perf_dump_path,
             use_pe=_get_extra_field(request, "use_pe"),
         )
+        trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
             server_args=server_args,
             sampling_params=sampling,
+            external_trace_header=trace_headers,
         )
         # Add diffusers_kwargs if provided
         if request.diffusers_kwargs:
@@ -199,6 +212,7 @@ async def generations(
 
 @router.post("/edits", response_model=ImageResponse)
 async def edits(
+    raw_request: Request,
     image: Optional[List[UploadFile]] = File(None),
     image_array: Optional[List[UploadFile]] = File(None, alias="image[]"),
     url: Optional[List[str]] = Form(None),
@@ -284,9 +298,11 @@ async def edits(
             upscaling_model_path=upscaling_model_path,
             upscaling_scale=upscaling_scale,
         )
+        trace_headers = extract_trace_headers(raw_request.headers)
         batch = prepare_request(
             server_args=server_args,
             sampling_params=sampling,
+            external_trace_header=trace_headers,
         )
         save_file_path_list, result = await process_generation_batch(
             async_scheduler_client, batch

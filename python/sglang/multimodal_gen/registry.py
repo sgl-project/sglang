@@ -99,6 +99,7 @@ from sglang.multimodal_gen.configs.sample.hunyuan import (
 from sglang.multimodal_gen.configs.sample.hunyuan3d import Hunyuan3DSamplingParams
 from sglang.multimodal_gen.configs.sample.ltx_2 import (
     LTX2SamplingParams,
+    LTX23HQSamplingParams,
     LTX23SamplingParams,
 )
 from sglang.multimodal_gen.configs.sample.mova import (
@@ -631,6 +632,11 @@ def _register_configs():
         model_detectors=[
             lambda path: "ltx-2.3" in path.lower(),
         ],
+    )
+    # register dedicated sampling params for LTX2TwoStageHQPipeline
+    _PIPELINE_CONFIG_REGISTRY.setdefault(
+        "LTX2TwoStageHQPipeline",
+        (LTX2PipelineConfig, LTX23HQSamplingParams),
     )
 
     # Hunyuan

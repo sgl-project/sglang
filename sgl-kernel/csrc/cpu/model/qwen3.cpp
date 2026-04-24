@@ -72,7 +72,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_re
     int64_t num_heads_v,
     int64_t head_qk,
     int64_t head_v) {
-  RECORD_FUNCTION("sgl-kernel::fused_qkvzba_split_reshape_cat_cpu", std::vector<c10::IValue>({mixed_qkvz, mixed_ba}));
   CHECK_DIM(2, mixed_qkvz);
   CHECK_DIM(2, mixed_ba);
   CHECK_INPUT(mixed_qkvz);
