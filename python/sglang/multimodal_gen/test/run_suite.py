@@ -65,7 +65,7 @@ FILE_SUITES = {
         "test_component_accuracy_2_gpu.py",
     ],
     "1-gpu-b200": [
-        "test_server_c.py",
+        "test_server_b200.py",
     ],
 }
 

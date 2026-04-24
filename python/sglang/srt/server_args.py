@@ -624,6 +624,7 @@ class ServerArgs:
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
+    enable_breakable_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
@@ -2033,6 +2034,17 @@ class ServerArgs:
             if self.is_attention_backend_not_set():
                 self.attention_backend = "triton"
                 logger.info("Use triton as default attention backend for Gemma4")
+        elif model_arch == "MossVLForConditionalGeneration":
+            if self.is_attention_backend_not_set():
+                self.prefill_attention_backend = "flashinfer"
+                logger.info(
+                    "Use flashinfer as default prefill attention backend for Moss-VL"
+                )
+            prefill_backend, _ = self.get_attention_backends()
+            assert prefill_backend == "flashinfer", (
+                "MossVLForConditionalGeneration requires flashinfer prefill "
+                "attention backend for cross-attention custom mask support."
+            )
         elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
                 logger.warning(
@@ -2407,7 +2419,7 @@ class ServerArgs:
         if current_platform.is_out_of_tree():
             return current_platform.get_default_attention_backend()
 
-        # Whisper requires flashinfer for cross-attention CUDA graph support
+        # Whisper requires flashinfer for cross-attention CUDA graph support.
         if "WhisperForConditionalGeneration" in (
             model_config.hf_config.architectures or []
         ):
@@ -4506,7 +4518,7 @@ class ServerArgs:
             "--device",
             type=str,
             default=ServerArgs.device,
-            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
+            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu', 'musa'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -5840,6 +5852,11 @@ class ServerArgs:
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--enable-breakable-cuda-graph",
+            action="store_true",
+            help="Use breakable CUDA graph for piecewise capture instead of torch.compile-based splitting.",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",
