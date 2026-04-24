@@ -31,6 +31,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
+from sglang.srt.utils.common import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -1093,28 +1094,41 @@ class SchedulerPPMixin:
         next_pp_outputs = None
         d2h_event = None
         batch_result = None
-        send_output_work = self._pp_send_output_to_next_stage(
-            next_first_rank_mb_id,
-            mbs,
-            last_rank_comm_queue,
-            pp_outputs,
-        )
+        send_output_work = []
 
-        if mbs[next_mb_id] is not None:
-            with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
-                next_pp_outputs = None
+        def send_output():
+            nonlocal send_output_work
+            send_output_work = self._pp_send_output_to_next_stage(
+                next_first_rank_mb_id,
+                mbs,
+                last_rank_comm_queue,
+                pp_outputs,
+            )
+
+        def recv_output():
+            nonlocal next_pp_outputs, d2h_event, batch_result
+            if mbs[next_mb_id] is not None:
+                with torch.profiler.record_function("recv_res_dict_from_prev_stage"):
+                    next_pp_outputs = None
+                    if not mbs[next_mb_id].forward_mode.is_prebuilt():
+                        next_pp_outputs = PPProxyTensors(
+                            self._pp_recv_dict_from_prev_stage()
+                        )
                 if not mbs[next_mb_id].forward_mode.is_prebuilt():
-                    next_pp_outputs = PPProxyTensors(
-                        self._pp_recv_dict_from_prev_stage()
-                    )
-            if not mbs[next_mb_id].forward_mode.is_prebuilt():
-                with self.copy_stream_ctx:
-                    self.copy_stream.wait_stream(self.schedule_stream)
-                    batch_result = self._pp_prep_batch_result(
-                        mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
-                    )
-                    d2h_event = torch.cuda.Event()
-                    d2h_event.record(torch.cuda.current_stream())
+                    with self.copy_stream_ctx:
+                        self.copy_stream.wait_stream(self.schedule_stream)
+                        batch_result = self._pp_prep_batch_result(
+                            mbs[next_mb_id], mb_metadata[next_mb_id], next_pp_outputs
+                        )
+                        d2h_event = torch.cuda.Event()
+                        d2h_event.record(torch.cuda.current_stream())
+
+        if is_npu() and self.pp_size == 2 and self.pp_group.is_first_rank:
+            recv_output()
+            send_output()
+        else:
+            send_output()
+            recv_output()
 
         return next_pp_outputs, batch_result, d2h_event, send_output_work
 
