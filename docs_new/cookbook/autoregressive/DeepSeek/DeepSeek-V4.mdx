@@ -63,11 +63,6 @@ import { DeepSeekV4Deployment } from "/src/snippets/autoregressive/deepseek-v4-d
 
 {/* TODO: expand this section as more recipes are validated end-to-end. */}
 
-**Hardware → quantization mapping**
-
-- B200 / GB300 use the FP4 checkpoint (`--moe-runner-backend flashinfer_mxfp4`). Always pair `flashinfer_mxfp4` with `--disable-flashinfer-autotune` — the autotune dummy run clashes with the FP4 MoE kernel and produces garbled output otherwise.
-- H200 uses the FP8 checkpoint. FP4 MoE kernels require Blackwell.
-
 **TP / DP sizing**
 
 | Model Size | B200 | GB300 | H200                |
