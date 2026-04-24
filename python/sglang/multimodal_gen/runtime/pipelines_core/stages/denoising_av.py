@@ -329,13 +329,16 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         self.scheduler = copy.deepcopy(original_scheduler)
         distilled_device = self.scheduler.sigmas.device
         num_steps = len(self.distilled_sigmas) - 1
-        # LTX-2.3 two-stage extends the stage-2 sigma schedule so the final
-        # step targets a small non-zero sigma (0.0011) instead of 0.0. This
-        # matches the official res2s loop (avoids the `sigma_next==0`
-        # singularity in `_ltx2_res2s_sde_step`) and is nearly a no-op for
-        # euler — the final step's `dt` shifts by 0.0011. LTX-2 (non-2.3)
-        # two-stage baselines were pinned to the un-extended schedule.
-        if is_ltx23 and self.distilled_sigmas[-1].item() == 0.0:
+        # Inject `0.0011` before the terminal `0.0` to avoid the
+        # `sigma_next==0` singularity in res2s' `(sample - denoised) /
+        # (sigma - sigma_next)`. Official `res2s_denoising_loop` does this
+        # exact injection (samplers.py:262); official `euler_denoising_loop`
+        # does NOT — it uses `sigma_next` directly. So gate on the active
+        # sampler, not on the model variant.
+        if (
+            self.sampler_name == "res2s"
+            and self.distilled_sigmas[-1].item() == 0.0
+        ):
             scheduler_sigmas = torch.cat(
                 [
                     self.distilled_sigmas[:-1],
