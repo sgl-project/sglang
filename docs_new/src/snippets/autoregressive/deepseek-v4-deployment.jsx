@@ -137,12 +137,11 @@ export const DeepSeekV4Deployment = () => {
     "b200|big":    { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 8,  multinode: false },
     "gb300|small": { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4,  multinode: false },
     "gb300|big":   { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 4,  multinode: false },
-    // H200 needs a separate FP8-only Instruct ckpt (Flash / Pro public repos
-    // ship FP4-mixed weights). That ckpt is still being uploaded, so we emit a
-    // placeholder that fails loudly on copy-paste instead of silently pulling
-    // the wrong weights. Replace with the real slug once Hopper ckpts are public.
-    "h200|small":  { slug: "<TO_BE_UPLOADED_DeepSeek-V4-Flash-hopper>", tp: 4,  multinode: false },
-    "h200|big":    { slug: "<TO_BE_UPLOADED_DeepSeek-V4-Pro-hopper>",   tp: 16, multinode: true, nnodes: 2 },
+    // H200 needs an FP8-only Instruct ckpt (deepseek-ai's Flash/Pro repos ship
+    // FP4-mixed weights that Hopper can't run). sgl-project publishes FP8
+    // repackagings; Flash is public, Pro is still being uploaded.
+    "h200|small":  { slug: "sgl-project/DeepSeek-V4-Flash-FP8",        tp: 4,  multinode: false },
+    "h200|big":    { slug: "<TO_BE_UPLOADED_DeepSeek-V4-Pro-FP8>",     tp: 16, multinode: true, nnodes: 2 },
   };
   // Per (hardware, modelSize) PD role TP (from allinone _PD_SPEC).
   const PD_TP_SPEC = {
