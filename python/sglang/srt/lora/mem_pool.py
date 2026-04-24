@@ -757,7 +757,7 @@ class LoRAMemoryPool:
                             temp_A_buffer[target_module] = (
                                 module.slice_moe_lora_a_weights(
                                     temp_A_buffer[target_module],
-                                    self.tp_rank,
+                                    self.moe_tp_rank,
                                     target_module,
                                 )
                             )
@@ -765,7 +765,7 @@ class LoRAMemoryPool:
                             temp_B_buffer[target_module] = (
                                 module.slice_moe_lora_b_weights(
                                     temp_B_buffer[target_module],
-                                    self.tp_rank,
+                                    self.moe_tp_rank,
                                     target_module,
                                 )
                             )
