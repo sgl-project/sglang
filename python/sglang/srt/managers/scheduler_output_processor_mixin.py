@@ -94,6 +94,9 @@ class SchedulerOutputProcessorMixin:
 
     def maybe_collect_routed_experts(self: Scheduler, req: Req):
         """Collect routed experts for a finished request."""
+        if not req.return_routed_experts:
+            req.routed_experts = None
+            return
         req.routed_experts = get_global_experts_capturer().get_routed_experts(
             req_pool_idx=req.req_pool_idx,
             seqlen=req.seqlen,

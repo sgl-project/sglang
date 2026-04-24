@@ -600,6 +600,9 @@ class ServerArgs:
     expert_offload_draft_model: bool = (
         False  # whether expert offload also applies to speculative draft workers
     )
+    expert_offload_decode_debug_log: bool = (
+        False  # enable verbose decode-time expert-offload diagnostics
+    )
     runtime_is_draft_worker: bool = dataclasses.field(
         default=False,
         init=False,
@@ -5277,6 +5280,13 @@ class ServerArgs:
             help="Also enable expert offloading for speculative draft-model MoE layers. "
             "By default, draft workers skip expert offload even when the target "
             "model uses it, which makes A/B comparison against target-only offload easier.",
+        )
+        parser.add_argument(
+            "--expert-offload-decode-debug-log",
+            action="store_true",
+            default=ServerArgs.expert_offload_decode_debug_log,
+            help="Enable verbose decode-time expert-offload diagnostics, including "
+            "frequency warmup capture and routed-expert debug logs. Disabled by default.",
         )
 
         # Diffusion LLM

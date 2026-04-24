@@ -348,19 +348,22 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
         expert_offload_prefix = (
-            "[ExpertOffload][draft]" if self.is_draft_worker else "[ExpertOffload][target]"
+            "[ExpertOffload][draft]"
+            if self.is_draft_worker
+            else "[ExpertOffload][target]"
         )
-        if (
-            self.server_args.expert_offload_num_resident >= 0
-            and (self.draft_model_idx in (None, 0))
+        if self.server_args.expert_offload_num_resident >= 0 and (
+            self.draft_model_idx in (None, 0)
         ):
             if self.is_draft_worker:
                 logger.info(
                     "%s %s expert offload for MoE layers.",
                     expert_offload_prefix,
-                    "enabled"
-                    if self.server_args.expert_offload_draft_model
-                    else "skipping",
+                    (
+                        "enabled"
+                        if self.server_args.expert_offload_draft_model
+                        else "skipping"
+                    ),
                 )
             else:
                 logger.info(
@@ -692,10 +695,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             num_fused_shared_experts = self.model.num_fused_shared_experts
         else:
             num_fused_shared_experts = 0
+        enable_frequency_warmup = (
+            self.server_args.expert_offload_num_resident >= 0
+            and self.server_args.expert_offload_resident_selection == "frequency"
+            and not self.is_draft_worker
+        )
 
         set_global_experts_capturer(
             RoutedExpertsCapturer.create(
-                enable=get_global_server_args().enable_return_routed_experts,
+                enable_return_routed_experts=get_global_server_args().enable_return_routed_experts,
+                enable_frequency_warmup=enable_frequency_warmup,
                 model_config=self.model_config,
                 num_fused_shared_experts=num_fused_shared_experts,
                 num_tokens=self.max_total_num_tokens + self.page_size,
@@ -2669,11 +2678,53 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         # Copy cached routing experts' buffers back to CPU cache
-        get_global_experts_capturer().on_forward_end(
+        experts_capturer = get_global_experts_capturer()
+        if (
+            self.server_args.expert_offload_num_resident >= 0
+            and self.server_args.expert_offload_resident_selection == "frequency"
+            and not self.is_draft_worker
+            and self.server_args.expert_offload_decode_debug_log
+        ):
+            logger.info(
+                "[ExpertOffload] FrequencyWarmupCapturerIdentity class=%s module=%s",
+                type(experts_capturer).__name__,
+                type(experts_capturer).__module__,
+            )
+        frequency_routed_experts = experts_capturer.on_forward_end(
             forward_batch=forward_batch,
             can_run_graph=output.can_run_graph,
             cuda_graph_batch=getattr(self.graph_runner, "bs", None),
         )
+        if (
+            self.server_args.expert_offload_num_resident >= 0
+            and self.server_args.expert_offload_resident_selection == "frequency"
+            and not self.is_draft_worker
+            and self.server_args.expert_offload_decode_debug_log
+        ):
+            capture_shape = (
+                tuple(frequency_routed_experts.shape)
+                if frequency_routed_experts is not None
+                else None
+            )
+            logger.info(
+                "[ExpertOffload] FrequencyWarmupCapture mode=%s can_run_graph=%s "
+                "capture_shape=%s cuda_graph_batch=%s out_cache_tokens=%s batch=%s",
+                forward_batch.forward_mode.name,
+                output.can_run_graph,
+                capture_shape,
+                getattr(self.graph_runner, "bs", None),
+                int(forward_batch.out_cache_loc.shape[0]),
+                getattr(forward_batch, "batch_size", -1),
+            )
+        if frequency_routed_experts is not None:
+            from sglang.srt.layers.moe.expert_offload import (
+                record_frequency_from_routed_experts_capture,
+            )
+
+            record_frequency_from_routed_experts_capture(
+                forward_batch=forward_batch,
+                captured_topk_ids=frequency_routed_experts,
+            )
 
         if self.eplb_manager is not None:
             self.eplb_manager.on_forward_pass_end()

@@ -1,4 +1,5 @@
 import logging
+import traceback
 from abc import ABC
 from typing import Optional
 
@@ -22,6 +23,12 @@ _GB = 1024 * 1024 * 1024
 _MB = 1024 * 1024
 
 
+def _should_log_decode_debug() -> bool:
+    return bool(
+        getattr(get_global_server_args(), "expert_offload_decode_debug_log", False)
+    )
+
+
 def get_tensor_size_bytes(t: torch.Tensor):
     return np.prod(t.shape) * t.dtype.itemsize
 
@@ -34,7 +41,9 @@ class _RoutedExpertsDeviceCache:
         num_experts_per_tok: int,
         num_fused_shared_experts: int,
         device: str,
+        label: str,
     ) -> None:
+        self.label = label
         self.buffer = torch.zeros(
             (
                 max(
@@ -63,7 +72,10 @@ class _RoutedExpertsDeviceCache:
         """Common logging and memory usage computation for captured experts buffers."""
         buffer_size_MB = self.get_buffer_size_bytes() / _MB
         logger.info(
-            f"Routing experts device buffer allocated. #shape: {tuple(self.buffer.shape)}, size: {buffer_size_MB:.2f} MB"
+            "%s allocated. #shape: %s, size: %.2f MB",
+            self.label,
+            tuple(self.buffer.shape),
+            buffer_size_MB,
         )
 
 
@@ -105,16 +117,19 @@ class _RoutedExpertsHostCache:
 class RoutedExpertsCapturer(ABC):
     @staticmethod
     def create(
-        enable: bool,
+        enable_return_routed_experts: bool,
+        enable_frequency_warmup: bool,
         model_config: ModelConfig,
         num_fused_shared_experts: int,
         num_tokens: int,
         max_running_requests: int,
         device: str,
     ):
-        if enable:
+        if enable_return_routed_experts or enable_frequency_warmup:
             return _RoutedExpertsCapturerReal(
                 model_config,
+                enable_return_routed_experts=enable_return_routed_experts,
+                enable_frequency_warmup=enable_frequency_warmup,
                 num_tokens=num_tokens,
                 max_running_requests=max_running_requests,
                 num_fused_shared_experts=num_fused_shared_experts,
@@ -132,6 +147,9 @@ class RoutedExpertsCapturer(ABC):
         raise NotImplementedError
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
+        raise NotImplementedError
+
+    def capture_frequency(self, layer_id: int, topk_ids: torch.Tensor):
         raise NotImplementedError
 
     def get_routed_experts(
@@ -158,6 +176,8 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
     def __init__(
         self,
         model_config: ModelConfig,
+        enable_return_routed_experts: bool,
+        enable_frequency_warmup: bool,
         num_tokens: int,
         max_running_requests: int,
         num_fused_shared_experts: int,
@@ -166,30 +186,61 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self.num_fused_shared_experts = num_fused_shared_experts
         self.num_hidden_layers = model_config.hf_text_config.num_hidden_layers
         self.num_experts_per_tok = model_config.hf_text_config.num_experts_per_tok
-
-        self.host_cache = _RoutedExpertsHostCache(
-            num_tokens=num_tokens,
-            num_hidden_layers=self.num_hidden_layers,
-            num_experts_per_tok=self.num_experts_per_tok,
+        logger.info(
+            "FrequencyWarmupCapturerInit enable_return_routed_experts=%s "
+            "enable_frequency_warmup=%s num_hidden_layers=%s num_experts_per_tok=%s "
+            "max_running_requests=%s num_tokens=%s",
+            enable_return_routed_experts,
+            enable_frequency_warmup,
+            self.num_hidden_layers,
+            self.num_experts_per_tok,
+            max_running_requests,
+            num_tokens,
         )
 
-        self.device_cache = _RoutedExpertsDeviceCache(
-            max_running_requests=max_running_requests,
-            num_hidden_layers=self.num_hidden_layers,
-            num_experts_per_tok=self.num_experts_per_tok,
-            num_fused_shared_experts=self.num_fused_shared_experts,
-            device=device,
+        self.host_cache = (
+            _RoutedExpertsHostCache(
+                num_tokens=num_tokens,
+                num_hidden_layers=self.num_hidden_layers,
+                num_experts_per_tok=self.num_experts_per_tok,
+            )
+            if enable_return_routed_experts
+            else None
         )
 
-    def _sync_fwd_experts_buffer_DtoH(
+        self.device_cache = (
+            _RoutedExpertsDeviceCache(
+                max_running_requests=max_running_requests,
+                num_hidden_layers=self.num_hidden_layers,
+                num_experts_per_tok=self.num_experts_per_tok,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                device=device,
+                label="Routing experts device buffer",
+            )
+            if enable_return_routed_experts
+            else None
+        )
+        self.frequency_device_cache = (
+            _RoutedExpertsDeviceCache(
+                max_running_requests=max_running_requests,
+                num_hidden_layers=self.num_hidden_layers,
+                num_experts_per_tok=self.num_experts_per_tok,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                device=device,
+                label="Routing experts frequency warmup buffer",
+            )
+            if enable_frequency_warmup
+            else None
+        )
+
+    def _get_forward_token_span(
         self,
         forward_batch: ForwardBatch,
         can_run_graph: bool,
         cuda_graph_batch: int,
-    ):
+    ) -> tuple[int, int]:
         if is_dp_attention_enabled():
             local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
-            # handle with cuda graph padding
             if can_run_graph:
                 local_start_pos = get_attention_dp_rank() * cuda_graph_batch
                 local_end_pos = local_start_pos + local_num_tokens
@@ -198,6 +249,19 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         else:
             local_start_pos = 0
             local_end_pos = forward_batch.out_cache_loc.shape[0]
+        return local_start_pos, local_end_pos
+
+    def _sync_fwd_experts_buffer_DtoH(
+        self,
+        forward_batch: ForwardBatch,
+        can_run_graph: bool,
+        cuda_graph_batch: int,
+    ):
+        if self.host_cache is None or self.device_cache is None:
+            return
+        local_start_pos, local_end_pos = self._get_forward_token_span(
+            forward_batch, can_run_graph, cuda_graph_batch
+        )
 
         # FIXME: sync explicitly here, overlap scheduler breaks here.
         out_cache_loc_cpu = forward_batch.out_cache_loc.cpu()
@@ -206,7 +270,12 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         ].cpu()
 
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
-        self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
+        if self.device_cache is not None:
+            self.device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
+
+    def capture_frequency(self, layer_id: int, topk_ids: torch.Tensor):
+        if self.frequency_device_cache is not None:
+            self.frequency_device_cache.capture_fwd_routed_experts(layer_id, topk_ids)
 
     def get_routed_experts(
         self,
@@ -214,10 +283,13 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         seqlen: int,
         req_to_token_pool: ReqToTokenPool,
     ):
+        host_cache = self.get_host_cache()
+        if host_cache is None:
+            return None
         cache_pool_idx = (
             req_to_token_pool.req_to_token[req_pool_idx][: seqlen - 1].cpu().clone()
         )
-        return self.get_host_cache().buffer[cache_pool_idx]
+        return host_cache.buffer[cache_pool_idx]
 
     def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
         self._sync_fwd_experts_buffer_DtoH(
@@ -225,6 +297,63 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
             can_run_graph=can_run_graph,
             cuda_graph_batch=cuda_graph_batch,
         )
+        if self.frequency_device_cache is None:
+            if _should_log_decode_debug():
+                logger.info(
+                    "FrequencyWarmupCaptureSkip mode=%s reason=no_frequency_device_cache "
+                    "can_run_graph=%s cuda_graph_batch=%s out_cache_tokens=%s",
+                    forward_batch.forward_mode.name,
+                    can_run_graph,
+                    cuda_graph_batch,
+                    int(forward_batch.out_cache_loc.shape[0]),
+                )
+            return None
+
+        if not forward_batch.forward_mode.is_target_verify():
+            if _should_log_decode_debug():
+                logger.info(
+                    "FrequencyWarmupCaptureSkip mode=%s reason=not_target_verify "
+                    "can_run_graph=%s cuda_graph_batch=%s out_cache_tokens=%s",
+                    forward_batch.forward_mode.name,
+                    can_run_graph,
+                    cuda_graph_batch,
+                    int(forward_batch.out_cache_loc.shape[0]),
+                )
+            return None
+
+        from sglang.srt.layers.moe.expert_offload import has_active_frequency_warmup
+
+        active_frequency_warmup = has_active_frequency_warmup()
+        if not active_frequency_warmup:
+            if _should_log_decode_debug():
+                logger.info(
+                    "FrequencyWarmupCaptureSkip mode=%s reason=inactive_frequency_warmup "
+                    "can_run_graph=%s cuda_graph_batch=%s out_cache_tokens=%s",
+                    forward_batch.forward_mode.name,
+                    can_run_graph,
+                    cuda_graph_batch,
+                    int(forward_batch.out_cache_loc.shape[0]),
+                )
+            return None
+
+        local_start_pos, local_end_pos = self._get_forward_token_span(
+            forward_batch, can_run_graph, cuda_graph_batch
+        )
+        captured = self.frequency_device_cache.buffer[
+            local_start_pos:local_end_pos
+        ].cpu()
+        if _should_log_decode_debug():
+            logger.info(
+                "FrequencyWarmupCaptureReturn mode=%s can_run_graph=%s "
+                "cuda_graph_batch=%s local_span=[%s:%s] capture_shape=%s",
+                forward_batch.forward_mode.name,
+                can_run_graph,
+                cuda_graph_batch,
+                local_start_pos,
+                local_end_pos,
+                tuple(captured.shape),
+            )
+        return captured
 
     def get_host_cache(self):
         return self.host_cache
@@ -248,6 +377,9 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
     def capture(self, layer_id: int, topk_ids: torch.Tensor):
         pass
 
+    def capture_frequency(self, layer_id: int, topk_ids: torch.Tensor):
+        pass
+
     def get_routed_experts(
         self,
         req_pool_idx: int,
@@ -257,7 +389,7 @@ class _RoutedExpertsCapturerNoop(RoutedExpertsCapturer):
         pass
 
     def on_forward_end(self, forward_batch, can_run_graph, cuda_graph_batch):
-        pass
+        return None
 
     def get_host_cache(self):
         pass
@@ -275,6 +407,30 @@ def get_global_experts_capturer():
 
 def set_global_experts_capturer(capturer: RoutedExpertsCapturer):
     global _global_expert_capturer
+    caller = traceback.extract_stack(limit=2)[0]
+    old_class = type(_global_expert_capturer).__name__
+    new_class = type(capturer).__name__
+    if (
+        old_class == "_RoutedExpertsCapturerReal"
+        and new_class == "_RoutedExpertsCapturerNoop"
+    ):
+        logger.info(
+            "SetGlobalExpertsCapturerIgnore old_class=%s new_class=%s caller=%s:%s:%s",
+            old_class,
+            new_class,
+            caller.filename,
+            caller.lineno,
+            caller.name,
+        )
+        return
+    logger.info(
+        "SetGlobalExpertsCapturer old_class=%s new_class=%s caller=%s:%s:%s",
+        old_class,
+        new_class,
+        caller.filename,
+        caller.lineno,
+        caller.name,
+    )
     _global_expert_capturer = capturer
 
 

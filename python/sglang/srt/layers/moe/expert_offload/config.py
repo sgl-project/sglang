@@ -43,11 +43,12 @@ class ExpertOffloadConfig:
     num_resident_experts: int  # experts whose pages are kept on GPU
     resident_selection: str  # "first_n" | "frequency" | "manual"
     resident_expert_ids: Optional[List[int]]  # explicit IDs for "manual" mode
-    warmup_tokens: int = 4096  # routed tokens to collect before readvise
+    warmup_tokens: int = 16384  # routed tokens to collect before readvise
     prefetch_num: int = 0  # 0 = disabled; N = prefetch top-N hot offloaded experts
     prefetch_depth: int = 1  # how many layers ahead to prefetch (1 = next layer only)
     memory_headroom_gib: int = 2  # GiB reserved for UVM page swapping
     is_draft_worker: bool = False
+    decode_debug_log: bool = False
 
     @property
     def num_offloaded_experts(self) -> int:
@@ -101,4 +102,5 @@ def create_expert_offload_config_from_server_args(
         prefetch_depth=server_args.expert_offload_prefetch_depth,
         memory_headroom_gib=server_args.expert_offload_memory_headroom,
         is_draft_worker=is_draft_worker,
+        decode_debug_log=server_args.expert_offload_decode_debug_log,
     )

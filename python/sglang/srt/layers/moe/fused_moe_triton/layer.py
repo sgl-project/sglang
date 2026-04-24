@@ -1016,14 +1016,6 @@ class FusedMoE(torch.nn.Module):
             hidden_states=hidden_states, topk_output=topk_output
         )
 
-        # Record expert routing frequencies for adaptive resident selection.
-        if (
-            isinstance(self.quant_method, ExpertOffloadWrapperMethod)
-            and self.quant_method.manager is not None
-            and not self.quant_method.manager._warmup_done
-        ):
-            self.quant_method.manager.record_expert_usage(topk_output.topk_ids, self)
-
         if _use_aiter and self.dispatcher.local_expert_mapping is not None:
             self.expert_mask_gpu = (
                 (

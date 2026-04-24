@@ -80,6 +80,7 @@ class ExpertOffloadManager:
         self._expert_freq: Optional[torch.Tensor] = None
         self._warmup_tokens: int = 0
         self._warmup_done: bool = False
+        self._next_warmup_progress_log: int = 1
 
         # Cross-layer prefetch state.
         self.next_layer_managers: List["ExpertOffloadManager"] = []
@@ -412,38 +413,82 @@ class ExpertOffloadManager:
     # Per-layer adaptive resident selection (warmup-then-readvise)
     # ------------------------------------------------------------------
 
-    # Minimum batch size to consider a forward pass as real prefill traffic.
-    # Pre-capture warmup and decode use small batch sizes with dummy/uniform
-    # routing -- their data would pollute the frequency distribution.
-    _MIN_TOKENS_FOR_FREQUENCY = 64
+    # Frequency warmup is now explicitly driven by target verify traffic.
+    # Verify batches can be as small as a single token and still represent the
+    # decode routing pattern we want to optimize for.
+    _TARGET_VERIFY_MIN_TOKENS_FOR_FREQUENCY = 1
+    _FREQUENCY_FORWARD_MODE = "TARGET_VERIFY"
+    _WARMUP_PROGRESS_LOG_STRIDE = 1024
 
     def record_expert_usage(
-        self, topk_ids: torch.Tensor, layer: torch.nn.Module
+        self,
+        topk_ids: torch.Tensor,
+        layer: torch.nn.Module,
+        forward_mode_name: str,
     ) -> None:
-        """Record expert routing frequencies from real prefill passes.
+        """Record expert routing frequencies from selected target-worker passes.
 
-        Only counts passes with >= ``_MIN_TOKENS_FOR_FREQUENCY`` tokens to
-        filter out dummy pre-capture warmup runs and single-token decode.
-        After accumulating ``config.warmup_tokens`` routed tokens, computes
-        the optimal per-layer resident set and calls ``cudaMemAdvise``.
+        Frequency warmup is intentionally limited to target verify traffic so
+        the final resident set reflects speculative decode verification rather
+        than prefill routing.
 
         Args:
             topk_ids: shape ``[num_tokens, top_k]``, expert indices chosen by
                 the router for the current forward pass.
             layer: the ``FusedMoE`` layer module (needed to access managed
                 tensors for ``cudaMemAdvise``/``cudaMemPrefetchAsync``).
+            forward_mode_name: name of the forward mode that produced
+                ``topk_ids``.
         """
-        if self._warmup_done or self.config.resident_selection != "frequency":
+        if not self._should_record_expert_usage(
+            forward_mode_name=forward_mode_name,
+            num_tokens=int(topk_ids.shape[0]),
+        ):
             return
 
-        # Skip during CUDA graph capture -- .cpu() is not permitted.
-        if torch.cuda.is_current_stream_capturing():
+        flat_ids = topk_ids.detach().reshape(-1)
+        flat_ids = flat_ids[
+            (flat_ids >= 0) & (flat_ids < self.config.num_local_experts)
+        ]
+        if flat_ids.numel() == 0:
             return
 
-        num_tokens = topk_ids.shape[0]
+        counts = torch.bincount(
+            flat_ids.to(dtype=torch.int64, device="cpu"),
+            minlength=self.config.num_local_experts,
+        )
+        self.record_expert_usage_counts(
+            counts=counts,
+            num_tokens=int(topk_ids.shape[0]),
+            layer=layer,
+            forward_mode_name=forward_mode_name,
+        )
 
-        # Ignore small batches (dummy warmup / decode leak).
-        if num_tokens < self._MIN_TOKENS_FOR_FREQUENCY:
+    def record_expert_usage_counts(
+        self,
+        counts: torch.Tensor,
+        num_tokens: int,
+        layer: torch.nn.Module,
+        forward_mode_name: str,
+    ) -> None:
+        """Record pre-aggregated expert routing frequencies for warmup."""
+        if not self._should_record_expert_usage(
+            forward_mode_name=forward_mode_name,
+            num_tokens=num_tokens,
+        ):
+            return
+
+        counts_cpu = counts.to(dtype=torch.int64, device="cpu")
+        if counts_cpu.numel() < self.config.num_local_experts:
+            padded = torch.zeros(
+                self.config.num_local_experts, dtype=torch.int64, device="cpu"
+            )
+            padded[: counts_cpu.numel()] = counts_cpu
+            counts_cpu = padded
+        elif counts_cpu.numel() > self.config.num_local_experts:
+            counts_cpu = counts_cpu[: self.config.num_local_experts]
+
+        if int(counts_cpu.sum().item()) == 0:
             return
 
         # Lazy-init the frequency tensor on first call.
@@ -452,14 +497,75 @@ class ExpertOffloadManager:
                 self.config.num_local_experts, dtype=torch.int64, device="cpu"
             )
 
-        # Accumulate frequencies on CPU.
-        ids_cpu = topk_ids.detach().reshape(-1).cpu()
-        counts = torch.bincount(ids_cpu, minlength=self.config.num_local_experts)
-        self._expert_freq += counts
-
-        self._warmup_tokens += num_tokens * topk_ids.shape[1]
+        self._expert_freq += counts_cpu
+        added_routed_tokens = int(counts_cpu.sum().item())
+        previous_warmup_tokens = self._warmup_tokens
+        self._warmup_tokens += added_routed_tokens
+        self._maybe_log_frequency_progress(
+            num_tokens=num_tokens,
+            added_routed_tokens=added_routed_tokens,
+            previous_warmup_tokens=previous_warmup_tokens,
+            top_counts=counts_cpu,
+        )
         if self._warmup_tokens >= self.config.warmup_tokens:
             self._readvise_from_frequency(layer)
+
+    def _should_record_expert_usage(
+        self, forward_mode_name: str, num_tokens: int
+    ) -> bool:
+        if self._warmup_done or self.config.resident_selection != "frequency":
+            return False
+        if forward_mode_name != self._FREQUENCY_FORWARD_MODE:
+            return False
+        return num_tokens >= self._TARGET_VERIFY_MIN_TOKENS_FOR_FREQUENCY
+
+    def _maybe_log_frequency_progress(
+        self,
+        num_tokens: int,
+        added_routed_tokens: int,
+        previous_warmup_tokens: int,
+        top_counts: torch.Tensor,
+    ) -> None:
+        if not self.config.decode_debug_log:
+            return
+        if added_routed_tokens <= 0:
+            return
+
+        should_log = previous_warmup_tokens == 0
+        while self._warmup_tokens >= self._next_warmup_progress_log:
+            should_log = True
+            self._next_warmup_progress_log += self._WARMUP_PROGRESS_LOG_STRIDE
+        if self._warmup_tokens >= self.config.warmup_tokens:
+            should_log = True
+        if not should_log:
+            return
+
+        nonzero_ids = torch.nonzero(top_counts > 0, as_tuple=False).flatten()
+        top_pairs: list[tuple[int, int]] = []
+        if nonzero_ids.numel() > 0:
+            pairs = [
+                (int(top_counts[eid].item()), int(eid.item())) for eid in nonzero_ids
+            ]
+            pairs.sort(key=lambda item: (-item[0], item[1]))
+            top_pairs = [(eid, count) for count, eid in pairs[:4]]
+
+        top_str = (
+            ", ".join(f"{eid}({count})" for eid, count in top_pairs)
+            if top_pairs
+            else "-"
+        )
+        logger.info(
+            "%s Layer %s: frequency warmup sample mode=%s verify_tokens=%s "
+            "added_routed_tokens=%s warmup_progress=%s/%s top=[%s]",
+            self.config.log_prefix,
+            self.config.layer_idx,
+            self._FREQUENCY_FORWARD_MODE,
+            num_tokens,
+            added_routed_tokens,
+            self._warmup_tokens,
+            self.config.warmup_tokens,
+            top_str,
+        )
 
     def _readvise_from_frequency(self, layer: torch.nn.Module) -> None:
         """Recompute resident set from frequency data and re-advise UVM pages."""
@@ -476,6 +582,14 @@ class ExpertOffloadManager:
 
         promoted = new_resident_set - old_resident_set
         demoted = old_resident_set - new_resident_set
+
+        logger.info(
+            "%s Layer %s: frequency warmup triggered readvise at %s/%s routed tokens",
+            self.config.log_prefix,
+            self.config.layer_idx,
+            self._warmup_tokens,
+            self.config.warmup_tokens,
+        )
 
         if not promoted and not demoted:
             logger.info(
@@ -502,15 +616,11 @@ class ExpertOffloadManager:
 
             # Promote: prefer GPU
             for eid in promoted:
-                uvm_advise(
-                    managed[eid], ADVISE_SET_PREFERRED_LOCATION, self.device_id
-                )
+                uvm_advise(managed[eid], ADVISE_SET_PREFERRED_LOCATION, self.device_id)
 
             # Demote: prefer CPU
             for eid in demoted:
-                uvm_advise(
-                    managed[eid], ADVISE_SET_PREFERRED_LOCATION, CUDA_CPU_DEVICE
-                )
+                uvm_advise(managed[eid], ADVISE_SET_PREFERRED_LOCATION, CUDA_CPU_DEVICE)
 
             # Prefetch promoted experts to GPU.
             if promoted:

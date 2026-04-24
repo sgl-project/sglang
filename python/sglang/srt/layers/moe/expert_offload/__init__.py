@@ -32,7 +32,10 @@ Pass ``--expert-offload-num-resident N`` to enable.  Additional options:
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Dict, List, Tuple
+
+import torch
 
 from sglang.srt.layers.moe.expert_offload.config import (
     ExpertOffloadConfig,
@@ -41,17 +44,18 @@ from sglang.srt.layers.moe.expert_offload.config import (
 from sglang.srt.layers.moe.expert_offload.wrapper import ExpertOffloadWrapperMethod
 
 if TYPE_CHECKING:
-    import torch
-
     from sglang.srt.layers.moe.expert_offload.manager import ExpertOffloadManager
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 __all__ = [
     "ExpertOffloadConfig",
     "ExpertOffloadWrapperMethod",
     "chain_managers",
     "create_expert_offload_config_from_server_args",
+    "has_active_frequency_warmup",
     "notify_decode_completed",
     "prepare_for_new_prefill",
+    "record_frequency_from_routed_experts_capture",
     "register_manager",
     "restore_after_prefill",
 ]
@@ -78,11 +82,19 @@ _decode_since_last_reset: bool = False
 # MoE layer the kernel hangs on.
 _tracing_prefill: bool = False
 
+logger = logging.getLogger(__name__)
+
 
 def _log_prefix() -> str:
     if _all_managers:
         return _all_managers[0][0].config.log_prefix
     return "[ExpertOffload]"
+
+
+def _should_log_decode_debug() -> bool:
+    if _all_managers:
+        return _all_managers[0][0].config.decode_debug_log
+    return False
 
 
 def register_manager(
@@ -129,6 +141,63 @@ def notify_decode_completed() -> None:
     """Mark that a decode step has run, so the next prefill triggers page reset."""
     global _decode_since_last_reset
     _decode_since_last_reset = True
+
+
+def has_active_frequency_warmup() -> bool:
+    """Return whether any target-worker frequency warmup is still collecting."""
+    return any(
+        mgr.config.resident_selection == "frequency"
+        and not mgr.config.is_draft_worker
+        and not mgr._warmup_done
+        for mgr, _ in _all_managers
+    )
+
+
+def record_frequency_from_routed_experts_capture(
+    forward_batch: "ForwardBatch", captured_topk_ids: "torch.Tensor | None"
+) -> None:
+    """Feed captured routed experts into frequency warmup after a forward ends."""
+    if captured_topk_ids is None or not has_active_frequency_warmup():
+        return
+    if not forward_batch.forward_mode.is_target_verify():
+        return
+
+    active_layers = 0
+    for mgr, layer in _all_managers:
+        if mgr.config.is_draft_worker or mgr.config.resident_selection != "frequency":
+            continue
+        if mgr._warmup_done or mgr.config.layer_idx >= captured_topk_ids.shape[1]:
+            continue
+
+        layer_topk = captured_topk_ids[:, mgr.config.layer_idx, :]
+        valid_ids = layer_topk[
+            (layer_topk >= 0) & (layer_topk < mgr.config.num_local_experts)
+        ]
+        if valid_ids.numel() == 0:
+            continue
+
+        active_layers += 1
+        counts = torch.bincount(
+            valid_ids.to(dtype=torch.int64, device="cpu"),
+            minlength=mgr.config.num_local_experts,
+        )
+        mgr.record_expert_usage_counts(
+            counts=counts,
+            num_tokens=int(layer_topk.shape[0]),
+            layer=layer,
+            forward_mode_name=forward_batch.forward_mode.name,
+        )
+
+    if active_layers > 0 and _should_log_decode_debug():
+        logger.info(
+            "%s FrequencyWarmupForward mode=%s tokens=%s active_layers=%s batch=%s can_record_verify=%s",
+            _log_prefix(),
+            forward_batch.forward_mode.name,
+            int(captured_topk_ids.shape[0]),
+            active_layers,
+            getattr(forward_batch, "batch_size", -1),
+            True,
+        )
 
 
 def prepare_for_new_prefill() -> None:
