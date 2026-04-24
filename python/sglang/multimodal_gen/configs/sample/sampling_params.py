@@ -193,6 +193,9 @@ class SamplingParams:
     rollout_return_dit_trajectory: bool = (
         False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
     )
+    # 0-indexed denoising-loop step filters; None = all steps.
+    rollout_sde_step_indices: list[int] | None = None
+    rollout_return_step_indices: list[int] | None = None
     # if True, disallow user params to override subclass-defined protected fields
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
