@@ -83,6 +83,27 @@ elif _is_hip:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
 
+if _is_cuda:
+    # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
+    # (the transformers backend path) to produce outputs that are numerically identical
+    # to HuggingFace `LlamaRMSNorm`: the cast from fp32 to the activation dtype happens
+    # BEFORE the weight multiply, so the multiply is done in the narrow dtype.
+    _jit_rmsnorm_hf_available = False
+    try:
+        from sglang.jit_kernel.rmsnorm_hf import (
+            is_supported_rmsnorm_hf_hidden_size,
+        )
+        from sglang.jit_kernel.rmsnorm_hf import rmsnorm_hf as _jit_rmsnorm_hf
+
+        _jit_rmsnorm_hf_available = True
+    except ImportError:
+
+        def is_supported_rmsnorm_hf_hidden_size(d: int) -> bool:
+            return False
+
+        _jit_rmsnorm_hf = None
+
+
 logger = logging.getLogger(__name__)
 
 if _is_npu:
@@ -199,6 +220,7 @@ class RMSNorm(MultiPlatformOp):
         if is_batch_invariant_mode_enabled():
             if (
                 residual is not None
+                or self.cast_x_before_out_mul
                 or get_global_server_args().rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
@@ -207,6 +229,23 @@ class RMSNorm(MultiPlatformOp):
                 self.weight.data,
                 self.variance_epsilon,
             )
+        if self.cast_x_before_out_mul and residual is None:
+            # Use HF-semantics kernel (cast to dtype before weight multiply).
+            if (
+                _jit_rmsnorm_hf_available
+                and x.dtype in (torch.float16, torch.bfloat16)
+                and self.weight.data.dtype == x.dtype
+                and is_supported_rmsnorm_hf_hidden_size(x.shape[-1])
+            ):
+                out = _jit_rmsnorm_hf(
+                    x.contiguous(), self.weight.data, self.variance_epsilon
+                )
+            else:
+                # Fallback: pure-Python HF semantics (already implemented in forward_native).
+                out = self.forward_native(x, None, None)
+            if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
         if residual is not None:
             # TODO: Ideally we want to have (hidden_states+residual)+post_residual_addition.
             # but right now we can only have hidden_states+(residual+post_residual_addition).
