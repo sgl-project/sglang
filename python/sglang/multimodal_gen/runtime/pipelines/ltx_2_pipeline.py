@@ -577,18 +577,25 @@ class LTX2TwoStageDeviceManager:
             module.to("cpu")
             return
 
+        pin_memory = bool(
+            self.server_args.pin_cpu_memory and torch.get_device_module().is_available()
+        )
         for name, param in module.named_parameters():
             snapshot = param_snapshots.get(name)
             if snapshot is None:
-                raise KeyError(
-                    f"Missing CPU parameter snapshot for {module_name}.{name}"
+                snapshot = self._clone_cpu_tensor_snapshot(
+                    param.data, pin_memory=pin_memory
                 )
+                param_snapshots[name] = snapshot
             param.data = snapshot
 
         for name, buffer in module.named_buffers():
             snapshot = buffer_snapshots.get(name)
             if snapshot is None:
-                raise KeyError(f"Missing CPU buffer snapshot for {module_name}.{name}")
+                snapshot = self._clone_cpu_tensor_snapshot(
+                    buffer.data, pin_memory=pin_memory
+                )
+                buffer_snapshots[name] = snapshot
             # Preserve runtime-updated buffers (e.g., lazily built caches) when
             # releasing back to CPU snapshots.
             if buffer.device.type == "cuda":
