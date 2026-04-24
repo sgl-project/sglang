@@ -217,6 +217,14 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the distilled refinement schedule on top of the shared AV denoiser."""
         batch.extra["ltx2_phase"] = "stage2"
+        pipeline = self.pipeline() if self.pipeline else None
+        ensure_phase_ready = (
+            getattr(pipeline, "ensure_ltx2_phase_ready", None)
+            if pipeline is not None
+            else None
+        )
+        if callable(ensure_phase_ready):
+            ensure_phase_ready("stage2")
         original_clean_latent_background = getattr(
             batch, "ltx2_ti2v_clean_latent_background", None
         )
