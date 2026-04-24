@@ -131,21 +131,24 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    if _is_hip and get_global_server_args().attention_backend == "aiter":
+    attn_backend = get_global_server_args().attention_backend
+    uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
+
+    if _is_hip and uses_triton_dispatch:
         # HIP-only: the legacy get_last_loc_triton kernel emits a
         # mixed-width int32->int64 store that Triton mis-compiles on HIP,
         # producing out-of-range last_loc values under EAGLE +
-        # page_size>1 + aiter unified attention. Route this combination
-        # through the int32-safe variant; other hardware and other
-        # attention backends keep the original dispatcher below.
+        # page_size>1 (e.g. with aiter unified attention or the triton
+        # attention backend). The bug is in the Triton HIP codegen, not
+        # in any particular attention backend, so route every HIP path
+        # that would otherwise use get_last_loc_triton through the
+        # int32-safe variant. Non-HIP hardware keeps the original
+        # dispatcher below.
         return get_last_loc_triton_safe(
             req_to_token, req_pool_indices_tensor, prefix_lens_tensor
         )
 
-    if (
-        get_global_server_args().attention_backend != "ascend"
-        and get_global_server_args().attention_backend != "torch_native"
-    ):
+    if uses_triton_dispatch:
         impl = get_last_loc_triton
     else:
         impl = get_last_loc_torch
