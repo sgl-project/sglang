@@ -2065,6 +2065,47 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.mamba_last_track_seqlen = mamba_track_seqlen_aligned
         mamba_track_seqlens_cpu.append(mamba_track_seqlen)
 
+    def _merge_mamba_tracking(self, other: "ScheduleBatch"):
+        """Merge mamba tracking tensors during batch merge."""
+        if self.mamba_track_mask is None and other.mamba_track_mask is None:
+            self.mamba_track_indices = None
+            self.mamba_track_mask = None
+            self.mamba_track_seqlens = None
+            return
+
+        other_bs = len(other.reqs)
+        if other_bs ==0:
+            return
+        device = self.device
+
+        # Decode requests need placeholder entries (no tracking needed).
+        if self.mamba_track_mask is not None:
+            self.mamba_track_mask = torch.cat(
+                [
+                    self.mamba_track_mask,
+                    torch.zeros(other_bs, dtype=torch.bool, device=device),
+                ]
+            )
+        if self.mamba_track_seqlens is not None:
+            self.mamba_track_seqlens = torch.cat(
+                [
+                    self.mamba_track_seqlens,
+                    torch.full((other_bs,), -1, dtype=torch.int64, device=device),
+                ]
+            )
+        if self.mamba_track_indices is not None:
+            decode_indices = other.mamba_track_indices
+            if decode_indices is None:
+                decode_indices = torch.stack(
+                    [
+                        r.mamba_ping_pong_track_buffer[r.mamba_next_track_idx]
+                        for r in other.reqs
+                    ]
+                ).to(torch.int64)
+            self.mamba_track_indices = torch.cat(
+                [self.mamba_track_indices, decode_indices.to(device=device)]
+            )
+
     def prepare_for_split_prefill(self):
         self.prepare_for_extend()
         # For split prefill, we need to set the forward mode to SPLIT_PREFILL
@@ -2503,9 +2544,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.seq_lens_sum += other.seq_lens_sum
         if self.output_ids is not None:
             self.output_ids = torch.cat([self.output_ids, other.output_ids])
-        self.mamba_track_indices = None
-        self.mamba_track_mask = None
-        self.mamba_track_seqlens = None
+        self._merge_mamba_tracking(other)
         if self.return_logprob and other.return_logprob:
             self.top_logprobs_nums.extend(other.top_logprobs_nums)
             self.token_ids_logprobs.extend(other.token_ids_logprobs)
