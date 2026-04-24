@@ -600,8 +600,15 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         )
 
 
-class Qwen35QKVParallelLinearWithLoRA(QKVParallelLinearWithLoRA):
-    """Route Qwen3.5's gated qkv LoRA through the torch backend."""
+class GatedQKVParallelLinearWithLoRA(QKVParallelLinearWithLoRA):
+    """Route gated-QKV LoRA through the torch backend.
+
+    Some hybrid LinearAttention models use ``attn_output_gate`` and therefore
+    expose a nonstandard qkv layout where the Q slice is doubled. The generic
+    Triton QKV path has been unreliable for that shape, so this wrapper keeps
+    the existing LoRA buffers but executes just this module via the torch-native
+    backend.
+    """
 
     def __init__(
         self,

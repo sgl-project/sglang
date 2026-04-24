@@ -710,16 +710,16 @@ class LoRAManager:
 
             lora_module = LinearAttnInProjQKVZWithLoRA(module, self.lora_backend)
         elif module_name.endswith("self_attn.qkv_proj") and (
-            getattr(self.base_hf_config, "model_type", "")
-            in {"qwen3_5", "qwen3_5_moe", "qwen3_5_text", "qwen3_5_moe_text"}
+            getattr(self.base_hf_config, "attn_output_gate", False)
             or getattr(
-                getattr(self.base_hf_config, "text_config", None), "model_type", ""
+                getattr(self.base_hf_config, "text_config", None),
+                "attn_output_gate",
+                False,
             )
-            in {"qwen3_5_text", "qwen3_5_moe_text"}
         ):
-            from sglang.srt.lora.layers import Qwen35QKVParallelLinearWithLoRA
+            from sglang.srt.lora.layers import GatedQKVParallelLinearWithLoRA
 
-            lora_module = Qwen35QKVParallelLinearWithLoRA(module, self.lora_backend)
+            lora_module = GatedQKVParallelLinearWithLoRA(module, self.lora_backend)
         else:
             lora_module = get_lora_layer(module, self.lora_backend)
         replace_submodule(self.base_model, module_name, lora_module)
