@@ -365,6 +365,7 @@ class ServerArgs:
     trust_remote_code: bool = False
     context_length: Optional[int] = None
     is_embedding: bool = False
+    prefill_only_disable_kv_cache: bool = False
     enable_multimodal: Optional[bool] = None
     revision: Optional[str] = None
     model_impl: str = "auto"
@@ -829,6 +830,31 @@ class ServerArgs:
     msprobe_dump_config: Optional[str] = None
 
     def __post_init__(self):
+        if self.prefill_only_disable_kv_cache:
+            # Two structural preconditions for the FA backend's fa_skip_kv_cache
+            # path (the only path that doesn't read or write the pool today):
+            # - chunked_prefill_size == -1 keeps a request in a single forward,
+            #   so K/V never has to be reused across prefill chunks.
+            # - disable_radix_cache stops the prefix cache from indexing pool
+            #   slots that no longer hold real data.
+            #
+            # We deliberately don't gate on is_embedding here; the same skip
+            # path applies to any prefill-only workload (scoring, rerank, etc.)
+            # that arranges for fa_skip_kv_cache to be active. If a user enables
+            # this flag in a mode that still does decode, NoOpMHATokenToKVPool's
+            # set_kv_buffer raises on the first cache write, surfacing the
+            # misuse loudly at the first forward instead of corrupting outputs.
+            if self.chunked_prefill_size != -1:
+                raise ValueError(
+                    "--prefill-only-disable-kv-cache requires --chunked-prefill-size=-1 so the FA backend "
+                    "takes the fa_skip_kv_cache path; otherwise the pool would be touched between prefill chunks."
+                )
+            if not self.disable_radix_cache:
+                raise ValueError(
+                    "--prefill-only-disable-kv-cache requires --disable-radix-cache because the radix cache "
+                    "indexes KV pool slots that no longer hold real data."
+                )
+
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
         """
@@ -4356,6 +4382,11 @@ class ServerArgs:
             "--is-embedding",
             action="store_true",
             help="Whether to use a CausalLM as an embedding model.",
+        )
+        parser.add_argument(
+            "--prefill-only-disable-kv-cache",
+            action="store_true",
+            help="Skip the physical KV cache allocation for prefill-only workloads. Only valid when --is-embedding and --chunked-prefill-size=-1 are set so the FA backend takes the fa_skip_kv_cache path (no layer reads or writes the cache). The scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
         )
         parser.add_argument(
             "--enable-multimodal",

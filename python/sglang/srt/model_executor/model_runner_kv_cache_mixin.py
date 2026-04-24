@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKVPoolFP4,
     MLATokenToKVPool,
     MLATokenToKVPoolFP4,
+    NoOpMHATokenToKVPool,
     NSATokenToKVPool,
     ReqToTokenPool,
 )
@@ -591,7 +592,12 @@ class ModelRunnerKVCacheMixin:
                         ),
                     )
                 else:
-                    self.token_to_kv_pool = MHATokenToKVPool(
+                    pool_cls = (
+                        NoOpMHATokenToKVPool
+                        if self.server_args.prefill_only_disable_kv_cache
+                        else MHATokenToKVPool
+                    )
+                    self.token_to_kv_pool = pool_cls(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
                         dtype=self.kv_cache_dtype,
