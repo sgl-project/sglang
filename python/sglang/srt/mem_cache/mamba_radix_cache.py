@@ -42,6 +42,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.kv_cache_events import (
+    KVCacheEventMixin,
+    split_node_hash_value,
+)
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
@@ -84,6 +88,8 @@ class TreeNode:
         self.hit_count = 0
         # store the host indices of KV cache
         self.host_value = None
+        # store hash values of each full-KV page
+        self.hash_value: Optional[List[str]] = None
 
         # for lru list, invariant:
         # 1. prev has greater last_access_time
@@ -368,7 +374,7 @@ class LRUList:
                 raise Exception(msg)
 
 
-class MambaRadixCache(BasePrefixCache):
+class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         assert isinstance(
             params.token_to_kv_pool_allocator, TokenToKVPoolAllocator
@@ -379,6 +385,7 @@ class MambaRadixCache(BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.enable_mamba_extra_buffer = params.enable_mamba_extra_buffer
+        self._init_kv_cache_events(params.enable_kv_cache_events)
 
         if not self.enable_mamba_extra_buffer:
             assert (
@@ -412,6 +419,7 @@ class MambaRadixCache(BasePrefixCache):
         self.root_node = TreeNode()
         self.root_node.key = RadixKey([], None)
         self.root_node.value = []
+        self.root_node.hash_value = []
         self.root_node.full_lock_ref = 1
         self.root_node.mamba_lock_ref = 1
         self.full_evictable_size_ = 0
@@ -421,6 +429,7 @@ class MambaRadixCache(BasePrefixCache):
         # LRU lists are used to maintain the order of eviction of the nodes in the tree
         self.full_lru_list = LRUList(mamba=False)
         self.mamba_lru_list = LRUList(mamba=True)
+        self._record_all_cleared_event()
 
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the matching prefix from the radix tree.
@@ -745,6 +754,7 @@ class MambaRadixCache(BasePrefixCache):
         self.mamba_lru_list.remove_node(x)
 
         # 3. delete the leaf node
+        self._record_remove_event(x)
         self._delete_leaf(x)
 
         # 4. Iteratively delete tombstone leaves to maintain invariant that leaf nodes are not tombstone
@@ -1038,6 +1048,9 @@ class MambaRadixCache(BasePrefixCache):
         child.key = child.key[split_len:]
         child.value = child.value[split_len:].clone()
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
+        new_node.hash_value, child.hash_value = split_node_hash_value(
+            child.hash_value, split_len, self.page_size
+        )
 
         # insert the new node and child into the lru lists, insert
         # parent first so that parent is after child in the lru list
@@ -1098,6 +1111,7 @@ class MambaRadixCache(BasePrefixCache):
             node.children[child_key] = new_node
             self.full_evictable_size_ += len(value)
             self.mamba_evictable_size_ += len(mamba_value)
+            self._record_store_event(new_node)
         elif node.mamba_value is None:  # add for mamba tombstone
             node.mamba_value = mamba_value
             self.full_lru_list.reset_node_mru(node)
@@ -1127,6 +1141,7 @@ class MambaRadixCache(BasePrefixCache):
                 node.parent.mamba_lock_ref == 0
             ), f"tombstone mamba_lock_ref should always be 0, {node.parent.full_lock_ref=}, {node.parent.mamba_lock_ref=}, {node.parent.id=}"
             # delete tombstone node evicts full tokens
+            self._record_remove_event(node.parent)
             self.token_to_kv_pool_allocator.free(node.parent.value)
             full_num_evicted += len(node.parent.value)
             self.full_lru_list.remove_node(node.parent)

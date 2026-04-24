@@ -34,11 +34,6 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-from sglang.srt.disaggregation.kv_events import (
-    AllBlocksCleared,
-    BlockRemoved,
-    BlockStored,
-)
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     EvictParams,
@@ -57,7 +52,11 @@ from sglang.srt.mem_cache.evict_policy import (
     MRUStrategy,
     PriorityStrategy,
 )
-from sglang.srt.mem_cache.hicache_storage import get_hash_str, hash_str_to_int64
+from sglang.srt.mem_cache.kv_cache_events import KVCacheEventMixin
+from sglang.srt.mem_cache.kv_cache_events import (
+    compute_node_hash_values as compute_node_hash_values,
+)
+from sglang.srt.mem_cache.kv_cache_events import split_node_hash_value
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -197,78 +196,16 @@ def get_child_key(key: RadixKey, page_size: int = 1):
         return (key.extra_key, plain_key)
 
 
-def compute_node_hash_values(node: "TreeNode", page_size: int) -> List[str]:
-    """Compute SHA256-based hash values for position-aware identification.
-
-    Args:
-        node: The TreeNode to compute hash values for
-        page_size: The page size for chunking tokens
-
-    Returns:
-        List of SHA256 hex strings, one per page
-    """
-    hash_values = []
-
-    # Get parent's last hash value if parent exists
-    parent_hash = None
-    if node.parent is not None and node.parent.hash_value is not None:
-        # Check if parent is root by checking if it has empty key
-        if len(node.parent.key) > 0 and len(node.parent.hash_value) > 0:
-            parent_hash = node.parent.hash_value[-1]
-
-    # Iterate through node's pages
-    for start in range(0, len(node.key), page_size):
-        page_tokens = node.key.token_ids[start : start + page_size]
-        if not page_tokens:
-            continue
-
-        # Use SHA256-based chaining via get_hash_str
-        hash_val = get_hash_str(page_tokens, prior_hash=parent_hash)
-        hash_values.append(hash_val)
-        parent_hash = hash_val
-
-    return hash_values
-
-
-def split_node_hash_value(
-    child_hash_value: Optional[List[str]], split_len: int, page_size: int
-) -> tuple[Optional[List[str]], Optional[List[str]]]:
-    """Split hash_value between parent and child nodes during node splitting.
-
-    Args:
-        child_hash_value: The hash_value list from the child node being split
-        split_len: The length at which to split (in tokens)
-        page_size: The page size for calculating number of pages
-
-    Returns:
-        Tuple of (new_node_hash_value, updated_child_hash_value)
-    """
-    if child_hash_value is None:
-        return None, None
-
-    if page_size == 1:
-        split_pages = split_len
-    else:
-        split_pages = split_len // page_size
-
-    new_node_hash = child_hash_value[:split_pages]
-    child_hash = child_hash_value[split_pages:]
-
-    return new_node_hash, child_hash
-
-
-class RadixCache(BasePrefixCache):
+class RadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         self.disable = params.disable
         self.req_to_token_pool = params.req_to_token_pool
         self.token_to_kv_pool_allocator = params.token_to_kv_pool_allocator
         self.page_size = params.page_size
-        self.enable_kv_cache_events = params.enable_kv_cache_events
+        self._init_kv_cache_events(params.enable_kv_cache_events)
         self.is_eagle = params.is_eagle
         self.disable_finished_insert = params.disable_finished_insert
         self.eviction_policy = params.eviction_policy.lower()
-
-        self.kv_event_queue = []
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -781,78 +718,6 @@ class RadixCache(BasePrefixCache):
                 stack.extend(cur_node.children.values())
 
         return ret_list
-
-    def _record_store_event(self, node: TreeNode):
-        # One BlockStored per ``page_size`` chunk.
-        if self.enable_kv_cache_events:
-            # Compute hash_value lazily if not already set
-            if node.hash_value is None:
-                node.hash_value = compute_node_hash_values(node, self.page_size)
-
-            # Get parent's last hash value for first page
-            parent_block_hash = None
-            if node.parent is not None and node.parent != self.root_node:
-                if (
-                    node.parent.hash_value is not None
-                    and len(node.parent.hash_value) > 0
-                ):
-                    parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
-
-            page_index = 0
-            for start in range(0, len(node.key), self.page_size):
-                page_tokens = node.key.token_ids[start : start + self.page_size]
-                if not page_tokens:
-                    continue
-
-                block_hash = hash_str_to_int64(node.hash_value[page_index])
-
-                self.kv_event_queue.append(
-                    BlockStored(
-                        block_hashes=[block_hash],
-                        parent_block_hash=parent_block_hash,
-                        token_ids=page_tokens,
-                        block_size=len(page_tokens),
-                        lora_id=None,
-                    )
-                )
-
-                parent_block_hash = block_hash
-                page_index += 1
-
-    def _record_remove_event(self, node: TreeNode):
-        # One BlockRemoved per chunk.
-        if self.enable_kv_cache_events:
-            # Compute hash_value lazily if not already set (must match what was stored)
-            if node.hash_value is None:
-                node.hash_value = compute_node_hash_values(node, self.page_size)
-
-            page_index = 0
-            for start in range(0, len(node.key), self.page_size):
-                page_tokens = node.key.token_ids[start : start + self.page_size]
-                if not page_tokens:
-                    continue
-
-                block_hash = hash_str_to_int64(node.hash_value[page_index])
-
-                self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
-
-                page_index += 1
-
-    def _record_all_cleared_event(self):
-        if self.enable_kv_cache_events:
-            self.kv_event_queue.append(AllBlocksCleared())
-
-    def take_events(self):
-        """Atomically takes all events and clears the queue.
-
-        Returns:
-            A list of KV cache events.
-        """
-        if not self.enable_kv_cache_events:
-            return []
-        events = self.kv_event_queue
-        self.kv_event_queue = []
-        return events
 
 
 if __name__ == "__main__":

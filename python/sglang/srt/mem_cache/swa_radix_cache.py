@@ -28,11 +28,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
-from sglang.srt.disaggregation.kv_events import (
-    AllBlocksCleared,
-    BlockRemoved,
-    BlockStored,
-)
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
@@ -44,14 +39,15 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.hicache_storage import hash_str_to_int64
+from sglang.srt.mem_cache.kv_cache_events import (
+    KVCacheEventMixin,
+    split_node_hash_value,
+)
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     _key_match_page_size1,
     _key_match_paged,
-    compute_node_hash_values,
     get_child_key,
-    split_node_hash_value,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
@@ -347,7 +343,7 @@ class LRUList:
             raise Exception(msg)
 
 
-class SWARadixCache(BasePrefixCache):
+class SWARadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         assert isinstance(params.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator)
         self.req_to_token_pool = params.req_to_token_pool
@@ -355,8 +351,7 @@ class SWARadixCache(BasePrefixCache):
         self.page_size = params.page_size
         self.disable = params.disable
         self.is_eagle = params.is_eagle
-        self.enable_kv_cache_events = params.enable_kv_cache_events
-        self.kv_event_queue = []
+        self._init_kv_cache_events(params.enable_kv_cache_events)
 
         if self.token_to_kv_pool_allocator:
             self.device = self.token_to_kv_pool_allocator.device
@@ -1212,71 +1207,6 @@ class SWARadixCache(BasePrefixCache):
             ret_list.append(cur_node)
             stack.extend(cur_node.children.values())
         return ret_list
-
-    def _ensure_hash_value(self, node: Optional[TreeNode]) -> None:
-        if node is None or node.hash_value is not None:
-            return
-        self._ensure_hash_value(node.parent)
-        node.hash_value = compute_node_hash_values(node, self.page_size)
-
-    def _record_store_event(self, node: TreeNode) -> None:
-        if not self.enable_kv_cache_events:
-            return
-
-        self._ensure_hash_value(node.parent)
-        self._ensure_hash_value(node)
-
-        parent_block_hash = None
-        if node.parent is not None and node.parent != self.root_node:
-            if node.parent.hash_value is not None and len(node.parent.hash_value) > 0:
-                parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
-
-        page_index = 0
-        for start in range(0, len(node.key), self.page_size):
-            page_tokens = node.key.token_ids[start : start + self.page_size]
-            if not page_tokens:
-                continue
-
-            block_hash = hash_str_to_int64(node.hash_value[page_index])
-            self.kv_event_queue.append(
-                BlockStored(
-                    block_hashes=[block_hash],
-                    parent_block_hash=parent_block_hash,
-                    token_ids=page_tokens,
-                    block_size=len(page_tokens),
-                    lora_id=None,
-                )
-            )
-
-            parent_block_hash = block_hash
-            page_index += 1
-
-    def _record_remove_event(self, node: TreeNode) -> None:
-        if not self.enable_kv_cache_events:
-            return
-
-        self._ensure_hash_value(node)
-
-        page_index = 0
-        for start in range(0, len(node.key), self.page_size):
-            page_tokens = node.key.token_ids[start : start + self.page_size]
-            if not page_tokens:
-                continue
-
-            block_hash = hash_str_to_int64(node.hash_value[page_index])
-            self.kv_event_queue.append(BlockRemoved(block_hashes=[block_hash]))
-            page_index += 1
-
-    def _record_all_cleared_event(self) -> None:
-        if self.enable_kv_cache_events:
-            self.kv_event_queue.append(AllBlocksCleared())
-
-    def take_events(self):
-        if not self.enable_kv_cache_events:
-            return []
-        events = self.kv_event_queue
-        self.kv_event_queue = []
-        return events
 
     def _print_helper(self, node: TreeNode, indent: int) -> None:
         """Prints the radix tree in a human-readable format."""

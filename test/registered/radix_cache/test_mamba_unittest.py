@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
+from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
@@ -31,6 +32,219 @@ class TestMamba(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         pass
+
+    def _create_mamba_radix_cache(self, enable_kv_cache_events=False):
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=1)
+        )
+
+        size = 128
+        dtype = torch.bfloat16
+        head_num = 2
+        head_dim = 64
+        num_layers = 8
+        global_interval = 4
+        max_num_reqs = 10
+        mamba_cache_size = 20
+        max_context_len = 128
+        device = "cuda"
+        full_attention_layer_ids = [
+            i for i in range(global_interval - 1, num_layers, global_interval)
+        ]
+        mamba_layers = [
+            i for i in range(num_layers) if i not in full_attention_layer_ids
+        ]
+        with envs.SGLANG_MAMBA_SSM_DTYPE.override("bfloat16"):
+            shape = Mamba2StateShape.create(
+                tp_world_size=1,
+                intermediate_size=128,
+                n_groups=2,
+                num_heads=2,
+                head_dim=64,
+                state_size=16,
+                conv_kernel=4,
+            )
+            mamba2_cache_params = Mamba2CacheParams(shape=shape, layers=mamba_layers)
+
+        req_to_token_pool = HybridReqToTokenPool(
+            size=max_num_reqs,
+            mamba_size=mamba_cache_size,
+            mamba_spec_state_size=max_num_reqs,
+            max_context_len=max_context_len,
+            device=device,
+            enable_memory_saver=False,
+            cache_params=mamba2_cache_params,
+            enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=3,
+        )
+        pool = HybridLinearKVPool(
+            size=size,
+            dtype=dtype,
+            page_size=1,
+            head_num=head_num,
+            head_dim=head_dim,
+            full_attention_layer_ids=full_attention_layer_ids,
+            enable_kvcache_transpose=False,
+            device=device,
+            enable_memory_saver=False,
+            mamba_pool=req_to_token_pool.mamba_pool,
+        )
+        allocator = TokenToKVPoolAllocator(
+            size=size,
+            dtype=dtype,
+            device=device,
+            kvcache=pool,
+            need_sort=False,
+        )
+        tree = MambaRadixCache(
+            params=CacheInitParams(
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                disable=False,
+                enable_kv_cache_events=enable_kv_cache_events,
+            )
+        )
+        return tree, allocator, req_to_token_pool
+
+    def _insert_mamba(self, tree, allocator, req_to_token_pool, token_ids):
+        kv_indices = allocator.alloc(len(token_ids))
+        self.assertIsNotNone(kv_indices)
+        mamba_value = req_to_token_pool.mamba_pool.alloc(1)
+        self.assertIsNotNone(mamba_value)
+        tree.insert(
+            InsertParams(
+                key=RadixKey(token_ids),
+                value=kv_indices,
+                mamba_value=mamba_value,
+            )
+        )
+
+    def test_mamba_kv_cache_events_store_full_blocks(self):
+        tree, allocator, req_to_token_pool = self._create_mamba_radix_cache(
+            enable_kv_cache_events=True
+        )
+        tree.take_events()
+
+        self._insert_mamba(tree, allocator, req_to_token_pool, [1, 2, 3])
+
+        events = tree.take_events()
+        stored_events = [e for e in events if isinstance(e, BlockStored)]
+        self.assertEqual(len(stored_events), 3)
+        self.assertEqual([e.token_ids for e in stored_events], [[1], [2], [3]])
+        self.assertIsNone(stored_events[0].parent_block_hash)
+        self.assertEqual(
+            stored_events[1].parent_block_hash,
+            stored_events[0].block_hashes[0],
+        )
+        self.assertEqual(
+            stored_events[2].parent_block_hash,
+            stored_events[1].block_hashes[0],
+        )
+
+    def test_mamba_kv_cache_events_ignore_mamba_tombstone(self):
+        tree, allocator, req_to_token_pool = self._create_mamba_radix_cache(
+            enable_kv_cache_events=True
+        )
+        tree.take_events()
+
+        self._insert_mamba(tree, allocator, req_to_token_pool, [1, 2, 3])
+        self._insert_mamba(tree, allocator, req_to_token_pool, [1, 2, 3, 4])
+        tree.take_events()
+
+        result = tree.evict(EvictParams(num_tokens=0, mamba_num=1))
+
+        self.assertGreaterEqual(result.mamba_num_evicted, 1)
+        events = tree.take_events()
+        self.assertEqual([e for e in events if isinstance(e, BlockRemoved)], [])
+
+    def test_mamba_kv_cache_events_full_eviction_removes(self):
+        tree, allocator, req_to_token_pool = self._create_mamba_radix_cache(
+            enable_kv_cache_events=True
+        )
+        tree.take_events()
+
+        self._insert_mamba(tree, allocator, req_to_token_pool, [10, 11, 12])
+        stored_hashes = [
+            e.block_hashes[0] for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+
+        result = tree.evict(EvictParams(num_tokens=1))
+
+        self.assertGreaterEqual(result.num_tokens_evicted, 1)
+        removed_hashes = [
+            e.block_hashes[0] for e in tree.take_events() if isinstance(e, BlockRemoved)
+        ]
+        self.assertEqual(removed_hashes, stored_hashes)
+
+    def test_mamba_kv_cache_events_split_preserves_remove_hashes(self):
+        tree, allocator, req_to_token_pool = self._create_mamba_radix_cache(
+            enable_kv_cache_events=True
+        )
+        tree.take_events()
+
+        self._insert_mamba(tree, allocator, req_to_token_pool, [1, 2, 3, 4])
+        first_stored_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        first_hashes = [e.block_hashes[0] for e in first_stored_events]
+        original_node = tree.root_node.children[1]
+        original_hash_value = list(original_node.hash_value)
+
+        self._insert_mamba(tree, allocator, req_to_token_pool, [1, 2, 9, 10])
+        second_stored_events = [
+            e for e in tree.take_events() if isinstance(e, BlockStored)
+        ]
+        second_hashes = [e.block_hashes[0] for e in second_stored_events]
+
+        shared_node = tree.root_node.children[1]
+        self.assertEqual(shared_node.key.token_ids, [1, 2])
+        self.assertEqual(shared_node.hash_value, original_hash_value[:2])
+        self.assertIn(3, shared_node.children)
+        self.assertIn(9, shared_node.children)
+
+        old_child = shared_node.children[3]
+        new_child = shared_node.children[9]
+        self.assertEqual(old_child.key.token_ids, [3, 4])
+        self.assertEqual(old_child.hash_value, original_hash_value[2:])
+        self.assertEqual(new_child.key.token_ids, [9, 10])
+        self.assertEqual(second_stored_events[0].parent_block_hash, first_hashes[1])
+
+        tree.evict(EvictParams(num_tokens=100))
+
+        removed_hashes = [
+            e.block_hashes[0] for e in tree.take_events() if isinstance(e, BlockRemoved)
+        ]
+        self.assertEqual(len(removed_hashes), len(first_hashes) + len(second_hashes))
+        for block_hash in first_hashes + second_hashes:
+            self.assertIn(block_hash, removed_hashes)
+
+    def test_mamba_kv_cache_events_tombstone_cleanup_removes(self):
+        tree, allocator, req_to_token_pool = self._create_mamba_radix_cache(
+            enable_kv_cache_events=True
+        )
+        tree.take_events()
+
+        self._insert_mamba(tree, allocator, req_to_token_pool, [1, 2, 3])
+        self._insert_mamba(tree, allocator, req_to_token_pool, [1, 2, 3, 4])
+        stored_by_tokens = {
+            tuple(e.token_ids): e.block_hashes[0]
+            for e in tree.take_events()
+            if isinstance(e, BlockStored)
+        }
+
+        tree.evict(EvictParams(num_tokens=0, mamba_num=1))
+        events = tree.take_events()
+        self.assertEqual([e for e in events if isinstance(e, BlockRemoved)], [])
+
+        tree.evict(EvictParams(num_tokens=1))
+
+        removed_hashes = [
+            e.block_hashes[0] for e in tree.take_events() if isinstance(e, BlockRemoved)
+        ]
+        self.assertIn(stored_by_tokens[(4,)], removed_hashes)
+        for token_id in [1, 2, 3]:
+            self.assertIn(stored_by_tokens[(token_id,)], removed_hashes)
 
     def test_hybrid_linear_kv_pool(self):
         size = 16
