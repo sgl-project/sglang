@@ -135,6 +135,18 @@ class LPLBSolver:
         # Store log2phy as int32 for kernel
         self.log2phy = log2phy.to(torch.int32).contiguous()
 
+        # Pre-JIT-compile the fused IPM kernel for this (NC, NV) shape so the
+        # 20-40s compile cost happens once at startup rather than on the first
+        # real request. No-op when the fused backend is unavailable.
+        nc = self.A_base.shape[0]
+        nv = self.A_base.shape[1] + 1  # +1 for Big-M column added in solve()
+        try:
+            from sglang.jit_kernel.lplb.torch_solver import warmup as _ipm_warmup
+
+            _ipm_warmup(nc, nv, num_iters=5, device=device)
+        except Exception as e:  # pragma: no cover
+            logger.warning(f"LPLB IPM warmup skipped: {e}")
+
     def solve(self, topk_ids: torch.Tensor) -> torch.Tensor:
         """
         Full LPLB pipeline: count -> all-reduce -> LP solve -> return log2phy_prob.
