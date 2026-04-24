@@ -30,6 +30,8 @@ from typing import (
 
 import torch
 import torch.nn.functional as F
+import triton
+import triton.language as tl
 
 try:
     from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
@@ -180,11 +182,16 @@ class TopKOutputChecker:
     def format_is_bypassed(topk_output: TopKOutput) -> TypeGuard[BypassedTopKOutput]:
         return isinstance(topk_output, BypassedTopKOutput)
 
+    @staticmethod
+    def format_is_packed(topk_output: TopKOutput) -> TypeGuard[PackedTopKOutput]:
+        return isinstance(topk_output, PackedTopKOutput)
+
 
 class TopKOutputFormat(IntEnum):
     STANDARD = auto()
     TRITON_KERNEL = auto()
     BYPASSED = auto()
+    PACKED = auto()
 
 
 @runtime_checkable
@@ -233,6 +240,22 @@ class BypassedTopKOutput(NamedTuple):
     @property
     def format(self) -> TopKOutputFormat:
         return TopKOutputFormat.BYPASSED
+
+
+class PackedTopKOutput(NamedTuple):
+    """Packed top-k output format used by FlashInfer TRT-LLM routed MoE.
+
+    ``packed_topk_ids`` is an int32 tensor of shape (num_tokens, top_k) where each
+    element encodes the expert id in the upper 16 bits and the bf16 routing
+    weight bits in the lower 16 bits, matching FlashInfer's packed layout.
+    """
+
+    packed_topk_ids: torch.Tensor
+    router_logits: torch.Tensor
+
+    @property
+    def format(self) -> TopKOutputFormat:
+        return TopKOutputFormat.PACKED
 
 
 # -------------------------------- TopK ---------------------------------------
@@ -308,6 +331,39 @@ class TopK(MultiPlatformOp):
             expert_location_dispatch_info=expert_location_dispatch_info,
         )
 
+    def _can_fuse_topk_and_pack(
+        self,
+        num_token_non_padded: Optional[torch.Tensor],
+        expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo],
+    ) -> bool:
+        """Whether topk+pack can run as a single fused Triton kernel.
+
+        The fused kernel implements raw-logits softmax topk, so it's only
+        eligible when no post-processing touches topk_ids (no grouping /
+        correction bias / custom routing / shared experts / EPLB dispatch /
+        padding mask / active distribution recorder).
+        """
+        cfg = self.topk_config
+        if cfg.scoring_func != "softmax":
+            return False
+        if cfg.correction_bias is not None:
+            return False
+        if cfg.use_grouped_topk:
+            return False
+        if cfg.custom_routing_function is not None:
+            return False
+        if cfg.num_fused_shared_experts != 0:
+            return False
+        if cfg.apply_routed_scaling_factor_on_output:
+            return False
+        if expert_location_dispatch_info is not None:
+            return False
+        if num_token_non_padded is not None:
+            return False
+        if get_global_expert_distribution_recorder().recording:
+            return False
+        return True
+
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
@@ -325,6 +381,8 @@ class TopK(MultiPlatformOp):
             or get_moe_runner_backend().is_flashinfer_mxfp4()
         ):
             output_format = TopKOutputFormat.BYPASSED
+        elif get_moe_runner_backend().is_flashinfer_trtllm_routed():
+            output_format = TopKOutputFormat.PACKED
         else:
             output_format = TopKOutputFormat.STANDARD
 
@@ -343,6 +401,35 @@ class TopK(MultiPlatformOp):
                 topk_config=self.topk_config,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
+            )
+        elif output_format == TopKOutputFormat.PACKED:
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                if self._can_fuse_topk_and_pack(
+                    num_token_non_padded, expert_location_dispatch_info
+                ):
+                    packed = fused_topk_softmax_pack_flashinfer_triton(
+                        gating_output=router_logits,
+                        topk=self.topk_config.top_k,
+                        renormalize=self.topk_config.renormalize,
+                    )
+                else:
+                    self.topk_config.torch_native = False
+                    std = select_experts(
+                        hidden_states=hidden_states,
+                        layer_id=self.layer_id,
+                        router_logits=router_logits,
+                        topk_config=self.topk_config,
+                        num_token_non_padded=num_token_non_padded,
+                        expert_location_dispatch_info=expert_location_dispatch_info,
+                    )
+                    packed = pack_topk_for_flashinfer_triton(
+                        std.topk_ids, std.topk_weights
+                    )
+            return PackedTopKOutput(
+                packed_topk_ids=packed,
+                router_logits=router_logits,
             )
         else:
             self.topk_config.torch_native = False
@@ -398,13 +485,19 @@ class TopK(MultiPlatformOp):
 
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
+        # FIXME: router_logits should be of size (0, num_experts)
+        router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
+        if get_moe_runner_backend().is_flashinfer_trtllm_routed():
+            with use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            ):
+                packed = torch.empty((0, topk), dtype=torch.int32, device=device)
+            return PackedTopKOutput(packed_topk_ids=packed, router_logits=router_logits)
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             topk_weights = torch.empty((0, topk), dtype=torch.float32, device=device)
             topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
-        # FIXME: router_logits should be of size (0, num_experts)
-        router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
 
@@ -469,6 +562,201 @@ def fused_topk_softmax_torch_raw_logits(
         topk_weights = F.softmax(topk_weights, dim=-1, dtype=torch.float32)
 
     return topk_weights.to(torch.float32), topk_ids.to(torch.int32)
+
+
+@triton.jit
+def _fused_topk_softmax_pack_flashinfer_kernel(
+    gating_ptr,  # (M, N) fp16/bf16/fp32
+    packed_ptr,  # (M, TOPK) int32 — (id << 16) | bf16_bits
+    stride_gm: tl.constexpr,
+    stride_gn: tl.constexpr,
+    stride_pm: tl.constexpr,
+    stride_pk: tl.constexpr,
+    N_EXPERTS: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    RENORMALIZE: tl.constexpr,
+):
+    """Fused topk + softmax + FlashInfer pack.
+
+    For each row of ``gating_ptr`` (shape ``N_EXPERTS``), selects the top-``TOPK``
+    experts by raw logit, optionally softmax-renormalizes the selected weights,
+    casts the weights to bf16, and packs ``(id << 16) | bf16_bits`` into int32
+    in FlashInfer's routed-MoE layout. Output order within a row is the greedy
+    max-selection order (sort order undefined, mirroring
+    ``torch.topk(..., sorted=False)``).
+
+    ``BLOCK_N`` and ``BLOCK_K`` must be powers of two >= ``N_EXPERTS`` and
+    ``TOPK`` respectively (Triton shape requirement).
+    """
+    pid = tl.program_id(0)
+
+    offs_n = tl.arange(0, BLOCK_N)
+    mask_n = offs_n < N_EXPERTS
+
+    row = tl.load(
+        gating_ptr + pid * stride_gm + offs_n * stride_gn,
+        mask=mask_n,
+        other=-float("inf"),
+    ).to(tl.float32)
+
+    # Register arrays sized at BLOCK_K (power-of-two), masked by TOPK. Writes
+    # via tl.where(arange == k, ...) act as a register-level scatter since the
+    # outer loop is unrolled by tl.static_range.
+    topk_vals = tl.full((BLOCK_K,), -float("inf"), dtype=tl.float32)
+    topk_ids = tl.full((BLOCK_K,), 0, dtype=tl.int32)
+    ks = tl.arange(0, BLOCK_K)
+
+    cur_row = row
+    for k in tl.static_range(TOPK):
+        cur_max = tl.max(cur_row, axis=0)
+        cur_arg = tl.argmax(cur_row, axis=0).to(tl.int32)
+        topk_vals = tl.where(ks == k, cur_max, topk_vals)
+        topk_ids = tl.where(ks == k, cur_arg, topk_ids)
+        # Mask the selected position out of further consideration.
+        cur_row = tl.where(offs_n == cur_arg, -float("inf"), cur_row)
+
+    # Unused slots (k >= TOPK) hold -inf; mask them out before softmax.
+    valid_k = ks < TOPK
+    if RENORMALIZE:
+        masked = tl.where(valid_k, topk_vals, -float("inf"))
+        v_max = tl.max(masked, axis=0)
+        ev = tl.where(valid_k, tl.exp(masked - v_max), 0.0)
+        ev_sum = tl.sum(ev, axis=0)
+        topk_weights = ev / ev_sum
+    else:
+        topk_weights = topk_vals
+
+    weights_bf16 = topk_weights.to(tl.bfloat16)
+    # View bf16 bits as int16, widen to int32 with sign-extension, OR with
+    # (id << 16). For non-negative weights (i.e. softmax outputs) sign-extend
+    # == zero-extend, so the id is preserved in the upper 16 bits — which is
+    # all FlashInfer's routed MoE accepts.
+    weights_bits = weights_bf16.to(tl.int16, bitcast=True).to(tl.int32)
+
+    packed = (topk_ids << 16) | weights_bits
+
+    tl.store(
+        packed_ptr + pid * stride_pm + ks * stride_pk,
+        packed,
+        mask=valid_k,
+    )
+
+
+def fused_topk_softmax_pack_flashinfer_triton(
+    gating_output: torch.Tensor,
+    topk: int,
+    renormalize: bool,
+) -> torch.Tensor:
+    """Single-kernel fused top-k softmax pack for FlashInfer TRT-LLM routed MoE.
+
+    Replaces ``fused_topk_softmax_torch_raw_logits`` followed by a separate
+    pack, which together launch many small kernels (topk, gather, softmax,
+    bf16 cast, bit-view, shift, OR). Returns a single int32 tensor of shape
+    ``(num_tokens, topk)`` in FlashInfer's packed format.
+    """
+    assert gating_output.dim() == 2
+    num_tokens, num_experts = gating_output.shape
+    assert 0 < topk <= num_experts
+
+    packed = torch.empty(
+        (num_tokens, topk), dtype=torch.int32, device=gating_output.device
+    )
+    if num_tokens == 0:
+        return packed
+
+    block_n = triton.next_power_of_2(num_experts)
+    block_k = triton.next_power_of_2(topk)
+    num_warps = 4 if block_n <= 256 else 8
+
+    _fused_topk_softmax_pack_flashinfer_kernel[(num_tokens,)](
+        gating_output,
+        packed,
+        stride_gm=gating_output.stride(0),
+        stride_gn=gating_output.stride(1),
+        stride_pm=packed.stride(0),
+        stride_pk=packed.stride(1),
+        N_EXPERTS=num_experts,
+        TOPK=topk,
+        BLOCK_N=block_n,
+        BLOCK_K=block_k,
+        RENORMALIZE=renormalize,
+        num_warps=num_warps,
+    )
+    return packed
+
+
+@triton.jit
+def _pack_topk_flashinfer_kernel(
+    topk_ids_ptr,  # (M, K)
+    topk_weights_ptr,  # (M, K) float
+    packed_ptr,  # (M, K) int32 — (id << 16) | bf16_bits
+    stride_im: tl.constexpr,
+    stride_ik: tl.constexpr,
+    stride_wm: tl.constexpr,
+    stride_wk: tl.constexpr,
+    stride_pm: tl.constexpr,
+    stride_pk: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs_k = tl.arange(0, BLOCK_K)
+    mask_k = offs_k < TOPK
+
+    ids = tl.load(
+        topk_ids_ptr + pid * stride_im + offs_k * stride_ik,
+        mask=mask_k,
+        other=0,
+    ).to(tl.int32)
+    weights = tl.load(
+        topk_weights_ptr + pid * stride_wm + offs_k * stride_wk,
+        mask=mask_k,
+        other=0.0,
+    ).to(tl.float32)
+
+    weights_bits = weights.to(tl.bfloat16).to(tl.int16, bitcast=True).to(tl.int32)
+    packed = (ids << 16) | weights_bits
+
+    tl.store(
+        packed_ptr + pid * stride_pm + offs_k * stride_pk,
+        packed,
+        mask=mask_k,
+    )
+
+
+def pack_topk_for_flashinfer_triton(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor
+) -> torch.Tensor:
+    """Triton replacement for the torch-op pack used by FlashInfer routed MoE.
+
+    Packs ``(topk_ids, topk_weights)`` into a single int32 tensor where each
+    lane holds ``(id << 16) | bf16_bits``. One Triton launch per batch, versus
+    the 4-5 small torch kernels the original helper required.
+    """
+    assert topk_ids.shape == topk_weights.shape
+    num_tokens, topk = topk_ids.shape
+    packed = torch.empty((num_tokens, topk), dtype=torch.int32, device=topk_ids.device)
+    if num_tokens == 0:
+        return packed
+
+    block_k = triton.next_power_of_2(topk)
+    _pack_topk_flashinfer_kernel[(num_tokens,)](
+        topk_ids,
+        topk_weights,
+        packed,
+        stride_im=topk_ids.stride(0),
+        stride_ik=topk_ids.stride(1),
+        stride_wm=topk_weights.stride(0),
+        stride_wk=topk_weights.stride(1),
+        stride_pm=packed.stride(0),
+        stride_pk=packed.stride(1),
+        TOPK=topk,
+        BLOCK_K=block_k,
+        num_warps=1,
+    )
+    return packed
 
 
 def fused_topk_cpu(
