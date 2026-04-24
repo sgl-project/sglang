@@ -149,12 +149,6 @@ curl http://localhost:30000/v1/chat/completions \
   }'
 ```
 
-**Output Example:**
-
-```text Output
-Pending update — replace with real server output after deployment.
-```
-
 > **PD-Disagg note**: if you deployed with the `pd-disagg` recipe from the generator above, the prefill server is on port `30000`, the decode server on `30001`, and the **router** on port `8000` — client traffic should target `http://localhost:8000`, not `:30000`.
 
 ### 4.2 Advanced Usage
