@@ -105,12 +105,7 @@ docker run --gpus all \
     --env "HF_TOKEN=<your-hf-token>" \
     --ipc=host \
     lmsysorg/sglang:deepseek-v4-blackwell \
-    sglang serve \
-        --model-path deepseek-ai/DeepSeek-V4-Flash \
-        --tp 4 \
-        --tool-call-parser deepseekv4 \
-        --reasoning-parser deepseek-v4 \
-        --host 0.0.0.0 --port 30000
+    sglang serve <use args below>
 ```
 
 ## 3. Model Deployment
