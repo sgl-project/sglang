@@ -152,12 +152,10 @@ class NPUW4A8MxFpLinearMethod(_NPULinearMethodBase):
 
 class NPUW4A4MxFp4LinearMethod(_NPULinearMethodBase):
     def process_weights_after_loading(self, layer: torch.nn.Module):
-        layer.weight.data = layer.weight.data.transpose(-1, -2).contiguous()
-        weight_scale = layer.weight_scale.data.transpose(-1, -2).contiguous()
-        k_group, n = weight_scale.shape
-        layer.weight_scale.data = (
-            weight_scale.view(k_group // 2, 2, n).permute(0, 2, 1).contiguous()
-        )
+        layer.weight.data = torch_npu.npu_format_cast(layer.weight.data, 29).transpose(0, 1)
+        weight_scale = layer.weight_scale.data
+        weight_scale = weight_scale.reshape(weight_scale.shape[0], weight_scale.shape[1] // 2, 2).transpose(0, 1)
+        layer.weight_scale.data = weight_scale
 
     def apply(
         self,
