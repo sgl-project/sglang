@@ -14,7 +14,8 @@ export const GLM51Deployment = () => {
         { id: 'b200',   label: 'B200',          default: false },
         { id: 'gb300',  label: 'GB300',         default: false },
         { id: 'h100',   label: 'H100',          default: false },
-        { id: 'mi300x', label: 'MI300X/MI325X', default: false },
+        { id: 'mi300x', label: 'MI300X',        default: false },
+        { id: 'mi325x', label: 'MI325X',        default: false },
         { id: 'mi355x', label: 'MI355X',        default: false }
       ]
     },
@@ -23,7 +24,7 @@ export const GLM51Deployment = () => {
       title: 'Quantization',
       getDynamicItems: (values) => {
         const hw = values.hardware;
-        const isAMD = hw === 'mi300x' || hw === 'mi355x';
+        const isAMD = ['mi300x', 'mi325x', 'mi355x'].includes(hw);
         const isGB300 = hw === 'gb300';
         return [
           { id: 'bf16', label: 'BF16', subtitle: 'Full Weights',    default: isAMD,  disabled: isGB300, disabledReason: isGB300 ? 'BF16 is not recommended on GB300 for GLM-5.1' : '' },
@@ -58,7 +59,7 @@ export const GLM51Deployment = () => {
     speculative: {
       name: 'speculative',
       title: 'Speculative Decoding',
-      condition: (values) => values.hardware !== 'mi300x' && values.hardware !== 'mi355x',
+      condition: (values) => !['mi300x', 'mi325x', 'mi355x'].includes(values.hardware),
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true  }
@@ -72,6 +73,7 @@ export const GLM51Deployment = () => {
     b200:   { fp8: { tp: 8,  mem: 0.9  }, bf16: { tp: 16, mem: 0.9  } },
     gb300:  { fp8: { tp: 4,  mem: 0.9  } },
     mi300x: { bf16: { tp: 8, mem: 0.80 } },
+    mi325x: { bf16: { tp: 8, mem: 0.80 } },
     mi355x: { bf16: { tp: 8, mem: 0.80 } }
   };
 
@@ -129,7 +131,7 @@ export const GLM51Deployment = () => {
 
   const generateCommand = () => {
     const { hardware, quantization } = values;
-    const isAMD = hardware === 'mi300x' || hardware === 'mi355x';
+    const isAMD = ['mi300x', 'mi325x', 'mi355x'].includes(hardware);
     const isGB300 = hardware === 'gb300';
     const effectiveQuant = isAMD ? 'bf16' : (isGB300 && quantization === 'bf16' ? 'fp8' : quantization);
     const suffix = effectiveQuant === 'fp8' ? '-FP8' : '';
