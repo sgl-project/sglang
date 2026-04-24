@@ -76,17 +76,6 @@ The generator currently picks values on the **conservative** side (mirroring an 
 - `max-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
 - MTP currently requires `SGLANG_ENABLE_SPEC_V2=1`.
 
-**Context Parallel (long prompts)**
-
-- Requires `--enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode round-robin-split`, larger `--chunked-prefill-size` (16384), lower `--mem-fraction-static` (0.78).
-- Currently does **not** combine with MTP in the validated recipes.
-
-**GB300 specifics**
-
-- GB300 image is not yet on Docker Hub (being pushed). Once published it is expected to be a separate tag from B200's `deepseek-v4-blackwell` due to the CUDA-13 / Grace-Blackwell userland differences.
-- For PD-disagg over MNNVL (mooncake-over-NVLink): export `SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True` (see [PD Disaggregation docs](../../../docs/advanced_features/pd_disaggregation) for supported values) and drop the `--disaggregation-ib-device` flag. Additional NCCL / transport knobs may be required depending on your cluster's NVLink topology.
-- DRA `compute-domain-channel` claim is required; without it, DeepEP CUDA-graph capture fails with `operation not permitted`.
-
 <a id="hopper-note" />
 
 **Hopper (H200) note — open item**
