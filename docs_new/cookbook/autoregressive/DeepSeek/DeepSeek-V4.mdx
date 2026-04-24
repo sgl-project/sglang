@@ -78,9 +78,9 @@ The generator currently picks values on the **conservative** side (mirroring an 
 
 <a id="hopper-note" />
 
-**Hopper (H200) note — open item**
+**Hopper (H200) note**
 
-The public `deepseek-ai/DeepSeek-V4-Flash` / `-Pro` repos ship with **MoE experts in FP4** (plus FP8 for the rest). Hopper GPUs don't have FP4 MoE kernels, so the public path on H200 depends on either (a) SGLang auto-dequantizing FP4 experts to FP8 on load, or (b) a separate HF upload of an FP8-only Instruct checkpoint. The H200 Docker image is currently being pushed but not yet public. Internally we use a converted FP8-only checkpoint (`DeepSeek-V4-HF-FP8-cvt` in the sunrise-nda allinone paths). Until the H200 tag is live, the H200 recipes in this cookbook are **pre-release reference** — commands are verified against the internal source of truth, but the public user journey on H200 is not yet complete.
+The H200 image and checkpoint are currently being uploaded — public path coming shortly.
 
 ## 4. Model Invocation
 
