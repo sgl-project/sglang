@@ -3442,7 +3442,6 @@ def is_gfx95_supported():
         return False
 
 
-@lru_cache(maxsize=1)
 def get_hip_version():
     if torch.version.hip:
         return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
