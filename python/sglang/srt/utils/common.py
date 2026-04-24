@@ -2793,7 +2793,7 @@ def log_info_on_rank0(logger, msg):
     try:
         if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
             logger.info(msg)
-    except RuntimeError as e:
+    except Exception as e:
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
                 logger.info(f"{msg} (rank-check failed: {e})")
@@ -2811,7 +2811,7 @@ def log_debug_on_rank0(logger, msg):
     try:
         if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
             logger.debug(msg)
-    except RuntimeError as e:
+    except Exception as e:
         if torch.distributed.is_initialized():
             if torch.distributed.get_rank() == 0:
                 logger.debug(f"{msg} (rank-check failed: {e})")

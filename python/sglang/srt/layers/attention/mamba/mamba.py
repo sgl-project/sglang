@@ -34,7 +34,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_npu,
-    log_info_on_rank0,
     set_weight_attrs,
 )
 
@@ -93,10 +92,9 @@ def mamba_v2_sharded_weight_loader(
             assert sum(weight_full_dim_list) == loaded_weight.size(
                 0
             ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {weight_full_dim_list} to {loaded_weight.size(0)}"
-            if loaded_weight.size(0) < full_dim_sum:
-                log_info_on_rank0(
-                    logger,
-                    f"Loaded_weight.dim(0) size:{loaded_weight.size(0)} is padding to {full_dim_sum}"
+            if loaded_weight.size(0) < full_dim_sum and tp_rank == 0:
+                logger.warning(
+                    f"[ZERO-PADDING] Loaded_weight.dim(0) size:{loaded_weight.size(0)} is padding to {full_dim_sum}"
                     f", where original sizes of {weight_full_dim_list} will be updated to {full_dim_list}",
                 )
 

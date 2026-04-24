@@ -68,7 +68,8 @@ def get_num_heads_padding_size(tp_size, weight_block_size, head_dim=None):
 
 def resolve_head_dim(cfg, num_heads, is_text_config):
     # default getting head_dim by hidden_size and num_heads
-    head_dim = cfg.hidden_size // num_heads
+    hidden_size = getattr(cfg, "hidden_size", getattr(cfg, "d_model", None))
+    head_dim = hidden_size // num_heads if hidden_size else None
     # update head_dim if specified in model config
     if is_text_config:
         if hasattr(cfg.hf_config, "qk_head_dim"):
