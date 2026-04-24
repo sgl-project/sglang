@@ -1,0 +1,167 @@
+{# Chat template for DeepSeek-V4 series (deepseek-ai/DeepSeek-V4-Pro,
+   deepseek-ai/DeepSeek-V4-Flash). Mirrors the reference implementation in the
+   model repo's encoding/encoding_dsv4.py.
+
+   Kwargs honored (via OpenAI request `chat_template_kwargs`):
+     - thinking            : bool, default false. true → leaves <think> open
+                             after <｜Assistant｜>; the deepseek-v4 reasoning
+                             parser then splits the model's </think>-terminated
+                             prefix into reasoning_content.
+     - reasoning_effort    : "max" | "high" | None, default None. "max" prepends
+                             the REASONING_EFFORT_MAX directive; only takes
+                             effect when thinking=true.
+     - drop_thinking       : bool, default true. When true, reasoning_content
+                             from prior assistant turns is dropped from the
+                             prompt (matches encoding_dsv4.py default).
+
+   Tool calling:
+     - When `tools` is passed, the V4 TOOLS_TEMPLATE block is appended to the
+       system prompt; the model emits tool calls as <｜DSML｜tool_calls>...
+       <｜DSML｜invoke name="X"><｜DSML｜parameter name="K" string="true|false">V
+       </｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>.
+     - Tool result messages (role=="tool") are emitted as <tool_result>{content}
+       </tool_result> attached to the next user-turn body (V4 has no standalone
+       "tool" role — see merge_tool_messages in encoding_dsv4.py).
+
+   Limitations of this template:
+     - Assistant turns in multi-turn HISTORY that contain tool_calls are
+       re-serialized to V4 DSML format from OpenAI shape; argument JSON is
+       passed through as a single <｜DSML｜parameter name="arguments"
+       string="false"> blob if it cannot be parsed into a flat object in Jinja.
+       Round-trip parity with encoding_dsv4.encode_arguments_to_dsml is
+       achieved when arguments is a flat JSON object of scalar values.
+#}
+{%- if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif -%}
+{%- if not thinking is defined %}{% set thinking = false %}{% endif -%}
+{%- if not reasoning_effort is defined %}{% set reasoning_effort = none %}{% endif -%}
+{%- if not drop_thinking is defined %}{% set drop_thinking = true %}{% endif -%}
+
+{# ---- pre-pass: aggregate system content, locate last user/developer turn ---- #}
+{%- set ns = namespace(sys='', last_user_idx=-1, has_tools=false) -%}
+{%- for m in messages -%}
+    {%- if m.role == 'system' -%}
+        {%- if ns.sys -%}{% set ns.sys = ns.sys + '\n\n' + (m.content or '') %}
+        {%- else -%}{% set ns.sys = (m.content or '') %}{%- endif -%}
+    {%- elif m.role in ['user', 'developer'] -%}
+        {%- set ns.last_user_idx = loop.index0 -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if tools is defined and tools is not none and tools|length > 0 -%}
+    {%- set ns.has_tools = true -%}
+{%- endif -%}
+
+{# tools force-enable thinking-content retention (per encode_messages) #}
+{%- set effective_drop = drop_thinking and not ns.has_tools -%}
+
+{# ---- TOOLS_TEMPLATE block, appended to system content if tools present ----
+   tools_from_openai_format strips the {"type":"function","function":{...}}
+   wrapper — we emit just the inner function dict per tool. #}
+{%- if ns.has_tools -%}
+    {%- set tool_schemas_lines = [] -%}
+    {%- for t in tools -%}
+        {%- set fn = t.function if (t.function is defined) else t -%}
+        {%- set _ = tool_schemas_lines.append(fn | tojson) -%}
+    {%- endfor -%}
+    {%- set tools_block = '\n\n## Tools\n\nYou have access to a set of tools to help answer the user\'s question. You can invoke tools by writing a "<｜DSML｜tool_calls>" block like the following:\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name="$TOOL_NAME">\n<｜DSML｜parameter name="$PARAMETER_NAME" string="true|false">$PARAMETER_VALUE</｜DSML｜parameter>\n...\n</｜DSML｜invoke>\n<｜DSML｜invoke name="$TOOL_NAME2">\n...\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\n\nString parameters should be specified as is and set `string="true"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string="false"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n' + (tool_schemas_lines | join('\n')) + '\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n' -%}
+    {%- set ns.sys = ns.sys + tools_block -%}
+{%- endif -%}
+
+{# ---- BOS + optional REASONING_EFFORT_MAX prefix + system ---- #}
+{{ bos_token -}}
+{%- if thinking and reasoning_effort == 'max' -%}
+{{- 'Reasoning Effort: Absolute maximum with no shortcuts permitted.\nYou MUST be very thorough in your thinking and comprehensively decompose the problem to resolve the root cause, rigorously stress-testing your logic against all potential paths, edge cases, and adversarial scenarios.\nExplicitly write out your entire deliberation process, documenting every intermediate step, considered alternative, and rejected hypothesis to ensure absolutely no assumption is left unchecked.\n\n' -}}
+{%- endif -%}
+{{ ns.sys -}}
+
+{# ---- main loop over conversation messages ----
+   Tool messages are folded into a single user turn with their predecessor /
+   successor user/tool messages, joined by '\n\n' (mirrors the merge_tool_messages
+   + render_message logic in encoding_dsv4.py). State is tracked in `us`. #}
+{%- set us = namespace(in_user=false, first_part_in_user=true) -%}
+{%- for m in messages -%}
+    {%- set is_user_like = m.role in ['user', 'developer', 'tool'] -%}
+    {%- if not is_user_like and us.in_user -%}
+        {# leaving a user-block — no closing token; just reset state. #}
+        {%- set us.in_user = false -%}
+    {%- endif -%}
+    {%- if m.role == 'system' -%}
+        {# already aggregated #}
+    {%- elif m.role in ['user', 'developer'] -%}
+        {%- if not us.in_user -%}
+{{ '<｜User｜>' -}}
+            {%- set us.in_user = true -%}
+            {%- set us.first_part_in_user = true -%}
+        {%- endif -%}
+        {%- if not us.first_part_in_user -%}
+{{ '\n\n' -}}
+        {%- endif -%}
+{{ (m.content or '') -}}
+        {%- set us.first_part_in_user = false -%}
+    {%- elif m.role == 'tool' -%}
+        {%- if not us.in_user -%}
+{{ '<｜User｜>' -}}
+            {%- set us.in_user = true -%}
+            {%- set us.first_part_in_user = true -%}
+        {%- endif -%}
+        {%- if not us.first_part_in_user -%}
+{{ '\n\n' -}}
+        {%- endif -%}
+        {%- set tc = m.content if m.content is string else (m.content | tojson) -%}
+{{ '<tool_result>' + tc + '</tool_result>' -}}
+        {%- set us.first_part_in_user = false -%}
+    {%- elif m.role == 'latest_reminder' -%}
+{{ '<｜latest_reminder｜>' + (m.content or '') -}}
+    {%- elif m.role == 'assistant' -%}
+        {# thinking part: present iff thinking-mode AND (kept-thinking OR
+           this is the last assistant turn) #}
+        {%- set keep_thinking = thinking and (not effective_drop or loop.index0 > ns.last_user_idx) -%}
+        {%- if keep_thinking -%}
+            {%- set rc = m.reasoning_content if (m.reasoning_content is defined and m.reasoning_content is not none) else '' -%}
+{{ '<｜Assistant｜>' + rc + '</think>' -}}
+        {%- else -%}
+{{ '<｜Assistant｜></think>' -}}
+        {%- endif -%}
+        {# content body #}
+{{ (m.content or '') -}}
+        {# tool_calls block #}
+        {%- if m.tool_calls is defined and m.tool_calls is not none and (m.tool_calls | length) > 0 -%}
+{{ '\n\n<｜DSML｜tool_calls>' -}}
+            {%- for tc in m.tool_calls -%}
+                {%- set fn = tc.function if tc.function is defined else tc -%}
+                {%- set name = fn.name -%}
+                {%- set args = fn.arguments -%}
+{{ '\n<｜DSML｜invoke name="' + name + '">' -}}
+                {# Jinja2 has no built-in JSON-string parser, so we mirror
+                   encode_arguments_to_dsml's dict-fallback path: emit the
+                   arguments as a single <｜DSML｜parameter name="arguments"
+                   string="false"> blob containing the JSON-serialized object
+                   (or the raw string if already a string).
+                   encoding_dsv4.parse_message_from_completion_text round-trips
+                   either form. For per-parameter rendering, call sites can
+                   pre-parse args and use a fromjson-enabled Jinja env. #}
+                {# Split into separate output statements so the Markup returned
+                   by `| tojson` does not poison the surrounding literal
+                   concats (Markup.__add__ HTML-escapes plain-str operands). #}
+{{ '\n<｜DSML｜parameter name="arguments" string="false">' -}}
+                {%- if args is mapping -%}
+{{ args | tojson -}}
+                {%- else -%}
+{{ args | string -}}
+                {%- endif -%}
+{{ '</｜DSML｜parameter>' -}}
+{{ '\n</｜DSML｜invoke>' -}}
+            {%- endfor -%}
+{{ '\n</｜DSML｜tool_calls>' -}}
+        {%- endif -%}
+{{ '<｜end▁of▁sentence｜>' -}}
+    {%- endif -%}
+{%- endfor -%}
+
+{# ---- generation prompt: <｜Assistant｜> + (<think> | </think>) ---- #}
+{%- if add_generation_prompt -%}
+    {%- if thinking -%}
+{{ '<｜Assistant｜><think>' -}}
+    {%- else -%}
+{{ '<｜Assistant｜></think>' -}}
+    {%- endif -%}
+{%- endif -%}
