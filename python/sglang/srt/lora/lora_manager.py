@@ -768,6 +768,14 @@ class LoRAManager:
                 # independently.
                 self.base_model.lm_head = untied_lm_head
 
+        # MoE models have dense MLP in early layers or shared experts —
+        # mem_pool allocates separate MoE buffers for those, so we must skip
+        # wrapping the dense gate_up_proj / down_proj modules here to avoid
+        # a shape mismatch between the shared-expert-sized buffer and the
+        # actual MoE expert linear dimensions.
+        has_moe = any(isinstance(m, FusedMoE) for m in self.base_model.modules())
+        dense_mlp_modules = {"gate_up_proj", "down_proj"} if has_moe else set()
+
         for module_name, module in self.base_model.named_modules():
             # Handle embed_tokens and lm_head before the should_apply_lora gate,
             # since VL models' should_apply_lora patterns only match language
@@ -809,7 +817,11 @@ class LoRAManager:
                 continue
 
             # The module should be converted if it is included in target_names
-            if module_name.split(".")[-1] in self.target_modules:
+            short_name = module_name.split(".")[-1]
+            if (
+                short_name in self.target_modules
+                and short_name not in dense_mlp_modules
+            ):
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue
