@@ -76,12 +76,6 @@ The generator currently picks values on the **conservative** side (mirroring an 
 - `max-throughput`: MTP disabled — at saturation the verify step costs more than it saves.
 - MTP currently requires `SGLANG_ENABLE_SPEC_V2=1`.
 
-**DeepEP**
-
-- All `balanced` / `max-throughput` / `cp` recipes use `--moe-a2a-backend deepep` on every platform. For `pd-disagg`, only Blackwell (B200 / GB300) uses DeepEP; H200 PD doesn't. For `low-latency`, DeepEP is only used by the H200-Pro multi-node exception; every other low-latency cell skips it.
-- On single-node, non-TBO recipes it is beneficial to raise DeepEP `num_sms` from the default 20 to 96 (verified on B200 FP4 prefill: chunk 16k → +19% tok/s, chunk 8k → +23% tok/s). Do NOT combine with `--enable-two-batch-overlap`.
-- Set `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` to match peak CUDA-graph load: `cuda-graph-max-bs × MTP_draft_tokens`. Too small trips `deep_ep.cpp:1105`; too large wastes VRAM on NVSHMEM symm buffers.
-
 **Context Parallel (long prompts)**
 
 - Requires `--enable-nsa-prefill-context-parallel --nsa-prefill-cp-mode round-robin-split`, larger `--chunked-prefill-size` (16384), lower `--mem-fraction-static` (0.78).
