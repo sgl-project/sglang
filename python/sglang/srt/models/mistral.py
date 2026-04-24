@@ -143,5 +143,45 @@ class Mistral3ForConditionalGeneration:
     def __call__(self, *args, **kwargs):
         return self.inner(*args, **kwargs)
 
+    def load_weights(self, weights):
+        """Normalize transformers v5 Mistral3 weight names for
+        LlavaForConditionalGeneration.load_weights.
+
+        v5 checkpoints lay out Mistral3 weights as:
+          model.language_model.{embed_tokens,layers.*,norm}.*
+          model.vision_tower.*
+          model.multi_modal_projector.*
+          lm_head.*
+
+        The Llava loader routes by top-level `language_model.` /
+        `vision_tower.` prefixes, stripping one segment before forwarding to
+        the sub-module.  The sub-module's own `load_weights` expects the
+        standard HF layout: `model.layers.*`, `model.embed_tokens.weight`,
+        `lm_head.weight` for Llama, and `vision_tower` internals at their
+        top level.  So we rewrite:
+          model.language_model.X   -> language_model.model.X
+          model.vision_tower.X     -> vision_tower.X
+          model.multi_modal_projector.X -> multi_modal_projector.X
+          lm_head.X                -> language_model.lm_head.X
+        """
+
+        def normalize(ws):
+            for name, w in ws:
+                if name.startswith("model.language_model."):
+                    rest = name[len("model.language_model.") :]
+                    name = "language_model.model." + rest
+                elif name.startswith("model.vision_tower."):
+                    name = "vision_tower." + name[len("model.vision_tower.") :]
+                elif name.startswith("model.multi_modal_projector."):
+                    name = (
+                        "multi_modal_projector."
+                        + name[len("model.multi_modal_projector.") :]
+                    )
+                elif name.startswith("lm_head."):
+                    name = "language_model." + name
+                yield name, w
+
+        return self.inner.load_weights(normalize(weights))
+
 
 EntryClass = [MistralForCausalLM, Mistral3ForConditionalGeneration]
