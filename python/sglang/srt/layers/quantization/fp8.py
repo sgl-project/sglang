@@ -1648,6 +1648,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
 
+
+        # On HIP with SGLANG_USE_AITER / SGLANG_INT4_WEIGHT, the aiter fused
+        # kernel was the unconditional fast-path before this refactor.
+        if _is_hip and (_use_aiter or _use_hip_int4):
+            moe_runner_backend = MoeRunnerBackend.AITER
+
+
         if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()

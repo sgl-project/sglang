@@ -346,25 +346,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
-            if (
-                _use_aiter
-                and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
-                and get_moe_a2a_backend().is_none()
-            ):
-                moe_runner_backend = MoeRunnerBackend.AITER
-            else:
-                moe_runner_backend = MoeRunnerBackend.TRITON
-
-        if (
-            moe_runner_backend.is_aiter()
-            or moe_runner_backend.is_triton()
-            or moe_runner_backend.is_flashinfer_trtllm()
-            or moe_runner_backend.is_flashinfer_trtllm_routed()
-        ):
-            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
-        else:
-            # TODO(cwan): refactor other backends
-            pass
+            moe_runner_backend = MoeRunnerBackend.TRITON
+        # Pre-refactor aiter fast-path: _use_aiter + channel-quant.
+        if _use_aiter and self.weight_quant.strategy == QuantizationStrategy.CHANNEL:
+            moe_runner_backend = MoeRunnerBackend.AITER
+        self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
 
     def apply_weights(
         self,
@@ -392,6 +378,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 w2_scale=layer.w2_weight_scale,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
+                apply_router_weight_on_input_pre_scale=True,
             )
             return self.runner.run(dispatch_output, quant_info)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:

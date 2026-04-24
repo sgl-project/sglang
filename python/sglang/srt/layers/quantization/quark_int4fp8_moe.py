@@ -409,15 +409,7 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         )
 
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and get_moe_a2a_backend().is_none():
-            moe_runner_backend = MoeRunnerBackend.AITER
-
-        if moe_runner_backend.is_aiter():
-            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
-        else:
-            # TODO(cwan): refactor other backends
-            pass
+        self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
 
     def apply(
         self,
