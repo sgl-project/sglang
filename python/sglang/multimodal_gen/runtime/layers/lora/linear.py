@@ -197,6 +197,14 @@ class BaseLayerWithLoRA(nn.Module):
                 data.add_(lora_delta, alpha=scale)
                 continue
 
+            if lora_A_sliced.dim() > 2 or lora_B_sliced.dim() > 2:
+                lora_delta = lora_B_sliced @ lora_A_sliced
+                if lora_delta.dim() > 2:
+                    lora_delta = lora_delta.reshape(-1, lora_delta.shape[-1])
+                data_2d = data.reshape(-1, data.shape[-1]) if data.dim() > 2 else data
+                data_2d.add_(lora_delta, alpha=scale)
+                continue
+
             data_2d = data.reshape(-1, data.shape[-1]) if data.dim() > 2 else data
             lora_B_2d = (
                 lora_B_sliced.reshape(-1, lora_B_sliced.shape[-1])
