@@ -219,6 +219,8 @@ class NemotronH_Nano_VL_V2(EVS):
             vit_embeds = self.pixel_shuffle(
                 vit_embeds, scale_factor=self.downsample_ratio
             )
+            vit_embeds = vit_embeds.view(-1, self.rmsnorm_hidden_size)
+            vit_embeds = self.mlp1(vit_embeds)
             vit_embeds = vit_embeds.view(batch_size, -1, self.llm_hidden_size)
             vit_embeds_list.append(vit_embeds)
         vit_embeds = torch.cat(vit_embeds_list, dim=0)
