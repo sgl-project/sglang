@@ -95,9 +95,26 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
   </tbody>
 </table>
 
+For how to actually launch one of these images, see [Install → Method 3: Using Docker](../../../docs/get-started/install#method-3-using-docker). A minimal example (substitute the image tag for your platform and the inner `sglang serve ...` with whatever the [command generator](#3-model-deployment) below produces):
+
+```bash Command
+docker run --gpus all \
+    --shm-size 32g \
+    -p 30000:30000 \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    --env "HF_TOKEN=<your-hf-token>" \
+    --ipc=host \
+    lmsysorg/sglang:deepseek-v4-blackwell \
+    sglang serve <use args below>
+```
+
 ## 3. Model Deployment
 
 SGLang supports three main serving recipes for DeepSeek-V4 with different latency/throughput trade-offs (`low-latency`, `balanced`, `max-throughput`), plus specialized recipes for long-context (`cp`, prefill context-parallel) and prefill/decode disaggregation (`pd-disagg`). The interactive generator below emits the exact launch command for any `(hardware, variant, recipe)` combination.
+
+<Note>
+For H200 GPU deployments, use the SGLang checkpoint under `sgl-project`, not the default DeepSeek checkpoint.
+</Note>
 
 ### 3.1 Basic Configuration
 
