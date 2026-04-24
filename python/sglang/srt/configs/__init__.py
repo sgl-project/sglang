@@ -8,6 +8,7 @@ from sglang.srt.configs.dots_vlm import DotsVLMConfig
 from sglang.srt.configs.exaone import ExaoneConfig
 from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
+from sglang.srt.configs.groot_n1d7 import Gr00tN1d7Config
 from sglang.srt.configs.janus_pro import MultiModalityConfig
 from sglang.srt.configs.jet_nemotron import JetNemotronConfig
 from sglang.srt.configs.jet_vlm import JetVLMConfig
@@ -56,6 +57,7 @@ __all__ = [
     "DotsOCRConfig",
     "FalconH1Config",
     "GraniteMoeHybridConfig",
+    "Gr00tN1d7Config",
     "Lfm2Config",
     "Lfm2MoeConfig",
     "Lfm2VlConfig",

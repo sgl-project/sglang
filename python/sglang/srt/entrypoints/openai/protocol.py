@@ -341,6 +341,10 @@ class SglExt(BaseModel):
 
     routed_experts: Optional[str] = None
     cached_tokens_details: Optional[CachedTokensDetails] = None
+    # VLA models (alpamayo, GR00T, ...) emit a predicted future trajectory
+    # here.  Shape varies by model (e.g. list of (x, y) waypoints for
+    # alpamayo, `[action_horizon, action_dim]` for GR00T).
+    pred_traj: Optional[List] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -648,6 +652,11 @@ class ChatCompletionRequest(BaseModel):
     # SGLang multimodal tiling controls (extensions)
     max_dynamic_patch: Optional[int] = None
     min_dynamic_patch: Optional[int] = None
+    # VLA models (alpamayo, GR00T, ...): per-request history payload as
+    # an opaque dict.  Each model's processor defines which keys it reads.
+    history_traj: Optional[Dict[str, Any]] = None
+    # Compatibility field for clients that nest extension params.
+    extra_body: Optional[Dict[str, Any]] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None

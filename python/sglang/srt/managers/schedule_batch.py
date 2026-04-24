@@ -817,6 +817,9 @@ class Req(ReqDllmMixin):
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
+        # VLA models (alpamayo, GR00T, ...): per-request history payload.
+        self.history_traj: Optional[Dict[str, Any]] = None
+
         # Embedding (return values)
         self.embedding = None
 
