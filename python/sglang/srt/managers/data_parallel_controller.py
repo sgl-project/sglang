@@ -157,6 +157,7 @@ class DataParallelController:
 
         # Load balance budget
         self.dp_budget = DPBudget(server_args.dp_size)
+        self.elastic_ep_send_timeout_ms = envs.SGLANG_ELASTIC_EP_SEND_TIMEOUT_MS.get()
 
         # To protect changing env vars to set CUDA_VISIBLE_DEVICES.
         self.env_lock = threading.Lock()
@@ -404,12 +405,13 @@ class DataParallelController:
                 )
                 worker_ports.append(worker_port)
                 self.workers[dp_rank] = worker_socket
-                logger.debug(
-                    "Assigned port %s to worker %s on host %s",
-                    worker_port,
-                    dp_rank,
-                    bind_host,
-                )
+                if (
+                    server_args.elastic_ep_backend is not None
+                    and self.elastic_ep_send_timeout_ms >= 0
+                ):
+                    worker_socket.setsockopt(
+                        zmq.SNDTIMEO, self.elastic_ep_send_timeout_ms
+                    )
 
         broadcasted_ports = self._broadcast_worker_ports(
             server_args, worker_ports if worker_ports else None
@@ -550,8 +552,26 @@ class DataParallelController:
 
         while True:
             if self.status[self.round_robin_counter]:
-                logger.debug(f"Choose worker {self.round_robin_counter}")
-                self.workers[self.round_robin_counter].send_pyobj(req)
+                logger.info(f"Choose worker {self.round_robin_counter}")
+                try:
+                    self.workers[self.round_robin_counter].send_pyobj(req)
+                except zmq.Again:
+                    if (
+                        self.server_args.elastic_ep_backend is None
+                        or self.elastic_ep_send_timeout_ms < 0
+                    ):
+                        raise
+                    self.status[self.round_robin_counter] = False
+                    logger.warning(
+                        f"Timed out sending request to DP worker "
+                        f"{self.round_robin_counter} after "
+                        f"{self.elastic_ep_send_timeout_ms} ms",
+                        exc_info=True,
+                    )
+                    self.round_robin_counter = (self.round_robin_counter + 1) % len(
+                        self.workers
+                    )
+                    continue
                 self.round_robin_counter = (self.round_robin_counter + 1) % len(
                     self.workers
                 )
