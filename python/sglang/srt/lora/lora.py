@@ -141,8 +141,6 @@ class LoRAAdapter(nn.Module):
             self.normalize_gate_up_proj(weight_names, layer.weights)
             weight_names = list(layer.weights.keys())
             self.normalize_fused_qkv_a_proj(weight_names, layer.weights)
-            weight_names = list(layer.weights.keys())
-            self.normalize_in_proj_qkvz(weight_names, layer.weights)
 
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
@@ -271,39 +269,6 @@ class LoRAAdapter(nn.Module):
             weights.pop(q_a_name)
             if kv_a_name in weights:
                 weights.pop(kv_a_name)
-
-    def normalize_in_proj_qkvz(
-        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
-    ):
-        """Fuse split linear-attention projections into ``in_proj_qkvz``."""
-
-        has_q = any(".linear_attn.in_proj_q." in n for n in weight_names)
-        has_k = any(".linear_attn.in_proj_k." in n for n in weight_names)
-        has_v = any(".linear_attn.in_proj_v." in n for n in weight_names)
-        has_z = any(".linear_attn.in_proj_z." in n for n in weight_names)
-        if sum([has_q, has_k, has_v, has_z]) < 3:
-            return
-
-        for weight_name in list(weight_names):
-            if ".linear_attn.in_proj_q." not in weight_name:
-                continue
-
-            q_name = weight_name
-            k_name = weight_name.replace(".in_proj_q.", ".in_proj_k.")
-            v_name = weight_name.replace(".in_proj_q.", ".in_proj_v.")
-            z_name = weight_name.replace(".in_proj_q.", ".in_proj_z.")
-            fused_name = weight_name.replace(".in_proj_q.", ".in_proj_qkvz.")
-
-            q_w = weights.pop(q_name)
-            k_w = weights.pop(k_name) if k_name in weights else torch.zeros_like(q_w)
-            v_w = weights.pop(v_name) if v_name in weights else None
-            z_w = weights.pop(z_name) if z_name in weights else None
-            if v_w is None:
-                v_w = torch.zeros_like(q_w)
-            if z_w is None:
-                z_w = torch.zeros_like(v_w)
-
-            weights[fused_name] = torch.cat([q_w, k_w, v_w, z_w], dim=0)
 
     def pin_weights_in_cpu(self):
         for layer in self.layers:

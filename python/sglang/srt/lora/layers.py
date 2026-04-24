@@ -624,33 +624,7 @@ class GatedQKVParallelLinearWithLoRA(QKVParallelLinearWithLoRA):
         )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        from sglang.srt.lora.backend.torch_backend import TorchNativeLoRABatchInfo
-
-        batch_info = self.lora_backend.batch_info
-        if isinstance(batch_info, TorchNativeLoRABatchInfo):
-            self.fallback_backend.batch_info = batch_info
-        else:
-            self.fallback_backend.batch_info = TorchNativeLoRABatchInfo(
-                use_cuda_graph=batch_info.use_cuda_graph,
-                bs=batch_info.bs,
-                num_segments=batch_info.num_segments,
-                seg_indptr=batch_info.seg_indptr,
-                seg_lens=batch_info.seg_lens,
-                weight_indices=batch_info.weight_indices,
-                lora_ranks=batch_info.lora_ranks,
-                scalings=batch_info.scalings,
-                max_len=batch_info.max_len,
-                permutation=batch_info.permutation,
-                seg_indptr_cpu=batch_info.seg_indptr.cpu(),
-                seg_lens_cpu=(
-                    batch_info.seg_lens.cpu()
-                    if batch_info.seg_lens is not None
-                    else None
-                ),
-                weight_indices_cpu=batch_info.weight_indices.cpu(),
-                lora_ranks_cpu=batch_info.lora_ranks.cpu(),
-            )
-
+        self.fallback_backend.batch_info = self._get_torch_native_batch_info()
         return self.fallback_backend.run_qkv_lora(
             x=x,
             qkv_lora_a=self.A_buffer_qkv,
@@ -660,6 +634,52 @@ class GatedQKVParallelLinearWithLoRA(QKVParallelLinearWithLoRA):
             max_qkv_out_dim=self.max_qkv_out_dim,
             base_output=base_output,
         )
+
+    def _get_torch_native_batch_info(self):
+        """Lazily build (and cache) a TorchNativeLoRABatchInfo for this batch.
+
+        The torch-native backend needs CPU shadows of seg_indptr / seg_lens /
+        weight_indices / lora_ranks. Computing them inside ``apply_lora`` would
+        force a GPU→CPU sync on every attention layer; instead we cache the
+        converted batch info on the shared ``lora_backend`` so all GatedQKV
+        layers in the same batch reuse the same CPU copies.
+        """
+        from sglang.srt.lora.backend.torch_backend import TorchNativeLoRABatchInfo
+
+        batch_info = self.lora_backend.batch_info
+        if isinstance(batch_info, TorchNativeLoRABatchInfo):
+            return batch_info
+
+        cached = getattr(self.lora_backend, "_gated_qkv_torch_batch_info", None)
+        cached_for = getattr(
+            self.lora_backend, "_gated_qkv_torch_batch_info_for", None
+        )
+        if cached is not None and cached_for is batch_info:
+            return cached
+
+        cached = TorchNativeLoRABatchInfo(
+            use_cuda_graph=batch_info.use_cuda_graph,
+            bs=batch_info.bs,
+            num_segments=batch_info.num_segments,
+            seg_indptr=batch_info.seg_indptr,
+            seg_lens=batch_info.seg_lens,
+            weight_indices=batch_info.weight_indices,
+            lora_ranks=batch_info.lora_ranks,
+            scalings=batch_info.scalings,
+            max_len=batch_info.max_len,
+            permutation=batch_info.permutation,
+            seg_indptr_cpu=batch_info.seg_indptr.cpu(),
+            seg_lens_cpu=(
+                batch_info.seg_lens.cpu()
+                if batch_info.seg_lens is not None
+                else None
+            ),
+            weight_indices_cpu=batch_info.weight_indices.cpu(),
+            lora_ranks_cpu=batch_info.lora_ranks.cpu(),
+        )
+        self.lora_backend._gated_qkv_torch_batch_info = cached
+        self.lora_backend._gated_qkv_torch_batch_info_for = batch_info
+        return cached
 
 
 class LinearAttnInProjQKVZWithLoRA(ColumnParallelLinearWithLoRA):

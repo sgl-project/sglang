@@ -54,6 +54,37 @@ class LoRAType(Enum):
     LORA_B = 1
 
 
+def _dense_mlp_inter_size(config: AutoConfig, layer_idx: int) -> int:
+    """Intermediate size for the dense MLP at ``layer_idx``.
+
+    For DeepSeek-style configs the layer is dense for ``layer_idx <
+    first_k_dense_replace`` and otherwise hosts a shared expert sized by
+    ``shared_expert_intermediate_size``. Qwen-style MoE configs (Qwen 3.5)
+    omit ``first_k_dense_replace`` and treat every layer as MoE with a
+    shared expert. In both cases we want the LoRA buffer to match the
+    actual ``Qwen2MoeMLP``/shared-expert dimensions.
+    """
+    inter = config.intermediate_size
+    first_k = getattr(config, "first_k_dense_replace", None)
+    moe_freq = getattr(config, "moe_layer_freq", 1)
+
+    is_moe_layer = first_k is None or (
+        layer_idx >= first_k and layer_idx % moe_freq == 0
+    )
+    if not is_moe_layer:
+        return inter
+
+    shared_expert_inter = getattr(config, "shared_expert_intermediate_size", None)
+    moe_inter = getattr(config, "moe_intermediate_size", None)
+    n_shared = getattr(config, "n_shared_experts", None)
+
+    if shared_expert_inter is not None and shared_expert_inter > 0:
+        return shared_expert_inter
+    if moe_inter is not None and n_shared is not None:
+        return moe_inter * n_shared
+    return inter
+
+
 def get_hidden_dim(
     module_name: str,
     config: AutoConfig,
@@ -120,42 +151,10 @@ def get_hidden_dim(
                 config.hidden_size,
             )
         elif module_name == "gate_up_proj":
-            inter = config.intermediate_size
-            first_k = getattr(config, "first_k_dense_replace", None)
-            moe_freq = getattr(config, "moe_layer_freq", 1)
-            if (
-                first_k is not None
-                and layer_idx >= first_k
-                and layer_idx % moe_freq == 0
-            ):
-                shared_expert_inter = getattr(
-                    config, "shared_expert_intermediate_size", None
-                )
-                moe_inter = getattr(config, "moe_intermediate_size", None)
-                n_shared = getattr(config, "n_shared_experts", None)
-                if shared_expert_inter is not None and shared_expert_inter > 0:
-                    inter = shared_expert_inter
-                elif moe_inter is not None and n_shared is not None:
-                    inter = moe_inter * n_shared
+            inter = _dense_mlp_inter_size(config, layer_idx)
             return config.hidden_size, inter * 2
         elif module_name == "down_proj":
-            inter = config.intermediate_size
-            first_k = getattr(config, "first_k_dense_replace", None)
-            moe_freq = getattr(config, "moe_layer_freq", 1)
-            if (
-                first_k is not None
-                and layer_idx >= first_k
-                and layer_idx % moe_freq == 0
-            ):
-                shared_expert_inter = getattr(
-                    config, "shared_expert_intermediate_size", None
-                )
-                moe_inter = getattr(config, "moe_intermediate_size", None)
-                n_shared = getattr(config, "n_shared_experts", None)
-                if shared_expert_inter is not None and shared_expert_inter > 0:
-                    inter = shared_expert_inter
-                elif moe_inter is not None and n_shared is not None:
-                    inter = moe_inter * n_shared
+            inter = _dense_mlp_inter_size(config, layer_idx)
             return inter, config.hidden_size
         elif module_name == "fused_qkv_a_proj_with_mqa":
             q_lora_rank = getattr(config, "q_lora_rank", None) or 0

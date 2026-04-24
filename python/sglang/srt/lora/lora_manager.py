@@ -754,9 +754,10 @@ class LoRAManager:
 
         # MoE models have both dense shared-expert gate_up_proj/down_proj
         # AND per-expert weights inside FusedMoE. mem_pool allocates separate
-        # 3D buffers (shared expert) and 4D buffers (MoE expert) for them.
-        # We must skip wrapping the dense shared-expert modules here because
-        # they use different buffer dimensions than the MoE experts.
+        # 3D buffers (shared expert) and 4D buffers (MoE expert), so we wrap
+        # both: the FusedMoE wrapper handles the per-expert (4D) path while
+        # the dense MergedColumnParallelLinear / RowParallelLinear wrappers
+        # cover the shared expert MLP.
         has_moe = any(isinstance(m, FusedMoE) for m in self.base_model.modules())
         cfg = self.base_hf_config
         if hasattr(cfg, "get_text_config"):
@@ -765,7 +766,6 @@ class LoRAManager:
             hasattr(cfg, "shared_expert_intermediate_size")
             and cfg.shared_expert_intermediate_size > 0
         ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
-        dense_mlp_modules = {"gate_up_proj", "down_proj"} if has_moe else set()
 
         for module_name, module in self.base_model.named_modules():
             # Handle embed_tokens and lm_head before the should_apply_lora gate,
@@ -809,10 +809,7 @@ class LoRAManager:
 
             # The module should be converted if it is included in target_names
             short_name = module_name.split(".")[-1]
-            if (
-                short_name in self.target_modules
-                and short_name not in dense_mlp_modules
-            ):
+            if short_name in self.target_modules:
                 layer_id = get_layer_id(module_name)
                 if layer_id is None:
                     continue
