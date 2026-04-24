@@ -35,6 +35,7 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     refresh_context_on_dual_transformer,
     refresh_context_on_transformer,
 )
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed import (
     cfg_model_parallel_all_reduce,
     get_local_torch_device,
@@ -82,11 +83,8 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
-    RolloutTrajectoryData,
-)
-from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
-    SchedulerRLMixin,
+from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import (
+    RolloutDenoisingMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
@@ -147,13 +145,17 @@ class DenoisingStepState:
     attn_metadata: Any | None
 
 
-class DenoisingStage(PipelineStage):
+class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     """
     Stage for running the denoising loop in diffusion pipelines.
 
     This stage handles the iterative denoising process that transforms
     the initial noise into the final output.
     """
+
+    @property
+    def role_affinity(self):
+        return RoleType.DENOISER
 
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
@@ -191,43 +193,6 @@ class DenoisingStage(PipelineStage):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
-
-    def _maybe_prepare_rollout(self, batch: Req):
-        """Prepare denoising loop for rollout."""
-        if not isinstance(self.scheduler, SchedulerRLMixin):
-            if batch.rollout:
-                raise ValueError(
-                    f"Scheduler {type(self.scheduler)} does not support rollout"
-                )
-            return
-
-        self.scheduler.release_rollout_resources(batch)
-        if batch.rollout:
-            self.scheduler.prepare_rollout(
-                batch=batch,
-                pipeline_config=self.server_args.pipeline_config,
-            )
-
-    def _maybe_collect_rollout_log_probs(self, batch: Req):
-        """Get rollout log probs and store into batch for reward calculation."""
-        if not isinstance(self.scheduler, SchedulerRLMixin):
-            if batch.rollout:
-                raise ValueError(
-                    f"Scheduler {type(self.scheduler)} does not support rollout"
-                )
-            return
-
-        if batch.rollout:
-            if batch.rollout_trajectory_data is None:
-                batch.rollout_trajectory_data = RolloutTrajectoryData()
-            batch.rollout_trajectory_data.rollout_log_probs = (
-                self.scheduler.collect_rollout_log_probs(batch)
-            )
-            if getattr(batch, "rollout_debug_mode", False):
-                batch.rollout_trajectory_data.rollout_debug_tensors = (
-                    self.scheduler.collect_rollout_debug_tensors(batch)
-                )
-            self.scheduler.release_rollout_resources(batch)
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -901,10 +866,6 @@ class DenoisingStage(PipelineStage):
             trajectory_tensor = None
             trajectory_timesteps_tensor = None
 
-        # Gather log probs for rollout
-        if batch.rollout:
-            self._maybe_collect_rollout_log_probs(batch)
-
         # Gather results if using sequence parallelism
         latents, trajectory_tensor = self._postprocess_sp_latents(
             batch, latents, trajectory_tensor
@@ -1137,6 +1098,15 @@ class DenoisingStage(PipelineStage):
         Run the denoising loop.
         """
         ctx = self._prepare_denoising_loop(batch, server_args)
+        if batch.rollout:
+            self._maybe_init_denoising_env_collection(
+                batch=batch,
+                pipeline_config=server_args.pipeline_config,
+                image_kwargs=ctx.image_kwargs,
+                pos_cond_kwargs=ctx.pos_cond_kwargs,
+                neg_cond_kwargs=ctx.neg_cond_kwargs,
+                guidance=ctx.guidance,
+            )
         denoising_start_time = time.time()
         self._before_denoising_loop(ctx, batch, server_args)
         # to avoid device-sync caused by timestep comparison
@@ -1164,6 +1134,17 @@ class DenoisingStage(PipelineStage):
                             t_host,
                             timesteps_cpu,
                         )
+                        # Capture the raw (pre-scale, pre-I2V-concat) noisy latent
+                        # x_{t_i} for rollout trajectory collection. Must run
+                        # BEFORE _run_denoising_step so ctx.latents is still the
+                        # pre-step value. Gated on batch.rollout to keep the
+                        # non-rollout path strictly untouched.
+                        if batch.rollout:
+                            self._maybe_append_dit_trajectory_step(
+                                batch=batch,
+                                latents=ctx.latents,
+                                timestep_value=step.t_host,
+                            )
                         self._run_denoising_step(ctx, step, batch, server_args)
                         self._record_trajectory(ctx, step, batch, server_args)
 
@@ -1185,6 +1166,16 @@ class DenoisingStage(PipelineStage):
                 (denoising_end_time - denoising_start_time) / len(ctx.timesteps),
             )
 
+        # Rollout postprocessing must run BEFORE _finalize_denoising_loop so
+        # the final scheduler.step output (ctx.latents) is still SP-sharded and
+        # can be gathered uniformly alongside the per-step dit_trajectory via
+        # gather_stacked_latents_for_sp.
+        if batch.rollout:
+            self._postprocess_rollout_outputs(
+                batch=batch,
+                latents=ctx.latents,
+                server_args=server_args,
+            )
         self._finalize_denoising_loop(ctx, batch, server_args)
         return batch
 
