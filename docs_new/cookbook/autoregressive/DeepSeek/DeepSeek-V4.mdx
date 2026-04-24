@@ -15,11 +15,13 @@ metatags:
 
 The Instruct repos ship **FP4 MoE experts + FP8 attention / dense** (one mixed-precision checkpoint covers all GPUs that support FP4). The Base (pre-trained only) variants — `DeepSeek-V4-Flash-Base`, `DeepSeek-V4-Pro-Base` — ship pure FP8 mixed and are **not** for chat / tool calling.
 
-**Key Features:**
+**Key Features** (per the official model card):
 
-- Mixture-of-Experts with DeepSeek-style fine-grained expert routing; MLA (Multi-head Latent Attention); Multi-Token Prediction (MTP / EAGLE) speculative decoding.
-- **Context length: 1M tokens** (recommend ≥ 384K window when running Think Max mode).
-- **Three reasoning modes**: *Non-think* (fast, intuitive), *Think High* (conscious logical analysis), *Think Max* (maximum reasoning capability).
+- **Hybrid Attention Architecture** — combines Compressed Sparse Attention (CSA) and Heavily Compressed Attention (HCA) for long-context efficiency. At 1M-token context, DeepSeek-V4-Pro uses only ~27% of per-token inference FLOPs and ~10% of KV cache compared with DeepSeek-V3.2.
+- **Manifold-Constrained Hyper-Connections (mHC)** — strengthens residual connections, improving signal-propagation stability across layers while preserving expressivity.
+- **Muon optimizer** — faster convergence and greater training stability.
+- **Context length: 1M tokens**; pre-trained on 32T+ diverse, high-quality tokens.
+- **Three reasoning modes**: *Non-think* (fast, intuitive responses), *Think High* (conscious logical analysis, slower but more accurate), *Think Max* (push reasoning to its fullest extent). Recommend a ≥ 384K context window when running Think Max.
 - Ships with a dedicated `encoding_dsv4.encode_messages` Python encoder + DSML tool-call grammar (`<｜DSML｜tool_calls>` / `<｜DSML｜invoke>` / `<｜DSML｜parameter>`).
 
 **Recommended Generation Parameters:** `temperature=1.0`, `top_p=1.0` (per the official model card).
@@ -42,10 +44,8 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
 | Hardware Platform  | Docker Image                                              |
 | ------------------ | --------------------------------------------------------- |
 | NVIDIA B200        | `lmsysorg/sglang:deepseek-v4-blackwell`                   |
+| NVIDIA H200        | `lmsysorg/sglang:deepseek-v4-hopper`                      |
 | NVIDIA GB300       | Being pushed — tag not yet public                         |
-| NVIDIA H200        | Being pushed — tag not yet public (see Hopper note below) |
-
-The `deepseek-v4-blackwell` tag is the pre-release image for DeepSeek-V4 on B200. It contains all the patched kernels / grammars needed for the DSML tool-call format, the `flashinfer_mxfp4` MoE runner, DeepEP, and MTP. GB300 and H200 images are in the pipeline; for now, follow the internal `optimize` branch for those deployments.
 
 ## 3. Model Deployment
 
