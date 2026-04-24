@@ -363,9 +363,9 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --mem-fraction-static 0.78");
       flags.push("  --max-running-requests 1024");
       if (isBig && hardware !== "h200") {
-        // Blackwell big cp: extra overrides. allinone emits these AFTER _CP_FLAGS,
-        // so two --mem-fraction-static appear — argparse last-wins (0.70 beats 0.78).
-        flags.push("  --mem-fraction-static 0.70");
+        // Blackwell big cp: extra overrides. allinone emits --mem-fraction-static 0.70
+        // after _CP_FLAGS' 0.78, but human directed (2026-04-24) to keep the 0.78 value
+        // so we drop the 0.70 override here. The cg/max-run overrides stay.
         flags.push("  --cuda-graph-max-bs 256");
         flags.push("  --max-running-requests 256");
       }
