@@ -101,10 +101,20 @@ def scale_kv_cell_size_per_token_for_dflash(
     ) // int(target_num_layers)
 
 
+_aiter_top_k_renorm_probs = None
+try:
+    from aiter.ops.sampling import top_k_renorm_probs as _aiter_top_k_renorm_probs
+except ImportError:
+    pass
+
+
 def _top_k_renorm_prob_torch(
     probs: torch.Tensor, top_k: torch.Tensor
 ) -> torch.Tensor:
-    """Pure PyTorch top-k renormalization fallback for ROCm."""
+    """Top-k renormalization: aiter kernel on ROCm, pure PyTorch fallback otherwise."""
+    if _aiter_top_k_renorm_probs is not None:
+        top_k_int = top_k.to(dtype=torch.int32, device=probs.device)
+        return _aiter_top_k_renorm_probs(probs.float(), top_k_int, 0).to(probs.dtype)
     top_k = top_k.to(dtype=torch.int64, device=probs.device)
     max_k = int(top_k.max().item())
     vocab_size = probs.shape[-1]
