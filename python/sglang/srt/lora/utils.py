@@ -128,9 +128,14 @@ def get_hidden_dim(
                 and layer_idx >= first_k
                 and layer_idx % moe_freq == 0
             ):
+                shared_expert_inter = getattr(
+                    config, "shared_expert_intermediate_size", None
+                )
                 moe_inter = getattr(config, "moe_intermediate_size", None)
                 n_shared = getattr(config, "n_shared_experts", None)
-                if moe_inter is not None and n_shared is not None:
+                if shared_expert_inter is not None and shared_expert_inter > 0:
+                    inter = shared_expert_inter
+                elif moe_inter is not None and n_shared is not None:
                     inter = moe_inter * n_shared
             return config.hidden_size, inter * 2
         elif module_name == "down_proj":
@@ -142,9 +147,14 @@ def get_hidden_dim(
                 and layer_idx >= first_k
                 and layer_idx % moe_freq == 0
             ):
+                shared_expert_inter = getattr(
+                    config, "shared_expert_intermediate_size", None
+                )
                 moe_inter = getattr(config, "moe_intermediate_size", None)
                 n_shared = getattr(config, "n_shared_experts", None)
-                if moe_inter is not None and n_shared is not None:
+                if shared_expert_inter is not None and shared_expert_inter > 0:
+                    inter = shared_expert_inter
+                elif moe_inter is not None and n_shared is not None:
                     inter = moe_inter * n_shared
             return inter, config.hidden_size
         elif module_name == "fused_qkv_a_proj_with_mqa":
