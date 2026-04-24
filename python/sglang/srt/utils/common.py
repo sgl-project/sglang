@@ -1294,6 +1294,7 @@ def point_to_point_pyobj(
     src: int = 0,
     dst: int = 1,
     async_send: bool = False,
+    device: Optional[str] = None,
 ):
     """Send data from src to dst in group."""
     from sglang.srt.distributed.parallel_state import P2PWork
@@ -1308,6 +1309,7 @@ def point_to_point_pyobj(
             tensor_size = torch.tensor(
                 [0],
                 dtype=torch.long,
+                device=device,
             )
             work = send_func(tensor_size, dst, group=group)
             if async_send:
@@ -1315,10 +1317,10 @@ def point_to_point_pyobj(
         else:
             serialized_data = pickle.dumps(data)
             size = len(serialized_data)
-            tensor_data = torch.ByteTensor(
+            tensor_data = torch.from_numpy(
                 np.frombuffer(serialized_data, dtype=np.uint8)
-            )
-            tensor_size = torch.tensor([size], dtype=torch.long)
+            ).to(device=device)
+            tensor_size = torch.tensor([size], dtype=torch.long, device=device)
 
             work = send_func(tensor_size, dst, group=group)
             if async_send:
@@ -1332,6 +1334,7 @@ def point_to_point_pyobj(
         tensor_size = torch.tensor(
             [0],
             dtype=torch.long,
+            device=device,
         )
         work = dist.irecv(tensor_size, src=src, group=group)
         work.wait()
@@ -1343,6 +1346,7 @@ def point_to_point_pyobj(
         tensor_data = torch.empty(
             size,
             dtype=torch.uint8,
+            device=device,
         )
         work = dist.irecv(tensor_data, src=src, group=group)
         work.wait()

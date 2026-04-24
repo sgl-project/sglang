@@ -1215,6 +1215,7 @@ class GroupCoordinator:
         dst: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
         async_send: bool = False,
+        metadata_cache_key: Optional[str] = None,
     ) -> Optional[List[P2PWork]]:
         """Send the input tensor dictionary.
         NOTE: `dst` is the local rank of the source rank.
@@ -1247,7 +1248,31 @@ class GroupCoordinator:
         # Thus the net performance gain justifies this approach.
 
         send_func = torch.distributed.isend if async_send else torch.distributed.send
-        p2p_works = self.send_object(metadata_list, dst=dst, async_send=async_send)
+        p2p_works: List[P2PWork] = []
+
+        if metadata_cache_key is not None:
+            try:
+                cache = self._send_metadata_cache
+            except AttributeError:
+                cache = self._send_metadata_cache = {}
+
+            cached = cache.get(metadata_cache_key)
+            cache_hit = cached is not None and cached == metadata_list
+
+            sig_hit, sig_miss, _ = self._get_cache_signals()
+            signal = sig_hit if cache_hit else sig_miss
+            work = send_func(signal, self.ranks[dst], group=group)
+            if async_send:
+                p2p_works.append(P2PWork(work, signal))
+            if not cache_hit:
+                p2p_works.extend(
+                    self.send_object(metadata_list, dst=dst, async_send=async_send)
+                )
+                cache[metadata_cache_key] = list(metadata_list)
+        else:
+            p2p_works.extend(
+                self.send_object(metadata_list, dst=dst, async_send=async_send)
+            )
 
         for tensor in tensor_list:
             if tensor.numel() == 0:
@@ -1268,6 +1293,7 @@ class GroupCoordinator:
         self,
         src: Optional[int] = None,
         all_gather_group: Optional["GroupCoordinator"] = None,
+        metadata_cache_key: Optional[str] = None,
     ) -> Optional[Dict[str, Union[torch.Tensor, Any]]]:
         """Recv the input tensor dictionary.
         NOTE: `src` is the local rank of the source rank.
@@ -1288,7 +1314,23 @@ class GroupCoordinator:
             src = (self.rank_in_group - 1) % self.world_size
         assert src < self.world_size, f"Invalid src rank ({src})"
 
-        recv_metadata_list = self.recv_object(src=src)
+        if metadata_cache_key is not None:
+            _, _, recv_buf = self._get_cache_signals()
+            torch.distributed.recv(recv_buf, src=self.ranks[src], group=group)
+
+            try:
+                cache = self._recv_metadata_cache
+            except AttributeError:
+                cache = self._recv_metadata_cache = {}
+
+            if recv_buf.item() == 0:
+                recv_metadata_list = cache[metadata_cache_key]
+            else:
+                recv_metadata_list = self.recv_object(src=src)
+                cache[metadata_cache_key] = recv_metadata_list
+        else:
+            recv_metadata_list = self.recv_object(src=src)
+
         tensor_dict: Dict[str, Any] = {}
         for key, value in recv_metadata_list:
             if isinstance(value, TensorMetadata):
@@ -1323,6 +1365,16 @@ class GroupCoordinator:
             else:
                 tensor_dict[key] = value
         return tensor_dict
+
+    def _get_cache_signals(self):
+        """Return pre-allocated (hit, miss, recv) signal tensors for metadata caching."""
+        try:
+            return self._cache_sig_hit, self._cache_sig_miss, self._cache_sig_recv
+        except AttributeError:
+            self._cache_sig_hit = torch.zeros(1, dtype=torch.int8, device=self.device)
+            self._cache_sig_miss = torch.ones(1, dtype=torch.int8, device=self.device)
+            self._cache_sig_recv = torch.empty(1, dtype=torch.int8, device=self.device)
+            return self._cache_sig_hit, self._cache_sig_miss, self._cache_sig_recv
 
     def barrier(self):
         """Barrier synchronization among the group.
