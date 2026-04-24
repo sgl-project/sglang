@@ -99,6 +99,10 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
 
 SGLang supports three main serving recipes for DeepSeek-V4 with different latency/throughput trade-offs (`low-latency`, `balanced`, `max-throughput`), plus specialized recipes for long-context (`cp`, prefill context-parallel) and prefill/decode disaggregation (`pd-disagg`). The interactive generator below emits the exact launch command for any `(hardware, variant, recipe)` combination.
 
+<Note>
+For H200 GPU deployments, use the SGLang checkpoint under `sgl-project`, not the default DeepSeek checkpoint.
+</Note>
+
 ### 3.1 Basic Configuration
 
 **Interactive Command Generator**: Use the selector below to generate the deployment command for your hardware + recipe combination.
