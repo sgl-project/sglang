@@ -1,9 +1,9 @@
 """Primitive RoPE ops: rotate helpers and apply_rotary_emb utilities."""
 
+import logging
 from typing import Optional, Tuple
 
 import torch
-import logging
 
 from sglang.jit_kernel.diffusion.triton.rotary import apply_rotary_embedding
 from sglang.kernel_api_logging import debug_kernel_api
@@ -152,4 +152,3 @@ def _warn_about_missing_flashinfer():
     logger.info_once(
         "FlashInfer not available, using Triton fallback for RoPE",
     )
-
