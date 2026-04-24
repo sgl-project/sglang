@@ -146,9 +146,13 @@ void dispatch_w4a8_moe_mm_sm90(
       INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 64, 512, 1, 1, 1>));
     }
   } else if (n == 7168 && k == 256) {
-    // group gemm 2 for tp
-    if (m <= 8) {
-      INVOKE_GEMM_WITH_CONFIG((SM90_PP<64, 16, 128, 1, 1, 1>));
+    // group gemm 2 for tp — K=256 means TileK=128 gives only 2 mainloop
+    // iterations.  Cooperative schedule hides latency better than PingPong
+    // for small m (benchmarked +10-32% on H20).
+    if (m <= 4) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 16, 128, 1, 1, 1>));
+    } else if (m <= 8) {
+      INVOKE_GEMM_WITH_CONFIG((SM90_CO<128, 32, 128, 1, 1, 1>));
     } else if (m <= 32) {
       INVOKE_GEMM_WITH_CONFIG((SM90_PP<128, 32, 128, 1, 1, 1>));
     } else if (m <= 512) {

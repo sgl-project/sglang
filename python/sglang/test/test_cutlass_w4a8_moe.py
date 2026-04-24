@@ -1,12 +1,48 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import socket
 from typing import Optional
+from unittest.mock import patch
 
 import pytest
 import torch
 
+from sglang.srt.distributed import (
+    init_distributed_environment,
+    initialize_model_parallel,
+)
+from sglang.srt.distributed.parallel_state import destroy_model_parallel
 from sglang.srt.layers.moe.cutlass_w4a8_moe import cutlass_w4a8_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _init_single_gpu_moe_parallel():
+    """cutlass_w4a8_moe calls get_moe_expert_parallel_world_size() which needs MoE EP group."""
+    if not torch.cuda.is_available():
+        yield
+        return
+
+    if not torch.distributed.is_initialized():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        init_distributed_environment(
+            world_size=1,
+            rank=0,
+            local_rank=0,
+            backend="nccl",
+            distributed_init_method=f"tcp://127.0.0.1:{port}",
+        )
+    try:
+        initialize_model_parallel(tensor_model_parallel_size=1)
+    except AssertionError:
+        # e.g. tensor / MoE parallel groups already initialized by the test runner
+        pass
+
+    yield
+
+    destroy_model_parallel()
 
 
 def pack_int4_values_to_int8(int4_values_interleaved: torch.Tensor) -> torch.Tensor:
@@ -122,6 +158,7 @@ def test_cutlass_w4a8_moe(M, N, K, E, tp_size, use_ep_moe, topk, group_size, dty
     expert_map = torch.arange(E, dtype=torch.int32, device=device)
     expert_map[local_e:] = -1
 
+    ep_size = tp_size if use_ep_moe else 1
     output = cutlass_moe(
         a,
         w1_q,
@@ -142,6 +179,7 @@ def test_cutlass_w4a8_moe(M, N, K, E, tp_size, use_ep_moe, topk, group_size, dty
         a1_scale,
         a2_scale,
         expert_map,
+        ep_size=ep_size,
     )
 
     ref_output = ref(
@@ -190,6 +228,7 @@ def cutlass_moe(
     a2_scale: Optional[torch.Tensor] = None,
     expert_map: Optional[torch.Tensor] = None,
     apply_router_weight_on_input: bool = False,
+    ep_size: int = 1,
 ):
     topk_ids = expert_map[topk_ids]
     device = a.device
@@ -203,29 +242,33 @@ def cutlass_moe(
     problem_sizes2 = torch.empty(
         (num_local_experts, 3), dtype=torch.int32, device=device
     )
-    return cutlass_w4a8_moe(
-        a,
-        w1_q,
-        w2_q,
-        w1_scale,
-        w2_scale,
-        topk_weights,
-        topk_ids,
-        a_strides1,
-        b_strides1,
-        c_strides1,
-        a_strides2,
-        b_strides2,
-        c_strides2,
-        s_strides13,
-        s_strides2,
-        expert_offsets,
-        problem_sizes1,
-        problem_sizes2,
-        a1_scale,
-        a2_scale,
-        apply_router_weight_on_input,
-    )
+    with patch(
+        "sglang.srt.layers.moe.cutlass_w4a8_moe.get_moe_expert_parallel_world_size",
+        return_value=ep_size,
+    ):
+        return cutlass_w4a8_moe(
+            a,
+            w1_q,
+            w2_q,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            a_strides1,
+            b_strides1,
+            c_strides1,
+            a_strides2,
+            b_strides2,
+            c_strides2,
+            s_strides13,
+            s_strides2,
+            expert_offsets,
+            problem_sizes1,
+            problem_sizes2,
+            a1_scale,
+            a2_scale,
+            apply_router_weight_on_input,
+        )
 
 
 def ref(
