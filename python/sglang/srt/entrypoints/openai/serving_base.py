@@ -32,7 +32,8 @@ class OpenAIServingBase(ABC):
             set(
                 self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
             )
-            if isinstance(self.tokenizer_manager.server_args, ServerArgs)
+            if self.tokenizer_manager is not None
+            and isinstance(self.tokenizer_manager.server_args, ServerArgs)
             and self.tokenizer_manager.server_args.tokenizer_metrics_allowed_custom_labels
             else None
         )

@@ -50,7 +50,12 @@ def solve_ipm(
         ax2c = ax2 @ c  # (NC,)
 
         # Cholesky solve: ax2a @ delta = ax2c
-        delta = torch.linalg.solve(ax2a, ax2c)  # (NC,)
+        # Add small regularization to avoid singular matrix
+        ax2a.diagonal().add_(1e-6)
+        try:
+            delta = torch.linalg.solve(ax2a, ax2c)  # (NC,)
+        except torch.linalg.LinAlgError:
+            return torch.full((nv,), 0.5, device=A.device, dtype=torch.float32)
 
         # Direction: r = delta^T @ A, then d = x * (c - r)
         r = A.t() @ delta  # (NV,)

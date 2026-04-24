@@ -313,7 +313,10 @@ async def lifespan(fast_api_app: FastAPI):
             thread_label = "Decode" + thread_label
         trace_set_thread_info(thread_label)
 
-    # Initialize OpenAI serving handlers
+    # Initialize OpenAI serving handlers (skip on worker nodes where tokenizer_manager is None)
+    if _global_state.tokenizer_manager is None:
+        yield
+        return
     fast_api_app.state.openai_serving_completion = OpenAIServingCompletion(
         _global_state.tokenizer_manager, _global_state.template_manager
     )
