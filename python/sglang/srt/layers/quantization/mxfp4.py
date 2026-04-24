@@ -856,7 +856,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_weight,
                 topk_weights,
                 topk_ids,
-                expert_mask=layer.expert_mask_gpu,
+                expert_mask=layer.dispatcher.expert_mask_gpu,
                 activation=ActivationType.Swiglu,
                 quant_type=QuantType.per_1x32,
                 w1_scale=layer.w13_weight_scale,
@@ -1045,6 +1045,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
                 else ActivationType.Gelu
             ),
             doweight_stage1=False,
-            expert_mask=layer.expert_mask_gpu,
+            expert_mask=layer.dispatcher.expert_mask_gpu,
         )
         return StandardCombineInput(hidden_states=output)

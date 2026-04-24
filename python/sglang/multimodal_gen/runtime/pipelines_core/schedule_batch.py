@@ -16,7 +16,7 @@ import os
 import pprint
 from copy import deepcopy
 from dataclasses import MISSING, asdict, dataclass, field, fields
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 import PIL.Image
 import torch
@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 from sglang.multimodal_gen.runtime.utils.perf_logger import RequestMetrics
 from sglang.multimodal_gen.utils import align_to
+from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 
 logger = init_logger(__name__)
 
@@ -160,6 +161,11 @@ class Req:
 
     # stage logging
     metrics: Optional["RequestMetrics"] = None
+
+    # tracing context (TraceReqContext or TraceNullContext)
+    trace_ctx: Union[TraceReqContext, TraceNullContext] = field(
+        default_factory=TraceNullContext
+    )
 
     # results
     output: torch.Tensor | None = None

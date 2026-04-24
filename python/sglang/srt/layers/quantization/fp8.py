@@ -50,6 +50,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    _use_aiter_gfx95,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
@@ -113,6 +114,12 @@ if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+
+if _use_aiter:
+    from sglang.srt.layers.quantization.fp8_utils import (
+        aiter_w8a8_block_fp8_linear,
+        use_aiter_triton_gemm_w8a8_tuned_gfx950,
+    )
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -501,6 +508,18 @@ class Fp8LinearMethod(LinearMethodBase):
 
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
+
+        if (
+            _use_aiter_gfx95
+            and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+        ):
+            n, k = layer.weight.shape
+            if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
+                # TODO(1am9trash), to deal with case that this branch chance
+                # drops as use_aiter_triton_gemm_w8a8_tuned_gfx950() expands
+                t = shuffle_weight(layer.weight, (16, 16))
+                layer.weight.copy_(t)
+                del t
 
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:
@@ -1802,7 +1821,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         if activation == "silu"
                         else ActivationType.Gelu
                     ),
-                    expert_mask=layer.expert_mask_gpu,
+                    expert_mask=layer.dispatcher.expert_mask_gpu,
                 )
             else:
                 return fused_moe(
@@ -1819,7 +1838,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         if activation == "silu"
                         else ActivationType.Gelu
                     ),
-                    expert_mask=layer.expert_mask_gpu,
+                    expert_mask=layer.dispatcher.expert_mask_gpu,
                 )
         return None
 

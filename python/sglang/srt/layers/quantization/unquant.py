@@ -484,7 +484,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                             if moe_runner_config.activation == "silu"
                             else ActivationType.Gelu
                         ),
-                        expert_mask=layer.expert_mask_gpu,
+                        expert_mask=layer.dispatcher.expert_mask_gpu,
                     )
                     return StandardCombineInput(hidden_states=output)
                 except RuntimeError as e:
