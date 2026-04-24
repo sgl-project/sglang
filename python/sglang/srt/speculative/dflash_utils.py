@@ -663,9 +663,16 @@ def compute_dflash_sampling_accept_len_and_bonus(
     scaled_logits = next_token_logits / expanded_temperature
     sparse_topk_applied = False
 
-    # Select renorm functions: kernel or PyTorch fallback
-    _top_k_fn = top_k_renorm_prob if _DFLASH_SAMPLING_VERIFY_USE_KERNEL else _top_k_renorm_prob_torch
-    _top_p_fn = top_p_renorm_prob if _DFLASH_SAMPLING_VERIFY_USE_KERNEL else _top_p_renorm_prob_torch
+    # Select renorm functions: use sgl_kernel only if the C++ ops are registered,
+    # otherwise use PyTorch fallback (the tree_speculative_sampling kernel may be
+    # available even when top_k/top_p renorm ops are not, e.g. on ROCm).
+    _has_renorm_ops = (
+        _DFLASH_SAMPLING_VERIFY_USE_KERNEL
+        and hasattr(torch.ops.sgl_kernel, "top_k_renorm_probs")
+        and hasattr(torch.ops.sgl_kernel, "top_p_renorm_probs")
+    )
+    _top_k_fn = top_k_renorm_prob if _has_renorm_ops else _top_k_renorm_prob_torch
+    _top_p_fn = top_p_renorm_prob if _has_renorm_ops else _top_p_renorm_prob_torch
 
     if use_sparse_topk and need_top_k:
         repeated_top_ks = torch.repeat_interleave(
