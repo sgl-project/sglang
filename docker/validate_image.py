@@ -112,6 +112,11 @@ def main() -> int:
 
     failures += _check("import flashinfer", _check_import_flashinfer)
 
+    def _check_import_nixl():
+        import nixl  # noqa: F401
+
+    failures += _check("import nixl", _check_import_nixl)
+
     # 3. Torch-bundled NVIDIA libs: pypi wheel version must startswith the
     # version torch was compiled against. Catches silent wheel downgrades.
     def _check_torch_bundled_nccl():
@@ -119,7 +124,12 @@ def main() -> int:
 
         torch_nccl = ".".join(str(v) for v in torch.cuda.nccl.version())
         pkg = f"nvidia-nccl-cu{cuda_major}"
-        installed = version(pkg)
+        try:
+            installed = version(pkg)
+        except PackageNotFoundError:
+            raise AssertionError(
+                f"{pkg} not installed; expected torch to declare it as a dep"
+            )
         print(f"      {pkg}={installed}, torch nccl={torch_nccl}")
         assert _version_matches(
             installed, torch_nccl
@@ -132,7 +142,12 @@ def main() -> int:
 
         torch_cudnn = _cudnn_int_to_str(torch.backends.cudnn.version())
         pkg = f"nvidia-cudnn-cu{cuda_major}"
-        installed = version(pkg)
+        try:
+            installed = version(pkg)
+        except PackageNotFoundError:
+            raise AssertionError(
+                f"{pkg} not installed; expected torch to declare it as a dep"
+            )
         print(f"      {pkg}={installed}, torch cudnn={torch_cudnn}")
         assert _version_matches(
             installed, torch_cudnn

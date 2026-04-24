@@ -539,9 +539,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 # Per-CUDA-major package installs. nixl ships as nixl-cu12 / nixl-cu13 binaries;
 # the `nixl` stub package unconditionally pulls nixl-cu12, so we install the
-# matching variant directly to avoid duplicating ~49 MB of wrong-CUDA binaries
-# on cu13 images. cuda-python pins are asserted by docker/validate_image.py —
-# keep in sync.
+# matching variant directly to avoid shipping wrong-CUDA binaries on cu13
+# images. cuda-python pins are asserted by docker/validate_image.py — keep in
+# sync.
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
     python3 -m pip install nixl-cu12 --no-deps ; \
     python3 -m pip install cuda-python==12.9 ; \
@@ -641,7 +641,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /tmp/gateway_wheels
 
 # Post-build validator invoked by the docker release workflow (see
-# .github/workflows/release-docker-dev.yml) — not run during `docker build`.
+# .github/workflows/_docker-build-and-publish.yml) — not run during `docker build`.
 COPY docker/validate_image.py /usr/local/bin/validate_image.py
 
 # Set workspace directory

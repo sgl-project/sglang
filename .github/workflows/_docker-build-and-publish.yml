@@ -138,7 +138,8 @@ jobs:
       - name: Validate AMD64 image (CUDA 12)
         run: |
           DIGEST="${{ steps.build-cu129.outputs.digest }}"
-          docker pull --platform linux/amd64 ${{ inputs.image_repo }}@${DIGEST}
+          # Retry pull: dockerhub has brief eventual-consistency after push-by-digest
+          for i in 1 2 3; do docker pull --platform linux/amd64 ${{ inputs.image_repo }}@${DIGEST} && break || sleep 10; done
           docker run --rm --platform linux/amd64 \
             -e VALIDATE_CUDA_VERSION=12.9.1 \
             ${{ inputs.image_repo }}@${DIGEST} \
@@ -176,7 +177,8 @@ jobs:
       - name: Validate AMD64 image (CUDA 13)
         run: |
           DIGEST="${{ steps.build-cu130.outputs.digest }}"
-          docker pull --platform linux/amd64 ${{ inputs.image_repo }}@${DIGEST}
+          # Retry pull: dockerhub has brief eventual-consistency after push-by-digest
+          for i in 1 2 3; do docker pull --platform linux/amd64 ${{ inputs.image_repo }}@${DIGEST} && break || sleep 10; done
           docker run --rm --platform linux/amd64 \
             -e VALIDATE_CUDA_VERSION=13.0.1 \
             ${{ inputs.image_repo }}@${DIGEST} \
@@ -268,7 +270,8 @@ jobs:
       - name: Validate ARM64 image (CUDA 12)
         run: |
           DIGEST="${{ steps.build-cu129.outputs.digest }}"
-          docker pull --platform linux/arm64 ${{ inputs.image_repo }}@${DIGEST}
+          # Retry pull: dockerhub has brief eventual-consistency after push-by-digest
+          for i in 1 2 3; do docker pull --platform linux/arm64 ${{ inputs.image_repo }}@${DIGEST} && break || sleep 10; done
           docker run --rm --platform linux/arm64 \
             -e VALIDATE_CUDA_VERSION=12.9.1 \
             ${{ inputs.image_repo }}@${DIGEST} \
@@ -306,7 +309,8 @@ jobs:
       - name: Validate ARM64 image (CUDA 13)
         run: |
           DIGEST="${{ steps.build-cu130.outputs.digest }}"
-          docker pull --platform linux/arm64 ${{ inputs.image_repo }}@${DIGEST}
+          # Retry pull: dockerhub has brief eventual-consistency after push-by-digest
+          for i in 1 2 3; do docker pull --platform linux/arm64 ${{ inputs.image_repo }}@${DIGEST} && break || sleep 10; done
           docker run --rm --platform linux/arm64 \
             -e VALIDATE_CUDA_VERSION=13.0.1 \
             ${{ inputs.image_repo }}@${DIGEST} \
