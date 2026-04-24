@@ -16,6 +16,7 @@ if _is_cuda_alike:
     )
 
 from sgl_kernel import silu_and_mul
+from triton.experimental.gluon import language as gl
 
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 from sglang.srt.distributed import get_moe_expert_parallel_world_size
@@ -23,7 +24,7 @@ from sglang.srt.layers.moe.ep_moe.kernels import (
     cutlass_w4_run_moe_ep_preproess,
     deepep_ll_get_cutlass_w4a8_moe_mm_data,
     deepep_permute_triton_kernel,
-    deepep_post_reorder_triton_kernel,
+    deepep_post_reorder_gluon_kernel,
     deepep_run_moe_deep_preprocess,
     fp8_per_token_to_per_tensor_quant_triton,
     post_reorder_for_cutlass_moe,
@@ -397,15 +398,22 @@ def cutlass_w4a8_moe_deepep_normal(
         device=c2.device,
         dtype=torch.bfloat16,
     )
-    deepep_post_reorder_triton_kernel[(num_tokens,)](
+    BLOCK_SIZE = 1024
+    hidden_size = c2.shape[1]
+    num_warps = 8
+    ept = BLOCK_SIZE // (32 * num_warps)
+    layout = gl.BlockedLayout([ept], [32], [num_warps], [0])
+    deepep_post_reorder_gluon_kernel[(num_tokens,)](
         c2,
         output,
         src2dst,
-        topk_ids_,
         topk_weights,
         topk,
-        c2.shape[1],
-        BLOCK_SIZE=512,
+        hidden_size,
+        BLOCK_SIZE=BLOCK_SIZE,
+        TOPK=topk,
+        layout=layout,
+        num_warps=num_warps,
     )
 
     return output
