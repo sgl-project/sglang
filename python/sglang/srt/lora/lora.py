@@ -272,8 +272,6 @@ class LoRAAdapter(nn.Module):
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
-        # Track which up_proj names were consumed by a matching gate_proj
-        consumed_up_names = set()
         for weight_name in weight_names:
             if "gate_proj" in weight_name:
                 up_name = weight_name.replace("gate_proj", "up_proj")
@@ -283,7 +281,6 @@ class LoRAAdapter(nn.Module):
                     # without stacking. Buffer uses stacked_multiply=1 for these.
                     weights[gate_up_name] = weights.pop(weight_name)
                     if up_name in weights:
-                        consumed_up_names.add(up_name)
                         weights.pop(up_name)
                 else:
                     cat_dim = weights[weight_name].dim() - 2
@@ -291,7 +288,6 @@ class LoRAAdapter(nn.Module):
                         (weights[weight_name], weights[up_name]), cat_dim
                     )
                     weights.pop(weight_name)
-                    consumed_up_names.add(up_name)
                     weights.pop(up_name)
             elif "gate_up_proj" in weight_name:
                 # If gate_up_proj is already stacked, we normalize it following the SGL convention
@@ -302,7 +298,6 @@ class LoRAAdapter(nn.Module):
                     repeat_dims[ndim - 2] = 2
                     weights[gate_up_name] = weights[gate_up_name].repeat(*repeat_dims)
                 # else: no-op as LoRA B weight is already stacked.
-
         # Orphan up_proj weights (no matching gate_proj) are kept as-is.
         # Models with non-gated MLP/shared-experts declare up_proj in
         # supported_lora_modules so they get their own buffer and wrapping.
