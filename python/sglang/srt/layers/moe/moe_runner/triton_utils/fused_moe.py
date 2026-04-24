@@ -20,6 +20,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_xpu,
     use_intel_xpu_backend,
 )
@@ -44,6 +45,7 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
+_is_musa = is_musa()
 
 
 if _is_cuda:
@@ -62,6 +64,10 @@ elif _is_hip:
     # because the code uses moe_sum_reduce_triton as fallback (line 619)
 elif _is_xpu:
     from sgl_kernel import moe_sum_reduce, silu_and_mul
+elif _is_musa:
+    from sgl_kernel import moe_sum_reduce
+
+    _silu_and_mul_musa = torch.nn.SwishGLU()
 
 # Try to import vllm_ops for non-CUDA/HIP/XPU platforms
 _has_vllm_ops = False
@@ -534,6 +540,8 @@ def _fused_moe_kernel_sequence(
                     down_moe_use_tma,
                     activation,
                 )
+        elif _is_musa:
+            intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
         else:
             if _has_vllm_ops:
                 vllm_ops.silu_and_mul(
@@ -618,7 +626,7 @@ def _fused_moe_kernel_sequence(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        not apply_router_weight_on_input,
+        not apply_router_weight_on_input and not no_combine,
         1,
         down_config or config,
         compute_type=compute_type,
@@ -647,7 +655,7 @@ def _fused_moe_kernel_sequence(
 
     if no_combine:
         pass
-    elif _is_cuda:
+    elif _is_cuda or _is_musa:
         if use_fused_moe_sum_all_reduce:
             if routed_scaling_factor != 1.0:
                 assert out_slice is not None

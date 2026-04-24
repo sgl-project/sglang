@@ -133,7 +133,11 @@ class Conversation:
                     ret += role + ": "  # must be end with a space
             return ret
         elif self.sep_style == SeparatorStyle.ADD_NEW_LINE_SINGLE:
-            ret = "" if system_prompt == "" else system_prompt + self.sep
+            ret = (
+                ""
+                if (not self.system_message or system_prompt == "")
+                else system_prompt + self.sep
+            )
             for role, message in self.messages:
                 if message:
                     ret += role + "\n" + message + self.sep
@@ -634,7 +638,7 @@ def generate_chat_conv(
                         conv.modalities.append(content.modalities)
                 image_token = (
                     conv.image_token + "\n"
-                    if conv.name != "qwen2-vl"
+                    if conv.name not in ("qwen2-vl", "moss-vl")
                     else conv.image_token
                 )
                 add_token_as_needed: bool = (
@@ -1015,6 +1019,20 @@ register_conv_template(
 
 register_conv_template(
     Conversation(
+        name="moss-vl",
+        system_message="",
+        system_template="<|im_start|>system\n{system_message}",
+        roles=("<|im_start|>user", "<|im_start|>assistant"),
+        sep="<|im_end|>\n",
+        sep_style=SeparatorStyle.ADD_NEW_LINE_SINGLE,
+        stop_str=["<|im_end|>"],
+        image_token="<|image|>",
+        video_token="<|video|>",
+    )
+)
+
+register_conv_template(
+    Conversation(
         name="points-v15-chat",
         system_message="",
         system_template="",
@@ -1051,6 +1069,7 @@ MODEL_TYPE_TO_TEMPLATE = {
     "phi4mm": "phi-4-mm",
     "minicpmv": "minicpmv",
     "minicpmo": "minicpmo",
+    "moss_vl": "moss-vl",
     "deepseek-ocr": "deepseek-ocr",
     "paddleocr_vl": "paddle-ocr",
     "whisper": "whisper",
@@ -1062,6 +1081,14 @@ def match_points_v15_chat(model_path: str):
     # reference: https://github.com/sgl-project/sglang/issues/12791
     if re.search(r"\bpoints\b", model_path, re.IGNORECASE):
         return "points-v15-chat"
+
+
+@register_conv_template_matching_function
+def match_moss_vl(model_path: str):
+    if re.search(r"moss.*vl|moss-vl", model_path, re.IGNORECASE):
+        return "moss-vl"
+    model_type = get_model_type(model_path)
+    return MODEL_TYPE_TO_TEMPLATE.get(model_type)
 
 
 def get_model_type(model_path: str) -> Optional[str]:
