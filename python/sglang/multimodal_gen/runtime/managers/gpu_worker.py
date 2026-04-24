@@ -3,11 +3,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import gc
 import logging
-import multiprocessing as mp
 import os
 import time
 from contextlib import ExitStack
 from dataclasses import dataclass, field
+from multiprocessing.connection import Connection
 from typing import Any, Callable, List, Union
 
 import numpy as np
@@ -121,7 +121,12 @@ class GPUWorker:
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
-        torch.get_device_module().set_device(self.local_rank)
+        role_device = self.server_args.resolved_role_device()
+        if role_device == "cpu":
+            os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cpu"
+        else:
+            os.environ["SGLANG_DIFFUSION_PLATFORM_OVERRIDE"] = "cuda"
+            torch.get_device_module().set_device(self.local_rank)
         # Set environment variables for distributed initialization
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = str(self.master_port)
@@ -143,6 +148,9 @@ class GPUWorker:
         )
 
         # set proc title
+        role = getattr(self.server_args, "disagg_role", "scheduler")
+        role_name = getattr(role, "value", role)
+        title_prefix = f"sgl_diffusion::{role_name}_scheduler"
         if model_parallel_is_initialized():
             suffix = ""
             if get_tp_world_size() != 1:
@@ -157,9 +165,9 @@ class GPUWorker:
             if get_classifier_free_guidance_world_size() != 1:
                 c_rank = get_classifier_free_guidance_rank()
                 suffix += f"_C{c_rank}"
-            setproctitle(f"sgl_diffusion::scheduler{suffix}")
+            setproctitle(f"{title_prefix}{suffix}")
         else:
-            setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
+            setproctitle(f"{title_prefix}_{self.local_rank}")
 
         self.pipeline = build_pipeline(self.server_args)
 
@@ -184,10 +192,14 @@ class GPUWorker:
                         )
 
         logger.info(
-            f"Worker {self.rank}: Initialized device, model, and distributed environment."
+            "Worker %s: Initialized device=%s, model, and distributed environment.",
+            self.rank,
+            role_device,
         )
 
     def do_mem_analysis(self, output_batch: OutputBatch):
+        if not (current_platform.is_cuda_alike() or current_platform.is_npu()):
+            return
         final_snapshot = capture_memory_snapshot()
         if output_batch.metrics:
             output_batch.metrics.record_memory_snapshot("mem_analysis", final_snapshot)
@@ -310,7 +322,10 @@ class GPUWorker:
         """
         output_batch = None
         try:
-            if self.rank == 0 and not current_platform.is_cpu():
+            supports_device_memory_stats = (
+                current_platform.is_cuda_alike() or current_platform.is_npu()
+            )
+            if self.rank == 0 and supports_device_memory_stats:
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
@@ -319,7 +334,7 @@ class GPUWorker:
             request_metrics = [
                 item.metrics for item in log_reqs if item.metrics is not None
             ]
-            if self.rank == 0 and request_metrics and not current_platform.is_cpu():
+            if self.rank == 0 and request_metrics and supports_device_memory_stats:
                 baseline_snapshot = capture_memory_snapshot()
                 for metrics in request_metrics:
                     metrics.record_memory_snapshot("before_forward", baseline_snapshot)
@@ -336,13 +351,16 @@ class GPUWorker:
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
             if return_req and isinstance(result, Req):
+                duration_ms = (time.monotonic() - start_time) * 1000
+                if result.metrics is not None:
+                    result.metrics.total_duration_ms = duration_ms
                 return result
 
             output_batch = self._to_output_batch(result)
             self._record_output_peak_memory(output_batch)
 
             output_metrics = self._iter_output_metrics(output_batch)
-            if self.rank == 0 and output_metrics and not current_platform.is_cpu():
+            if self.rank == 0 and output_metrics and supports_device_memory_stats:
                 peak_snapshot = capture_memory_snapshot()
                 for metrics in output_metrics:
                     metrics.record_memory_snapshot("after_forward", peak_snapshot)
@@ -350,7 +368,7 @@ class GPUWorker:
             if (
                 self.rank == 0
                 and not req.suppress_logs
-                and not current_platform.is_cpu()
+                and supports_device_memory_stats
                 and logger.isEnabledFor(logging.DEBUG)
             ):
                 self.do_mem_analysis(output_batch)
@@ -895,15 +913,15 @@ def run_scheduler_process(
     rank: int,
     master_port: int,
     server_args: ServerArgs,
-    pipe_writer: mp.connection.Connection,
+    pipe_writer: Connection,
     # For all workers: pipe to receive tasks from rank 0
-    task_pipe_r: mp.connection.Connection,
+    task_pipe_r: Connection,
     # For slave workers: pipe to send results back to rank 0
-    result_pipe_w: mp.connection.Connection | None,
+    result_pipe_w: Connection | None,
     # For rank 0 worker only: pipes to send tasks to slaves
-    task_pipes_to_slaves: list[mp.connection.Connection] | None = None,
+    task_pipes_to_slaves: list[Connection] | None = None,
     # For rank 0 worker only: pipes to receive results from slaves
-    result_pipes_from_slaves: list[mp.connection.Connection] | None = None,
+    result_pipes_from_slaves: list[Connection] | None = None,
 ) -> None:
     """
     The entry point for the worker process.

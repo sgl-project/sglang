@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, ClassVar, Literal, Optional
 
 import addict
 import yaml
@@ -27,11 +27,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
-from sglang.multimodal_gen.runtime.disaggregation.disagg_args import (
-    DisaggArgsMixin,
-    add_disagg_cli_args,
-    convert_disagg_role_string,
-)
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
@@ -90,6 +85,37 @@ def is_ltx2_two_stage_pipeline_name(pipeline_class_name: str | None) -> bool:
     return pipeline_class_name in LTX2_TWO_STAGE_PIPELINE_NAMES
 
 
+def _normalize_gpu_ids(gpu_ids: Any) -> list[int] | None:
+    if gpu_ids is None:
+        return None
+    if isinstance(gpu_ids, str):
+        values = [gpu_ids]
+    else:
+        values = list(gpu_ids)
+
+    tokens: list[str] = []
+    for value in values:
+        tokens.extend(part for part in str(value).replace(",", " ").split() if part)
+    if not tokens:
+        return []
+
+    parsed: list[int] = []
+    for token in tokens:
+        try:
+            gpu_id = int(token)
+        except ValueError as exc:
+            raise ValueError(
+                f"--gpu-ids contains a non-integer GPU id: {token}"
+            ) from exc
+        if gpu_id < 0:
+            raise ValueError(f"--gpu-ids GPU ids must be non-negative: {gpu_id}")
+        parsed.append(gpu_id)
+
+    if len(set(parsed)) != len(parsed):
+        raise ValueError(f"--gpu-ids contains duplicate GPU ids: {parsed}")
+    return parsed
+
+
 class Backend(str, Enum):
     """
     Enumeration for different model backends.
@@ -118,8 +144,218 @@ class Backend(str, Enum):
         return [backend.value for backend in cls]
 
 
+class DisaggServerArgsMixin:
+    DISAGG_RESULT_PORT_OFFSETS: ClassVar[dict[RoleType, int]] = {
+        RoleType.ENCODER: 1,
+        RoleType.DENOISER: 2,
+        RoleType.DECODER: 3,
+    }
+
+    def get_role_parallelism(self, role_type: "RoleType") -> dict[str, int | None]:
+        _none = {
+            "tp_size": None,
+            "sp_degree": None,
+            "ulysses_degree": None,
+            "ring_degree": None,
+        }
+        if role_type == RoleType.ENCODER:
+            return {**_none, "tp_size": self.encoder_tp}
+        if role_type == RoleType.DENOISER:
+            return {
+                "tp_size": self.denoiser_tp,
+                "sp_degree": self.denoiser_sp,
+                "ulysses_degree": self.denoiser_ulysses,
+                "ring_degree": self.denoiser_ring,
+            }
+        if role_type == RoleType.DECODER:
+            return {**_none, "sp_degree": self.decoder_sp}
+        return _none
+
+    def derive_pool_result_endpoint(self) -> str:
+        if self.disagg_server_addr is None:
+            raise ValueError("disagg_server_addr is required for per-role launch")
+        addr = self.disagg_server_addr
+        if addr.startswith("tcp://"):
+            addr = addr[len("tcp://") :]
+        host, port_str = addr.rsplit(":", 1)
+        base_port = int(port_str)
+        offset = self.DISAGG_RESULT_PORT_OFFSETS[self.disagg_role]
+        return f"tcp://{host}:{base_port + offset}"
+
+    def derive_pool_work_endpoint(self) -> str:
+        return f"tcp://0.0.0.0:{self.scheduler_port}"
+
+    def derive_pool_control_endpoint(self) -> str:
+        return f"tcp://0.0.0.0:{self.scheduler_port + 1}"
+
+    def derive_pool_control_advertised_endpoint(self) -> str:
+        host = self.host or self.disagg_p2p_hostname or "127.0.0.1"
+        if host == "0.0.0.0":
+            host = self.disagg_p2p_hostname or "127.0.0.1"
+        return f"tcp://{host}:{self.scheduler_port + 1}"
+
+    def resolved_role_device(self) -> Literal["cpu", "cuda"]:
+        if self.disagg_role_device == "auto":
+            return "cpu" if self.num_gpus <= 0 else "cuda"
+        return self.disagg_role_device
+
+    @staticmethod
+    def add_disagg_cli_args(parser: FlexibleArgumentParser) -> None:
+        parser.add_argument(
+            "--disagg-role",
+            type=str,
+            default=ServerArgs.disagg_role.value,
+            choices=RoleType.choices(),
+            help="Role for disaggregated pipeline.",
+        )
+        parser.add_argument(
+            "--disagg-timeout",
+            type=int,
+            default=ServerArgs.disagg_timeout,
+            help="Timeout in seconds for pending disagg requests. "
+            f"Default: {ServerArgs.disagg_timeout}.",
+        )
+        parser.add_argument(
+            "--disagg-downstream-wait-timeout",
+            type=int,
+            default=ServerArgs.disagg_downstream_wait_timeout,
+            help="Timeout in seconds while waiting for a downstream role slot. "
+            f"Default: {ServerArgs.disagg_downstream_wait_timeout}.",
+        )
+        parser.add_argument(
+            "--disagg-dispatch-policy",
+            type=str,
+            default=ServerArgs.disagg_dispatch_policy,
+            choices=["round_robin", "max_free_slots"],
+            help="Dispatch policy for pool mode disagg routing.",
+        )
+        parser.add_argument(
+            "--disagg-instance-id",
+            type=int,
+            default=ServerArgs.disagg_instance_id,
+            help="Stable per-role instance ID used by DiffusionServer registration.",
+        )
+        parser.add_argument(
+            "--disagg-max-slots-per-instance",
+            type=int,
+            default=ServerArgs.disagg_max_slots_per_instance,
+            help="Maximum concurrent transfer/computation slots tracked per instance.",
+        )
+        parser.add_argument(
+            "--disagg-transfer-redundancy",
+            type=float,
+            default=ServerArgs.disagg_transfer_redundancy,
+            help="Redundancy factor used when sizing transfer buffers from warmup.",
+        )
+        parser.add_argument(
+            "--disagg-role-device",
+            type=str,
+            default=ServerArgs.disagg_role_device,
+            choices=["auto", "cpu", "cuda"],
+            help="Per-role device override. 'cpu' is intended for same-machine encoder roles.",
+        )
+        parser.add_argument(
+            "--disagg-transfer-backend",
+            type=str,
+            default=ServerArgs.disagg_transfer_backend,
+            choices=["auto", "mock", "mooncake"],
+            help="Transfer backend for multimodal diffusion disaggregation.",
+        )
+        parser.add_argument(
+            "--disagg-transfer-pool-size",
+            type=int,
+            default=ServerArgs.disagg_transfer_pool_size,
+            help="Size of the P2P transfer buffer pool in bytes.",
+        )
+        parser.add_argument(
+            "--disagg-transfer-pin-memory",
+            type=str,
+            default=ServerArgs.disagg_transfer_pin_memory,
+            choices=["auto", "off", "required"],
+            help="CUDA host-register same-host shared-memory transfer buffers.",
+        )
+        parser.add_argument(
+            "--disagg-p2p-hostname",
+            type=str,
+            default=ServerArgs.disagg_p2p_hostname,
+            help="Hostname for P2P transfer engine.",
+        )
+        parser.add_argument(
+            "--disagg-ib-device",
+            type=str,
+            default=ServerArgs.disagg_ib_device,
+            help="InfiniBand device for P2P RDMA transfers.",
+        )
+        parser.add_argument(
+            "--disagg-server-addr",
+            type=str,
+            default=ServerArgs.disagg_server_addr,
+            help="DiffusionServer head node address for per-role launch mode.",
+        )
+        parser.add_argument(
+            "--encoder-urls",
+            type=str,
+            default=ServerArgs.encoder_urls,
+            help="Encoder instance work endpoints for DiffusionServer head mode.",
+        )
+        parser.add_argument(
+            "--denoiser-urls",
+            type=str,
+            default=ServerArgs.denoiser_urls,
+            help="Denoiser instance work endpoints for DiffusionServer head mode.",
+        )
+        parser.add_argument(
+            "--decoder-urls",
+            type=str,
+            default=ServerArgs.decoder_urls,
+            help="Decoder instance work endpoints for DiffusionServer head mode.",
+        )
+        parser.add_argument(
+            "--encoder-tp",
+            type=int,
+            default=ServerArgs.encoder_tp,
+            help="Tensor parallelism for encoder role.",
+        )
+        parser.add_argument(
+            "--denoiser-tp",
+            type=int,
+            default=ServerArgs.denoiser_tp,
+            help="Tensor parallelism for denoiser role.",
+        )
+        parser.add_argument(
+            "--denoiser-sp",
+            type=int,
+            default=ServerArgs.denoiser_sp,
+            help="Sequence parallelism for denoiser role.",
+        )
+        parser.add_argument(
+            "--denoiser-ulysses",
+            type=int,
+            default=ServerArgs.denoiser_ulysses,
+            help="Ulysses SP degree for denoiser role.",
+        )
+        parser.add_argument(
+            "--denoiser-ring",
+            type=int,
+            default=ServerArgs.denoiser_ring,
+            help="Ring SP degree for denoiser role.",
+        )
+        parser.add_argument(
+            "--decoder-sp",
+            type=int,
+            default=ServerArgs.decoder_sp,
+            help="Sequence parallelism for decoder role.",
+        )
+        parser.add_argument(
+            "--decoder-tp",
+            type=int,
+            default=ServerArgs.decoder_tp,
+            help="Deprecated alias for --decoder-sp.",
+        )
+
+
 @dataclasses.dataclass
-class ServerArgs(DisaggArgsMixin):
+class ServerArgs(DisaggServerArgsMixin):
     # Model and path configuration (for convenience)
     model_path: str
 
@@ -148,6 +384,8 @@ class ServerArgs(DisaggArgsMixin):
 
     # Parallelism
     num_gpus: int = 1
+    base_gpu_id: int = 0
+    gpu_ids: list[int] | None = None
     tp_size: Optional[int] = None
     sp_degree: Optional[int] = None
     # sequence parallelism
@@ -270,13 +508,21 @@ class ServerArgs(DisaggArgsMixin):
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
-    # Disaggregation — fields defined here, methods in DisaggArgsMixin,
-    # CLI registration in disagg_args.add_disagg_cli_args().
-    base_gpu_id: int = 0
+    # Disaggregation (pool mode only — launched via launch_pool_disagg_server())
     disagg_role: RoleType = RoleType.MONOLITHIC
-    disagg_timeout: int = 600
+    disagg_timeout: int = 3600
+    disagg_downstream_wait_timeout: int = 1800
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
+    disagg_instance_id: int = 0
+    disagg_max_slots_per_instance: int = 8
+    disagg_transfer_redundancy: float = 1.25
+    disagg_role_device: Literal["auto", "cpu", "cuda"] = "auto"
+    disagg_transfer_backend: Literal["auto", "mock", "mooncake"] = "auto"
+    disagg_transfer_pool_size: int = 256 * 1024 * 1024
+    disagg_transfer_pin_memory: Literal["auto", "off", "required"] = "auto"
+    disagg_p2p_hostname: str = "127.0.0.1"
+    disagg_ib_device: str | None = None
     disagg_server_addr: str | None = None
     encoder_urls: str | None = None
     denoiser_urls: str | None = None
@@ -286,12 +532,12 @@ class ServerArgs(DisaggArgsMixin):
     denoiser_sp: int | None = None
     denoiser_ulysses: int | None = None
     denoiser_ring: int | None = None
+    decoder_sp: int | None = None
     decoder_tp: int | None = None
-    disagg_transfer_pool_size: int = 256 * 1024 * 1024
-    disagg_p2p_hostname: str = "127.0.0.1"
-    disagg_ib_device: str | None = None
     pool_work_endpoint: str | None = None
     pool_result_endpoint: str | None = None
+    pool_control_endpoint: str | None = None
+    pool_control_advertised_endpoint: str | None = None
 
     # Logging
     log_level: str = "info"
@@ -300,8 +546,6 @@ class ServerArgs(DisaggArgsMixin):
     # Tracing
     enable_trace: bool = False
     otlp_traces_endpoint: str = "localhost:4317"
-
-    # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
     @property
     def broker_port(self) -> int:
@@ -320,6 +564,7 @@ class ServerArgs(DisaggArgsMixin):
 
     def _adjust_parameters(self):
         """set defaults and normalize values."""
+        self._adjust_disagg_parallelism_aliases()
         self._adjust_offload()
         self._adjust_ltx2_two_stage_device_mode()
         self._adjust_path()
@@ -332,6 +577,21 @@ class ServerArgs(DisaggArgsMixin):
         self._adjust_platform_specific()
         self._adjust_autocast()
         self.adjust_pipeline_config()
+
+    def _adjust_disagg_parallelism_aliases(self):
+        if self.decoder_tp is None:
+            return
+        if self.decoder_sp is not None and self.decoder_sp != self.decoder_tp:
+            raise ValueError(
+                "decoder_tp is deprecated in favor of decoder_sp; "
+                "please set only one of them or keep the same value."
+            )
+        if self.decoder_sp is None:
+            logger.warning(
+                "decoder_tp is deprecated and is treated as decoder_sp for "
+                "decoder/VAE parallel decode. Please use decoder_sp instead."
+            )
+            self.decoder_sp = self.decoder_tp
 
     def _validate_parameters(self):
         """check consistency and raise errors for invalid configs"""
@@ -667,15 +927,15 @@ class ServerArgs(DisaggArgsMixin):
         ring_unspecified = self.ring_degree is None
         cfg_unspecified = self.enable_cfg_parallel is None
 
+        if self.tp_size is None:
+            self.tp_size = 1
+
         if current_platform.is_cpu() and self.tp_size > 1:
             # CPU platform reuse num_gpus to represent num cpu numa nodes as devices
             self.num_gpus = self.tp_size
 
         if self.hsdp_shard_dim is None:
             self.hsdp_shard_dim = self.num_gpus
-
-        if self.tp_size is None:
-            self.tp_size = 1
 
         # --cfg-parallel-size takes precedence over --enable-cfg-parallel bool.
         if self.cfg_parallel_degree is not None:
@@ -861,7 +1121,9 @@ class ServerArgs(DisaggArgsMixin):
         configure_logger(server_args=self)
 
         # Convert string disagg_role to enum (from CLI/config)
-        convert_disagg_role_string(self.__dict__)
+        if isinstance(self.disagg_role, str):
+            self.disagg_role = RoleType.from_string(self.disagg_role)
+        self.gpu_ids = _normalize_gpu_ids(self.gpu_ids)
 
         # 1. adjust parameters
         self._adjust_parameters()
@@ -961,7 +1223,23 @@ class ServerArgs(DisaggArgsMixin):
             default=ServerArgs.num_gpus,
             help="The number of GPUs to use.",
         )
-
+        parser.add_argument(
+            "--base-gpu-id",
+            type=int,
+            default=ServerArgs.base_gpu_id,
+            help="The starting GPU ID for this instance. Used with --disagg-role "
+            "to place role instances on specific GPUs without CUDA_VISIBLE_DEVICES.",
+        )
+        parser.add_argument(
+            "--gpu-ids",
+            nargs="+",
+            default=None,
+            help=(
+                "Physical GPU IDs for this instance, e.g. --gpu-ids 0 1 6 7 "
+                "or --gpu-ids 0,1,6,7. Overrides --base-gpu-id for standalone "
+                "disagg roles."
+            ),
+        )
         parser.add_argument(
             "--tp-size",
             type=int,
@@ -1032,8 +1310,7 @@ class ServerArgs(DisaggArgsMixin):
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
         )
 
-        # Disaggregated diffusion args (defined in disagg_args.py)
-        add_disagg_cli_args(parser)
+        ServerArgs.add_disagg_cli_args(parser)
 
         # Prompt text file for batch processing
         parser.add_argument(
@@ -1533,7 +1810,8 @@ class ServerArgs(DisaggArgsMixin):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
 
         # Convert disagg_role string to enum if necessary
-        convert_disagg_role_string(kwargs)
+        if "disagg_role" in kwargs and isinstance(kwargs["disagg_role"], str):
+            kwargs["disagg_role"] = RoleType.from_string(kwargs["disagg_role"])
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)

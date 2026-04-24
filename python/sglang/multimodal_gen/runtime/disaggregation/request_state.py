@@ -31,6 +31,14 @@ class RequestState(enum.Enum):
     TIMED_OUT = "timed_out"
 
 
+class TransferPhase(enum.Enum):
+    WAITING_FOR_DOWNSTREAM_SLOT = "waiting_for_downstream_slot"
+    WAITING_ALLOC_RESULT = "waiting_alloc_result"
+    SENDING = "sending"
+    RUNNING_DOWNSTREAM = "running_downstream"
+    ABORTING = "aborting"
+
+
 _TERMINAL_STATES = {RequestState.DONE, RequestState.FAILED, RequestState.TIMED_OUT}
 _ACTIVE_STATES = set(RequestState) - _TERMINAL_STATES
 
@@ -137,6 +145,26 @@ class RequestTracker:
     def get(self, request_id: str) -> RequestRecord | None:
         with self._lock:
             return self._requests.get(request_id)
+
+    def update_instances(
+        self,
+        request_id: str,
+        *,
+        encoder_instance: int | None = None,
+        denoiser_instance: int | None = None,
+        decoder_instance: int | None = None,
+    ) -> RequestRecord:
+        with self._lock:
+            record = self._requests.get(request_id)
+            if record is None:
+                raise ValueError(f"Unknown request_id: {request_id}")
+            if encoder_instance is not None:
+                record.encoder_instance = encoder_instance
+            if denoiser_instance is not None:
+                record.denoiser_instance = denoiser_instance
+            if decoder_instance is not None:
+                record.decoder_instance = decoder_instance
+            return record
 
     def remove(self, request_id: str) -> RequestRecord | None:
         with self._lock:

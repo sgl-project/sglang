@@ -1,0 +1,402 @@
+---
+title: "Disaggregated Diffusion"
+description: "Launch recipes and parameter guide for SGLang Diffusion disaggregation."
+---
+
+# Disaggregated Diffusion Cookbook
+
+This page shows how to run SGLang Diffusion with separate encoder, denoiser,
+decoder, and head processes. The examples use
+`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`.
+
+For the internal design, see
+[Disaggregated Diffusion Pipeline](/docs/sglang-diffusion/disaggregation).
+
+## Quick Start: Single Host
+
+Use one process per role. The head process has the HTTP server and does not need
+a GPU.
+
+```bash
+# Encoder on GPU 0
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --disagg-role encoder \
+  --disagg-server-addr tcp://127.0.0.1:19655 \
+  --scheduler-port 19000 \
+  --num-gpus 1 --base-gpu-id 0
+
+# Denoiser on GPU 1
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --disagg-role denoiser \
+  --disagg-server-addr tcp://127.0.0.1:19655 \
+  --scheduler-port 19001 \
+  --num-gpus 1 --base-gpu-id 1 \
+  --disagg-transfer-pin-memory auto
+
+# Decoder on GPU 2
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --disagg-role decoder \
+  --disagg-server-addr tcp://127.0.0.1:19655 \
+  --scheduler-port 19002 \
+  --num-gpus 1 --base-gpu-id 2 \
+  --disagg-transfer-pin-memory auto
+
+# Head process
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --disagg-role server \
+  --encoder-urls tcp://127.0.0.1:19000 \
+  --denoiser-urls tcp://127.0.0.1:19001 \
+  --decoder-urls tcp://127.0.0.1:19002 \
+  --host 0.0.0.0 --port 22000 \
+  --scheduler-port 19655 \
+  --disagg-dispatch-policy round_robin \
+  --disagg-max-slots-per-instance 8 \
+  --warmup
+```
+
+Send the request to the head process:
+
+```bash
+curl http://127.0.0.1:22000/v1/videos \
+  -H "Content-Type: application/json" \
+  -d '{"model":"Wan-AI/Wan2.1-T2V-1.3B-Diffusers","prompt":"A city skyline at sunset","size":"832x480"}'
+```
+
+## GPU Placement
+
+There are two ways to select GPUs for a role process.
+
+### Consecutive GPUs
+
+Use `--base-gpu-id` plus `--num-gpus` when the role uses a consecutive GPU
+range.
+
+```bash
+# Uses physical GPUs 4, 5, 6, 7
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --disagg-role denoiser \
+  --disagg-server-addr tcp://127.0.0.1:19655 \
+  --scheduler-port 19001 \
+  --base-gpu-id 4 --num-gpus 4 \
+  --denoiser-sp 4 --denoiser-ulysses 2 --denoiser-ring 2
+```
+
+### Explicit GPUs
+
+Use `--gpu-ids` when the role uses non-consecutive GPUs. It overrides
+`--base-gpu-id`.
+
+```bash
+# Uses physical GPUs 0, 1, 6, 7
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --disagg-role denoiser \
+  --disagg-server-addr tcp://127.0.0.1:19655 \
+  --scheduler-port 19001 \
+  --gpu-ids 0 1 6 7 \
+  --denoiser-sp 4 --denoiser-ulysses 2 --denoiser-ring 2
+```
+
+Pass `--gpu-ids` to the matching role process, or pass `encoder_gpus`, `denoiser_gpus`, and
+`decoder_gpus` to the Python pool launcher.
+
+CPU encoder roles must not set `--gpu-ids`:
+
+```bash
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --disagg-role encoder \
+  --disagg-role-device cpu \
+  --num-gpus 0 \
+  --disagg-server-addr tcp://127.0.0.1:19655 \
+  --scheduler-port 19000
+```
+
+## Ports and Endpoints
+
+Use separate port ranges for the head and each role.
+
+| Setting | Process | Meaning |
+| --- | --- | --- |
+| `--port` | head | HTTP API port. Clients send requests here. |
+| `--scheduler-port` | head | DiffusionServer frontend ROUTER port. Roles use this in `--disagg-server-addr`. |
+| `--scheduler-port + 1` | head | Encoder result PULL endpoint. Derived automatically. |
+| `--scheduler-port + 2` | head | Denoiser result PULL endpoint. Derived automatically. |
+| `--scheduler-port + 3` | head | Decoder result PULL endpoint. Derived automatically. |
+| `--scheduler-port` | role | Role work PULL endpoint. The head uses this in `--encoder-urls`, `--denoiser-urls`, or `--decoder-urls`. |
+| `--scheduler-port + 1` | role | Role control endpoint. Derived automatically. |
+| `--disagg-server-addr` | role | Address of the head `--scheduler-port`. |
+
+Example:
+
+```text
+head:    --port 22000 --scheduler-port 19655
+encoder: --scheduler-port 19000 --disagg-server-addr tcp://127.0.0.1:19655
+denoiser: --scheduler-port 19001 --disagg-server-addr tcp://127.0.0.1:19655
+decoder: --scheduler-port 19002 --disagg-server-addr tcp://127.0.0.1:19655
+```
+
+Then the head uses:
+
+```bash
+--encoder-urls tcp://127.0.0.1:19000
+--denoiser-urls tcp://127.0.0.1:19001
+--decoder-urls tcp://127.0.0.1:19002
+```
+
+## Transfer Buffer and Warmup
+
+Each role has a data transfer buffer and a metadata buffer. These buffers are
+used for encoder-to-denoiser and denoiser-to-decoder handoff.
+
+The main sizing knobs are:
+
+- `--disagg-max-slots-per-instance`: max in-flight transfer slots per role
+  instance. It also controls the metadata buffer slot count.
+- `--disagg-transfer-pool-size`: lower bound for the data transfer buffer.
+- `--disagg-transfer-redundancy`: safety factor used when warmup measures the
+  payload size.
+- `--warmup`: pass this to the head/server process to send a real end-to-end
+  warmup request and resize transfer buffers before normal traffic.
+- `--warmup-resolutions`: optional calibration resolutions. If not set, the
+  warmup request uses the default request shape.
+
+With warmup, the runtime estimates:
+
+```text
+buffer_size = max(
+  disagg_transfer_pool_size,
+  rounded_measured_payload_size * disagg_max_slots_per_instance * disagg_transfer_redundancy
+)
+```
+
+Use a larger `--disagg-transfer-pool-size` when you want a hard lower bound:
+
+```bash
+--disagg-transfer-pool-size 4294967296
+```
+
+## Warmup Input Path
+
+Image-conditioned warmup needs an input image. The input directory follows the
+same rule as normal requests:
+
+- If `--input-save-path PATH` is set, warmup writes the image under `PATH`.
+- If `--input-save-path ""` is used, the runtime creates a temporary
+  `sglang_input_` directory and cleans it up.
+
+Example:
+
+```bash
+--warmup \
+--warmup-resolutions 832x480 \
+--input-save-path /data/sglang_inputs
+```
+
+## CUDA Pinned Memory
+
+`--disagg-transfer-pin-memory` controls CUDA host registration for same-host
+shared-memory transfer buffers.
+
+| Value | Behavior | When to use |
+| --- | --- | --- |
+| `auto` | CUDA roles try `cudaHostRegister`. If it fails, the role logs a warning and uses normal shared memory. | Recommended default. |
+| `required` | CUDA roles must pin the buffer. Startup fails if pinning fails. | Use when validating pinned memory setup. |
+| `off` | Do not pin transfer buffers. | Use when pinning quota or driver policy is a problem. |
+
+CPU roles do not force CUDA pinned memory. With a CPU encoder, the denoiser and
+decoder can still use pinned buffers for their GPU load and store paths.
+
+## Timeouts and Dispatch Policies
+
+Timeouts:
+
+- `--disagg-timeout`: full request timeout. It is also used by startup role
+  registration and calibration waits.
+- `--disagg-downstream-wait-timeout`: max wait time when a role has output ready
+  but no downstream slot is available.
+
+Policies:
+
+- `round_robin`: select role instances in order, while skipping full instances.
+- `max_free_slots`: select the instance with the most free slots. Use it when
+  role instances may have different load.
+
+Example:
+
+```bash
+--disagg-dispatch-policy max_free_slots \
+--disagg-max-slots-per-instance 8 \
+--disagg-timeout 3600 \
+--disagg-downstream-wait-timeout 1800
+```
+
+## Multi-Host RDMA Setup
+
+For cross-host serving, install Mooncake and set a network address that other
+machines can reach. This example runs the head and encoder on host A, and the
+denoiser and decoder on host B.
+
+```bash
+# Host A: encoder
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --disagg-role encoder \
+  --disagg-server-addr tcp://10.3.4.3:19655 \
+  --scheduler-port 19000 \
+  --num-gpus 1 --base-gpu-id 0 \
+  --disagg-p2p-hostname 10.3.4.3 \
+  --disagg-ib-device mlx5_0 \
+  --disagg-transfer-backend auto
+
+# Host B: denoiser
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --disagg-role denoiser \
+  --disagg-server-addr tcp://10.3.4.3:19655 \
+  --scheduler-port 19001 \
+  --num-gpus 4 --base-gpu-id 0 \
+  --denoiser-sp 4 --denoiser-ulysses 2 --denoiser-ring 2 \
+  --disagg-p2p-hostname 10.3.4.2 \
+  --disagg-ib-device mlx5_0 \
+  --disagg-transfer-backend auto
+
+# Host B: decoder
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --disagg-role decoder \
+  --disagg-server-addr tcp://10.3.4.3:19655 \
+  --scheduler-port 19002 \
+  --num-gpus 1 --base-gpu-id 4 \
+  --disagg-p2p-hostname 10.3.4.2 \
+  --disagg-ib-device mlx5_0 \
+  --disagg-transfer-backend auto
+
+# Host A: head
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --disagg-role server \
+  --encoder-urls tcp://10.3.4.3:19000 \
+  --denoiser-urls tcp://10.3.4.2:19001 \
+  --decoder-urls tcp://10.3.4.2:19002 \
+  --host 0.0.0.0 --port 30010 \
+  --scheduler-port 19655 \
+  --disagg-dispatch-policy max_free_slots \
+  --warmup
+```
+
+`--disagg-p2p-hostname` is the address advertised to transfer peers. It does
+not directly change buffer size. It affects backend selection and the address
+used by remote roles. Same-host fast path is selected by host id and still uses
+the shared-memory transfer buffer.
+
+`--disagg-ib-device` is the RDMA device used by Mooncake, for example `mlx5_0`.
+When `--disagg-transfer-backend auto` is used, loopback or same-host addresses
+prefer the local fallback path, while an IB device or non-loopback hostname
+selects Mooncake.
+
+## Multiple Instances per Role
+
+Use semicolons to register more than one role instance.
+
+```bash
+sglang serve --model-path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
+  --disagg-role server \
+  --encoder-urls "tcp://10.3.4.3:19000;tcp://10.3.4.4:19000" \
+  --denoiser-urls "tcp://10.3.4.5:19000;tcp://10.3.4.6:19000" \
+  --decoder-urls "tcp://10.3.4.2:19002" \
+  --host 0.0.0.0 --port 30010 \
+  --scheduler-port 19655 \
+  --disagg-dispatch-policy max_free_slots
+```
+
+## All Disaggregation Parameters
+
+| Parameter | Meaning | When to use |
+| --- | --- | --- |
+| `--disagg-role` | Selects `monolithic`, `encoder`, `denoiser`, `decoder`, or `server`. | Required for disaggregation. |
+| `--disagg-timeout` | Full request timeout in seconds. Also used by registration and startup calibration waits. | Increase for long video requests or slow startup. |
+| `--disagg-downstream-wait-timeout` | Timeout while waiting for a downstream role slot. | Increase when denoiser or decoder queues are expected to be full for a while. |
+| `--disagg-dispatch-policy` | Role instance selection policy: `round_robin` or `max_free_slots`. | Use `max_free_slots` for uneven load. |
+| `--disagg-instance-id` | Stable id for a role instance during registration. | Set when manually assigning instance ids. Most users can keep default. |
+| `--disagg-max-slots-per-instance` | Max concurrent transfer/computation slots per instance. | Tune for concurrency and buffer memory. |
+| `--disagg-transfer-redundancy` | Safety factor for warmup-based buffer sizing. | Increase if payload size varies across requests. |
+| `--disagg-role-device` | Role device override: `auto`, `cpu`, or `cuda`. | Use `cpu` for CPU encoder. |
+| `--disagg-transfer-backend` | Transfer backend: `auto`, `mock`, or `mooncake`. | Use `auto` normally; use `mooncake` to require production RDMA. |
+| `--disagg-transfer-pool-size` | Minimum data transfer buffer size in bytes. | Raise it for large resolutions or more slots. |
+| `--disagg-transfer-pin-memory` | Same-host shared-memory pin mode: `auto`, `off`, or `required`. | Use `auto` normally; use `required` to verify pinning. |
+| `--disagg-p2p-hostname` | Address advertised to transfer peers. | Set to a reachable machine IP in multi-host runs. |
+| `--disagg-ib-device` | RDMA device name for Mooncake. | Set on hosts that use RDMA, for example `mlx5_0`. |
+| `--disagg-server-addr` | Head DiffusionServer address. | Required for encoder, denoiser, and decoder roles. |
+| `--encoder-urls` | Encoder work endpoints used by the head. | Required for the head role. Use semicolons for multiple encoders. |
+| `--denoiser-urls` | Denoiser work endpoints used by the head. | Required for the head role. Use semicolons for multiple denoisers. |
+| `--decoder-urls` | Decoder work endpoints used by the head. | Required for the head role. Use semicolons for multiple decoders. |
+| `--encoder-tp` | Encoder tensor parallel size. | Use when encoder runs on multiple GPUs. |
+| `--denoiser-tp` | Denoiser tensor parallel size. | Use when the denoiser needs TP. |
+| `--denoiser-sp` | Denoiser sequence parallel size. | Common for video DiT workloads. |
+| `--denoiser-ulysses` | Ulysses SP degree for denoiser attention. | Set with `--denoiser-sp` when using Ulysses/Ring split. |
+| `--denoiser-ring` | Ring SP degree for denoiser attention. | Set with `--denoiser-sp` when using Ulysses/Ring split. |
+| `--decoder-sp` | Decoder sequence parallel size. | Use for parallel VAE decode. |
+| `--decoder-tp` | Deprecated alias for `--decoder-sp`. | Prefer `--decoder-sp`. |
+
+Related launch parameters:
+
+| Parameter | Meaning |
+| --- | --- |
+| `--num-gpus` | Number of GPUs used by this process. |
+| `--base-gpu-id` | First physical GPU id for a consecutive GPU range. |
+| `--gpu-ids` | Explicit physical GPU ids for this process. Overrides `--base-gpu-id`. |
+| `--warmup` | Enables startup or first-request warmup. In disaggregation, pass it to the head/server process for transfer buffer calibration. |
+| `--warmup-resolutions` | Resolutions used by warmup requests. |
+| `--input-save-path` | Directory for saved input files and warmup input images. Empty string means temporary input directory. |
+
+## Common Flag Snippets
+
+Use a stable instance id when logs and `/stats` need a fixed role name:
+
+```bash
+--disagg-role denoiser \
+--disagg-instance-id denoiser-a0
+```
+
+Use role-specific parallelism when one stage needs a different layout:
+
+```bash
+# 2-GPU encoder tensor parallelism
+--disagg-role encoder \
+--num-gpus 2 \
+--encoder-tp 2
+
+# Denoiser tensor and sequence parallelism
+--disagg-role denoiser \
+--num-gpus 4 \
+--denoiser-tp 1 \
+--denoiser-sp 4 \
+--denoiser-ulysses 2 \
+--denoiser-ring 2
+
+# Decoder sequence parallelism. --decoder-tp is an old alias.
+--disagg-role decoder \
+--num-gpus 2 \
+--decoder-sp 2
+```
+
+## Python Pool API
+
+For local experiments, `launch_pool_disagg_server()` accepts explicit GPU lists
+per role:
+
+```python
+from sglang.multimodal_gen.runtime.launch_server import launch_pool_disagg_server
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+server_args = ServerArgs.from_kwargs(
+    model_path="Wan-AI/Wan2.1-T2V-1.3B-Diffusers",
+    host="127.0.0.1",
+    port=30010,
+    scheduler_port=30020,
+    warmup=True,
+    disagg_transfer_pin_memory="auto",
+)
+
+launch_pool_disagg_server(
+    server_args,
+    encoder_gpus=[[0]],
+    denoiser_gpus=[[1, 2, 3, 4]],
+    decoder_gpus=[[5]],
+)
+```

@@ -23,12 +23,17 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.utils import FlexibleArgumentParser
 
 
+def _from_dict_without_model_resolution(
+    kwargs, pipeline_config: PipelineConfig | None = None
+):
+    pipeline_config = pipeline_config or QwenImagePipelineConfig()
+    with patch.object(PipelineConfig, "from_kwargs", return_value=pipeline_config):
+        return ServerArgs.from_dict(kwargs)
+
+
 class TestServerArgsPathExpansion(unittest.TestCase):
     def _from_dict_without_model_resolution(self, kwargs):
-        with patch.object(
-            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
-        ):
-            return ServerArgs.from_dict(kwargs)
+        return _from_dict_without_model_resolution(kwargs)
 
     def test_tilde_model_path_is_expanded(self):
         args = self._from_dict_without_model_resolution(
@@ -241,10 +246,7 @@ class TestPerRoleParallelism(unittest.TestCase):
     """Test per-role parallelism args and get_role_parallelism helper."""
 
     def _from_dict(self, kwargs):
-        with patch.object(
-            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
-        ):
-            return ServerArgs.from_dict(kwargs)
+        return _from_dict_without_model_resolution(kwargs)
 
     def test_defaults_are_none(self):
         args = self._from_dict({"model_path": "/fake"})
@@ -286,14 +288,33 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(par["ring_degree"], 2)
 
     def test_decoder_overrides(self):
-        args = self._from_dict({"model_path": "/fake", "decoder_tp": 2})
+        args = self._from_dict({"model_path": "/fake", "decoder_sp": 2})
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
         par = args.get_role_parallelism(RoleType.DECODER)
-        self.assertEqual(par["tp_size"], 2)
-        self.assertIsNone(par["sp_degree"])
+        self.assertIsNone(par["tp_size"])
+        self.assertEqual(par["sp_degree"], 2)
         self.assertIsNone(par["ulysses_degree"])
         self.assertIsNone(par["ring_degree"])
+
+    def test_decoder_tp_is_alias_of_decoder_sp(self):
+        args = self._from_dict({"model_path": "/fake", "decoder_tp": 2})
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        self.assertEqual(args.decoder_sp, 2)
+        par = args.get_role_parallelism(RoleType.DECODER)
+        self.assertIsNone(par["tp_size"])
+        self.assertEqual(par["sp_degree"], 2)
+
+    def test_conflicting_decoder_tp_and_decoder_sp_raise(self):
+        with self.assertRaisesRegex(ValueError, "decoder_tp is deprecated"):
+            self._from_dict(
+                {
+                    "model_path": "/fake",
+                    "decoder_tp": 2,
+                    "decoder_sp": 4,
+                }
+            )
 
     def test_monolithic_returns_all_none(self):
         args = self._from_dict({"model_path": "/fake", "encoder_tp": 2})
@@ -310,14 +331,14 @@ class TestPerRoleParallelism(unittest.TestCase):
                 "model_path": "/fake",
                 "encoder_tp": 1,
                 "denoiser_tp": 2,
-                "decoder_tp": 4,
+                "decoder_sp": 4,
             }
         )
         from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 
         self.assertEqual(args.get_role_parallelism(RoleType.ENCODER)["tp_size"], 1)
         self.assertEqual(args.get_role_parallelism(RoleType.DENOISER)["tp_size"], 2)
-        self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["tp_size"], 4)
+        self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["sp_degree"], 4)
 
     def test_cli_args_parsed(self):
         """Per-role parallelism args are parsed from CLI."""
@@ -336,6 +357,8 @@ class TestPerRoleParallelism(unittest.TestCase):
             "2",
             "--encoder-tp",
             "1",
+            "--decoder-sp",
+            "8",
         ]
         args, unknown = parser.parse_known_args(argv)
         self.assertEqual(args.denoiser_tp, 2)
@@ -343,6 +366,7 @@ class TestPerRoleParallelism(unittest.TestCase):
         self.assertEqual(args.denoiser_ulysses, 2)
         self.assertEqual(args.denoiser_ring, 2)
         self.assertEqual(args.encoder_tp, 1)
+        self.assertEqual(args.decoder_sp, 8)
         self.assertIsNone(args.decoder_tp)
 
 
@@ -382,6 +406,72 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
         self.assertTrue(server_args.pipeline_config.disable_autocast)
         self.assertTrue(server_args.disable_autocast)
+
+
+class TestDisaggTimeoutArgs(unittest.TestCase):
+    def test_disagg_defaults_match_reviewed_values(self):
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
+        self.assertEqual(args.disagg_max_slots_per_instance, 8)
+        self.assertEqual(args.disagg_downstream_wait_timeout, 1800)
+        self.assertEqual(args.disagg_timeout, 3600)
+
+    def test_downstream_wait_timeout_cli_arg_is_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--disagg-downstream-wait-timeout",
+            "45",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.disagg_downstream_wait_timeout, 45)
+
+    def test_disagg_timeout_help_uses_current_defaults(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        help_text = parser.format_help()
+
+        self.assertIn("Default: 3600.", help_text)
+        self.assertIn("Default: 1800.", help_text)
+
+    def test_disagg_role_alias_cli_arg_is_accepted(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args, _unknown = parser.parse_known_args(
+            ["--model-path", "/fake", "--disagg-role", "denoising"]
+        )
+
+        self.assertEqual(args.disagg_role, "denoising")
+
+    def test_disagg_role_alias_normalizes_to_denoiser(self):
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        args = _from_dict_without_model_resolution(
+            {"model_path": "/fake", "disagg_role": "denoising"}
+        )
+
+        self.assertEqual(args.disagg_role, RoleType.DENOISER)
+
+
+class TestDisaggTransferBackendArgs(unittest.TestCase):
+    def test_transfer_backend_defaults_to_auto(self):
+        args = _from_dict_without_model_resolution({"model_path": "/fake"})
+        self.assertEqual(args.disagg_transfer_backend, "auto")
+
+    def test_transfer_backend_cli_arg_is_parsed(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--disagg-transfer-backend",
+            "mock",
+        ]
+
+        args, _unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.disagg_transfer_backend, "mock")
 
 
 if __name__ == "__main__":
