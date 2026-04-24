@@ -161,7 +161,7 @@ export const DeepSeekV4Deployment = () => {
   // and the cell renders as a normal, runnable command.
   // pd-disagg is verified as a single unit (both prefill and decode together).
   const VERIFIED_RECIPES = new Set([
-    // e.g. "b200|small|low-latency",
+    "b200|small|low-latency",
   ]);
   const BEING_VERIFIED_NOTE =
     "# NOTE: this recipe is being verified on the latest checkpoint";
@@ -206,7 +206,7 @@ export const DeepSeekV4Deployment = () => {
 
     // ---- env ----
     // _LAUNCH_HEAD always prepends these:
-    const COMMON_ENV = ["SGLANG_ENABLE_THINKING=1", "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
+    const COMMON_ENV = ["SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
     // Per-hardware env (whitelist #1: NVSHMEM removed for B200).
     const HW_ENV = {
       h200:  ["SGLANG_DSV4_FP4_EXPERTS=0"],   // allinone _ENV_H200
@@ -249,10 +249,10 @@ export const DeepSeekV4Deployment = () => {
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       }
     }
-    // _ENV_MTP (allinone): set on low-latency and balanced (MTP recipes).
-    if (recipe === "low-latency" || recipe === "balanced") {
-      recipeEnv.push("SGLANG_ENABLE_SPEC_V2=1");
-    }
+    // SGLANG_ENABLE_SPEC_V2=1 was in allinone's _ENV_MTP for low-latency / balanced
+    // recipes, but V4 auto-enables spec-v2 when MTP is detected — human confirmed
+    // the env is redundant on the public cookbook path. Kept as a no-op reference
+    // in allinone for legacy runs.
 
     // ---- flags ----
     const flags = [];
@@ -415,7 +415,7 @@ export const DeepSeekV4Deployment = () => {
     // Whitelist #5: only SGLANG_MOONCAKE_CUSTOM_MEM_POOL kept; MC_FORCE_MNNVL /
     // NCCL_MNNVL_ENABLE / NCCL_CUMEM_ENABLE stripped (personal-cluster topology).
     const MNNVL_ENV = isGB300 ? ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True"] : [];
-    const COMMON_ENV = ["SGLANG_ENABLE_THINKING=1", "SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
+    const COMMON_ENV = ["SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
 
     const buildRole = (mode, port, distPort) => {
       const roleEnv = [];
