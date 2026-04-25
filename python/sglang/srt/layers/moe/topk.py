@@ -538,13 +538,24 @@ def fused_topk(
                 renormalize,
             )
     elif scoring_func == "sigmoid":
-        topk_sigmoid(
-            topk_weights,
-            topk_ids,
-            gating_output,
-            renormalize,
-            correction_bias,
-        )
+        if _use_aiter and correction_bias is not None:
+            aiter_biased_grouped_topk(
+                gating_output,
+                correction_bias.to(dtype=gating_output.dtype),
+                topk_weights,
+                topk_ids,
+                num_expert_group=1,
+                topk_group=1,
+                need_renorm=renormalize,
+            )
+        else:
+            topk_sigmoid(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                renormalize,
+                correction_bias,
+            )
     else:
         raise ValueError(f"Invalid scoring function: {scoring_func}")
 
