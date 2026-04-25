@@ -514,9 +514,12 @@ export const DeepSeekV4Deployment = () => {
       // H200 Pro PD memory-budget: cookbook defaults give available_gpu_memory
       // ~17.93 GB after weights but reserve target = (1 - mem_fraction_static)
       // × 138 GB = 87 GB → "Not enough memory" at memory profile. mem-frac 0.90
-      // and cg-max-bs 64 verified on 2026-04-25 (journal 2026-04-25-014).
+      // and cg-max-bs 128 verified on 2026-04-25 (journal 2026-04-25-014). 128
+      // matches gb300|big|pd decode and gives larger decode batching headroom;
+      // CG capture takes ~1 hr (one-time, vs ~5 min for cg=64) but runtime
+      // throughput is better.
       if (hardware === "h200" && modelSize === "big") {
-        flags.push("  --cuda-graph-max-bs 64");
+        flags.push("  --cuda-graph-max-bs 128");
         flags.push("  --mem-fraction-static 0.9");
       }
       if (mode === "decode") {
