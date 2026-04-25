@@ -1035,7 +1035,7 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
 
     Args:
         pkg: Package name (distribution name, e.g., "flashinfer-python")
-        min_version: Minimum version required (e.g., "0.6.7.post3")
+        min_version: Minimum version required (e.g., "0.6.8.post1")
 
     Returns:
         True if package is installed and version >= min_version, False otherwise
@@ -1530,7 +1530,7 @@ def get_amdgpu_memory_capacity():
 
 
 def get_device_sm():
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() or is_musa():
         major, minor = torch.cuda.get_device_capability()
         return major * 10 + minor
     return 0
@@ -2074,6 +2074,8 @@ def direct_register_custom_op(
             my_lib.impl(op_name, op_func, "PrivateUse1")
         elif is_xpu():
             my_lib.impl(op_name, op_func, "XPU")
+        elif is_musa():
+            my_lib.impl(op_name, op_func, "MUSA")
         else:
             my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
@@ -2702,6 +2704,73 @@ def get_quantization_config(hf_config) -> str | None:
     if quantization_config is not None:
         return quantization_config.get("quant_method")
     return None
+
+
+def has_fp8_weights_in_checkpoint(model_path: str) -> bool:
+    """Check if a model checkpoint actually contains FP8 (float8_e4m3fn) expert
+    weight tensors by reading safetensors metadata headers.
+
+    This is needed because some models (e.g. DeepSeek V3/R1) use native FP8 MoE
+    experts without declaring it in quantization_config, while other models
+    sharing the same architecture (e.g. Moonlight) are purely BF16.
+
+    Accepts a local directory or a HuggingFace repo ID. For remote repos, only
+    safetensors headers (a few KB) are fetched via byte-range reads; full
+    shards are never downloaded.
+    """
+    import json
+    import struct
+
+    try:
+        if os.path.isdir(model_path):
+
+            def _open(name):
+                return open(os.path.join(model_path, name), "rb")
+
+            def _exists(name):
+                return os.path.exists(os.path.join(model_path, name))
+
+        else:
+            from huggingface_hub import HfFileSystem
+
+            fs = HfFileSystem()
+
+            def _open(name):
+                return fs.open(f"{model_path}/{name}", "rb")
+
+            def _exists(name):
+                return fs.exists(f"{model_path}/{name}")
+
+        if _exists("model.safetensors.index.json"):
+            with _open("model.safetensors.index.json") as f:
+                weight_map = json.loads(f.read()).get("weight_map", {})
+            expert_files = sorted(
+                {v for k, v in weight_map.items() if "experts" in k and "weight" in k}
+            )
+            shard_file = (
+                expert_files[0]
+                if expert_files
+                else next(iter(sorted(set(weight_map.values()))), None)
+            )
+            if shard_file is None:
+                return False
+        elif _exists("model.safetensors"):
+            shard_file = "model.safetensors"
+        else:
+            return False
+
+        with _open(shard_file) as f:
+            header_len = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(header_len))
+
+        for key, meta in header.items():
+            if key == "__metadata__":
+                continue
+            if "experts" in key and "weight" in key:
+                return meta.get("dtype") == "F8_E4M3"
+        return False
+    except Exception:
+        return False
 
 
 def flatten_nested_list(nested_list):
@@ -3371,6 +3440,12 @@ def is_gfx95_supported():
         return any(gfx in gcn_arch for gfx in ["gfx95"])
     else:
         return False
+
+
+def get_hip_version():
+    if torch.version.hip:
+        return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
+    return (0, 0, 0)
 
 
 # LoRA-related constants and utilities
