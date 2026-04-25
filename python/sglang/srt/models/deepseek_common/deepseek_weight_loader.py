@@ -136,7 +136,11 @@ class DeepseekV2WeightLoaderMixin:
         # Params for special naming rules in mixed-precision models, for example:
         # model.layers.xx.mlp.experts.xx.w1.input_scale. For details,
         # see https://huggingface.co/Barrrrry/DeepSeek-R1-W4AFP8/blob/main.
-        if self.quant_config and self.quant_config.get_name() == "w4afp8":
+        if self.quant_config and (
+            self.quant_config.get_name() == "w4afp8"
+            or getattr(self.quant_config, "is_w4afp8_config", lambda: False)()
+            or getattr(self.quant_config, "is_w4a16_config", lambda: False)()
+        ):
             expert_params_mapping += FusedMoE.make_expert_input_scale_params_mapping(
                 num_experts=self.config.n_routed_experts
             )
@@ -155,6 +159,7 @@ class DeepseekV2WeightLoaderMixin:
             futures = []
             params_dict = dict(self.named_parameters())
             weight_names = []
+
             for name, loaded_weight in weights:
                 use_async_loading = should_async_load(loaded_weight)
                 layer_id = get_layer_id(name)
@@ -236,16 +241,18 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     break
                 else:
+                    skip_unmaterialized_expert_param = False
                     for mapping in expert_params_mapping:
                         param_name, weight_name, expert_id, shard_id = mapping
                         if weight_name not in name:
                             continue
                         if _is_npu:
                             name = name.replace("weight_packed", "weight")
-                        name = name.replace(weight_name, param_name)
-                        if name not in params_dict:
+                        resolved_name = name.replace(weight_name, param_name)
+                        if resolved_name not in params_dict:
+                            skip_unmaterialized_expert_param = True
                             continue
-                        param = params_dict[name]
+                        param = params_dict[resolved_name]
                         weight_loader = param.weight_loader
                         maybe_executor_submit(
                             executor=executor,
@@ -255,7 +262,7 @@ class DeepseekV2WeightLoaderMixin:
                             func_args=(
                                 param,
                                 loaded_weight,
-                                name,
+                                resolved_name,
                             ),
                             func_kwargs={
                                 "shard_id": shard_id,
@@ -264,6 +271,8 @@ class DeepseekV2WeightLoaderMixin:
                         )
                         break
                     else:
+                        if skip_unmaterialized_expert_param:
+                            continue
                         # Skip loading extra bias for GPTQ models.
                         if name.endswith(".bias") and name not in params_dict:
                             continue
