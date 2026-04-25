@@ -92,6 +92,80 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
+_FP4_TABLE = torch.tensor(
+    [
+        0.0,
+        0.5,
+        1.0,
+        1.5,
+        2.0,
+        3.0,
+        4.0,
+        6.0,
+        0.0,
+        -0.5,
+        -1.0,
+        -1.5,
+        -2.0,
+        -3.0,
+        -4.0,
+        -6.0,
+    ],
+    dtype=torch.float32,
+)
+
+
+def convert_fp4_experts_to_fp8(
+    weight_param: torch.nn.Parameter,
+    scale_param: torch.nn.Parameter,
+    weight_block_size: List[int],
+) -> None:
+    """Convert FP4 (E2M1) expert weights to FP8 (E4M3) in-place.
+
+    Called after EP/TP sharding so only local experts are converted.
+    Batched across all local experts with no Python loop.
+
+    Args:
+        weight_param: [E, out_dim, in_dim//2] int8 (two E2M1 nibbles per byte)
+        scale_param:  [E, out_dim, in_dim//fp4_block_size] float32 per-block scales
+        weight_block_size: [block_n, block_k] from quant_config
+    """
+    fp8_blk_n, fp8_blk_k = weight_block_size
+    MAX_OFFSET_BITS = 6
+
+    w = weight_param.data
+    s = scale_param.data
+    E, out_dim, half_in = w.shape
+    in_dim = half_in * 2
+    fp4_blk = in_dim // s.shape[-1]
+
+    # Unpack two FP4 nibbles per byte via lookup table
+    w = w.view(torch.uint8)
+    table = _FP4_TABLE.to(w.device)
+    w = torch.stack([table[(w & 0x0F).long()], table[(w >> 4).long()]], dim=-1).flatten(
+        3
+    )
+
+    # Reshape into (fp8_blk_n x fp8_blk_k) blocks
+    bOut = out_dim // fp8_blk_n
+    bIn = in_dim // fp8_blk_k
+    w = w.view(E, bOut, fp8_blk_n, bIn, fp8_blk_k).transpose(2, 3)
+    s = s.float().view(E, bOut, fp8_blk_n, bIn, -1).transpose(2, 3).flatten(3)
+
+    # Compute per-block scale and apply offset
+    scale_max = s.amax(dim=-1, keepdim=True) / (2**MAX_OFFSET_BITS)
+    offset = (
+        (s / scale_max)
+        .unflatten(-1, (fp8_blk_n, -1))
+        .repeat_interleave(fp4_blk, dim=-1)
+    )
+    w = (w * offset).transpose(2, 3).reshape(E, out_dim, in_dim)
+
+    weight_param.data = w.to(torch.float8_e4m3fn)
+    scale_param.data = scale_max.squeeze(-1).to(torch.float32)
+    del w, s
+
+
 if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
@@ -618,6 +692,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.is_fp4_expert = (
             envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
         )
+        self.convert_fp4_to_fp8 = envs.SGLANG_DSV4_FP4_CHECKPOINT.get()
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -677,7 +752,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     )
 
         # WEIGHTS
-        if self.is_fp4_expert:
+        if self.is_fp4_expert or self.convert_fp4_to_fp8:
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
@@ -743,8 +818,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
-        if self.is_fp4_expert:
-            if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get() and not is_large_dummy_model():
+        if self.is_fp4_expert or self.convert_fp4_to_fp8:
+            if (
+                envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get()
+                and not is_large_dummy_model()
+            ):
                 assert hidden_size == 4096
                 assert intermediate_size_per_partition == 2048
             fp4_block_k = 32
@@ -927,6 +1005,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
+
+            if self.convert_fp4_to_fp8:
+                weight_block_size = self.quant_config.weight_block_size
+                convert_fp4_experts_to_fp8(
+                    layer.w13_weight,
+                    layer.w13_weight_scale_inv,
+                    weight_block_size,
+                )
+                convert_fp4_experts_to_fp8(
+                    layer.w2_weight,
+                    layer.w2_weight_scale_inv,
+                    weight_block_size,
+                )
+                return
 
             if self.is_fp4_expert:
                 layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)

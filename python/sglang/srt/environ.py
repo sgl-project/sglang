@@ -469,6 +469,7 @@ class Envs:
     SGLANG_DSV4_MODE = EnvStr("2604")
     SGLANG_DSV4_2604_SUBMODE = EnvStr("2604B")
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)  # Set False when using FP4-to-FP8 converted checkpoint with 2604 config
+    SGLANG_DSV4_FP4_CHECKPOINT = EnvBool(False)  # True when checkpoint is FP4 but runtime converts to FP8 (Hopper)
     SGLANG_OPT_HISPARSE_C4_SHRINK = EnvInt(1)
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)

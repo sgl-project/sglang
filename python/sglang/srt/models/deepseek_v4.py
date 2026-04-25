@@ -1625,21 +1625,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             envs.SGLANG_DSV4_MODE.get() == "2604"
             and not envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
         ):
-            if envs.SGLANG_FIX_DSV4_BASE_MODEL_LOAD.get():
-                weights = list(weights)
-                exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
-                if exists_wo_a_scale:
-                    logger.info("Execute dequant fp8 wo_a")
-                    weights = _dequant_fp8_wo_a(weights)
-                else:
-                    logger.info("Skip dequant fp8 wo_a")
-            else:
-                # ----------------------------- legacy code ------------------------------
-                if envs.SGLANG_DSV4_FP4_EXPERTS.get():
-                    weights = _dequant_fp8_wo_a(weights)
-                else:
-                    weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
-                # ------------------------------------------------------------------------
+            weights = _dequant_fp8_wo_a(weights)
 
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -2054,20 +2040,30 @@ def build_mega_moe_experts_weights(experts) -> None:
 def _dequant_fp8_wo_a(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
-    weights_dict = dict(weights)
+    wo_a_weights: dict[str, torch.Tensor] = {}
+    wo_a_scales: dict[str, torch.Tensor] = {}
 
-    for name in list(weights_dict.keys()):
-        if name not in weights_dict:
+    for name, tensor in weights:
+        if (
+            name.endswith(".wo_a.weight")
+            and tensor.dtype.is_floating_point
+            and tensor.element_size() <= 1
+        ):
+            wo_a_weights[name] = tensor
             continue
-        if not name.endswith(".wo_a.weight"):
+        if name.endswith(".wo_a.scale"):
+            wo_a_scales[name] = tensor
             continue
+        yield name, tensor
+
+    for name, weight in wo_a_weights.items():
         scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
-        assert scale_name in weights_dict
-        weight = weights_dict.pop(name)
-        scale = weights_dict.pop(scale_name)
+        if scale_name not in wo_a_scales:
+            raise ValueError(
+                f"Missing scale {scale_name} for non-bfloat16 weight {name}"
+            )
+        scale = wo_a_scales.pop(scale_name)
         yield name, _dequant_fp8(weight, scale)
-
-    yield from weights_dict.items()
 
 
 def _debug_assert_model_path_configs() -> None:

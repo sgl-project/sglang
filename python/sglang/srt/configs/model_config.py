@@ -395,8 +395,7 @@ class ModelConfig:
         (mxfp4); only flip it automatically when we can positively identify the
         converted-FP8 layout. Explicit env settings always win.
         """
-        if envs.SGLANG_DSV4_FP4_EXPERTS.is_set():
-            return
+        explicitly_set = envs.SGLANG_DSV4_FP4_EXPERTS.is_set()
         if not is_deepseek_compressed(self.hf_config):
             return
         if envs.SGLANG_DSV4_MODE.get() != "2604":
@@ -416,8 +415,16 @@ class ModelConfig:
         # Packed mxfp4 expert weights are stored as int8/uint8 (or native F4);
         # the FP4-to-FP8 conversion path writes F8_E4M3. Anything else is
         # unexpected for 2604 mode, so leave the env alone and log it.
+        is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
+        is_fp4_checkpoint = False
         if dtype in ("U8", "I8", "F4"):
-            is_fp4_experts = True
+            from sglang.srt.utils import is_blackwell_supported, is_sm90_supported
+
+            if is_sm90_supported() and not is_blackwell_supported():
+                is_fp4_experts = False
+                is_fp4_checkpoint = True
+            else:
+                is_fp4_experts = True
         elif dtype == "F8_E4M3":
             is_fp4_experts = False
         else:
@@ -427,12 +434,15 @@ class ModelConfig:
                 dtype,
             )
             return
-        envs.SGLANG_DSV4_FP4_EXPERTS.set(is_fp4_experts)
+        if not explicitly_set:
+            envs.SGLANG_DSV4_FP4_EXPERTS.set(is_fp4_experts)
+        envs.SGLANG_DSV4_FP4_CHECKPOINT.set(is_fp4_checkpoint)
         logger.info(
             "Auto-detected routed-expert safetensors dtype=%s; "
-            "SGLANG_DSV4_FP4_EXPERTS=%s",
+            "SGLANG_DSV4_FP4_EXPERTS=%s, SGLANG_DSV4_FP4_CHECKPOINT=%s",
             dtype,
-            is_fp4_experts,
+            envs.SGLANG_DSV4_FP4_EXPERTS.get(),
+            envs.SGLANG_DSV4_FP4_CHECKPOINT.get(),
         )
 
     def _derive_hybrid_model(self):
