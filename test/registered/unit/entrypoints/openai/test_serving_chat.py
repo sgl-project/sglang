@@ -900,6 +900,25 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(context.exception.status_code, 400)
         self.assertIn("must be an integer", context.exception.detail)
 
+    def test_hunyuan_reasoning_effort_dispatch(self):
+        tm = _MockTokenizerManager()
+        tm.server_args.reasoning_parser = "hunyuan"
+        chat = OpenAIServingChat(tm, _MockTemplateManager())
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        cases = [
+            ("no_think", False),
+            ("none", False),
+            (None, False),
+            ("high", True),
+            ("low", True),
+        ]
+        for effort, expected in cases:
+            with self.subTest(effort=effort):
+                req.reasoning_effort = effort
+                self.assertEqual(chat._get_reasoning_from_request(req), expected)
+
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""

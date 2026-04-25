@@ -21,6 +21,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_gfx95_supported,
     _is_hip,
+    _is_musa,
     _use_aiter,
     _use_aiter_gfx95,
 )
@@ -553,6 +554,11 @@ class DeepseekMLAForwardMixin:
                     torch.bfloat16,
                 )
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        elif _is_musa:
+            attn_bmm_output = torch.bmm(
+                attn_output.to(torch.bfloat16).transpose(0, 1), self.w_vc
+            )
+            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
             if is_in_piecewise_cuda_graph():
                 # torch dynamo requires out= op was called where output tensor was non-contiguous

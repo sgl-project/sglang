@@ -59,6 +59,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -428,6 +434,11 @@ class NemotronHMambaDecoderLayer(nn.Module):
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
+
+        if is_in_breakable_cuda_graph():
+            output = torch.empty_like(hidden_states)
+            breakable_nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+            return output, residual
 
         if is_in_piecewise_cuda_graph():
             output = torch.empty_like(hidden_states)
@@ -912,4 +923,8 @@ def nemotron_mamba2_with_output(
 
     # Copy result back; output may be larger (padded) so only fill actual tokens
     output[:num_actual_tokens].view(ret.shape).copy_(ret)
-    return
+
+
+breakable_nemotron_mamba2_with_output = eager_on_graph(True)(
+    nemotron_mamba2_with_output
+)
