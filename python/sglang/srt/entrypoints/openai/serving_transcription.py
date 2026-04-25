@@ -157,6 +157,11 @@ class OpenAIServingTranscription(OpenAIServingBase):
         )
         if use_fused:
             request._fused_autodetect = True
+            # Stash the variant alongside the flag so the adapter dispatch in
+            # parse_fused_output and the build_fused_autodetect_params regex
+            # selection see the same boolean — and we don't recompute it on
+            # every cumulative-text snapshot in streaming.
+            request._fused_ts_variant = bool(timestamp_granularities)
 
         # Use the base class handle_request pattern
         return await self.handle_request(request, raw_request)
@@ -188,7 +193,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
         # returns (None, None) and we fall back to a best-effort scrub —
         # the language stays unset rather than reporting a bogus detection.
         if getattr(request, "_fused_autodetect", False):
-            lang, visible = self._adapter.parse_fused_output(text)
+            lang, visible = self._adapter.parse_fused_output(
+                text, ts_variant=getattr(request, "_fused_ts_variant", False)
+            )
             if visible is None:
                 logger.warning(
                     "Fused auto-detect parse failed on non-streaming response; "
@@ -259,6 +266,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         visible_buffer = ""
 
         fused_mode = getattr(request, "_fused_autodetect", False)
+        ts_variant = getattr(request, "_fused_ts_variant", False)
         # When ``incremental_streaming_output`` is enabled, each chunk's
         # ``content["text"]`` is the new delta from the detokenizer, not
         # the cumulative text. Always reconstruct cumulative text locally
@@ -285,7 +293,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
                     cumulative_text = chunk_text
 
                 if fused_mode:
-                    lang, visible = self._adapter.parse_fused_output(cumulative_text)
+                    lang, visible = self._adapter.parse_fused_output(
+                        cumulative_text, ts_variant=ts_variant
+                    )
                     if visible is None:
                         # Prefix not yet locatable. Keep buffering until the
                         # stream ends.

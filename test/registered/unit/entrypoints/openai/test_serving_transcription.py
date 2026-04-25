@@ -189,6 +189,7 @@ class TestStreamingFusedAutodetect(CustomTestCase):
             model="whisper", stream=True, timestamp_granularities=["segment"]
         )
         request._fused_autodetect = True
+        request._fused_ts_variant = True
 
         async def drive():
             frames = []
@@ -232,6 +233,7 @@ class TestStreamingFusedAutodetect(CustomTestCase):
             model="whisper", stream=True, timestamp_granularities=["segment"]
         )
         request._fused_autodetect = True
+        request._fused_ts_variant = True
 
         async def drive():
             frames = []

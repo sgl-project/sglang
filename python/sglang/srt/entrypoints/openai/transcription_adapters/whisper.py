@@ -155,16 +155,30 @@ WHISPER_AUTODETECT_TS_REGEX = (
     _LANG_PREFIX + r"<\|transcribe\|>" + r"<\|0\.00\|>" + r"[\s\S]*"
 )
 
-# Full forced-prefix pattern, anchored at start. Accepts the exact 3-token
-# shape the FSM emits and rejects anything else (so a bypassed FSM or a
-# chunk-boundary snapshot that's missing ``<|transcribe|>`` can't slip
-# through as a valid detection). ``[\s\S]*`` captures everything after the
-# prefix as the user-visible transcription. Scoped to
-# WHISPER_LANG_TOKEN_CODES so a bogus 2-or-3-letter code can't sneak through
-# either.
-_FUSED_PREFIX_RE = re.compile(
-    r"^" + _LANG_PREFIX + r"<\|transcribe\|>" + r"(?:<\|notimestamps\|>|<\|0\.00\|>)"
+# Forced-prefix patterns, one per FSM variant. Each is anchored at start
+# and rejects anything missing ``<|transcribe|>`` so a bypassed FSM or a
+# mid-stream snapshot can't slip through as a valid detection. The two
+# patterns differ in what the third forced token is decoded *as*:
+#
+# * ``_FUSED_PREFIX_RE_NOTS`` — non-timestamps variant. The third token
+#   is ``<|notimestamps|>`` (id 50364), which detokenizes to its literal
+#   string. Mid-stream snapshots stuck at ``<|en|><|transcribe|>`` (the
+#   third token hasn't fired yet) correctly miss this regex, so the
+#   streaming handler can detect FSM-abort and surface an error.
+#
+# * ``_FUSED_PREFIX_RE_TS`` — timestamps variant. The third token is
+#   ``<|0.00|>`` (id 50365), which Whisper's tokenizer decodes to the
+#   *empty string* even with ``skip_special_tokens=False`` (only
+#   ``<|notimestamps|>`` survives detokenization; every ``<|X.XX|>``
+#   maps to ``""``). So the regex must accept just
+#   ``<|en|><|transcribe|>`` and rely on the FSM having already
+#   constrained ``output_ids[2] == 50365``. ``_parse_segments`` reads
+#   the timestamps from ``output_ids`` directly, so segment timing is
+#   unaffected.
+_FUSED_PREFIX_RE_NOTS = re.compile(
+    r"^" + _LANG_PREFIX + r"<\|transcribe\|><\|notimestamps\|>"
 )
+_FUSED_PREFIX_RE_TS = re.compile(r"^" + _LANG_PREFIX + r"<\|transcribe\|>")
 
 # Fixed Whisper control tokens (see transformers.models.whisper vocab).
 # <|startoftranscript|> / <|startofprev|> / <|startoflm|> only appear at
@@ -239,7 +253,7 @@ class WhisperAdapter(TranscriptionAdapter):
         Either way, detection and transcription run in a single encoder
         pass with no extra HTTP round-trip.
         """
-        use_ts = bool(request.timestamp_granularities)
+        ts_variant = bool(request.timestamp_granularities)
         params: dict = {
             "temperature": request.temperature,
             # Fused auto-detect decoder prompt is just <|startoftranscript|>
@@ -248,7 +262,7 @@ class WhisperAdapter(TranscriptionAdapter):
             # 1 prompt + 3 forced prefix + up to 444 free transcription = 448.
             "max_new_tokens": 447,
             "regex": (
-                WHISPER_AUTODETECT_TS_REGEX if use_ts else WHISPER_AUTODETECT_REGEX
+                WHISPER_AUTODETECT_TS_REGEX if ts_variant else WHISPER_AUTODETECT_REGEX
             ),
             "skip_special_tokens": False,
             # parse_fused_output matches a zero-space forced prefix
@@ -260,27 +274,33 @@ class WhisperAdapter(TranscriptionAdapter):
             "spaces_between_special_tokens": False,
             "_detect_language": True,
         }
-        if use_ts:
+        if ts_variant:
             params["timestamp_granularities"] = request.timestamp_granularities
         return params
 
     @staticmethod
-    def parse_fused_output(text: str) -> tuple[Optional[str], Optional[str]]:
+    def parse_fused_output(
+        text: str, *, ts_variant: bool = False
+    ) -> tuple[Optional[str], Optional[str]]:
         """Parse fused output into ``(language_code, user_visible_text)``.
 
-        Matches the exact 3-token forced prefix the FSM emits, in either
-        variant:
-          * ``<|en|><|transcribe|><|notimestamps|> Hello...``
-          * ``<|en|><|transcribe|><|0.00|> Hello<|5.00|>...``
+        Matches the forced prefix the FSM emits. ``ts_variant`` selects
+        which shape to expect — the caller knows from
+        ``request.timestamp_granularities`` which regex was sent to the
+        FSM and so which decoded shape to look for:
+
+          * ``ts_variant=False`` — ``<|en|><|transcribe|><|notimestamps|> Hello...``
+          * ``ts_variant=True``  — ``<|en|><|transcribe|> Hello...`` (``<|0.00|>``
+            is in ``output_ids`` but Whisper detokenizes it to the empty string).
 
         Return cases:
 
-        * ``(None, None)`` — the full forced prefix isn't in yet (streaming
-          snapshot is mid-prefix, or the prefix is malformed / doesn't
-          match the FSM contract). Streaming callers should keep
-          buffering; non-streaming / end-of-stream callers should treat
-          this as a parse failure and fall back to a best-effort scrub of
-          the raw text.
+        * ``(None, None)`` — the prefix isn't fully in yet (mid-stream
+          snapshot before ``<|transcribe|>`` lands, or before
+          ``<|notimestamps|>`` lands in the no-ts variant) or the prefix
+          is malformed. Streaming callers keep buffering; non-streaming /
+          end-of-stream callers treat this as a parse failure and fall
+          back to a best-effort scrub of the raw text.
         * ``(lang, visible)`` — prefix fully parsed. ``visible`` is the
           transcription with the forced prefix removed, any embedded
           special tokens (``<|X.XX|>``, ``<|endoftext|>``) scrubbed, and
@@ -288,7 +308,8 @@ class WhisperAdapter(TranscriptionAdapter):
           streaming chunks because Whisper's special tokens detokenize
           atomically, so callers can compute deltas against it directly.
         """
-        m = _FUSED_PREFIX_RE.match(text)
+        pattern = _FUSED_PREFIX_RE_TS if ts_variant else _FUSED_PREFIX_RE_NOTS
+        m = pattern.match(text)
         if not m:
             return None, None
         transcription = text[m.end() :]

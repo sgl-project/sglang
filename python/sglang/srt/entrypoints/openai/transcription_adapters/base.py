@@ -43,11 +43,16 @@ class TranscriptionAdapter(ABC):
         raise NotImplementedError
 
     @staticmethod
-    def parse_fused_output(text: str) -> tuple[Optional[str], Optional[str]]:
+    def parse_fused_output(
+        text: str, *, ts_variant: bool = False
+    ) -> tuple[Optional[str], Optional[str]]:
         """Parse the fused output into ``(language_code, user_visible_text)``.
 
         Called by both streaming and non-streaming handlers with the same
-        contract:
+        contract. ``ts_variant`` indicates which forced-prefix shape was
+        requested (the caller knows from ``request.timestamp_granularities``);
+        adapters use it to disambiguate variants whose detokenized prefix
+        differs in shape from their token-id prefix.
 
         * ``(None, None)`` — the forced prefix is not yet locatable.
           Streaming callers keep buffering; non-streaming / end-of-stream

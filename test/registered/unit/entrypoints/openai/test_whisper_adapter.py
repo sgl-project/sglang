@@ -97,13 +97,36 @@ class TestWhisperParseFusedOutput(CustomTestCase):
         self.assertEqual((lang, visible), ("en", "Hello world"))
 
     def test_embedded_timestamp_tokens_scrubbed(self):
-        # Timestamps variant: segment-boundary tokens must not appear in
-        # the plain-text field. verbose_json segment timing comes from
-        # _parse_segments over output_ids on a separate path.
+        # Defensive: in the ts variant Whisper's tokenizer normally
+        # decodes <|X.XX|> tokens to "" so they never reach this path,
+        # but if a future tokenizer leaks them through they must be
+        # scrubbed from the user-visible text. verbose_json segment
+        # timing comes from _parse_segments over output_ids on a
+        # separate path.
         lang, visible = WhisperAdapter.parse_fused_output(
-            "<|en|><|transcribe|><|0.00|> Hello<|5.00|> world<|10.00|><|endoftext|>"
+            "<|en|><|transcribe|><|0.00|> Hello<|5.00|> world<|10.00|><|endoftext|>",
+            ts_variant=True,
         )
         self.assertEqual((lang, visible), ("en", "Hello world"))
+
+    def test_ts_variant_realistic_decoded_text(self):
+        # Real Whisper tokenizer decodes every <|X.XX|> timestamp token
+        # (id 50365+) to "" even with skip_special_tokens=False, so for
+        # the ts variant the cumulative text is just <|en|><|transcribe|>
+        # followed directly by the BPE-decoded transcription. Asserts
+        # that the parser handles this shape — without ts_variant=True
+        # it would (correctly) defer because <|notimestamps|> is missing.
+        lang, visible = WhisperAdapter.parse_fused_output(
+            "<|en|><|transcribe|> Hello world<|endoftext|>", ts_variant=True
+        )
+        self.assertEqual((lang, visible), ("en", "Hello world"))
+        # Same input under non-ts contract correctly defers.
+        self.assertEqual(
+            WhisperAdapter.parse_fused_output(
+                "<|en|><|transcribe|> Hello world<|endoftext|>"
+            ),
+            (None, None),
+        )
 
     def test_visible_grows_monotonically_across_snapshots(self):
         # Streaming property: cumulative text produces cumulative visible.
