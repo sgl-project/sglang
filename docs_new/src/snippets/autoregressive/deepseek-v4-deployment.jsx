@@ -430,6 +430,9 @@ export const DeepSeekV4Deployment = () => {
   //     GB300 small/big: tp=4 single-node,  ib=""    (uses MNNVL, no IB device)
   //
   //   deepep flag only on Blackwell PD; H200 PD does NOT use deepep.
+  //   DEEPEP_LARGE_SMS_FLAG (num_sms=96) added on Blackwell PD (single-node,
+  //     non-TBO — same gating as balanced / max-throughput / cp). New
+  //     optimization vs allinone — see DISCUSSION.md whitelist #6.
   //   cap_env (SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024) only on B200 decode.
   //   SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True only on GB300.
   //   --dist-init-addr for disagg wiring only on non-GB300.
@@ -482,7 +485,16 @@ export const DeepSeekV4Deployment = () => {
       flags.push(`  --dp ${pdTp}`);
       flags.push("  --enable-dp-attention");
       if (multinode) flags.push(...multiNodeFlags(nnodes));
-      if (isBlackwell) flags.push("  --moe-a2a-backend deepep");
+      if (isBlackwell) {
+        flags.push("  --moe-a2a-backend deepep");
+        // Blackwell PD-Disagg always single-node (b200/gb300 PD_TP_SPEC) and
+        // no TBO, so num_sms=96 is safe — same gating that lets balanced /
+        // max-throughput / cp emit it on Blackwell. Bumps DeepEP normal-mode
+        // SMs from default 20 → 96 (deepep.py num_qps_per_rank); bench-verified
+        // +19~23% tok/s on B200 single-node non-PD recipes (allinone _DEEPEP_LARGE_SMS_FLAG
+        // comment). Deviation from allinone — see DISCUSSION.md whitelist #6.
+        if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
+      }
       flags.push(`  --disaggregation-mode ${mode}`);
       flags.push("  --disaggregation-transfer-backend mooncake");
       if (ibDevice) flags.push(`  --disaggregation-ib-device ${ibDevice}`);
