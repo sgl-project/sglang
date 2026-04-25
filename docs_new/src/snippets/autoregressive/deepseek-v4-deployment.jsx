@@ -425,7 +425,20 @@ export const DeepSeekV4Deployment = () => {
     const envAll = [...HW_ENV, ...recipeEnv, ...COMMON_ENV];
     const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
     const base = `${envBlock}sglang serve \\\n${flags.join(" \\\n")}`;
-    const withMultinode = multinode ? prependMultiNodeNote(base, nnodes) : base;
+    // H200 big is multinode and may need machine-specific NVSHMEM / NCCL / Gloo
+    // env vars; emit them as commented hints above the env block.
+    let cmd = base;
+    if (hardware === "h200" && multinode) {
+      cmd =
+        `# The following env vars may be needed depending on your cluster:\n` +
+        `#   NVSHMEM_ENABLE_NIC_PE_MAPPING=1\n` +
+        `#   NVSHMEM_HCA_LIST=<your-hca-list>\n` +
+        `#   GLOO_SOCKET_IFNAME=<your-nic>\n` +
+        `#   NCCL_SOCKET_IFNAME=<your-nic>\n` +
+        `#   NCCL_IB_HCA=<your-hca-list>\n` +
+        cmd;
+    }
+    const withMultinode = multinode ? prependMultiNodeNote(cmd, nnodes) : cmd;
     const verifyKey = `${hardware}|${modelSize}|${recipe}`;
     if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
     return VERIFIED_RECIPES.has(verifyKey)
