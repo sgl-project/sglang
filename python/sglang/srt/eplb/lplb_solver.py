@@ -83,12 +83,14 @@ class LPLBSolver:
         # Count copies per logical expert
         logcnt = torch.bincount(phy2log, minlength=self.num_logical)
 
-        # Separate single-copy vs replicated experts
-        self.log_single = torch.nonzero(logcnt == 1).flatten().to(torch.int32)
-        self.phy_single = log2phy[self.log_single.long(), 0].to(torch.int32)
-        self.log_replicated = torch.nonzero(logcnt > 1).flatten().to(torch.int32)
+        # Separate single-copy vs replicated experts.
+        # Stored as int64 so they can be used directly as index tensors in
+        # _solve_torch without per-call .long() casts (Tier 1 optimization).
+        self.log_single = torch.nonzero(logcnt == 1).flatten().to(torch.int64)
+        self.phy_single = log2phy[self.log_single, 0].to(torch.int64)
+        self.log_replicated = torch.nonzero(logcnt > 1).flatten().to(torch.int64)
         self.phy_replicated = (
-            torch.nonzero(logcnt[phy2log] > 1).flatten().to(torch.int32)
+            torch.nonzero(logcnt[phy2log] > 1).flatten().to(torch.int64)
         )
 
         self.num_single = len(self.log_single)
@@ -101,14 +103,14 @@ class LPLBSolver:
         )
         for i in range(num_gpus):
             B_full[i, i * num_phy_per_gpu : (i + 1) * num_phy_per_gpu] = 1
-        self.B1 = B_full[:, self.phy_single.long()].contiguous()
-        B2 = B_full[:, self.phy_replicated.long()]
+        self.B1 = B_full[:, self.phy_single].contiguous()
+        B2 = B_full[:, self.phy_replicated]
 
         # Build C matrix (copy-to-logical mapping)
         C = torch.zeros(
             (self.num_red_log, self.num_red_phy), dtype=torch.float32, device=device
         )
-        phy2log_rep = phy2log[self.phy_replicated.long()]
+        phy2log_rep = phy2log[self.phy_replicated]
         for i in range(self.num_red_log):
             C[i, phy2log_rep == self.log_replicated[i]] = 1.0
 
@@ -132,8 +134,9 @@ class LPLBSolver:
         self.c_vec[-2] = 1.0
         self.c_vec[-1] = 1000.0
 
-        # Store log2phy as int32 for kernel
-        self.log2phy = log2phy.to(torch.int32).contiguous()
+        # Store log2phy as int64 so torch.take in _solve_torch doesn't need a
+        # per-call .long() cast (Tier 1 optimization).
+        self.log2phy = log2phy.to(torch.int64).contiguous()
 
         # Pre-JIT-compile the fused IPM kernel for this (NC, NV) shape so the
         # 20-40s compile cost happens once at startup rather than on the first
@@ -146,6 +149,21 @@ class LPLBSolver:
             _ipm_warmup(nc, nv, num_iters=5, device=device)
         except Exception as e:  # pragma: no cover
             logger.warning(f"LPLB IPM warmup skipped: {e}")
+
+        # Tier 1 optimization: pre-compute static intermediates and pre-allocate
+        # scratch buffers so _solve_torch becomes allocation-free in the hot path.
+        # All shapes are fixed for the lifetime of this LPLBSolver instance.
+        self._A_base_row_sum = self.A_base.sum(dim=1).contiguous()  # (NC,)
+        self._b_buf = torch.empty(nc, dtype=torch.float32, device=device)
+        # _A_full_buf holds [A_base | big_M_col]; copy A_base once, write the
+        # last column on every solve.
+        self._A_full_buf = torch.empty(nc, nv, dtype=torch.float32, device=device)
+        self._A_full_buf[:, : nv - 1].copy_(self.A_base)
+        self._phy_prob_buf = torch.empty(
+            self.num_single + self.num_red_phy + 1,
+            dtype=torch.float32,
+            device=device,
+        )
 
     def solve(self, topk_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -191,33 +209,37 @@ class LPLBSolver:
         return log2phy_prob
 
     def _solve_torch(self, global_counts: torch.Tensor) -> torch.Tensor:
-        """PyTorch fallback solver."""
+        """LP solve pipeline.
+
+        Tier 1: indices are pre-cast to int64; A_base row sum and buffers
+        (b, A_full, phy_prob) are pre-allocated in __init__. The hot path
+        is allocation-free except for the IPM solver's internal workspace.
+        """
         from sglang.jit_kernel.lplb.torch_solver import solve_ipm
 
-        device = global_counts.device
+        # Normalize counts (clamp denominator to keep the all-zero case finite).
         total = global_counts.sum()
-        if total > 0:
-            counts_norm = global_counts / total
-        else:
-            counts_norm = global_counts
+        counts_norm = global_counts / total.clamp(min=1.0)
 
-        t1 = counts_norm[self.log_single.long()]
-        b2 = -(self.B1 @ t1).flatten()
-        b1 = counts_norm[self.log_replicated.long()]
-        b = torch.cat([b1, b2])
+        # t1 = counts_norm[log_single] — gather (no .long() cast needed)
+        t1 = counts_norm[self.log_single]
 
-        big_M_col = b - self.A_base.sum(dim=1)
-        A_full = torch.hstack([self.A_base, big_M_col.unsqueeze(1)])
+        # Build b in pre-allocated buffer:  b = [counts_norm[log_rep] | -(B1 @ t1)]
+        nrl = self.num_red_log
+        self._b_buf[:nrl] = counts_norm[self.log_replicated]
+        torch.matmul(self.B1, t1, out=self._b_buf[nrl:])
+        self._b_buf[nrl:].neg_()
+        b = self._b_buf
+
+        # Write Big-M column into the last column of pre-allocated A_full.
+        # A_full = [A_base (constant, copied once at init) | big_M_col]
+        torch.sub(b, self._A_base_row_sum, out=self._A_full_buf[:, -1])
+        A_full = self._A_full_buf
 
         x = solve_ipm(A_full, b, self.c_vec)
 
-        x_ratios = x[: self.num_red_phy].clamp(min=0)
-        phy_prob = torch.zeros(
-            self.num_single + self.num_red_phy + 1,
-            dtype=torch.float32,
-            device=device,
-        )
-        phy_prob[self.phy_replicated.long()] = x_ratios
-        phy_prob[self.phy_single.long()] = t1
-        log2phy_prob = torch.take(phy_prob, self.log2phy.long())
-        return log2phy_prob
+        # Extract probabilities into pre-allocated buffer.
+        self._phy_prob_buf.zero_()
+        self._phy_prob_buf[self.phy_replicated] = x[: self.num_red_phy].clamp(min=0)
+        self._phy_prob_buf[self.phy_single] = t1
+        return torch.take(self._phy_prob_buf, self.log2phy)
