@@ -263,6 +263,16 @@ class Fp8Config(QuantizationConfig):
                 )
 
                 return Mxfp4FlashinferTrtllmMoEMethod(fp8_method, prefix=prefix)
+            if (
+                envs.SGLANG_DSV4_MODE.get() == "2604"
+                and envs.SGLANG_DSV4_FP4_EXPERTS.get()
+                and get_moe_runner_backend().is_flashinfer_w4a16()
+            ):
+                from sglang.srt.layers.quantization.w4a16_deepseek import (
+                    DeepSeekW4A16MoEMethod,
+                )
+
+                return DeepSeekW4A16MoEMethod(fp8_method, prefix=prefix)
             return fp8_method
         elif isinstance(layer, RadixAttention):
             return Fp8KVCacheMethod(self)
