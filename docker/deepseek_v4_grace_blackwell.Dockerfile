@@ -4,7 +4,7 @@ FROM lmsysorg/sglang:v0.5.7-cu130-runtime
 RUN mkdir -p /workspace && cd /workspace && rm -rf sglang && \
     git clone -b deepseek_v4 https://github.com/sgl-project/sglang.git
 
-RUN pip install https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+cu130-cp310-abi3-manylinux2014_x86_64.whl
+RUN pip install https://github.com/sgl-project/whl/releases/download/v0.3.21/sgl_kernel-0.3.21+cu130-cp310-abi3-manylinux2014_aarch64.whl
 RUN pip install cuda-python --upgrade
 RUN cd /tmp && rm -rf flash-mla && git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && cd flash-mla && ln -s /usr/local/cuda/include/cccl/cuda /usr/local/cuda/include/cuda && git submodule update --init --recursive && pip install --no-build-isolation -v .
 
