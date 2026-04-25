@@ -1,7 +1,7 @@
-// FractalMesh Omega Titan v2.0.0 — PM2 Ecosystem
+// FractalMesh Omega Titan v2.1.0 — PM2 Ecosystem
 // Samuel James Hiotis | ABN 56628117363 | Sole Trader | Albury NSW
 // Usage: pm2 start ecosystem.config.js --env production
-// Agents: 44 nodes | Memory budget: ~2.6GB total
+// Agents: 49 nodes | Memory budget: ~2.9GB total
 
 const ROOT = process.env.FRACTALMESH_HOME || require('path').join(process.env.HOME, 'fmsaas');
 const REPO = process.env.REPO_ROOT        || require('path').join(process.env.HOME, 'sglang');
@@ -773,6 +773,105 @@ module.exports = {
             },
             error_file: `${ROOT}/logs/fm-campaign-manager-error.log`,
             out_file:   `${ROOT}/logs/fm-campaign-manager-out.log`,
+            time:       true,
+        },
+
+        // ── v2.1.0 AFFILIATE + CONTENT + DRIP + NEXUS ────────────────
+
+        // Research agent — NOAA Kp, CoinGecko, analytics aggregation (interval 1800s)
+        {
+            name:              'research-agent',
+            script:            `${REPO}/fractalmesh/agents/research_agent.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'80M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/research-agent-error.log`,
+            out_file:   `${ROOT}/logs/research-agent-out.log`,
+            time:       true,
+        },
+
+        // Affiliate manager — 17 programs, click tracking, drip enrollment (interval 3600s)
+        {
+            name:              'affiliate-manager',
+            script:            `${REPO}/fractalmesh/agents/affiliate_manager.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'60M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/affiliate-manager-error.log`,
+            out_file:   `${ROOT}/logs/affiliate-manager-out.log`,
+            time:       true,
+        },
+
+        // Content generator — GPT-4o-mini articles + dev.to publishing (interval 24h)
+        {
+            name:              'content-generator',
+            script:            `${REPO}/fractalmesh/agents/content_generator.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'80M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/content-generator-error.log`,
+            out_file:   `${ROOT}/logs/content-generator-out.log`,
+            time:       true,
+        },
+
+        // Drip agent — 5-step email sequences, 3-day spacing, Gmail SMTP (interval 3600s)
+        {
+            name:              'fm-drip-agent',
+            script:            `${REPO}/fractalmesh/agents/fm_drip_agent.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'60M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-drip-agent-error.log`,
+            out_file:   `${ROOT}/logs/fm-drip-agent-out.log`,
+            time:       true,
+        },
+
+        // Omni Nexus — FastAPI terminal dashboard (port 8095, 30s auto-refresh)
+        {
+            name:              'fm-omni-nexus',
+            script:            `${REPO}/fractalmesh/api/fm_omni_nexus.py`,
+            interpreter:       '/usr/bin/python3',
+            cwd:               ROOT,
+            autorestart:       true,
+            watch:             false,
+            max_memory_restart:'150M',
+            env_production: {
+                FRACTALMESH_HOME: ROOT,
+                REPO_ROOT:        REPO,
+                NEXUS_PORT:       '8095',
+                NODE_ENV:         'production',
+                PYTHONUNBUFFERED: '1',
+            },
+            error_file: `${ROOT}/logs/fm-omni-nexus-error.log`,
+            out_file:   `${ROOT}/logs/fm-omni-nexus-out.log`,
             time:       true,
         },
 
