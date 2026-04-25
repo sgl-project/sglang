@@ -26,6 +26,7 @@ export const DeepSeekV4Deployment = () => {
       title: "Hardware Platform",
       items: [
         { id: "b200",  label: "B200 (FP4)",  default: true  },
+        { id: "b300",  label: "B300 (FP4)",  default: false  },
         { id: "gb300", label: "GB300 (FP4)", default: false },
         { id: "h200",  label: "H200 (FP8)",  default: false },
       ],
@@ -222,7 +223,9 @@ export const DeepSeekV4Deployment = () => {
   // === SHARED END ===
 
   const generateCommand = () => {
-    const { hardware, modelSize, recipe, reasoningParser, toolcall } = values;
+    const { hardware: rawHardware, modelSize, recipe, reasoningParser, toolcall } = values;
+    // B300 usage is identical to B200 — alias so we don't duplicate every spec entry.
+    const hardware = rawHardware === "b300" ? "b200" : rawHardware;
     const specKey = `${hardware}|${modelSize}`;
     const spec = HW_SIZE_SPEC[specKey];
     const { slug, tp, multinode, nnodes } = spec;
@@ -439,7 +442,9 @@ export const DeepSeekV4Deployment = () => {
   //   --max-running-requests 256 only on decode (PD decode can't retract).
   //   No flashinfer_mxfp4 / autotune-fix / MTP / mem-fraction-static on PD (allinone omits).
   // ============================================================================
-  const buildPDDisaggCommand = (hardware, modelSize) => {
+  const buildPDDisaggCommand = (rawHardware, modelSize) => {
+    // B300 usage is identical to B200 — alias so we don't duplicate every spec entry.
+    const hardware = rawHardware === "b300" ? "b200" : rawHardware;
     const specKey = `${hardware}|${modelSize}`;
     const { tp: pdTp, multinode, nnodes } = PD_TP_SPEC[specKey];
     const slug = HW_SIZE_SPEC[specKey].slug;
