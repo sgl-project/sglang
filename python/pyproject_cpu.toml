@@ -21,6 +21,7 @@ dependencies = [
   "anthropic>=0.20.0",
   "blobfile==3.0.0",
   "build",
+  "cachetools",
   "compressed-tensors",
   "datasets",
   "einops",

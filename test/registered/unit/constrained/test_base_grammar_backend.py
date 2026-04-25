@@ -28,6 +28,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     create_grammar_backend,
     register_grammar_backend,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "stage-a-test-cpu")
@@ -234,6 +235,38 @@ class TestBaseGrammarBackend(unittest.TestCase):
         # Both should complete successfully
         self.assertIsInstance(result1.result(timeout=5), InvalidGrammarObject)
         self.assertIsInstance(result2.result(timeout=5), InvalidGrammarObject)
+
+    def test_lru_cache_eviction_and_reset(self):
+        """Positive cache limit should evict the LRU entry and reset should clear it."""
+        with envs.SGLANG_GRAMMAR_CACHE_MAX_ENTRIES.override(2):
+            limited_backend = BaseGrammarBackend()
+            try:
+                key1 = ("json", "schema-1")
+                key2 = ("json", "schema-2")
+                key3 = ("json", "schema-3")
+
+                value1 = BaseGrammarObject()
+                value2 = BaseGrammarObject()
+                value3 = BaseGrammarObject()
+
+                limited_backend.set_cache(key1, value1)
+                limited_backend.set_cache(key2, value2)
+
+                # Touch key1 so key2 becomes the least recently used entry.
+                _, cache_hit = limited_backend.get_cached_or_future_value(key1, False)
+                self.assertTrue(cache_hit)
+
+                limited_backend.set_cache(key3, value3)
+
+                self.assertEqual(len(limited_backend.cache), 2)
+                self.assertIn(key1, limited_backend.cache)
+                self.assertIn(key3, limited_backend.cache)
+                self.assertNotIn(key2, limited_backend.cache)
+
+                limited_backend.reset()
+                self.assertEqual(len(limited_backend.cache), 0)
+            finally:
+                limited_backend.executor.shutdown(wait=True)
 
 
 class TestRegisterGrammarBackend(unittest.TestCase):

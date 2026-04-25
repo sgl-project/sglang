@@ -17,10 +17,12 @@ import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import List, MutableMapping, Optional, Tuple
 
 import torch
+from cachetools import LRUCache
 
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -130,7 +132,11 @@ class InvalidGrammarObject(BaseGrammarObject):
 class BaseGrammarBackend:
     def __init__(self):
         self.executor = ThreadPoolExecutor()
-        self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
+        self.cache: MutableMapping[Tuple[str, str], BaseGrammarObject] = (
+            LRUCache(maxsize=cache_max_entries)
+            if (cache_max_entries := envs.SGLANG_GRAMMAR_CACHE_MAX_ENTRIES.get()) > 0
+            else {}
+        )
 
     def _not_supported(self, key_type: str, key_string: str) -> BaseGrammarObject:
         logger.warning(f"Skip unsupported {key_type=}, {key_string=}")
