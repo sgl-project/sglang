@@ -249,6 +249,8 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         getattr(server_args, "cuda_graph_max_bs", None) or 512,
         getattr(server_args, "chunked_prefill_size", None) or 8192,
     )
+    if server_args.enable_dp_attention:
+        max_num_tokens *= server_args.dp_size
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
