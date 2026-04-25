@@ -164,6 +164,7 @@ export const DeepSeekV4Deployment = () => {
     "b200|small|balanced",
     "b200|small|max-throughput",
     "b200|small|cp",
+    "b200|small|pd-disagg",
     "b200|big|low-latency",
     "b200|big|balanced",
     "b200|big|max-throughput",
@@ -174,7 +175,18 @@ export const DeepSeekV4Deployment = () => {
     "gb300|small|low-latency",
     "gb300|small|balanced",
     "gb300|small|max-throughput",
+    "h200|small|cp",
+    "h200|small|pd-disagg",
+    // h200|big|pd-disagg: pending verification (needs 4-node H200 cluster with
+    //   shared IB fabric: 2-node prefill + 2-node decode).
   ]);
+  // Recipes whose command is intentionally not yet provided (e.g. blocked by an
+  // upstream limitation). Showing a minimal placeholder is friendlier to users
+  // than emitting a commented-out invalid command.
+  const TBD_RECIPES = new Set([
+    "h200|big|cp",
+  ]);
+  const TBD_PLACEHOLDER = "# to be provided";
   const BEING_VERIFIED_NOTE =
     "# NOTE: this recipe is being verified on the latest checkpoint";
 
@@ -390,6 +402,7 @@ export const DeepSeekV4Deployment = () => {
     const base = `${envBlock}sglang serve \\\n${flags.join(" \\\n")}`;
     const withMultinode = multinode ? prependMultiNodeNote(base, nnodes) : base;
     const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+    if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
     return VERIFIED_RECIPES.has(verifyKey)
       ? withMultinode
       : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(withMultinode)}`;
@@ -477,6 +490,7 @@ python3 -m sglang_router.launch_router \\
 
     const full = `${prefill}\n\n${decode}\n\n${router}`;
     const verifyKey = `${hardware}|${modelSize}|pd-disagg`;
+    if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
     return VERIFIED_RECIPES.has(verifyKey)
       ? full
       : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(full)}`;
