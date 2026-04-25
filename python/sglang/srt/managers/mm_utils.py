@@ -1529,6 +1529,9 @@ class ShmPointerMMData:
     This acts as a "pointer" to the tensor data across process boundaries.
     """
 
+    # Class-level dictionary to track reference counts for shared memory objects
+    _shm_ref_counts = {}
+
     def __init__(self, tensor: torch.Tensor):
         if not tensor.is_cpu:
             tensor = tensor.cpu()
@@ -1548,8 +1551,13 @@ class ShmPointerMMData:
         self.shm_name = shm.name
         shm.close()
         self._shm_handle = None
+        ShmPointerMMData._shm_ref_counts[self.shm_name] = 1
 
     def __getstate__(self):
+        # Increment reference count when pickling (new instance will be created)
+        # Only increment if the shm_name is still tracked (not already released)
+        if self.shm_name in ShmPointerMMData._shm_ref_counts:
+            ShmPointerMMData._shm_ref_counts[self.shm_name] += 1
         return {
             "shm_name": self.shm_name,
             "shape": self.shape,
@@ -1572,10 +1580,15 @@ class ShmPointerMMData:
         tensor = self.tensor.clone()
         if self._shm_handle is not None:
             self._shm_handle.close()
-            try:
-                self._shm_handle.unlink()
-            except FileNotFoundError:
-                pass  # Another rank already unlinked
+            # Decrement reference count and unlink only if this is the last reference
+            if self.shm_name in ShmPointerMMData._shm_ref_counts:
+                ShmPointerMMData._shm_ref_counts[self.shm_name] -= 1
+                if ShmPointerMMData._shm_ref_counts[self.shm_name] <= 0:
+                    try:
+                        shared_memory.SharedMemory(name=self.shm_name).unlink()
+                        del ShmPointerMMData._shm_ref_counts[self.shm_name]
+                    except FileNotFoundError:
+                        pass  # Already unlinked
             self._shm_handle = None
         return tensor
 
