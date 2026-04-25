@@ -200,6 +200,13 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         self._scratch_new_lens_i32 = torch.zeros(
             max_running_requests, dtype=torch.int32, device=self.device,
         )
+        # Persistent int32 scratch for the per-batch pool_page_tables slice
+        # (see get_pool_page_tables): avoids a per-layer allocator hit from
+        # fancy indexing. Full width; caller takes a [:B] view.
+        self._scratch_pool_page_tables = torch.zeros(
+            (max_running_requests, max_pool_pages_per_req),
+            dtype=torch.int32, device=self.device,
+        )
 
         logger.info(
             "HisaNSATokenToKVPool(v3): k_block_size=%d, pool_page_size=%d, "
@@ -328,8 +335,20 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         Dim-1 is always the full column cap (== allocated table width). The
         v3 block_mqa kernel masks beyond ``num_pool_pages`` via
         ``context_lens_pool``.
+
+        Uses a persistent scratch buffer (written in-place via ``index_select``)
+        so each layer avoids a fresh allocator hit. The returned slice aliases
+        scratch; callers must consume it before the next ``get_pool_page_tables``
+        call on the same pool (which overwrites scratch). In decode, the
+        indexer calls this once per layer and passes the tensor directly into
+        the kernel launch, so the lifetime is safe.
         """
-        return self.req_to_pool_page.req_to_pool_page[req_pool_indices.long(), :]
+        B = req_pool_indices.shape[0]
+        out = self._scratch_pool_page_tables[:B]
+        torch.index_select(
+            self.req_to_pool_page.req_to_pool_page, 0, req_pool_indices, out=out,
+        )
+        return out
 
 
 # ---------------------------------------------------------------------------

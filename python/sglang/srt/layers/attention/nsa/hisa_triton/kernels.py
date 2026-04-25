@@ -332,6 +332,7 @@ def sparse_paged_mqa_triton(
     assert kv_block_size % paged_block_size == 0
     subs_per_topk = kv_block_size // paged_block_size
     max_blocks = int(block_tables.shape[-1])
+    total_subblocks = topk * subs_per_topk
 
     assert topk_block_index.dtype == torch.int64
     assert context_lens.dtype == torch.int32
@@ -350,7 +351,7 @@ def sparse_paged_mqa_triton(
         device=q_fp8.device, dtype=torch.float32,
     )
 
-    grid = (B, seq_len, topk * subs_per_topk)
+    grid = (B, seq_len, total_subblocks)
     _sparse_paged_mqa_kernel[grid](
         q_fp8, kv_fp8_view, kv_f32_view, topk_block_index,
         logits, weights, context_lens, block_tables,

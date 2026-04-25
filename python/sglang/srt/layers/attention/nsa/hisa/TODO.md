@@ -8,20 +8,21 @@ Legend: `[ ]` pending, `[/]` in progress, `[x]` done, `[?]` needs investigation.
 
 ## P0 — Kernel-level perf (attack the sparse_paged 80% hotspot)
 
-Microbench says `sparse_paged + topk + coord_transform` is 82-86% of a v3 indexer call across all (B, ctx). The target kernel is `fp8_native_paged_block_sparse_mqa_attn_return_logits`. Ordered by ROI / effort:
+**Status 2026-04-24 update:** The 80% hotspot claim was pre-triton-port. After porting, the triton `sparse_paged_mqa_triton` is 5-20× faster than the original tilelang baseline. Rechecked kernel bench numbers on H200 (kernels.py, default config):
+- B=1 ctx=65K: 0.011 ms (tilelang was 0.214 ms → 19×)
+- B=8 ctx=65K: 0.012 ms (17×)
+- B=32 ctx=65K: 0.022 ms (10×)
+- B=64 ctx=65K: 0.036 ms (6×)
 
-1. `[ ]` **Pipeline stages** — current `num_stages=1` everywhere. Try 2 and 3 on the hot kernel; check smem fits. **1-line change, ~30 min, probably 10-30% win for the kernel if memory-bound.**
+At B=64 we're at ~73% of HBM peak bandwidth already. At B=1-8 we're launch/occupancy-limited, not bandwidth-limited.
 
-2. `[ ]` **`nsys profile` on one real workload** to determine memory- vs compute-bound. Numbers we need: HBM throughput (GB/s vs H200's 4.8 TB/s peak), SM occupancy, L2 hit rate. Informs all downstream moves.
-
-3. `[ ]` **Read DeepGEMM's `fp8_paged_mqa_logits` source** — it's the baseline we lose to in decode. Understand: does it TMA-load paged K? How deep is its pipeline? Does it warp-specialize? Cluster-launch? Persistent-kernel?
-    - `fp8_paged_mqa_logits` is the closest-in-spirit kernel to our sparse_paged_mqa. Any trick that works there likely applies here.
-
-4. `[ ]` **Warp specialization (producer/consumer warps)** — split warps: some do TMA loads, others do GEMM. mbarrier sync. FlashMLA / DeepGEMM use this pattern. Potentially 30-50% win on memory-bound paths. Tilelang has `T.warp_specialize` primitive. **Biggest single improvement likely, but steepest learning curve.**
-
-5. `[ ]` **Persistent kernel for `sparse_paged_mqa`** — current grid is (B, seq_len). For B < 132 (H200 SMs), many SMs idle. Persistent-kernel pattern: launch 132 blocks, each drains a work queue. FlashMLA does this. Eliminates launch overhead + raises SM utilization.
-
-6. `[ ]` **Cluster launch for shared-Q broadcast** — H100+ cluster feature. Two or more SMs share smem; Q (which is per-batch, shared across topk iterations) loaded once and multicasted. May save ~5-10% bandwidth.
+Tried optimizations (2026-04-24):
+1. `[~]` **Pipeline stages (`num_stages=2/3`)** — NO WIN. Both sparse_paged and v3 kernels are 1-tile-per-CTA with no inner loop; nothing to overlap. `num_stages=3 + num_warps=4` regressed B=1 by 40%. Reverted.
+2. `[~]` **Q reuse via chunked topk (A1)** — NO WIN. Tested CHUNK ∈ {1, 2, 4, 8, 16} with `tl.range(num_stages=2)`. Best case: CHUNK=2 at B=64 saved 5%; all other configs equal-or-worse. Root cause: at small B the kernel is instruction-latency-bound (Q bandwidth isn't the bottleneck); at B=64 we're near HBM peak anyway. Reverted.
+3. `[ ]` **`nsys profile` on one real workload** to determine memory- vs compute-bound. Numbers we need: HBM throughput (GB/s vs H200's 4.8 TB/s peak), SM occupancy, L2 hit rate. Informs all downstream moves. Still useful to quantify.
+4. `[ ]` **Warp specialization (producer/consumer warps)** — FlashMLA / DeepGEMM (`sm90_fp8_paged_mqa_logits`) use kNumTMAThreads + kNumMathThreads pattern w/ mbarrier sync. Potentially 30-50% win, but requires switching back to tilelang (triton doesn't expose `cp.async.bulk`) and 1-2 weeks of work. Hold until/unless sparse_paged shows up as the hotspot in a real profile.
+5. `[ ]` **Persistent kernel (A2)** — expected win dominated by launch overhead savings. Under CUDA graph replay (production decode), launch overhead is ~0. Non-graph (prefill, warmup): could save ~60μs per call. Low ROI.
+6. `[ ]` **Cluster launch for shared-Q broadcast** — H100+ cluster feature; max cluster=16. Triton support is partial/experimental. Save for when the simpler moves have been exhausted.
 
 ## P0 — Correctness (should fix before declaring Phase-2 "done")
 
@@ -42,9 +43,9 @@ Microbench says `sparse_paged + topk + coord_transform` is 82-86% of a v3 indexe
 
 Each of these attacks a specific overhead identified in the stages microbench. Pick any one to restart the "is v3 actually faster than v1?" investigation. Current e2e: v3 ≈ v1 ≈ 62 ms TPOT at B=10 ctx=65K; v3 microbench is 1.15× per-call faster so we know the delta is swallowed by bookkeeping.
 
-- [ ] **Batch `update_pool × 61 layers` into one kernel launch.** Add a `layer_stride` dim to the kernel grid → 61 launches collapse to 1. Saves ~0.5 ms/step of launch overhead.
+- [~] **Batch `update_pool × 61 layers` into one kernel launch.** SKIPPED 2026-04-24. Measured: non-graph cost 0.81 ms/step (61 × 13 μs CPU launch), but under CUDA graph replay (production decode) only 0.18 ms/step (61 × 2.9 μs GPU). Max savings from batching under graph ≈ 0.17 ms/step (0.3% of 58 ms TPOT). Architectural churn (defer hook + per-layer tensor stacking) not justified.
 
-- [ ] **Replace `get_pool_page_tables`'s fancy indexing with `index_select(out=persistent_scratch)`.** Current per-layer `req_to_pool_page[req_pool_indices.long(), :]` triggers a gather kernel launch + allocation (from the graph pool) each layer × 61 layers = ~0.6 ms/step. Persistent `[max_running_req, max_pool_pages_per_req]` scratch + `index_select` in-place avoids the alloc.
+- [x] **Replace `get_pool_page_tables`'s fancy indexing with `index_select(out=persistent_scratch)`.** DONE 2026-04-24. Added `_scratch_pool_page_tables` in `HisaNSATokenToKVPool.__init__`; `get_pool_page_tables` now writes via `index_select(out=scratch[:B])`. Microbench (61 layers, B=10): 0.483 → 0.420 ms/step, 13% win (~63 μs). Smaller than the original 0.6 ms/step estimate — PyTorch's caching allocator is fast for small re-used allocs.
 
 - [ ] **Bench at B=32 and B=64** to validate that v3's 1.5-2× microbench advantage materializes in e2e. Current bench (B=10) is right at v3's cross-over point — see `project_hisa_bench_v1_v3.md` memory.
 
