@@ -5,8 +5,9 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import is_cuda_alike
+from sglang.srt.utils import is_cuda, is_cuda_alike
 
+_is_cuda = is_cuda()
 _is_cuda_alike = is_cuda_alike()
 
 if _is_cuda_alike:
@@ -15,7 +16,10 @@ if _is_cuda_alike:
         get_cutlass_w4a8_moe_mm_data,
     )
 
-from sgl_kernel import silu_and_mul
+if _is_cuda:
+    from sglang.jit_kernel.activation import silu_and_mul
+else:
+    from sgl_kernel import silu_and_mul
 
 from sglang.jit_kernel.per_tensor_quant_fp8 import per_tensor_quant_fp8
 from sglang.srt.distributed import get_moe_expert_parallel_world_size

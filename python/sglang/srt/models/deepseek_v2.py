@@ -141,6 +141,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_gfx95_supported,
     _is_hip,
+    _is_musa,
     _is_npu,
     _is_xpu,
     _use_aiter,
@@ -182,6 +183,8 @@ elif _is_npu:
         forward_mla_core_npu,
         forward_mla_prepare_npu,
     )
+elif _is_musa:
+    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
 else:
     pass
 
@@ -640,7 +643,9 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=dispatch_info,
             )
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
+            if not (_is_cuda or _is_musa) or isinstance(
+                self.experts.quant_method, KTEPWrapperMethod
+            ):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
@@ -725,6 +730,7 @@ class DeepseekV2MoE(nn.Module):
         )
         if (
             not _is_cuda
+            and not _is_musa
             and not _is_xpu
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
@@ -1753,7 +1759,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states,
             residual,
             forward_batch,
-            self._gfx95_quant_format,
+            getattr(self, "_gfx95_quant_format", ""),
         )
 
         hidden_states = self.self_attn(
@@ -1910,7 +1916,7 @@ class DeepseekV2Model(nn.Module):
 
         self.alt_stream = (
             torch.cuda.Stream()
-            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            if _is_cuda or _is_musa or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
 
@@ -2249,12 +2255,15 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Config does not support fused shared expert(s)."
-        elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
-            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
+        elif (
+            (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0))
+            and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
+            and (not _is_musa or torch.musa.get_device_capability("musa") < (3, 1))
         ):
             disable_reason = (
                 "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
+                "or MT-platform with capability >= 31 can use shared experts fusion optimization."
             )
         elif get_moe_expert_parallel_world_size() > 1 and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)

@@ -43,6 +43,7 @@ from sglang.srt.utils.common import (
     get_device_sm,
     get_nvidia_driver_version,
     get_quantization_config,
+    has_fp8_weights_in_checkpoint,
     human_readable_int,
     is_blackwell_supported,
     is_cpu,
@@ -410,7 +411,7 @@ class ServerArgs:
     crash_dump_folder: Optional[str] = None
     show_time_cost: bool = False
     enable_metrics: bool = False
-    metrics_http_port: Optional[int] = None
+    grpc_http_sidecar_port: Optional[int] = None
     enable_mfu_metrics: bool = False
     enable_metrics_for_all_schedulers: bool = False
     tokenizer_metrics_custom_labels_header: str = "x-custom-labels"
@@ -419,7 +420,6 @@ class ServerArgs:
     bucket_time_to_first_token: Optional[List[float]] = None
     bucket_inter_token_latency: Optional[List[float]] = None
     bucket_e2e_request_latency: Optional[List[float]] = None
-    collect_tokens_histogram: bool = False
     prompt_tokens_buckets: Optional[List[str]] = None
     generation_tokens_buckets: Optional[List[str]] = None
     gc_warning_threshold_secs: float = 0.0
@@ -538,6 +538,7 @@ class ServerArgs:
         "none", "deepep", "mooncake", "nixl", "mori", "ascend_fuseep", "flashinfer"
     ] = "none"
     moe_runner_backend: str = "auto"
+    record_nolora_graph: bool = True
     flashinfer_mxfp4_moe_precision: Literal["default", "bf16"] = "default"
     enable_flashinfer_allreduce_fusion: bool = False
     enforce_disable_flashinfer_allreduce_fusion: bool = False
@@ -622,6 +623,7 @@ class ServerArgs:
     cuda_graph_bs: Optional[List[int]] = None
     disable_cuda_graph: bool = False
     disable_cuda_graph_padding: bool = False
+    enable_breakable_cuda_graph: bool = False
     enable_profile_cuda_graph: bool = False
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
@@ -1771,14 +1773,23 @@ class ServerArgs:
                     self.quantization is None
                     and not self._quantization_explicitly_unset
                 ):
-                    # Default DeepSeek V3/R1 native FP8 when not explicitly set,
-                    # Because we need this condition for an assertion in
-                    # flashinfer_trtllm MoE runner backend.
+                    # DeepSeek V3/R1 uses native FP8 MoE experts without
+                    # declaring it in quantization_config.  However, other
+                    # models that share the same architecture class (e.g.
+                    # Moonlight-16B-A3B) are purely BF16.  Check the actual
+                    # safetensors header instead of assuming FP8 by arch name.
                     if quant_method is None and model_arch in ["DeepseekV3ForCausalLM"]:
-                        self.quantization = "fp8"
-                        logger.info(
-                            "Quantization not specified, default to fp8 for DeepSeek on sm100"
-                        )
+                        if has_fp8_weights_in_checkpoint(self.model_path):
+                            self.quantization = "fp8"
+                            logger.info(
+                                "Detected FP8 expert weights in checkpoint, "
+                                "default to fp8 for DeepSeek on sm100"
+                            )
+                        else:
+                            logger.info(
+                                "No FP8 expert weights found in checkpoint, "
+                                "keeping bf16 for DeepSeek-arch model on sm100"
+                            )
                     else:
                         self.quantization = quant_method
                 if (
@@ -2022,6 +2033,17 @@ class ServerArgs:
             if self.is_attention_backend_not_set():
                 self.attention_backend = "triton"
                 logger.info("Use triton as default attention backend for Gemma4")
+        elif model_arch == "MossVLForConditionalGeneration":
+            if self.is_attention_backend_not_set():
+                self.prefill_attention_backend = "flashinfer"
+                logger.info(
+                    "Use flashinfer as default prefill attention backend for Moss-VL"
+                )
+            prefill_backend, _ = self.get_attention_backends()
+            assert prefill_backend == "flashinfer", (
+                "MossVLForConditionalGeneration requires flashinfer prefill "
+                "attention backend for cross-attention custom mask support."
+            )
         elif model_arch in ["Exaone4ForCausalLM", "ExaoneMoEForCausalLM"]:
             if hf_config.sliding_window_pattern is not None:
                 logger.warning(
@@ -2396,7 +2418,7 @@ class ServerArgs:
         if current_platform.is_out_of_tree():
             return current_platform.get_default_attention_backend()
 
-        # Whisper requires flashinfer for cross-attention CUDA graph support
+        # Whisper requires flashinfer for cross-attention CUDA graph support.
         if "WhisperForConditionalGeneration" in (
             model_config.hf_config.architectures or []
         ):
@@ -3388,6 +3410,7 @@ class ServerArgs:
                 "BailingMoeV2_5ForCausalLM",
                 "MistralLarge3ForCausalLM",
                 "PixtralForConditionalGeneration",
+                "HYV3ForCausalLM",
             ]:
                 if self.speculative_draft_model_path is None:
                     self.speculative_draft_model_path = self.model_path
@@ -4495,7 +4518,7 @@ class ServerArgs:
             "--device",
             type=str,
             default=ServerArgs.device,
-            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu'). Defaults to auto-detection if not specified.",
+            help="The device to use ('cuda', 'xpu', 'hpu', 'npu', 'cpu', 'musa'). Defaults to auto-detection if not specified.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -4716,12 +4739,12 @@ class ServerArgs:
             help="Enable log prometheus metrics.",
         )
         parser.add_argument(
-            "--metrics-http-port",
+            "--grpc-http-sidecar-port",
             type=int,
-            default=ServerArgs.metrics_http_port,
-            help="Port for the Prometheus metrics HTTP server. "
-            "Only used in gRPC mode (--grpc-mode); in HTTP mode, metrics are served on the main --port. "
-            "Defaults to --port + 1 when --enable-metrics is set.",
+            default=ServerArgs.grpc_http_sidecar_port,
+            help="Port for the HTTP sidecar server in gRPC mode (--grpc-mode). "
+            "Serves Prometheus metrics and profiling endpoints. "
+            "Defaults to --port + 1. Not used in HTTP mode.",
         )
         parser.add_argument(
             "--enable-mfu-metrics",
@@ -4780,9 +4803,8 @@ class ServerArgs:
         )
         parser.add_argument(
             "--collect-tokens-histogram",
-            action="store_true",
-            default=ServerArgs.collect_tokens_histogram,
-            help="Collect prompt/generation tokens histogram.",
+            action=DeprecatedAction,
+            help="Deprecated. Token histograms are now automatically collected when --enable-metrics is set.",
         )
         bucket_rule = (
             "Supports 3 rule types: 'default' uses predefined buckets; 'tse <middle> <base> <count>' "
@@ -5408,6 +5430,14 @@ class ServerArgs:
             help="Choose the runner backend for MoE.",
         )
         parser.add_argument(
+            "--record-nolora-graph",
+            action=argparse.BooleanOptionalAction,
+            default=ServerArgs.record_nolora_graph,
+            help="Capture a second set of CUDA graphs without LoRA hooks. "
+            "Batches without active adapters replay the faster nolora graph. "
+            "Enabled by default.",
+        )
+        parser.add_argument(
             "--flashinfer-mxfp4-moe-precision",
             type=str,
             choices=["default", "bf16"],
@@ -5821,6 +5851,11 @@ class ServerArgs:
             "--disable-cuda-graph-padding",
             action="store_true",
             help="Disable cuda graph when padding is needed. Still uses cuda graph when padding is not needed.",
+        )
+        parser.add_argument(
+            "--enable-breakable-cuda-graph",
+            action="store_true",
+            help="Use breakable CUDA graph for piecewise capture instead of torch.compile-based splitting.",
         )
         parser.add_argument(
             "--enable-profile-cuda-graph",
