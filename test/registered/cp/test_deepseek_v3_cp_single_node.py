@@ -1,32 +1,3 @@
-"""MLA prefill-CP accuracy gate on real ``DeepSeek-V3-0324`` weights.
-
-MLA counterpart of ``test_deepseek_v32_cp_single_node.py`` (NSA CP)
-and ``test_qwen3_30b.py`` (MHA CP) — one e2e file per CP flavor.
-Cheaper helper-level coverage lives in ``test_cp_utils.py`` and
-``test_mla_cp_fa3_parity.py``.
-
-Two topologies, both FA3 backend, both gated on GSM8k 0.935
-(matches the non-CP DSv3 baseline in ``test_deepseek_v3_basic.py``
-/ ``test_deepseek_v3_mtp.py``). No MTP in this baseline (MTP x
-MLA CP is a follow-up).
-
-1. ``TestDeepseekV3CPInSeqSplit`` — ``tp=8, dp=2, attn-cp=4``. The
-   last three knobs (``enable-dp-attention``, ``attn-cp-size``,
-   plus DeepEP MoE with ``ep=8``, ``moe-dense-tp-size=1``) are
-   auto-configured by ``_handle_model_specific_adjustments`` —
-   mirrors NSA CP's in-seq-split auto-config for DSv3.2.
-
-2. ``TestDeepseekV3CPAttnTPOnly`` — ``tp=8, dp=1, attn-cp=4``
-   (attn-tp=2). Matches ``scripts/playground/mla_prefill_cp/
-   launch_server.sh`` — the "just TP + CP" path. ``dp=1`` causes
-   ``_handle_data_parallelism`` to force-disable DP attention,
-   so the MLA CP auto-config's ``enable_dp_attention = True`` is
-   clobbered back to ``False``. EP still auto-enables at
-   ``ep_size == tp_size == 8`` (MLA CP auto-config pins this;
-   it is not reachable without patching ``server_args.py``).
-   Sibling to NSA CP's ``TestDeepseekV32CPRoundRobinSplit``.
-"""
-
 import unittest
 from types import SimpleNamespace
 
