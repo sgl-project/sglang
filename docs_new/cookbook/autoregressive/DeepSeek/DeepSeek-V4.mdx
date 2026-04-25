@@ -158,6 +158,13 @@ TCP, which can lead to garbled KV transfer on large checkpoints.
 
 In order to use base models, please enable `SGLANG_FIX_DSV4_BASE_MODEL_LOAD=1` and use latest code, before the next round of testing matrix is finished.
 
+**GB300 PD-Disagg cross-pod MNNVL**
+
+On some GB300 clusters with cross-pod KV transfer over NVLink, mooncake may
+fail with `nvlink_transport.cpp:497 Requested address ... not found!`. If
+this happens, prepend `MC_FORCE_MNNVL=1 NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1`
+to both prefill and decode `sglang serve` commands.
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
