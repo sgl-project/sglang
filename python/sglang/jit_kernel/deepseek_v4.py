@@ -13,7 +13,7 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda
 
 _is_cpu = is_cpu()
 _cpu_amx = cpu_has_amx_support()
@@ -21,15 +21,10 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
-try:
-    import tvm_ffi  # noqa: F401
-
-    _HAS_TVM_FFI = True
-except ImportError:
-    # tvm_ffi is unavailable on some platforms (e.g. XPU). JIT-compiled
-    # CUDA kernels in this module require it; consumers should fall back
-    # to triton/torch implementations when this flag is False.
-    _HAS_TVM_FFI = False
+# JIT-compiled CUDA kernels in this module require tvm_ffi and a working CUDA
+# toolchain. On non-CUDA backends (e.g. XPU) those entrypoints fall back to
+# triton/torch implementations.
+_is_cuda = is_cuda()
 
 
 def make_name(name: str) -> str:
@@ -433,7 +428,7 @@ class CompressorPrefillPlan(NamedTuple):
             pin_memory=seq_lens.is_cpu if not _is_cpu else False,
         )
         is_overlap = compress_ratio == 4
-        if _HAS_TVM_FFI:
+        if _is_cuda:
             module = _jit_common_module()
             plan_lens = module.plan_compress_prefill(
                 extend_lens,
@@ -691,14 +686,25 @@ def fused_rope(
     positions: torch.Tensor,
     inverse: bool = False,
 ) -> None:
-    if _is_cpu and _cpu_amx:
+    if _is_cuda:
+        freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
+        module = _jit_fused_rope_module()
+        module.forward(q, k, freqs_real, positions, inverse)
+    elif _is_cpu and _cpu_amx:
         torch.ops.sgl_kernel.apply_rotary_emb_interleaved_cpu(
             q, freqs_cis, inverse, positions, k
         )
     else:
-        freqs_real = torch.view_as_real(freqs_cis).flatten(-2).contiguous()
-        module = _jit_fused_rope_module()
-        module.forward(q, k, freqs_real, positions, inverse)
+        # Triton fallback for non-CUDA backends (e.g. XPU). Mirrors
+        # FusedQKRopeKernel: apply rotary embedding in-place to q and
+        # (when provided) k.
+        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+
+        apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
+        if k is not None:
+            apply_rotary_emb_triton(
+                k, freqs_cis, positions=positions, inverse=inverse
+            )
 
 
 @triton.jit
