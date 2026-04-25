@@ -695,4 +695,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
 
+    def forward_musa(self, *args, **kwargs) -> CombineInput:
+        return self.forward_cuda(*args, **kwargs)
+
     forward_native = forward_cpu

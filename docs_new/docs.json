@@ -940,6 +940,7 @@
                   {
                     "group": "DeepSeek",
                     "pages": [
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V4",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_2",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_1",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3",
@@ -1091,6 +1092,12 @@
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
                       "cookbook/diffusion/Wan/Wan2.2"
+                    ]
+                  },
+                  {
+                    "group": "LTX",
+                    "pages": [
+                      "cookbook/diffusion/LTX/LTX"
                     ]
                   },
                   {

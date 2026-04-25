@@ -34,11 +34,13 @@ from sglang.srt.utils import (
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    get_hip_version,
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_musa,
     is_sm90_supported,
     is_sm100_supported,
     is_sm120_supported,
@@ -54,9 +56,12 @@ _is_fp8_fnuz = is_fp8_fnuz()
 _is_sm100_supported = is_sm100_supported()
 _is_sm120_supported = is_sm120_supported()
 _is_gfx95_supported = is_gfx95_supported()
+_is_musa = is_musa()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+# ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
+_use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
@@ -759,7 +764,7 @@ def aiter_w8a8_block_fp8_linear(
 
     n, k = weight.shape
 
-    if _use_aiter_gfx95:
+    if _use_aiter_bpreshuffle_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
     else:
         use_triton = True
