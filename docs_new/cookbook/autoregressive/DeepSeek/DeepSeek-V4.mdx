@@ -161,10 +161,10 @@ In order to use base models, please enable `SGLANG_FIX_DSV4_BASE_MODEL_LOAD=1` a
 **GB300 PD-Disagg cross-pod MNNVL note**
 
 If you're running the GB300 `pd-disagg` recipe with prefill and decode on
-**different physical nodes** wired together by NVLink (e.g. inside a 2-node
+different physical nodes wired together by NVLink (e.g. inside a 2-node
 ComputeDomain on a GCP a4x cluster), and mooncake KV transfer fails with
 `nvlink_transport.cpp:497 Requested address ... not found!` (or long runs
-silently corrupt KV cache), prepend these env vars to **both** the prefill
+silently corrupt KV cache), prepend these env vars to both the prefill
 and decode `sglang serve` commands:
 
 ```bash
