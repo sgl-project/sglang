@@ -44,6 +44,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.observability.trace import extract_trace_headers
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
@@ -349,9 +350,11 @@ async def create_video(
     await VIDEO_STORE.upsert(request_id, job)
 
     # Build Req for scheduler
+    trace_headers = extract_trace_headers(request.headers)
     batch = prepare_request(
         server_args=server_args,
         sampling_params=sampling_params,
+        external_trace_header=trace_headers,
     )
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:

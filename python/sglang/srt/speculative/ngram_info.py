@@ -303,9 +303,10 @@ class NgramVerifyInput(SpecInput):
             accept_index=self.accepted_indices,  # mutable
             accept_token_num=self.accept_length,  # mutable
             candidates=candidates,
-            retrieve_index=self.retrieve_index,
-            retrieve_next_token=self.retrieve_next_token,
-            retrieve_next_sibling=self.retrieve_next_sibling,
+            # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+            retrive_index=self.retrieve_index,
+            retrive_next_token=self.retrieve_next_token,
+            retrive_next_sibling=self.retrieve_next_sibling,
             target_predict=target_predict,
         )
 
