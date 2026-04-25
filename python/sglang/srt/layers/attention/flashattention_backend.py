@@ -691,12 +691,6 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
-        _fa_out = (
-            forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            if getattr(forward_batch, "_attn_output", None) is not None
-            else None
-        )
-
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
             local_metadata = metadata.local_attn_metadata
@@ -803,7 +797,6 @@ class FlashAttentionBackend(AttentionBackend):
                     window_size=window_size,
                     softcap=layer.logit_cap,
                     num_splits=self.num_splits,
-                    out=_fa_out,
                     **kwargs,
                 )
             else:
@@ -824,7 +817,6 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
-                    out=_fa_out,
                     ver=self.fa_impl_ver,
                     **kwargs,
                 )
@@ -893,7 +885,6 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=False,
                         return_softmax_lse=True,
-                        out=_fa_out,
                         ver=self.fa_impl_ver,
                         **kwargs,
                     )
@@ -920,7 +911,6 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
-                        out=_fa_out,
                         ver=self.fa_impl_ver,
                         **kwargs,
                     )
@@ -1074,12 +1064,6 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
-        _fa_out = (
-            forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-            if getattr(forward_batch, "_attn_output", None) is not None
-            else None
-        )
-
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -1191,7 +1175,6 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
-                    out=_fa_out,
                     ver=self.fa_impl_ver,
                     scheduler_metadata=sched_meta,
                     **kwargs,
