@@ -1216,17 +1216,24 @@ class HiRadixCache(RadixCache):
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def match_prefix(self, params: MatchPrefixParams):
-        key = params.key
         empty_value = torch.empty((0,), dtype=torch.int64, device=self.device)
-        key, _ = key.maybe_to_bigram_view(self.is_eagle)
-        key = key.page_aligned(self.page_size)
-        if self.disable or len(key) == 0:
+
+        def empty_match_result():
             return MatchResult(
                 device_indices=empty_value,
                 last_device_node=self.root_node,
                 last_host_node=self.root_node,
                 host_hit_length=0,
             )
+
+        if self.disable:
+            return empty_match_result()
+
+        key = params.key
+        key, _ = key.maybe_to_bigram_view(self.is_eagle)
+        key = key.page_aligned(self.page_size)
+        if len(key) == 0:
+            return empty_match_result()
 
         value, last_node = self._match_prefix_helper(self.root_node, key)
         if value:
