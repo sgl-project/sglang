@@ -340,12 +340,10 @@ def expand_topk_with_shared_expert(
     expanded_topk_weights = torch.empty(
         num_tokens, topk + 1, dtype=topk_weights.dtype, device=device
     )
-    expanded_topk_weights[:, :topk] = topk_weights
+    expanded_topk_weights[:, :topk] = torch.where(valid_mask, topk_weights, 0.0)
     expanded_topk_weights[:, topk] = torch.where(has_valid, shared_weight, 0.0).to(
         topk_weights.dtype
     )
-    if (~has_valid).any():
-        expanded_topk_weights[~has_valid, :topk] = 0.0
     local_shared_mask = has_valid
     return expanded_topk_ids, expanded_topk_weights, local_shared_mask
 
@@ -477,6 +475,23 @@ class DeepEPWaterfillBalancer:
         self, topk_output: StandardTopKOutput, num_tokens: int
     ) -> StandardTopKOutput:
         """Expand topk [N, 8] -> [N, 9] with waterfill-assigned shared expert."""
+        if num_tokens < self.MIN_BATCH_FOR_BALANCE:
+            # Low-batch decode uses the local shared-expert path and does not need
+            # rank counts. Avoid launching the count kernel in captured graphs.
+            expanded_ids, expanded_weights, _ = expand_topk_with_shared_expert(
+                topk_output.topk_ids,
+                topk_output.topk_weights,
+                self.num_routed_experts,
+                self.world_size,
+                self.rank,
+                self.shared_weight,
+            )
+            return StandardTopKOutput(
+                topk_weights=expanded_weights,
+                topk_ids=expanded_ids,
+                router_logits=topk_output.router_logits,
+            )
+
         from sglang.srt.distributed import get_moe_ep_group
 
         local_routed_counts = self.count_local_routed(topk_output.topk_ids)
