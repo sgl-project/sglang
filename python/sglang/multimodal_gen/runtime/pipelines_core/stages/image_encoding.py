@@ -417,25 +417,48 @@ class LTX2ImageEncodingStage(PipelineStage):
         ):
             return self._condition_image_encoder(video_condition)
 
+    @staticmethod
+    def _normalize_ltx2_image_paths(image_path: str | list[str]) -> list[str]:
+        image_paths = image_path if isinstance(image_path, list) else [image_path]
+        if len(image_paths) > 2:
+            raise ValueError(
+                "LTX-2 TI2V currently supports at most two conditioning images "
+                "([first_frame, last_frame])."
+            )
+        return image_paths
+
+    @staticmethod
+    def _normalize_ltx2_image_latents(
+        image_latent: torch.Tensor | list[torch.Tensor] | None,
+    ) -> list[torch.Tensor]:
+        if image_latent is None:
+            return []
+        return image_latent if isinstance(image_latent, list) else [image_latent]
+
     # -- forward ---------------------------------------------------------
 
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         if batch.image_path is None:
             return batch
+        image_paths = self._normalize_ltx2_image_paths(batch.image_path)
+
+        vae_sf = int(server_args.pipeline_config.vae_scale_factor)
+        patch = int(server_args.pipeline_config.patch_size)
+        expected_tokens = (int(batch.height) // vae_sf // patch) * (
+            int(batch.width) // vae_sf // patch
+        )
         if (
             batch.image_latent is not None
             and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
         ):
             # Re-encode if resolution changed (e.g. two-stage upsample between stages)
-            vae_sf = int(server_args.pipeline_config.vae_scale_factor)
-            patch = int(server_args.pipeline_config.patch_size)
-            expected = (int(batch.height) // vae_sf // patch) * (
-                int(batch.width) // vae_sf // patch
-            )
-            if int(batch.image_latent.shape[1]) == expected:
+            existing_latents = self._normalize_ltx2_image_latents(batch.image_latent)
+            if len(existing_latents) == len(image_paths) and all(
+                int(latent.shape[1]) == expected_tokens for latent in existing_latents
+            ):
                 return batch
-            # Resolution mismatch — clear and re-encode below
+            # Resolution or reference-count mismatch — clear and re-encode below
             batch.image_latent = None
             batch.ltx2_num_image_tokens = 0
 
@@ -447,20 +470,23 @@ class LTX2ImageEncodingStage(PipelineStage):
 
         from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 
-        # 1. Load image, apply codec compression, resize for condition_image
-        image_path = (
-            batch.image_path[0]
-            if isinstance(batch.image_path, list)
-            else batch.image_path
-        )
-        img = load_image(image_path)
-        arr = np.array(img).astype(np.uint8)[..., :3]
-        arr = self._apply_video_codec_compression(arr, crf=33)
-        conditioned_img = PIL.Image.fromarray(arr)
-        batch.condition_image = conditioned_img.resize(
-            (int(batch.width), int(batch.height)),
-            resample=PIL.Image.Resampling.BILINEAR,
-        )
+        # 1. Load images, apply codec compression, resize for condition_image
+        conditioned_imgs = []
+        for image_path in image_paths:
+            img = load_image(image_path)
+            arr = np.array(img).astype(np.uint8)[..., :3]
+            arr = self._apply_video_codec_compression(arr, crf=33)
+            conditioned_img = PIL.Image.fromarray(arr)
+            conditioned_imgs.append(conditioned_img)
+        batch.condition_image = [
+            img.resize(
+                (int(batch.width), int(batch.height)),
+                resample=PIL.Image.Resampling.BILINEAR,
+            )
+            for img in conditioned_imgs
+        ]
+        if len(batch.condition_image) == 1:
+            batch.condition_image = batch.condition_image[0]
 
         # 2. Load encoder(s) to device, cast to encode_dtype
         use_condition_encoder = self._ensure_condition_image_encoder(server_args)
@@ -478,21 +504,35 @@ class LTX2ImageEncodingStage(PipelineStage):
         else:
             self.vae = self.vae.to(dtype=encode_dtype)
 
-        video_condition = self._pil_to_video_tensor(
-            conditioned_img,
-            width=int(batch.width),
-            height=int(batch.height),
-            device=device,
-            dtype=encode_dtype,
-        )
-
-        # 3. Encode
-        if use_condition_encoder:
-            latent = self._condition_encode(video_condition, server_args).to(
-                dtype=encode_dtype
+        packed_latents = []
+        for conditioned_img in conditioned_imgs:
+            video_condition = self._pil_to_video_tensor(
+                conditioned_img,
+                width=int(batch.width),
+                height=int(batch.height),
+                device=device,
+                dtype=encode_dtype,
             )
-        else:
-            latent = self._vae_encode(video_condition, server_args, batch.generator)
+
+            # 3. Encode
+            if use_condition_encoder:
+                latent = self._condition_encode(video_condition, server_args).to(
+                    dtype=encode_dtype
+                )
+            else:
+                latent = self._vae_encode(video_condition, server_args, batch.generator)
+
+            packed = server_args.pipeline_config.maybe_pack_latents(
+                latent, latent.shape[0], batch
+            )
+            if not (isinstance(packed, torch.Tensor) and packed.ndim == 3):
+                raise ValueError("Expected packed image latents [B, S0, D].")
+            if int(packed.shape[1]) != expected_tokens:
+                raise ValueError(
+                    f"LTX-2 conditioning token count mismatch: "
+                    f"{packed.shape[1]=} {expected_tokens=}."
+                )
+            packed_latents.append(packed)
 
         # Restore VAE to its config dtype (shared with decoding stage)
         if not use_condition_encoder:
@@ -501,32 +541,16 @@ class LTX2ImageEncodingStage(PipelineStage):
             ]
             self.vae = self.vae.to(dtype=original_dtype)
 
-        # 4. Pack into token latents and validate
-        packed = server_args.pipeline_config.maybe_pack_latents(
-            latent, latent.shape[0], batch
+        batch.image_latent = (
+            packed_latents[0] if len(packed_latents) == 1 else packed_latents
         )
-        if not (isinstance(packed, torch.Tensor) and packed.ndim == 3):
-            raise ValueError("Expected packed image latents [B, S0, D].")
-
-        vae_sf = int(server_args.pipeline_config.vae_scale_factor)
-        patch = int(server_args.pipeline_config.patch_size)
-        expected_tokens = (int(batch.height) // vae_sf // patch) * (
-            int(batch.width) // vae_sf // patch
-        )
-        if int(packed.shape[1]) != expected_tokens:
-            raise ValueError(
-                f"LTX-2 conditioning token count mismatch: "
-                f"{packed.shape[1]=} {expected_tokens=}."
-            )
-
-        batch.image_latent = packed
-        batch.ltx2_num_image_tokens = int(packed.shape[1])
+        batch.ltx2_num_image_tokens = int(packed_latents[0].shape[1])
 
         if batch.debug:
             logger.info(
                 "LTX2 TI2V: %d tokens (shape=%s) for %sx%s",
                 batch.ltx2_num_image_tokens,
-                tuple(batch.image_latent.shape),
+                tuple(packed_latents[0].shape),
                 batch.width,
                 batch.height,
             )
@@ -703,7 +727,6 @@ class ImageVAEEncodingStage(PipelineStage):
         self,
         image: torch.Tensor | PIL.Image.Image,
     ) -> torch.Tensor:
-
         if isinstance(image, PIL.Image.Image):
             image = pil_to_numpy(image)  # to np
             image = numpy_to_pt(image)  # to pt

@@ -47,7 +47,6 @@ class LTX2TextConnectorStage(PipelineStage):
 
         # Handle CFG: Concatenate negative and positive inputs
         if batch.do_classifier_free_guidance:
-
             # Concatenate: [Negative, Positive]
             prompt_embeds = torch.cat([neg_prompt_embeds, prompt_embeds], dim=0)
             prompt_attention_mask = torch.cat(
@@ -57,7 +56,9 @@ class LTX2TextConnectorStage(PipelineStage):
         # Prepare additive mask for connectors (as per Diffusers implementation)
         dtype = prompt_embeds.dtype
 
-        additive_attention_mask = (1 - prompt_attention_mask.to(dtype)) * -1000000.0
+        additive_attention_mask = (prompt_attention_mask.to(torch.int64) - 1).to(
+            dtype
+        ) * torch.finfo(dtype).max
 
         # Call connectors
         # Expects: prompt_embeds, attention_mask, additive_mask=True
