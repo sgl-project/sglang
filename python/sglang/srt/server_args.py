@@ -809,6 +809,9 @@ class ServerArgs:
 
         current_platform.apply_server_args_defaults(self)
 
+        if self.rl_on_policy_target is not None:
+            self.enable_deterministic_inference = True
+
         # Handle piecewise CUDA graph.
         self._handle_piecewise_cuda_graph()
 
@@ -3847,6 +3850,19 @@ class ServerArgs:
                 "Enable deterministic inference because of rl_on_policy_target."
             )
             self.enable_deterministic_inference = True
+            if self.enforce_piecewise_cuda_graph:
+                raise ValueError(
+                    "--rl-on-policy-target currently does not support --enforce-piecewise-cuda-graph."
+                )
+            if self.moe_a2a_backend != "none":
+                raise ValueError(
+                    f"--rl-on-policy-target currently supports the standard MoE path only, but got --moe-a2a-backend={self.moe_a2a_backend}."
+                )
+            if self.enable_flashinfer_allreduce_fusion:
+                logger.warning(
+                    "Disable --enable-flashinfer-allreduce-fusion because rl_on_policy_target does not support allreduce fusion."
+                )
+                self.enable_flashinfer_allreduce_fusion = False
 
             # For VLM
             envs.SGLANG_VLM_CACHE_SIZE_MB.set(0)

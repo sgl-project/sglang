@@ -126,54 +126,49 @@ class Sampler(nn.Module):
             if return_logprob and SGLANG_RETURN_ORIGINAL_LOGPROB:
                 original_logprobs = torch.log_softmax(logits, dim=-1)
 
-            # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
-            logprobs_via_logsoftmax_kernel = None
-            if self.rl_on_policy_target is not None:
-                # TODO: use more inplace ops to save memory
-                logits_div_temperature = (
-                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
-                )
-                logprobs_via_logsoftmax_kernel = torch.log_softmax(
-                    logits_div_temperature, dim=-1
-                )
-                del logits_div_temperature
-
             if self.use_ascend_backend:
                 # Ascend backend: sample from logits directly.
                 batch_next_token_ids, logprobs = self._forward_ascend_backend(
                     logits, sampling_info, simple_sampling_case, return_logprob
                 )
-            elif (
-                self.use_log_softmax_logprob
-                and self.enable_deterministic
-                and simple_sampling_case
-            ):
-                # RL on-policy path: sample from logprobs to match the trainer.
-                batch_next_token_ids = self._sample_from_logprobs(
-                    logprobs_via_logsoftmax_kernel,
-                    sampling_info,
-                    positions,
-                )
-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    logprobs = logprobs_via_logsoftmax_kernel
             else:
-                # Standard path: do softmax and sample from probs.
+                # Post process logits
                 logits.div_(sampling_info.temperatures)
 
-                # In-place op to save memory
-                logits[:] = torch.softmax(logits, dim=-1)
-                probs = logits
+                # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
+                logprobs_via_logsoftmax_kernel = None
+                if self.rl_on_policy_target is not None:
+                    logprobs_via_logsoftmax_kernel = torch.log_softmax(logits, dim=-1)
 
-                batch_next_token_ids = self._sample_from_probs(
-                    probs, sampling_info, positions, simple_sampling_case
-                )
-                if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
-                    logprobs = (
-                        logprobs_via_logsoftmax_kernel
-                        if logprobs_via_logsoftmax_kernel is not None
-                        else torch.log(probs)
+                if (
+                    self.use_log_softmax_logprob
+                    and self.enable_deterministic
+                    and simple_sampling_case
+                ):
+                    # RL on-policy path: sample from logprobs to match the trainer.
+                    batch_next_token_ids = self._sample_from_logprobs(
+                        logprobs_via_logsoftmax_kernel,
+                        sampling_info,
+                        positions,
                     )
-                del probs
+                    if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+                        logprobs = logprobs_via_logsoftmax_kernel
+                else:
+                    # Standard path: do softmax and sample from probs.
+                    # In-place op to save memory
+                    logits[:] = torch.softmax(logits, dim=-1)
+                    probs = logits
+
+                    batch_next_token_ids = self._sample_from_probs(
+                        probs, sampling_info, positions, simple_sampling_case
+                    )
+                    if return_logprob and not SGLANG_RETURN_ORIGINAL_LOGPROB:
+                        logprobs = (
+                            logprobs_via_logsoftmax_kernel
+                            if logprobs_via_logsoftmax_kernel is not None
+                            else torch.log(probs)
+                        )
+                    del probs
 
         # Attach logprobs to logits_output (in-place modification)
         if return_logprob:
