@@ -192,62 +192,71 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     head_sha = pr.head.sha
     print(f"Checking workflows for commit: {head_sha}")
 
-    # If PR has sgl-kernel changes, check whether the wheel build already
-    # succeeded for this commit. If so, we can skip the full rerun and just
-    # rerun failed jobs — avoids retriggering all tests (including flaky ones).
+    # If PR has sgl-kernel changes, check whether ALL wheel builds already
+    # succeeded for this commit (CUDA + ARM). If so, we can use
+    # rerun_failed_jobs and avoid retriggering all tests. If any wheel
+    # build is pending/failed, a dependent job could fail for missing
+    # artifacts, so fall back to full rerun.
+    # Check-runs display names: "Build Wheel (<python>, <cuda>)" (CUDA) and
+    # "Build Wheel Arm (<python>, <cuda>)" (ARM). The YAML job ids
+    # sgl-kernel-build-wheels{,-arm} are NOT what the check-runs API
+    # returns — it returns the job's `name:` field.
     kernel_wheel_built = False
     if sgl_kernel_changes:
         try:
-            check_runs = gh_repo.get_commit(head_sha).get_check_runs()
-            for cr in check_runs:
-                if "sgl-kernel-build-wheels" in cr.name and cr.conclusion == "success":
-                    kernel_wheel_built = True
-                    print(
-                        f"sgl-kernel-build-wheels already passed (check run {cr.id})"
-                        " - using rerun_failed_jobs"
-                    )
-                    break
-            if not kernel_wheel_built:
-                print(
-                    "sgl-kernel-build-wheels has not passed yet"
-                    " - will use full rerun"
-                )
+            wheel_builds = [
+                cr
+                for cr in gh_repo.get_commit(head_sha).get_check_runs()
+                if cr.name.startswith("Build Wheel")
+            ]
+            kernel_wheel_built = bool(wheel_builds) and all(
+                cr.conclusion == "success" for cr in wheel_builds
+            )
+            print(
+                f"All {len(wheel_builds)} kernel wheel build(s) passed - using rerun_failed_jobs"
+                if kernel_wheel_built
+                else f"Kernel wheel not fully built "
+                f"({sum(1 for c in wheel_builds if c.conclusion == 'success')}"
+                f"/{len(wheel_builds)} success) - will use full rerun"
+            )
         except Exception as e:
             print(
-                f"Failed to check sgl-kernel-build-wheels status: {e}"
-                " - falling back to full rerun"
+                f"Failed to check kernel wheel status: {e} - falling back to full rerun"
             )
 
-    # List all workflow runs for this commit
+    # Rerun workflows with conclusion=failure or conclusion=skipped.
+    #
+    # - failure: use rerun_failed_jobs() which reruns failed jobs *and their
+    #   dependent jobs* (GitHub API). Fast-fail cascades call
+    #   core.setFailed(...) so their conclusion is "failure" and are covered.
+    # - skipped: the entire run was skipped (no jobs ran), so there are no
+    #   failed jobs for rerun_failed_jobs() to target. Use run.rerun().
+    # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
+    #   builds are success yet, full-rerun failure runs too — Build Wheel
+    #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
+    #   rerun_failed_jobs() is scoped to a single workflow run.
     runs = gh_repo.get_workflow_runs(head_sha=head_sha)
 
     rerun_count = 0
     for run in runs:
         if run.status != "completed":
             continue
+        if run.conclusion not in ("failure", "skipped"):
+            continue
 
-        if run.conclusion == "failure":
-            print(f"Rerunning failed workflow: {run.name} (ID: {run.id})")
-            try:
-                if sgl_kernel_changes and not kernel_wheel_built:
-                    # Full rerun to ensure sgl-kernel-build-wheels runs
-                    # and produces fresh artifacts for dependent jobs
-                    run.rerun()
-                else:
-                    # Use rerun_failed_jobs for efficiency on failures
-                    run.rerun_failed_jobs()
-                rerun_count += 1
-            except Exception as e:
-                print(f"Failed to rerun workflow {run.id}: {e}")
-
-        elif run.conclusion == "skipped":
-            print(f"Rerunning skipped workflow: {run.name} (ID: {run.id})")
-            try:
-                # Skipped workflows don't have 'failed jobs', so we use full rerun()
+        print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
+        try:
+            if run.conclusion == "skipped" or (
+                sgl_kernel_changes and not kernel_wheel_built
+            ):
+                print("  Full rerun")
                 run.rerun()
-                rerun_count += 1
-            except Exception as e:
-                print(f"Failed to rerun workflow {run.id}: {e}")
+            else:
+                print("  rerun_failed_jobs")
+                run.rerun_failed_jobs()
+            rerun_count += 1
+        except Exception as e:
+            print(f"Failed to rerun workflow {run.id}: {e}")
 
     if rerun_count > 0:
         print(f"Triggered rerun for {rerun_count} workflows.")
@@ -294,6 +303,7 @@ def handle_rerun_stage(
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-h20",
         "stage-c-test-4-gpu-b200",
+        "stage-c-test-4-gpu-b200-small",
         "stage-c-test-4-gpu-gb200",
         "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
@@ -357,6 +367,18 @@ def handle_rerun_stage(
         )
         print(f"PR is from fork: {is_fork}")
 
+        # If the PR modifies sgl-kernel/, the target stage would otherwise use the
+        # PyPI sgl-kernel wheel instead of the PR's changes (sgl-kernel-build-wheels
+        # skips in target_stage mode by default). Set include_wheel_build=true so the
+        # workflow runs sgl-kernel-build-wheels alongside the target stage; the target
+        # stage waits for the build via its needs list.
+        kernel_changes = has_sgl_kernel_changes(pr)
+        if kernel_changes:
+            print(
+                "PR modifies sgl-kernel/ - setting include_wheel_build=true so the "
+                "target stage gets the freshly-built wheel instead of the PyPI one."
+            )
+
         # pr_head_sha is used for fork PRs (passed to workflow and used for URL lookup)
         pr_head_sha = None
 
@@ -368,25 +390,29 @@ def handle_rerun_stage(
             print(
                 f"Triggering {workflow_name} workflow on ref: {ref}, PR head SHA: {pr_head_sha}"
             )
-            if is_amd_stage:
-                inputs = {
-                    "target_stage": stage_name,
-                    "pr_head_sha": pr_head_sha,
-                }
-            else:
-                inputs = {
-                    "target_stage": stage_name,
-                    "pr_head_sha": pr_head_sha,
-                }
+            inputs = {
+                "target_stage": stage_name,
+                "pr_head_sha": pr_head_sha,
+            }
         else:
             # For non-fork PRs: dispatch on the PR branch directly
             # This allows testing workflow changes before merge
             ref = pr.head.ref
             print(f"Triggering {workflow_name} workflow on branch: {ref}")
-            if is_amd_stage:
-                inputs = {"target_stage": stage_name}
-            else:
-                inputs = {"target_stage": stage_name}
+            inputs = {"target_stage": stage_name}
+
+        # For NVIDIA stages, honor the sgl-kernel / include_wheel_build flow. AMD is
+        # a separate workflow that doesn't share the same wheel-build pipeline.
+        if kernel_changes and not is_amd_stage:
+            inputs["include_wheel_build"] = "true"
+            # include_wheel_build relies on filter-api detecting kernel changes, which
+            # requires pr_head_sha. Ensure it's set even for non-fork PRs, and keep
+            # the local pr_head_sha in sync so find_workflow_run_url builds the
+            # expected display_title with the SHA suffix (the workflow's run-name
+            # includes the SHA whenever inputs.pr_head_sha is set).
+            if not is_fork:
+                inputs["pr_head_sha"] = pr.head.sha
+                pr_head_sha = pr.head.sha
 
         # Record dispatch time before triggering
         dispatch_time = time.time()
@@ -449,6 +475,7 @@ def handle_rerun_stage(
 
 
 CUDA_SUITE_TO_RUNNER = {
+    # PR test suites
     "stage-a-test-1-gpu-small": "1-gpu-5090",
     "stage-a-test-cpu": "ubuntu-latest",
     "stage-b-test-1-gpu-small": "1-gpu-5090",
@@ -459,8 +486,25 @@ CUDA_SUITE_TO_RUNNER = {
     "stage-c-test-8-gpu-h200": "8-gpu-h200",
     "stage-c-test-8-gpu-h20": "8-gpu-h20",
     "stage-c-test-4-gpu-b200": "4-gpu-b200",
+    "stage-c-test-4-gpu-b200-small": "4-gpu-b200-low-disk",
     "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200",
+    # Nightly test suites (NVIDIA)
+    "nightly-1-gpu": "1-gpu-h100",
+    "nightly-4-gpu": "4-gpu-h100",
+    "nightly-4-gpu-b200": "4-gpu-b200",
+    "nightly-8-gpu-common": "8-gpu-h200",
+    "nightly-8-gpu-h200": "8-gpu-h200",
+    "nightly-8-gpu-h20": "8-gpu-h20",
+    "nightly-8-gpu-b200": "8-gpu-b200",
+    "nightly-eval-text-2-gpu": "2-gpu-h100",
+    "nightly-eval-vlm-2-gpu": "2-gpu-h100",
+    "nightly-perf-text-2-gpu": "2-gpu-h100",
+    "nightly-perf-vlm-2-gpu": "2-gpu-h100",
+    "nightly-kernel-1-gpu": "1-gpu-h100",
+    "nightly-kernel-8-gpu-h200": "8-gpu-h200",
+    # Weekly test suites
+    "weekly-8-gpu-h200": "8-gpu-h200",
 }
 
 DEEPEP_SUITES = {
@@ -470,40 +514,104 @@ DEEPEP_SUITES = {
 }
 
 
+MULTIMODAL_TEST_DIR = "python/sglang/multimodal_gen/test"
+
+MULTIMODAL_PATH_TO_RUNNER = {
+    "2_gpu": "2-gpu-h100",
+    "2-gpu": "2-gpu-h100",
+}
+MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
+
+
 def resolve_test_file(file_part):
     """
-    Resolve a user-provided file path to a path relative to test/.
+    Resolve a user-provided file path to a path relative to test/ or full path for multimodal.
 
     Supports:
     - Full path: test/registered/core/test_srt_endpoint.py
     - Relative to test/: registered/core/test_srt_endpoint.py
     - Bare filename: test_srt_endpoint.py (glob-matched, must be unique)
+    - Multimodal paths: python/sglang/multimodal_gen/test/server/test_server_a.py
 
-    Returns (resolved_path, error_message). On success error_message is None.
+    Returns (resolved_path, is_multimodal, error_message). On success error_message is None.
     """
+    # Check if it's explicitly a multimodal path
+    multimodal_prefixes = [
+        "python/sglang/multimodal_gen/test/",
+        "sglang/multimodal_gen/test/",
+        "multimodal_gen/test/",
+    ]
+    for prefix in multimodal_prefixes:
+        if file_part.startswith(prefix):
+            full_path = (
+                file_part
+                if file_part.startswith("python/")
+                else f"python/sglang/multimodal_gen/test/{file_part[len(prefix):]}"
+            )
+            if not os.path.isfile(full_path):
+                return None, False, f"File not found: `{full_path}`"
+            return full_path, True, None
+
+    # Existing logic for test/registered/ paths
     if file_part.startswith("test/"):
         file_part = file_part[len("test/") :]
 
     if "/" not in file_part:
+        # Try test/registered/ first
         matches = glob.glob(f"test/registered/**/{file_part}", recursive=True)
-        if len(matches) == 0:
+
+        # Try multimodal test directory
+        mm_matches = glob.glob(f"{MULTIMODAL_TEST_DIR}/**/{file_part}", recursive=True)
+        # Filter to only test files
+        mm_matches = [m for m in mm_matches if os.path.basename(m).startswith("test_")]
+
+        if len(matches) == 1 and len(mm_matches) == 0:
+            return matches[0][len("test/") :], False, None
+        if len(matches) == 0 and len(mm_matches) == 1:
+            return mm_matches[0], True, None
+
+        all_matches = matches + mm_matches
+        if len(all_matches) == 0:
             return (
                 None,
-                f"No test file found matching `{file_part}` under `test/registered/`.",
+                False,
+                f"No test file found matching `{file_part}` under `test/registered/` or `{MULTIMODAL_TEST_DIR}/`.",
             )
-        if len(matches) > 1:
-            match_list = "\n".join(f"- `{m}`" for m in sorted(matches))
-            return None, (
-                f"Ambiguous filename `{file_part}` — matched {len(matches)} files:\n\n"
-                f"{match_list}\n\n"
-                f"Please provide the full path, e.g. `/rerun-test {matches[0]}`"
+        if len(all_matches) > 1:
+            match_list = "\n".join(f"- `{m}`" for m in sorted(all_matches))
+            return (
+                None,
+                False,
+                (
+                    f"Ambiguous filename `{file_part}` — matched {len(all_matches)} files:\n\n"
+                    f"{match_list}\n\n"
+                    f"Please provide the full path, e.g. `/rerun-test {all_matches[0]}`"
+                ),
             )
-        return matches[0][len("test/") :], None
+        # Shouldn't reach here, but handle gracefully
+        if mm_matches:
+            return mm_matches[0], True, None
+        return matches[0][len("test/") :], False, None
 
+    # Path with directory - check test/ location
     full_path = f"test/{file_part}"
-    if not os.path.isfile(full_path):
-        return None, f"File not found: `{full_path}`"
-    return file_part, None
+    if os.path.isfile(full_path):
+        return file_part, False, None
+
+    return None, False, f"File not found: `{full_path}`"
+
+
+def detect_multimodal_suite(file_path):
+    """
+    Determine runner for a multimodal gen test file based on its path.
+
+    Returns (runner_label, error_message).
+    """
+    # Check path components and basename for GPU count hints
+    for pattern, runner in MULTIMODAL_PATH_TO_RUNNER.items():
+        if pattern in file_path:
+            return runner, None
+    return MULTIMODAL_DEFAULT_RUNNER, None
 
 
 def detect_suite(file_path_from_test):
@@ -579,9 +687,34 @@ def _resolve_test_spec(test_spec):
     if test_selector:
         test_selector = test_selector.strip()
 
-    resolved_path, err = resolve_test_file(file_part)
+    resolved_path, is_multimodal, err = resolve_test_file(file_part)
     if err:
         return {"spec": test_spec, "error": err}
+
+    if is_multimodal:
+        runner_label, err = detect_multimodal_suite(resolved_path)
+        if err:
+            return {"spec": test_spec, "error": err}
+
+        # For multimodal pytest tests, use :: separator for test selection
+        test_command = resolved_path
+        if test_selector:
+            test_command = f"{resolved_path}::{test_selector}"
+
+        print(
+            f"Resolved (multimodal): file={resolved_path}, selector={test_selector}, "
+            f"runner={runner_label}, command='{test_command}'"
+        )
+        return {
+            "spec": test_spec,
+            "test_command": test_command,
+            "suite": "multimodal",
+            "runner_label": runner_label,
+            "use_deepep": False,
+            "is_cpu": False,
+            "install_diffusion": True,
+            "error": None,
+        }
 
     suite, runner_label, use_deepep, is_cpu, err = detect_suite(resolved_path)
     if err:
@@ -603,6 +736,7 @@ def _resolve_test_spec(test_spec):
         "runner_label": runner_label,
         "use_deepep": use_deepep,
         "is_cpu": is_cpu,
+        "install_diffusion": False,
         "error": None,
     }
 
@@ -618,6 +752,7 @@ def _dispatch_batch(gh_repo, pr, batch, token):
     runner_label = batch[0]["runner_label"]
     use_deepep = batch[0]["use_deepep"]
     is_cpu = batch[0]["is_cpu"]
+    install_diffusion = batch[0].get("install_diffusion", False)
 
     # Join multiple commands with newlines for the workflow to iterate over
     combined_command = "\n".join(test_commands)
@@ -648,6 +783,7 @@ def _dispatch_batch(gh_repo, pr, batch, token):
             "runner_label": runner_label,
             "use_deepep": str(use_deepep).lower(),
             "is_cpu": str(is_cpu).lower(),
+            "install_diffusion": str(install_diffusion).lower(),
         }
         if is_fork:
             ref = "main"
@@ -758,10 +894,15 @@ def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
         else:
             resolved.append(r)
 
-    # Phase 2: Group by (runner_label, use_deepep, is_cpu)
+    # Phase 2: Group by (runner_label, use_deepep, is_cpu, install_diffusion)
     groups = {}
     for r in resolved:
-        key = (r["runner_label"], r["use_deepep"], r["is_cpu"])
+        key = (
+            r["runner_label"],
+            r["use_deepep"],
+            r["is_cpu"],
+            r.get("install_diffusion", False),
+        )
         groups.setdefault(key, []).append(r)
 
     # Phase 3: Dispatch one workflow per group
@@ -773,9 +914,19 @@ def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
     lines = []
     for dr in dispatch_results:
         if dr["success"]:
-            cmds = "\n".join(
-                f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
+            install_diff = any(
+                r.get("install_diffusion", False)
+                for r in resolved
+                if r["spec"] in dr["specs"]
             )
+            if install_diff:
+                cmds = "\n".join(
+                    f"python3 -m pytest {cmd} -x" for cmd in dr["test_commands"]
+                )
+            else:
+                cmds = "\n".join(
+                    f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
+                )
             if dr.get("run_url"):
                 lines.append(
                     f"✅ `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "

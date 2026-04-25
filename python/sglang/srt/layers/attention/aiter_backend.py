@@ -2478,6 +2478,23 @@ class AiterAttnBackend(AttentionBackend):
                     k_scale=k_descale,
                     v_scale=v_descale,
                 )
+            elif self.use_triton_unified_attention and self.kv_cache_dtype == fp8_dtype:
+                # [PATCH] FP8 non-SWA: use launch_reshape_and_cache_flash to
+                # fuse bf16→fp8 cast + paged write in one Triton kernel,
+                # eliminating separate float8_copy + store_kvcache overhead.
+                token_to_kv_pool = forward_batch.token_to_kv_pool
+                k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                launch_reshape_and_cache_flash(
+                    k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    forward_batch.out_cache_loc,
+                )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, forward_batch.out_cache_loc, k, v
