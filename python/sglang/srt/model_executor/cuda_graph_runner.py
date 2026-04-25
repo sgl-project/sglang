@@ -580,6 +580,13 @@ class CudaGraphRunner:
         if model_runner.server_args.enable_return_hidden_states:
             self.capture_hidden_mode = CaptureHiddenMode.FULL
 
+        # TRAIL: capture graphs with LAST mode so decode batches can use CUDA graphs
+        if (
+            self.capture_hidden_mode == CaptureHiddenMode.NULL
+            and model_runner.server_args.schedule_policy.startswith("trail-")
+        ):
+            self.capture_hidden_mode = CaptureHiddenMode.LAST
+
         # Attention backend
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs

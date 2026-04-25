@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import sys
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from enum import Enum, auto
@@ -91,6 +92,11 @@ class CacheAgnosticPolicy(Enum):
     LOF = "lof"  # longest output first
     RANDOM = "random"
     ROUTING_KEY = "routing-key"  # prioritize by routing key frequency in running batch
+    TRAIL_SJF = "trail-sjf"  # TRAIL shortest-job-first by initial predicted length
+    TRAIL_SPRPT = "trail-sprpt"  # TRAIL SRPT by (predicted - generated)
+    TRAIL_LSPRPT = "trail-lsprpt"  # TRAIL limited-preemption SRPT (50% threshold)
+    TRAIL_RPSPRPT = "trail-rpsprpt"  # TRAIL refined-prediction SRPT
+    TRAIL_LRPSPRPT = "trail-lrpsprpt"  # TRAIL limited refined-prediction SRPT (80% threshold)
 
 
 class SchedulePolicy:
@@ -103,6 +109,7 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        trail_preemption_threshold: float = 0.8,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -110,6 +117,7 @@ class SchedulePolicy:
         self.enable_priority_scheduling = enable_priority_scheduling
         self.schedule_low_priority_values_first = schedule_low_priority_values_first
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
+        self.trail_preemption_threshold = trail_preemption_threshold
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -154,6 +162,20 @@ class SchedulePolicy:
             elif policy == CacheAgnosticPolicy.ROUTING_KEY:
                 if running_batch is not None:
                     SchedulePolicy._sort_by_routing_key(waiting_queue, running_batch)
+            elif policy == CacheAgnosticPolicy.TRAIL_SJF:
+                SchedulePolicy._sort_by_trail_sjf(waiting_queue)
+            elif policy == CacheAgnosticPolicy.TRAIL_SPRPT:
+                SchedulePolicy._sort_by_trail_sprpt(waiting_queue)
+            elif policy == CacheAgnosticPolicy.TRAIL_LSPRPT:
+                SchedulePolicy._sort_by_trail_lsprpt(
+                    waiting_queue, 0.5
+                )
+            elif policy == CacheAgnosticPolicy.TRAIL_RPSPRPT:
+                SchedulePolicy._sort_by_trail_rpsprpt(waiting_queue)
+            elif policy == CacheAgnosticPolicy.TRAIL_LRPSPRPT:
+                SchedulePolicy._sort_by_trail_lrpsprpt(
+                    waiting_queue, self.trail_preemption_threshold
+                )
             else:
                 raise ValueError(f"Unknown CacheAgnostic Policy: {policy=}")
         return prefix_computed
@@ -293,6 +315,99 @@ class SchedulePolicy:
             )
         else:
             waiting_queue.sort(key=lambda x: -x.sampling_params.max_new_tokens)
+
+    @staticmethod
+    def _sort_by_trail_sjf(waiting_queue: "List[Req]") -> None:
+        """Sort by TRAIL initial predicted length (shortest job first)."""
+        waiting_queue.sort(
+            key=lambda x: (
+                x.trail_state.initial_predicted_len
+                if x.trail_state is not None
+                else float("inf")
+            )
+        )
+
+    @staticmethod
+    def _sort_by_trail_sprpt(waiting_queue: "List[Req]") -> None:
+        """TRAIL SPRPT: priority = -(predicted_len - generated_len)."""
+        def sprpt_key(req):
+            if req.trail_state is None:
+                return float("inf")
+            return req.trail_state.current_predicted_remaining
+        waiting_queue.sort(key=sprpt_key)
+
+    @staticmethod
+    def _sort_by_trail_lsprpt(
+        waiting_queue: "List[Req]", preemption_threshold: float = 0.5
+    ) -> None:
+        """TRAIL LSPRPT: SPRPT + limited preemption at 50% threshold."""
+        def lsprpt_key(req):
+            if req.trail_state is None:
+                return (1, float("inf"))
+            ts = req.trail_state
+            generated_len = len(req.output_ids)
+            if ts.initial_predicted_len > 0 and generated_len > preemption_threshold * ts.initial_predicted_len:
+                return (0, 0)
+            return (1, ts.current_predicted_remaining)
+        waiting_queue.sort(key=lsprpt_key)
+
+    @staticmethod
+    def _sort_by_trail_rpsprpt(waiting_queue: "List[Req]") -> None:
+        """TRAIL RPSPRPT: refined prediction SRPT (no preemption limit)."""
+        def rpsprpt_key(req):
+            if req.trail_state is None:
+                return float("inf")
+            return req.trail_state.current_predicted_remaining
+        waiting_queue.sort(key=rpsprpt_key)
+
+    @staticmethod
+    def _sort_by_trail_lrpsprpt(
+        waiting_queue: "List[Req]", preemption_threshold: float = 0.8
+    ) -> None:
+        """TRAIL LRPSPRPT: refined prediction SRPT + 80% limited preemption."""
+        def lrpsprpt_key(req):
+            if req.trail_state is None:
+                return (1, float("inf"))
+            ts = req.trail_state
+            generated_len = len(req.output_ids)
+            if ts.initial_predicted_len > 0 and generated_len > preemption_threshold * ts.initial_predicted_len:
+                return (0, 0)  # Un-preemptable
+            return (1, ts.current_predicted_remaining)
+        waiting_queue.sort(key=lrpsprpt_key)
+
+    @staticmethod
+    def trail_compare(
+        waiting_req, running_req, preemption_threshold: float = 0.8
+    ) -> int:
+        """Compare waiting vs running request for TRAIL preemption.
+        Returns > 0 if waiting should preempt running, <= 0 otherwise."""
+        # Running request is un-preemptable
+        if running_req.trail_state is not None:
+            ts = running_req.trail_state
+            generated_len = len(running_req.output_ids)
+            if ts.initial_predicted_len > 0 and generated_len > preemption_threshold * ts.initial_predicted_len:
+                return -1  # Cannot preempt
+
+        # Waiting request has no prediction
+        if waiting_req.trail_state is None:
+            # New request without prediction — allow preemption if running
+            # has clearly long remaining (> half max output len)
+            if running_req.trail_state is not None:
+                if running_req.trail_state.current_predicted_remaining > 256:
+                    return 1  # Let new request try
+            return -1
+
+        # Running request has no prediction — don't preempt (just started)
+        if running_req.trail_state is None:
+            return -1
+
+        waiting_remaining = waiting_req.trail_state.current_predicted_remaining
+        running_remaining = running_req.trail_state.current_predicted_remaining
+
+        # Positive = waiting has shorter remaining = should preempt
+        if running_remaining > waiting_remaining:
+            return 1
+        return -1
 
     @staticmethod
     def _sort_randomly(waiting_queue: List[Req]) -> None:

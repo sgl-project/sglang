@@ -555,6 +555,15 @@ class MultimodalInputs:
         # other args would be kept intact
 
 
+
+@dataclasses.dataclass
+class TrailState:
+    """TRAIL scheduling state for a request."""
+    initial_predicted_len: float = 0.0
+    current_predicted_remaining: float = 0.0
+    prediction_count: int = 0
+
+
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
@@ -691,6 +700,7 @@ class Req(ReqDllmMixin):
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
+        self.trail_state: Optional[TrailState] = None
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -1426,6 +1436,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Whether to return hidden states
     return_hidden_states: bool = False
+
+    # TRAIL: force hidden state capture for scheduling predictions
+    trail_capture_mode: bool = False
 
     # Whether to return captured experts
     return_routed_experts: bool = False
@@ -2429,11 +2442,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 CaptureHiddenMode.FULL
                 if self.return_hidden_states
                 else (
-                    getattr(
-                        self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+                    CaptureHiddenMode.LAST
+                    if self.trail_capture_mode
+                    else (
+                        getattr(
+                            self.spec_info, "capture_hidden_mode", CaptureHiddenMode.NULL
+                        )
+                        if self.spec_info
+                        else CaptureHiddenMode.NULL
                     )
-                    if self.spec_info
-                    else CaptureHiddenMode.NULL
                 )
             ),
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
@@ -2475,6 +2492,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_seqlens=self.mamba_track_seqlens,
             dp_cooperation_info=self.dp_cooperation_info,
             prefill_stats=self.prefill_stats,
+            trail_capture_mode=self.trail_capture_mode,
         )
 
     def maybe_evict_swa(self):

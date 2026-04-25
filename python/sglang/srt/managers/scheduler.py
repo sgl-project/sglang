@@ -350,6 +350,39 @@ class Scheduler(
         self.priority_scheduling_preemption_threshold = (
             server_args.priority_scheduling_preemption_threshold
         )
+
+        # TRAIL scheduling config
+        self.trail_collect_embeddings = server_args.trail_collect_embeddings
+        self.trail_classifier_path = server_args.trail_classifier_path
+        self.trail_capture_layer = server_args.trail_capture_layer
+        self.trail_embedding_save_dir = server_args.trail_embedding_save_dir
+        self.trail_num_bins = server_args.trail_num_bins
+        self.trail_max_output_len = server_args.trail_max_output_len
+        self.trail_preemption_threshold = server_args.trail_preemption_threshold
+        self.trail_active = self.trail_collect_embeddings or self.trail_classifier_path is not None
+        self._trail_preempted_this_step = False
+
+        # Load TRAIL classifier for online prediction
+        self.trail_classifier = None
+        self.trail_bin_edges = None
+        if self.trail_classifier_path is not None:
+            import torch as trail_torch
+            ckpt = trail_torch.load(self.trail_classifier_path, map_location='cpu', weights_only=False)
+            input_dim = ckpt['input_dim']
+            num_bins = ckpt['num_bins']
+            import numpy as np
+            self.trail_bin_edges = np.array(ckpt['bin_edges'])
+            self.trail_classifier = trail_torch.nn.Sequential(
+                trail_torch.nn.Linear(input_dim, 512),
+                trail_torch.nn.ReLU(),
+                trail_torch.nn.Linear(512, num_bins),
+            )
+            self.trail_classifier.load_state_dict(ckpt['model_state_dict'])
+            self.trail_classifier.eval()
+            self.trail_classifier.cuda()
+            logger.info(f'TRAIL: Loaded classifier from {self.trail_classifier_path} '
+                        f'(input_dim={input_dim}, num_bins={num_bins})')
+
         self.enable_lora = server_args.enable_lora
         self.enable_lora_overlap_loading = server_args.enable_lora_overlap_loading
         self.max_loras_per_batch = server_args.max_loras_per_batch
@@ -898,6 +931,7 @@ class Scheduler(
         self.waiting_queue: List[Req] = []
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        self.running_batch.trail_capture_mode = self.trail_active
         # The current forward batch
         self.cur_batch: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -957,6 +991,7 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            trail_preemption_threshold=self.trail_preemption_threshold,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.max_prefill_bs: int = 0
@@ -2347,6 +2382,9 @@ class Scheduler(
                 not self.running_batch.is_empty()
                 and not self.running_batch.is_prefill_only
             ):
+                # TRAIL: ensure decode batches have trail_capture_mode set
+                if self.trail_active:
+                    self.running_batch.trail_capture_mode = True
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
             else:
@@ -2387,6 +2425,102 @@ class Scheduler(
 
         return ret
 
+
+    def _trail_preempt_running(self):
+        """TRAIL two-pointer preemption: preempt running requests whose predicted
+        remaining is longer than waiting requests' predicted remaining.
+        Uses the same release pattern as SGLang's preempt_to_schedule."""
+        if not self.trail_active or self.trail_classifier is None:
+            return
+        if self._trail_preempted_this_step:
+            return  # Only preempt once per scheduling round
+        if self.running_batch is None or self.running_batch.is_empty():
+            return
+        if len(self.waiting_queue) == 0:
+            return
+
+        # Only preempt for policies that support it
+        if self.schedule_policy not in (
+            "trail-lrpsprpt", "trail-rpsprpt", "trail-sprpt", "trail-lsprpt"
+        ):
+            return
+
+        from sglang.srt.managers.schedule_policy import SchedulePolicy
+
+        threshold = self.trail_preemption_threshold
+        default_remaining = self.trail_max_output_len / 2.0
+
+        def trail_priority(req):
+            if req.trail_state is None:
+                if len(req.output_ids) == 0:
+                    return (1, default_remaining)
+                return (1, float("inf"))
+            ts = req.trail_state
+            generated_len = len(req.output_ids)
+            if ts.initial_predicted_len > 0 and generated_len > threshold * ts.initial_predicted_len:
+                return (0, 0)  # Un-preemptable
+            return (1, ts.current_predicted_remaining)
+
+        # Skip finished requests (same guard as preempt_to_schedule)
+        valid_running = [r for r in self.running_batch.reqs if not r.finished()]
+        waiting_reqs = list(self.waiting_queue)
+
+        sorted_waiting = sorted(waiting_reqs, key=trail_priority)
+        sorted_running = sorted(valid_running, key=trail_priority)
+
+        # Two-pointer: compare best waiting against worst running
+        to_preempt = []
+        w_idx = 0
+        r_idx = len(sorted_running) - 1
+
+        while w_idx < len(sorted_waiting) and r_idx >= 0:
+            waiting_req = sorted_waiting[w_idx]
+            running_req = sorted_running[r_idx]
+
+            r_pri = trail_priority(running_req)
+            if r_pri == (0, 0):
+                break  # Un-preemptable
+
+            cmp = SchedulePolicy.trail_compare(waiting_req, running_req, threshold)
+            if cmp > 0:
+                to_preempt.append(running_req)
+                w_idx += 1
+                r_idx -= 1
+            else:
+                break
+
+        # Cap preemption at half the running batch to avoid starvation
+        max_preempt = max(1, len(valid_running) // 2)
+        to_preempt = to_preempt[:max_preempt]
+
+        if not to_preempt:
+            return
+
+        # Execute preemptions using the same pattern as preempt_to_schedule
+        preempt_set = set(id(r) for r in to_preempt)
+        keep_indices = []
+        release_counter = 0
+        for i, running_req in enumerate(self.running_batch.reqs):
+            if id(running_req) in preempt_set:
+                release_counter += 1
+                self.running_batch.release_req(
+                    i, len(self.running_batch.reqs) - release_counter, self.server_args
+                )
+            else:
+                keep_indices.append(i)
+        self.running_batch.filter_batch(keep_indices=keep_indices)
+
+        # Re-queue preempted requests
+        for req in to_preempt:
+            self._add_request_to_queue(req, is_retracted=True)
+
+        self._trail_preempted_this_step = True
+        self.num_retracted_reqs += len(to_preempt)
+        logger.info(
+            f"TRAIL: Preempted {len(to_preempt)} running requests "
+            f"(running={len(keep_indices)}, waiting={len(self.waiting_queue)})"
+        )
+
     def _get_new_batch_prefill_raw(
         self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
     ) -> Optional[ScheduleBatch]:
@@ -2398,6 +2532,9 @@ class Scheduler(
 
         if self.enable_hierarchical_cache:
             self.tree_cache.check_hicache_events()
+
+        # TRAIL: two-pointer preemption before scheduling
+        self._trail_preempt_running()
 
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
@@ -2583,6 +2720,10 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
+        # TRAIL: enable embedding capture on prefill batches for initial prediction
+        if self.trail_active:
+            new_batch.trail_capture_mode = True
+
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
             adder,
@@ -2614,6 +2755,7 @@ class Scheduler(
             self.running_batch = ScheduleBatch(
                 reqs=[], batch_is_full=self.running_batch.batch_is_full
             )
+            self.running_batch.trail_capture_mode = self.trail_active
         else:
             new_batch.decoding_reqs = None
 
