@@ -1404,9 +1404,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("enable_thinking") is True
             )
-        if self.reasoning_parser in ["mistral"]:
-            # Mistral models only reason when reasoning_effort is explicitly
-            # set to a value other than None/"none" (typically "high").
+        if self.reasoning_parser == "hunyuan":
+            # Hy3-preview template emits no <think> when reasoning_effort is
+            # "no_think" / "none" / unset; forcing reasoning would route all
+            # output into reasoning_content.
+            return request.reasoning_effort not in (None, "none", "no_think")
+        if self.reasoning_parser == "mistral":
+            # Mistral only reasons when reasoning_effort is explicitly set
+            # to a non-"none" value (typically "high").
             return (
                 request.reasoning_effort is not None
                 and request.reasoning_effort != "none"
