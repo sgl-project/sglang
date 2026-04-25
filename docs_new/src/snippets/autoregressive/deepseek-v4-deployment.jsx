@@ -500,11 +500,13 @@ export const DeepSeekV4Deployment = () => {
         // weights at tp=4 take ~224 GB/card on a 273 GB GB300; runtime needs
         // headroom for DeepEP buffer + mooncake KV recv + CG private pool.
         // Cookbook defaults (mem-frac 0.874, cg_max_bs 512, max-running 256)
-        // OOM during CG capture. Verified working on 2026-04-25 (journal
-        // 2026-04-25-001 Cell D, Δ10).
+        // OOM during CG capture. mem-frac sweep at 0.83 / 0.87 / 0.89 / 0.91
+        // all pass static smoke; 0.9 picked as the default — leaves
+        // ~14 GB / GPU post-CG headroom for mooncake transfer + activation
+        // peaks while giving ~1M-token KV pool.
         if (isGB300 && modelSize === "big") {
           flags.push("  --max-running-requests 128");
-          flags.push("  --mem-fraction-static 0.83");
+          flags.push("  --mem-fraction-static 0.9");
           flags.push("  --cuda-graph-max-bs 128");
         } else {
           flags.push("  --max-running-requests 256");
