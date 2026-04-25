@@ -100,6 +100,52 @@ class TestDPAttentionMixedChunk(
         kill_process_tree(cls.process.pid)
 
 
+class TestDPAttentionDP2TP2MixedComm(
+    CustomTestCase,
+    GSM8KMixin,
+    JSONConstrainedMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
+):
+    gsm8k_accuracy_thres = 0.6
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import flashinfer.comm.mixed_comm  # noqa: F401
+        except ImportError as e:
+            raise unittest.SkipTest(f"flashinfer.comm.mixed_comm unavailable: {e}")
+
+        cls.model = DEFAULT_MODEL_NAME_FOR_TEST_MLA
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls._env_override = envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(
+            True
+        )
+        cls._env_override.__enter__()
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "2",
+                "--enable-dp-attention",
+                "--dp",
+                "2",
+                "--enable-torch-compile",
+                "--torch-compile-max-bs",
+                "2",
+            ],
+            env={"SGLANG_USE_MIXED_COMM": "1"},
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+        cls._env_override.__exit__(None, None, None)
+
+
 class TestDPRetract(
     CustomTestCase,
     JSONConstrainedMixin,

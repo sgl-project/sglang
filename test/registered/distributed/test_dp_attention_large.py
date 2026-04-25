@@ -72,6 +72,56 @@ class TestDPAttentionDP2TP4(
 
 @unittest.skipIf(
     is_in_amd_ci(),
+    "MixedComm path is CUDA-only (flashinfer.comm.mixed_comm)",
+)
+class TestDPAttentionDP2TP4MixedComm(
+    CustomTestCase,
+    JSONConstrainedMixin,
+    EBNFConstrainedMixin,
+    RegexConstrainedMixin,
+):
+    @classmethod
+    def setUpClass(cls):
+        try:
+            import flashinfer.comm.mixed_comm  # noqa: F401
+        except ImportError as e:
+            raise unittest.SkipTest(f"flashinfer.comm.mixed_comm unavailable: {e}")
+
+        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp=4",
+                "--enable-dp-attention",
+                "--dp=2",
+            ],
+            env={"SGLANG_USE_MIXED_COMM": "1"},
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            num_examples=None,
+            num_threads=1024,
+        )
+
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], 0.8)
+
+
+@unittest.skipIf(
+    is_in_amd_ci(),
     "DeepSeek MTP forward_mla NameError on AMD + needs 8 GPUs",
 )
 class TestDPAttentionDP2TP2DeepseekV3MTP(

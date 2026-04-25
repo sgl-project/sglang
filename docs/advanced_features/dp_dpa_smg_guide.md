@@ -117,6 +117,31 @@ python -m sglang.launch_server \
 
 Note that MLA models, of course, also support DP. Suppose you want to enable standard DP for MLA models. First, launch each MLA model's replica independently. You may launch these replicas one by one with DPA enabled. After launching each MLA model's replica, launch an SMG and connect all the replicas to the SMG. A detailed explanation of SMG is as follows.
 
+### Fused communication via FlashInfer MixedComm
+
+When DPA is combined with attention tensor parallelism, each layer issues two communication kernels (reducescatter + allgather) both after attention and FFN. SGLang can use MixedComm kernels from [FlashInfer](https://github.com/flashinfer-ai/flashinfer) to fuse two communication kernels into a single kernel.
+
+The communication handler is constructed once per process during initialization (outside CUDA-graph capture). The performance of some predefined communication sizes is also tested during initialization to enable autotuning.
+
+Requirements for MixedComm to be enabled:
+- `--enable-dp-attention` is set and `--dp-size > 1`.
+- GPUs are SM90 (e.g., H200) or SM100 (e.g., B200)**.
+- An NVSwitch / NVLink-Switch fabric is present on each node.
+- Attention TP size and the number of GPUs per node are divisors of one another.
+- The installed version of FlashInfer contains `flashinfer.comm.mixed_comm`.
+
+To enable MixedComm, the environment variable `SGLANG_USE_MIXED_COMM` needs to be set to `1` or `true` before launching the server. It is **off by default**.
+
+```bash
+export SGLANG_USE_MIXED_COMM=1
+python -m sglang.launch_server \
+    --model-path deepseek-ai/DeepSeek-V3 \
+    --tp 8 \
+    --dp-size 2 \
+    --enable-dp-attention \
+    ...
+```
+
 ## Modern Data Parallelism SGLang Model Gateway (SMG)
 
 ### Native DP Mode
