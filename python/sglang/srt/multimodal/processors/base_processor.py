@@ -446,9 +446,7 @@ class BaseMultimodalProcessor(ABC):
 
                 npu_apply_qwen_image_preprocess_patch()
 
-                if processor.__class__.__name__ in {
-                    "Glm46VProcessor",
-                }:
+                if processor.__class__.__name__ == "Glm46VProcessor":
                     from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
                         npu_apply_glm46v_image_preprocess_patch,
                     )
