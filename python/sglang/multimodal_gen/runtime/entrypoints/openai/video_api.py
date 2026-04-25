@@ -44,6 +44,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.observability.trace import extract_trace_headers
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/v1/videos", tags=["videos"])
@@ -108,7 +109,11 @@ def _video_job_from_sampling(
 
 
 async def _save_first_input_image(
-    image_sources, request_id: str, uploads_dir: str
+    image_sources,
+    request_id: str,
+    uploads_dir: str,
+    *,
+    prefer_remote_source: bool = False,
 ) -> str | None:
     """Save the first input image from a list of sources and return its path."""
     image_list = merge_image_input_list(image_sources)
@@ -120,7 +125,9 @@ async def _save_first_input_image(
 
     filename = image.filename if hasattr(image, "filename") else "url_image"
     target_path = os.path.join(uploads_dir, f"{request_id}_{filename}")
-    return await save_image_to_path(image, target_path)
+    return await save_image_to_path(
+        image, target_path, prefer_remote_source=prefer_remote_source
+    )
 
 
 async def _dispatch_job_async(
@@ -228,7 +235,10 @@ async def create_video(
             )
         try:
             input_path = await _save_first_input_image(
-                image_sources, request_id, uploads_dir
+                image_sources,
+                request_id,
+                uploads_dir,
+                prefer_remote_source=server_args.input_save_path is None,
             )
         except Exception as e:
             raise HTTPException(
@@ -303,7 +313,10 @@ async def create_video(
             if payload.get("reference_url"):
                 try:
                     input_path = await _save_first_input_image(
-                        payload.get("reference_url"), request_id, uploads_dir
+                        payload.get("reference_url"),
+                        request_id,
+                        uploads_dir,
+                        prefer_remote_source=server_args.input_save_path is None,
                     )
                 except Exception as e:
                     raise HTTPException(
@@ -337,9 +350,11 @@ async def create_video(
     await VIDEO_STORE.upsert(request_id, job)
 
     # Build Req for scheduler
+    trace_headers = extract_trace_headers(request.headers)
     batch = prepare_request(
         server_args=server_args,
         sampling_params=sampling_params,
+        external_trace_header=trace_headers,
     )
     # Add diffusers_kwargs if provided
     if req.diffusers_kwargs:

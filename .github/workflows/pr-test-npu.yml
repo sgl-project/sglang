@@ -63,7 +63,7 @@ jobs:
               - "test/srt/ascend/**"
               - ".github/workflows/pr-test-npu.yml"
             multimodal_gen:
-              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
+              - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/srt/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
@@ -102,6 +102,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -154,6 +156,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -202,6 +206,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -251,6 +257,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -297,6 +305,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -344,6 +354,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -391,6 +403,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
