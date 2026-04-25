@@ -441,6 +441,37 @@ def render_message(
 # ============================================================
 
 
+def _user_message_content_to_str(
+    content: Optional[Union[str, List[Any]]],
+) -> str:
+    """
+    Normalize OpenAI user `content` to a string.
+
+    ``content`` is ``str``, a list of content parts, or ``None`` (as in
+    :func:`dict.get`); see ``ChatCompletionMessageUserParam`` in the OpenAI
+    protocol. The V4 text block only stores a ``str``.
+
+    A non-``str`` / non-``list`` value is coerced with :func:`str` for
+    robustness.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        text_parts: List[str] = []
+        for b in content:
+            if not isinstance(b, dict):
+                text_parts.append(str(b))
+                continue
+            if b.get("type") == "text":
+                text_parts.append(b.get("text", ""))
+            else:
+                text_parts.append(f"[Unsupported {b.get('type')}]")
+        return "\n\n".join(text_parts)
+    return str(content)
+
+
 def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Merge tool messages into the preceding user message using content_blocks format.
@@ -486,7 +517,8 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                     }
                 )
         elif role == "user":
-            text_block = {"type": "text", "text": msg.get("content", "")}
+            content_str = _user_message_content_to_str(msg.get("content"))
+            text_block = {"type": "text", "text": content_str}
             if (
                 merged
                 and merged[-1].get("role") == "user"
@@ -497,7 +529,7 @@ def merge_tool_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             else:
                 new_msg = {
                     "role": "user",
-                    "content": msg.get("content", ""),
+                    "content": content_str,
                     "content_blocks": [text_block],
                 }
                 # Preserve extra fields (task, wo_eos, mask, etc.)
