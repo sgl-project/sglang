@@ -1625,10 +1625,21 @@ class DeepseekV4ForCausalLM(nn.Module):
             envs.SGLANG_DSV4_MODE.get() == "2604"
             and not envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
         ):
-            if envs.SGLANG_DSV4_FP4_EXPERTS.get():
-                weights = _dequant_fp8_wo_a(weights)
+            if envs.SGLANG_FIX_DSV4_BASE_MODEL_LOAD.get():
+                weights = list(weights)
+                exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
+                if exists_wo_a_scale:
+                    logger.info("Execute dequant fp8 wo_a")
+                    weights = _dequant_fp8_wo_a(weights)
+                else:
+                    logger.info("Skip dequant fp8 wo_a")
             else:
-                weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
+                # ----------------------------- legacy code ------------------------------
+                if envs.SGLANG_DSV4_FP4_EXPERTS.get():
+                    weights = _dequant_fp8_wo_a(weights)
+                else:
+                    weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
+                # ------------------------------------------------------------------------
 
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -1955,9 +1966,10 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     assert (
         weight.dtype == torch.float8_e4m3fn
     ), f"expected fp8_e4m3fn, got {weight.dtype}"
-    assert (
-        scale.dtype == torch.float8_e8m0fnu
-    ), f"expected fp8_e8m0fnu, got {scale.dtype}"
+    assert scale.dtype in (
+        torch.float8_e8m0fnu,
+        torch.float32,
+    ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
     if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get() and not is_large_dummy_model():
         assert weight.shape == (8192, 4096), f"unexpected weight shape {weight.shape}"
         assert scale.shape == (64, 32), f"unexpected scale shape {scale.shape}"

@@ -20,3 +20,6 @@ RUN pip install -e /workspace/sglang/python/
 
 # Install TileLang for arm
 RUN pip install https://github.com/tile-ai/tilelang/releases/download/v0.1.8/tilelang-0.1.8-cp38-abi3-manylinux_2_34_aarch64.whl
+
+# Install hadamard transform
+RUN pip install --no-build-isolation git+https://github.com/Dao-AILab/fast-hadamard-transform.git

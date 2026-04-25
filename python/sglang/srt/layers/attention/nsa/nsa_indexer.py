@@ -10,11 +10,19 @@ from einops import rearrange
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    ceil_align,
+    get_device_sm,
+    is_cuda,
+    is_hip,
+    is_npu,
+)
 
 global _use_multi_stream
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_sm103 = _is_cuda and get_device_sm() == 103
 _is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
 if _is_cuda:
@@ -116,7 +124,7 @@ class BaseIndexerMetadata(ABC):
 
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
-    if _is_hip:
+    if _is_hip or _is_sm103:
         from fast_hadamard_transform import hadamard_transform
     else:
         from sgl_kernel import hadamard_transform
