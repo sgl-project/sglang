@@ -9,11 +9,14 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import dispatch_branches
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    cfg_model_parallel_all_gather,
     cfg_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_classifier_free_guidance_rank,
+    get_classifier_free_guidance_world_size,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
@@ -182,6 +185,124 @@ class LTX2DenoisingStage(DenoisingStage):
             cfg_model_parallel_all_reduce(video_partial),
             cfg_model_parallel_all_reduce(audio_partial),
         )
+
+    def _run_legacy_one_stage_multi_branch_cfg_parallel(
+        self,
+        *,
+        base_model_kwargs: dict[str, object],
+        ctx: "LTX2DenoisingContext",
+        step: "DenoisingStepState",
+        encoder_hidden_states: torch.Tensor,
+        audio_encoder_hidden_states: torch.Tensor,
+        encoder_attention_mask: torch.Tensor | None,
+        negative_encoder_hidden_states: torch.Tensor,
+        negative_audio_encoder_hidden_states: torch.Tensor,
+        negative_encoder_attention_mask: torch.Tensor | None,
+        need_perturbed: bool,
+        need_modality: bool,
+        stage1_guider_params: dict[str, object],
+    ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+        """Multi-branch CFG parallel for the legacy LTX-2.3 one-stage path.
+
+        Distributes up to 4 forward passes (cond, neg, perturbed, modality)
+        across CFG ranks via round-robin.  Each rank runs only its assigned
+        passes, then an all-gather collects every output so all ranks can
+        compute the guidance combination locally.
+        """
+        cfg_rank = get_classifier_free_guidance_rank()
+        cfg_world_size = get_classifier_free_guidance_world_size()
+
+        # Build kwargs for every pass in canonical order.
+        all_passes: list[tuple[str, dict[str, object]]] = [
+            (
+                "cond",
+                self._build_ltx2_model_kwargs(
+                    ctx,
+                    base_model_kwargs,
+                    encoder_hidden_states=encoder_hidden_states,
+                    audio_encoder_hidden_states=audio_encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                ),
+            ),
+            (
+                "neg",
+                self._build_ltx2_model_kwargs(
+                    ctx,
+                    base_model_kwargs,
+                    encoder_hidden_states=negative_encoder_hidden_states,
+                    audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
+                    encoder_attention_mask=negative_encoder_attention_mask,
+                ),
+            ),
+        ]
+        if need_perturbed:
+            all_passes.append((
+                "perturbed",
+                self._build_ltx2_model_kwargs(
+                    ctx,
+                    base_model_kwargs,
+                    encoder_hidden_states=encoder_hidden_states,
+                    audio_encoder_hidden_states=audio_encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    skip_video_self_attn_blocks=tuple(stage1_guider_params["video_stg_blocks"]),
+                    skip_audio_self_attn_blocks=tuple(stage1_guider_params["audio_stg_blocks"]),
+                ),
+            ))
+        if need_modality:
+            all_passes.append((
+                "modality",
+                self._build_ltx2_model_kwargs(
+                    ctx,
+                    base_model_kwargs,
+                    encoder_hidden_states=encoder_hidden_states,
+                    audio_encoder_hidden_states=audio_encoder_hidden_states,
+                    encoder_attention_mask=encoder_attention_mask,
+                    disable_a2v_cross_attn=True,
+                    disable_v2a_cross_attn=True,
+                ),
+            ))
+
+        pass_names = [name for name, _ in all_passes]
+        n_passes = len(pass_names)
+        assignments = dispatch_branches(n_passes, cfg_world_size)
+        my_indices = assignments[cfg_rank]
+        max_local = max(len(a) for a in assignments)
+
+        local_videos: list[torch.Tensor] = []
+        local_audios: list[torch.Tensor] = []
+
+        with set_forward_context(current_timestep=step.step_index, attn_metadata=step.attn_metadata):
+            for idx in my_indices:
+                _, kwargs = all_passes[idx]
+                v, a = step.current_model(**kwargs)
+                local_videos.append(v.float())
+                local_audios.append(a.float())
+
+        # Pad to max_local for unbalanced cases (n_passes not divisible by n_ranks).
+        while len(local_videos) < max_local:
+            local_videos.append(torch.zeros_like(local_videos[0]))
+            local_audios.append(torch.zeros_like(local_audios[0]))
+
+        # Stack → [max_local, B, ...], flatten to [max_local*B, ...] for all-gather.
+        local_v = torch.stack(local_videos, dim=0)
+        local_a = torch.stack(local_audios, dim=0)
+        B = local_v.shape[1]
+        local_v_flat = local_v.reshape(max_local * B, *local_v.shape[2:])
+        local_a_flat = local_a.reshape(max_local * B, *local_a.shape[2:])
+
+        # All-gather along batch dim → [cfg_world_size * max_local * B, ...].
+        all_v_flat = cfg_model_parallel_all_gather(local_v_flat, dim=0)
+        all_a_flat = cfg_model_parallel_all_gather(local_a_flat, dim=0)
+
+        # Reshape to [cfg_world_size, max_local, B, ...].
+        all_v = all_v_flat.reshape(cfg_world_size, max_local, B, *all_v_flat.shape[1:])
+        all_a = all_a_flat.reshape(cfg_world_size, max_local, B, *all_a_flat.shape[1:])
+
+        # Branch i was run by rank (i % cfg_world_size) at slot (i // cfg_world_size).
+        return {
+            name: (all_v[i % cfg_world_size, i // cfg_world_size], all_a[i % cfg_world_size, i // cfg_world_size])
+            for i, name in enumerate(pass_names)
+        }
 
     @staticmethod
     def _get_video_latent_num_frames_for_model(
