@@ -34,7 +34,7 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 
 if _is_cuda or _is_musa:
-    from sgl_kernel import gelu_and_mul, moe_align_block_size, moe_sum, silu_and_mul
+    from sgl_kernel import gelu_and_mul, moe_align_block_size, silu_and_mul
     from sgl_kernel.quantization import (
         ggml_dequantize,
         ggml_moe_a8,
@@ -43,6 +43,8 @@ if _is_cuda or _is_musa:
         ggml_mul_mat_a8,
         ggml_mul_mat_vec_a8,
     )
+
+    from sglang.jit_kernel.moe_sum import moe_sum
 else:
     if not _is_hip:
         warnings.warn(f"Only CUDA and MUSA support GGUF quantization currently.")
