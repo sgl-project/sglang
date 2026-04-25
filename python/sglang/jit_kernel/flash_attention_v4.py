@@ -33,6 +33,10 @@ def flash_attn_varlen_func(
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
+    qv: Optional[torch.Tensor] = None,
+    q_descale: Optional[torch.Tensor] = None,
+    k_descale: Optional[torch.Tensor] = None,
+    v_descale: Optional[torch.Tensor] = None,
     softcap: Optional[float] = None,
     window_size: Tuple[Optional[int], Optional[int]] = (-1, -1),
     learnable_sink: Optional[torch.Tensor] = None,
@@ -62,10 +66,20 @@ def flash_attn_varlen_func(
     if window_size == (-1, -1):
         window_size = (None, None)
 
+    if qv is not None:
+        qv = _maybe_contiguous(qv)
+
+    # NOTE: The FA4 CUTE public API (flash_attn_varlen_func) does not expose
+    # q_descale/k_descale/v_descale — those are only accepted by the internal
+    # _flash_attn_fwd.  For FP8 inputs, the kernel defaults to identity (1.0)
+    # descale which is correct for MLA's direct-cast quantization.
+    # Additionally, qv (MLA absorption) and descale are mutually exclusive
+    # in the upstream kernel.
     result = _flash_attn_varlen_func(
         q=q,
         k=k,
         v=v,
+        qv=qv,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         seqused_q=seqused_q,
@@ -129,7 +143,7 @@ def flash_attn_with_kvcache(
     return_softmax_lse: bool = False,
     **_: object,
 ):
-    if k is not None or v is not None or qv is not None:
+    if k is not None or v is not None:
         raise NotImplementedError("FA4 does not support updating KV cache in-place.")
     if rotary_cos is not None or rotary_sin is not None or rotary_seqlens is not None:
         raise NotImplementedError("FA4 path does not support rotary embedding.")
@@ -137,8 +151,6 @@ def flash_attn_with_kvcache(
         raise NotImplementedError(
             "FA4 path does not support non-consecutive batch indices or left padding."
         )
-    if q_descale is not None or k_descale is not None or v_descale is not None:
-        raise NotImplementedError("FA4 path does not support descale.")
 
     if isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
@@ -155,6 +167,7 @@ def flash_attn_with_kvcache(
         page_table=page_table,
         softmax_scale=softmax_scale,
         causal=causal,
+        qv=qv,
         softcap=softcap if softcap != 0.0 else None,
         window_size=window_size,
         num_splits=num_splits if num_splits != 0 else 1,
