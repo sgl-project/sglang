@@ -28,6 +28,7 @@ def apply_rotary_embedding_native(
         and x.dim() == 3
         and x.shape[1] < NPU_ROTARY_MUL_MAX_NUM_HEADS
         and x.shape[2] < NPU_ROTARY_MUL_MAX_HEAD_SIZE
+        and not interleaved
     ):
         if cos.size(-1) * 2 == x.size(-1):
             cos = torch.cat([cos, cos], dim=-1)

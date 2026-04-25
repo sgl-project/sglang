@@ -2351,20 +2351,20 @@ vllm_get_world_group = None
 
 def monkey_patch_vllm_parallel_state(reverse: bool = False):
     try:
-        import vllm.distributed.parallel_state as vllm_parrlel_state
+        import vllm.distributed.parallel_state as vllm_parallel_state
     except ImportError:
         return
 
     global vllm_get_pp_group, vllm_get_tp_group, vllm_get_world_group
     if vllm_get_pp_group is None:
-        vllm_get_pp_group = vllm_parrlel_state.get_pp_group
-        vllm_get_tp_group = vllm_parrlel_state.get_tp_group
-        vllm_get_world_group = vllm_parrlel_state.get_world_group
+        vllm_get_pp_group = vllm_parallel_state.get_pp_group
+        vllm_get_tp_group = vllm_parallel_state.get_tp_group
+        vllm_get_world_group = vllm_parallel_state.get_world_group
     if reverse:
-        setattr(vllm_parrlel_state, "get_pp_group", vllm_get_pp_group)
-        setattr(vllm_parrlel_state, "get_tp_group", vllm_get_tp_group)
-        setattr(vllm_parrlel_state, "get_world_group", vllm_get_world_group)
+        setattr(vllm_parallel_state, "get_pp_group", vllm_get_pp_group)
+        setattr(vllm_parallel_state, "get_tp_group", vllm_get_tp_group)
+        setattr(vllm_parallel_state, "get_world_group", vllm_get_world_group)
     else:
-        setattr(vllm_parrlel_state, "get_pp_group", get_pp_group)
-        setattr(vllm_parrlel_state, "get_tp_group", get_tp_group)
-        setattr(vllm_parrlel_state, "get_world_group", get_world_group)
+        setattr(vllm_parallel_state, "get_pp_group", get_pp_group)
+        setattr(vllm_parallel_state, "get_tp_group", get_tp_group)
+        setattr(vllm_parallel_state, "get_world_group", get_world_group)

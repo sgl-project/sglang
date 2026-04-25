@@ -178,8 +178,7 @@ export const DeepSeekV4Deployment = () => {
     "gb300|small|max-throughput",
     "h200|small|cp",
     "h200|small|pd-disagg",
-    // h200|big|pd-disagg: pending verification (needs 4-node H200 cluster with
-    //   shared IB fabric: 2-node prefill + 2-node decode).
+    "h200|big|pd-disagg",
     "gb300|small|cp",
     "gb300|big|cp",
     "gb300|small|pd-disagg",
@@ -480,6 +479,12 @@ export const DeepSeekV4Deployment = () => {
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
           : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       }
+      // H200 Pro PD: tp=16 multinode + DeepEP needs the dispatch buffer cap on
+      // BOTH prefill + decode (matches production playground LWS for the same
+      // hw/model combo). Verified on 2026-04-25 (journal 2026-04-25-014).
+      if (hardware === "h200" && modelSize === "big") {
+        roleEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128");
+      }
       const envAll = [...HW_ENV, ...roleEnv, ...MNNVL_ENV, ...COMMON_ENV];
       const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
 
@@ -490,21 +495,45 @@ export const DeepSeekV4Deployment = () => {
       flags.push(`  --dp ${pdTp}`);
       flags.push("  --enable-dp-attention");
       if (multinode) flags.push(...multiNodeFlags(nnodes));
-      if (isBlackwell) flags.push("  --moe-a2a-backend deepep");
+      // H200 Pro PD also needs deepep: at tp=16 the FP8 block_n=128 doesn't
+      // divide moe intermediate_size_per_partition (3072 / 16 = 192) so MoE
+      // experts must be kept on a single rank rather than TP-sharded. Verified
+      // on 2026-04-25 (journal 2026-04-25-014, candidate cookbook Bug L).
+      if (isBlackwell || (hardware === "h200" && modelSize === "big")) {
+        flags.push("  --moe-a2a-backend deepep");
+      }
       flags.push(`  --disaggregation-mode ${mode}`);
       flags.push("  --disaggregation-transfer-backend mooncake");
       if (ibDevice) flags.push(`  --disaggregation-ib-device ${ibDevice}`);
-      if (!isGB300) flags.push(`  --dist-init-addr 127.0.0.1:${distPort}`);
+      // Same-host PD bootstrap addr; for multinode PD (h200 big tp=16 across 2
+      // nodes) skip this — argparse would override the multinode dist-init-addr
+      // already emitted by multiNodeFlags above. Verified 2026-04-25 (journal
+      // 2026-04-25-014). sglang falls back to its own bootstrap port (default
+      // 8998) which works for cross-node mooncake handshake.
+      if (!isGB300 && !multinode) flags.push(`  --dist-init-addr 127.0.0.1:${distPort}`);
+      // H200 Pro PD memory-budget: cookbook defaults give available_gpu_memory
+      // ~17.93 GB after weights but reserve target = (1 - mem_fraction_static)
+      // × 138 GB = 87 GB → "Not enough memory" at memory profile. mem-frac 0.90
+      // and cg-max-bs 128 verified on 2026-04-25 (journal 2026-04-25-014). 128
+      // matches gb300|big|pd decode and gives larger decode batching headroom;
+      // CG capture takes ~1 hr (one-time, vs ~5 min for cg=64) but runtime
+      // throughput is better.
+      if (hardware === "h200" && modelSize === "big") {
+        flags.push("  --cuda-graph-max-bs 128");
+        flags.push("  --mem-fraction-static 0.9");
+      }
       if (mode === "decode") {
         // GB300 big PD decode is the most memory-pressured PD role: Pro 1.6T
         // weights at tp=4 take ~224 GB/card on a 273 GB GB300; runtime needs
         // headroom for DeepEP buffer + mooncake KV recv + CG private pool.
         // Cookbook defaults (mem-frac 0.874, cg_max_bs 512, max-running 256)
-        // OOM during CG capture. Verified working on 2026-04-25 (journal
-        // 2026-04-25-001 Cell D, Δ10).
+        // OOM during CG capture. mem-frac sweep at 0.83 / 0.87 / 0.89 / 0.91
+        // all pass static smoke; 0.9 picked as the default — leaves
+        // ~14 GB / GPU post-CG headroom for mooncake transfer + activation
+        // peaks while giving ~1M-token KV pool.
         if (isGB300 && modelSize === "big") {
           flags.push("  --max-running-requests 128");
-          flags.push("  --mem-fraction-static 0.83");
+          flags.push("  --mem-fraction-static 0.9");
           flags.push("  --cuda-graph-max-bs 128");
         } else {
           flags.push("  --max-running-requests 256");
