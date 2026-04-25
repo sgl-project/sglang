@@ -17,6 +17,46 @@
       "destination": "/cookbook/intro"
     },
     {
+      "source": "/whl",
+      "destination": "https://sgl-project.github.io/whl/",
+      "permanent": false
+    },
+    {
+      "source": "/whl/:path*",
+      "destination": "https://sgl-project.github.io/whl/:path*",
+      "permanent": false
+    },
+    {
+      "source": "/sglang-omni",
+      "destination": "https://sgl-project.github.io/sglang-omni/",
+      "permanent": false
+    },
+    {
+      "source": "/sglang-omni/:path*",
+      "destination": "https://sgl-project.github.io/sglang-omni/:path*",
+      "permanent": false
+    },
+    {
+      "source": "/SpecForge",
+      "destination": "https://sgl-project.github.io/SpecForge/",
+      "permanent": false
+    },
+    {
+      "source": "/SpecForge/:path*",
+      "destination": "https://sgl-project.github.io/SpecForge/:path*",
+      "permanent": false
+    },
+    {
+      "source": "/specforge",
+      "destination": "https://sgl-project.github.io/SpecForge/",
+      "permanent": false
+    },
+    {
+      "source": "/specforge/:path*",
+      "destination": "https://sgl-project.github.io/SpecForge/:path*",
+      "permanent": false
+    },
+    {
       "source": "/index.html",
       "destination": "/"
     },
@@ -900,6 +940,7 @@
                   {
                     "group": "DeepSeek",
                     "pages": [
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V4",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_2",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_1",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3",
@@ -920,16 +961,16 @@
                   {
                     "group": "GLM",
                     "pages": [
-                      "cookbook/autoregressive/GLM/GLM-4.5",
-                      "cookbook/autoregressive/GLM/GLM-4.6",
+                      "cookbook/autoregressive/GLM/GLM-5.1",
+                      "cookbook/autoregressive/GLM/GLM-5",
+                      "cookbook/autoregressive/GLM/GLM-OCR",
+                      "cookbook/autoregressive/GLM/GLM-Glyph",
                       "cookbook/autoregressive/GLM/GLM-4.7",
                       "cookbook/autoregressive/GLM/GLM-4.7-Flash",
-                      "cookbook/autoregressive/GLM/GLM-5",
-                      "cookbook/autoregressive/GLM/GLM-5.1",
-                      "cookbook/autoregressive/GLM/GLM-Glyph",
-                      "cookbook/autoregressive/GLM/GLM-OCR",
-                      "cookbook/autoregressive/GLM/GLM-4.5V",
-                      "cookbook/autoregressive/GLM/GLM-4.6V"
+                      "cookbook/autoregressive/GLM/GLM-4.6",
+                      "cookbook/autoregressive/GLM/GLM-4.6V",
+                      "cookbook/autoregressive/GLM/GLM-4.5",
+                      "cookbook/autoregressive/GLM/GLM-4.5V"
                     ]
                   },
                   {
@@ -1027,6 +1068,12 @@
                     "pages": [
                       "cookbook/autoregressive/FlashLabs/Chroma1.0"
                     ]
+                  },
+                  {
+                    "group": "Tencent",
+                    "pages": [
+                      "cookbook/autoregressive/Tencent/Hunyuan3-Preview"
+                    ]
                   }
                 ]
               },
@@ -1045,6 +1092,12 @@
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
                       "cookbook/diffusion/Wan/Wan2.2"
+                    ]
+                  },
+                  {
+                    "group": "LTX",
+                    "pages": [
+                      "cookbook/diffusion/LTX/LTX"
                     ]
                   },
                   {
@@ -1128,7 +1181,6 @@
                 "group": "References",
                 "pages": [
                   "docs/sglang-diffusion/environment_variables",
-                  "docs/sglang-diffusion/compatibility_matrix",
                   "docs/sglang-diffusion/support_new_models",
                   "docs/sglang-diffusion/contributing"
                 ]
