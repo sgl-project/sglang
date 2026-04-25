@@ -1058,9 +1058,6 @@ std::tuple<at::Tensor, at::Tensor> chunk_gated_delta_rule_cpu(
     bool head_first,
     bool use_qk_l2norm_in_kernel,
     double eps = 1e-5) {
-  RECORD_FUNCTION(
-      "sgl-kernel::chunk_gated_delta_rule_cpu", std::vector<c10::IValue>({query, key, value, g, beta, initial_state}));
-
   TORCH_CHECK(head_first == false, "chunk_gated_delta_rule_cpu does not support head first");
   int64_t B = query.size(0);
   int64_t global_seq_len = query.size(1);
@@ -1234,10 +1231,6 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     bool use_qk_l2norm_in_kernel,
     double softplus_beta = 1.0,
     double softplus_threshold = 20.0) {
-  RECORD_FUNCTION(
-      "sgl-kernel::fused_sigmoid_gating_delta_rule_update_cpu",
-      std::vector<c10::IValue>(
-          {A_log, dt_bias, q, k, v, a, b, initial_state_source, initial_state_indices, cu_seqlens}));
   CHECK_DIM(4, q);
   CHECK_DIM(4, v);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
@@ -1312,7 +1305,6 @@ at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
 // -A_log.float().exp() * F.softplus(a.float() + dt_bias)
 std::tuple<at::Tensor, at::Tensor>
 fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Tensor& b, const at::Tensor& dt_bias) {
-  RECORD_FUNCTION("sgl-kernel::fused_gdn_gating_cpu", std::vector<c10::IValue>({A_log, a, b, dt_bias}));
   CHECK_DIM(1, A_log);
   CHECK_DIM(2, a);
   CHECK_DIM(2, b);

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import gc
 import inspect
@@ -110,6 +111,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    RoutedExpertsOutput,
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
@@ -122,6 +124,9 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.breakable_cuda_graph_runner import (
+    BreakableCudaGraphRunner,
+)
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
@@ -287,6 +292,7 @@ class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+    routed_experts_output: Optional[RoutedExpertsOutput] = None
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
@@ -2390,10 +2396,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         draft_token=None,
                         custom_mask=buffers.custom_mask,
                         positions=None,
-                        retrive_index=None,
-                        retrive_next_token=None,
-                        retrive_next_sibling=None,
-                        retrive_cum_len=None,
+                        retrieve_index=None,
+                        retrieve_next_token=None,
+                        retrieve_next_sibling=None,
+                        retrieve_cum_len=None,
                         spec_steps=self.server_args.speculative_num_steps,
                         topk=self.server_args.speculative_eagle_topk,
                         draft_token_num=self.server_args.speculative_num_draft_tokens,
@@ -2424,9 +2430,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     draft_token=None,
                     tree_mask=buffers.custom_mask,
                     positions=None,
-                    retrive_index=None,
-                    retrive_next_token=None,
-                    retrive_next_sibling=None,
+                    retrieve_index=None,
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
                     draft_token_num=num_tokens_per_bs,
                 )
                 spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
@@ -2723,7 +2729,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+        if self.server_args.enable_breakable_cuda_graph:
+            # Experimental feature
+            self.piecewise_cuda_graph_runner = BreakableCudaGraphRunner(self)
+        else:
+            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
@@ -2783,6 +2793,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         if not skip_attn_backend_init:
+            if hasattr(self.model, "prepare_forward_batch"):
+                # Prepare model-specific attention metadata before planning,
+                # e.g. Moss-VL's prefill cross-attention custom mask.
+                self.model.prepare_forward_batch(forward_batch)
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
                 forward_batch.attn_backend = self.decode_attn_backend
@@ -2838,6 +2852,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if not skip_attn_backend_init:
+            if hasattr(self.model, "prepare_forward_batch"):
+                # Prepare model-specific attention metadata before planning,
+                # e.g. Moss-VL's prefill cross-attention custom mask.
+                self.model.prepare_forward_batch(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
 
         return (
@@ -2900,10 +2918,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
-        with get_global_expert_distribution_recorder().with_forward_pass(
-            self.forward_pass_id,
-            forward_batch,
-        ) as recorder_outputs:
+        step_span_ctx = (
+            torch.profiler.record_function(_build_step_span_name(forward_batch))
+            if torch.autograd._profiler_enabled()
+            else contextlib.nullcontext()
+        )
+        with (
+            step_span_ctx,
+            get_global_expert_distribution_recorder().with_forward_pass(
+                self.forward_pass_id,
+                forward_batch,
+            ) as recorder_outputs,
+        ):
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -2934,11 +2960,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
-        # Copy cached routing experts' buffers back to CPU cache
-        get_global_experts_capturer().on_forward_end(
+        no_copy_to_cpu = not self.server_args.disable_overlap_schedule
+        output.routed_experts_output = get_global_experts_capturer().on_forward_end(
             forward_batch=forward_batch,
             can_run_graph=output.can_run_graph,
             cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+            no_copy_to_cpu=no_copy_to_cpu,
         )
 
         if self.eplb_manager is not None:
@@ -3206,6 +3233,39 @@ def _unwrap_tensor(tensor, tp_rank, device):
     if isinstance(tensor, LocalSerializedTensor):
         tensor = tensor.get(tp_rank)
     return tensor.to(device)
+
+
+def _build_step_span_name(forward_batch: ForwardBatch) -> str:
+    """Build a profile-trace span name for one forward step.
+
+    Format:
+      step[decode bs=N]                   — decode-only batch
+      step[prefill bs=N toks=T]           — extend-only (prefill) batch
+      step[mixed bs=N ext=T dec=D]        — extend+decode mixed batch
+      step[idle]                          — idle/padding step
+      step[<MODE> bs=N]                   — other modes (target-verify, etc.)
+
+    Used by ModelRunner.forward to wrap each step in a torch.profile
+    record_function so Chrome traces show labeled step boundaries.
+    """
+    mode = forward_batch.forward_mode
+    bs = forward_batch.batch_size
+    if mode.is_idle():
+        return "step[idle]"
+    if mode.is_decode():
+        return f"step[decode bs={bs}]"
+    if mode.is_extend():
+        ext_toks = forward_batch.extend_num_tokens or 0
+        ext_seqs = (
+            forward_batch.extend_seq_lens.shape[0]
+            if forward_batch.extend_seq_lens is not None
+            else bs
+        )
+        dec_seqs = bs - ext_seqs
+        if dec_seqs > 0:
+            return f"step[mixed bs={bs} ext={ext_toks} dec={dec_seqs}]"
+        return f"step[prefill bs={bs} toks={ext_toks}]"
+    return f"step[{mode.name} bs={bs}]"
 
 
 @dataclass
