@@ -24,7 +24,6 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req
-from sglang.srt.session.session_aware_cache import SessionAwareCache
 from sglang.srt.utils.common import log_info_on_rank0
 
 if TYPE_CHECKING:
@@ -236,6 +235,7 @@ class Session:
             return_routed_experts=req.return_routed_experts,
             priority=req.priority,
             routing_key=req.routing_key,
+            extra_key=req.extra_key,
             http_worker_ipc=req.http_worker_ipc,
             time_stats=req.time_stats,
         )
@@ -349,8 +349,7 @@ class SessionController:
                 mm.release_features()
             node.req.multimodal_inputs = None
 
-        if isinstance(self.tree_cache, SessionAwareCache):
-            self.tree_cache.release_session(session_id)
+        self.tree_cache.release_session(session_id)
         del self.sessions[session_id]
         log_info_on_rank0(
             logger, f"Session closed: {session_id} (active={len(self.sessions)})"
