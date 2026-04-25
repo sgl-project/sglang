@@ -112,7 +112,7 @@ class PrefillDelayer:
         )
         global_prefillable = tp0_info[:, 0]
         global_token_watermark_force_allow = tp0_info[:, 1]
-        global_running_batch = tp0_info[:, 2]
+        global_new_prefill_requests = tp0_info[:, 2]
         global_max_prefill_bs = tp0_info[:, 3]
 
         # Compute derived global states
@@ -142,29 +142,25 @@ class PrefillDelayer:
                     **debug_info,
                 )
 
-            max_running_requests = kwargs.get("max_running_requests", 0)
-            if not self.enable_dp_attention:
-                max_running_requests = (
-                    max_running_requests + self.dp_size - 1
-                ) // self.dp_size
+            prev_delayed_count = prev_state.delayed_count if prev_state else 0
             if (
-                max_running_requests - global_running_batch.max().item()
-                < global_max_prefill_bs.max().item()
+                global_new_prefill_requests.min().item() < global_max_prefill_bs.max().item()
             ):
-                # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
-                # the first merge_batch causes the decoding to fail to reach the maximum batch size.
-                if self.skip_first_delayer:
-                    self.skip_first_delayer = False
-                    pass
-                else:
-                    next_state = prev_state or _State()
-                    next_state = next_state.bump_delayed_count()
-                    return _NegotiateOutput(
-                        next_state=next_state,
-                        output_allow=False,
-                        output_reason="delay",
-                        **debug_info,
-                    )
+                if prev_delayed_count < self._max_delay_passes - 1:
+                    # When the "num_new_prefill_requests < max_prefill_bs" condition is met,
+                    # the first merge_batch causes the decoding to fail to reach the maximum batch size.
+                    if self.skip_first_delayer:
+                        self.skip_first_delayer = False
+                        pass
+                    else:
+                        next_state = prev_state or _State()
+                        next_state = next_state.bump_delayed_count()
+                        return _NegotiateOutput(
+                            next_state=next_state,
+                            output_allow=False,
+                            output_reason="delay",
+                            **debug_info,
+                        )
             exist_previous_wait = prev_state is not None
             return _NegotiateOutput(
                 next_state=None,
@@ -216,7 +212,7 @@ class PrefillDelayer:
             [
                 int(local_prefillable),
                 int(local_token_watermark_force_allow),
-                kwargs.get("running_batch", 0),
+                kwargs.get("new_prefill_requests_count", 0),
                 kwargs.get("max_prefill_bs", 0),
             ],
             device="cpu",
