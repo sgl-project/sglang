@@ -798,6 +798,8 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         ###
         guidance: torch.Tensor = None,  # TODO: this should probably be removed
     ) -> Tuple[torch.Tensor]:
+        self._update_teacache_status()
+
         if kv_caches is not None:
             kv_caches.set_mode(kv_caches_mode)
 
@@ -842,16 +844,21 @@ class GlmImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
         temb = F.silu(temb)
 
         # 3. Transformer blocks
-        for idx, block in enumerate(self.transformer_blocks):
-            hidden_states, encoder_hidden_states = block(
-                hidden_states,
-                encoder_hidden_states,
-                temb,
-                image_rotary_emb,
-                attention_mask,
-                attention_kwargs,
-                kv_cache=kv_caches[idx] if kv_caches is not None else None,
-            )
+        skip, hs_or_orig = self.teacache_skip_or_prepare(hidden_states, temb)
+        if skip:
+            hidden_states = hs_or_orig
+        else:
+            for idx, block in enumerate(self.transformer_blocks):
+                hidden_states, encoder_hidden_states = block(
+                    hidden_states,
+                    encoder_hidden_states,
+                    temb,
+                    image_rotary_emb,
+                    attention_mask,
+                    attention_kwargs,
+                    kv_cache=kv_caches[idx] if kv_caches is not None else None,
+                )
+            self.teacache_finalize(hidden_states, hs_or_orig)
 
         # 4. Output norm & projection
         hidden_states = self.norm_out(hidden_states, temb)

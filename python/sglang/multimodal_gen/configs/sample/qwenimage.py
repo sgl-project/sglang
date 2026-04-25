@@ -1,9 +1,26 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+
+
+@dataclass
+class QwenImageTeaCacheParams(TeaCacheParams):
+    """TeaCache parameters for Qwen-Image models."""
+
+    teacache_thresh: float = 0.2
+    coefficients: list[float] = field(
+        default_factory=lambda: [
+            7.33226126e02,
+            -4.01131952e02,
+            6.75869174e01,
+            -3.14987800e00,
+            9.61237896e-02,
+        ]
+    )
 
 
 @dataclass
@@ -13,6 +30,10 @@ class QwenImageSamplingParams(SamplingParams):
     # Denoising stage
     guidance_scale: float = 4.0
     num_inference_steps: int = 50
+
+    teacache_params: QwenImageTeaCacheParams = field(
+        default_factory=QwenImageTeaCacheParams
+    )
 
 
 @dataclass

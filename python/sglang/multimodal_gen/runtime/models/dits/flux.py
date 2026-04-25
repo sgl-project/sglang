@@ -18,6 +18,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+
 from diffusers.models.attention import AttentionModuleMixin
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import (
@@ -25,8 +26,6 @@ from diffusers.models.normalization import (
     AdaLayerNormZero,
     AdaLayerNormZeroSingle,
 )
-from torch.nn import LayerNorm as LayerNorm
-
 from sglang.multimodal_gen.configs.models.dits.flux import FluxConfig
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import (
@@ -617,8 +616,8 @@ class FluxTransformerBlock(nn.Module):
             prefix=f"{prefix}.attn" if prefix else "attn",
         )
 
-        self.norm2 = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
-        self.norm2_context = LayerNorm(dim, eps=1e-6, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, eps=1e-6, elementwise_affine=False)
+        self.norm2_context = nn.LayerNorm(dim, eps=1e-6, elementwise_affine=False)
 
         nunchaku_enabled = (
             quant_config is not None
@@ -894,6 +893,8 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
 
         """
+        self._update_teacache_status()
+
         if (
             joint_attention_kwargs is not None
             and joint_attention_kwargs.get("scale", None) is not None
@@ -921,22 +922,28 @@ class FluxTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             ip_hidden_states = self.encoder_hid_proj(ip_adapter_image_embeds)
             joint_attention_kwargs.update({"ip_hidden_states": ip_hidden_states})
 
-        for block in self.transformer_blocks:
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                freqs_cis=freqs_cis,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
-        for block in self.single_transformer_blocks:
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                temb=temb,
-                freqs_cis=freqs_cis,
-                joint_attention_kwargs=joint_attention_kwargs,
-            )
+        skip, hs_or_orig = self.teacache_skip_or_prepare(hidden_states, temb)
+
+        if skip:
+            hidden_states = hs_or_orig
+        else:
+            for block in self.transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    freqs_cis=freqs_cis,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
+            for block in self.single_transformer_blocks:
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=temb,
+                    freqs_cis=freqs_cis,
+                    joint_attention_kwargs=joint_attention_kwargs,
+                )
+            self.teacache_finalize(hidden_states, hs_or_orig)
 
         hidden_states = self.norm_out(hidden_states, temb)
 

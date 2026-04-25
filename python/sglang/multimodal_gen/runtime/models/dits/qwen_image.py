@@ -5,16 +5,16 @@
 import functools
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-import diffusers
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import diffusers
 from diffusers.models.attention import FeedForward
 from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
-
 from sglang.jit_kernel.diffusion.triton.scale_shift import (
     fuse_layernorm_scale_shift_gate_select01_kernel,
     fuse_residual_layernorm_scale_shift_gate_select01_kernel,
@@ -1207,12 +1207,14 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 [diffusers.models.attention_processor](https://github.com/huggingface/diffusers/blob/main/src/diffusers/models/attention_processor.py).
             return_dict (`bool`, *optional*, defaults to `True`):
                 Whether or not to return a [`~models.transformer_2d.Transformer2DModelOutput`] instead of a plain
-                tuple.
+                `tuple`.
 
         Returns:
             If `return_dict` is True, an [`~models.transformer_2d.Transformer2DModelOutput`] is returned, otherwise a
             `tuple` where the first element is the sample tensor.
         """
+        self._update_teacache_status()
+
         if (
             attention_kwargs is not None
             and attention_kwargs.get("scale", None) is not None
@@ -1248,29 +1250,37 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
             temb_txt = temb
             temb_txt_silu = temb_img_silu
 
-        image_rotary_emb = freqs_cis
-        for index_block, block in enumerate(self.transformer_blocks):
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_hidden_states_mask=encoder_hidden_states_mask,
-                temb_img_silu=temb_img_silu,
-                temb_txt_silu=temb_txt_silu,
-                image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=attention_kwargs,
-                modulate_index=modulate_index,
-            )
+        skip, hs_or_orig = self.teacache_skip_or_prepare(hidden_states, temb)
 
-            # controlnet residual
-            if controlnet_block_samples is not None:
-                interval_control = len(self.transformer_blocks) / len(
-                    controlnet_block_samples
+        if skip:
+            hidden_states = hs_or_orig
+        else:
+            image_rotary_emb = freqs_cis
+            for index_block, block in enumerate(self.transformer_blocks):
+                encoder_hidden_states, hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    encoder_hidden_states_mask=encoder_hidden_states_mask,
+                    temb_img_silu=temb_img_silu,
+                    temb_txt_silu=temb_txt_silu,
+                    image_rotary_emb=image_rotary_emb,
+                    joint_attention_kwargs=attention_kwargs,
+                    modulate_index=modulate_index,
                 )
-                interval_control = int(np.ceil(interval_control))
-                hidden_states = (
-                    hidden_states
-                    + controlnet_block_samples[index_block // interval_control]
-                )
+
+                # controlnet residual
+                if controlnet_block_samples is not None:
+                    interval_control = len(self.transformer_blocks) / len(
+                        controlnet_block_samples
+                    )
+                    interval_control = int(np.ceil(interval_control))
+                    hidden_states = (
+                        hidden_states
+                        + controlnet_block_samples[index_block // interval_control]
+                    )
+
+            self.teacache_finalize(hidden_states, hs_or_orig)
+
         # Use only the image part (hidden_states) from the dual-stream blocks
         hidden_states = self.norm_out(hidden_states, temb_txt)
 

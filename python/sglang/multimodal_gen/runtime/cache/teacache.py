@@ -124,9 +124,16 @@ class TeaCacheMixin:
         accumulated_rel_l1_distance_negative: L1 distance for negative branch.
     """
 
-    # Models that support CFG cache separation (wan/hunyuan/zimage)
-    # Models not in this set (flux/qwen) auto-disable TeaCache when CFG is enabled
-    _CFG_SUPPORTED_PREFIXES: set[str] = {"wan", "hunyuan", "zimage"}
+    # Models that support CFG cache separation
+    # Models not in this set auto-disable TeaCache when CFG is enabled
+    _CFG_SUPPORTED_PREFIXES: set[str] = {
+        "wan",
+        "hunyuan",
+        "zimage",
+        "glmimage",
+        "flux",
+        "qwenimage",
+    }
     config: DiTConfig
 
     def _init_teacache_state(self) -> None:
@@ -151,6 +158,19 @@ class TeaCacheMixin:
             self.previous_modulated_input_negative: torch.Tensor | None = None
             self.previous_residual_negative: torch.Tensor | None = None
             self.accumulated_rel_l1_distance_negative: float = 0.0
+
+    def _update_teacache_status(self) -> None:
+        # Reads enable_teacache flag from forward_batch context.
+        # Lazy import required to avoid circular dependency with runtime.managers.
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            get_forward_context,
+        )
+
+        forward_context = get_forward_context()
+        forward_batch = forward_context.forward_batch if forward_context else None
+        self.enable_teacache = forward_batch is not None and getattr(
+            forward_batch, "enable_teacache", False
+        )
 
     def reset_teacache_state(self) -> None:
         """Reset all TeaCache state at the start of each generation task."""
@@ -199,15 +219,19 @@ class TeaCacheMixin:
         diff = modulated_inp - prev_modulated_inp
         rel_l1 = (diff.abs().mean() / prev_modulated_inp.abs().mean()).cpu().item()
 
-        # Apply polynomial rescaling
-        rescale_func = np.poly1d(coefficients)
+        # Apply polynomial rescaling if coefficients provided, else use raw L1
+        if coefficients:
+            rescale_func = np.poly1d(coefficients)
+            rescaled_l1 = rescale_func(rel_l1)
+        else:
+            rescaled_l1 = rel_l1
 
         accumulated_rel_l1_distance = (
             self.accumulated_rel_l1_distance_negative
             if self.is_cfg_negative
             else self.accumulated_rel_l1_distance
         )
-        accumulated_rel_l1_distance = accumulated_rel_l1_distance + rescale_func(rel_l1)
+        accumulated_rel_l1_distance = accumulated_rel_l1_distance + rescaled_l1
 
         if accumulated_rel_l1_distance >= teacache_thresh:
             # Threshold exceeded: force compute and reset accumulator
@@ -272,14 +296,15 @@ class TeaCacheMixin:
         forward_batch = forward_context.forward_batch
 
         # Early return checks
-        if (
-            forward_batch is None
-            or not forward_batch.enable_teacache
-            or forward_batch.teacache_params is None
-        ):
+        if forward_batch is None:
             return None
 
-        teacache_params = forward_batch.teacache_params
+        if not getattr(forward_batch, "enable_teacache", False):
+            return None
+
+        teacache_params = getattr(forward_batch, "teacache_params", None)
+        if teacache_params is None:
+            return None
 
         # Extract common values
         current_timestep = forward_context.current_timestep
@@ -302,15 +327,78 @@ class TeaCacheMixin:
         )
 
     def maybe_cache_states(
-        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor
+        self, hidden_states: torch.Tensor, original_hidden_states: torch.Tensor | None
     ) -> None:
-        """Cache states for later retrieval. Override in subclass if needed."""
-        pass
+        """Cache residual (output - input) for later retrieval.
+
+        This default implementation handles CFG-aware caching by storing
+        separate residuals for positive and negative branches.
+        """
+        if original_hidden_states is None:
+            return
+
+        residual = hidden_states - original_hidden_states
+        if not self.is_cfg_negative:
+            self.previous_residual = residual
+        else:
+            self.previous_residual_negative = residual
 
     def should_skip_forward_for_cached_states(self, **kwargs: dict[str, Any]) -> bool:
-        """Check if forward can be skipped using cached states."""
-        return False
+        """Check if forward can be skipped using cached states.
+
+        Subclasses should call this with `temb` (modulated input) in kwargs.
+        Example: `should_skip_forward_for_cached_states(temb=temb)`
+
+        Returns:
+            True if forward should be skipped (use cached residual).
+        """
+        if not self.enable_teacache:
+            return False
+        ctx = self._get_teacache_context()
+        if ctx is None:
+            return False
+
+        temb = kwargs.get("temb")
+        if temb is None:
+            return False
+
+        self.is_cfg_negative = ctx.is_cfg_negative
+
+        is_boundary_step = (
+            ctx.current_timestep == 0
+            or ctx.current_timestep >= ctx.num_inference_steps - 1
+        )
+
+        should_calc = self._compute_teacache_decision(
+            modulated_inp=temb,
+            is_boundary_step=is_boundary_step,
+            coefficients=ctx.coefficients,
+            teacache_thresh=ctx.teacache_thresh,
+        )
+
+        return not should_calc
 
     def retrieve_cached_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Retrieve cached states. Must be implemented by subclass."""
-        raise NotImplementedError("retrieve_cached_states is not implemented")
+        # Adds cached residual to hidden_states. CFG-aware: uses separate residual
+        # for negative branch (previous_residual_negative) vs positive branch.
+        if not self.is_cfg_negative:
+            return hidden_states + self.previous_residual
+        else:
+            return hidden_states + self.previous_residual_negative
+
+    def teacache_skip_or_prepare(
+        self, hidden_states: torch.Tensor, temb: torch.Tensor
+    ) -> tuple[bool, torch.Tensor | None]:
+        # Combined cache check + preparation for block execution.
+        # Returns (True, cached_result) to skip blocks entirely.
+        # Returns (False, original_tensor) to run blocks; original is cloned for later caching.
+        if self.should_skip_forward_for_cached_states(temb=temb):
+            return True, self.retrieve_cached_states(hidden_states)
+        return False, hidden_states.clone() if self.enable_teacache else None
+
+    def teacache_finalize(
+        self, hidden_states: torch.Tensor, original: torch.Tensor | None
+    ) -> None:
+        # Called after block execution to cache the residual (output - original).
+        if self.enable_teacache and original is not None:
+            self.maybe_cache_states(hidden_states, original)
