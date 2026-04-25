@@ -128,6 +128,7 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
     "output_top_logprobs",
     "output_token_ids_logprobs",
 )
+_INCREMENTAL_STREAMING_DLLM_META_INFO_KEYS = ("dllm_forward_counts",)
 
 
 @dataclasses.dataclass
@@ -146,6 +147,9 @@ class ReqState:
 
     # For streaming output
     last_output_offset: int = 0
+
+    # For dLLM block-aligned streaming metadata
+    last_dllm_meta_info_offset: int = 0
 
     # Accumulate text lazily so incremental streaming can emit the incoming
     # delta directly without rebuilding the full output prefix.
@@ -202,6 +206,18 @@ def _slice_streaming_output_meta_info(
     """Align output-side metadata with the current incremental streaming chunk."""
     for key in meta_info.keys() & set(_INCREMENTAL_STREAMING_META_INFO_KEYS):
         meta_info[key] = meta_info[key][last_output_offset:]
+
+
+def _slice_streaming_dllm_output_meta_info(
+    meta_info: Dict[Any, Any],
+    last_output_offset: int,
+) -> int:
+    """Align block-aligned dLLM metadata with the current streaming chunk."""
+    next_offset = last_output_offset
+    for key in meta_info.keys() & set(_INCREMENTAL_STREAMING_DLLM_META_INFO_KEYS):
+        next_offset = len(meta_info[key])
+        meta_info[key] = meta_info[key][last_output_offset:]
+    return next_offset
 
 
 class InputFormat(Enum):
@@ -1211,7 +1227,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if "meta_info" in out:
             meta_info_list = [chunk["meta_info"] for chunk in out_list]
             meta_info = dict(meta_info_list[-1])
-            for key in _INCREMENTAL_STREAMING_META_INFO_KEYS:
+            incremental_keys = (
+                *_INCREMENTAL_STREAMING_META_INFO_KEYS,
+                *_INCREMENTAL_STREAMING_DLLM_META_INFO_KEYS,
+            )
+            for key in incremental_keys:
                 if any(key in m for m in meta_info_list):
                     meta_info[key] = [
                         item for m in meta_info_list for item in m.get(key, [])
@@ -1727,6 +1747,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         output_token_ids = delta_output_ids
                         _slice_streaming_output_meta_info(meta_info, output_offset)
                         state.last_output_offset = len(state.output_ids)
+                        # dLLM incremental metadata is block-aligned rather than token-aligned.
+                        state.last_dllm_meta_info_offset = (
+                            _slice_streaming_dllm_output_meta_info(
+                                meta_info,
+                                state.last_dllm_meta_info_offset,
+                            )
+                        )
                         out_dict = {
                             "text": delta_text,
                             "output_ids": output_token_ids,
@@ -1769,6 +1796,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         output_token_ids = delta_output_ids
                         _slice_streaming_output_meta_info(meta_info, output_offset)
                         state.last_output_offset = len(state.output_ids)
+                        # dLLM incremental metadata is block-aligned rather than token-aligned.
+                        state.last_dllm_meta_info_offset = (
+                            _slice_streaming_dllm_output_meta_info(
+                                meta_info,
+                                state.last_dllm_meta_info_offset,
+                            )
+                        )
                         out_dict = {
                             "output_ids": output_token_ids,
                             "meta_info": meta_info,
