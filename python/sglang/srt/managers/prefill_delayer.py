@@ -71,9 +71,6 @@ class PrefillDelayer:
         self.skip_first_delayer = True
 
         assert (
-            server_args.disaggregation_mode == "null"
-        ), "To use PrefillDelayer, disaggregation_mode must be null."
-        assert (
             not server_args.disable_overlap_schedule
         ), "To use PrefillDelayer, disable_overlap_schedule must be False."
 
