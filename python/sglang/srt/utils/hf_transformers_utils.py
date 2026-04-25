@@ -163,6 +163,28 @@ def get_hf_text_config(config: PretrainedConfig):
 
 
 # Temporary hack for DeepSeek-V3.2 model
+def _is_compressed_tensors_w4a16(config_file: str) -> bool:
+    """Return True if the checkpoint's config.json declares a compressed-tensors
+    W4A16 quantization (int4 weights, no input-activation quant)."""
+    try:
+        with open(config_file, "r") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return False
+    qc = cfg.get("quantization_config") or {}
+    if qc.get("quant_method") != "compressed-tensors":
+        return False
+    for group in (qc.get("config_groups") or {}).values():
+        weights = group.get("weights") or {}
+        if (
+            weights.get("num_bits") == 4
+            and weights.get("type") == "int"
+            and group.get("input_activations") is None
+        ):
+            return True
+    return False
+
+
 def _load_deepseek_temp_model(
     model_path: str,
     model_type: Literal["deepseek_v32", "deepseek_ref"],
@@ -204,15 +226,27 @@ def _load_deepseek_temp_model(
                 f"SGLANG_APPLY_CONFIG_BACKUP={backup_mode!r} is not recognized; "
                 f"use 'none' (off), 'small', 'large', or 'auto'."
             )
-        config_file = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "configs",
-            backup_file,
-        )
-        logger.warning(
-            f"SGLANG_APPLY_CONFIG_BACKUP={backup_mode}: using packaged {config_file} "
-            f"instead of the checkpoint's config.json at {local_path}."
-        )
+        # Skip backup when checkpoint is already compressed-tensors W4A16:
+        # its config.json is the source of truth for quant params.
+        real_config_file = os.path.join(local_path, "config.json")
+        if os.path.exists(real_config_file) and _is_compressed_tensors_w4a16(
+            real_config_file
+        ):
+            logger.warning(
+                f"SGLANG_APPLY_CONFIG_BACKUP={backup_mode}: detected compressed-tensors "
+                f"W4A16 in {real_config_file}; keeping checkpoint config."
+            )
+            config_file = real_config_file
+        else:
+            config_file = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "configs",
+                backup_file,
+            )
+            logger.warning(
+                f"SGLANG_APPLY_CONFIG_BACKUP={backup_mode}: using packaged {config_file} "
+                f"instead of the checkpoint's config.json at {local_path}."
+            )
     else:
         config_file = os.path.join(local_path, "config.json")
     if not os.path.exists(config_file):
