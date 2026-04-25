@@ -517,18 +517,14 @@ export const DeepSeekV4Deployment = () => {
 
     const prefill = `${prefillHeader}\n${buildRole("prefill", 30000, 30335)}`;
     const decode  = `${decodeHeader}\n${buildRole("decode",  30001, 30435)}`;
-    // GB300 PD prefill and decode commonly run on different physical nodes
-    // (different pods within a numNodes=2 ComputeDomain), so the router must
-    // address them by their actual reachable hostnames / IPs, not 127.0.0.1.
-    // For B200 / H200 where prefill and decode share a host (or use an
-    // IB device), 127.0.0.1 is fine.
-    const prefillHost = isGB300 ? "<prefill-host>" : "127.0.0.1";
-    const decodeHost  = isGB300 ? "<decode-host>"  : "127.0.0.1";
+    // Router addresses prefill / decode by their reachable hostnames / IPs.
+    // Substitute <prefill-host> / <decode-host> with the actual hosts before
+    // running. On a same-host deployment, both can be 127.0.0.1.
     const router  = `# --- Router (port 8000) ---
 python3 -m sglang_router.launch_router \\
   --pd-disaggregation \\
-  --prefill http://${prefillHost}:30000 \\
-  --decode http://${decodeHost}:30001 \\
+  --prefill http://<prefill-host>:30000 \\
+  --decode http://<decode-host>:30001 \\
   --host 0.0.0.0 --port 8000 \\
   --disable-circuit-breaker \\
   --health-check-interval-secs 999999`;
