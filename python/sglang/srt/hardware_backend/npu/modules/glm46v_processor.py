@@ -90,14 +90,23 @@ def npu_wrapper_glm46v_preprocess(func):
             resized_height, resized_width = stacked_images.shape[-2:]
 
             patches = self.rescale_and_normalize(
-                stacked_images, do_rescale, rescale_factor, do_normalize, image_mean, image_std
+                stacked_images,
+                do_rescale,
+                rescale_factor,
+                do_normalize,
+                image_mean,
+                image_std,
             )
             if patches.ndim == 4:
                 patches = patches.unsqueeze(1)
 
             if patches.shape[1] % temporal_patch_size != 0:
                 repeats = patches[:, -1:].repeat(
-                    1, temporal_patch_size - (patches.shape[1] % temporal_patch_size), 1, 1, 1
+                    1,
+                    temporal_patch_size - (patches.shape[1] % temporal_patch_size),
+                    1,
+                    1,
+                    1,
                 )
                 patches = torch.cat([patches, repeats], dim=1)
 
@@ -126,7 +135,9 @@ def npu_wrapper_glm46v_preprocess(func):
             processed_images_grouped[shape] = flatten_patches
             processed_grids[shape] = [[grid_t, grid_h, grid_w]] * batch_size
 
-        processed_images = reorder_images(processed_images_grouped, grouped_images_index)
+        processed_images = reorder_images(
+            processed_images_grouped, grouped_images_index
+        )
         processed_grids = reorder_images(processed_grids, grouped_images_index)
 
         pixel_values = torch.cat(processed_images, dim=0)
