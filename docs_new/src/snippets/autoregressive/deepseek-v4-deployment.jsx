@@ -178,6 +178,7 @@ export const DeepSeekV4Deployment = () => {
     "gb300|small|max-throughput",
     "h200|small|cp",
     "h200|small|pd-disagg",
+    "h200|big|max-throughput",
     "h200|big|pd-disagg",
     "gb300|small|cp",
     "gb300|big|cp",
@@ -262,7 +263,9 @@ export const DeepSeekV4Deployment = () => {
       }
     } else if (recipe === "max-throughput") {
       if (hardware === "h200") {
-        recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
+        recipeEnv.push(isBig
+          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
+          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
       } else {
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
@@ -351,7 +354,7 @@ export const DeepSeekV4Deployment = () => {
       if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
     } else if (recipe === "max-throughput") {
       // allinone max-throughput: TP + DP + DP-attn + DeepEP (NO MTP).
-      //   H200 small: cg=128 max-run=256  |  H200 big: cg=128 max-run=256 (same)
+      //   H200 small: cg=128 max-run=256  |  H200 big: max-run=64 mem-frac=0.875
       //   B200 small: no cg/max-run       |  B200 big: cg=64  max-run=256
       //   GB300 small: no cg/max-run      |  GB300 big: cg=128 max-run=256
       flags.push(`  --tp ${tp}`);
@@ -359,8 +362,14 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --enable-dp-attention");
       if (multinode) flags.push(...multiNodeFlags(nnodes));
       flags.push("  --moe-a2a-backend deepep");
-      if (isBig) flags.push("  --mem-fraction-static 0.82");
-      if (hardware === "h200") {
+      if (isBig && hardware === "h200") {
+        flags.push("  --mem-fraction-static 0.875");
+      } else if (isBig) {
+        flags.push("  --mem-fraction-static 0.82");
+      }
+      if (hardware === "h200" && isBig) {
+        flags.push("  --max-running-requests 64");
+      } else if (hardware === "h200") {
         flags.push("  --cuda-graph-max-bs 128");
         flags.push("  --max-running-requests 256");
       } else if (isBig && hardware === "b200") {
