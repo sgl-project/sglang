@@ -1095,6 +1095,12 @@
                     ]
                   },
                   {
+                    "group": "LTX",
+                    "pages": [
+                      "cookbook/diffusion/LTX/LTX"
+                    ]
+                  },
+                  {
                     "group": "Qwen-Image",
                     "pages": [
                       "cookbook/diffusion/Qwen-Image/Qwen-Image",

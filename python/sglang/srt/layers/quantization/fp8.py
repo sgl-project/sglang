@@ -50,7 +50,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    _use_aiter_gfx95,
+    _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
@@ -515,7 +515,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight_scale_inv.data = weight_scale.data
 
         if (
-            _use_aiter_gfx95
+            _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
         ):
             n, k = layer.weight.shape

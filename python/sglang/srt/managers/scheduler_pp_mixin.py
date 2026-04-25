@@ -31,7 +31,7 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils import DynamicGradMode, broadcast_pyobj, point_to_point_pyobj
-from sglang.srt.utils.common import is_xpu
+from sglang.srt.utils.common import get_device_module, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -628,8 +628,9 @@ class SchedulerPPMixin:
                 pp_proxy = PPProxyTensors(proxy_tensors)
 
                 # Measure latency with device synchronization for accurate timing
+                device_module = get_device_module()
                 # Synchronize before starting timing to ensure clean measurement
-                self.device_module.synchronize()
+                device_module.synchronize()
 
                 start = time.perf_counter()
                 batch.prepare_for_extend()
@@ -643,7 +644,7 @@ class SchedulerPPMixin:
                 )
 
                 # Synchronize after forward to ensure GPU operations complete
-                self.device_module.synchronize()
+                device_module.synchronize()
 
                 latency_seconds = time.perf_counter() - start
                 latency_ms = latency_seconds * 1e3  # Convert to milliseconds
