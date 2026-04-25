@@ -98,15 +98,15 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                     images.append(item.image if item.image is not None else None)
                     videos.append(item.video if item.video is not None else None)
 
+                # Precedence: a SGLang-registered conversation template wins
+                # over the tokenizer's own HF Jinja template when both exist.
                 generate_prompts = []
-                # Built-in conversation templates.
                 if self.template_manager.chat_template_name is not None:
                     convs = generate_embedding_convs(
                         texts, images, videos, self.template_manager.chat_template_name
                     )
                     for conv in convs:
                         generate_prompts.append(conv.get_prompt())
-                # Explicit/HF Jinja templates.
                 elif (
                     self.tokenizer_manager.tokenizer is not None
                     and getattr(self.tokenizer_manager.tokenizer, "chat_template", None)
@@ -181,6 +181,14 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         images: List[Optional[str]],
         videos: List[Optional[str]],
     ) -> List[str]:
+        """Render each multimodal embedding input through the tokenizer's Jinja chat template.
+
+        Image/video bytes are threaded to the engine separately via
+        ``EmbeddingReqInput.image_data``/``video_data``; this method only produces
+        the prompt string. ``text=None`` emits no text chunk (no ``"padding"``
+        literal). Jinja failures are re-raised as ``ValueError`` so the caller
+        returns HTTP 400 instead of 500.
+        """
         prompts: List[str] = []
         template_content_format = self.template_manager.jinja_template_content_format
 
@@ -197,6 +205,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 "role": "user",
                 "content": content_parts if content_parts else "",
             }
+            # Empty list args: this helper is only used to normalize the content
+            # shape (e.g. image_url -> image); real payloads ride on the outer
+            # images/videos lists, not EmbeddingReqInput fields derived here.
             processed_msg = process_content_for_template_format(
                 msg_dict,
                 template_content_format,
@@ -212,7 +223,16 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                     add_generation_prompt=True,
                 )
             except jinja2.TemplateError as template_error:
-                raise ValueError(str(template_error)) from template_error
+                location = getattr(template_error, "lineno", None)
+                name = getattr(template_error, "name", None)
+                suffix = ""
+                if name or location:
+                    suffix = f" (template={name or '<unknown>'}, line={location})"
+                raise ValueError(f"{template_error}{suffix}") from template_error
+            except (TypeError, KeyError, AttributeError) as template_error:
+                raise ValueError(
+                    f"Failed to render chat template for embedding input: {template_error}"
+                ) from template_error
             prompts.append(prompt)
 
         return prompts

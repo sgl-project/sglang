@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, Mock
 
 import jinja2
 
+
 # Stub out sgl_kernel (and all submodules) before any sglang import so
 # the test runs on CPU-only runners without the real CUDA library.
 class _SglKernelMockLoader(importlib.abc.Loader):
@@ -132,6 +133,15 @@ class ServingEmbeddingTestCase(unittest.TestCase):
             ],
             encoding_format="float",
         )
+        self.video_multimodal_req = EmbeddingRequest(
+            model="test-model",
+            input=[
+                MultimodalEmbeddingInput(
+                    text="Describe", image=None, video="base64_video_data"
+                ),
+            ],
+            encoding_format="float",
+        )
         self.token_ids_req = EmbeddingRequest(
             model="test-model",
             input=[1, 2, 3, 4, 5],
@@ -211,15 +221,24 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         self.assertEqual(
             self.tokenizer_manager.tokenizer.apply_chat_template.call_count, 2
         )
-        first_call = self.tokenizer_manager.tokenizer.apply_chat_template.call_args_list[
-            0
-        ]
+        first_call = (
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_args_list[0]
+        )
         first_messages = first_call.args[0]
         self.assertEqual(first_messages[0]["role"], "user")
         self.assertEqual(first_messages[0]["content"][0]["type"], "image")
         self.assertEqual(first_messages[0]["content"][1]["type"], "text")
+        self.assertEqual(first_messages[0]["content"][1]["text"], "Hello")
         self.assertEqual(first_call.kwargs["tokenize"], False)
         self.assertEqual(first_call.kwargs["add_generation_prompt"], True)
+
+        second_call = (
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_args_list[1]
+        )
+        second_messages = second_call.args[0]
+        self.assertEqual(len(second_messages[0]["content"]), 1)
+        self.assertEqual(second_messages[0]["content"][0]["type"], "text")
+        self.assertEqual(second_messages[0]["content"][0]["text"], "World")
 
     def test_convert_image_only_multimodal_request_with_jinja_chat_template(self):
         """Image-only requests should not inject literal padding into Jinja prompts."""
@@ -239,6 +258,48 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         self.assertEqual(len(first_messages[0]["content"]), 1)
         self.assertEqual(first_messages[0]["content"][0]["type"], "image")
 
+    def test_convert_video_multimodal_request_with_jinja_chat_template(self):
+        """Video inputs should land in video_data and flow through the Jinja branch."""
+        self.tokenizer_manager.tokenizer.chat_template = "mock-template"
+        self.tokenizer_manager.tokenizer.apply_chat_template = Mock(
+            return_value="<prompt>Describe<video></prompt>"
+        )
+
+        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
+            self.video_multimodal_req
+        )
+
+        self.assertEqual(adapted_request.text, "<prompt>Describe<video></prompt>")
+        self.assertEqual(adapted_request.video_data, "base64_video_data")
+        self.assertIsNone(adapted_request.image_data)
+        first_messages = (
+            self.tokenizer_manager.tokenizer.apply_chat_template.call_args.args[0]
+        )
+        content = first_messages[0]["content"]
+        self.assertEqual([c["type"] for c in content], ["video", "text"])
+
+    def test_multimodal_request_falls_back_when_no_chat_template(self):
+        """Without any chat template the raw-text fallback must run without raising."""
+        self.tokenizer_manager.tokenizer.chat_template = None
+
+        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
+            self.image_only_multimodal_req
+        )
+
+        # text=None on an image-only input falls back to the "padding" literal.
+        self.assertEqual(adapted_request.text, "padding")
+        self.assertEqual(adapted_request.image_data, "base64_image_data")
+
+    def test_multimodal_request_with_no_tokenizer_uses_fallback(self):
+        """Missing tokenizer should not crash the Jinja branch check."""
+        self.tokenizer_manager.tokenizer = None
+
+        adapted_request, _ = self.serving_embedding._convert_to_internal_request(
+            self.multimodal_req
+        )
+
+        self.assertEqual(adapted_request.text, ["Hello", "World"])
+
     def test_jinja_template_errors_are_raised_as_value_error(self):
         """Template failures should be converted to ValueError for a 400 response."""
         self.tokenizer_manager.tokenizer.chat_template = "mock-template"
@@ -247,6 +308,32 @@ class ServingEmbeddingTestCase(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "bad template"):
+            self.serving_embedding._convert_to_internal_request(
+                self.image_only_multimodal_req
+            )
+
+    def test_jinja_template_syntax_error_includes_location(self):
+        """TemplateSyntaxError should surface template name and line number."""
+        err = jinja2.TemplateSyntaxError("unexpected end", lineno=7, name="mock.jinja")
+        self.tokenizer_manager.tokenizer.chat_template = "mock-template"
+        self.tokenizer_manager.tokenizer.apply_chat_template = Mock(side_effect=err)
+
+        with self.assertRaises(ValueError) as ctx:
+            self.serving_embedding._convert_to_internal_request(
+                self.image_only_multimodal_req
+            )
+        message = str(ctx.exception)
+        self.assertIn("mock.jinja", message)
+        self.assertIn("line=7", message)
+
+    def test_non_jinja_template_errors_are_raised_as_value_error(self):
+        """TypeError / KeyError from apply_chat_template should map to 400, not 500."""
+        self.tokenizer_manager.tokenizer.chat_template = "mock-template"
+        self.tokenizer_manager.tokenizer.apply_chat_template = Mock(
+            side_effect=KeyError("missing_field")
+        )
+
+        with self.assertRaisesRegex(ValueError, "missing_field"):
             self.serving_embedding._convert_to_internal_request(
                 self.image_only_multimodal_req
             )
