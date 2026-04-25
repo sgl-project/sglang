@@ -176,6 +176,10 @@ export const DeepSeekV4Deployment = () => {
     "h200|small|pd-disagg",
     // h200|big|pd-disagg: pending verification (needs 4-node H200 cluster with
     //   shared IB fabric: 2-node prefill + 2-node decode).
+    "gb300|small|cp",
+    "gb300|big|cp",
+    "gb300|small|pd-disagg",
+    "gb300|big|pd-disagg",
   ]);
   // Recipes whose command is intentionally not yet provided (e.g. blocked by an
   // upstream limitation). Showing a minimal placeholder is friendlier to users
@@ -372,7 +376,17 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --enable-nsa-prefill-context-parallel");
       flags.push("  --nsa-prefill-cp-mode round-robin-split");
       flags.push("  --chunked-prefill-size 16384");
-      flags.push("  --mem-fraction-static 0.78");
+      // GB300 big CP needs higher mem-fraction-static: Pro 1.6T weights at
+      // tp=4 are ~224 GB/card on a 273 GB GB300, so 0.78 leaves a negative
+      // KV pool (init_memory_pool fails: "Not enough memory ... weights
+      // 224 GB > static target 213 GB"). 0.88 gives weights 224 + KV 16 +
+      // runtime 33. Other Blackwell tp=8 paths fit fine at 0.78.
+      // Verified on 2026-04-25 (journal 2026-04-25-001 Cell B, Δ4).
+      if (hardware === "gb300" && isBig) {
+        flags.push("  --mem-fraction-static 0.88");
+      } else {
+        flags.push("  --mem-fraction-static 0.78");
+      }
       // allinone _CP_FLAGS has --max-running-requests 1024; Blackwell big cp overrides
       // to 256. Human directed (2026-04-24) to emit only one value — keep 256 override
       // for big Blackwell, else the default 1024.
@@ -436,7 +450,8 @@ export const DeepSeekV4Deployment = () => {
       gb300: [],
     }[hardware];
     // Whitelist #5: only SGLANG_MOONCAKE_CUSTOM_MEM_POOL kept; MC_FORCE_MNNVL /
-    // NCCL_MNNVL_ENABLE / NCCL_CUMEM_ENABLE stripped (personal-cluster topology).
+    // NCCL_MNNVL_ENABLE / NCCL_CUMEM_ENABLE may also be needed depending on the
+    // GB300 cluster's NVLink/IB topology — see §3.2 "Configuration Tips" note.
     const MNNVL_ENV = isGB300 ? ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True"] : [];
     const COMMON_ENV = ["SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
 
@@ -444,6 +459,18 @@ export const DeepSeekV4Deployment = () => {
       const roleEnv = [];
       if (hardware === "b200" && mode === "decode") {
         roleEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
+      }
+      // GB300 PD needs DeepEP dispatch buffer cap on BOTH prefill + decode;
+      // without it, the first forward fails `deep_ep.cpp:1233` assertion
+      // `x.size(0) <= num_max_dispatch_tokens_per_rank`. The cap also
+      // co-moves with --max-running-requests below: 256 for big (which
+      // uses --max-running-requests 128, per-rank=32 ≤ 256), 1024 for
+      // small (--max-running-requests 256, per-rank=64 ≤ 1024).
+      // Verified on 2026-04-25 (journal 2026-04-25-001 §C/§D).
+      if (isGB300) {
+        roleEnv.push(modelSize === "big"
+          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
+          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       }
       const envAll = [...HW_ENV, ...roleEnv, ...MNNVL_ENV, ...COMMON_ENV];
       const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
@@ -460,7 +487,21 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --disaggregation-transfer-backend mooncake");
       if (ibDevice) flags.push(`  --disaggregation-ib-device ${ibDevice}`);
       if (!isGB300) flags.push(`  --dist-init-addr 127.0.0.1:${distPort}`);
-      if (mode === "decode") flags.push("  --max-running-requests 256");
+      if (mode === "decode") {
+        // GB300 big PD decode is the most memory-pressured PD role: Pro 1.6T
+        // weights at tp=4 take ~224 GB/card on a 273 GB GB300; runtime needs
+        // headroom for DeepEP buffer + mooncake KV recv + CG private pool.
+        // Cookbook defaults (mem-frac 0.874, cg_max_bs 512, max-running 256)
+        // OOM during CG capture. Verified working on 2026-04-25 (journal
+        // 2026-04-25-001 Cell D, Δ10).
+        if (isGB300 && modelSize === "big") {
+          flags.push("  --max-running-requests 128");
+          flags.push("  --mem-fraction-static 0.83");
+          flags.push("  --cuda-graph-max-bs 128");
+        } else {
+          flags.push("  --max-running-requests 256");
+        }
+      }
       flags.push("  --host 0.0.0.0");
       flags.push(`  --port ${port}`);
 
@@ -476,11 +517,18 @@ export const DeepSeekV4Deployment = () => {
 
     const prefill = `${prefillHeader}\n${buildRole("prefill", 30000, 30335)}`;
     const decode  = `${decodeHeader}\n${buildRole("decode",  30001, 30435)}`;
+    // GB300 PD prefill and decode commonly run on different physical nodes
+    // (different pods within a numNodes=2 ComputeDomain), so the router must
+    // address them by their actual reachable hostnames / IPs, not 127.0.0.1.
+    // For B200 / H200 where prefill and decode share a host (or use an
+    // IB device), 127.0.0.1 is fine.
+    const prefillHost = isGB300 ? "<prefill-host>" : "127.0.0.1";
+    const decodeHost  = isGB300 ? "<decode-host>"  : "127.0.0.1";
     const router  = `# --- Router (port 8000) ---
 python3 -m sglang_router.launch_router \\
   --pd-disaggregation \\
-  --prefill http://127.0.0.1:30000 \\
-  --decode http://127.0.0.1:30001 \\
+  --prefill http://${prefillHost}:30000 \\
+  --decode http://${decodeHost}:30001 \\
   --host 0.0.0.0 --port 8000 \\
   --disable-circuit-breaker \\
   --health-check-interval-secs 999999`;

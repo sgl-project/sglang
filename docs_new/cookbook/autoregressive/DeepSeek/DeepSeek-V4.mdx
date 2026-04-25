@@ -158,6 +158,28 @@ TCP, which can lead to garbled KV transfer on large checkpoints.
 
 In order to use base models, please enable `SGLANG_FIX_DSV4_BASE_MODEL_LOAD=1` and use latest code, before the next round of testing matrix is finished.
 
+**GB300 PD-Disagg cross-pod MNNVL note**
+
+If you're running the GB300 `pd-disagg` recipe with prefill and decode on
+**different physical nodes** wired together by NVLink (e.g. inside a 2-node
+ComputeDomain on a GCP a4x cluster), and mooncake KV transfer fails with
+`nvlink_transport.cpp:497 Requested address ... not found!` (or long runs
+silently corrupt KV cache), prepend these env vars to **both** the prefill
+and decode `sglang serve` commands:
+
+```bash
+MC_FORCE_MNNVL=1 \
+NCCL_MNNVL_ENABLE=1 \
+NCCL_CUMEM_ENABLE=1 \
+sglang serve ...
+```
+
+These force NCCL / mooncake to use the MNNVL transport explicitly. They are
+**not** required when prefill and decode share a host, or when both hosts
+are on the same NVLink clique without explicit MNNVL routing — those
+defaults work without the envs. If your cookbook command works without these,
+you don't need them.
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
