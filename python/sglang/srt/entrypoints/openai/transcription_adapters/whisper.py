@@ -4,6 +4,8 @@ import logging
 import re
 from typing import List, Optional
 
+from transformers.models.whisper.tokenization_whisper import LANGUAGES
+
 from sglang.srt.entrypoints.openai.protocol import (
     TranscriptionRequest,
     TranscriptionSegment,
@@ -17,124 +19,27 @@ from sglang.srt.entrypoints.openai.transcription_adapters.base import (
 
 logger = logging.getLogger(__name__)
 
+# Sampling-params key the adapter plants and the multimodal processor pops
+# to flip the decoder prompt from the explicit 4-token forced sequence to
+# the bare ``<|startoftranscript|>`` (so the FSM regex drives token 1-3
+# instead). Centralized so adapter / processor / warmup all reference the
+# same string.
+FUSED_AUTODETECT_FLAG = "_detect_language"
+
 # The complete set of Whisper language tokens as they appear in the tokenizer
-# vocab (<|xx|> / <|xxx|>). Intentionally defined separately from
-# ``processors.whisper.ISO639_1_SUPPORTED_LANGS`` (a narrower set used by the
-# input-validation path ``normalize_language_to_code``) — for the FSM regex
-# we want to cover every language the model was actually trained on so we
+# vocab (<|xx|> / <|xxx|>). Sourced from the upstream ``LANGUAGES`` dict in
+# ``transformers.models.whisper.tokenization_whisper`` so newly-added tokens
+# (e.g. ``yue`` in Whisper v3) automatically propagate.
+#
+# Intentionally wider than ``processors.whisper.ISO639_1_SUPPORTED_LANGS``
+# (the narrower input-validation set used by ``normalize_language_to_code``)
+# — for the FSM regex we want every language the model was trained on so we
 # don't silently force a wrong nearest-match code on audio in languages the
 # model *can* detect but the input dict doesn't list (yue/Cantonese,
-# jw/Javanese, haw/Hawaiian, ba/Bashkir, su/Sundanese, ...).
-#
-# Source: the ``LANGUAGES`` dict in
-# ``transformers.models.whisper.tokenization_whisper``. Includes ``yue``
-# (Cantonese), added in Whisper v3; harmless on older models where the
-# ``<|yue|>`` token isn't in the vocab — xgrammar simply leaves that
-# regex branch with no admissible tokens.
-WHISPER_LANG_TOKEN_CODES: frozenset[str] = frozenset(
-    {
-        "af",
-        "am",
-        "ar",
-        "as",
-        "az",
-        "ba",
-        "be",
-        "bg",
-        "bn",
-        "bo",
-        "br",
-        "bs",
-        "ca",
-        "cs",
-        "cy",
-        "da",
-        "de",
-        "el",
-        "en",
-        "es",
-        "et",
-        "eu",
-        "fa",
-        "fi",
-        "fo",
-        "fr",
-        "gl",
-        "gu",
-        "ha",
-        "haw",
-        "he",
-        "hi",
-        "hr",
-        "ht",
-        "hu",
-        "hy",
-        "id",
-        "is",
-        "it",
-        "ja",
-        "jw",
-        "ka",
-        "kk",
-        "km",
-        "kn",
-        "ko",
-        "la",
-        "lb",
-        "ln",
-        "lo",
-        "lt",
-        "lv",
-        "mg",
-        "mi",
-        "mk",
-        "ml",
-        "mn",
-        "mr",
-        "ms",
-        "mt",
-        "my",
-        "ne",
-        "nl",
-        "nn",
-        "no",
-        "oc",
-        "pa",
-        "pl",
-        "ps",
-        "pt",
-        "ro",
-        "ru",
-        "sa",
-        "sd",
-        "si",
-        "sk",
-        "sl",
-        "sn",
-        "so",
-        "sq",
-        "sr",
-        "su",
-        "sv",
-        "sw",
-        "ta",
-        "te",
-        "tg",
-        "th",
-        "tk",
-        "tl",
-        "tr",
-        "tt",
-        "uk",
-        "ur",
-        "uz",
-        "vi",
-        "yi",
-        "yo",
-        "yue",
-        "zh",
-    }
-)
+# jw/Javanese, haw/Hawaiian, ba/Bashkir, su/Sundanese, ...). Codes whose
+# ``<|xxx|>`` token isn't in an older checkpoint's vocab are harmless —
+# xgrammar simply leaves that regex branch with no admissible tokens.
+WHISPER_LANG_TOKEN_CODES: frozenset[str] = frozenset(LANGUAGES.keys())
 
 # Two forced-prefix variants, picked at request build time based on whether
 # the client asked for timestamp_granularities:
@@ -272,7 +177,7 @@ class WhisperAdapter(TranscriptionAdapter):
             # spaces_between_special_tokens=False so the parse regex is
             # correct regardless of tokenizer variant.
             "spaces_between_special_tokens": False,
-            "_detect_language": True,
+            FUSED_AUTODETECT_FLAG: True,
         }
         if ts_variant:
             params["timestamp_granularities"] = request.timestamp_granularities

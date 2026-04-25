@@ -58,6 +58,7 @@ async def whisper_autodetect(
     import soundfile as sf
 
     from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
+        FUSED_AUTODETECT_FLAG,
         WHISPER_AUTODETECT_REGEX,
         WHISPER_AUTODETECT_TS_REGEX,
     )
@@ -86,7 +87,7 @@ async def whisper_autodetect(
                 "regex": regex,
                 "skip_special_tokens": False,
                 "spaces_between_special_tokens": False,
-                "_detect_language": True,
+                FUSED_AUTODETECT_FLAG: True,
             },
             modalities=["audio"],
         )

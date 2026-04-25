@@ -1,6 +1,9 @@
 import logging
 from typing import Any, Dict, Optional
 
+from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
+    FUSED_AUTODETECT_FLAG,
+)
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -178,7 +181,7 @@ class WhisperProcessor(BaseMultimodalProcessor):
 
         # Check if this is a fused auto-detect request (decoder prompt = [SOT] only,
         # structured generation handles the rest via regex constraint).
-        detect_language = self._pop_sampling_param(request_obj, "_detect_language")
+        detect_language = self._pop_sampling_param(request_obj, FUSED_AUTODETECT_FLAG)
         # timestamp_granularities is a transcription-level field; it must be
         # popped in both branches or it leaks into SamplingParams(**kwargs)
         # downstream and TypeErrors. In the fused branch the FSM regex was

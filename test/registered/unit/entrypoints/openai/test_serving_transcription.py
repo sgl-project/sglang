@@ -91,13 +91,19 @@ def _deltas_from_sse(sse_lines: List[str]) -> List[str]:
 class TestStreamingFusedAutodetect(CustomTestCase):
     """_generate_transcription_stream with _fused_autodetect=True."""
 
-    def _run_stream(self, chunks: List[dict], fused: bool = True):
+    def _run_stream(
+        self, chunks: List[dict], fused: bool = True, ts_variant: bool = False
+    ):
         tm = _MockTokenizerManager(chunks)
         serving = OpenAIServingTranscription(tm)
 
-        request = TranscriptionRequest(model="whisper", stream=True)
+        kwargs = {"model": "whisper", "stream": True}
+        if ts_variant:
+            kwargs["timestamp_granularities"] = ["segment"]
+        request = TranscriptionRequest(**kwargs)
         if fused:
             request._fused_autodetect = True
+            request._fused_ts_variant = ts_variant
         adapted = GenerateReqInput(text="", modalities=["audio"])
         raw_request = Mock()
 
@@ -183,23 +189,7 @@ class TestStreamingFusedAutodetect(CustomTestCase):
                 finish="stop",
             ),
         ]
-        tm = _MockTokenizerManager(chunks)
-        serving = OpenAIServingTranscription(tm)
-        request = TranscriptionRequest(
-            model="whisper", stream=True, timestamp_granularities=["segment"]
-        )
-        request._fused_autodetect = True
-        request._fused_ts_variant = True
-
-        async def drive():
-            frames = []
-            async for f in serving._generate_transcription_stream(
-                GenerateReqInput(text="", modalities=["audio"]), request, Mock()
-            ):
-                frames.append(f)
-            return frames
-
-        frames = get_or_create_event_loop().run_until_complete(drive())
+        request, frames = self._run_stream(chunks, ts_variant=True)
         deltas = _deltas_from_sse(frames)
         self.assertEqual(request.language, "en")
         self.assertFalse(any("<|" in d for d in deltas))
@@ -225,25 +215,7 @@ class TestStreamingFusedAutodetect(CustomTestCase):
                 finish="stop",
             ),
         ]
-        # Mark request as having requested timestamps; the stream handler
-        # itself doesn't branch on that, but this documents the scenario.
-        tm = _MockTokenizerManager(chunks)
-        serving = OpenAIServingTranscription(tm)
-        request = TranscriptionRequest(
-            model="whisper", stream=True, timestamp_granularities=["segment"]
-        )
-        request._fused_autodetect = True
-        request._fused_ts_variant = True
-
-        async def drive():
-            frames = []
-            async for f in serving._generate_transcription_stream(
-                GenerateReqInput(text="", modalities=["audio"]), request, Mock()
-            ):
-                frames.append(f)
-            return frames
-
-        frames = get_or_create_event_loop().run_until_complete(drive())
+        request, frames = self._run_stream(chunks, ts_variant=True)
         deltas = _deltas_from_sse(frames)
         self.assertEqual(request.language, "en")
         self.assertFalse(any("<|" in d for d in deltas))
