@@ -164,6 +164,7 @@ export const DeepSeekV4Deployment = () => {
     "b200|small|balanced",
     "b200|small|max-throughput",
     "b200|small|cp",
+    "b200|small|pd-disagg",
     "b200|big|low-latency",
     "b200|big|balanced",
     "b200|big|max-throughput",
