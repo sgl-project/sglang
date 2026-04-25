@@ -172,6 +172,14 @@ export const DeepSeekV4Deployment = () => {
     "h200|small|low-latency",
     "h200|small|balanced",
     "h200|small|max-throughput",
+    "h200|small|cp",
+    "h200|small|pd-disagg",
+    // h200|big|cp: TBD — cross-machine CP not yet supported by sglang
+    //   (server_args.py asserts tp_size <= 8 with "Cross-machine CP has
+    //   precision issues"), but Pro 1.5T FP8 doesn't fit single 8xH200 node.
+    //   Awaiting an alternative recipe.
+    // h200|big|pd-disagg: pending verification (needs 4-node H200 cluster with
+    //   shared IB fabric: 2-node prefill + 2-node decode).
   ]);
   const BEING_VERIFIED_NOTE =
     "# NOTE: this recipe is being verified on the latest checkpoint";

@@ -145,7 +145,14 @@ The generator currently picks values on the **conservative** side (mirroring an 
 
 **Hopper (H200) note**
 
-The H200 image and checkpoint are currently being uploaded — public path coming shortly.
+H200 image (`lmsysorg/sglang:deepseek-v4-hopper`) and FP8 checkpoints
+(`sgl-project/DeepSeek-V4-Flash-FP8`, `sgl-project/DeepSeek-V4-Pro-FP8`) are
+publicly available.
+
+PD-Disagg recipes on H200 require `docker run --privileged --ulimit memlock=-1`
+(or explicitly `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`)
+so mooncake can discover the IB HCAs; without it RDMA falls back silently to
+TCP and KV transfer produces garbled output.
 
 **Base model usage**
 
