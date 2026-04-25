@@ -487,9 +487,9 @@ jobs:
           # entry (~16-23 GB each). Prune them before building so the runner
           # doesn't fill up. The local buildx cache at ~/.cache/sgl-kernel/buildx
           # and the tagged sgl-kernel-deps image are not affected.
-          # `until=1h` avoids racing with a sibling matrix cell (cuda 12.9 vs
+          # `until=12h` avoids racing with a sibling matrix cell (cuda 12.9 vs
           # 13.0) that may have just orphaned an image seconds ago.
-          docker image prune -f --filter "until=1h"
+          docker image prune -f --filter "until=12h"
           # Drop orphaned buildx builder volumes from past `docker buildx create`
           # invocations. The active `sgl-kernel-builder` volume is held open and
           # would fail to remove anyway, but skip it explicitly for clarity.
@@ -569,7 +569,7 @@ jobs:
         run: |
           set -x
           # See sgl-kernel-build-wheels above for the rationale.
-          docker image prune -f --filter "until=1h"
+          docker image prune -f --filter "until=12h"
           for v in $(docker volume ls -q | grep '^buildx_buildkit_' | grep -v '^buildx_buildkit_sgl-kernel-builder' || true); do
             echo "Removing orphan buildx volume: $v"
             docker volume rm "$v" || true
