@@ -26,6 +26,7 @@ export const DeepSeekV4Deployment = () => {
       title: "Hardware Platform",
       items: [
         { id: "b200",  label: "B200 (FP4)",  default: true  },
+        { id: "b300",  label: "B300 (FP4)",  default: false  },
         { id: "gb300", label: "GB300 (FP4)", default: false },
         { id: "h200",  label: "H200 (FP8)",  default: false },
       ],
@@ -164,6 +165,7 @@ export const DeepSeekV4Deployment = () => {
     "b200|small|balanced",
     "b200|small|max-throughput",
     "b200|small|cp",
+    "b200|small|pd-disagg",
     "b200|big|low-latency",
     "b200|big|balanced",
     "b200|big|max-throughput",
@@ -171,7 +173,25 @@ export const DeepSeekV4Deployment = () => {
     "h200|small|low-latency",
     "h200|small|balanced",
     "h200|small|max-throughput",
+    "gb300|small|low-latency",
+    "gb300|small|balanced",
+    "gb300|small|max-throughput",
+    "h200|small|cp",
+    "h200|small|pd-disagg",
+    // h200|big|pd-disagg: pending verification (needs 4-node H200 cluster with
+    //   shared IB fabric: 2-node prefill + 2-node decode).
+    "gb300|small|cp",
+    "gb300|big|cp",
+    "gb300|small|pd-disagg",
+    "gb300|big|pd-disagg",
   ]);
+  // Recipes whose command is intentionally not yet provided (e.g. blocked by an
+  // upstream limitation). Showing a minimal placeholder is friendlier to users
+  // than emitting a commented-out invalid command.
+  const TBD_RECIPES = new Set([
+    "h200|big|cp",
+  ]);
+  const TBD_PLACEHOLDER = "# to be provided";
   const BEING_VERIFIED_NOTE =
     "# NOTE: this recipe is being verified on the latest checkpoint";
 
@@ -203,7 +223,9 @@ export const DeepSeekV4Deployment = () => {
   // === SHARED END ===
 
   const generateCommand = () => {
-    const { hardware, modelSize, recipe, reasoningParser, toolcall } = values;
+    const { hardware: rawHardware, modelSize, recipe, reasoningParser, toolcall } = values;
+    // B300 usage is identical to B200 — alias so we don't duplicate every spec entry.
+    const hardware = rawHardware === "b300" ? "b200" : rawHardware;
     const specKey = `${hardware}|${modelSize}`;
     const spec = HW_SIZE_SPEC[specKey];
     const { slug, tp, multinode, nnodes } = spec;
@@ -360,7 +382,17 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --enable-nsa-prefill-context-parallel");
       flags.push("  --nsa-prefill-cp-mode round-robin-split");
       flags.push("  --chunked-prefill-size 16384");
-      flags.push("  --mem-fraction-static 0.78");
+      // GB300 big CP needs higher mem-fraction-static: Pro 1.6T weights at
+      // tp=4 are ~224 GB/card on a 273 GB GB300, so 0.78 leaves a negative
+      // KV pool (init_memory_pool fails: "Not enough memory ... weights
+      // 224 GB > static target 213 GB"). 0.88 gives weights 224 + KV 16 +
+      // runtime 33. Other Blackwell tp=8 paths fit fine at 0.78.
+      // Verified on 2026-04-25 (journal 2026-04-25-001 Cell B, Δ4).
+      if (hardware === "gb300" && isBig) {
+        flags.push("  --mem-fraction-static 0.88");
+      } else {
+        flags.push("  --mem-fraction-static 0.78");
+      }
       // allinone _CP_FLAGS has --max-running-requests 1024; Blackwell big cp overrides
       // to 256. Human directed (2026-04-24) to emit only one value — keep 256 override
       // for big Blackwell, else the default 1024.
@@ -387,6 +419,7 @@ export const DeepSeekV4Deployment = () => {
     const base = `${envBlock}sglang serve \\\n${flags.join(" \\\n")}`;
     const withMultinode = multinode ? prependMultiNodeNote(base, nnodes) : base;
     const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+    if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
     return VERIFIED_RECIPES.has(verifyKey)
       ? withMultinode
       : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(withMultinode)}`;
@@ -409,7 +442,9 @@ export const DeepSeekV4Deployment = () => {
   //   --max-running-requests 256 only on decode (PD decode can't retract).
   //   No flashinfer_mxfp4 / autotune-fix / MTP / mem-fraction-static on PD (allinone omits).
   // ============================================================================
-  const buildPDDisaggCommand = (hardware, modelSize) => {
+  const buildPDDisaggCommand = (rawHardware, modelSize) => {
+    // B300 usage is identical to B200 — alias so we don't duplicate every spec entry.
+    const hardware = rawHardware === "b300" ? "b200" : rawHardware;
     const specKey = `${hardware}|${modelSize}`;
     const { tp: pdTp, multinode, nnodes } = PD_TP_SPEC[specKey];
     const slug = HW_SIZE_SPEC[specKey].slug;
@@ -423,7 +458,8 @@ export const DeepSeekV4Deployment = () => {
       gb300: [],
     }[hardware];
     // Whitelist #5: only SGLANG_MOONCAKE_CUSTOM_MEM_POOL kept; MC_FORCE_MNNVL /
-    // NCCL_MNNVL_ENABLE / NCCL_CUMEM_ENABLE stripped (personal-cluster topology).
+    // NCCL_MNNVL_ENABLE / NCCL_CUMEM_ENABLE may also be needed depending on the
+    // GB300 cluster's NVLink/IB topology — see §3.2 "Configuration Tips" note.
     const MNNVL_ENV = isGB300 ? ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True"] : [];
     const COMMON_ENV = ["SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
 
@@ -431,6 +467,18 @@ export const DeepSeekV4Deployment = () => {
       const roleEnv = [];
       if (hardware === "b200" && mode === "decode") {
         roleEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
+      }
+      // GB300 PD needs DeepEP dispatch buffer cap on BOTH prefill + decode;
+      // without it, the first forward fails `deep_ep.cpp:1233` assertion
+      // `x.size(0) <= num_max_dispatch_tokens_per_rank`. The cap also
+      // co-moves with --max-running-requests below: 256 for big (which
+      // uses --max-running-requests 128, per-rank=32 ≤ 256), 1024 for
+      // small (--max-running-requests 256, per-rank=64 ≤ 1024).
+      // Verified on 2026-04-25 (journal 2026-04-25-001 §C/§D).
+      if (isGB300) {
+        roleEnv.push(modelSize === "big"
+          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
+          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       }
       const envAll = [...HW_ENV, ...roleEnv, ...MNNVL_ENV, ...COMMON_ENV];
       const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
@@ -447,7 +495,21 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --disaggregation-transfer-backend mooncake");
       if (ibDevice) flags.push(`  --disaggregation-ib-device ${ibDevice}`);
       if (!isGB300) flags.push(`  --dist-init-addr 127.0.0.1:${distPort}`);
-      if (mode === "decode") flags.push("  --max-running-requests 256");
+      if (mode === "decode") {
+        // GB300 big PD decode is the most memory-pressured PD role: Pro 1.6T
+        // weights at tp=4 take ~224 GB/card on a 273 GB GB300; runtime needs
+        // headroom for DeepEP buffer + mooncake KV recv + CG private pool.
+        // Cookbook defaults (mem-frac 0.874, cg_max_bs 512, max-running 256)
+        // OOM during CG capture. Verified working on 2026-04-25 (journal
+        // 2026-04-25-001 Cell D, Δ10).
+        if (isGB300 && modelSize === "big") {
+          flags.push("  --max-running-requests 128");
+          flags.push("  --mem-fraction-static 0.83");
+          flags.push("  --cuda-graph-max-bs 128");
+        } else {
+          flags.push("  --max-running-requests 256");
+        }
+      }
       flags.push("  --host 0.0.0.0");
       flags.push(`  --port ${port}`);
 
@@ -463,17 +525,21 @@ export const DeepSeekV4Deployment = () => {
 
     const prefill = `${prefillHeader}\n${buildRole("prefill", 30000, 30335)}`;
     const decode  = `${decodeHeader}\n${buildRole("decode",  30001, 30435)}`;
+    // Router addresses prefill / decode by their reachable hostnames / IPs.
+    // Substitute <prefill-host> / <decode-host> with the actual hosts before
+    // running. On a same-host deployment, both can be 127.0.0.1.
     const router  = `# --- Router (port 8000) ---
 python3 -m sglang_router.launch_router \\
   --pd-disaggregation \\
-  --prefill http://127.0.0.1:30000 \\
-  --decode http://127.0.0.1:30001 \\
+  --prefill http://<prefill-host>:30000 \\
+  --decode http://<decode-host>:30001 \\
   --host 0.0.0.0 --port 8000 \\
   --disable-circuit-breaker \\
   --health-check-interval-secs 999999`;
 
     const full = `${prefill}\n\n${decode}\n\n${router}`;
     const verifyKey = `${hardware}|${modelSize}|pd-disagg`;
+    if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
     return VERIFIED_RECIPES.has(verifyKey)
       ? full
       : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(full)}`;

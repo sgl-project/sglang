@@ -3442,6 +3442,12 @@ def is_gfx95_supported():
         return False
 
 
+def get_hip_version():
+    if torch.version.hip:
+        return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
+    return (0, 0, 0)
+
+
 # LoRA-related constants and utilities
 SUPPORTED_LORA_TARGET_MODULES = [
     "q_proj",
