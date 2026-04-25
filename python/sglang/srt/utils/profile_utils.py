@@ -1,12 +1,15 @@
 import logging
 import os
+import re
 import time
 from abc import ABC
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 import torch
+from torch.profiler import record_function
 
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -25,6 +28,9 @@ if _is_npu:
     torch_npu._apply_patches(patches)
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ScheduleBatch
 
 
 class ProfileManager:
@@ -60,6 +66,7 @@ class ProfileManager:
         merge_profiles: bool,
         profile_prefix: str,
         profile_stages: Optional[List[str]] = None,
+        profile_annotate: bool = False,
     ):
         # not supported yet
         assert start_step is None
@@ -80,6 +87,7 @@ class ProfileManager:
             output_dir=output_dir,
             output_prefix=profile_prefix,
             profile_id=profile_id,
+            profile_annotate=profile_annotate,
         )
 
         self.stage_based_trigger.configure(
@@ -119,6 +127,100 @@ class ProfileManager:
             f"Profiling done. Traces are saved to: {self.profiler_kwargs['output_dir']}"
         )
         self.profiler = None
+
+
+def build_iteration_profile_annotation(batch: "ScheduleBatch") -> str:
+    forward_mode = batch.forward_mode
+    if forward_mode is None:
+        stage = "unknown"
+    elif forward_mode.is_extend():
+        stage = "prefill"
+    elif forward_mode.is_decode():
+        stage = "decode"
+    elif forward_mode.is_mixed():
+        stage = "mixed"
+    else:
+        stage = forward_mode.name.lower()
+
+    num_ctx_requests = 0
+    num_ctx_tokens = 0
+    num_gen_requests = 0
+    num_gen_tokens = 0
+
+    reqs = batch.reqs or []
+    if forward_mode is not None and forward_mode.is_decode():
+        num_gen_requests = len(reqs)
+        num_gen_tokens = len(reqs)
+    elif forward_mode is not None and forward_mode.is_extend():
+        num_ctx_requests = len(reqs)
+        if batch.extend_num_tokens is not None:
+            num_ctx_tokens = batch.extend_num_tokens
+        else:
+            num_ctx_tokens = sum(req.extend_input_len for req in reqs)
+    elif forward_mode is not None and forward_mode.is_mixed():
+        if batch.decoding_reqs is not None:
+            num_gen_requests = len(batch.decoding_reqs)
+        else:
+            num_gen_requests = sum(1 for req in reqs if len(req.output_ids) > 0)
+        num_ctx_requests = max(len(reqs) - num_gen_requests, 0)
+        if batch.extend_num_tokens is not None:
+            num_ctx_tokens = batch.extend_num_tokens
+        else:
+            num_ctx_tokens = sum(req.extend_input_len for req in reqs)
+        num_gen_tokens = num_gen_requests
+
+    def _sum_lens(value) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, torch.Tensor):
+            return int(value.sum().item())
+        return sum(value)
+
+    seq_sum = _sum_lens(batch.seq_lens)
+    if forward_mode is not None and forward_mode.is_decode():
+        # prefix_lens and extend_lens are not refreshed in prepare_for_decode
+        # and carry stale values from the last extend/mixed iteration.
+        prefix_sum = 0
+        extend_sum = 0
+    else:
+        prefix_sum = _sum_lens(batch.prefix_lens)
+        extend_sum = _sum_lens(batch.extend_lens)
+    return (
+        f"{stage}_context_{num_ctx_requests}({num_ctx_tokens})_generation_"
+        f"{num_gen_requests}({num_gen_tokens})_prefix_numtokens_{prefix_sum}"
+        f"_extend_numtokens_{extend_sum}_seq_lens_sum_{seq_sum}"
+    )
+
+
+def get_iteration_profile_context(
+    batch: "ScheduleBatch", enabled: bool
+) -> AbstractContextManager:
+    if not enabled:
+        return nullcontext()
+    name = build_iteration_profile_annotation(batch)
+    return record_function(name)
+
+
+def _classify_kernel_name(name: str) -> Optional[str]:
+    patterns = [
+        (
+            "gemm",
+            r"(Cijk_Alik_Bljk|gemm|cublas|cublaslt|xmma|wgmma|sgemm|hgemm|dgemm|igemm)",
+        ),
+        ("moe", r"(moe|expert|mixtral|fused_moe|router|\btopk\b)"),
+        ("attention", r"(attn|flash|paged|mha|mqa|gqa|qkv|kvcache|kv_cache)"),
+        (
+            "comm",
+            r"(nccl|allreduce|all_reduce|allgather|all_gather|reduce_scatter|broadcast|sendrecv|cross_device_reduce)",
+        ),
+        ("norm", r"(layernorm|rmsnorm|batchnorm|groupnorm|\bnorm\b)"),
+        ("activation", r"(gelu|silu|swiglu|relu|activation|softmax|sigmoid)"),
+        ("embedding", r"(embedding|rope|pos_enc|posenc)"),
+    ]
+    for label, pattern in patterns:
+        if re.search(pattern, name):
+            return label
+    return None
 
 
 def _get_stage_from_forward_mode(forward_mode: ForwardMode):
@@ -243,6 +345,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         tp_rank: int,
         cpu_group,
         first_rank_in_node: bool,
+        profile_annotate: bool = False,
     ):
         self.output_dir = output_dir
         self.output_prefix = output_prefix
@@ -251,6 +354,7 @@ class _ProfilerConcreteBase(_ProfilerBase):
         self.tp_rank = tp_rank
         self.cpu_group = cpu_group
         self.first_rank_in_node = first_rank_in_node
+        self.profile_annotate = profile_annotate
 
 
 class _ProfilerTorch(_ProfilerConcreteBase):

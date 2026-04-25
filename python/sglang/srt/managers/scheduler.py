@@ -2787,9 +2787,12 @@ class Scheduler(
 
         # Whether to run the profiler
         self._profile_batch_predicate(batch)
+        profile_ctx = self.get_profile_iteration_context(batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
+
+        profile_ctx.__enter__()
 
         # Capture prefill start time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:
@@ -2797,6 +2800,7 @@ class Scheduler(
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
+            profile_ctx.__exit__(None, None, None)
             return self._run_batch_prebuilt(batch)
 
         # Run forward
@@ -2915,6 +2919,8 @@ class Scheduler(
                     embeddings=pooler_output.embeddings,
                     pooled_hidden_states=pooler_output.pooled_hidden_states,
                 )
+
+        profile_ctx.__exit__(None, None, None)
 
         # Capture prefill end time for EXTEND mode
         if batch.forward_mode == ForwardMode.EXTEND:

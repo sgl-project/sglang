@@ -8,15 +8,20 @@ import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from sglang.srt.utils.profile_utils import _classify_kernel_name
+
 logger = logging.getLogger(__name__)
 
 
 class ProfileMerger:
     """Merge profile traces from all parallelism types: TP, DP, PP, EP."""
 
-    def __init__(self, output_dir: str, profile_id: str):
+    def __init__(
+        self, output_dir: str, profile_id: str, profile_annotate: bool = False
+    ):
         self.output_dir = output_dir
         self.profile_id = profile_id
+        self.profile_annotate = profile_annotate
         self.merged_trace_path = os.path.join(
             output_dir, f"merged-{profile_id}.trace.json.gz"
         )
@@ -156,7 +161,29 @@ class ProfileMerger:
 
             event["pid"] = f"{rank_label} {event['pid']}"
 
+            if self.profile_annotate:
+                kernel_type = self._classify_kernel_event(event)
+                if kernel_type is not None:
+                    args = event.setdefault("args", {})
+                    args.setdefault("kernel_type", kernel_type)
         return events
+
+    def _classify_kernel_event(self, event: Dict) -> Optional[str]:
+        if not self._is_kernel_event(event):
+            return None
+        name = str(event.get("name") or "").lower()
+        if not name:
+            return None
+        return _classify_kernel_name(name)
+
+    @staticmethod
+    def _is_kernel_event(event: Dict) -> bool:
+        cat = event.get("cat", "")
+        if isinstance(cat, str):
+            cat_lower = cat.lower()
+            if "cuda" in cat_lower or "kernel" in cat_lower or "gpu" in cat_lower:
+                return True
+        return False
 
     def _calculate_sort_index(self, rank_info: Dict[str, int], pid: int) -> int:
         sort_index = pid

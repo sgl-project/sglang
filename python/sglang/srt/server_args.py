@@ -628,6 +628,7 @@ class ServerArgs:
     enable_cudagraph_gc: bool = False
     debug_cuda_graph: bool = False
     enable_layerwise_nvtx_marker: bool = False
+    profile_annotate: bool = False
     enable_nccl_nvls: bool = False
     enable_symm_mem: bool = False
     disable_flashinfer_cutlass_moe_fp4_allgather: bool = False
@@ -5891,6 +5892,14 @@ class ServerArgs:
             "--enable-layerwise-nvtx-marker",
             action="store_true",
             help="Enable layerwise NVTX profiling annotations for the model.",
+        )
+        parser.add_argument(
+            "--profile-annotate",
+            action="store_true",
+            help=(
+                "Enable extended profiling annotations (per-iteration labels) "
+                "and kernel classification in merged traces."
+            ),
         )
         parser.add_argument(
             "--enable-nccl-nvls",

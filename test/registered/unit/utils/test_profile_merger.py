@@ -199,6 +199,60 @@ class TestProfileMerger(unittest.TestCase):
         with self.assertRaises(ValueError):
             empty_merger.merge_chrome_traces()
 
+    def test_kernel_classification_on_merge(self):
+        trace_files = [
+            {
+                "filename": f"{self.profile_id}-TP-0.trace.json.gz",
+                "events": [
+                    {
+                        "ph": "X",
+                        "name": "cublasGemmEx",
+                        "cat": "cuda",
+                        "pid": 83,
+                        "ts": 1000.0,
+                        "dur": 10.0,
+                    },
+                    {
+                        "ph": "X",
+                        "name": "flash_attn_fwd",
+                        "cat": "cuda",
+                        "pid": 84,
+                        "ts": 2000.0,
+                        "dur": 12.0,
+                    },
+                ],
+            }
+        ]
+
+        for trace_data in trace_files:
+            filepath = os.path.join(self.temp_dir, trace_data["filename"])
+            trace_content = {
+                "schemaVersion": 1,
+                "deviceProperties": [{"device_id": 0, "name": "GPU-0"}],
+                "traceEvents": trace_data["events"],
+            }
+            with gzip.open(filepath, "wt") as f:
+                json.dump(trace_content, f)
+
+        merger = ProfileMerger(self.temp_dir, self.profile_id, True)
+        merged_path = merger.merge_chrome_traces()
+        with gzip.open(merged_path, "rt") as f:
+            merged_data = json.load(f)
+
+        kernel_types = {
+            event.get("args", {}).get("kernel_type")
+            for event in merged_data["traceEvents"]
+        }
+        self.assertIn("gemm", kernel_types)
+        self.assertIn("attention", kernel_types)
+
+        merger_no_classify = ProfileMerger(self.temp_dir, self.profile_id, False)
+        merged_path = merger_no_classify.merge_chrome_traces()
+        with gzip.open(merged_path, "rt") as f:
+            merged_data = json.load(f)
+        for event in merged_data["traceEvents"]:
+            self.assertNotIn("kernel_type", event.get("args", {}))
+
 
 class TestProfileMergerIntegration(unittest.TestCase):
 

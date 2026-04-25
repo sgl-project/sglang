@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from contextlib import AbstractContextManager, nullcontext
 from pathlib import Path
 from typing import TYPE_CHECKING, List, Optional
 
@@ -14,7 +15,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.srt.utils.profile_utils import ProfileManager
+from sglang.srt.utils.profile_utils import (
+    ProfileManager,
+    get_iteration_profile_context,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -91,6 +95,7 @@ class SchedulerProfilerMixin:
                 merge_profiles=merge_profiles,
                 profile_prefix=profile_prefix,
                 profile_stages=profile_stages,
+                profile_annotate=self.server_args.profile_annotate,
             )
 
         if self.profile_in_progress:
@@ -101,7 +106,6 @@ class SchedulerProfilerMixin:
 
         self.profile_by_stage = profile_by_stage
         self.merge_profiles = merge_profiles
-
         if output_dir is None:
             output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
         if activities is None:
@@ -231,7 +235,11 @@ class SchedulerProfilerMixin:
 
         try:
             logger.info("Starting profile merge...")
-            merger = ProfileMerger(self.torch_profiler_output_dir, self.profile_id)
+            merger = ProfileMerger(
+                self.torch_profiler_output_dir,
+                self.profile_id,
+                profile_annotate=self.server_args.profile_annotate,
+            )
             merged_path = merger.merge_chrome_traces()
 
             summary = merger.get_merge_summary()
@@ -375,6 +383,23 @@ class SchedulerProfilerMixin:
                 and self.profiler_start_forward_ct == self.forward_ct
             ):
                 self.start_profile()
+
+    def get_profile_iteration_context(
+        self: Scheduler, batch: ScheduleBatch
+    ) -> AbstractContextManager:
+        if not self.server_args.profile_annotate:
+            return nullcontext()
+
+        if envs.SGLANG_PROFILE_V2.get():
+            profiler_active = (
+                hasattr(self, "_profile_manager")
+                and self._profile_manager is not None
+                and self._profile_manager.profiler is not None
+            )
+        else:
+            profiler_active = self.profile_in_progress
+
+        return get_iteration_profile_context(batch, profiler_active)
 
     def profile(self: Scheduler, recv_req: ProfileReq):
         if recv_req.type == ProfileReqType.START_PROFILE:

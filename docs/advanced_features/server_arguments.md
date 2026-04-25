@@ -407,6 +407,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--enable-profile-cuda-graph` | Enable profiling of cuda graph capture. | `False` | bool flag (set to enable) |
 | `--enable-cudagraph-gc` | Enable garbage collection during CUDA graph capture. If disabled (default), GC is frozen during capture to speed up the process. | `False` | bool flag (set to enable) |
 | `--enable-layerwise-nvtx-marker` | Enable layerwise NVTX profiling annotations for the model. This adds NVTX markers to every layer for detailed per-layer performance analysis with Nsight Systems. | `False` | bool flag (set to enable) |
+| `--profile-annotate` | Enable profiling annotations (per-iteration labels) and kernel classification in merged traces. | `False` | bool flag (set to enable) |
 | `--enable-nccl-nvls` | Enable NCCL NVLS for prefill heavy requests when available. | `False` | bool flag (set to enable) |
 | `--enable-symm-mem` | Enable NCCL symmetric memory for fast collectives. | `False` | bool flag (set to enable) |
 | `--disable-flashinfer-cutlass-moe-fp4-allgather` | Disables quantize before all-gather for flashinfer cutlass moe. | `False` | bool flag (set to enable) |
