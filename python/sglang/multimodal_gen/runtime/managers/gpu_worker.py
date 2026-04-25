@@ -58,6 +58,8 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
+from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
@@ -223,18 +225,19 @@ class GPUWorker:
         req = batch[0]
         output_batch = None
         try:
-            if self.rank == 0:
+            if self.rank == 0 and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
 
             # capture memory baseline before forward
-            if self.rank == 0 and req.metrics:
+            if self.rank == 0 and req.metrics and not current_platform.is_cpu():
                 baseline_snapshot = capture_memory_snapshot()
                 req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
             req.log(server_args=self.server_args)
-            result = self.pipeline.forward(req, self.server_args)
+            with trace_slice(req.trace_ctx, DiffStage.GPU_FORWARD):
+                result = self.pipeline.forward(req, self.server_args)
 
             # For disagg roles, return raw Req to let the caller handle
             # the role-to-role tensor transfer before OutputBatch conversion.
@@ -259,7 +262,11 @@ class GPUWorker:
                 output_batch = result
 
             # capture memory after forward (peak)
-            if self.rank == 0 and output_batch.metrics:
+            if (
+                self.rank == 0
+                and output_batch.metrics
+                and not current_platform.is_cpu()
+            ):
                 peak_snapshot = capture_memory_snapshot()
                 output_batch.metrics.record_memory_snapshot(
                     "after_forward", peak_snapshot
@@ -268,6 +275,7 @@ class GPUWorker:
             if (
                 self.rank == 0
                 and not req.suppress_logs
+                and not current_platform.is_cpu()
                 and logger.isEnabledFor(logging.DEBUG)
             ):
                 self.do_mem_analysis(output_batch)
@@ -524,6 +532,10 @@ def run_scheduler_process(
         set_cuda_arch()
     elif current_platform.is_musa():
         set_musa_arch()
+
+    if server_args.enable_trace:
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
+        trace_set_thread_info(f"DiffWorker_rank{rank}")
 
     port_args = PortArgs.from_server_args(server_args)
 

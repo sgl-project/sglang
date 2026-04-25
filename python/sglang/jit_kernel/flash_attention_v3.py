@@ -119,6 +119,7 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
+    out=None,
 ):
     if not _is_fa3_supported():
         raise NotImplementedError(
@@ -160,6 +161,7 @@ def flash_attn_with_kvcache(
         sm_margin,
         return_softmax_lse,
         sinks,
+        out=out,
     )
 
 
@@ -189,6 +191,7 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
+    out=None,
 ):
 
     if not _is_fa3_supported():
@@ -221,4 +224,5 @@ def flash_attn_varlen_func(
         sm_margin,
         return_softmax_lse,
         sinks,
+        out=out,
     )

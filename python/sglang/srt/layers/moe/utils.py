@@ -148,6 +148,7 @@ MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
+RECORD_NOLORA_GRAPH: bool = False
 DEEPEP_MODE: Optional[DeepEPMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
 IS_SBO_ENABLED: Optional[bool] = None
@@ -162,6 +163,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global MOE_RUNNER_BACKEND
     global SPECULATIVE_MOE_RUNNER_BACKEND
     global SPECULATIVE_MOE_A2A_BACKEND
+    global RECORD_NOLORA_GRAPH
     global DEEPEP_MODE
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
@@ -172,6 +174,25 @@ def initialize_moe_config(server_args: ServerArgs):
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
+    # Dual CUDA graphs only validated for triton MoE backends.
+    _triton_ok = MOE_RUNNER_BACKEND in (
+        MoeRunnerBackend.TRITON,
+        MoeRunnerBackend.TRITON_KERNELS,
+    )
+    if (
+        bool(server_args.record_nolora_graph)
+        and bool(server_args.enable_lora)
+        and not _triton_ok
+    ):
+        logger.warning(
+            f"record_nolora_graph only validated for triton MoE backend, "
+            f"but moe_runner_backend={server_args.moe_runner_backend}. Disabling."
+        )
+    RECORD_NOLORA_GRAPH = (
+        bool(server_args.record_nolora_graph)
+        and bool(server_args.enable_lora)
+        and _triton_ok
+    )
     SPECULATIVE_MOE_RUNNER_BACKEND = (
         MoeRunnerBackend(server_args.speculative_moe_runner_backend)
         if server_args.speculative_moe_runner_backend is not None
@@ -227,6 +248,10 @@ def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
     return SPECULATIVE_MOE_A2A_BACKEND
 
 
+def should_record_nolora_graph() -> bool:
+    return RECORD_NOLORA_GRAPH
+
+
 def get_deepep_mode() -> DeepEPMode:
     global DEEPEP_MODE
     if DEEPEP_MODE is None:
@@ -261,6 +286,14 @@ def is_deepep_class_backend() -> bool:
     """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
     b = get_moe_a2a_backend()
     return b.is_deepep() or b.is_mooncake() or b.is_mori()
+
+
+def is_flashinfer_cutedsl_v1_path() -> bool:
+    """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune)."""
+    return (
+        get_moe_runner_backend().is_flashinfer_cutedsl()
+        and get_moe_a2a_backend().is_deepep()
+    )
 
 
 def get_tbo_token_distribution_threshold() -> float:
