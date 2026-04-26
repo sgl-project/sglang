@@ -20,9 +20,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.hunyuan3d import (
     Hunyuan3D2PipelineConfig,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
-    clone_scheduler_runtime,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -778,7 +775,7 @@ class Hunyuan3DPaintTexGenStage(PipelineStage):
 
         prompt_embeds = self.transformer.learned_text_clip_gen.repeat(1, 1, 1)
         negative_prompt_embeds = torch.zeros_like(prompt_embeds)
-        scheduler = clone_scheduler_runtime(self.scheduler)
+        scheduler = self.scheduler
 
         if self.is_turbo:
             bsz = 3

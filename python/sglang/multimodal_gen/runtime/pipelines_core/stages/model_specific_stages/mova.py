@@ -46,9 +46,6 @@ from sglang.multimodal_gen.runtime.models.dits.mova_video_dit import (
 # Create aliases for backward compatibility
 video_sinusoidal_embedding_1d = sinusoidal_embedding_1d
 audio_sinusoidal_embedding_1d = sinusoidal_embedding_1d
-from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
-    clone_scheduler_runtime,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -130,7 +127,7 @@ class MOVATimestepPreparationStage(PipelineStage):
         self.scheduler = scheduler
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        scheduler = clone_scheduler_runtime(self.scheduler)
+        scheduler = self.scheduler
         scheduler.set_timesteps(
             batch.num_inference_steps,
             denoising_strength=1.0,

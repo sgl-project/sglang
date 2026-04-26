@@ -20,9 +20,6 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
     TransformerLoader,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
-    clone_scheduler_runtime,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
@@ -199,7 +196,7 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
             cond = cat_recursive(cond, un_cond)
 
         # 4. Latent and timestep preparation
-        scheduler = clone_scheduler_runtime(self.scheduler)
+        scheduler = self.scheduler
         batch_size = image.shape[0]
         sigmas = np.linspace(0, 1, batch.num_inference_steps)
         timesteps, _ = retrieve_timesteps(

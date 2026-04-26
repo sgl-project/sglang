@@ -13,8 +13,20 @@ def clone_scheduler_runtime(scheduler: Any) -> Any:
     return deepcopy(scheduler)
 
 
-def get_or_create_request_scheduler(batch: Req, scheduler_template: Any) -> Any:
-    """Return the request-local scheduler, cloning the template when absent."""
+def get_or_create_request_scheduler(
+    batch: Req, scheduler_template: Any, *, isolate: bool = False
+) -> Any:
+    """Return the scheduler runtime for this request.
+
+    Diffusion serving currently executes one request at a time on the normal
+    worker path, so reusing the stage-local scheduler preserves warmup caches
+    and avoids unnecessary deepcopy overhead. Set ``isolate=True`` only when a
+    request can run concurrently or outlive the stage-local scheduler state.
+    """
     if batch.scheduler is None:
-        batch.scheduler = clone_scheduler_runtime(scheduler_template)
+        batch.scheduler = (
+            clone_scheduler_runtime(scheduler_template)
+            if isolate
+            else scheduler_template
+        )
     return batch.scheduler

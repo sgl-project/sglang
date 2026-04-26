@@ -10,9 +10,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
-from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
-    clone_scheduler_runtime,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -491,7 +488,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         ]
 
         # 5. Prepare timesteps
-        scheduler = clone_scheduler_runtime(self.scheduler)
+        scheduler = self.scheduler
         sigmas = np.linspace(1.0, 0, num_inference_steps + 1)[:-1]
         image_seq_len = latents.shape[1]
         base_seqlen = 256 * 256 / 16 / 16

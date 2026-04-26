@@ -14,9 +14,6 @@ from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.glm_image import GlmImageKVCache
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
-from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
-    clone_scheduler_runtime,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
@@ -778,7 +775,7 @@ class GlmImageBeforeDenoisingStage(PipelineStage):
         )
 
         # Prepare timesteps
-        scheduler = clone_scheduler_runtime(self.scheduler)
+        scheduler = self.scheduler
         image_seq_len = (
             (height // self.vae_scale_factor) * (width // self.vae_scale_factor)
         ) // (self.transformer.config.patch_size**2)
