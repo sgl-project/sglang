@@ -101,16 +101,18 @@ class Qwen3Attention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.tp_rank = get_tensor_model_parallel_rank()
 
-        norm_kwargs = (
-            dict(
-                weight_dtype=torch.float32,
-                cast_x_before_out_mul=True,
-            )
-            if get_global_server_args().rl_on_policy_target is not None
-            else {}
-        )
-        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
-        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
+        # For non-triton on-policy backends, keep fp32 qk norms for precision.
+        # For triton on-policy, RMSNorm.__init__ auto-enables cast_x_before_out_mul.
+        _server_args = get_global_server_args()
+        if (
+            _server_args.rl_on_policy_target is not None
+            and _server_args.attention_backend != "triton"
+        ):
+            _qk_norm_kwargs = dict(weight_dtype=torch.float32, cast_x_before_out_mul=True)
+        else:
+            _qk_norm_kwargs = {}
+        self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **_qk_norm_kwargs)
+        self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **_qk_norm_kwargs)
 
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
@@ -266,7 +268,12 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if get_global_server_args().rl_on_policy_target is not None:
+        _server_args = get_global_server_args()
+        # Non-triton on-policy path: ensure bf16 dtype before attention.
+        if (
+            _server_args.rl_on_policy_target is not None
+            and _server_args.attention_backend != "triton"
+        ):
             hidden_states = hidden_states.bfloat16()
 
         save_kv_cache = True
@@ -296,7 +303,11 @@ class Qwen3Attention(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if get_global_server_args().rl_on_policy_target is not None:
+        # Non-triton on-policy path: ensure q/k are bf16 for attention kernel.
+        if (
+            _server_args.rl_on_policy_target is not None
+            and _server_args.attention_backend != "triton"
+        ):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
@@ -351,21 +362,27 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
         )
 
-        norm_kwargs = (
-            dict(
+        # For non-triton on-policy backends, preserve fp32 residual path.
+        # For triton on-policy, RMSNorm.__init__ auto-enables cast_x_before_out_mul
+        # and uses forward_native; residual is added in bf16 to match HF.
+        _server_args = get_global_server_args()
+        if (
+            _server_args.rl_on_policy_target is not None
+            and _server_args.attention_backend != "triton"
+        ):
+            _ln_kwargs = dict(
                 weight_dtype=torch.float32,
                 cast_x_before_out_mul=True,
                 override_orig_dtype=torch.float32,
                 fp32_residual=True,
             )
-            if get_global_server_args().rl_on_policy_target is not None
-            else {}
-        )
+        else:
+            _ln_kwargs = {}
         self.input_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            config.hidden_size, eps=config.rms_norm_eps, **_ln_kwargs
         )
         self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+            config.hidden_size, eps=config.rms_norm_eps, **_ln_kwargs
         )
 
         self.layer_scatter_modes = LayerScatterModes.init_new(

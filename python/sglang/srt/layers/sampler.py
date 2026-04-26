@@ -129,10 +129,10 @@ class Sampler(nn.Module):
             # In RL on-policy mode, we use log_softmax to compute logprobs to match the trainer.
             logprobs_via_logsoftmax_kernel = None
             if self.rl_on_policy_target is not None:
-                # TODO: use more inplace ops to save memory
-                logits_div_temperature = (
-                    logits.bfloat16().div(sampling_info.temperatures).bfloat16()
-                )
+                # Use fp32 log_softmax to match training-side computation exactly.
+                # The training side computes log_softmax in fp32; previous bf16
+                # casts here introduced a systematic ~5e-4 drift in logprob_abs_diff.
+                logits_div_temperature = logits.div(sampling_info.temperatures)
                 logprobs_via_logsoftmax_kernel = torch.log_softmax(
                     logits_div_temperature, dim=-1
                 )

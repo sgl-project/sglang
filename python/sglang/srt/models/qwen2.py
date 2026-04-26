@@ -20,6 +20,7 @@ import logging
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from sglang.srt.distributed import (
@@ -93,9 +94,18 @@ class Qwen2MLP(nn.Module):
 
     def forward(self, x):
         if get_global_server_args().rl_on_policy_target is not None:
-            x = x.bfloat16()
-
-        gate_up, _ = self.gate_up_proj(x)
+            # Split into separate gate and up matmuls to match HF's MLP which
+            # does gate_proj(x) and up_proj(x) separately. A single merged
+            # matmul produces different floating-point results due to different
+            # accumulation order, causing logprob drift in on-policy training.
+            intermediate_size = self.gate_up_proj.output_size // 2
+            gate_weight = self.gate_up_proj.weight[:intermediate_size]
+            up_weight = self.gate_up_proj.weight[intermediate_size:]
+            gate = F.linear(x, gate_weight)
+            up = F.linear(x, up_weight)
+            gate_up = torch.cat([gate, up], dim=-1)
+        else:
+            gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
@@ -280,11 +290,6 @@ class Qwen2Model(nn.Module):
                 quant_config=quant_config,
                 use_attn_tp_group=is_dp_attention_enabled(),
                 prefix=add_prefix("embed_tokens", prefix),
-                params_dtype=(
-                    torch.float32
-                    if get_global_server_args().rl_on_policy_target is not None
-                    else None
-                ),
             )
         else:
             self.embed_tokens = PPMissingLayer()
@@ -305,18 +310,22 @@ class Qwen2Model(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            norm_kwargs = (
-                dict(
+            # For non-triton on-policy backends, preserve fp32 final norm.
+            _server_args = get_global_server_args()
+            if (
+                _server_args.rl_on_policy_target is not None
+                and _server_args.attention_backend != "triton"
+            ):
+                _norm_kwargs = dict(
                     weight_dtype=torch.float32,
                     cast_x_before_out_mul=True,
                     override_orig_dtype=torch.float32,
                     fp32_residual=True,
                 )
-                if get_global_server_args().rl_on_policy_target is not None
-                else {}
-            )
+            else:
+                _norm_kwargs = {}
             self.norm = RMSNorm(
-                config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
+                config.hidden_size, eps=config.rms_norm_eps, **_norm_kwargs
             )
         else:
             self.norm = PPMissingLayer(return_tuple=True)

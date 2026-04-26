@@ -101,9 +101,8 @@ class RotaryEmbedding(MultiPlatformOp):
 
         if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
-            self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
-                apply_rotary_emb
-            )
+            # NOTE: Do NOT torch.compile _apply_rotary_emb_wrapped — it can
+            # change numerical behavior and cause misalignment with HF's RoPE.
         self.position_cos, self.position_sin = None, None
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
@@ -133,19 +132,31 @@ class RotaryEmbedding(MultiPlatformOp):
                 / self.rotary_dim
             )
         )
-        if get_global_server_args().rl_on_policy_target is not None:
-            inv_freq = inv_freq.cuda()
         return inv_freq
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         """Compute the cos and sin cache."""
         inv_freq = self._compute_inv_freq(self.base)
-        t = torch.arange(self.max_position_embeddings, dtype=torch.float)
-
-        freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
-        cache = torch.cat((cos, sin), dim=-1)
+        if get_global_server_args().rl_on_policy_target is not None:
+            # Compute entirely on CPU to match HF's numerical behavior exactly.
+            # GPU float32 ops can produce slightly different results from CPU,
+            # causing bf16 rounding differences after cast.
+            t = torch.arange(
+                self.max_position_embeddings, dtype=torch.float, device="cpu"
+            )
+            inv_freq_cpu = inv_freq.cpu() if inv_freq.is_cuda else inv_freq
+            freqs = torch.einsum("i,j -> ij", t, inv_freq_cpu)
+            cos = freqs.cos()
+            sin = freqs.sin()
+            cache = torch.cat((cos, sin), dim=-1)
+            if torch.cuda.is_available():
+                cache = cache.to(torch.device("cuda"))
+        else:
+            t = torch.arange(self.max_position_embeddings, dtype=torch.float)
+            freqs = torch.einsum("i,j -> ij", t, inv_freq)
+            cos = freqs.cos()
+            sin = freqs.sin()
+            cache = torch.cat((cos, sin), dim=-1)
         return cache
 
     def _ensure_cos_sin_cache_length(self, needed_max_pos: int):
