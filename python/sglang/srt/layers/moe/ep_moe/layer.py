@@ -92,14 +92,11 @@ class DeepEPMoE(FusedMoE):
             routed_scaling_factor=routed_scaling_factor,
             **kwargs,
         )
-        if _is_npu:
+        if _use_aiter or _is_npu:
             self.deprecate_flag = False
-        elif _use_aiter or (
-            deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-            and isinstance(quant_config, Fp8Config)
+        elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and isinstance(
+            quant_config, Fp8Config
         ):
-            # AITER routes through the unified MoeRunner (("deepep","aiter") /
-            # ("mori","aiter") fused funcs); DeepGemm uses self.quant_method.apply.
             self.deprecate_flag = True
         elif (
             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -148,18 +145,33 @@ class DeepEPMoE(FusedMoE):
             assert (
                 deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
             ), f"DeepEP {self.deepep_mode} mode requires deep_gemm"
+
         if _use_aiter:
-            # expert_mask is of size (self.num_local_experts + 1),
-            # the extra 1 is for invalid rank_id (in original deepep, the invalid rank_id is -1, but aiter does not allow -1, we use a mask to make those ids invalid)
-            # for instance, if we have 4 experts on this rank, we would have a expert_mask like:
-            #     self.expert_mask = [1, 1, 1, 1, 0]
-            # idx from 0-3 is valid and will be processed, while idx == 4 will be masked out
+            self._init_aiter_expert_mask()
+
+    def _init_aiter_expert_mask(self) -> None:
+        if get_moe_a2a_backend().is_mori():
+            # mori dispatch produces global topk_ids in [0, num_experts);
+            # mask out experts that are not local to this rank.
             self.expert_mask = torch.zeros(
-                (self.num_local_experts + 1),
+                self.num_experts,
+                device=torch.cuda.current_device(),
+                dtype=torch.int32,
+            )
+            start = self.moe_ep_rank * self.num_local_experts
+            self.expert_mask[start : start + self.num_local_experts] = 1
+            self.mori_moe_max_input_tokens = get_int_env_var(
+                "SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0
+            )
+        else:
+            # DeepEP/Mooncake/Nixl mark invalid topk slots with -1; the AITER
+            # pre_permute reroutes them to the sink slot at index
+            # num_local_experts, which is masked off here.
+            self.expert_mask = torch.zeros(
+                self.num_local_experts + 1,
                 device=torch.cuda.current_device(),
                 dtype=torch.int,
             )
-            # the last one is invalid rank_id
             self.expert_mask[:-1] = 1
 
     def forward(
@@ -193,14 +205,17 @@ class DeepEPMoE(FusedMoE):
                 topk_output,
             )
 
-        # TODO: can we call super().forward here?
+        num_tokens = hidden_states.shape[0]
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
         combine_input = self.run_moe_core(dispatch_output)
-        hidden_states = self.dispatcher.combine(
-            combine_input=combine_input,
-        )
+        hidden_states = self.dispatcher.combine(combine_input=combine_input)
+
+        if get_moe_a2a_backend().is_mori():
+            # mori combine returns a buffer-sized tensor; slice back to the
+            # caller's token count.
+            hidden_states = hidden_states[:num_tokens]
 
         return hidden_states
 
@@ -219,10 +234,10 @@ class DeepEPMoE(FusedMoE):
         dispatch_output: DispatchOutput,
     ):
 
-        if self.deprecate_flag:
-            return super().run_moe_core(
-                dispatch_output,
-            )
+        if self.deprecate_flag or _use_aiter:
+            # AITER routes through quant_method.apply -> self.runner.run, which
+            # picks the right ("<dispatch>", "aiter") pre/post permute pair.
+            return super().run_moe_core(dispatch_output)
 
         from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker
 
@@ -565,74 +580,11 @@ class NpuFuseEPMoE(DeepEPMoE):
             )
 
 
-class MoriEPMoE(DeepEPMoE):
-    def __init__(
-        self,
-        num_experts: int,
-        top_k: int,
-        hidden_size: int,
-        intermediate_size: int,
-        layer_id: int,
-        num_fused_shared_experts: int = 0,
-        params_dtype: Optional[torch.dtype] = None,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-        activation: str = "silu",
-        routed_scaling_factor: Optional[float] = None,
-        **kwargs,
-    ):
-        super().__init__(
-            num_experts=num_experts,
-            top_k=top_k,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            layer_id=layer_id,
-            num_fused_shared_experts=num_fused_shared_experts,
-            params_dtype=params_dtype,
-            quant_config=quant_config,
-            prefix=prefix,
-            activation=activation,
-            routed_scaling_factor=routed_scaling_factor,
-            **kwargs,
-        )
-
-        assert _use_aiter, "Mori need to be used together with aiter as of now"
-        self.expert_mask = torch.zeros(
-            (self.num_experts),
-            device=torch.cuda.current_device(),
-            dtype=torch.int32,
-        )
-        expert_start_idx = self.moe_ep_rank * self.num_local_experts
-        expert_end_idx = expert_start_idx + self.num_local_experts
-        self.expert_mask[expert_start_idx:expert_end_idx] = 1
-
-        self.mori_moe_max_input_tokens = get_int_env_var(
-            "SGLANG_MORI_MOE_MAX_INPUT_TOKENS", 0
-        )
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        topk_output: TopKOutput,
-    ):
-        num_token = hidden_states.shape[0]
-        dispatch_output = self.dispatcher.dispatch(
-            hidden_states=hidden_states, topk_output=topk_output
-        )
-        combine_input = self.run_moe_core(dispatch_output)
-        hidden_states = self.dispatcher.combine(
-            combine_input=combine_input,
-        )
-
-        return hidden_states[:num_token]
-
-
 def get_moe_impl_class(quant_config: Optional[QuantizationConfig]):
     # [TODO] kk, temporary solution
-    if get_moe_a2a_backend().is_mori():
-        return MoriEPMoE
     if (
-        get_moe_a2a_backend().is_deepep()
+        get_moe_a2a_backend().is_mori()
+        or get_moe_a2a_backend().is_deepep()
         or get_moe_a2a_backend().is_mooncake()
         or get_moe_a2a_backend().is_nixl()
     ):
