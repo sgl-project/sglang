@@ -1021,6 +1021,14 @@ class TritonAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
+        # In deterministic mode, use the unified 1-stage kernel so that decode
+        # and extend share the same sequential reduction order, enabling bit-wise
+        # alignment of log_probs between rollout (decode) and training (extend).
+        if self.enable_deterministic:
+            return self._forward_decode_unified(
+                q, o, layer, forward_batch, logits_soft_cap, sinks
+            )
+
         if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
             kv_indptr = self.forward_metadata.window_kv_indptr
             kv_indices = self.forward_metadata.window_kv_indices
@@ -1041,6 +1049,67 @@ class TritonAttnBackend(AttentionBackend):
             self.max_kv_splits,
             layer.scaling,
             logit_cap=logits_soft_cap,
+            sinks=sinks,
+            xai_temperature_len=layer.xai_temperature_len,
+        )
+        return o
+
+    def _forward_decode_unified(
+        self,
+        q: torch.Tensor,
+        o: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        logits_soft_cap: float,
+        sinks: Optional[torch.Tensor],
+    ):
+        """
+        Decode attention using the unified 1-stage kernel for bit-wise alignment
+        with the extend (training) path.
+
+        During decode, each sequence contributes exactly 1 query token. We treat
+        this as a degenerate extend call where:
+          - qo_indptr = [0, 1, 2, ..., bs]  (one Q token per sequence)
+          - kv_indptr / kv_indices already built by init_forward_metadata for decode
+          - prefix_lens = full KV length per sequence (all KV slots are "prefix";
+            the current token was written to the cache before this call)
+          - max_len_extend = 1
+
+        This ensures the same sequential reduction order as _fwd_kernel_unified
+        used in extend and in the FSDP training forward pass, achieving bit-wise
+        identical attention outputs and therefore identical log_probs.
+        """
+        bs = forward_batch.batch_size
+
+        # One Q token per sequence.
+        qo_indptr = torch.arange(bs + 1, dtype=torch.int32, device=self.device)
+
+        # Reuse the kv_indptr / kv_indices already prepared for decode.
+        # These already include the token that was just written to the KV cache.
+        if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
+            kv_indptr = self.forward_metadata.window_kv_indptr
+            kv_indices = self.forward_metadata.window_kv_indices
+        else:
+            kv_indptr = self.forward_metadata.kv_indptr
+            kv_indices = self.forward_metadata.kv_indices
+
+        # All KV slots are prefix (no new extend tokens beyond the one already
+        # written to cache).  prefix_lens equals the per-sequence KV length.
+        prefix_lens = (kv_indptr[1 : bs + 1] - kv_indptr[:bs]).to(torch.int32)
+
+        self.extend_attention_fwd_unified(
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            prefix_lens,
+            max_len_extend=1,
+            sm_scale=layer.scaling,
+            logit_cap=logits_soft_cap,
+            is_causal=True,
             sinks=sinks,
             xai_temperature_len=layer.xai_temperature_len,
         )
