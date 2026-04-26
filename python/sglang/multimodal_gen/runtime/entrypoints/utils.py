@@ -12,7 +12,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from copy import deepcopy
+from copy import copy
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Sequence, Union
 
@@ -161,6 +161,34 @@ def _with_output_index_suffix(output_file_name: str, output_index: int) -> str:
     return f"{base}_{output_index}{ext}"
 
 
+def _copy_trace_ctx_for_output(req: Req, request_id: str | None, output_index: int):
+    trace_ctx = req.trace_ctx
+    if output_index == 0 or not trace_ctx.tracing_enable:
+        return trace_ctx
+
+    output_trace_ctx = TraceReqContext(
+        rid=request_id,
+        module_name=trace_ctx.module_name,
+        external_trace_header=trace_ctx.external_trace_header,
+    )
+    output_trace_ctx.trace_req_start()
+    return output_trace_ctx
+
+
+def _copy_req_for_output(
+    req: Req,
+    *,
+    request_id: str | None,
+    output_index: int,
+) -> Req:
+    """Create a lightweight per-output ``Req`` without deep-copying tensors."""
+    output_req = copy(req)
+    output_req.sampling_params = copy(req.sampling_params)
+    output_req.extra = dict(req.extra)
+    output_req.trace_ctx = _copy_trace_ctx_for_output(req, request_id, output_index)
+    return output_req
+
+
 def expand_request_outputs(
     req: Req,
     *,
@@ -187,7 +215,12 @@ def expand_request_outputs(
 
     expanded: list[Req] = []
     for output_index, seed in enumerate(seeds):
-        output_req = deepcopy(req)
+        output_request_id = (
+            f"{req.request_id}:{output_index}" if req.request_id is not None else None
+        )
+        output_req = _copy_req_for_output(
+            req, request_id=output_request_id, output_index=output_index
+        )
         output_req.seed = seed
         output_req.num_outputs_per_prompt = 1
         output_req.seeds = None
@@ -195,8 +228,8 @@ def expand_request_outputs(
         output_req.extra["parent_request_id"] = req.request_id
         output_req.extra["output_index"] = output_index
 
-        if req.request_id is not None:
-            output_req.request_id = f"{req.request_id}:{output_index}"
+        if output_request_id is not None:
+            output_req.request_id = output_request_id
 
         if req.output_file_name:
             output_req.output_file_name = _with_output_index_suffix(

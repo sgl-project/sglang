@@ -6,6 +6,8 @@ import logging
 import multiprocessing as mp
 import os
 import time
+from contextlib import ExitStack
+from dataclasses import dataclass, field
 from typing import Any, Callable, List, Union
 
 import torch
@@ -63,6 +65,18 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _ExpandedOutputParts:
+    tensor_outputs: list[torch.Tensor] = field(default_factory=list)
+    list_outputs: list[Any] = field(default_factory=list)
+    tensor_audio: list[torch.Tensor] = field(default_factory=list)
+    trajectory_latents: list[torch.Tensor] = field(default_factory=list)
+    noise_preds: list[torch.Tensor] = field(default_factory=list)
+    output_file_paths: list[str] = field(default_factory=list)
+    metrics_list: list[Any] = field(default_factory=list)
+    trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
 
 
 class GPUWorker:
@@ -222,9 +236,14 @@ class GPUWorker:
                 Used by disaggregated pipelines to access intermediate tensors.
         """
         assert self.pipeline is not None
-        if len(batch) > 1 and not return_req:
+        if len(batch) > 1:
+            if return_req:
+                raise ValueError(
+                    "Grouped execute_forward does not support return_req=True"
+                )
             # batched reqs is only possible with `num_outputs_per_prompt > 1` now
-            return self._execute_forward_group(batch)
+            self._validate_group_forward_reqs(batch)
+            return self._execute_forward_batch(batch)
 
         req = batch[0]
         return self._execute_forward_common(
@@ -238,13 +257,8 @@ class GPUWorker:
             error_context=f"request {req.request_id}",
         )
 
-    def _execute_forward_group(self, batch: list[Req]) -> OutputBatch:
-        """
-            This would decrease e2e time if some of the stages shares the same input across reqs,
-            but the first few reqs' return time are compromised: all reqs execute the same stage while being processed together
-
-            This is acceptable since `num_outputs_per_prompt` is mostly requested by a single user
-        """
+    def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch:
+        """Execute expanded multi-output requests as one grouped forward."""
         # TODO: support early return or mix-stage execution for reqs in a group
         assert self.pipeline is not None
         req = batch[0]
@@ -280,13 +294,21 @@ class GPUWorker:
 
             start_time = time.monotonic()
 
-            if self.rank == 0 and req.metrics and not current_platform.is_cpu():
+            request_metrics = [
+                item.metrics for item in log_reqs if item.metrics is not None
+            ]
+            if self.rank == 0 and request_metrics and not current_platform.is_cpu():
                 baseline_snapshot = capture_memory_snapshot()
-                req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
+                for metrics in request_metrics:
+                    metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
             for item in log_reqs:
                 item.log(server_args=self.server_args)
-            with trace_slice(req.trace_ctx, DiffStage.GPU_FORWARD):
+            with ExitStack() as stack:
+                for item in log_reqs:
+                    stack.enter_context(
+                        trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
+                    )
                 result = forward_fn()
 
             if return_req and isinstance(result, Req):
@@ -294,15 +316,11 @@ class GPUWorker:
 
             output_batch = self._to_output_batch(result)
 
-            if (
-                self.rank == 0
-                and output_batch.metrics
-                and not current_platform.is_cpu()
-            ):
+            output_metrics = self._iter_output_metrics(output_batch)
+            if self.rank == 0 and output_metrics and not current_platform.is_cpu():
                 peak_snapshot = capture_memory_snapshot()
-                output_batch.metrics.record_memory_snapshot(
-                    "after_forward", peak_snapshot
-                )
+                for metrics in output_metrics:
+                    metrics.record_memory_snapshot("after_forward", peak_snapshot)
 
             if (
                 self.rank == 0
@@ -313,8 +331,8 @@ class GPUWorker:
                 self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000
-            if output_batch.metrics is not None:
-                output_batch.metrics.total_duration_ms = duration_ms
+            for metrics in output_metrics:
+                metrics.total_duration_ms = duration_ms
 
             if req.save_output and req.return_file_paths_only:
                 save_output_paths(output_batch)
@@ -359,7 +377,7 @@ class GPUWorker:
         assert self.pipeline is not None
         results = self.pipeline.forward_batch(batch, self.server_args)
         output_batches = [self._to_output_batch(result) for result in results]
-        return self._merge_group_output_batches(output_batches)
+        return self._merge_expanded_output_batches(output_batches)
 
     def _save_output_paths(self, req: Req, output_batch: OutputBatch) -> None:
         if self.rank != 0 or output_batch.output is None:
@@ -415,6 +433,49 @@ class GPUWorker:
         )
 
     @staticmethod
+    def _validate_group_forward_reqs(reqs: list[Req]) -> None:
+        """Validate fields that the grouped output/save path treats as shared."""
+        first_req = reqs[0]
+        shared_output_fields = (
+            "save_output",
+            "return_file_paths_only",
+            "data_type",
+            "fps",
+            "output_compression",
+            "enable_frame_interpolation",
+            "frame_interpolation_exp",
+            "frame_interpolation_scale",
+            "frame_interpolation_model_path",
+            "enable_upscaling",
+            "upscaling_model_path",
+            "upscaling_scale",
+        )
+        for req in reqs[1:]:
+            mismatched = [
+                field
+                for field in shared_output_fields
+                if getattr(req, field) != getattr(first_req, field)
+            ]
+            if mismatched:
+                raise ValueError(
+                    "Grouped execute_forward requires matching output settings; "
+                    f"mismatched fields: {mismatched}"
+                )
+
+    @staticmethod
+    def _iter_output_metrics(output_batch: OutputBatch):
+        """Return all metrics objects carried by an output batch."""
+        if output_batch.metrics_list is not None:
+            return [
+                metrics
+                for metrics in output_batch.metrics_list
+                if metrics is not None
+            ]
+        if output_batch.metrics is not None:
+            return [output_batch.metrics]
+        return []
+
+    @staticmethod
     def _to_output_batch(result: Req | OutputBatch) -> OutputBatch:
         if isinstance(result, Req):
             return GPUWorker._req_to_output_batch(result)
@@ -435,74 +496,102 @@ class GPUWorker:
         )
 
     @staticmethod
-    def _merge_group_output_batches(output_batches: list[OutputBatch]) -> OutputBatch:
+    def _merge_expanded_output_batches(output_batches: list[OutputBatch]) -> OutputBatch:
+        """Merge per-output batches produced by grouped execution."""
         merged = OutputBatch()
-        tensor_outputs: list[torch.Tensor] = []
-        list_outputs: list[Any] = []
-        tensor_audio: list[torch.Tensor] = []
-        trajectory_latents: list[torch.Tensor] = []
-        noise_preds: list[torch.Tensor] = []
-        trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
-        output_file_paths: list[str] = []
+        parts = _ExpandedOutputParts()
 
         for output_batch in output_batches:
-            if output_batch.error is not None and merged.error is None:
-                merged.error = output_batch.error
-            if merged.metrics is None and output_batch.metrics is not None:
-                merged.metrics = output_batch.metrics
-            merged.peak_memory_mb = max(
-                merged.peak_memory_mb, output_batch.peak_memory_mb
-            )
-            if output_batch.output_file_paths:
-                output_file_paths.extend(output_batch.output_file_paths)
-            if (
-                merged.trajectory_timesteps is None
-                and output_batch.trajectory_timesteps is not None
-            ):
-                merged.trajectory_timesteps = output_batch.trajectory_timesteps
-            if (
-                merged.rollout_trajectory_data is None
-                and output_batch.rollout_trajectory_data is not None
-            ):
-                merged.rollout_trajectory_data = output_batch.rollout_trajectory_data
-            if isinstance(output_batch.trajectory_latents, torch.Tensor):
-                trajectory_latents.append(output_batch.trajectory_latents)
-            if isinstance(output_batch.noise_pred, torch.Tensor):
-                noise_preds.append(output_batch.noise_pred)
-            if output_batch.trajectory_decoded:
-                if trajectory_decoded_parts is None:
-                    trajectory_decoded_parts = [
-                        [] for _ in output_batch.trajectory_decoded
-                    ]
-                for index, decoded in enumerate(output_batch.trajectory_decoded):
-                    trajectory_decoded_parts[index].append(decoded)
-            if isinstance(output_batch.output, torch.Tensor):
-                tensor_outputs.append(output_batch.output)
-            elif output_batch.output is not None:
-                list_outputs.extend(output_batch.output)
-            if isinstance(output_batch.audio, torch.Tensor):
-                tensor_audio.append(output_batch.audio)
+            GPUWorker._merge_expanded_singletons(merged, output_batch)
+            GPUWorker._collect_expanded_parts(parts, output_batch)
 
-        if output_file_paths:
-            merged.output_file_paths = output_file_paths
-        if tensor_outputs:
-            merged.output = torch.cat(tensor_outputs, dim=0)
-        elif list_outputs:
-            merged.output = list_outputs
-        if tensor_audio:
-            merged.audio = torch.cat(tensor_audio, dim=0)
-            merged.audio_sample_rate = output_batches[0].audio_sample_rate
-        if trajectory_latents:
-            merged.trajectory_latents = torch.cat(trajectory_latents, dim=0)
-        if noise_preds:
-            merged.noise_pred = torch.cat(noise_preds, dim=0)
-        if trajectory_decoded_parts:
-            merged.trajectory_decoded = [
-                torch.cat(decoded_step, dim=0)
-                for decoded_step in trajectory_decoded_parts
-            ]
+        GPUWorker._finalize_expanded_parts(
+            merged,
+            parts,
+            audio_sample_rate=output_batches[0].audio_sample_rate,
+        )
 
         return merged
+
+    @staticmethod
+    def _merge_expanded_singletons(
+        merged: OutputBatch, output_batch: OutputBatch
+    ) -> None:
+        if output_batch.error is not None and merged.error is None:
+            merged.error = output_batch.error
+        merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
+        if (
+            merged.trajectory_timesteps is None
+            and output_batch.trajectory_timesteps is not None
+        ):
+            merged.trajectory_timesteps = output_batch.trajectory_timesteps
+        if (
+            merged.rollout_trajectory_data is None
+            and output_batch.rollout_trajectory_data is not None
+        ):
+            merged.rollout_trajectory_data = output_batch.rollout_trajectory_data
+
+    @staticmethod
+    def _collect_expanded_parts(
+        parts: _ExpandedOutputParts, output_batch: OutputBatch
+    ) -> None:
+        parts.metrics_list.append(output_batch.metrics)
+        if output_batch.output_file_paths:
+            parts.output_file_paths.extend(output_batch.output_file_paths)
+        if isinstance(output_batch.output, torch.Tensor):
+            parts.tensor_outputs.append(output_batch.output)
+        elif output_batch.output is not None:
+            parts.list_outputs.extend(output_batch.output)
+        if isinstance(output_batch.audio, torch.Tensor):
+            parts.tensor_audio.append(output_batch.audio)
+        if isinstance(output_batch.trajectory_latents, torch.Tensor):
+            parts.trajectory_latents.append(output_batch.trajectory_latents)
+        if isinstance(output_batch.noise_pred, torch.Tensor):
+            parts.noise_preds.append(output_batch.noise_pred)
+        if output_batch.trajectory_decoded:
+            GPUWorker._collect_trajectory_decoded(
+                parts, output_batch.trajectory_decoded
+            )
+
+    @staticmethod
+    def _collect_trajectory_decoded(
+        parts: _ExpandedOutputParts, trajectory_decoded: list[torch.Tensor]
+    ) -> None:
+        if parts.trajectory_decoded_parts is None:
+            parts.trajectory_decoded_parts = [[] for _ in trajectory_decoded]
+        for index, decoded in enumerate(trajectory_decoded):
+            parts.trajectory_decoded_parts[index].append(decoded)
+
+    @staticmethod
+    def _finalize_expanded_parts(
+        merged: OutputBatch,
+        parts: _ExpandedOutputParts,
+        *,
+        audio_sample_rate: int | None,
+    ) -> None:
+        if parts.output_file_paths:
+            merged.output_file_paths = parts.output_file_paths
+        if any(metrics is not None for metrics in parts.metrics_list):
+            merged.metrics_list = parts.metrics_list
+            merged.metrics = next(
+                metrics for metrics in parts.metrics_list if metrics is not None
+            )
+        if parts.tensor_outputs:
+            merged.output = torch.cat(parts.tensor_outputs, dim=0)
+        elif parts.list_outputs:
+            merged.output = parts.list_outputs
+        if parts.tensor_audio:
+            merged.audio = torch.cat(parts.tensor_audio, dim=0)
+            merged.audio_sample_rate = audio_sample_rate
+        if parts.trajectory_latents:
+            merged.trajectory_latents = torch.cat(parts.trajectory_latents, dim=0)
+        if parts.noise_preds:
+            merged.noise_pred = torch.cat(parts.noise_preds, dim=0)
+        if parts.trajectory_decoded_parts:
+            merged.trajectory_decoded = [
+                torch.cat(decoded_step, dim=0)
+                for decoded_step in parts.trajectory_decoded_parts
+            ]
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float

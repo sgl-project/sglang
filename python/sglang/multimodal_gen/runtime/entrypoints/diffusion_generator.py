@@ -12,6 +12,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 import time
+from contextlib import ExitStack
 from typing import Any, List, Union
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -243,9 +244,12 @@ class DiffGenerator:
             try:
                 timer_prompt = [req.prompt for req in requests]
                 logger.info("Processing %d grouped request(s)", len(requests))
-                with trace_req(requests[0].trace_ctx), log_generation_timer(
-                    logger, timer_prompt
-                ) as timer:
+                with ExitStack() as stack:
+                    for req in requests:
+                        stack.enter_context(trace_req(req.trace_ctx))
+                    timer = stack.enter_context(
+                        log_generation_timer(logger, timer_prompt)
+                    )
                     output_batch = self._send_to_scheduler_and_wait_for_response(
                         requests
                     )
@@ -269,7 +273,7 @@ class DiffGenerator:
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
-                                        req, output_batch, timer.duration
+                                        req, output_batch, timer.duration, idx
                                     ),
                                     prompt_index=global_output_index + idx,
                                     output_file_path=path,
@@ -285,7 +289,7 @@ class DiffGenerator:
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
-                                        req, output_batch, timer.duration
+                                        req, output_batch, timer.duration, idx
                                     ),
                                     prompt_index=global_output_index + idx,
                                     output_file_path=sample,
@@ -330,7 +334,7 @@ class DiffGenerator:
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
-                                        req, output_batch, timer.duration
+                                        req, output_batch, timer.duration, idx
                                     ),
                                     samples=samples_out[idx],
                                     frames=frames_out[idx],
@@ -397,13 +401,21 @@ class DiffGenerator:
         req: Req,
         output_batch: OutputBatch,
         generation_time: float,
+        output_index: int | None = None,
     ) -> dict[str, Any]:
+        metrics = output_batch.metrics
+        if (
+            output_index is not None
+            and output_batch.metrics_list is not None
+            and output_index < len(output_batch.metrics_list)
+        ):
+            metrics = output_batch.metrics_list[output_index]
         return dict(
             prompt=req.prompt,
             size=(req.height, req.width, req.num_frames),
             generation_time=generation_time,
             peak_memory_mb=output_batch.peak_memory_mb,
-            metrics=output_batch.metrics.to_dict() if output_batch.metrics else {},
+            metrics=metrics.to_dict() if metrics else {},
             trajectory_latents=output_batch.trajectory_latents,
             trajectory_timesteps=output_batch.trajectory_timesteps,
             rollout_trajectory_data=output_batch.rollout_trajectory_data,
