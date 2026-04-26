@@ -641,17 +641,28 @@ class NixlKVManager(CommonKVManager):
         src_state_item_lens = self.kv_args.state_item_lens
         assert len(src_state_ptrs) == len(dst_state_ptrs)
         assert len(src_state_item_lens) == len(dst_state_item_lens)
+        # The page-by-index transfer below assumes prefill and decode have
+        # matching state-pool layouts (same item_len per tensor). Mismatched
+        # layouts arise only with mamba TP-slice across non-equal attn_tp_size,
+        # which is not yet supported in the nixl backend (see mooncake
+        # _send_mamba_state_with_tp_slice for the future TP-slice path).
+        for i in range(len(src_state_item_lens)):
+            assert src_state_item_lens[i] == dst_state_item_lens[i], (
+                f"State item length mismatch at index {i}: "
+                f"{src_state_item_lens[i]} != {dst_state_item_lens[i]} "
+                "(non-equal item lens require mamba TP-slice transfer, "
+                "not yet supported in nixl backend)"
+            )
 
         src_addrs = []
         dst_addrs = []
         for i in range(len(src_state_ptrs)):
-            src_len = src_state_item_lens[i]
-            dst_len = dst_state_item_lens[i]
+            item_len = src_state_item_lens[i]
             for src_idx, dst_idx in zip(prefill_state_indices, dst_state_indices):
-                src_addr = src_state_ptrs[i] + int(src_idx) * src_len
-                dst_addr = dst_state_ptrs[i] + int(dst_idx) * dst_len
-                src_addrs.append((src_addr, src_len, self.kv_args.gpu_id))
-                dst_addrs.append((dst_addr, dst_len, dst_gpu_id))
+                src_addr = src_state_ptrs[i] + int(src_idx) * item_len
+                dst_addr = dst_state_ptrs[i] + int(dst_idx) * item_len
+                src_addrs.append((src_addr, item_len, self.kv_args.gpu_id))
+                dst_addrs.append((dst_addr, item_len, dst_gpu_id))
 
         if not src_addrs:
             return None
