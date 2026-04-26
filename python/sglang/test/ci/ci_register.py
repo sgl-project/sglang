@@ -2,7 +2,7 @@ import ast
 import warnings
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 __all__ = [
     "HWBackend",
@@ -87,6 +87,7 @@ class RegistryVisitor(ast.NodeVisitor):
     def __init__(self, filename: str):
         self.filename = filename
         self.registries: list[CIRegistry] = []
+        self.has_main_entry: bool = False
 
     def _constant_value(self, node: ast.AST) -> object:
         if isinstance(node, ast.Constant):
@@ -180,25 +181,53 @@ class RegistryVisitor(ast.NodeVisitor):
             disabled=disabled,
         )
 
+    @staticmethod
+    def _is_main_block_with_call(stmt: ast.If) -> bool:
+        """True iff `stmt` is `if __name__ == "__main__":` with a body that
+        contains at least one call (i.e. actually runs something, not just
+        `pass`). This is what makes `python3 file.py` execute tests."""
+        test = stmt.test
+        if not isinstance(test, ast.Compare):
+            return False
+        if not (isinstance(test.left, ast.Name) and test.left.id == "__name__"):
+            return False
+        if len(test.ops) != 1 or not isinstance(test.ops[0], ast.Eq):
+            return False
+        if len(test.comparators) != 1:
+            return False
+        rhs = test.comparators[0]
+        if not (isinstance(rhs, ast.Constant) and rhs.value == "__main__"):
+            return False
+        for child in ast.walk(ast.Module(body=stmt.body, type_ignores=[])):
+            if isinstance(child, ast.Call):
+                return True
+        return False
+
     def visit_Module(self, node):
         for stmt in node.body:
-            if not isinstance(stmt, ast.Expr) or not isinstance(stmt.value, ast.Call):
-                continue
-
-            cr = self._collect_ci_registry(stmt.value)
-            if cr is not None:
-                self.registries.append(cr)
+            if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                cr = self._collect_ci_registry(stmt.value)
+                if cr is not None:
+                    self.registries.append(cr)
+            elif isinstance(stmt, ast.If) and self._is_main_block_with_call(stmt):
+                self.has_main_entry = True
 
         self.generic_visit(node)
 
 
-def ut_parse_one_file(filename: str) -> List[CIRegistry]:
+def ut_parse_one_file(filename: str) -> Tuple[List[CIRegistry], bool]:
+    """Parse a test file and return (registries, has_main_entry).
+
+    `has_main_entry` is True iff the file has `if __name__ == "__main__":`
+    with a call in its body -- required for `python3 file.py` to actually
+    run tests (the CI runner's invocation pattern).
+    """
     with open(filename, "r") as f:
         file_content = f.read()
     tree = ast.parse(file_content, filename=filename)
     visitor = RegistryVisitor(filename=filename)
     visitor.visit(tree)
-    return visitor.registries
+    return visitor.registries, visitor.has_main_entry
 
 
 def auto_partition(files: List[CIRegistry], rank: int, size: int) -> List[CIRegistry]:
@@ -230,7 +259,7 @@ def auto_partition(files: List[CIRegistry], rank: int, size: int) -> List[CIRegi
 def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistry]:
     ci_tests = []
     for file in files:
-        registries = ut_parse_one_file(file)
+        registries, has_main_entry = ut_parse_one_file(file)
         if len(registries) == 0:
             msg = f"No CI registry found in {file}"
             if sanity_check:
@@ -238,6 +267,20 @@ def collect_tests(files: list[str], sanity_check: bool = True) -> List[CIRegistr
             else:
                 warnings.warn(msg)
                 continue
+
+        # Every file with at least one enabled registry must have an
+        # executable `if __name__ == "__main__":` block; otherwise
+        # `python3 file.py -f` (how run_unittest_files invokes tests)
+        # silently exits and the file shows green without running.
+        has_enabled = any(r.disabled is None for r in registries)
+        if sanity_check and has_enabled and not has_main_entry:
+            raise ValueError(
+                f'{file}: missing `if __name__ == "__main__":` entry. '
+                f"Pytest-style tests in this file will silently skip under "
+                f"`python3 file.py -f`. Add `unittest.main()` (for "
+                f"unittest.TestCase) or `sys.exit(pytest.main([__file__, "
+                f'"-v"]))` (for pytest-style).'
+            )
 
         ci_tests.extend(registries)
 
