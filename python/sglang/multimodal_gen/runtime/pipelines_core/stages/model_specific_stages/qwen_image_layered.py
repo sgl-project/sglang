@@ -488,12 +488,13 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         ]
 
         # 5. Prepare timesteps
+        scheduler = self.scheduler
         sigmas = np.linspace(1.0, 0, num_inference_steps + 1)[:-1]
         image_seq_len = latents.shape[1]
         base_seqlen = 256 * 256 / 16 / 16
         mu = (image_latents.shape[1] / base_seqlen) ** 0.5
         timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler,
+            scheduler,
             num_inference_steps,
             device,
             sigmas=sigmas,
@@ -518,8 +519,10 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         batch.negative_prompt_embeds_mask = [negative_prompt_embeds_mask]
         batch.latents = latents
         batch.image_latent = image_latents
+        batch.timesteps = timesteps
+        batch.scheduler = scheduler
         batch.num_inference_steps = num_inference_steps
-        batch.sigmas = sigmas.tolist()  # Convert numpy array to list for validation
+        batch.sigmas = None
         batch.generator = torch.manual_seed(0)
         batch.original_condition_image_size = image_size
         batch.raw_latent_shape = latents.shape

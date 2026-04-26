@@ -13,6 +13,9 @@ from typing import Any, Callable, Tuple
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    get_or_create_request_scheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -68,7 +71,10 @@ class TimestepPreparationStage(PipelineStage):
         Returns:
             The batch with prepared timesteps.
         """
-        scheduler = self.scheduler
+        if batch.scheduler is not None and batch.timesteps is not None:
+            return batch
+
+        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
         timesteps = batch.timesteps
@@ -133,6 +139,7 @@ class TimestepPreparationStage(PipelineStage):
 
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
+        batch.scheduler = scheduler
         if not batch.is_warmup:
             self.log_debug("timesteps: %s", timesteps)
         return batch
