@@ -46,7 +46,7 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
-  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == 'true' }}
 
 jobs:
@@ -117,7 +117,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -186,7 +186,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -251,7 +251,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -300,7 +300,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -356,7 +356,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
