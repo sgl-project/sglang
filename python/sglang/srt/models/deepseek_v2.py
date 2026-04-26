@@ -385,7 +385,7 @@ class DeepseekV2MoE(nn.Module):
         )
 
         # DeepEP waterfill: shared expert dispatched to least-loaded rank via DeepEP.
-        # Uses same expert layout as FuSiOn but routes shared expert dynamically
+        # Uses same expert layout as fusion but routes shared expert dynamically
         # instead of always sending to home rank.
         _enable_deepep_waterfill = (
             get_global_server_args().enable_deepep_waterfill and _is_deepep_fusion

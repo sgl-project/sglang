@@ -5428,8 +5428,10 @@ class ServerArgs:
             default=ServerArgs.enable_deepep_waterfill,
             help="Enable DeepEP Waterfill: dispatch the shared expert as the 9th "
             "routed expert to the least-loaded EP rank. Requires "
-            "--moe-a2a-backend deepep --deepep-mode normal, and implicitly enables "
-            "shared-expert fusion. Supported on DeepSeek-V3/R1 with EP >= 2.",
+            "--moe-a2a-backend deepep, implicitly enables shared-expert fusion, "
+            "and supports --deepep-mode auto or normal. Use auto for production "
+            "decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 "
+            "with EP >= 2.",
         )
 
         # Mamba Cache

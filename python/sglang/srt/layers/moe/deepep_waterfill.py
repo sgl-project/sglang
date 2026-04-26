@@ -475,9 +475,12 @@ class DeepEPWaterfillBalancer:
         self, topk_output: StandardTopKOutput, num_tokens: int
     ) -> StandardTopKOutput:
         """Expand topk [N, 8] -> [N, 9] with waterfill-assigned shared expert."""
-        if num_tokens < self.MIN_BATCH_FOR_BALANCE:
-            # Low-batch decode uses the local shared-expert path and does not need
-            # rank counts. Avoid launching the count kernel in captured graphs.
+        if (
+            self.static_rank_load is not None
+            and num_tokens < self.MIN_BATCH_FOR_BALANCE
+        ):
+            # Static EPLB low-batch path can use local expansion. Dynamic mode
+            # always all-reduces so decode and extend have the same participation.
             expanded_ids, expanded_weights, _ = expand_topk_with_shared_expert(
                 topk_output.topk_ids,
                 topk_output.topk_weights,
@@ -493,26 +496,25 @@ class DeepEPWaterfillBalancer:
             )
 
         from sglang.srt.distributed import get_moe_ep_group
+        from sglang.srt.distributed.communication_op import (
+            moe_expert_parallel_all_reduce,
+        )
 
         local_routed_counts = self.count_local_routed(topk_output.topk_ids)
         if self.static_rank_load is not None:
             global_routed_counts, local_tokens_per_rank = local_routed_counts, None
         else:
-            group = get_moe_ep_group().device_group
-            world = torch.distributed.get_world_size(group=group)
+            group = get_moe_ep_group()
+            world = group.world_size
             buf = torch.zeros(
                 world * 2, dtype=torch.int64, device=topk_output.topk_ids.device
             )
             buf[:world] = local_routed_counts
-            if not torch.cuda.is_current_stream_capturing():
-                buf[world + torch.distributed.get_rank(group=group)] = num_tokens
-            torch.distributed.all_reduce(
-                buf, op=torch.distributed.ReduceOp.SUM, group=group
-            )
+            rank = group.rank_in_group
+            buf[world + rank : world + rank + 1].fill_(num_tokens)
+            buf = moe_expert_parallel_all_reduce(buf)
             global_routed_counts = buf[:world]
-            local_tokens_per_rank = (
-                buf[world:] if not torch.cuda.is_current_stream_capturing() else None
-            )
+            local_tokens_per_rank = buf[world:]
 
         expanded_ids, expanded_weights, _ = self.prepare_dispatch(
             topk_output.topk_ids,
