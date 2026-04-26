@@ -571,7 +571,7 @@ class GPUWorker:
         audio_sample_rate: int | None,
     ) -> None:
         """
-            merge batched output
+        merge batched output
         """
         if parts.output_file_paths:
             merged.output_file_paths = parts.output_file_paths
