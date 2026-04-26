@@ -338,9 +338,9 @@ async def process_generation_batch(
 
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
-            if len(save_file_path_list) != len(requests):
+            if len(save_file_path_list) < len(requests):
                 raise RuntimeError(
-                    f"Expected {len(requests)} output paths, "
+                    f"Expected at least {len(requests)} output paths, "
                     f"got {len(save_file_path_list)}"
                 )
         else:

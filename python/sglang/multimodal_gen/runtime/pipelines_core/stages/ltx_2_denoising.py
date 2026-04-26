@@ -1292,9 +1292,9 @@ class LTX2DenoisingStage(DenoisingStage):
                 model_video = model_video_uncond + (
                     batch.guidance_scale * (model_video_text - model_video_uncond)
                 )
-            model_audio = model_audio_uncond + (
-                batch.guidance_scale * (model_audio_text - model_audio_uncond)
-            )
+                model_audio = model_audio_uncond + (
+                    batch.guidance_scale * (model_audio_text - model_audio_uncond)
+                )
 
             if self.sampler_name == "res2s":
                 # HQ stage-2 uses RK2 res2s here to match official LTX-2.3 HQ
