@@ -187,7 +187,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and get_moe_a2a_backend().is_none():
+        if moe_runner_backend.is_auto() and get_moe_a2a_backend().supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():
@@ -204,6 +204,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
+            get_aiter_expert_mask,
         )
 
         if hasattr(torch, "float4_e2m1fn_x2"):
@@ -223,6 +224,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             quant_type=AiterQuantType.PER_1X32,
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            expert_mask=layer.dispatcher.expert_mask_gpu,
+            expert_mask=get_aiter_expert_mask(layer),
         )
         return self.runner.run(dispatch_output, quant_info)

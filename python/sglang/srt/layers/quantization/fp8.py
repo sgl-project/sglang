@@ -1640,10 +1640,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             elif (
                 _is_hip
                 and (_use_aiter or _use_hip_int4)
-                and get_moe_a2a_backend().is_none()
+                and get_moe_a2a_backend().supports_aiter()
             ):
-                # *EPMoE backends bypass self.runner via run_moe_core, and the
-                # AITER fused func is only registered for ("none", "aiter").
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
@@ -1931,6 +1929,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
+            get_aiter_expert_mask,
         )
 
         if _use_aiter and self.block_quant:
@@ -1947,7 +1946,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             quant_type=quant_type,
             w13_scale=w13_scale,
             w2_scale=w2_scale,
-            expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
+            expert_mask=get_aiter_expert_mask(layer) if _use_aiter else None,
         )
 
 

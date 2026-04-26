@@ -1006,7 +1006,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
             # Must match apply() priority: _use_aiter before use_triton_kernels.
-            if _use_aiter and get_moe_a2a_backend().is_none():
+            if _use_aiter and get_moe_a2a_backend().supports_aiter():
                 moe_runner_backend = MoeRunnerBackend.AITER
             elif self.use_triton_kernels:
                 moe_runner_backend = MoeRunnerBackend.TRITON_KERNELS
@@ -1193,6 +1193,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.moe_runner.aiter import (
                 AiterMoeQuantInfo,
                 AiterQuantType,
+                get_aiter_expert_mask,
             )
 
             if hasattr(torch, "float4_e2m1fn_x2"):
@@ -1213,7 +1214,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 w2_scale=layer.w2_weight_scale,
                 b13=layer.w13_weight_bias,
                 b2=layer.w2_weight_bias,
-                expert_mask=layer.dispatcher.expert_mask_gpu,
+                expert_mask=get_aiter_expert_mask(layer),
                 doweight_stage1=self.moe_runner_config.apply_router_weight_on_input,
                 hidden_pad=self.hidden_pad,
                 intermediate_pad=self.intermediate_pad,
@@ -1356,7 +1357,7 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and get_moe_a2a_backend().is_none():
+        if moe_runner_backend.is_auto() and get_moe_a2a_backend().supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():
@@ -1373,6 +1374,7 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.moe_runner.aiter import (
             AiterMoeQuantInfo,
             AiterQuantType,
+            get_aiter_expert_mask,
         )
 
         if hasattr(torch, "float4_e2m1fn_x2"):
@@ -1392,6 +1394,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
             quant_type=AiterQuantType.PER_1X32,
             w13_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            expert_mask=layer.dispatcher.expert_mask_gpu,
+            expert_mask=get_aiter_expert_mask(layer),
         )
         return self.runner.run(dispatch_output, quant_info)

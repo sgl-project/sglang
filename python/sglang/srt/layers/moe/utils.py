@@ -64,6 +64,17 @@ class MoeA2ABackend(Enum):
     def is_customized(self):
         return self == MoeA2ABackend.CUSTOMIZED
 
+    def supports_aiter(self) -> bool:
+        # a2a backends that have an ("<a2a>", "aiter") fused func registered in
+        # sglang.srt.layers.moe.moe_runner.aiter.
+        return self in (
+            MoeA2ABackend.NONE,
+            MoeA2ABackend.DEEPEP,
+            MoeA2ABackend.MOONCAKE,
+            MoeA2ABackend.NIXL,
+            MoeA2ABackend.MORI,
+        )
+
 
 class MoeRunnerBackend(Enum):
 
