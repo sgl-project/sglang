@@ -16,14 +16,16 @@ class WeightChecker:
         self._model_runner = model_runner
         self._snapshot_tensors = None
 
-    def handle(self, action: str):
-        logger.info(f"[WeightChecker] handle action={action}")
+    def handle(self, action: str, dequant_mean_err_threshold: float | None = None):
+        logger.info(
+            f"[WeightChecker] handle action={action} dequant_mean_err_threshold={dequant_mean_err_threshold}"
+        )
         if action == "snapshot":
             self._snapshot()
         elif action == "reset_tensors":
             self._reset_tensors()
         elif action == "compare":
-            self._compare()
+            self._compare(dequant_mean_err_threshold=dequant_mean_err_threshold)
         else:
             raise Exception(f"Unsupported {action=}")
 
@@ -38,14 +40,17 @@ class WeightChecker:
 
     def _reset_tensors(self):
         for name, param in self._model_state():
+            if "cos_sin_cache" in name or "freqs_cis" in name:
+                continue
             param.copy_(_random_like(param))
 
-    def _compare(self):
+    def _compare(self, dequant_mean_err_threshold: float | None = None):
         assert self._snapshot_tensors is not None
 
         _check_tensors(
             expect_tensors=_postprocess_tensors(self._snapshot_tensors),
             actual_tensors=_postprocess_tensors(dict(self._model_state())),
+            dequant_mean_err_threshold=dequant_mean_err_threshold,
         )
 
     def _model_state(self):
@@ -57,6 +62,7 @@ class WeightChecker:
 def _check_tensors(
     expect_tensors: Iterable[Tuple[str, bool, torch.Tensor]],
     actual_tensors: Iterable[Tuple[str, bool, torch.Tensor]],
+    dequant_mean_err_threshold: float | None = None,
 ):
     from sglang.srt.debug_utils.dumper import get_tensor_info
 
@@ -64,17 +70,20 @@ def _check_tensors(
     error_messages = []
     info_messages = []
 
-    for (expect_name, expect_should_compare, expect), (
+    for (expect_name, expect_should_compare, expect_is_dequant, expect), (
         actual_name,
         actual_should_compare,
+        actual_is_dequant,
         actual,
     ) in zip(expect_tensors, actual_tensors, strict=True):
         assert expect_name == actual_name, f"{expect_name=} {actual_name=}"
         assert (
             expect_should_compare == actual_should_compare
         ), f"{expect_should_compare=} {actual_should_compare=}"
+        assert expect_is_dequant == actual_is_dequant
         name = expect_name
         should_compare = expect_should_compare
+        is_dequant = expect_is_dequant
 
         expect = expect.cuda()
         actual = actual.cuda()
@@ -83,14 +92,24 @@ def _check_tensors(
             good_names.append(name)
         else:
             abs_diff = (actual.float() - expect.float()).abs()
+            mean_abs_err = abs_diff.mean().item()
             msg = (
                 f"name={name} "
                 f"max_abs_err={abs_diff.max()} "
-                f"mean_abs_err={abs_diff.mean()} "
+                f"mean_abs_err={mean_abs_err} "
                 f"{get_tensor_info(expect)=} "
                 f"{get_tensor_info(actual)=} "
             )
-            (error_messages if should_compare else info_messages).append(msg)
+            if not should_compare:
+                info_messages.append(msg)
+            elif (
+                is_dequant
+                and dequant_mean_err_threshold is not None
+                and mean_abs_err < dequant_mean_err_threshold
+            ):
+                info_messages.append(msg)
+            else:
+                error_messages.append(msg)
 
     logger.info(f"[check_tensors] equal tensors: {good_names}")
     if len(info_messages) > 0:
@@ -118,7 +137,8 @@ def _random_like(t: torch.Tensor):
 
 def _postprocess_tensors(
     raw: Dict[str, torch.Tensor],
-) -> Iterable[Tuple[str, bool, torch.Tensor]]:
+) -> Iterable[Tuple[str, bool, bool, torch.Tensor]]:
+    """Yields (name, should_compare, is_dequant, tensor)."""
     from sglang.srt.debug_utils.dumper import get_tensor_info
 
     skip_compare_names = []
@@ -131,23 +151,25 @@ def _postprocess_tensors(
         if name.endswith("weight") and name.replace("weight", "weight_scale_inv") in raw
     ]
     skip_compare_names += quant_names
+    skip_compare_names += [
+        name.replace("weight", "weight_scale_inv") for name in quant_names
+    ]
     for name in quant_names:
         w_q = raw[name]
         w_s = raw[name.replace("weight", "weight_scale_inv")]
 
         try:
-            # TODO this is only needed for Blackwell
-            w_s_inverse_transformed = inverse_transform_scale_ue8m0(
-                w_s, mn=w_q.shape[-2]
-            )
+            if w_s.dtype == torch.int32:
+                # UE8M0 packed format (Blackwell DeepGEMM)
+                w_s = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
             w_dequant = block_quant_dequant(
                 w_q,
-                w_s_inverse_transformed,
+                w_s,
                 # TODO do not hardcode
                 block_size=[128, 128],
                 dtype=torch.bfloat16,
             )
-            yield name, True, w_dequant
+            yield name, True, True, w_dequant
         except Exception as e:
             e.add_note(
                 f"when handling {name=} {get_tensor_info(w_q)=} {get_tensor_info(w_s)=}"
@@ -156,4 +178,4 @@ def _postprocess_tensors(
 
     for name in raw:
         should_compare = name not in skip_compare_names
-        yield name, should_compare, raw[name]
+        yield name, should_compare, False, raw[name]

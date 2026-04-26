@@ -3211,8 +3211,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
         ShardedStateLoader.save_model(self.model, path, pattern, max_size)
 
-    def check_weights(self, action: str):
-        self._weight_checker.handle(action=action)
+    def check_weights(
+        self, action: str, dequant_mean_err_threshold: float | None = None
+    ):
+        self._weight_checker.handle(
+            action=action, dequant_mean_err_threshold=dequant_mean_err_threshold
+        )
 
     def update_weights_from_ipc(self, recv_req):
         """Update weights from IPC for checkpoint-engine integration."""

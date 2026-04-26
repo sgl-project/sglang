@@ -196,7 +196,10 @@ class SchedulerUpdateWeightsMixin:
 
     def check_weights(self: Scheduler, recv_req: CheckWeightsReqInput):
         try:
-            self.tp_worker.model_runner.check_weights(action=recv_req.action)
+            self.tp_worker.model_runner.check_weights(
+                action=recv_req.action,
+                dequant_mean_err_threshold=recv_req.dequant_mean_err_threshold,
+            )
             return CheckWeightsReqOutput(success=True, message="Success.")
         except Exception as e:
             logger.warning(f"check_weights see error: {e}")
