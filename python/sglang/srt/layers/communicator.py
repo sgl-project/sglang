@@ -22,6 +22,7 @@ import torch
 
 from sglang.srt.distributed import (
     attention_tensor_model_parallel_all_reduce,
+    attention_tensor_model_parallel_tree_all_reduce,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -896,7 +897,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
             if not handled:
                 if should_use_tp_invariant_tree_all_reduce():
-                    hidden_states = tensor_model_parallel_tree_all_reduce(hidden_states)
+                    hidden_states = attention_tensor_model_parallel_tree_all_reduce(
+                        hidden_states
+                    )
                 else:
                     hidden_states = attention_tensor_model_parallel_all_reduce(
                         hidden_states

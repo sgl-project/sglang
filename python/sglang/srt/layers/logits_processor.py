@@ -922,18 +922,21 @@ class LogitsProcessor(nn.Module):
 
     def _gather_attn_tp_logits(self, logits: torch.Tensor) -> torch.Tensor:
         if self.vocab_size % self.attn_tp_size == 0:
+            leading_shape = logits.shape[:-1]
+            local_logits = logits.reshape(-1, logits.shape[-1])
             global_logits = torch.empty(
                 (
-                    self.attn_tp_size,
-                    logits.shape[0],
-                    self.vocab_size // self.attn_tp_size,
+                    self.attn_tp_size * local_logits.shape[0],
+                    local_logits.shape[-1],
                 ),
                 device=logits.device,
                 dtype=logits.dtype,
             )
-            attn_tp_all_gather_into_tensor(global_logits, logits)
-            global_logits = global_logits.permute(1, 0, 2).reshape(
-                logits.shape[0], self.vocab_size
+            attn_tp_all_gather_into_tensor(global_logits, local_logits)
+            global_logits = (
+                global_logits.reshape(self.attn_tp_size, *leading_shape, -1)
+                .movedim(0, -2)
+                .reshape(*leading_shape, self.attn_tp_size * local_logits.shape[-1])
             )
         else:
             global_logits = torch.empty(

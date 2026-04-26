@@ -95,8 +95,11 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
 
     def forward(self, x):
-        if should_force_bfloat16_dense_tensor_math():
-            x = x.to(torch.bfloat16)
+        if (
+            should_force_bfloat16_dense_tensor_math()
+            or x.dtype != self.gate_up_proj.weight.dtype
+        ):
+            x = x.to(self.gate_up_proj.weight.dtype)
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)

@@ -266,8 +266,14 @@ class Qwen3Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if should_force_bfloat16_dense_tensor_math():
-            hidden_states = hidden_states.to(torch.bfloat16)
+        if (
+            should_force_bfloat16_dense_tensor_math()
+            or hidden_states.dtype != self.qkv_proj.weight.dtype
+        ):
+            # True-on-policy RMSNorm can produce fp32 activations while dense
+            # projections remain bf16, including during cuda-graph capture when
+            # the global on-policy flag is temporarily cleared.
+            hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
 
         save_kv_cache = True
         use_aiter_fused = (
@@ -296,9 +302,9 @@ class Qwen3Attention(nn.Module):
                 forward_batch=forward_batch,
             )
 
-        if should_force_bfloat16_dense_tensor_math():
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
+        if should_force_bfloat16_dense_tensor_math() or q.dtype != v.dtype:
+            q = q.to(v.dtype)
+            k = k.to(v.dtype)
 
         attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=save_kv_cache)
         output, _ = self.o_proj(attn_output)

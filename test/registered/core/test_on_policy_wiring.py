@@ -317,6 +317,57 @@ class TestOnPolicyHelpers(unittest.TestCase):
             )
         )
 
+    def test_attention_handoff_tree_reduce_uses_attention_tp_group(self):
+        from sglang.srt.layers.communicator import CommunicateWithAllReduceAndLayerNormFn
+
+        hidden_states = torch.ones(2, 4)
+        residual = torch.full((2, 4), 3.0)
+
+        class FakeNorm:
+            def __call__(self, x, residual):
+                return x + residual, residual
+
+        with (
+            patch(
+                "sglang.srt.layers.communicator.get_attn_tp_context",
+                return_value=SimpleNamespace(input_scattered=False),
+            ),
+            patch(
+                "sglang.srt.layers.communicator.apply_aiter_all_reduce_fusion",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.communicator.apply_flashinfer_allreduce_fusion",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.layers.communicator.should_use_tp_invariant_tree_all_reduce",
+                return_value=True,
+            ),
+            patch(
+                "sglang.srt.layers.communicator.attention_tensor_model_parallel_tree_all_reduce",
+                side_effect=lambda x: x + 10.0,
+            ) as attn_tree_reduce,
+            patch(
+                "sglang.srt.layers.communicator.tensor_model_parallel_tree_all_reduce",
+                side_effect=AssertionError("generic TP tree reduce must not handle attention output"),
+            ),
+        ):
+            output, output_residual = (
+                CommunicateWithAllReduceAndLayerNormFn._gather_hidden_states_and_residual(
+                    hidden_states,
+                    residual,
+                    forward_batch=None,
+                    layernorm=FakeNorm(),
+                    context=SimpleNamespace(attn_dp_size=1, cache=None),
+                    residual_input_mode=None,
+                )
+            )
+
+        attn_tree_reduce.assert_called_once()
+        torch.testing.assert_close(output, hidden_states + 10.0 + residual)
+        torch.testing.assert_close(output_residual, residual)
+
     def test_prefill_only_cuda_graph_patch_temporarily_disables_on_policy_state(self):
         server_args = SimpleNamespace(
             enable_prefill_only_deterministic_inference=True,

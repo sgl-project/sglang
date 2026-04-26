@@ -2670,9 +2670,12 @@ class ServerArgs:
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
     def _handle_data_parallelism(self):
+        use_context_parallel_lm_head = self.enable_dp_lm_head and self.attn_cp_size > 1
+
         if self.dp_size == 1:
             self.enable_dp_attention = False
-            self.enable_dp_lm_head = False
+            if not use_context_parallel_lm_head:
+                self.enable_dp_lm_head = False
 
         if self.enable_dp_attention:
             self.schedule_conservativeness = self.schedule_conservativeness * 0.3
@@ -2683,9 +2686,10 @@ class ServerArgs:
             )
 
         if self.enable_dp_lm_head:
-            assert (
-                self.enable_dp_attention
-            ), "Please enable dp attention when setting enable_dp_lm_head. "
+            assert use_context_parallel_lm_head or self.enable_dp_attention, (
+                "Please enable dp attention when setting enable_dp_lm_head, "
+                "unless attention context parallelism is enabled."
+            )
 
     def _handle_moe_kernel_config(self):
         if self.quantization == "mxfp8":

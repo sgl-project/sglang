@@ -185,6 +185,12 @@ class RMSNorm(MultiPlatformOp):
             return x
         if self.variance_size_override is not None:
             return self.forward_native(x, residual, post_residual_addition)
+        if (
+            self.weight.dtype != x.dtype
+            or self.cast_x_before_out_mul
+            or self.override_orig_dtype is not None
+        ):
+            return self.forward_native(x, residual, post_residual_addition)
         if is_batch_invariant_mode_enabled():
             if residual is not None or is_true_on_policy_enabled():
                 return self.forward_native(x, residual, post_residual_addition)
