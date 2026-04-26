@@ -813,9 +813,34 @@ class MoriKVManager(CommonKVManager):
                     )
                 if not info.is_dummy:
                     dst_indices_chunk = info.dst_kv_indices[index_slice]
-                    statuses = self.send_kvcache(
-                        peer_info, kv_indices, dst_indices_chunk
-                    )
+                    src_kv = kv_indices
+
+                    # MLA striped transfer: each prefill rank pushes
+                    # 1/N of the pages to maximize NIC utilization.
+                    decode_tp_size = peer_info.decode_tp_size
+                    local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+                    if self.is_mla_backend and self.attn_tp_size > decode_tp_size:
+                        stripe_total = self.attn_tp_size // decode_tp_size
+                        stripe_index = local_tp_rank % stripe_total
+                    elif (
+                        self.is_mla_backend
+                        and self.attn_tp_size == decode_tp_size
+                        and self.attn_tp_size > 1
+                    ):
+                        stripe_total = self.attn_tp_size
+                        stripe_index = local_tp_rank
+                    else:
+                        stripe_total = 0
+                    if stripe_total > 1:
+                        n = len(dst_indices_chunk)
+                        chunk_sz = n // stripe_total
+                        rem = n % stripe_total
+                        start = stripe_index * chunk_sz + min(stripe_index, rem)
+                        end = start + chunk_sz + (1 if stripe_index < rem else 0)
+                        dst_indices_chunk = dst_indices_chunk[start:end]
+                        src_kv = src_kv[start:end]
+
+                    statuses = self.send_kvcache(peer_info, src_kv, dst_indices_chunk)
                     result_statuses.extend(statuses)
                 if (
                     is_last

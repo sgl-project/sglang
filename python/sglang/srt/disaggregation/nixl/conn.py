@@ -44,6 +44,7 @@ class TransferInfo:
     dst_aux_index: int
     required_dst_info_num: int
     dst_state_indices: List[int]
+    mla_stripe_total: int = 0
 
     def is_dummy(self):
         return self.dst_kv_indices.size == 0
@@ -56,6 +57,8 @@ class TransferInfo:
         else:
             dst_state_indices = []
 
+        mla_stripe_total = int(msg[8].decode("ascii")) if len(msg) > 8 else 0
+
         return cls(
             room=int(msg[0].decode("ascii")),
             endpoint=msg[1].decode("ascii"),
@@ -65,6 +68,7 @@ class TransferInfo:
             dst_aux_index=int(msg[5].decode("ascii")),
             required_dst_info_num=int(msg[6].decode("ascii")),
             dst_state_indices=dst_state_indices,
+            mla_stripe_total=mla_stripe_total,
         )
 
 
@@ -859,6 +863,37 @@ class NixlKVManager(CommonKVManager):
                 )
             return None
 
+    @staticmethod
+    def _compute_mla_stripe(
+        stripe_total: int,
+        stripe_index: int,
+        kv_indices: npt.NDArray[np.int32],
+        index_slice: slice,
+        dst_kv_indices: npt.NDArray[np.int32],
+    ):
+        """Compute this rank's stripe of an MLA KV transfer.
+
+        All prefill ranks hold identical MLA KV, so we split the token
+        dimension across participating prefill ranks. Each rank transfers
+        1/N of the pages, utilizing multiple EFA/NIC devices in parallel.
+
+        The stripe is computed per-chunk (not against the full request
+        length) so that every chunk's pages are distributed across ranks
+        regardless of how the engine splits the forward pass.
+        """
+        # First apply the chunk slice to get this chunk's dst indices,
+        # then partition that chunk across ranks.
+        chunk_dst = dst_kv_indices[index_slice]
+        n = len(chunk_dst)
+        chunk_size = n // stripe_total
+        remainder = n % stripe_total
+        start = stripe_index * chunk_size + min(stripe_index, remainder)
+        end = start + chunk_size + (1 if stripe_index < remainder else 0)
+
+        dst_stripe = chunk_dst[start:end]
+        src_stripe = kv_indices[start:end]
+        return src_stripe, dst_stripe
+
     def add_transfer_request(
         self,
         bootstrap_room: int,
@@ -879,44 +914,85 @@ class NixlKVManager(CommonKVManager):
             if req.is_dummy():
                 continue
 
-            chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
-            assert len(chunked_dst_kv_indice) == len(kv_indices)
             assert req.agent_name in self.decode_kv_args_table
+            decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
+
+            # MLA striped transfer: each prefill rank pushes 1/N of the
+            # pages. For homogeneous TP (all-to-all), N = P_TP. For
+            # heterogeneous TP (P_TP > D_TP), N = P_TP / D_TP.
+            local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+            if req.mla_stripe_total > 1:
+                stripe_total = req.mla_stripe_total
+                stripe_index = local_tp_rank % stripe_total
+                is_mla_striped = True
+            elif self.is_mla_backend and self.attn_tp_size > decode_tp_size:
+                # Fallback for older decode that doesn't send mla_stripe_total
+                stripe_total = self.attn_tp_size // decode_tp_size
+                stripe_index = local_tp_rank % stripe_total
+                is_mla_striped = True
+            else:
+                is_mla_striped = False
+
+            if is_mla_striped:
+                src_kv_indices, chunked_dst_kv_indice = self._compute_mla_stripe(
+                    stripe_total,
+                    stripe_index,
+                    kv_indices,
+                    index_slice,
+                    req.dst_kv_indices,
+                )
+            else:
+                chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
+                src_kv_indices = kv_indices
+
+            assert len(chunked_dst_kv_indice) == len(src_kv_indices), (
+                f"Index mismatch: dst={len(chunked_dst_kv_indice)} src={len(src_kv_indices)} "
+                f"mla_striped={is_mla_striped}"
+            )
 
             notif = (
                 f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
             )
-            decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
 
-            if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
-                kv_xfer_handle = self.send_kvcache(
-                    req.agent_name,
-                    kv_indices,
-                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
-                    chunked_dst_kv_indice,
-                    self.decode_kv_args_table[req.agent_name].gpu_id,
-                    notif,
-                )
+            if len(src_kv_indices) == 0:
+                # Empty stripe (chunk has fewer pages than stripe ranks).
+                # Send a bare notification so the decode completion tracker
+                # still sees this rank's chunk without issuing an empty
+                # RDMA transfer that NIXL may not handle.
+                self.agent.send_notif(req.agent_name, notif.encode("ascii"))
             else:
-                kv_xfer_handle = self.send_kvcache_slice(
-                    req.agent_name,
-                    kv_indices,
-                    self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
-                    chunked_dst_kv_indice,
-                    self.decode_kv_args_table[req.agent_name].gpu_id,
-                    notif,
-                    prefill_tp_size=self.attn_tp_size,
-                    decode_tp_size=decode_tp_size,
-                    decode_tp_rank=self.decode_kv_args_table[
-                        req.agent_name
-                    ].decode_tp_rank,
-                    dst_kv_item_len=self.decode_kv_args_table[
-                        req.agent_name
-                    ].dst_kv_item_len,
-                )
+                if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
+                    kv_xfer_handle = self.send_kvcache(
+                        req.agent_name,
+                        src_kv_indices,
+                        self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
+                        chunked_dst_kv_indice,
+                        self.decode_kv_args_table[req.agent_name].gpu_id,
+                        notif,
+                    )
+                else:
+                    kv_xfer_handle = self.send_kvcache_slice(
+                        req.agent_name,
+                        src_kv_indices,
+                        self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
+                        chunked_dst_kv_indice,
+                        self.decode_kv_args_table[req.agent_name].gpu_id,
+                        notif,
+                        prefill_tp_size=self.attn_tp_size,
+                        decode_tp_size=decode_tp_size,
+                        decode_tp_rank=self.decode_kv_args_table[
+                            req.agent_name
+                        ].decode_tp_rank,
+                        dst_kv_item_len=self.decode_kv_args_table[
+                            req.agent_name
+                        ].dst_kv_item_len,
+                    )
+                handles.append(kv_xfer_handle)
 
-            handles.append(kv_xfer_handle)
-            # Only the last chunk we need to send the aux data.
+            # Only the last chunk needs aux/state data. For MLA striped
+            # transfers, all ranks send aux/state (data is identical, writes
+            # are idempotent) so the completion tracker sees the expected
+            # number of state notifications from all participating ranks.
             if is_last:
                 if state_indices is not None:
                     dst_info = self.decode_kv_args_table[req.agent_name]
@@ -1130,6 +1206,7 @@ class NixlKVReceiver(CommonKVReceiver):
             logger.debug(
                 f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
             )
+            mla_stripe_total = bootstrap_info.get("mla_stripe_total", 0)
             with lock:
                 sock.send_multipart(
                     [
@@ -1146,6 +1223,7 @@ class NixlKVReceiver(CommonKVReceiver):
                             if not is_dummy and state_indices is not None
                             else b""
                         ),
+                        str(mla_stripe_total).encode("ascii"),
                     ]
                 )
 

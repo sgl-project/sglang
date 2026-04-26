@@ -252,9 +252,14 @@ class CommonKVManager(BaseKVManager):
         # TP rank mapping
         if self.attn_tp_size == info.attn_tp_size:
             target_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
-            required_dst_info_num = 1
-            required_prefill_response_num = 1
-            target_tp_ranks = [target_tp_rank]
+            if self.is_mla_backend and info.attn_tp_size > 1:
+                target_tp_ranks = list(range(info.attn_tp_size))
+                required_dst_info_num = 1
+                required_prefill_response_num = len(target_tp_ranks)
+            else:
+                required_dst_info_num = 1
+                required_prefill_response_num = 1
+                target_tp_ranks = [target_tp_rank]
         elif self.attn_tp_size > info.attn_tp_size:
             if not self.is_mla_backend:
                 logger.warning_once(
@@ -271,7 +276,6 @@ class CommonKVManager(BaseKVManager):
                 logger.warning_once(
                     "Performance is NOT guaranteed when using different TP sizes for non-MLA models. "
                 )
-            # For non-MLA models, one decode rank needs to retrieve KVCache from multiple prefill ranks
             target_tp_ranks = list(
                 range(
                     (self.kv_args.engine_rank % self.attn_tp_size)
@@ -280,13 +284,14 @@ class CommonKVManager(BaseKVManager):
                     * (info.attn_tp_size // self.attn_tp_size),
                 )
             )
-            # For MLA models, we can retrieve KVCache from only one prefill rank, but we still need to maintain
-            # multiple connections in the connection pool and have to send dummy requests to other prefill ranks,
-            # or the KVPoll will never be set correctly
             target_tp_rank = target_tp_ranks[0]
             required_dst_info_num = 1
             if self.is_mla_backend:
-                required_prefill_response_num = 1
+                # MLA KV is TP-independent (replicated on all prefill ranks).
+                # Stripe the transfer across ALL target prefill ranks so each
+                # one pushes a different portion of the token dimension,
+                # utilizing all available NIC bandwidth instead of just one.
+                required_prefill_response_num = len(target_tp_ranks)
             else:
                 required_prefill_response_num = info.attn_tp_size // self.attn_tp_size
 
@@ -584,14 +589,23 @@ class CommonKVReceiver(BaseKVReceiver):
                             target_pp_rank,
                         )
                         if bootstrap_info is not None:
-                            if self.kv_mgr.is_mla_backend:
-                                # For MLA: target_tp_rank is the selected real rank, others are dummy ranks
-                                bootstrap_info["is_dummy"] = not bool(
-                                    target_tp_rank == self.target_tp_rank
-                                    or self.target_tp_rank is None
+                            if (
+                                self.kv_mgr.is_mla_backend
+                                and len(self.target_tp_ranks) > 1
+                            ):
+                                # MLA striped transfer (homogeneous or P_TP > D_TP):
+                                # all prefill ranks participate for higher aggregate
+                                # bandwidth across multiple EFA/NIC devices.
+                                bootstrap_info["is_dummy"] = False
+                                bootstrap_info["mla_stripe_index"] = (
+                                    self.target_tp_ranks.index(target_tp_rank)
                                 )
+                                bootstrap_info["mla_stripe_total"] = len(
+                                    self.target_tp_ranks
+                                )
+                            elif self.kv_mgr.is_mla_backend:
+                                bootstrap_info["is_dummy"] = False
                             else:
-                                # For non-MLA: all target_tp_ranks are selected real ranks
                                 bootstrap_info["is_dummy"] = False
                             logger.debug(
                                 f"Fetched bootstrap info: {bootstrap_info} for DP {self.prefill_dp_rank} CP {target_cp_rank} TP {target_tp_rank} PP {target_pp_rank}"

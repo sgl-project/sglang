@@ -1201,30 +1201,58 @@ class MooncakeKVManager(CommonKVManager):
                                 break
 
                         chunked_dst_kv_indice = req.dst_kv_indices[kv_chunk.index_slice]
-
-                        # NOTE: This is temporarily a workaround to deal with the case where the prefill_kv_indices
-                        # is mismatched with the dst_kv_indices when page size > 1, this should never happen.
-                        if len(chunked_dst_kv_indice) < len(
-                            kv_chunk.prefill_kv_indices
-                        ):
-                            logger.warning(
-                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(kv_chunk.prefill_kv_indices) = {len(kv_chunk.prefill_kv_indices)}"
-                            )
-                            kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices[
-                                : len(chunked_dst_kv_indice)
-                            ]
+                        prefill_kv_indices = kv_chunk.prefill_kv_indices
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
                         )
-                        if self.is_mla_backend or (
-                            self.attn_tp_size
-                            == target_rank_registration_info.dst_attn_tp_size
+                        decode_tp_size = target_rank_registration_info.dst_attn_tp_size
+
+                        # MLA striped transfer: each prefill rank pushes
+                        # 1/N of the pages to maximize NIC utilization.
+                        local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
+                        if self.is_mla_backend and self.attn_tp_size > decode_tp_size:
+                            stripe_total = self.attn_tp_size // decode_tp_size
+                            stripe_index = local_tp_rank % stripe_total
+                            is_mla_striped = True
+                        elif (
+                            self.is_mla_backend
+                            and self.attn_tp_size == decode_tp_size
+                            and self.attn_tp_size > 1
                         ):
-                            if target_rank_registration_info.enable_hisparse:
+                            stripe_total = self.attn_tp_size
+                            stripe_index = local_tp_rank
+                            is_mla_striped = True
+                        else:
+                            is_mla_striped = False
+                        if is_mla_striped:
+                            n = len(chunked_dst_kv_indice)
+                            chunk_sz = n // stripe_total
+                            rem = n % stripe_total
+                            start = stripe_index * chunk_sz + min(stripe_index, rem)
+                            end = start + chunk_sz + (1 if stripe_index < rem else 0)
+                            chunked_dst_kv_indice = chunked_dst_kv_indice[start:end]
+                            prefill_kv_indices = prefill_kv_indices[start:end]
+
+                        # Workaround for page size > 1 index mismatch
+                        if len(chunked_dst_kv_indice) < len(prefill_kv_indices):
+                            logger.warning(
+                                f"len(chunked_dst_kv_indice) = {len(chunked_dst_kv_indice)}, len(prefill_kv_indices) = {len(prefill_kv_indices)}"
+                            )
+                            prefill_kv_indices = prefill_kv_indices[
+                                : len(chunked_dst_kv_indice)
+                            ]
+
+                        if self.is_mla_backend or (self.attn_tp_size == decode_tp_size):
+                            if (
+                                target_rank_registration_info.enable_hisparse
+                                and not is_mla_striped
+                            ):
+                                # HiSparse's page-level index expansion is
+                                # incompatible with MLA striped indices.
                                 ret = self.send_kvcache_hisparse(
                                     req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
+                                    prefill_kv_indices,
                                     target_rank_registration_info.dst_kv_ptrs,
                                     req.dst_kv_indices,
                                     kv_chunk.index_slice,
@@ -1233,7 +1261,7 @@ class MooncakeKVManager(CommonKVManager):
                             else:
                                 ret = self.send_kvcache(
                                     req.mooncake_session_id,
-                                    kv_chunk.prefill_kv_indices,
+                                    prefill_kv_indices,
                                     target_rank_registration_info.dst_kv_ptrs,
                                     chunked_dst_kv_indice,
                                     executor,
