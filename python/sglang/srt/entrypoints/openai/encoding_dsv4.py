@@ -363,7 +363,7 @@ def render_message(
                             elif isinstance(b, str):
                                 text_parts.append(b)
                             else:
-                                text_parts.append(f"[Unsupported tool content type]")
+                                text_parts.append(f"[Unsupported tool content type: {type(b).__name__}]")
                         tool_content = "\n\n".join(text_parts)
                     elif not isinstance(tool_content, str):
                         tool_content = str(tool_content)
@@ -381,8 +381,8 @@ def render_message(
 
         if parts:
             prompt += "\n\n".join(parts)
-        else:
-            prompt += content or ""
+        elif isinstance(content, str):
+            prompt += content
 
     elif role == "latest_reminder":
         prompt += LATEST_REMINDER_SP_TOKEN + latest_reminder_msg_template.format(
