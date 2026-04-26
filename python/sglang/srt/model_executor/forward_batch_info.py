@@ -351,6 +351,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     encoder_lens: Optional[torch.Tensor] = None
     encoder_lens_cpu: Optional[List[int]] = None
     encoder_out_cache_loc: Optional[torch.Tensor] = None
+    cross_attention_custom_mask: Optional[torch.Tensor] = None
 
     # For LoRA
     lora_ids: Optional[List[str]] = None
