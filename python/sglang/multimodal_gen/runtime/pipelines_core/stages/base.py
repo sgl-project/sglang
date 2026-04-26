@@ -11,7 +11,7 @@ composed to create complete diffusion pipelines.
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from enum import Enum, auto
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Callable, Tuple
 
 import torch
 
@@ -188,8 +188,6 @@ class PipelineStage(ABC):
         Execute the stage's processing on the batch with optional verification and logging.
         Should not be overridden by subclasses.
 
-
-
         Returns:
             The updated batch information after this stage's processing.
         """
@@ -234,34 +232,13 @@ class PipelineStage(ABC):
 
         A grouped request is still a list of normal ``Req`` objects. The group
         boundary only gives a stage the opportunity to reduce duplicate work.
-        The default implementation preserves the single-request contract by
-        calling ``self(batch, server_args)`` for every request, so stages that do
-        not override this method keep exactly the same behavior as before.
 
-        Stage overrides decide their own reuse granularity. A simple stage may
-        group by a single full-stage fingerprint, compute once, then copy or
-        split the stage-local outputs back to every request. A mixed stage may
-        instead reuse only one subprocess, such as positive prompt encoding,
-        while still running another subprocess per request. Overrides must
-        preserve input order and return one result per input request.
+        Stages that do not override this method keep exactly the same behavior as before.
 
-        Full-stage dedup is opt-in: a stage declares the request fields it
-        writes through ``deduplicated_output_fields`` (and the clone/deepcopy
-        variants when needed), and overrides ``build_dedup_fingerprint`` to
-        describe when two requests are equivalent for that stage. The base
-        implementation then handles grouping, running the first request, and
-        copying only the declared stage outputs to the remaining requests.
-
-        Stages with finer internal reuse should override this method directly.
-        For example, latent preparation cannot copy one request's random noise
-        to another request, but it can still group requests and batch the
-        deterministic packing/scaling subprocess.
-
-        This hook is deliberately not a global cache: deduplication is local to
-        the current stage and current group. A dedup fingerprint must only
-        contain fields that can change this stage's outputs. Request metadata
-        such as request id, output path, or seed should be excluded unless this
-        stage actually reads it.
+        Stage overrides decide their own reuse granularity:
+         - A simple stage may group by a single full-stage fingerprint, compute once, then copy or split the stage-local outputs back to every request.
+         - A mixed stage may instead reuse only one subprocess, such as positive prompt encoding, while still running another subprocess per request.
+        Overrides must preserve input order and return one result per input request.
         """
         if self.has_deduplicated_output_fields():
             return self.run_deduplicated_group(batches, server_args)
@@ -270,13 +247,7 @@ class PipelineStage(ABC):
 
     @classmethod
     def has_deduplicated_output_fields(cls) -> bool:
-        """Return whether this stage opts into base full-stage dedup.
-
-        The base class treats declared output fields as the opt-in signal. This
-        keeps the common full-stage case declarative: subclasses only name the
-        ``Req`` fields that this stage owns and implement
-        ``build_dedup_fingerprint``. A stage that needs partial reuse leaves
-        these declarations empty and overrides ``run_grouped_requests``.
+        """Return whether this stage is available and opts into base full-stage dedup
         """
         return bool(
             cls.deduplicated_output_fields
@@ -293,14 +264,12 @@ class PipelineStage(ABC):
         fingerprint only when this stage would produce equivalent outputs for
         both of them.
 
-        The default fingerprint is unique per request, so stages opt into
-        deduplication explicitly. Overrides should prefer a named frozen
-        dataclass whose field names document the stage inputs. Include every
-        request/config field read by this stage, and exclude fields that only
-        matter to later stages, such as output path. If this stage reads seed or
-        mutable inputs, include them or disable dedup for that request. Use
-        ``freeze_for_dedup`` for tensors and nested containers so the
-        fingerprint remains hashable and deterministic.
+        The default fingerprint is unique per request, so stages opt into deduplication explicitly, which is safe for most stages (except LatentPreparationStage).
+
+        How to organize fingerprint:
+        1. Include every request/config field read by this stage, and exclude fields that only matter to later stages, such as output path.
+        2. If this stage reads seed or mutable inputs, include them or disable dedup for that request.
+        3. Use ``freeze_for_dedup`` for tensors and nested containers so the fingerprint remains hashable and deterministic.
         """
         return id(batch)
 
@@ -312,23 +281,14 @@ class PipelineStage(ABC):
     ) -> list[Req]:
         """Run full-stage-equivalent requests once and fan out stage outputs.
 
-        This helper is the implementation behind declarative full-stage dedup.
-        It groups requests by ``build_dedup_fingerprint()``, executes the first
-        request in each group through the normal ``self(batch, server_args)``
-        path, and copies only this stage's declared outputs to the remaining
-        requests. The returned list preserves the input order.
-
-        ``copy_outputs`` exists for rare stages that need bespoke full-stage
-        copying, but the preferred path is to declare ``deduplicated_*`` fields
-        and let ``copy_deduplicated_outputs`` do the copy. Stages with partial
-        subprocess reuse should override ``run_grouped_requests`` instead of
-        forcing their logic through this full-stage helper.
         """
         if copy_outputs is None:
-            copy_outputs = self.copy_deduplicated_outputs
+            copy_outputs: Callable[Tuple[Req], None] = self.copy_deduplicated_outputs
 
+        # [[group_1], [group_2]...]
         results: list[Req | None] = [None] * len(batches)
 
+        # group requests by their id
         for _, group in self._group_requests_by_fingerprint(
             batches, lambda batch: self.build_dedup_fingerprint(batch, server_args)
         ):

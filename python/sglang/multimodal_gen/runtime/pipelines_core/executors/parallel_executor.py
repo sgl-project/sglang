@@ -59,7 +59,8 @@ class ParallelExecutor(PipelineExecutor):
         server_args: ServerArgs,
     ) -> OutputBatch:
         """
-        Execute all pipeline stages respecting their declared parallelism type.
+            Execute all pipeline stages respecting their declared parallelism type.
+            Requests are executed sequentially, one at a time
         """
         if server_args.enable_cfg_parallel:
             rank = get_classifier_free_guidance_rank()
