@@ -9,8 +9,9 @@ composed to create complete diffusion pipelines.
 """
 
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from enum import Enum, auto
-from typing import Any
+from typing import Any, ClassVar
 
 import torch
 
@@ -50,6 +51,11 @@ class PipelineStage(ABC):
     composed with other stages to create a complete pipeline. Each stage is responsible
     for a specific part of the process, such as prompt encoding, latent preparation, etc.
     """
+
+    deduplicated_output_fields: ClassVar[tuple[str, ...]] = ()
+    deduplicated_tensor_tree_output_fields: ClassVar[tuple[str, ...]] = ()
+    deduplicated_deepcopy_output_fields: ClassVar[tuple[str, ...]] = ()
+    deduplicated_extra_tensor_tree_output_keys: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self):
         self.server_args = get_global_server_args()
@@ -239,10 +245,17 @@ class PipelineStage(ABC):
         while still running another subprocess per request. Overrides must
         preserve input order and return one result per input request.
 
-        ``build_dedup_fingerprint`` and ``run_deduplicated_group`` are the
-        helpers for the full-stage case. They are intentionally small: they
-        define the grouping contract, but the stage still owns the semantic
-        decision of what is equivalent and how its outputs should be copied.
+        Full-stage dedup is opt-in: a stage declares the request fields it
+        writes through ``deduplicated_output_fields`` (and the clone/deepcopy
+        variants when needed), and overrides ``build_dedup_fingerprint`` to
+        describe when two requests are equivalent for that stage. The base
+        implementation then handles grouping, running the first request, and
+        copying only the declared stage outputs to the remaining requests.
+
+        Stages with finer internal reuse should override this method directly.
+        For example, latent preparation cannot copy one request's random noise
+        to another request, but it can still group requests and batch the
+        deterministic packing/scaling subprocess.
 
         This hook is deliberately not a global cache: deduplication is local to
         the current stage and current group. A dedup fingerprint must only
@@ -250,13 +263,32 @@ class PipelineStage(ABC):
         such as request id, output path, or seed should be excluded unless this
         stage actually reads it.
         """
+        if self.has_deduplicated_output_fields():
+            return self.run_deduplicated_group(batches, server_args)
+
         return [self(batch, server_args) for batch in batches]
+
+    @classmethod
+    def has_deduplicated_output_fields(cls) -> bool:
+        """Return whether this stage opts into base full-stage dedup.
+
+        The base class treats declared output fields as the opt-in signal. This
+        keeps the common full-stage case declarative: subclasses only name the
+        ``Req`` fields that this stage owns and implement
+        ``build_dedup_fingerprint``. A stage that needs partial reuse leaves
+        these declarations empty and overrides ``run_grouped_requests``.
+        """
+        return bool(
+            cls.deduplicated_output_fields
+            or cls.deduplicated_tensor_tree_output_fields
+            or cls.deduplicated_deepcopy_output_fields
+            or cls.deduplicated_extra_tensor_tree_output_keys
+        )
 
     def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs) -> Any:
         """Return this stage's semantic input fingerprint for grouped dedup.
 
-        A fingerprint is not a request identity and not a cache key shared
-        across stages. It is the stage-local set of input values that fully
+        A fingerprint is the stage-local set of input values that fully
         determines the outputs this stage writes. Two requests may share a
         fingerprint only when this stage would produce equivalent outputs for
         both of them.
@@ -276,28 +308,25 @@ class PipelineStage(ABC):
         self,
         batches: list[Req],
         server_args: ServerArgs,
-        copy_outputs,
+        copy_outputs=None,
     ) -> list[Req]:
         """Run full-stage-equivalent requests once and fan out stage outputs.
 
-        This helper is for the common case where the whole stage is reusable for
-        a group of requests. It groups requests by
-        ``build_dedup_fingerprint()``, executes only the first request in each
-        group through the normal ``self(batch, server_args)`` path, and calls
-        ``copy_outputs(src, dst)`` to transfer this stage's outputs to the
-        remaining requests.
+        This helper is the implementation behind declarative full-stage dedup.
+        It groups requests by ``build_dedup_fingerprint()``, executes the first
+        request in each group through the normal ``self(batch, server_args)``
+        path, and copies only this stage's declared outputs to the remaining
+        requests. The returned list preserves the input order.
 
-        The helper intentionally does not know which ``Req`` fields belong to a
-        stage. ``copy_outputs`` is stage-specific and must copy only the fields
-        written by this stage; unrelated request metadata should stay on the
-        destination request. The result list preserves input order and contains
-        one ``Req`` per input request.
-
-        Do not force partial reuse through this helper. If only a subprocess is
-        reusable, such as one text-encoder branch but not the whole stage,
-        override ``run_grouped_requests`` and do the finer-grained grouping
-        inside that stage.
+        ``copy_outputs`` exists for rare stages that need bespoke full-stage
+        copying, but the preferred path is to declare ``deduplicated_*`` fields
+        and let ``copy_deduplicated_outputs`` do the copy. Stages with partial
+        subprocess reuse should override ``run_grouped_requests`` instead of
+        forcing their logic through this full-stage helper.
         """
+        if copy_outputs is None:
+            copy_outputs = self.copy_deduplicated_outputs
+
         results: list[Req | None] = [None] * len(batches)
 
         for _, group in self._group_requests_by_fingerprint(
@@ -313,20 +342,40 @@ class PipelineStage(ABC):
 
         return [result for result in results if result is not None]
 
+    def copy_deduplicated_outputs(self, src: Req, dst: Req) -> None:
+        """Copy declared stage outputs from a computed request to a duplicate.
+
+        This method is intentionally field-based. The stage still owns the
+        semantic contract by declaring exactly which ``Req`` fields it writes.
+        The helper only applies the requested ownership policy:
+
+        - ``deduplicated_output_fields``: shallow container copy, tensor refs
+          shared. This is the default for read-only outputs such as embeddings.
+        - ``deduplicated_tensor_tree_output_fields``: recursively clone tensors.
+          Use this for small mutable tensor outputs such as timesteps/sigmas.
+        - ``deduplicated_deepcopy_output_fields``: Python deepcopy. This is for
+          request-local mutable runtime objects such as scheduler instances.
+        - ``deduplicated_extra_tensor_tree_output_keys``: clone selected
+          ``Req.extra`` entries without replacing the whole extra dict.
+        """
+        for field in self.deduplicated_output_fields:
+            setattr(dst, field, self.copy_stage_output(getattr(src, field)))
+        for field in self.deduplicated_tensor_tree_output_fields:
+            setattr(dst, field, self.clone_tensor_tree(getattr(src, field)))
+        for field in self.deduplicated_deepcopy_output_fields:
+            setattr(dst, field, deepcopy(getattr(src, field)))
+        for key in self.deduplicated_extra_tensor_tree_output_keys:
+            if key in src.extra:
+                dst.extra[key] = self.clone_tensor_tree(src.extra[key])
+
     @classmethod
     def copy_stage_output(cls, value):
         """Copy a reusable output with the default low-overhead ownership model.
 
         The default is a shallow container copy: lists/tuples/dicts get a new
         container, while tensor objects inside are shared by reference. This is
-        deliberate. Most shared stage outputs, such as prompt embeddings, are
-        read-only after the stage, and cloning every tensor would add GPU memory
-        traffic that can erase the benefit of deduplication.
-
-        Use ``clone_tensor_tree`` instead for outputs that downstream code may
-        mutate in-place or whose object identity carries request-local state.
-        Scheduler runtimes are a separate case and should be deep-copied by the
-        stage-specific copy function when isolation is required.
+        deliberate for large read-only outputs, where cloning tensors would add
+        GPU memory traffic and defeat much of the dedup benefit.
         """
         if isinstance(value, list):
             return list(value)
@@ -340,11 +389,10 @@ class PipelineStage(ABC):
     def clone_tensor_tree(cls, value):
         """Recursively clone tensors in a small output tree.
 
-        This is intentionally opt-in. It is appropriate for outputs like custom
-        timestep tensors or sigma lists that should not share mutable tensor
-        storage across duplicated requests. It should not be used as the default
-        copier for large embedding trees unless a stage has a concrete
-        mutation/ownership requirement.
+        This is opt-in because it is more expensive than
+        ``copy_stage_output``. Use it when downstream code may mutate the tensor
+        or when sharing tensor storage would accidentally couple duplicated
+        requests.
         """
         if isinstance(value, torch.Tensor):
             return value.clone()
@@ -402,10 +450,9 @@ class PipelineStage(ABC):
         group keep their original relative order. Callers can fill a result
         list by ``original_index`` to preserve input/output ordering.
 
-        This helper is deliberately private to the stage layer. It does not
-        choose the fingerprint, does not execute a stage, and does not copy
-        outputs; it only provides the stable ordering behavior shared by
-        full-stage dedup and finer-grained stage-local reuse.
+        The helper does not define request equivalence and does not copy
+        outputs; it only provides stable grouping for both full-stage dedup and
+        finer-grained stage-local reuse.
         """
         groups: dict[Any, list[tuple[int, Req]]] = {}
         for index, batch in enumerate(batches):

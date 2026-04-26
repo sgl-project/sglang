@@ -8,7 +8,6 @@ This module contains implementations of timestep preparation stages for diffusio
 """
 
 import inspect
-from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Callable, Tuple
 
@@ -53,6 +52,10 @@ class TimestepPreparationStage(PipelineStage):
     This stage handles the preparation of the timestep sequence that will be used
     during the diffusion process.
     """
+
+    deduplicated_tensor_tree_output_fields = ("timesteps", "sigmas")
+    deduplicated_deepcopy_output_fields = ("scheduler",)
+    deduplicated_extra_tensor_tree_output_keys = ("mu",)
 
     def __init__(
         self,
@@ -156,22 +159,6 @@ class TimestepPreparationStage(PipelineStage):
         if not batch.is_warmup:
             self.log_debug("timesteps: %s", timesteps)
         return batch
-
-    def run_grouped_requests(
-        self,
-        batches: list[Req],
-        server_args: ServerArgs,
-    ) -> list[Req]:
-        return self.run_deduplicated_group(
-            batches, server_args, self._copy_timestep_outputs
-        )
-
-    def _copy_timestep_outputs(self, src: Req, dst: Req) -> None:
-        dst.timesteps = self.clone_tensor_tree(src.timesteps)
-        dst.sigmas = self.clone_tensor_tree(src.sigmas)
-        dst.scheduler = deepcopy(src.scheduler)
-        if "mu" in src.extra:
-            dst.extra["mu"] = self.clone_tensor_tree(src.extra["mu"])
 
     def build_dedup_fingerprint(
         self, batch: Req, server_args: ServerArgs

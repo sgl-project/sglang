@@ -47,6 +47,18 @@ class TextEncodingStage(PipelineStage):
     expected by the diffusion model.
     """
 
+    deduplicated_output_fields = (
+        "prompt_embeds",
+        "negative_prompt_embeds",
+        "prompt_attention_mask",
+        "negative_attention_mask",
+        "pooled_embeds",
+        "neg_pooled_embeds",
+        "clip_embedding_pos",
+        "clip_embedding_neg",
+        "is_prompt_processed",
+    )
+
     def __init__(self, text_encoders, tokenizers) -> None:
         """
         Initialize the prompt encoding stage.
@@ -118,15 +130,6 @@ class TextEncodingStage(PipelineStage):
 
         return batch
 
-    def run_grouped_requests(
-        self,
-        batches: list[Req],
-        server_args: ServerArgs,
-    ) -> list[Req]:
-        return self.run_deduplicated_group(
-            batches, server_args, self._copy_text_outputs
-        )
-
     def build_dedup_fingerprint(
         self, batch: Req, server_args: ServerArgs
     ) -> TextEncodingFingerprint:
@@ -137,30 +140,6 @@ class TextEncodingStage(PipelineStage):
             prompt_template=self.freeze_for_dedup(batch.prompt_template),
             max_sequence_length=batch.max_sequence_length,
         )
-
-    @staticmethod
-    def _copy_text_outputs(src: Req, dst: Req) -> None:
-        dst.prompt_embeds = PipelineStage.copy_stage_output(src.prompt_embeds)
-        dst.negative_prompt_embeds = (
-            PipelineStage.copy_stage_output(src.negative_prompt_embeds)
-            if src.negative_prompt_embeds is not None
-            else None
-        )
-        dst.prompt_attention_mask = (
-            PipelineStage.copy_stage_output(src.prompt_attention_mask)
-            if src.prompt_attention_mask is not None
-            else None
-        )
-        dst.negative_attention_mask = (
-            PipelineStage.copy_stage_output(src.negative_attention_mask)
-            if src.negative_attention_mask is not None
-            else None
-        )
-        dst.pooled_embeds = PipelineStage.copy_stage_output(src.pooled_embeds)
-        dst.neg_pooled_embeds = PipelineStage.copy_stage_output(src.neg_pooled_embeds)
-        dst.clip_embedding_pos = src.clip_embedding_pos
-        dst.clip_embedding_neg = src.clip_embedding_neg
-        dst.is_prompt_processed = src.is_prompt_processed
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage inputs."""

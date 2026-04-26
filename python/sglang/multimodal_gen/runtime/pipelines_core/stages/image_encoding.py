@@ -114,6 +114,12 @@ class ImageEncodingStage(PipelineStage):
     expected by the diffusion model.
     """
 
+    deduplicated_output_fields = (
+        "image_embeds",
+        "prompt_embeds",
+        "negative_prompt_embeds",
+    )
+
     def __init__(
         self,
         image_processor,
@@ -271,15 +277,6 @@ class ImageEncodingStage(PipelineStage):
 
         return batch
 
-    def run_grouped_requests(
-        self,
-        batches: list[Req],
-        server_args: ServerArgs,
-    ) -> list[Req]:
-        return self.run_deduplicated_group(
-            batches, server_args, self._copy_image_encoding_outputs
-        )
-
     def build_dedup_fingerprint(
         self, batch: Req, server_args: ServerArgs
     ) -> ImageEncodingFingerprint:
@@ -291,16 +288,6 @@ class ImageEncodingStage(PipelineStage):
             height=batch.height,
             width=batch.width,
             num_frames=batch.num_frames,
-        )
-
-    @staticmethod
-    def _copy_image_encoding_outputs(src: Req, dst: Req) -> None:
-        dst.image_embeds = PipelineStage.copy_stage_output(src.image_embeds)
-        dst.prompt_embeds = PipelineStage.copy_stage_output(src.prompt_embeds)
-        dst.negative_prompt_embeds = (
-            PipelineStage.copy_stage_output(src.negative_prompt_embeds)
-            if src.negative_prompt_embeds is not None
-            else None
         )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
@@ -328,6 +315,12 @@ class LTX2ImageEncodingStage(PipelineStage):
       - ``batch.image_latent``    (packed [B, S0, D] token latents)
       - ``batch.ltx2_num_image_tokens``
     """
+
+    deduplicated_output_fields = (
+        "condition_image",
+        "image_latent",
+        "ltx2_num_image_tokens",
+    )
 
     def __init__(self, vae=None, **kwargs) -> None:
         super().__init__()
@@ -653,15 +646,6 @@ class LTX2ImageEncodingStage(PipelineStage):
         self.offload_model()
         return batch
 
-    def run_grouped_requests(
-        self,
-        batches: list[Req],
-        server_args: ServerArgs,
-    ) -> list[Req]:
-        return self.run_deduplicated_group(
-            batches, server_args, self._copy_ltx2_outputs
-        )
-
     def build_dedup_fingerprint(
         self, batch: Req, server_args: ServerArgs
     ) -> LTX2ImageEncodingFingerprint | int:
@@ -685,12 +669,6 @@ class LTX2ImageEncodingStage(PipelineStage):
             encode_sample_mode=sample_mode,
         )
 
-    @staticmethod
-    def _copy_ltx2_outputs(src: Req, dst: Req) -> None:
-        dst.condition_image = src.condition_image
-        dst.image_latent = src.image_latent
-        dst.ltx2_num_image_tokens = src.ltx2_num_image_tokens
-
 
 class ImageVAEEncodingStage(PipelineStage):
     """
@@ -699,6 +677,12 @@ class ImageVAEEncodingStage(PipelineStage):
     This stage handles the encoding of pixel representations into the final
     input format (e.g., image_latents).
     """
+
+    deduplicated_output_fields = (
+        "image_latent",
+        "condition_image_latent_ids",
+        "vae_image_sizes",
+    )
 
     def __init__(self, vae: ParallelTiledVAE, **kwargs) -> None:
         super().__init__()
@@ -843,15 +827,6 @@ class ImageVAEEncodingStage(PipelineStage):
         self.offload_model()
         return batch
 
-    def run_grouped_requests(
-        self,
-        batches: list[Req],
-        server_args: ServerArgs,
-    ) -> list[Req]:
-        return self.run_deduplicated_group(
-            batches, server_args, self._copy_image_vae_outputs
-        )
-
     def build_dedup_fingerprint(
         self, batch: Req, server_args: ServerArgs
     ) -> ImageVAEEncodingFingerprint | int:
@@ -870,16 +845,6 @@ class ImageVAEEncodingStage(PipelineStage):
             encode_sample_mode=sample_mode,
             vae_precision=server_args.pipeline_config.vae_precision,
             vae_tiling=bool(server_args.pipeline_config.vae_tiling),
-        )
-
-    @staticmethod
-    def _copy_image_vae_outputs(src: Req, dst: Req) -> None:
-        dst.image_latent = src.image_latent
-        dst.condition_image_latent_ids = src.condition_image_latent_ids
-        dst.vae_image_sizes = (
-            PipelineStage.copy_stage_output(src.vae_image_sizes)
-            if src.vae_image_sizes is not None
-            else None
         )
 
     def retrieve_latents(
