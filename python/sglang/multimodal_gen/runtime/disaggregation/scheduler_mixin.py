@@ -185,8 +185,12 @@ def _init_request_scheduler_from_template(
     num_steps = getattr(req, "num_inference_steps", None)
 
     if sigmas is not None and "sigmas" in set_timesteps_params:
+        if isinstance(sigmas, torch.Tensor):
+            sigmas = sigmas.detach().cpu()
         scheduler.set_timesteps(sigmas=sigmas, device=device, **extra_kwargs)
     elif timesteps is not None and "timesteps" in set_timesteps_params:
+        if isinstance(timesteps, torch.Tensor):
+            timesteps = timesteps.detach().cpu()
         scheduler.set_timesteps(timesteps=timesteps, device=device, **extra_kwargs)
     elif num_steps is not None:
         scheduler.set_timesteps(num_steps, device=device, **extra_kwargs)
