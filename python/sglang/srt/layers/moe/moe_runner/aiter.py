@@ -234,10 +234,10 @@ def _resolve_mori_quant_type(
 
 def _pre_permute_deepep_to_aiter(
     dispatch_output: Union[
-        "DeepEPNormalDispatchOutput",
-        "DeepEPLLDispatchOutput",
-        "MoriEPNormalDispatchOutput",
-        "MoriEPLLDispatchOutput",
+        DeepEPNormalDispatchOutput,
+        DeepEPLLDispatchOutput,
+        MoriEPNormalDispatchOutput,
+        MoriEPLLDispatchOutput,
     ],
     quant_info: AiterMoeQuantInfo,
     runner_config: MoeRunnerConfig,
@@ -357,7 +357,7 @@ def _post_permute_aiter_to_deepep(
     runner_config: MoeRunnerConfig,
     running_state: dict,
     is_normal: bool,
-) -> "CombineInput":
+) -> CombineInput:
     if running_state.get("aiter_combine_is_mori"):
         from sglang.srt.layers.moe.token_dispatcher.moriep import (
             MoriEPLLCombineInput,
@@ -386,7 +386,7 @@ def post_permute_aiter_to_deepep_normal(
     quant_info: AiterMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> "CombineInput":
+) -> CombineInput:
     return _post_permute_aiter_to_deepep(
         runner_output, quant_info, runner_config, running_state, is_normal=True
     )
@@ -398,7 +398,7 @@ def post_permute_aiter_to_deepep_ll(
     quant_info: AiterMoeQuantInfo,
     runner_config: MoeRunnerConfig,
     running_state: dict,
-) -> "CombineInput":
+) -> CombineInput:
     return _post_permute_aiter_to_deepep(
         runner_output, quant_info, runner_config, running_state, is_normal=False
     )
