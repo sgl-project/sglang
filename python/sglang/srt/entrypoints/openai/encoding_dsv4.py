@@ -324,25 +324,62 @@ def render_message(
 
         # Handle content blocks (tool results mixed with text)
         content_blocks = msg.get("content_blocks")
+        raw_content = msg.get("content")
+
+        if not content_blocks and isinstance(raw_content, list):
+            content_blocks = raw_content
+
+        parts = []
         if content_blocks:
-            parts = []
             for block in content_blocks:
+                if isinstance(block, str):
+                    parts.append(block)
+                    continue
+                if not isinstance(block, dict):
+                    parts.append(str(block))
+                    continue
+
                 block_type = block.get("type")
                 if block_type == "text":
-                    parts.append(block.get("text", ""))
+                    text_val = block.get("text", "")
+                    if isinstance(text_val, list):
+                        parts.append("\n".join(str(t) for t in text_val))
+                    elif isinstance(text_val, str):
+                        parts.append(text_val)
+                    else:
+                        parts.append(str(text_val))
+
                 elif block_type == "tool_result":
                     tool_content = block.get("content", "")
                     if isinstance(tool_content, list):
                         text_parts = []
                         for b in tool_content:
-                            if b.get("type") == "text":
-                                text_parts.append(b.get("text", ""))
+                            if isinstance(b, dict) and b.get("type") == "text":
+                                t_val = b.get("text", "")
+                                if isinstance(t_val, list):
+                                    text_parts.append("\n".join(str(v) for v in t_val))
+                                else:
+                                    text_parts.append(str(t_val))
+                            elif isinstance(b, str):
+                                text_parts.append(b)
                             else:
-                                text_parts.append(f"[Unsupported {b.get('type')}]")
+                                text_parts.append(f"[Unsupported tool content type]")
                         tool_content = "\n\n".join(text_parts)
+                    elif not isinstance(tool_content, str):
+                        tool_content = str(tool_content)
+
                     parts.append(tool_output_template.format(content=tool_content))
+                elif block_type == "image_url":
+                    pass
                 else:
                     parts.append(f"[Unsupported {block_type}]")
+
+        elif isinstance(raw_content, str):
+            parts.append(raw_content)
+        elif raw_content is not None:
+            parts.append(str(raw_content))
+
+        if parts:
             prompt += "\n\n".join(parts)
         else:
             prompt += content or ""
