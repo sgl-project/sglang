@@ -2765,7 +2765,7 @@ class DeepseekV32ForCausalLM(DeepseekV2ForCausalLM):
 
 @register_custom_op(
     op_name="flashinfer_dsv3_router_gemm",
-    mutates_args=[],
+    mutates_args=["logits"],
     fake_impl=lambda logits, hidden_states, weight: None,
 )
 def flashinfer_dsv3_router_gemm(
@@ -2783,7 +2783,7 @@ def flashinfer_dsv3_router_gemm(
 
 @register_custom_op(
     op_name="flashinfer_glm_dsa_router_gemm",
-    mutates_args=[],
+    mutates_args=["logits"],
     fake_impl=lambda logits, hidden_states, weight: None,
 )
 def flashinfer_glm_dsa_router_gemm(
