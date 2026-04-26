@@ -8,7 +8,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,
 )
-from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device, get_sp_world_size
 from sglang.multimodal_gen.runtime.distributed.cfg_parallel_utils import dispatch_branches
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_gather,
@@ -1208,7 +1208,8 @@ class LTX2DenoisingStage(DenoisingStage):
             kwargs["disable_v2a_cross_attn"] = True
         if perturbation_configs is not None:
             kwargs["perturbation_configs"] = perturbation_configs
-        return kwargs
+        device = get_local_torch_device()
+        return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in kwargs.items()}
 
     @staticmethod
     def _ltx2_guidance_perturbation_config(
@@ -1429,6 +1430,23 @@ class LTX2DenoisingStage(DenoisingStage):
                     clean_latent_background=clean_latent_background,
                 )
             )
+
+        # Batch tensors are broadcast from CFG rank 0 and remain on its device.
+        # Move every context tensor that will be used in model forward passes or
+        # scheduler steps to the local device once here, before the loop begins.
+        if server_args.enable_cfg_parallel:
+            device = get_local_torch_device()
+            ctx.latents = ctx.latents.to(device)
+            ctx.timesteps = ctx.timesteps.to(device)
+            if ctx.audio_latents is not None:
+                ctx.audio_latents = ctx.audio_latents.to(device)
+            if ctx.guidance is not None:
+                ctx.guidance = ctx.guidance.to(device)
+            if ctx.denoise_mask is not None:
+                ctx.denoise_mask = ctx.denoise_mask.to(device)
+            if ctx.clean_latent is not None:
+                ctx.clean_latent = ctx.clean_latent.to(device)
+
         return ctx
 
     def _before_denoising_loop(

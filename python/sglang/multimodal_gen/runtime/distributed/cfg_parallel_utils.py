@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable
 
+import dataclasses
+
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
     cfg_model_parallel_all_gather,
 )
@@ -21,6 +24,10 @@ try:
 except Exception:
     import logging
     logger = logging.getLogger(__name__)
+
+# Tracks (n_branches, cfg_world_size, cfg_rank) tuples already logged so the
+# dispatch table is printed once per unique configuration, not once per step.
+_logged_dispatch_keys: set[tuple[int, int, int]] = set()
 
 
 def run_cfg_parallel(
@@ -56,8 +63,25 @@ def run_cfg_parallel(
             cfg_world_size - n_branches,
         )
 
+    dispatch_key = (n_branches, cfg_world_size, cfg_rank)
+    if dispatch_key not in _logged_dispatch_keys:
+        _logged_dispatch_keys.add(dispatch_key)
+        branch_names = [branches[i].name for i in my_indices] if my_indices else ["(idle)"]
+        logger.info(
+            "CFG parallel dispatch: rank %d/%d → [%s]",
+            cfg_rank,
+            cfg_world_size,
+            ", ".join(branch_names),
+        )
+
     def _run(bid: int) -> tuple[torch.Tensor, ...]:
-        raw = predict_fn(branches[bid])
+        branch = branches[bid]
+        device = get_local_torch_device()
+        local_branch = dataclasses.replace(branch, kwargs={
+            k: v.to(device) if isinstance(v, torch.Tensor) else v
+            for k, v in branch.kwargs.items()
+        })
+        raw = predict_fn(local_branch)
         return tuple(p.float() for p in _wrap(raw))
 
     my_preds: list[tuple[torch.Tensor, ...]] = [_run(bid) for bid in my_indices]
