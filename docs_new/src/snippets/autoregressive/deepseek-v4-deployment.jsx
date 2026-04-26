@@ -184,6 +184,9 @@ export const DeepSeekV4Deployment = () => {
     "gb300|small|max-throughput",
     "h200|small|cp",
     "h200|small|pd-disagg",
+    "h200|big|low-latency",
+    "h200|big|balanced",
+    "h200|big|max-throughput",
     "h200|big|pd-disagg",
     "gb300|small|cp",
     "gb300|big|cp",
@@ -272,7 +275,9 @@ export const DeepSeekV4Deployment = () => {
       }
     } else if (recipe === "balanced") {
       if (hardware === "h200") {
-        recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
+        recipeEnv.push(isBig
+          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
+          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
       } else {
         // Blackwell: small=1024, big=256 (allinone ternary).
         recipeEnv.push(isBig
@@ -281,7 +286,9 @@ export const DeepSeekV4Deployment = () => {
       }
     } else if (recipe === "max-throughput") {
       if (hardware === "h200") {
-        recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
+        recipeEnv.push(isBig
+          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
+          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
       } else {
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
@@ -328,8 +335,8 @@ export const DeepSeekV4Deployment = () => {
         flags.push("  --moe-runner-backend flashinfer_mxfp4");
       }
       if (hardware === "h200" && isBig) {
-        flags.push("  --cuda-graph-max-bs 32");
-        flags.push("  --max-running-requests 64");
+        flags.push("  --cuda-graph-max-bs 8");
+        flags.push("  --max-running-requests 32");
       }
       // MTP 3/4
       flags.push("  --speculative-algo EAGLE");
@@ -340,7 +347,7 @@ export const DeepSeekV4Deployment = () => {
         flags.push("  --chunked-prefill-size 4096");
         flags.push("  --disable-flashinfer-autotune");
       }
-      if (isBig) flags.push("  --mem-fraction-static 0.82");
+      if (isBig) flags.push("  --mem-fraction-static 0.88");
     } else if (recipe === "balanced") {
       // allinone balanced: TP + DP + DP-attn + DeepEP + MTP_112.
       //   H200 small: cg=128 max-run=128  |  H200 big: cg=128 max-run=128 (same)
@@ -355,12 +362,17 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --speculative-num-steps 1");
       flags.push("  --speculative-eagle-topk 1");
       flags.push("  --speculative-num-draft-tokens 2");
-      if (isBig && hardware === "gb200") {
+      if (hardware === "h200" && isBig) {
+        flags.push("  --mem-fraction-static 0.88");
+      } else if (isBig && hardware === "gb200") {
         flags.push("  --mem-fraction-static 0.78");
       } else if (isBig) {
         flags.push("  --mem-fraction-static 0.82");
       }
-      if (hardware === "h200") {
+      if (hardware === "h200" && isBig) {
+        flags.push("  --cuda-graph-max-bs 8");
+        flags.push("  --max-running-requests 32");
+      } else if (hardware === "h200") {
         flags.push("  --cuda-graph-max-bs 128");
         flags.push("  --max-running-requests 128");
       } else if (isBig && hardware === "b200") {
@@ -386,7 +398,9 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --enable-dp-attention");
       if (multinode) flags.push(...multiNodeFlags(nnodes));
       flags.push("  --moe-a2a-backend deepep");
-      if (isBig && hardware === "gb200") {
+      if (hardware === "h200" && isBig) {
+        flags.push("  --mem-fraction-static 0.88");
+      } else if (isBig && hardware === "gb200") {
         flags.push("  --mem-fraction-static 0.78");
       } else if (isBig) {
         flags.push("  --mem-fraction-static 0.82");
