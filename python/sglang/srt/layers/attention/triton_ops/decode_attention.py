@@ -24,6 +24,7 @@ import logging
 
 import triton
 import triton.language as tl
+
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()

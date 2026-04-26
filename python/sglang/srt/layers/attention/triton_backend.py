@@ -4,10 +4,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
-from sgl_kernel.utils import is_arch_support_pdl
-
 import triton
 import triton.language as tl
+from sgl_kernel.utils import is_arch_support_pdl
+
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
