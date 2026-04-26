@@ -335,6 +335,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         if (
             self.ep_size > 1
             and not should_allreduce_fusion
+            and not use_reduce_scatter
             and not should_use_dp_reduce_scatterv()
         ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
