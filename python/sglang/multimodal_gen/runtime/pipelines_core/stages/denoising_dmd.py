@@ -10,9 +10,6 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler
     FlowMatchEulerDiscreteScheduler,
 )
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
-from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
-    clone_scheduler_runtime,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -73,7 +70,7 @@ class DmdDenoisingStage(DenoisingStage):
         num_warmup_steps = prepared_vars["num_warmup_steps"]
         latents = prepared_vars["latents"]
         video_raw_latent_shape = latents.shape
-        scheduler = clone_scheduler_runtime(self.scheduler)
+        scheduler = self.scheduler
 
         timesteps = torch.tensor(
             server_args.pipeline_config.dmd_denoising_steps,
