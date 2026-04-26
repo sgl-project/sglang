@@ -223,6 +223,7 @@ class GPUWorker:
         """
         assert self.pipeline is not None
         if len(batch) > 1 and not return_req:
+            # batched reqs is only possible with `num_outputs_per_prompt > 1` now
             return self._execute_forward_group(batch)
 
         req = batch[0]
@@ -238,6 +239,13 @@ class GPUWorker:
         )
 
     def _execute_forward_group(self, batch: list[Req]) -> OutputBatch:
+        """
+            This would decrease e2e time if some of the stages shares the same input across reqs,
+            but the first few reqs' return time are compromised: all reqs execute the same stage while being processed together
+
+            This is acceptable since `num_outputs_per_prompt` is mostly requested by a single user
+        """
+        # TODO: support early return or mix-stage execution for reqs in a group
         assert self.pipeline is not None
         req = batch[0]
         return self._execute_forward_common(
@@ -261,6 +269,10 @@ class GPUWorker:
         save_output_paths: Callable[[OutputBatch], None],
         error_context: str,
     ) -> OutputBatch | Req:
+        """
+            Args:
+                forward_fn: the actual forward function for reqs
+        """
         output_batch = None
         try:
             if self.rank == 0 and not current_platform.is_cpu():
