@@ -9,14 +9,13 @@ composed to create complete diffusion pipelines.
 """
 
 from abc import ABC, abstractmethod
-from copy import deepcopy
 from enum import Enum, auto
-from typing import Any, ClassVar, Callable, Tuple
 
 import torch
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.dedup import StageDedupMixin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
@@ -43,7 +42,7 @@ class StageVerificationError(Exception):
     pass
 
 
-class PipelineStage(ABC):
+class PipelineStage(StageDedupMixin, ABC):
     """
     Abstract base class for all pipeline stages.
 
@@ -51,11 +50,6 @@ class PipelineStage(ABC):
     composed with other stages to create a complete pipeline. Each stage is responsible
     for a specific part of the process, such as prompt encoding, latent preparation, etc.
     """
-
-    deduplicated_output_fields: ClassVar[tuple[str, ...]] = ()
-    deduplicated_tensor_tree_output_fields: ClassVar[tuple[str, ...]] = ()
-    deduplicated_deepcopy_output_fields: ClassVar[tuple[str, ...]] = ()
-    deduplicated_extra_tensor_tree_output_keys: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self):
         self.server_args = get_global_server_args()
@@ -222,203 +216,6 @@ class PipelineStage(ABC):
             raise
 
         return result
-
-    def run_grouped_requests(
-        self,
-        batches: list[Req],
-        server_args: ServerArgs,
-    ) -> list[Any]:
-        """Run this stage for a group of independent requests.
-
-        A grouped request is still a list of normal ``Req`` objects. The group
-        boundary only gives a stage the opportunity to reduce duplicate work.
-
-        Stages that do not override this method keep exactly the same behavior as before.
-
-        Stage overrides decide their own reuse granularity:
-         - A simple stage may group by a single full-stage fingerprint, compute once, then copy or split the stage-local outputs back to every request.
-         - A mixed stage may instead reuse only one subprocess, such as positive prompt encoding, while still running another subprocess per request.
-        Overrides must preserve input order and return one result per input request.
-        """
-        if self.has_deduplicated_output_fields():
-            return self.run_deduplicated_group(batches, server_args)
-
-        return [self(batch, server_args) for batch in batches]
-
-    @classmethod
-    def has_deduplicated_output_fields(cls) -> bool:
-        """Return whether this stage is available and opts into base full-stage dedup
-        """
-        return bool(
-            cls.deduplicated_output_fields
-            or cls.deduplicated_tensor_tree_output_fields
-            or cls.deduplicated_deepcopy_output_fields
-            or cls.deduplicated_extra_tensor_tree_output_keys
-        )
-
-    def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs) -> Any:
-        """Return this stage's semantic input fingerprint for grouped dedup.
-
-        A fingerprint is the stage-local set of input values that fully
-        determines the outputs this stage writes. Two requests may share a
-        fingerprint only when this stage would produce equivalent outputs for
-        both of them.
-
-        The default fingerprint is unique per request, so stages opt into deduplication explicitly, which is safe for most stages (except LatentPreparationStage).
-
-        How to organize fingerprint:
-        1. Include every request/config field read by this stage, and exclude fields that only matter to later stages, such as output path.
-        2. If this stage reads seed or mutable inputs, include them or disable dedup for that request.
-        3. Use ``freeze_for_dedup`` for tensors and nested containers so the fingerprint remains hashable and deterministic.
-        """
-        return id(batch)
-
-    def run_deduplicated_group(
-        self,
-        batches: list[Req],
-        server_args: ServerArgs,
-        copy_outputs=None,
-    ) -> list[Req]:
-        """Run full-stage-equivalent requests once and fan out stage outputs.
-
-        """
-        if copy_outputs is None:
-            copy_outputs: Callable[Tuple[Req], None] = self.copy_deduplicated_outputs
-
-        # [[group_1], [group_2]...]
-        results: list[Req | None] = [None] * len(batches)
-
-        # group requests by their id
-        for _, group in self._group_requests_by_fingerprint(
-            batches, lambda batch: self.build_dedup_fingerprint(batch, server_args)
-        ):
-            first_index, first_batch = group[0]
-            first_result = self(first_batch, server_args)
-            results[first_index] = first_result
-
-            for index, batch in group[1:]:
-                copy_outputs(first_result, batch)
-                results[index] = batch
-
-        return [result for result in results if result is not None]
-
-    def copy_deduplicated_outputs(self, src: Req, dst: Req) -> None:
-        """Copy declared stage outputs from a computed request to a duplicate.
-
-        This method is intentionally field-based. The stage still owns the
-        semantic contract by declaring exactly which ``Req`` fields it writes.
-        The helper only applies the requested ownership policy:
-
-        - ``deduplicated_output_fields``: shallow container copy, tensor refs
-          shared. This is the default for read-only outputs such as embeddings.
-        - ``deduplicated_tensor_tree_output_fields``: recursively clone tensors.
-          Use this for small mutable tensor outputs such as timesteps/sigmas.
-        - ``deduplicated_deepcopy_output_fields``: Python deepcopy. This is for
-          request-local mutable runtime objects such as scheduler instances.
-        - ``deduplicated_extra_tensor_tree_output_keys``: clone selected
-          ``Req.extra`` entries without replacing the whole extra dict.
-        """
-        for field in self.deduplicated_output_fields:
-            setattr(dst, field, self.copy_stage_output(getattr(src, field)))
-        for field in self.deduplicated_tensor_tree_output_fields:
-            setattr(dst, field, self.clone_tensor_tree(getattr(src, field)))
-        for field in self.deduplicated_deepcopy_output_fields:
-            setattr(dst, field, deepcopy(getattr(src, field)))
-        for key in self.deduplicated_extra_tensor_tree_output_keys:
-            if key in src.extra:
-                dst.extra[key] = self.clone_tensor_tree(src.extra[key])
-
-    @classmethod
-    def copy_stage_output(cls, value):
-        """Copy a reusable output with the default low-overhead ownership model.
-
-        The default is a shallow container copy: lists/tuples/dicts get a new
-        container, while tensor objects inside are shared by reference. This is
-        deliberate for large read-only outputs, where cloning tensors would add
-        GPU memory traffic and defeat much of the dedup benefit.
-        """
-        if isinstance(value, list):
-            return list(value)
-        if isinstance(value, tuple):
-            return tuple(value)
-        if isinstance(value, dict):
-            return dict(value)
-        return value
-
-    @classmethod
-    def clone_tensor_tree(cls, value):
-        """Recursively clone tensors in a small output tree.
-
-        This is opt-in because it is more expensive than
-        ``copy_stage_output``. Use it when downstream code may mutate the tensor
-        or when sharing tensor storage would accidentally couple duplicated
-        requests.
-        """
-        if isinstance(value, torch.Tensor):
-            return value.clone()
-        if isinstance(value, list):
-            return [cls.clone_tensor_tree(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(cls.clone_tensor_tree(item) for item in value)
-        if isinstance(value, dict):
-            return {key: cls.clone_tensor_tree(item) for key, item in value.items()}
-        return value
-
-    @staticmethod
-    def freeze_for_dedup(value: Any) -> Any:
-        """Convert common nested values into a hashable fingerprint fragment.
-
-        Small tensors include their values so scheduler/timestep overrides can
-        distinguish user-provided tensors. Larger tensors include shape, dtype,
-        and device only; they should not normally be part of a fingerprint
-        unless the stage has a stronger equivalence guarantee.
-        """
-        if isinstance(value, torch.Tensor):
-            if value.numel() <= 256:
-                return (
-                    "tensor",
-                    tuple(value.shape),
-                    str(value.dtype),
-                    tuple(value.detach().cpu().reshape(-1).tolist()),
-                )
-            return ("tensor", tuple(value.shape), str(value.dtype), value.device.type)
-        if isinstance(value, dict):
-            return tuple(
-                sorted(
-                    (key, PipelineStage.freeze_for_dedup(item))
-                    for key, item in value.items()
-                )
-            )
-        if isinstance(value, (list, tuple)):
-            return tuple(PipelineStage.freeze_for_dedup(item) for item in value)
-        if isinstance(value, set):
-            return tuple(
-                sorted(PipelineStage.freeze_for_dedup(item) for item in value)
-            )
-        return value
-
-    @staticmethod
-    def _group_requests_by_fingerprint(
-        batches: list[Req],
-        fingerprint_fn,
-    ) -> list[tuple[Any, list[tuple[int, Req]]]]:
-        """Group requests by a stage-local fingerprint while preserving order.
-
-        The return value is
-        ``[(fingerprint, [(original_index, req), ...]), ...]``. Group order
-        follows the first appearance of each fingerprint, and requests inside a
-        group keep their original relative order. Callers can fill a result
-        list by ``original_index`` to preserve input/output ordering.
-
-        The helper does not define request equivalence and does not copy
-        outputs; it only provides stable grouping for both full-stage dedup and
-        finer-grained stage-local reuse.
-        """
-        groups: dict[Any, list[tuple[int, Req]]] = {}
-        for index, batch in enumerate(batches):
-            fingerprint = fingerprint_fn(batch)
-            groups.setdefault(fingerprint, []).append((index, batch))
-        return list(groups.items())
 
     @abstractmethod
     def forward(

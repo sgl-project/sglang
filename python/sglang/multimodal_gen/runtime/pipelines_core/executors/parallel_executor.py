@@ -1,6 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-from typing import List
+from typing import Any, Callable, List
 
 import torch
 
@@ -52,16 +52,14 @@ class ParallelExecutor(PipelineExecutor):
                 src=self.worker.cfg_group.ranks[0],
             )
 
-    def _execute(
+    def _execute_stages(
         self,
         stages: List[PipelineStage],
-        batch: Req,
+        payload: Any,
         server_args: ServerArgs,
-    ) -> OutputBatch:
-        """
-            Execute all pipeline stages respecting their declared parallelism type.
-            Requests are executed sequentially, one at a time
-        """
+        run_stage: Callable[[PipelineStage, Any], Any],
+    ) -> Any:
+        """Execute stages while respecting their declared parallelism type."""
         if server_args.enable_cfg_parallel:
             rank = get_classifier_free_guidance_rank()
         else:
@@ -75,23 +73,23 @@ class ParallelExecutor(PipelineExecutor):
             if paradigm == StageParallelismType.MAIN_RANK_ONLY:
                 if rank == 0:
                     # Only main rank executes, others just wait
-                    batch = stage(batch, server_args)
+                    payload = run_stage(stage, payload)
                 torch.distributed.barrier()
 
             elif paradigm == StageParallelismType.CFG_PARALLEL:
-                obj_list = [batch] if rank == 0 else []
+                obj_list = [payload] if rank == 0 else []
                 broadcasted_list = broadcast_pyobj(
                     obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
                 )
                 if rank != 0:
-                    batch = broadcasted_list[0]
-                batch = stage(batch, server_args)
+                    payload = broadcasted_list[0]
+                payload = run_stage(stage, payload)
 
                 torch.distributed.barrier()
 
             elif paradigm == StageParallelismType.REPLICATED:
-                batch = stage(batch, server_args)
-        return batch
+                payload = run_stage(stage, payload)
+        return payload
 
     def execute(
         self,
@@ -99,8 +97,12 @@ class ParallelExecutor(PipelineExecutor):
         batch: Req,
         server_args: ServerArgs,
     ) -> OutputBatch:
-        batch = self._execute(stages, batch, server_args)
-        return batch
+        return self._execute_stages(
+            stages,
+            batch,
+            server_args,
+            lambda stage, current: stage(current, server_args),
+        )
 
     def execute_group(
         self,
@@ -108,32 +110,9 @@ class ParallelExecutor(PipelineExecutor):
         batches: list[Req],
         server_args: ServerArgs,
     ):
-        if server_args.enable_cfg_parallel:
-            rank = get_classifier_free_guidance_rank()
-        else:
-            rank = get_world_rank()
-        cfg_group = get_cfg_group()
-
-        for stage in stages:
-            paradigm = stage.parallelism_type
-
-            if paradigm == StageParallelismType.MAIN_RANK_ONLY:
-                if rank == 0:
-                    batches = stage.run_grouped_requests(batches, server_args)
-                torch.distributed.barrier()
-
-            elif paradigm == StageParallelismType.CFG_PARALLEL:
-                obj_list = [batches] if rank == 0 else []
-                broadcasted_list = broadcast_pyobj(
-                    obj_list, rank=rank, dist_group=cfg_group.cpu_group, src=0
-                )
-                if rank != 0:
-                    batches = broadcasted_list[0]
-                batches = stage.run_grouped_requests(batches, server_args)
-
-                torch.distributed.barrier()
-
-            elif paradigm == StageParallelismType.REPLICATED:
-                batches = stage.run_grouped_requests(batches, server_args)
-
-        return batches
+        return self._execute_stages(
+            stages,
+            batches,
+            server_args,
+            lambda stage, current: stage.run_grouped_requests(current, server_args),
+        )
