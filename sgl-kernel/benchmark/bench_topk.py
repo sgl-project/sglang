@@ -15,7 +15,7 @@ from sglang.jit_kernel.topk_indexer import fast_topk_v3
 SEED = 42
 MAX_SEQ_LEN = 131072
 
-USE_TORCH_ORI = True  # False
+USE_TORCH_ORI = True
 
 # CI environment detection
 IS_CI = (
@@ -39,6 +39,7 @@ def _ref_torch_impl_ori(
         scores = []
         for i, (start, end) in enumerate(zip(ks, ke)):
             scores.append(score[i, start:end].unsqueeze(0))
+
         score = torch.cat(scores, dim=0)
         return torch.topk(score, topk, dim=-1, sorted=False).indices
 
@@ -94,8 +95,10 @@ def calculate_diff(bs, k, seq_len, has_row_starts):
     stream = torch.cuda.Stream()
     torch.cuda.set_stream(stream)
 
-    # score = torch.randn(bs, MAX_SEQ_LEN, dtype=torch.float32, device="cuda")
-    score = torch.randn(bs, seq_len, dtype=torch.float32, device="cuda")
+    if has_row_starts:
+        score = torch.randn(bs, MAX_SEQ_LEN, dtype=torch.float32, device="cuda")
+    else:
+        score = torch.randn(bs, seq_len, dtype=torch.float32, device="cuda")
 
     score_max = score.max()
     score_min = score.min()
@@ -125,23 +128,17 @@ def calculate_diff(bs, k, seq_len, has_row_starts):
     indices_old = torch.sort(indices_old, dim=-1).values
     indices_our = torch.sort(indices_our, dim=-1).values
 
-    # from pdb import set_trace
-    # set_trace()
-
     # Tests can pass with max_permit_error=3, set to 5 for safety
-    assert_equal(score, indices_ref, indices_old, bs, k, seq_len, max_permit_error=5)
+    # assert_equal(score, indices_ref, indices_old, bs, k, seq_len, max_permit_error=5)
+
     assert_equal(score, indices_ref, indices_our, bs, k, seq_len, max_permit_error=5)
 
 
-bs = [1]  # [1, 132, 256, 4096]
+bs = [1, 2, 4, 8]
 k = [2048]  # we only support 2048 now
 # 32k smem
-seq_len = [
-    16384,
-    65536,
-    98304,
-]  # [16384, 65536, 98304] # [2048, 4096, 16384, 65536, 98304, 120000]
-has_row_starts = [False]  # [True, False]
+seq_len = [16384, 65536, 98304, 120000]
+has_row_starts = [True, False]
 
 configs = list(itertools.product(bs, k, seq_len, has_row_starts))
 
@@ -165,8 +162,10 @@ def benchmark(bs: int, k: int, seq_len: int, has_row_starts: bool, provider) -> 
     stream = torch.cuda.Stream()
     torch.cuda.set_stream(stream)
 
-    # score = torch.randn(bs, MAX_SEQ_LEN, dtype=torch.float32, device="cuda")
-    score = torch.randn(bs, seq_len, dtype=torch.float32, device="cuda")
+    if has_row_starts:
+        score = torch.randn(bs, MAX_SEQ_LEN, dtype=torch.float32, device="cuda")
+    else:
+        score = torch.randn(bs, seq_len, dtype=torch.float32, device="cuda")
 
     score_max = score.max()
     score_min = score.min()
@@ -198,7 +197,7 @@ def benchmark(bs: int, k: int, seq_len: int, has_row_starts: bool, provider) -> 
             fn = lambda: fast_topk_v3(score, lengths, k, row_starts=row_starts)
         else:
             fn = lambda: fast_topk_v2(score, lengths, k, row_starts=row_starts)
-        ms, min_ms, max_ms = triton.testing.do_bench(  # do_bench_cudagraph(
+        ms, min_ms, max_ms = triton.testing.do_bench_cudagraph(  # do_bench(  #
             fn, quantiles=quantiles
         )
 
@@ -215,7 +214,7 @@ if __name__ == "__main__":
 
     for cfg in test_configs:
         print(f"cfg : {cfg}")
-        # calculate_diff(*cfg)
+        calculate_diff(*cfg)
 
     print("\n" + "=" * 60)
     print("Starting performance benchmark...")

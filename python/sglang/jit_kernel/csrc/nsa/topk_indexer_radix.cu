@@ -4,7 +4,7 @@
  *
  * Author LEI WANG (yiakwang@ust.hk)
  *
- * Distributed Topk Radix Indexer
+ * Distributed Topk Radix Indexer for Decoding Acceleration in DeepSeek V3.2
  *
  * We studied how Radix should be used together with TopK from massive number (>64K):
  * 1. We reduce decoding latency (batch=1, batch=2,...,batch=64) by introducing distributed topk radix indexer,
@@ -47,6 +47,10 @@ namespace cg = cooperative_groups;
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 #endif
 
+#ifndef MAX
+#define MAX(x, y) (((x) > (y)) ? (x) : (y))
+#endif
+
 #ifndef CEILDIV
 #define CEILDIV(x, y) (((x) + (y) - 1) / (y))
 #endif
@@ -67,7 +71,10 @@ constexpr int kThreadsPerBlock = 512;
 constexpr int RADIX = 256;
 constexpr int WARP_SIZE = 32;
 
-constexpr size_t kSmem = 32768;
+constexpr size_t kSmem = 32768 / 2;
+constexpr size_t SMEM_INPUT_SIZE = TopK;
+
+constexpr size_t MAX_BIN_CACHE = 4096 * 2;
 
 // BASE step radix prefix sum
 template <int BASE>
@@ -110,6 +117,8 @@ atomicUpdateMaxIndex(int* index_ptr, const Tval* input_ptr, Tval* new_val_ptr, i
 
   Tval old_val = new_val;
 
+  // printf("[before] [tx#%d] upding old_idx=%d to new_idx=%d....\n\n", threadIdx.x, old_idx, new_idx);
+
   do {
     assumed = old_idx;
 
@@ -124,9 +133,10 @@ atomicUpdateMaxIndex(int* index_ptr, const Tval* input_ptr, Tval* new_val_ptr, i
     old_idx = atomicCAS(index_ptr, assumed, new_idx);
   } while (assumed != old_idx);
 
+  // printf("[after] [tx#%d] updated index from old_idx=%d to new_idx=%d\n\n", threadIdx.x, old_idx, new_idx);
+
   *new_idx_ptr = old_idx;
   *new_val_ptr = input_ptr[old_idx + row_start];
-  ;
 }
 
 struct FastTopKParams {
@@ -187,7 +197,7 @@ __device__ __forceinline__ auto convert_to_uint8(float x) -> uint8_t {
 
 // TODO (yiakwy) : test
 __device__ __forceinline__ auto convert_to_monotonic_8bit(float x) -> uint8_t {
-  int bin = __float2int_rn(x);
+  int bin = __float2int_rd(x);
   // return (uint8_t)max(0, min(bin, 255));
   return bin;
 }
@@ -218,121 +228,16 @@ __device__ char* manual_itoa(int num, char* str) {
   return str;
 }
 
-__device__ void fast_topk_split_kv_cuda_tl(
-    const float* __restrict__ input,
-    int* __restrict__ index,
-    int row_start,
-    int length,
-    int topk = TopK,
-    int* g_scratch = nullptr,
-    bool is_split_mode = false) {
-  // We assume length > TopK here, or it will crash
-  constexpr auto BLOCK_SIZE = kThreadsPerBlock;
-
-#define MAX_BIN_CACHE 2048
-  alignas(128) __shared__ uint8_t bin_cache[MAX_BIN_CACHE];
-
-  // double buffer
-  alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
-
-  // block-level coarse radix threshold
-  alignas(128) __shared__ int s_threshold_bin_id;
-
-  // block-level counters
-  alignas(128) __shared__ int s_block_count;
-
-  // block-level global TopK writing offsets
-  alignas(128) __shared__ int s_block_offset;
-
-  // block-level writing index
-  alignas(128) __shared__ int s_write_ptr;
-
-  alignas(128) __shared__ int s_last_block_write_offset;
-
-  auto& s_histogram = s_histogram_buf[0];
-
-  const int tx = threadIdx.x;
-
-  const int lane_id = threadIdx.x % WARP_SIZE;
-  const int warp_id = threadIdx.x / WARP_SIZE;
-
-  int split_idx = -1;
-  int num_splits = 1;
-
-  // stage 0 : cross blocks histogram accumulation preparation
+__device__ __forceinline__ void parallel_reduce_histogram(
+    int* s_histogram /*src and dest*/,
+    int* g_scratch /*dest*/,
+    const int& tx,
+    const bool& is_split_mode,
+    const int& num_splits,
+    const int& split_idx,
+    const int& BLOCK_SIZE) {
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
   auto cluster = cooperative_groups::this_cluster();
-
-  if (is_split_mode) {
-    split_idx = cluster.block_rank();
-    num_splits = cluster.num_blocks();
-  }
-#else
-  if (is_split_mode) {
-    split_idx = blockIdx.y;
-    num_splits = gridDim.y;
-  }
-#endif
-
-  // stage 1: local 8bit coarse histogram
-  const int chunk = (length + num_splits - 1) / num_splits;
-  const int start_offset = split_idx * chunk;
-  const int end_offset = MIN(start_offset + chunk, length);
-
-  // if (tx == 0 && blockIdx.x == 0 && (blockIdx.y == 0 || blockIdx.y == 1)) {
-  //   printf("[Blk#%d] [Cooperative Blk#%d] start_offset=%d, end_offset=%d, length=%d, chunk_size=%d, split_idx=%d,
-  //   num_splits=%d\n", blockIdx.x, blockIdx.y, start_offset, end_offset, length, chunk, split_idx, num_splits);
-  // }
-  // __syncthreads();
-
-  if (tx < RADIX + 1) s_histogram[tx] = 0;
-  if (tx == 0) {
-    s_block_count = 0;
-    s_write_ptr = 0;
-
-    s_last_block_write_offset = 0;
-  }
-  __syncthreads();
-
-  for (int idx = start_offset + tx; idx < end_offset; idx += BLOCK_SIZE) {
-    const auto bin = convert_to_uint8(input[idx + row_start]);
-    const auto& _idx = idx - start_offset;
-    if (_idx < MAX_BIN_CACHE) {
-      bin_cache[_idx] = bin;
-    }
-
-    ::atomicAdd(&s_histogram[bin], 1);
-  }
-  __syncthreads();
-
-// if (tx == 0 && blockIdx.x == 0 && (blockIdx.y == 0 || blockIdx.y == 1)) {
-//   printf("\n\n[Blk#%d] [Cooperative Blk#%d] Local histogram: \n", blockIdx.x, blockIdx.y);
-//   char buffer[2048];
-//   char* output_buffer = &buffer[0];
-//   for (int i = 0; i < RADIX - 1; ++i) {
-//     // output_buffer += i;
-//     output_buffer = manual_itoa(i, output_buffer);
-//     // output_buffer += ":";
-//     *output_buffer++ = ':';
-//     // output_buffer += s_histogram[i];
-//     output_buffer = manual_itoa(s_histogram[i], output_buffer);
-//     // output_buffer += ", ";
-//     *output_buffer++ = ', ';
-//   }
-//
-//   // output_buffer += s_histogram[RADIX - 1];
-//   output_buffer = manual_itoa(RADIX, output_buffer);
-//   *output_buffer++ = ':';
-//   output_buffer = manual_itoa(s_histogram[RADIX - 1], output_buffer);
-//   *output_buffer++ = '\0';
-
-//   printf("%s ", buffer);
-//   printf("\n\n");
-// }
-// __syncthreads();
-
-// stage 2 : aggregate radix histogram across blocks with NoC (requires compute arch >= 90) or L2 cache
-#if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
   // NOTE (yiakwy) : enable dshmem for faster decoding
   if (is_split_mode && num_splits > 1) {
     cluster.sync();
@@ -377,33 +282,23 @@ __device__ void fast_topk_split_kv_cuda_tl(
     __syncthreads();
   }
 #endif  // end of stage 2
+}
 
-  // stage 3 : global prefix sum to cover the most likely topK (upper bound) in each block
-  const auto run_cumsum = [&] { radix_prefix_sum<2>(s_histogram_buf, tx); };
-
-  run_cumsum();
-
-  if (tx < RADIX) {
-    if (s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
-      ::atomicExch(&s_threshold_bin_id, tx);
-      // s_threshold_bin_id = tx;
-    }
-  }
-  __syncthreads();
-
-  const auto threshold_bin = s_threshold_bin_id;
-  const auto suspected_global_remainder = topk - s_histogram[threshold_bin + 1];
-
-  // if (blockIdx.x == 0 && blockIdx.y == 0 && tx == 0) {
-  //   printf("s_histogram[%d]=%d\n", threshold_bin - 1, s_histogram[threshold_bin - 1]);
-  //   printf("s_histogram[%d]=%d\n", threshold_bin, s_histogram[threshold_bin]);
-  //   printf("s_histogram[%d]=%d\n", threshold_bin + 1, s_histogram[threshold_bin + 1]);
-  // }
-  // __syncthreads();
-
-  // stage 4 : count local matches
-
-  // per thread reduce
+__device__ __forceinline__ void local_calc_block_offset(
+    int* s_block_count_ptr /*dest*/,
+    int* s_block_offset_ptr /*dest*/,
+    int* g_scratch /*dest*/,
+    const int& tx,
+    const int& lane_id,
+    const int& split_idx,
+    const int& num_splits,
+    const int& threshold_bin,
+    const uint8_t* bin_cache,
+    const float* input,
+    const int& start_offset,
+    const int& end_offset,
+    const int& row_start,
+    const int& BLOCK_SIZE) {
   int local_count = 0;
   for (int idx = start_offset + tx; idx < end_offset; idx += BLOCK_SIZE) {
     // int bin = convert_to_uint8(input[idx + row_start]);
@@ -430,27 +325,21 @@ __device__ void fast_topk_split_kv_cuda_tl(
 
   // per block reduce
   if (lane_id == 0) {
-    atomicAdd(&s_block_count, local_count);
+    atomicAdd(s_block_count_ptr, local_count);
   }
   __syncthreads();
 
-  const int local_remainder = topk - s_block_count;
-  // if (tx == 0 && blockIdx.x == 0 && (blockIdx.y >= 0)) {
-  //   printf("[Blk#%d] [Cooperative Blk#%d] threshold_bin: %d, block_count: %d, local remainder: %d, global remainder :
-  //   %d\n", blockIdx.x, blockIdx.y, threshold_bin, s_block_count, local_remainder, suspected_global_remainder);
-  // }
-  // __syncthreads();
-
-  // stage 4: global offset calculation for each block
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+  auto cluster = cooperative_groups::this_cluster();
+
   if (split_idx == 0) {
     int offset = 0;
     if (tx == 0) {
       for (int r = 0; r < num_splits; ++r) {
-        int* dst_cnt = cluster.map_shared_rank(&s_block_count, r);
+        int* dst_cnt = cluster.map_shared_rank(s_block_count_ptr, r);
         int c = *dst_cnt;
 
-        int* dst_off = cluster.map_shared_rank(&s_block_offset, r);
+        int* dst_off = cluster.map_shared_rank(s_block_offset_ptr, r);
         *dst_off = offset;
 
         offset += c;
@@ -462,7 +351,8 @@ __device__ void fast_topk_split_kv_cuda_tl(
 #else
   // TODO (yiakwy) : fallback
   if (tx == 0) {
-    g_scratch[blockIdx.x + split_idx * blockDim.x] = s_block_count;  // write block_count to g_scratch for each block
+    g_scratch[blockIdx.x + split_idx * blockDim.x] =
+        *s_block_count_ptr;  // write block_count to g_scratch for each block
   }
 
   cooperative_groups::this_grid().sync();
@@ -473,127 +363,278 @@ __device__ void fast_topk_split_kv_cuda_tl(
       offset += g_scratch[blockIdx.x + i * blockDim.x];
     }
 
-    s_block_offset = offset;  // write block_offset to shared memory for each block
+    *s_block_offset_ptr = offset;  // write block_offset to shared memory for each block
   }
   __syncthreads();
-
 #endif
+}
 
-  // if (tx == 0 && blockIdx.x == 0 && (blockIdx.y >= 0)) {
-  //   printf("[Blk#%d] [Cooperative Blk#%d] s_block_offset %d, s_write_ptr %d\n", blockIdx.x, blockIdx.y,
-  //   s_block_offset, s_write_ptr);
-  // }
-  // __syncthreads();
-
-  // stage 5: write most likely topk indices onto g_mem
-  for (int idx = start_offset + tx; idx < end_offset && s_write_ptr < topk; idx += BLOCK_SIZE) {
-    // int bin = convert_to_uint8(input[idx + row_start]);
-
-    const auto& _idx = idx - start_offset;
+__device__ __forceinline__ void local_calc_block_offset_with_s_input(
+    int* s_block_count_ptr /*dest*/,
+    int* s_block_offset_ptr /*dest*/,
+    int* g_scratch /*dest*/,
+    const int& tx,
+    const int& lane_id,
+    const int& split_idx,
+    const int& num_splits,
+    const int& threshold_bin,
+    const uint8_t* bin_cache,
+    const float* s_input,
+    const int& s_num_input,
+    const int& BLOCK_SIZE) {
+  int local_count = 0;
+  for (unsigned int idx = tx; idx < s_num_input; idx += BLOCK_SIZE) {
     int bin;
 
-    if (_idx < MAX_BIN_CACHE) {
-      bin = bin_cache[_idx];
+    if (idx < MAX_BIN_CACHE) {
+      bin = bin_cache[idx];
     } else {
-      bin = convert_to_uint8(input[idx + row_start]);
+      bin = convert_to_uint8(s_input[idx]);
     }
-
-    // if (tx == 0) {
-    //   printf("[Blk#%d] [Cooperative Blk#%d] idx: %d, bin: %d, threshold_bin: %d\n\n", blockIdx.x, blockIdx.y, idx,
-    //   bin, threshold_bin);
-    // }
 
     if (bin > threshold_bin) {
-      int local_pos = atomicAdd(&s_write_ptr, 1);
-      int global_pos = s_block_offset + local_pos;
-
-      // if (blockIdx.x == 0 && blockIdx.y == 0 && idx == 1) {
-      //   printf("[idx#%d] [row_start#%d] val %f -> bin %d, local_pos %d, global_pos %d\n\n", idx, row_start, input[idx
-      //   + row_start], bin, local_pos, global_pos);
-      // }
-
-      // if (blockIdx.x == 0 && blockIdx.y == 0 && idx == 27) {
-      //   printf("[idx#%d] [row_start#%d] val %f -> bin %d, local_pos %d, global_pos %d\n\n", idx, row_start, input[idx
-      //   + row_start], bin, local_pos, global_pos);
-      // }
-
-      if (global_pos < topk) {
-        index[global_pos] = idx;
-
-        // if (blockIdx.x == 0 && blockIdx.y > 0 && global_pos > 2040) {
-        //   printf("[Blk#%d] [Cooperative Blk#%d] [tx#%d] bin:%d, s_block_offset: %d, hit local %d, global %d, val
-        //   %f\n\n", blockIdx.x, blockIdx.y, tx, bin, s_block_offset, local_pos, s_block_offset + local_pos, input[idx
-        //   + row_start]);
-        // }
-      }
+      local_count++;
     }
+  }
+  __syncwarp();
+
+  // per warp reduce
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+    local_count += __shfl_down_sync(0xffffffff, local_count, offset);
   }
   __syncthreads();
 
-  // stage 6 : if global_remainder > 0, i.e. there are still some slots in g_mem not filled
-  // do top#global_remainder from the rest on each block and aggregation the results
-  using Tval = float;
+  // per block reduce
+  if (lane_id == 0) {
+    atomicAdd(s_block_count_ptr, local_count);
+  }
+  __syncthreads();
 
 #if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
-  if (split_idx != num_splits - 1) {
+  auto cluster = cooperative_groups::this_cluster();
+
+  if (split_idx == 0) {
+    int offset = 0;
     if (tx == 0) {
-      int* dst_write_ptr = cluster.map_shared_rank(&s_write_ptr, num_splits - 1);
-      int* dst_block_offset = cluster.map_shared_rank(&s_block_offset, num_splits - 1);
+      for (int r = 0; r < num_splits; ++r) {
+        int* dst_cnt = cluster.map_shared_rank(s_block_count_ptr, r);
+        int c = *dst_cnt;
 
-      s_last_block_write_offset = *dst_block_offset + *dst_write_ptr;
+        int* dst_off = cluster.map_shared_rank(s_block_offset_ptr, r);
+        *dst_off = offset;
 
-      // TODO(yiakwy) : remove for test
-      // s_last_block_write_offset = 2040;
-      s_last_block_write_offset = 2040 - 8;
-      // s_last_block_write_offset = 2040 - 16;
-    }
-  } else {
-    if (tx == 0) {
-      s_last_block_write_offset = s_block_offset + s_write_ptr;
-
-      // TODO(yiakwy) : remove for test
-      // s_last_block_write_offset = 2040;
-      s_last_block_write_offset = 2040 - 8;
-      // s_last_block_write_offset = 2040 - 16;
+        offset += c;
+      }
     }
   }
 
   cluster.sync();
 #else
+  // TODO (yiakwy) : fallback
   if (tx == 0) {
-    g_scratch[blockIdx.x + split_idx * blockDim.x] = s_block_offset + s_write_ptr;
+    g_scratch[blockIdx.x + split_idx * blockDim.x] =
+        *s_block_count_ptr;  // write block_count to g_scratch for each block
   }
 
   cooperative_groups::this_grid().sync();
 
   if (tx == 0) {
-    s_last_block_write_offset = g_scratch[blockIdx.x + (num_splits - 1) * blockDim.x];
+    int offset = 0;
+    for (int i = 0; i < split_idx; ++i) {
+      offset += g_scratch[blockIdx.x + i * blockDim.x];
+    }
 
-    // TODO(yiakwy) : remove for test
-    // s_last_block_write_offset = 2040;
-    s_last_block_write_offset = 2040 - 8;
-    // s_last_block_write_offset = 2040 - 16;
+    *s_block_offset_ptr = offset;  // write block_offset to shared memory for each block
+  }
+  __syncthreads();
+#endif
+}
+
+__device__ __forceinline__ void calc_global_remainder(
+    int* s_last_block_write_offset_ptr /*dest*/,
+    int* s_block_offset_ptr /*src & dest*/,
+    int* s_write_ptr_p /*src & dest*/,
+    int* g_scratch /*dest*/,
+    const int& tx,
+    const int& split_idx,
+    const int& num_splits) {
+#if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+  auto cluster = cooperative_groups::this_cluster();
+  if (split_idx != num_splits - 1) {
+    if (tx == 0) {
+      int* dst_write_ptr = cluster.map_shared_rank(s_write_ptr_p, num_splits - 1);
+      int* dst_block_offset = cluster.map_shared_rank(s_block_offset_ptr, num_splits - 1);
+
+      *s_last_block_write_offset_ptr = *dst_block_offset + *dst_write_ptr;
+    }
+  } else {
+    if (tx == 0) {
+      *s_last_block_write_offset_ptr = *s_block_offset_ptr + *s_write_ptr_p;
+    }
   }
 
-  cooperative_groups::this_grid().sync();
+  cluster.sync();
+#else
+  auto grid = cooperative_groups::this_grid();
+  if (tx == 0) {
+    g_scratch[blockIdx.x + split_idx * blockDim.x] = *s_block_offset_ptr + *s_write_ptr_p;
+  }
+
+  grid.sync();
+
+  if (tx == 0) {
+    *s_last_block_write_offset_ptr = g_scratch[blockIdx.x + (num_splits - 1) * blockDim.x];
+  }
+
+  grid.sync();
+#endif
+}
+
+__device__ void fast_topk_split_kv_cuda_tl(
+    const float* __restrict__ input,
+    int* __restrict__ index,
+    int row_start,
+    int length,
+    int topk = TopK,
+    int* g_scratch = nullptr,
+    bool is_split_mode = false) {
+  // using Tval = half;
+  using Tval = float;
+
+  // We assume length > TopK here, or it will crash
+  constexpr auto BLOCK_SIZE = kThreadsPerBlock;
+
+  alignas(128) __shared__ uint8_t bin_cache[MAX_BIN_CACHE];
+
+  extern __shared__ int shared_mem[][SMEM_INPUT_SIZE];
+
+  Tval(*s_input)[SMEM_INPUT_SIZE] = (Tval(*)[SMEM_INPUT_SIZE]) & shared_mem[0][0];
+  unsigned int (*s_input_idx)[SMEM_INPUT_SIZE] =
+      (unsigned int (*)[SMEM_INPUT_SIZE])(&shared_mem[0][0] + SMEM_INPUT_SIZE);
+
+  // double buffer
+  alignas(128) __shared__ int s_histogram_buf[2][RADIX + 128];
+
+  // block-level radix threshold
+  alignas(128) __shared__ int s_threshold_bin_id;
+
+  // block-level elements drop in s_threshold_bin_id bin
+  alignas(128) __shared__ unsigned int s_num_input[2];
+
+  // block-level counters
+  alignas(128) __shared__ int s_block_count;
+
+  // block-level global TopK writing offsets
+  alignas(128) __shared__ int s_block_offset;
+
+  // block-level writing index
+  alignas(128) __shared__ int s_write_ptr;
+
+  alignas(128) __shared__ int s_last_block_write_offset;
+
+  auto& s_histogram = s_histogram_buf[0];
+
+  const int tx = threadIdx.x;
+
+  const int lane_id = threadIdx.x % WARP_SIZE;
+  const int warp_id = threadIdx.x / WARP_SIZE;
+
+  int split_idx = -1;
+  int num_splits = 1;
+
+  // stage 0 : cross blocks histogram accumulation preparation
+#if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+  auto cluster = cooperative_groups::this_cluster();
+
+  if (is_split_mode) {
+    split_idx = cluster.block_rank();
+    num_splits = cluster.num_blocks();
+  }
+#else
+  if (is_split_mode) {
+    split_idx = blockIdx.y;
+    num_splits = gridDim.y;
+  }
 #endif
 
-  // this is more accurate than suspect_global_remainder)
-  const int global_remainder = topk - s_last_block_write_offset;
+  // stage 1: local 8bit coarse histogram
+  const int chunk = (length + num_splits - 1) / num_splits;
+  const int start_offset = split_idx * chunk;
+  const int end_offset = MIN(start_offset + chunk, length);
 
   // if (tx == 0 && blockIdx.x == 0 && (blockIdx.y >= 0)) {
-  //   printf("[Blk#%d] [Cooperative Blk#%d] s_block_offset %d, elements to write %d, local_end %d, global_off %d\n",
-  //   blockIdx.x, blockIdx.y, s_block_offset, s_write_ptr, s_write_ptr + s_block_offset, s_last_block_write_offset);
+  //   printf("[Blk#%d] [Cooperative Blk#%d] start_offset=%d, end_offset=%d, length=%d, chunk_size=%d, split_idx=%d,
+  //   num_splits=%d\n", blockIdx.x, blockIdx.y, start_offset, end_offset, length, chunk, split_idx, num_splits);
   // }
   // __syncthreads();
 
-  if (global_remainder > 0) {
-    __syncthreads();
+  if (tx < RADIX + 1) s_histogram[tx] = 0;
+  if (tx == 0) {
+    s_block_count = 0;
+    s_write_ptr = 0;
 
-    const int global_off = s_last_block_write_offset;
+    s_last_block_write_offset = 0;
+  }
+  __syncthreads();
 
-    for (int idx = start_offset + tx; idx < end_offset; idx += BLOCK_SIZE) {
-      Tval val = input[idx + row_start];
+  for (unsigned int idx = start_offset + tx; idx < end_offset; idx += BLOCK_SIZE) {
+    const auto bin = convert_to_uint8(input[idx + row_start]);
+    const auto& _idx = idx - start_offset;
+    if (_idx < MAX_BIN_CACHE) {
+      bin_cache[_idx] = bin;
+    }
+    ::atomicAdd(&s_histogram[bin], 1);
+  }
+  __syncthreads();
+
+  // stage 2 : aggregate radix histogram across blocks with NoC (requires compute arch >= 90) or L2 cache
+  parallel_reduce_histogram(
+      s_histogram /*src and dest*/, g_scratch /*dest*/, tx, is_split_mode, num_splits, split_idx, BLOCK_SIZE);
+
+  // stage 3 : global prefix sum to cover the most likely topK (upper bound) in each block
+  const auto run_cumsum = [&] { radix_prefix_sum<2>(s_histogram_buf, tx); };
+  run_cumsum();
+
+  if (tx < RADIX) {
+    if (s_histogram[tx] > topk && s_histogram[tx + 1] <= topk) {
+      ::atomicExch(&s_threshold_bin_id, tx);
+    }
+  }
+  __syncthreads();
+
+  const int threshold_bin = s_threshold_bin_id;
+  int global_remainder = topk - s_histogram[threshold_bin + 1];
+
+  // if (blockIdx.x == 0 && blockIdx.y == 0 && tx == 0) {
+  //   printf("s_histogram[%d]=%d\n", threshold_bin - 1, s_histogram[threshold_bin - 1]);
+  //   printf("s_histogram[%d]=%d\n", threshold_bin, s_histogram[threshold_bin]);
+  //   printf("s_histogram[%d]=%d\n", threshold_bin + 1, s_histogram[threshold_bin + 1]);
+  // }
+  // __syncthreads();
+
+  // stage 4: global offset calculation for each block
+  local_calc_block_offset(
+      &s_block_count,
+      &s_block_offset,
+      g_scratch,
+      tx,
+      lane_id,
+      split_idx,
+      num_splits,
+      threshold_bin,
+      bin_cache,
+      input,
+      start_offset,
+      end_offset,
+      row_start,
+      BLOCK_SIZE);
+
+  const int local_remainder = topk - s_block_count;
+
+  // stage 5: write most likely topk indices onto g_mem and narrow down search elements
+  if (global_remainder == 0) {
+    for (unsigned int idx = start_offset + tx; idx < end_offset && s_write_ptr < topk; idx += BLOCK_SIZE) {
+      // int bin = convert_to_uint8(input[idx + row_start]);
 
       const auto& _idx = idx - start_offset;
       int bin;
@@ -601,31 +642,282 @@ __device__ void fast_topk_split_kv_cuda_tl(
       if (_idx < MAX_BIN_CACHE) {
         bin = bin_cache[_idx];
       } else {
-        bin = convert_to_uint8(val);
+        bin = convert_to_uint8(input[idx + row_start]);
       }
 
-      if (bin == threshold_bin) {
-        // Greedy Top#remainder to compete for the remaining slots
+      if (bin > threshold_bin) {
+        int local_pos = atomicAdd(&s_write_ptr, 1);
+        int global_pos = s_block_offset + local_pos;
 
-        Tval cur_val = val;
-        int cur_idx = idx;
+        if (global_pos < topk) {
+          index[global_pos] = idx;
+        }
+      }
+    }
 
-        for (int i = 0; i < global_remainder; i++) {
-          int global_pos = global_off + i;
+  } else {
+    if (tx < RADIX + 1) {
+      s_histogram[tx] = 0;
+    }
+    if (tx == 0) {
+      s_num_input[0] = 0;
+    }
+    __syncthreads();
 
-          atomicUpdateMaxIndex(index + global_pos, input, &cur_val, &cur_idx, row_start);
+    for (unsigned int idx = start_offset + tx; idx < end_offset && s_write_ptr < topk; idx += BLOCK_SIZE) {
+      // int bin = convert_to_uint8(input[idx + row_start]);
 
-          if (cur_val == -1) {
-            break;
+      const auto& _idx = idx - start_offset;
+      int bin;
+
+      if (_idx < MAX_BIN_CACHE) {
+        bin = bin_cache[_idx];
+
+        bin_cache[_idx] = 0;
+
+        if (bin > threshold_bin) {
+          int local_pos = atomicAdd(&s_write_ptr, 1);
+          int global_pos = s_block_offset + local_pos;
+
+          if (global_pos < topk) {
+            index[global_pos] = idx;
           }
+        } else if (bin == threshold_bin) {
+          Tval val = input[idx + row_start];
+          Tval val_scale = (val - threshold_bin) * RADIX;
+          const auto sub_bin = convert_to_uint8(val_scale);
 
-          if (cur_val != val) {
-            val = cur_val;
+          const unsigned int pos = ::atomicAdd(&s_num_input[0], 1);
+          // if (pos < SMEM_INPUT_SIZE) {
+          s_input[0][pos] = val_scale;
+          s_input_idx[0][pos] = idx;
+          bin_cache[pos] = sub_bin;
+          // }
+
+          ::atomicAdd(&s_histogram[sub_bin], 1);
+        }
+      } else {
+        Tval val = input[idx + row_start];
+        bin = convert_to_uint8(val);
+
+        if (bin > threshold_bin) {
+          int local_pos = atomicAdd(&s_write_ptr, 1);
+          int global_pos = s_block_offset + local_pos;
+
+          if (global_pos < topk) {
+            index[global_pos] = idx;
+          }
+        } else if (bin == threshold_bin) {
+          Tval val_scale = (val - threshold_bin) * RADIX;
+          const auto sub_bin = convert_to_uint8(val_scale);
+
+          const unsigned int pos = ::atomicAdd(&s_num_input[0], 1);
+          // if (pos < SMEM_INPUT_SIZE) {
+          s_input[0][pos] = val_scale;
+          s_input_idx[0][pos] = idx;
+          bin_cache[pos] = sub_bin;
+          // }
+
+          ::atomicAdd(&s_histogram[sub_bin], 1);
+        }
+      }
+    }
+    __syncthreads();
+
+    // if (tx == 0) {
+    //   printf("[before] [Blk#%d] count=%d; s_input_idx[0]=%d, s_input_idx[1]=%d\n\n", blockIdx.y, s_num_input[0],
+    //   s_input_idx[0][0], s_input_idx[0][1]);
+    // }
+    // if (tx == 0 && blockIdx.y == 2) {
+    //   for (int i=0; i < 28; i++) {
+    //     if (s_input_idx[0][i] == 22134) {
+    //       printf("[blk#%d] find it 22134 , pos=%d\n\n", blockIdx.y, i);
+    //     }
+    //   }
+    // }
+    // __syncthreads();
+
+    int round = 0;
+    index += topk - global_remainder;
+
+    do {
+      __syncthreads();
+      const int scan_size = s_num_input[0];
+
+      // stage 6 : repeat fine scale radix sort upon narrowed down elements in the threshold bin
+      parallel_reduce_histogram(s_histogram, g_scratch, tx, is_split_mode, num_splits, split_idx, BLOCK_SIZE);
+      run_cumsum();
+
+      if (tx < RADIX) {
+        if (s_histogram[tx] > global_remainder && s_histogram[tx + 1] <= global_remainder) {
+          ::atomicExch(&s_threshold_bin_id, tx);
+        }
+      }
+      __syncthreads();
+
+      auto next_threshold_bin = s_threshold_bin_id;
+      auto next_global_remainder = global_remainder - s_histogram[next_threshold_bin + 1];
+
+      if (tx == 0) {
+        s_block_count = 0;
+        s_write_ptr = 0;
+
+        s_last_block_write_offset = 0;
+      }
+      __syncthreads();
+
+      local_calc_block_offset_with_s_input(
+          &s_block_count,
+          &s_block_offset,
+          g_scratch,
+          tx,
+          lane_id,
+          split_idx,
+          num_splits,
+          next_threshold_bin,
+          bin_cache,
+          s_input[0],
+          s_num_input[0],
+          BLOCK_SIZE);
+      __syncthreads();
+
+      if (next_global_remainder == 0) {
+        for (unsigned int idx = tx; idx < scan_size && s_write_ptr < global_remainder; idx += BLOCK_SIZE) {
+          int bin = bin_cache[idx];
+
+          if (bin > next_threshold_bin) {
+            int local_pos = atomicAdd(&s_write_ptr, 1);
+            int global_pos = s_block_offset + local_pos;
+
+            if (global_pos < global_remainder) {
+              index[global_pos] = s_input_idx[0][idx];
+            }
           }
         }
-      }  // end of threshold_bin check
+      } else {
+        if (tx < RADIX + 1) {
+          s_histogram[tx] = 0;
+        }
+        if (tx == 0) {
+          s_num_input[0] = 0;
+        }
+        __syncthreads();
+
+        for (unsigned int idx = tx; idx < scan_size && s_write_ptr < global_remainder; idx += BLOCK_SIZE) {
+          int bin = bin_cache[idx];
+
+          bin_cache[idx] = 0;
+
+          if (bin > next_threshold_bin) {
+            int local_pos = atomicAdd(&s_write_ptr, 1);
+            int global_pos = s_block_offset + local_pos;
+
+            if (global_pos < global_remainder) {
+              index[global_pos] = s_input_idx[0][idx];
+            }
+          } else if (bin == next_threshold_bin) {
+            Tval val = s_input[0][idx];
+            Tval val_scale = (val - next_threshold_bin) * RADIX;
+            const auto sub_bin = convert_to_uint8(val_scale);
+
+            const unsigned int pos = ::atomicAdd(&s_num_input[0], 1);
+            // if (pos < SMEM_INPUT_SIZE) {
+            s_input[0][pos] = val_scale;
+            s_input_idx[0][pos] = s_input_idx[0][idx];
+            bin_cache[pos] = sub_bin;
+            // }
+
+            ::atomicAdd(&s_histogram[sub_bin], 1);
+          }
+        }
+      }
+
+      index += global_remainder - next_global_remainder;
+      global_remainder = next_global_remainder;
+      __syncthreads();
+
+#if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+      auto cluster = cooperative_groups::this_cluster();
+      cluster.sync();
+#else
+      auto grid = cooperative_groups::this_grid();
+      grid.sync();
+#endif
+
+    } while (++round < 4 && global_remainder > num_splits);  // end of do-while loop for global radix refinement
+
+    if (tx == 0) {
+      s_write_ptr = 0;
     }
-  }  // end of global remainder
+    __syncthreads();
+
+    if (global_remainder != 0) {
+#if __CUDA_ARCH__ >= 900 && ENABLE_HOPPER
+
+      auto cluster = cooperative_groups::this_cluster();
+      cluster.sync();
+
+      if (split_idx == 0) {
+        if (tx == 0) {
+          unsigned int count = s_num_input[0];
+          for (int r = 1; r < num_splits; r++) {
+            unsigned int* dst_input_num_ptr = cluster.map_shared_rank(&s_num_input[0], r);
+            int dst_input_num = *dst_input_num_ptr;
+
+            if (dst_input_num > 0) {
+              float* dst_input = cluster.map_shared_rank(&s_input[0][0], r);
+              unsigned int* dst_input_idx = cluster.map_shared_rank(&s_input_idx[0][0], r);
+
+              for (unsigned int i = 0; i < dst_input_num; i++) {
+                s_input[0][i + count] = dst_input[i];
+                s_input_idx[0][i + count] = dst_input_idx[i];
+              }
+              count += dst_input_num;
+            }
+          }
+
+          s_num_input[0] = count;
+        }
+        __syncthreads();
+
+        // if (tx == 0) {
+        //   printf("count=%d; s_input_idx[0]=%d, s_input_idx[1]=%d, s_input[0]=%f, s_input[1]=%f,
+        //   global_remainder=%d\n\n", s_num_input[0], s_input_idx[0][0], s_input_idx[0][1], s_input[0][0],
+        //   s_input[0][1], global_remainder);
+        // }
+        // __syncthreads();
+
+        if (tx < s_num_input[0]) {
+          Tval val = s_input[0][tx];
+          Tval cur_val = val;
+          int cur_idx = tx;
+          for (int i = 0; i < global_remainder; i++) {
+            atomicUpdateMaxIndex(index + i, &s_input[0][0], &cur_val, &cur_idx, 0);
+
+            if (cur_val == -1) {
+              break;
+            }
+            if (cur_val != val) {
+              val = cur_val;
+            }
+          }
+        }
+        __syncthreads();
+
+        if (tx < global_remainder) {
+          index[tx] = static_cast<int>(s_input_idx[0][index[tx]]);
+        }
+        __syncthreads();
+      }  // end of split_idx == 0
+
+      cluster.sync();
+#else
+      auto grid = cooperative_groups::this_grid();
+      grid.sync();
+      // NOTE (yiakwy) : we will support it soon, but definitely sync via L2 cache will increase latency
+#endif
+    }
+  }  // end of global_remainder > 0 case
 }
 
 __global__ __launch_bounds__(kThreadsPerBlock)  // topk
