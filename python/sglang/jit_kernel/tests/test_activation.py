@@ -75,11 +75,6 @@ def test_activation_out_param(
     torch.testing.assert_close(out, expected, atol=atol, rtol=rtol)
 
 
-# ----------------------------------------------------------------------------
-# filter_expert (expert_ids) coverage — replaces act_and_mul_triton
-# ----------------------------------------------------------------------------
-
-# 2D shapes only — filter_expert is row-aligned.
 FILTER_SHAPES = get_ci_test_range(
     full_range=[(83, 1024), (256, 2048), (1024, 4096)],
     ci_range=[(83, 1024)],
@@ -113,14 +108,12 @@ def test_activation_filter_expert(
     expert_ids = torch.randint(
         low=0, high=8, size=(num_groups,), dtype=torch.int32, device="cuda"
     )
-    # Force a fraction to -1 so we exercise the skip path.
     skip_mask = torch.rand(num_groups, device="cuda") < 0.4
     expert_ids[skip_mask] = -1
 
     result = run_activation(op_name, x, out, expert_ids, expert_step)
     assert result is out
 
-    # Per-token skip mask follows expert_step.
     token_skip = skip_mask[torch.arange(num_tokens, device="cuda") // expert_step]
     expected = _reference(op_name, x)
     atol, rtol = _tolerances(dtype)
@@ -129,7 +122,6 @@ def test_activation_filter_expert(
     if kept.any():
         torch.testing.assert_close(out[kept], expected[kept], atol=atol, rtol=rtol)
     if token_skip.any():
-        # Skipped rows must remain at their pre-kernel sentinel value.
         assert torch.isnan(
             out[token_skip]
         ).all(), "filter_expert kernel touched rows whose expert_id is -1"

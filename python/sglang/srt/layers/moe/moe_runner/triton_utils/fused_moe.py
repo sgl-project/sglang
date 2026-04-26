@@ -530,11 +530,8 @@ def _fused_moe_kernel_sequence(
             )
         elif _is_cuda or _is_hip or _is_xpu:
             if filter_expert and _is_cuda:
-                # JIT silu_and_mul skips rows whose routed expert is -1.
-                # On HIP/XPU, the AOT silu_and_mul has no filter_expert path;
-                # we let it write all rows because the subsequent fused_moe
-                # down kernel skips filtered rows via its own filter_expert
-                # branch (writes zeros to output without reading the input).
+                # HIP/XPU fall through to the unfiltered path: the down kernel
+                # zeros filtered rows without reading their input.
                 silu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,

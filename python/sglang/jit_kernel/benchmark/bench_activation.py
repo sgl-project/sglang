@@ -82,12 +82,6 @@ def benchmark(op_name: str, dim: int, batch_size: int, provider: str):
     return run_benchmark(f, scale=NUM_LAYERS)
 
 
-# ----------------------------------------------------------------------------
-# filter_expert benchmark: confirms that the expert_ids skip path adds
-# negligible overhead vs the plain JIT kernel (skip_ratio=0) and that
-# skipping rows scales work down (skip_ratio>0).
-# ----------------------------------------------------------------------------
-
 FILTER_OPS = ["silu", "gelu"]
 FILTER_BS = get_benchmark_range(
     full_range=[64, 256, 1024, 4096, 16384], ci_range=[1024]
