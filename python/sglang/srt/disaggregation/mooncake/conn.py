@@ -797,9 +797,14 @@ class MooncakeKVManager(CommonKVManager):
                 unique_head_idx * src_heads_per_rank
             ) % dst_heads_per_rank
         else:
-            # Send KVCache from 1 prefill instance to multiple decode instances
+            # Send KVCache from 1 prefill instance to multiple decode instances.
+            # When dst_attn_tp_size > total_kv_heads, multiple decode ranks share
+            # the same KV head (GQA replication on dst side). Map
+            # dst_tp_rank_in_group to its actual KV head index first.
+            dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
+            unique_dst_idx = dst_tp_rank_in_group // dst_replication
             src_head_start_offset = (
-                dst_tp_rank_in_group * dst_heads_per_rank
+                unique_dst_idx * dst_heads_per_rank
             ) % src_heads_per_rank
             num_heads_to_send = dst_heads_per_rank
             dst_head_start_offset = 0
@@ -1070,6 +1075,11 @@ class MooncakeKVManager(CommonKVManager):
 
         The 3rd dimension is sliced by TP. When prefill and decode have different
         attn_tp_size, we need to slice the state accordingly.
+
+        For conv_state, the sliceable dimension is composed of multiple groups
+        (e.g. [K, K, V] for GatedDeltaNet) that are each independently sharded
+        by mamba_v2_sharded_weight_loader. Simple contiguous slicing would
+        corrupt the data; we must slice each group independently.
         """
         logger.warning_once(
             "Using Mamba state slice transfer for different TP sizes between prefill and decode. "
@@ -1090,51 +1100,90 @@ class MooncakeKVManager(CommonKVManager):
         local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
 
+        # Conv shard groups for group-aware slicing. Tensors are laid out with
+        # all conv-state tensors first (indices [0, conv_tensor_count)) followed
+        # by temporal-state tensors. Per-group slicing only kicks in when the
+        # conv dim is composed of multiple independently TP-sharded groups
+        # (e.g. [K, K, V] for GatedDeltaNet); standard single-group conv state
+        # and all temporal tensors fall through to plain contiguous slicing.
+        conv_shard_groups = getattr(self.kv_args, "state_conv_shard_groups", [])
+        conv_tensor_count = getattr(self.kv_args, "state_conv_tensor_count", 0)
+        has_grouped_conv_layout = len(conv_shard_groups) > 1
+
         for i, dst_state_ptr in enumerate(dst_state_data_ptrs):
             src_item_len = prefill_state_item_lens[i]
             dst_item_len = dst_state_item_lens[i]
             src_dim = src_state_dim_per_tensor[i]
             dst_dim = dst_state_dim_per_tensor[i]
 
-            # Calculate bytes per dimension slice
-            # item_len = dim * trailing_dims_size, so trailing_dims_size = item_len / dim
             src_bytes_per_dim = src_item_len // src_dim
-            dst_bytes_per_dim = dst_item_len // dst_dim
 
-            # Determine slicing parameters based on TP configuration
-            if self.attn_tp_size > dst_attn_tp_size:
-                # Multiple prefill ranks send to 1 decode rank
-                # Each prefill sends all its dims to the appropriate offset in decode
-                src_dim_start = 0
-                num_dims_to_send = src_dim
-                writers_per_decode = self.attn_tp_size // dst_attn_tp_size
-                local_writer_idx = local_tp_rank_in_group % writers_per_decode
-                dst_dim_start = local_writer_idx * src_dim
+            src_base = prefill_state_data_ptrs[i] + src_item_len * int(
+                prefill_mamba_index[0]
+            )
+            dst_base = dst_state_ptr + dst_item_len * int(req.dst_state_indices[0])
+
+            is_conv_tensor = i < conv_tensor_count
+            needs_per_group_slicing = is_conv_tensor and has_grouped_conv_layout
+
+            if needs_per_group_slicing:
+                # Per-group slicing for conv state tensors.
+                # The conv dim is composed of groups (e.g. [K, K, V]) that are
+                # each independently TP-sharded by mamba_v2_sharded_weight_loader.
+                src_group_dim_offset = 0
+                dst_group_dim_offset = 0
+
+                for group_size in conv_shard_groups:
+                    src_group_dims = group_size // self.attn_tp_size
+                    dst_group_dims = group_size // dst_attn_tp_size
+
+                    if self.attn_tp_size > dst_attn_tp_size:
+                        writers_per_dst = self.attn_tp_size // dst_attn_tp_size
+                        local_writer_idx = local_tp_rank_in_group % writers_per_dst
+                        src_start = src_group_dim_offset
+                        dst_start = (
+                            dst_group_dim_offset + local_writer_idx * src_group_dims
+                        )
+                        dims_to_send = src_group_dims
+                    else:
+                        readers_per_src = dst_attn_tp_size // self.attn_tp_size
+                        dst_local_idx = dst_tp_rank_in_group % readers_per_src
+                        src_start = (
+                            src_group_dim_offset + dst_local_idx * dst_group_dims
+                        )
+                        dst_start = dst_group_dim_offset
+                        dims_to_send = dst_group_dims
+
+                    transfer_blocks.append(
+                        (
+                            src_base + src_start * src_bytes_per_dim,
+                            dst_base + dst_start * src_bytes_per_dim,
+                            dims_to_send * src_bytes_per_dim,
+                        )
+                    )
+
+                    src_group_dim_offset += src_group_dims
+                    dst_group_dim_offset += dst_group_dims
             else:
-                # 1 prefill rank sends to multiple decode ranks
-                # Prefill sends a slice of its dims to each decode rank
-                src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
-                num_dims_to_send = dst_dim
-                dst_dim_start = 0
+                # Contiguous slicing for temporal state (or conv without groups)
+                if self.attn_tp_size > dst_attn_tp_size:
+                    writers_per_decode = self.attn_tp_size // dst_attn_tp_size
+                    local_writer_idx = local_tp_rank_in_group % writers_per_decode
+                    src_dim_start = 0
+                    num_dims_to_send = src_dim
+                    dst_dim_start = local_writer_idx * src_dim
+                else:
+                    src_dim_start = (dst_tp_rank_in_group * dst_dim) % src_dim
+                    num_dims_to_send = dst_dim
+                    dst_dim_start = 0
 
-            # Calculate byte offsets
-            src_dim_offset = src_dim_start * src_bytes_per_dim
-            dst_dim_offset = dst_dim_start * dst_bytes_per_dim
-            bytes_to_send = num_dims_to_send * src_bytes_per_dim
-
-            # Calculate addresses for this state tensor
-            src_addr = (
-                prefill_state_data_ptrs[i]
-                + src_item_len * int(prefill_mamba_index[0])
-                + src_dim_offset
-            )
-            dst_addr = (
-                dst_state_ptr
-                + dst_item_len * int(req.dst_state_indices[0])
-                + dst_dim_offset
-            )
-
-            transfer_blocks.append((src_addr, dst_addr, bytes_to_send))
+                transfer_blocks.append(
+                    (
+                        src_base + src_dim_start * src_bytes_per_dim,
+                        dst_base + dst_dim_start * src_bytes_per_dim,
+                        num_dims_to_send * src_bytes_per_dim,
+                    )
+                )
 
         return self._transfer_data(req.mooncake_session_id, transfer_blocks)
 

@@ -287,14 +287,17 @@ class Qwen3NextConfig(PretrainedConfig):
             world_size = get_attention_tp_size()
             adjust_tp_num_heads_if_necessary(self, world_size, False)
 
+        key_dim = self.linear_num_key_heads * self.linear_key_head_dim
+        value_dim = self.linear_value_head_dim * self.linear_num_value_heads
         shape = Mamba2StateShape.create(
             tp_world_size=get_attention_tp_size(),
-            intermediate_size=self.linear_value_head_dim * self.linear_num_value_heads,
+            intermediate_size=value_dim,
             n_groups=self.linear_num_key_heads,
             num_heads=self.linear_num_value_heads,
             head_dim=self.linear_value_head_dim,
             state_size=self.linear_key_head_dim,
             conv_kernel=self.linear_conv_kernel_dim,
+            conv_shard_groups=[key_dim, key_dim, value_dim],
         )
 
         return Mamba2CacheParams(

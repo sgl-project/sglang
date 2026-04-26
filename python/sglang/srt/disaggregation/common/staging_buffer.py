@@ -708,9 +708,12 @@ def compute_head_slice_params(
         unique_head_idx = local_tp_rank // src_replication
         dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
     else:
-        src_head_start = (
-            dst_tp_rank_in_group * dst_heads_per_rank
-        ) % src_heads_per_rank
+        # When dst_attn_tp_size > total_kv_heads, multiple decode ranks share
+        # the same KV head (GQA replication on dst side). Map
+        # dst_tp_rank_in_group to its actual KV head index first.
+        dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
+        unique_dst_idx = dst_tp_rank_in_group // dst_replication
+        src_head_start = (unique_dst_idx * dst_heads_per_rank) % src_heads_per_rank
         num_heads_to_send = dst_heads_per_rank
         dst_head_start = 0
 

@@ -572,6 +572,10 @@ def setup_state_kv_args(
         # Get state dimension info for cross-TP slice transfer
         if hasattr(token_to_kv_pool, "get_state_dim_per_tensor"):
             kv_args.state_dim_per_tensor = token_to_kv_pool.get_state_dim_per_tensor()
+        if hasattr(token_to_kv_pool, "get_state_conv_shard_info"):
+            groups, count = token_to_kv_pool.get_state_conv_shard_info()
+            kv_args.state_conv_shard_groups = groups
+            kv_args.state_conv_tensor_count = count
     elif isinstance(token_to_kv_pool, NSATokenToKVPool):
         kv_args.state_type = "nsa"
         if draft_token_to_kv_pool is not None and isinstance(

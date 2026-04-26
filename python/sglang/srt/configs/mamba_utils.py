@@ -137,6 +137,9 @@ class Mamba2StateShape:
     head_dim: int
     state_size: int
     conv_kernel: int
+    # Unsharded group sizes for conv state, matching mamba_v2_sharded_weight_loader ordering.
+    # e.g. Mamba2: [x_size, B_size, C_size], GatedDeltaNet: [K_dim, K_dim, V_dim]
+    conv_shard_groups: list[int] = field(default_factory=list)
 
     @staticmethod
     def create(
@@ -148,6 +151,7 @@ class Mamba2StateShape:
         head_dim: int,
         state_size: int,
         conv_kernel: int,
+        conv_shard_groups: Optional[list[int]] = None,
     ) -> "Mamba2StateShape":
         # if n_groups is not divisible by world_size, need to extend the shards
         # to ensure all groups needed by a head is sharded along with it
@@ -164,6 +168,15 @@ class Mamba2StateShape:
         # - they are typically small
         #   e.g., QWen3-Next: (32, 128, 128)
         temporal_state_shape = (divide(num_heads, tp_world_size), head_dim, state_size)
+        if conv_shard_groups is None:
+            bc_size = n_groups * state_size
+            conv_shard_groups = [intermediate_size, bc_size, bc_size]
+        if sum(conv_shard_groups) != conv_dim:
+            raise ValueError(
+                f"conv_shard_groups {conv_shard_groups} sum={sum(conv_shard_groups)} "
+                f"!= conv_dim={conv_dim}"
+            )
+
         return Mamba2StateShape(
             conv=[conv_state_shape],
             temporal=temporal_state_shape,
@@ -174,6 +187,7 @@ class Mamba2StateShape:
             head_dim=head_dim,
             state_size=state_size,
             conv_kernel=conv_kernel,
+            conv_shard_groups=conv_shard_groups,
         )
 
 

@@ -34,6 +34,9 @@ class KVArgs:
     state_type: str  # "none", "mamba", "swa", "nsa", "dsv4"
     # for mamba state different tp slice transfer
     state_dim_per_tensor: List[int]  # dimension to slice for each state tensor
+    # Conv state shard groups for heterogeneous TP slice transfer (unsharded group sizes)
+    state_conv_shard_groups: List[int]
+    state_conv_tensor_count: int  # number of conv entries in state_dim_per_tensor
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
