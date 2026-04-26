@@ -41,11 +41,6 @@ class AiterMoeQuantInfo(MoeQuantInfo):
     doweight_stage1: bool = False
     hidden_pad: int = 0
     intermediate_pad: int = 0
-    # Override MoeRunnerConfig.activation (used by MXFP4's hard-coded Swiglu).
-    activation_override: Optional[str] = None
-    # Pre-scale hidden_states by topk_weights when apply_router_weight_on_input
-    # is True; only enabled by unquant.py and compressed-tensors FP8.
-    apply_router_weight_on_input_pre_scale: bool = False
 
 
 _AITER_ACTIVATIONS = {"silu": "Silu", "swiglu": "Swiglu"}
@@ -67,23 +62,22 @@ def fused_experts_none_to_aiter(
     hidden_states = dispatch_output.hidden_states
     topk_weights, topk_ids, _ = dispatch_output.topk_output
     topk_weights = topk_weights.to(torch.float32)
-    topk_ids = topk_ids.to(torch.int32)
 
-    if (
-        runner_config.apply_router_weight_on_input
-        and quant_info.apply_router_weight_on_input_pre_scale
-    ):
-        assert topk_weights.dim() == 2 and topk_weights.shape[-1] == 1
+    if runner_config.apply_router_weight_on_input and not quant_info.doweight_stage1:
+        # Pre-scale at the Python level for kernels that don't honor doweight_stage1.
+        assert (
+            topk_weights.dim() == 2 and topk_weights.shape[-1] == 1
+        ), "apply_router_weight_on_input requires topk=1"
         hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
-        topk_weights = torch.ones_like(topk_weights, dtype=torch.float32)
+        topk_weights = torch.ones_like(topk_weights)
 
-    activation = quant_info.activation_override or runner_config.activation
+    activation = runner_config.activation
     output = fused_moe(
         hidden_states=hidden_states,
         w1=quant_info.w13_weight,
         w2=quant_info.w2_weight,
         topk_weight=topk_weights,
-        topk_ids=topk_ids,
+        topk_ids=topk_ids.to(torch.int32),
         quant_type=getattr(QuantType, quant_info.quant_type.value),
         activation=getattr(ActivationType, _AITER_ACTIVATIONS.get(activation, "Gelu")),
         w1_scale=quant_info.w13_scale,

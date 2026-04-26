@@ -390,7 +390,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
         # Separate runner so CK-shape errors fall back to self.runner on every call.
         self._aiter_runner: Optional[MoeRunner] = None
-        if _use_aiter and get_moe_runner_backend().is_auto():
+        if (
+            _use_aiter
+            and (
+                get_moe_runner_backend().is_auto()
+                or get_moe_runner_backend().is_aiter()
+            )
+            and get_moe_a2a_backend().is_none()
+        ):
             self._aiter_runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
 
     @property
@@ -489,7 +496,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                         w13_weight=layer.w13_weight,
                         w2_weight=layer.w2_weight,
                         expert_mask=layer.dispatcher.expert_mask_gpu,
-                        apply_router_weight_on_input_pre_scale=True,
                     )
                     return self._aiter_runner.run(dispatch_output, quant_info)
                 except RuntimeError as e:

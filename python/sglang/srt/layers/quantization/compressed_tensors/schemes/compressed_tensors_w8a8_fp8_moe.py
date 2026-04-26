@@ -346,12 +346,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
-            if _use_aiter and get_moe_a2a_backend().is_mori():
-                # mori bypasses self.runner via MoriEPMoE.run_moe_core.
-                pass
-            elif (
+            if (
                 _use_aiter
                 and self.weight_quant.strategy == QuantizationStrategy.CHANNEL
+                and get_moe_a2a_backend().is_none()
             ):
                 moe_runner_backend = MoeRunnerBackend.AITER
             else:
@@ -394,7 +392,6 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 w2_scale=layer.w2_weight_scale,
                 a13_scale=layer.w13_input_scale,
                 a2_scale=layer.w2_input_scale,
-                apply_router_weight_on_input_pre_scale=True,
             )
             return self.runner.run(dispatch_output, quant_info)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:

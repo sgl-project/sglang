@@ -187,8 +187,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
-        if moe_runner_backend.is_auto() and not get_moe_a2a_backend().is_mori():
-            # mori bypasses self.runner via MoriEPMoE.run_moe_core.
+        if moe_runner_backend.is_auto() and get_moe_a2a_backend().is_none():
             moe_runner_backend = MoeRunnerBackend.AITER
 
         if moe_runner_backend.is_aiter():
