@@ -129,10 +129,12 @@ class Req:
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
 
-    # Request scheduler runtime used by timestep/denoising stages. Normal serving
-    # executes one request at a time and may point this at the stage-local
-    # scheduler to preserve warmup caches. Concurrent/grouped/disagg execution
-    # should install an isolated scheduler runtime instead.
+    # Scheduler runtime used by timestep/denoising stages. This is optional
+    # because the normal worker path executes one request at a time, so it can
+    # point at the stage-local scheduler and preserve warmup/device caches.
+    # Request-local cloned schedulers are only needed when a request can run
+    # concurrently with another request or outlive the stage-local scheduler
+    # state, such as grouped execution or disaggregation.
     scheduler: Any | None = None
 
     eta: float = 0.0
