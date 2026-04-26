@@ -1637,22 +1637,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
-            elif (
-                _is_hip
-                and (_use_aiter or _use_hip_int4)
-                and get_moe_a2a_backend().is_none()
-            ):
-                # *EPMoE backends bypass self.runner via run_moe_core, and the
-                # AITER fused func is only registered for ("none", "aiter").
-                moe_runner_backend = MoeRunnerBackend.AITER
+            elif _is_hip and (_use_aiter or _use_hip_int4):
+                # mori bypasses self.runner via MoriEPMoE.run_moe_core.
+                if not get_moe_a2a_backend().is_mori():
+                    moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
-
-
-        # On HIP with SGLANG_USE_AITER / SGLANG_INT4_WEIGHT, the aiter fused
-        # kernel was the unconditional fast-path before this refactor.
-        if _is_hip and (_use_aiter or _use_hip_int4):
-            moe_runner_backend = MoeRunnerBackend.AITER
 
 
         if (

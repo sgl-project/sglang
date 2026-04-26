@@ -1003,14 +1003,28 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        # Must match apply() priority: _use_aiter before use_triton_kernels.
-        if _use_aiter:
-            backend = MoeRunnerBackend.AITER
-        elif self.use_triton_kernels:
-            backend = MoeRunnerBackend.TRITON_KERNELS
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto():
+            # Must match apply() priority: _use_aiter before use_triton_kernels.
+            if _use_aiter and get_moe_a2a_backend().is_mori():
+                # mori bypasses self.runner via MoriEPMoE.run_moe_core.
+                pass
+            elif _use_aiter:
+                moe_runner_backend = MoeRunnerBackend.AITER
+            elif self.use_triton_kernels:
+                moe_runner_backend = MoeRunnerBackend.TRITON_KERNELS
+            else:
+                moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if (
+            moe_runner_backend.is_aiter()
+            or moe_runner_backend.is_triton_kernels()
+            or moe_runner_backend.is_triton()
+        ):
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
-            backend = MoeRunnerBackend.TRITON
-        self.runner = MoeRunner(backend, moe_runner_config)
+            # TODO(cwan): refactor other backends
+            pass
 
     def _apply_sm90_cutlass(self, layer, x, topk_output):
         """SM90 (Hopper) MXFP4 x BF16 MoE via FlashInfer's cutlass mixed-input
@@ -1344,7 +1358,16 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto() and not get_moe_a2a_backend().is_mori():
+            # mori bypasses self.runner via MoriEPMoE.run_moe_core.
+            moe_runner_backend = MoeRunnerBackend.AITER
+
+        if moe_runner_backend.is_aiter():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            # TODO(cwan): refactor other backends
+            pass
 
     def apply(
         self,

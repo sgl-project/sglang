@@ -186,7 +186,16 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         )
 
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_auto() and not get_moe_a2a_backend().is_mori():
+            # mori bypasses self.runner via MoriEPMoE.run_moe_core.
+            moe_runner_backend = MoeRunnerBackend.AITER
+
+        if moe_runner_backend.is_aiter():
+            self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
+        else:
+            # TODO(cwan): refactor other backends
+            pass
 
     def apply_weights(
         self,
