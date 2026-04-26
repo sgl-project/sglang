@@ -21,22 +21,23 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeAlias, Unio
 
 from openai.types.responses import (
     ResponseFunctionToolCall,
-    ResponseInputItemParam,
     ResponseOutputItem,
     ResponseOutputMessage,
     ResponseOutputText,
     ResponseReasoningItem,
 )
 from openai.types.responses.response import ToolChoice
-from openai.types.responses.tool import Tool
+from openai.types.responses.tool import Tool as OpenAIResponsesTool
 from pydantic import (
     BaseModel,
+    ConfigDict,
     Field,
+    TypeAdapter,
     field_validator,
     model_serializer,
     model_validator,
 )
-from typing_extensions import Literal
+from typing_extensions import Annotated, Literal
 
 try:
     from xgrammar import StructuralTag
@@ -48,6 +49,7 @@ from sglang.utils import convert_json_schema_to_str
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL_NAME = "default"
+OPENAI_RESPONSES_TOOL_ADAPTER = TypeAdapter(OpenAIResponsesTool)
 
 
 class ModelCard(BaseModel):
@@ -508,7 +510,7 @@ class ChatCompletionMessageGenericParam(BaseModel):
     name: Optional[str] = None
     reasoning_content: Optional[str] = None
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
-    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    tools: Optional[List["Tool"]] = Field(default=None, examples=[None])
 
     @field_validator("role", mode="before")
     @classmethod
@@ -609,7 +611,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     user: Optional[str] = None
-    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    tools: Optional[List["Tool"]] = Field(default=None, examples=[None])
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
@@ -1175,15 +1177,116 @@ class ResponseReasoningParam(BaseModel):
 class ResponseTool(BaseModel):
     """Tool definition for responses."""
 
-    type: Literal["web_search_preview", "code_interpreter"] = Field(
-        description="Type of tool to enable"
-    )
+    type: Literal[
+        "function", "web_search", "web_search_preview", "code_interpreter"
+    ] = Field(description="Type of tool to enable")
+    name: Optional[str] = None
+    description: Optional[str] = None
+    parameters: Optional[object] = None
+    strict: Optional[bool] = None
+    filters: Optional[Dict[str, Any]] = None
+    user_location: Optional[Dict[str, Any]] = None
+    search_context_size: Optional[str] = None
+    external_web_access: Optional[bool] = None
+    container: Optional[Dict[str, Any]] = None
+
+    def to_tool(self) -> OpenAIResponsesTool:
+        payload = self.model_dump(exclude_none=True)
+        return OPENAI_RESPONSES_TOOL_ADAPTER.validate_python(payload)
+
+    @model_validator(mode="after")
+    def validate_supported_tool_shape(self) -> "ResponseTool":
+        self.to_tool()
+        return self
 
 
-ResponseInputOutputItem: TypeAlias = Union[
-    ResponseInputItemParam,
-    "ResponseReasoningItem",
-    ResponseFunctionToolCall,
+class ResponsesInputBaseModel(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
+
+class ResponseInputImageUrl(ResponsesInputBaseModel):
+    url: str
+    detail: Optional[str] = None
+
+
+class ResponseInputTextContentPart(ResponsesInputBaseModel):
+    type: Literal["input_text", "output_text", "text"]
+    text: str
+
+
+class ResponseInputReasoningContentPart(ResponsesInputBaseModel):
+    type: Literal["reasoning_text"]
+    text: str
+
+
+class ResponseInputImageContentPart(ResponsesInputBaseModel):
+    type: Literal["input_image", "image_url"]
+    image_url: Union[str, ResponseInputImageUrl]
+    detail: Optional[str] = None
+
+
+ResponseInputContentPart: TypeAlias = Annotated[
+    Union[
+        ResponseInputTextContentPart,
+        ResponseInputReasoningContentPart,
+        ResponseInputImageContentPart,
+    ],
+    Field(discriminator="type"),
+]
+
+
+class ResponseInputMessageItem(ResponsesInputBaseModel):
+    type: Literal["message"]
+    role: Literal["system", "developer", "user", "assistant", "tool", "function"]
+    content: List[ResponseInputContentPart]
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _normalize_role(cls, v):
+        if isinstance(v, str):
+            v_lower = v.lower()
+            if v_lower not in {
+                "system",
+                "developer",
+                "user",
+                "assistant",
+                "tool",
+                "function",
+            }:
+                raise ValueError(
+                    "'role' must be one of 'system', 'developer', 'user', "
+                    "'assistant', 'tool', or 'function' (case-insensitive)."
+                )
+            return v_lower
+        raise ValueError("'role' must be a string")
+
+
+class ResponseInputFunctionCallItem(ResponsesInputBaseModel):
+    type: Literal["function_call"]
+    call_id: str
+    name: str
+    arguments: str
+
+
+class ResponseInputFunctionCallOutputItem(ResponsesInputBaseModel):
+    type: Literal["function_call_output"]
+    call_id: str
+    output: Union[str, List[ResponseInputContentPart]]
+
+
+class ResponseInputReasoningItem(ResponsesInputBaseModel):
+    type: Literal["reasoning"]
+    content: List[ResponseInputReasoningContentPart]
+
+
+ResponseInputOutputItem: TypeAlias = Annotated[
+    Union[
+        ResponseInputMessageItem,
+        ResponseInputFunctionCallItem,
+        ResponseInputFunctionCallOutputItem,
+        ResponseInputReasoningItem,
+    ],
+    Field(discriminator="type"),
 ]
 
 
@@ -1254,6 +1357,28 @@ class ResponsesRequest(BaseModel):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
+
+    @field_validator("tools", mode="before")
+    @classmethod
+    def validate_tools(cls, value):
+        if value is None:
+            return []
+        for i, tool in enumerate(value):
+            if not isinstance(tool, dict):
+                continue
+            tool_type = tool.get("type")
+            if tool_type not in {
+                "function",
+                "web_search",
+                "web_search_preview",
+                "code_interpreter",
+            }:
+                raise ValueError(
+                    f"Unsupported responses tool type at index {i}: {tool_type!r}. "
+                    "Supported types are 'function', 'web_search', "
+                    "'web_search_preview', and 'code_interpreter'."
+                )
+        return value
 
     def to_sampling_params(
         self, default_max_tokens: int, default_params: Optional[Dict] = None
@@ -1472,11 +1597,6 @@ class ToolCallProcessingResult(NamedTuple):
 class ResponseReasoningTextContent(BaseModel):
     text: str
     type: Literal["reasoning_text"] = "reasoning_text"
-
-
-ResponseInputOutputItem: TypeAlias = Union[
-    ResponseInputItemParam, "ResponseReasoningItem", ResponseFunctionToolCall
-]
 
 
 # ================== Transcription API Protocol Definitions ==================

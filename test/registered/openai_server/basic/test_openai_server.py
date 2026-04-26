@@ -6,6 +6,7 @@ python3 -m unittest openai_server.basic.test_openai_server.TestOpenAIServer.test
 """
 
 import json
+import os
 import random
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -31,11 +32,16 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=189, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
 
+OPENAI_SERVER_TEST_MODEL = os.environ.get(
+    "SGLANG_OPENAI_SERVER_TEST_MODEL",
+    os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST),
+)
+
 
 class TestOpenAIServer(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = OPENAI_SERVER_TEST_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -45,7 +51,7 @@ class TestOpenAIServer(CustomTestCase):
             api_key=cls.api_key,
         )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+        cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
     def tearDownClass(cls):
@@ -446,7 +452,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 class TestOpenAIServerv1Responses(CustomTestCase):
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        cls.model = OPENAI_SERVER_TEST_MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-123456"
         cls.process = popen_launch_server(
@@ -456,7 +462,7 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             api_key=cls.api_key,
         )
         cls.base_url += "/v1"
-        cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
+        cls.tokenizer = get_tokenizer(cls.model)
 
     @classmethod
     def tearDownClass(cls):
@@ -622,6 +628,36 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         for _ in generator:
             pass
 
+    def _responses_headers(self):
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _assert_invalid_responses_request(
+        self,
+        payload: dict,
+        *,
+        stream: bool = False,
+        message_substring: Optional[str] = None,
+    ) -> dict:
+        request_payload = dict(payload)
+        if stream:
+            request_payload["stream"] = True
+        response = requests.post(
+            f"{self.base_url}/responses",
+            headers=self._responses_headers(),
+            json=request_payload,
+            stream=stream,
+        )
+        self.assertEqual(response.status_code, 400, response.text)
+        body = response.json()
+        self.assertIn("error", body)
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+        if message_substring is not None:
+            self.assertIn(message_substring, body["error"]["message"])
+        return body
+
     # ---- tests ----
     def test_response(self):
         resp = self.run_response(temperature=0, max_output_tokens=32)
@@ -677,6 +713,356 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         assert saw_in_progress
         assert saw_completed
         assert final_usage_ok or True  # final_usage's stats are not done for now
+
+    def test_response_accepts_codex_tool_shapes(self):
+        url = f"{self.base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Say hello in one sentence."}
+                    ],
+                }
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "Run a shell command.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string"},
+                        },
+                        "required": ["cmd"],
+                    },
+                },
+                {
+                    "type": "web_search",
+                    "filters": {"allowed_domains": ["example.com"]},
+                },
+            ],
+        }
+        r = requests.post(url, headers=headers, json=payload)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body.get("object"), "response")
+        self.assertIn("output", body)
+
+    def test_response_accepts_function_call_output_content_items(self):
+        url = f"{self.base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Summarize the tool result in one short sentence.",
+                        }
+                    ],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "exec_command",
+                    "arguments": '{"cmd":"pwd"}',
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_1",
+                    "output": [{"type": "input_text", "text": "/tmp/project"}],
+                },
+            ],
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "Run a shell command.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string"},
+                        },
+                        "required": ["cmd"],
+                    },
+                }
+            ],
+        }
+        r = requests.post(url, headers=headers, json=payload)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body.get("object"), "response")
+        self.assertIn("output", body)
+
+    def test_response_accepts_assistant_reasoning_text_history(self):
+        url = f"{self.base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "input": [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "reasoning_text",
+                            "text": "Thinking briefly about whether web search is needed.",
+                        },
+                        {
+                            "type": "output_text",
+                            "text": "I can help check that.",
+                        },
+                    ],
+                },
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": "Can you search www.baidu.com ?",
+                        }
+                    ],
+                },
+            ],
+        }
+        r = requests.post(url, headers=headers, json=payload)
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body.get("object"), "response")
+        self.assertIn("output", body)
+
+    def test_response_stream_accepts_codex_tool_shapes(self):
+        url = f"{self.base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "input": "Say hello in one sentence.",
+            "stream": True,
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "exec_command",
+                    "description": "Run a shell command.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "cmd": {"type": "string"},
+                        },
+                        "required": ["cmd"],
+                    },
+                },
+                {
+                    "type": "web_search",
+                    "filters": {"allowed_domains": ["example.com"]},
+                },
+            ],
+        }
+        r = requests.post(url, headers=headers, json=payload, stream=True)
+        self.assertEqual(r.status_code, 200, r.text)
+
+        event_types = []
+        for line in r.iter_lines(decode_unicode=True):
+            if line and line.startswith("event: "):
+                event_types.append(line[len("event: ") :])
+
+        self.assertIn("response.created", event_types)
+        self.assertIn("response.completed", event_types)
+
+    def test_response_rejects_unsupported_tool_type(self):
+        url = f"{self.base_url}/responses"
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "model": self.model,
+            "input": "Hi",
+            "tools": [
+                {
+                    "type": "namespace",
+                    "name": "functions",
+                    "description": "Unsupported namespace tool.",
+                    "tools": [],
+                }
+            ],
+        }
+        r = requests.post(url, headers=headers, json=payload)
+        self.assertEqual(r.status_code, 400)
+        body = r.json()
+        self.assertIn("error", body)
+        self.assertIn("Unsupported responses tool type", body["error"]["message"])
+
+    def test_response_rejects_malformed_structured_input(self):
+        invalid_cases = [
+            (
+                "message missing role",
+                {
+                    "model": self.model,
+                    "input": [
+                        {
+                            "type": "message",
+                            "content": [{"type": "input_text", "text": "Hi"}],
+                        }
+                    ],
+                },
+                "role",
+            ),
+            (
+                "function_call missing call_id",
+                {
+                    "model": self.model,
+                    "input": [
+                        {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "arguments": '{"cmd":"pwd"}',
+                        }
+                    ],
+                },
+                "call_id",
+            ),
+            (
+                "function_call missing name",
+                {
+                    "model": self.model,
+                    "input": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "arguments": '{"cmd":"pwd"}',
+                        }
+                    ],
+                },
+                "name",
+            ),
+            (
+                "function_call missing arguments",
+                {
+                    "model": self.model,
+                    "input": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "exec_command",
+                        }
+                    ],
+                },
+                "arguments",
+            ),
+            (
+                "function_call_output missing call_id",
+                {
+                    "model": self.model,
+                    "input": [
+                        {
+                            "type": "function_call_output",
+                            "output": "done",
+                        }
+                    ],
+                },
+                "call_id",
+            ),
+            (
+                "function_call_output missing output",
+                {
+                    "model": self.model,
+                    "input": [
+                        {
+                            "type": "function_call_output",
+                            "call_id": "call_1",
+                        }
+                    ],
+                },
+                "output",
+            ),
+            (
+                "unknown input type",
+                {
+                    "model": self.model,
+                    "input": [
+                        {
+                            "type": "computer_call",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "Hi"}],
+                        }
+                    ],
+                },
+                None,
+            ),
+            (
+                "invalid nested content type",
+                {
+                    "model": self.model,
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_audio", "audio_url": "x"}],
+                        }
+                    ],
+                },
+                None,
+            ),
+            (
+                "content must be a list",
+                {
+                    "model": self.model,
+                    "input": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": "Hi",
+                        }
+                    ],
+                },
+                "content",
+            ),
+            (
+                "arguments must be a string",
+                {
+                    "model": self.model,
+                    "input": [
+                        {
+                            "type": "function_call",
+                            "call_id": "call_1",
+                            "name": "exec_command",
+                            "arguments": {"cmd": "pwd"},
+                        }
+                    ],
+                },
+                "arguments",
+            ),
+        ]
+
+        for stream in (False, True):
+            for case_name, payload, message_substring in invalid_cases:
+                with self.subTest(case=case_name, stream=stream):
+                    self._assert_invalid_responses_request(
+                        payload,
+                        stream=stream,
+                        message_substring=message_substring,
+                    )
 
     def test_regex(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)

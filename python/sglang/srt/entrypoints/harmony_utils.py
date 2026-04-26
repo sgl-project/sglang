@@ -4,7 +4,7 @@
 # Slight differences in processing chat messages
 import datetime
 from collections.abc import Iterable
-from typing import Literal, Optional, Union
+from typing import Any, Literal, Optional, Union
 
 import orjson
 from openai.types.responses import (
@@ -119,6 +119,18 @@ def get_user_message(content: str) -> Message:
     return Message.from_role_and_content(Role.USER, content)
 
 
+def _response_content_part_to_text(content_part: dict[str, Any]) -> str:
+    part_type = content_part.get("type")
+    if part_type in {"input_text", "output_text", "text", "reasoning_text"}:
+        return content_part["text"]
+    if part_type in {"input_image", "image_url"}:
+        image_url = content_part["image_url"]
+        if isinstance(image_url, dict):
+            return str(image_url.get("url", ""))
+        return str(image_url)
+    raise ValueError(f"Unsupported response content part type: {part_type!r}")
+
+
 def parse_response_input(
     response_msg: ResponseInputOutputItem,
     prev_responses: list[Union[ResponseOutputItem, ResponseReasoningItem]],
@@ -139,7 +151,14 @@ def parse_response_input(
         if isinstance(content, str):
             msg = Message.from_role_and_content(role, text_prefix + content)
         else:
-            contents = [TextContent(text=text_prefix + c["text"]) for c in content]
+            contents = []
+            for idx, content_part in enumerate(content):
+                prefix = text_prefix if idx == 0 else ""
+                contents.append(
+                    TextContent(
+                        text=prefix + _response_content_part_to_text(content_part)
+                    )
+                )
             msg = Message.from_role_and_contents(role, contents)
     elif response_msg["type"] == "function_call_output":
         call_id = response_msg["call_id"]
@@ -153,9 +172,14 @@ def parse_response_input(
                 break
         if call_response is None:
             raise ValueError(f"No call message found for {call_id}")
+        output = response_msg["output"]
+        if isinstance(output, list):
+            output = "\n".join(
+                filter(None, (_response_content_part_to_text(item) for item in output))
+            )
         msg = Message.from_author_and_content(
             Author.new(Role.TOOL, f"functions.{call_response.name}"),
-            response_msg["output"],
+            output,
         )
     elif response_msg["type"] == "reasoning":
         content = response_msg["content"]

@@ -48,10 +48,26 @@ from sglang.srt.entrypoints.harmony_utils import (
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageParam,
     ChatCompletionRequest,
+    ChatCompletionResponse,
+    ChatCompletionStreamResponse,
+    Function,
     PromptTokenUsageInfo,
     RequestResponseMetadata,
+    ResponseInputContentPart,
+    ResponseInputFunctionCallItem,
+    ResponseInputFunctionCallOutputItem,
+    ResponseInputImageContentPart,
+    ResponseInputMessageItem,
+    ResponseInputOutputItem,
+    ResponseInputReasoningContentPart,
+    ResponseInputReasoningItem,
+    ResponseInputTextContentPart,
     ResponsesRequest,
     ResponsesResponse,
+    ResponseTool,
+)
+from sglang.srt.entrypoints.openai.protocol import Tool as ChatTool
+from sglang.srt.entrypoints.openai.protocol import (
     UsageInfo,
 )
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -159,6 +175,844 @@ class OpenAIServingResponses(OpenAIServingChat):
     def _request_id_prefix(self) -> str:
         return "resp_"
 
+    def _response_tool_to_chat_tool(self, tool: ResponseTool) -> Optional[ChatTool]:
+        if tool.type != "function":
+            return None
+
+        return ChatTool(
+            type="function",
+            function=Function(
+                name=tool.name or "",
+                description=tool.description,
+                parameters=tool.parameters,
+                strict=bool(tool.strict),
+                defer_loading=None,
+            ),
+            defer_loading=None,
+        )
+
+    def _response_tool_choice_to_chat(
+        self,
+        request: ResponsesRequest,
+        chat_tools: list[ChatTool],
+    ) -> str:
+        if chat_tools:
+            return request.tool_choice
+        if request.tool_choice == "required":
+            raise ValueError(
+                "Only function tools are supported for non-harmony /v1/responses requests."
+            )
+        return "none"
+
+    def _response_content_part_to_chat_part(
+        self, part: ResponseInputContentPart
+    ) -> Optional[dict[str, Any]]:
+        if isinstance(part, ResponseInputReasoningContentPart):
+            # Codex may send prior assistant reasoning traces inside message
+            # content. Non-harmony models cannot consume these as structured
+            # reasoning, so skip them while preserving the assistant text.
+            return None
+        if isinstance(part, ResponseInputTextContentPart):
+            return {"type": "text", "text": part.text}
+        if isinstance(part, ResponseInputImageContentPart):
+            image_url = part.image_url
+            if isinstance(image_url, str):
+                image_url = {
+                    "url": image_url,
+                    "detail": part.detail or "auto",
+                }
+            else:
+                image_url = image_url.model_dump(exclude_none=True)
+                image_url.setdefault(
+                    "detail", part.detail or image_url.get("detail") or "auto"
+                )
+            return {"type": "image_url", "image_url": image_url}
+        raise TypeError(f"Unsupported content part type: {type(part)!r}")
+
+    def _response_content_to_chat_content(
+        self,
+        content: Optional[list[ResponseInputContentPart]],
+    ) -> Any:
+        if content is None:
+            return None
+        chat_parts = []
+        for part in content:
+            chat_part = self._response_content_part_to_chat_part(part)
+            if chat_part is not None:
+                chat_parts.append(chat_part)
+
+        if not chat_parts:
+            return ""
+        if all(part.get("type") == "text" for part in chat_parts):
+            return "".join(part.get("text", "") for part in chat_parts)
+        return chat_parts
+
+    def _function_call_output_to_text(
+        self,
+        output: Union[str, list[ResponseInputContentPart]],
+    ) -> str:
+        if isinstance(output, str):
+            return output
+        text_parts = []
+        for item in output:
+            if isinstance(
+                item,
+                (ResponseInputTextContentPart, ResponseInputReasoningContentPart),
+            ):
+                text_parts.append(item.text)
+            elif isinstance(item, ResponseInputImageContentPart):
+                image_url = item.image_url
+                text_parts.append(
+                    image_url if isinstance(image_url, str) else image_url.url
+                )
+            else:
+                raise TypeError(
+                    f"Unsupported function call output item: {type(item)!r}"
+                )
+        return "\n".join(part for part in text_parts if part)
+
+    def _response_input_item_to_chat_messages(
+        self,
+        response_msg: ResponseInputOutputItem,
+    ) -> list[dict[str, Any]]:
+        if isinstance(response_msg, ResponseInputMessageItem):
+            return [
+                {
+                    "role": response_msg.role,
+                    "content": self._response_content_to_chat_content(
+                        response_msg.content
+                    ),
+                }
+            ]
+        if isinstance(response_msg, ResponseInputFunctionCallItem):
+            return [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": response_msg.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": response_msg.name,
+                                "arguments": response_msg.arguments,
+                            },
+                        }
+                    ],
+                }
+            ]
+        if isinstance(response_msg, ResponseInputFunctionCallOutputItem):
+            return [
+                {
+                    "role": "tool",
+                    "tool_call_id": response_msg.call_id,
+                    "content": self._function_call_output_to_text(response_msg.output),
+                }
+            ]
+        if isinstance(response_msg, ResponseInputReasoningItem):
+            return []
+        raise TypeError(f"Unsupported response input item: {type(response_msg)!r}")
+
+    def _response_function_call_item_to_output(
+        self, response_msg: ResponseInputFunctionCallItem
+    ) -> ResponseFunctionToolCall:
+        return ResponseFunctionToolCall(
+            id=f"fc_{random_uuid()}",
+            arguments=response_msg.arguments,
+            call_id=response_msg.call_id,
+            type="function_call",
+            name=response_msg.name,
+        )
+
+    def _build_chat_request_from_responses(
+        self,
+        request: ResponsesRequest,
+        prev_response: Optional[ResponsesResponse],
+    ) -> ChatCompletionRequest:
+        messages: list[dict[str, Any]] = []
+        if request.instructions and prev_response is None:
+            messages.append({"role": "system", "content": request.instructions})
+
+        if prev_response is not None:
+            prev_messages = self.msg_store.get(prev_response.id)
+            if prev_messages is None:
+                raise ValueError(
+                    f"Message history for response {prev_response.id} was not found."
+                )
+            messages.extend(copy.deepcopy(prev_messages))
+
+        if isinstance(request.input, str):
+            messages.append({"role": "user", "content": request.input})
+        else:
+            for response_msg in request.input:
+                messages.extend(
+                    self._response_input_item_to_chat_messages(response_msg)
+                )
+
+        chat_tools = [
+            chat_tool
+            for tool in request.tools
+            for chat_tool in [self._response_tool_to_chat_tool(tool)]
+            if chat_tool is not None
+        ]
+        chat_tool_choice = self._response_tool_choice_to_chat(request, chat_tools)
+
+        return ChatCompletionRequest(
+            messages=messages,
+            model=request.model or self.tokenizer_manager.served_model_name,
+            frequency_penalty=request.frequency_penalty,
+            max_completion_tokens=request.max_output_tokens,
+            presence_penalty=request.presence_penalty,
+            stop=request.stop,
+            stream=request.stream,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            user=request.user,
+            tools=chat_tools or None,
+            tool_choice=chat_tool_choice,
+            parallel_tool_calls=bool(request.parallel_tool_calls),
+            top_logprobs=request.top_logprobs,
+            top_k=request.top_k,
+            min_p=request.min_p,
+            repetition_penalty=request.repetition_penalty,
+            reasoning_effort=request.reasoning.effort if request.reasoning else None,
+            rid=request.request_id,
+            extra_key=request.extra_key,
+            cache_salt=request.cache_salt,
+            priority=request.priority,
+        )
+
+    def _chat_response_to_response_output(
+        self, chat_response: ChatCompletionResponse
+    ) -> list[
+        Union[ResponseOutputMessage, ResponseReasoningItem, ResponseFunctionToolCall]
+    ]:
+        output_items = []
+        if not chat_response.choices:
+            return output_items
+
+        message = chat_response.choices[0].message
+        if message.reasoning_content:
+            output_items.append(
+                ResponseReasoningItem(
+                    id=f"rs_{random_uuid()}",
+                    type="reasoning",
+                    summary=[],
+                    content=[
+                        ResponseReasoningTextContent(
+                            type="reasoning_text", text=message.reasoning_content
+                        )
+                    ],
+                    status="completed",
+                )
+            )
+
+        for tool_call in message.tool_calls or []:
+            tool_call_id = tool_call.id or f"call_{random_uuid()}"
+            arguments = tool_call.function.arguments or ""
+            if not isinstance(arguments, str):
+                arguments = json.dumps(arguments, ensure_ascii=False)
+            output_items.append(
+                ResponseFunctionToolCall(
+                    id=f"fc_{random_uuid()}",
+                    arguments=arguments,
+                    call_id=tool_call_id,
+                    type="function_call",
+                    name=tool_call.function.name or "",
+                )
+            )
+
+        if message.content:
+            output_items.append(
+                ResponseOutputMessage(
+                    id=f"msg_{random_uuid()}",
+                    type="message",
+                    role="assistant",
+                    content=[
+                        ResponseOutputText(
+                            type="output_text",
+                            text=message.content,
+                            annotations=[],
+                            logprobs=None,
+                        )
+                    ],
+                    status="completed",
+                )
+            )
+
+        return output_items
+
+    def _append_response_messages_to_history(
+        self, chat_request: ChatCompletionRequest, chat_response: ChatCompletionResponse
+    ) -> list[dict[str, Any]]:
+        messages = [message.model_dump() for message in chat_request.messages]
+        if not chat_response.choices:
+            return messages
+
+        message = chat_response.choices[0].message
+        assistant_message = {
+            "role": "assistant",
+            "content": message.content,
+        }
+        if message.reasoning_content:
+            assistant_message["reasoning_content"] = message.reasoning_content
+        if message.tool_calls:
+            assistant_message["tool_calls"] = [
+                tool_call.model_dump() for tool_call in message.tool_calls
+            ]
+        messages.append(assistant_message)
+        return messages
+
+    def _usage_from_chat_usage(self, usage: UsageInfo) -> UsageInfo:
+        return UsageInfo(
+            prompt_tokens=usage.prompt_tokens,
+            completion_tokens=usage.completion_tokens,
+            total_tokens=usage.total_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            prompt_tokens_details=usage.prompt_tokens_details,
+        )
+
+    async def _generate_non_harmony_response(
+        self,
+        request: ResponsesRequest,
+        chat_request: ChatCompletionRequest,
+        raw_request: Optional[Request],
+    ) -> tuple[ResponsesResponse, list[dict[str, Any]]]:
+        validation_error = self._validate_request(chat_request)
+        if validation_error:
+            raise ValueError(validation_error)
+
+        adapted_request, chat_request = self._convert_to_internal_request(
+            chat_request, raw_request
+        )
+
+        try:
+            ret = await self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ).__anext__()
+        except ValueError:
+            raise
+
+        if not isinstance(ret, list):
+            ret = [ret]
+
+        chat_response = self._build_chat_response(
+            chat_request,
+            ret,
+            int(time.time()),
+        )
+        output = self._chat_response_to_response_output(chat_response)
+        usage = self._usage_from_chat_usage(chat_response.usage)
+        response = ResponsesResponse.from_request(
+            request,
+            adapted_request.sampling_params,
+            model_name=chat_response.model,
+            created_time=chat_response.created,
+            output=output,
+            status="completed",
+            usage=usage,
+        )
+        history = self._append_response_messages_to_history(chat_request, chat_response)
+        return response, history
+
+    async def _create_non_harmony_response(
+        self,
+        request: ResponsesRequest,
+        prev_response: Optional[ResponsesResponse],
+        raw_request: Optional[Request],
+    ) -> Union[AsyncGenerator[str, None], ResponsesResponse, ORJSONResponse]:
+        try:
+            chat_request = self._build_chat_request_from_responses(
+                request, prev_response
+            )
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
+        request_metadata = RequestResponseMetadata(request_id=request.request_id)
+        if raw_request:
+            raw_request.state.request_metadata = request_metadata
+
+        if request.background:
+            created_time = int(time.time())
+            response = ResponsesResponse.from_request(
+                request,
+                {},
+                model_name=chat_request.model,
+                created_time=created_time,
+                output=[],
+                status="queued",
+                usage=None,
+            )
+            async with self.response_store_lock:
+                self.response_store[response.id] = response
+
+            async def run_background():
+                try:
+                    final_response, history = await self._generate_non_harmony_response(
+                        request,
+                        chat_request,
+                        raw_request,
+                    )
+                    async with self.response_store_lock:
+                        self.response_store[response.id] = final_response
+                    if request.store:
+                        self.msg_store[response.id] = history
+                except Exception as e:
+                    logger.exception(
+                        "Background non-harmony response failed for %s",
+                        request.request_id,
+                    )
+                    async with self.response_store_lock:
+                        stored = self.response_store.get(response.id)
+                        if stored is not None:
+                            stored.status = "failed"
+                            stored.error = {
+                                "message": str(e),
+                                "type": "invalid_request_error",
+                                "param": None,
+                                "code": 400,
+                            }
+
+            task = asyncio.create_task(
+                run_background(), name=f"create_non_harmony_{response.id}"
+            )
+            self.background_tasks[response.id] = task
+            task.add_done_callback(
+                lambda _: self.background_tasks.pop(response.id, None)
+            )
+            return response
+
+        if request.stream:
+            return self._stream_responses_from_chat(request, chat_request, raw_request)
+
+        try:
+            response, history = await self._generate_non_harmony_response(
+                request,
+                chat_request,
+                raw_request,
+            )
+        except ValueError as e:
+            return self.create_error_response(str(e))
+
+        if request.store:
+            async with self.response_store_lock:
+                self.response_store[response.id] = response
+            self.msg_store[response.id] = history
+        return response
+
+    async def _stream_responses_from_chat(
+        self,
+        request: ResponsesRequest,
+        chat_request: ChatCompletionRequest,
+        raw_request: Optional[Request],
+    ) -> AsyncGenerator[str, None]:
+        def _stream_failure_event(message: str) -> str:
+            return (
+                "event: response.failed\n"
+                f"data: {orjson.dumps({'type': 'response.failed', 'response': {'error': {'message': message, 'type': 'invalid_request_error', 'param': None, 'code': 400}}}).decode()}\n\n"
+            )
+
+        validation_error = self._validate_request(chat_request)
+        if validation_error:
+            yield _stream_failure_event(validation_error)
+            return
+
+        try:
+            adapted_request, chat_request = self._convert_to_internal_request(
+                chat_request, raw_request
+            )
+        except ValueError as e:
+            yield _stream_failure_event(str(e))
+            return
+
+        created_time = int(time.time())
+        sequence_number = 0
+
+        def _send_event(event: Any) -> str:
+            nonlocal sequence_number
+            if hasattr(event, "sequence_number"):
+                event.sequence_number = sequence_number
+            sequence_number += 1
+            event_type = getattr(event, "type", "unknown")
+            return (
+                f"event: {event_type}\n"
+                f"data: {event.model_dump_json(indent=None)}\n\n"
+            )
+
+        def _allocate_item_id(prefix: str) -> str:
+            return f"{prefix}_{random_uuid()}"
+
+        output_index = 0
+        text_state: Optional[dict[str, Any]] = None
+        reasoning_state: Optional[dict[str, Any]] = None
+        tool_states: dict[int, dict[str, Any]] = {}
+        completed_items: list[tuple[int, Any]] = []
+        final_usage: Optional[UsageInfo] = None
+        final_model_name = chat_request.model
+        last_chunk_id: Optional[str] = None
+
+        def _finalize_reasoning() -> list[str]:
+            nonlocal reasoning_state
+            if reasoning_state is None:
+                return []
+            item_id = reasoning_state["item_id"]
+            output_item = ResponseReasoningItem(
+                id=item_id,
+                type="reasoning",
+                summary=[],
+                content=[
+                    ResponseReasoningTextContent(
+                        type="reasoning_text",
+                        text=reasoning_state["text"],
+                    )
+                ],
+                status="completed",
+            )
+            completed_items.append((reasoning_state["output_index"], output_item))
+            events = [
+                _send_event(
+                    openai_responses_types.ResponseReasoningTextDoneEvent(
+                        type="response.reasoning_text.done",
+                        item_id=item_id,
+                        sequence_number=-1,
+                        output_index=reasoning_state["output_index"],
+                        content_index=0,
+                        text=reasoning_state["text"],
+                    )
+                ),
+                _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=reasoning_state["output_index"],
+                        item=output_item,
+                    )
+                ),
+            ]
+            reasoning_state = None
+            return events
+
+        def _finalize_text() -> list[str]:
+            nonlocal text_state
+            if text_state is None:
+                return []
+            item_id = text_state["item_id"]
+            text = text_state["text"]
+            text_part = ResponseOutputText(
+                type="output_text",
+                text=text,
+                annotations=[],
+                logprobs=None,
+            )
+            output_item = ResponseOutputMessage(
+                id=item_id,
+                type="message",
+                role="assistant",
+                content=[text_part],
+                status="completed",
+            )
+            completed_items.append((text_state["output_index"], output_item))
+            events = [
+                _send_event(
+                    openai_responses_types.ResponseTextDoneEvent(
+                        type="response.output_text.done",
+                        sequence_number=-1,
+                        output_index=text_state["output_index"],
+                        content_index=0,
+                        text=text,
+                        logprobs=[],
+                        item_id=item_id,
+                    )
+                ),
+                _send_event(
+                    openai_responses_types.ResponseContentPartDoneEvent(
+                        type="response.content_part.done",
+                        sequence_number=-1,
+                        item_id=item_id,
+                        output_index=text_state["output_index"],
+                        content_index=0,
+                        part=text_part,
+                    )
+                ),
+                _send_event(
+                    openai_responses_types.ResponseOutputItemDoneEvent(
+                        type="response.output_item.done",
+                        sequence_number=-1,
+                        output_index=text_state["output_index"],
+                        item=output_item,
+                    )
+                ),
+            ]
+            text_state = None
+            return events
+
+        def _finalize_tools() -> list[str]:
+            events = []
+            for tool_index in sorted(tool_states):
+                state = tool_states[tool_index]
+                call_id = state["call_id"] or f"call_{random_uuid()}"
+                item = ResponseFunctionToolCall(
+                    id=state["item_id"],
+                    arguments=state["arguments"],
+                    call_id=call_id,
+                    type="function_call",
+                    name=state["name"] or "",
+                )
+                completed_items.append((state["output_index"], item))
+                events.append(
+                    _send_event(
+                        openai_responses_types.ResponseOutputItemDoneEvent(
+                            type="response.output_item.done",
+                            sequence_number=-1,
+                            output_index=state["output_index"],
+                            item=item,
+                        )
+                    )
+                )
+            tool_states.clear()
+            return events
+
+        initial_response = ResponsesResponse.from_request(
+            request,
+            adapted_request.sampling_params,
+            model_name=chat_request.model,
+            created_time=created_time,
+            output=[],
+            status="in_progress",
+            usage=None,
+        ).model_dump()
+        yield _send_event(
+            openai_responses_types.ResponseCreatedEvent(
+                type="response.created",
+                sequence_number=-1,
+                response=initial_response,
+            )
+        )
+        yield _send_event(
+            openai_responses_types.ResponseInProgressEvent(
+                type="response.in_progress",
+                sequence_number=-1,
+                response=initial_response,
+            )
+        )
+
+        async for chunk in self._generate_chat_stream(
+            adapted_request, chat_request, raw_request
+        ):
+            payload_line = None
+            for line in chunk.splitlines():
+                if line.startswith("data: "):
+                    payload_line = line[6:]
+                    break
+            if payload_line is None:
+                continue
+            if payload_line == "[DONE]":
+                break
+
+            payload = orjson.loads(payload_line)
+            if "error" in payload:
+                yield _stream_failure_event(
+                    payload["error"].get("message", "Stream failed")
+                )
+                return
+
+            chunk_obj = ChatCompletionStreamResponse.model_validate(payload)
+            final_model_name = chunk_obj.model
+            last_chunk_id = chunk_obj.id
+            if chunk_obj.usage is not None:
+                final_usage = self._usage_from_chat_usage(chunk_obj.usage)
+
+            if not chunk_obj.choices:
+                continue
+
+            choice = chunk_obj.choices[0]
+            delta = choice.delta
+
+            if delta.reasoning_content:
+                if reasoning_state is None:
+                    reasoning_state = {
+                        "item_id": _allocate_item_id("rs"),
+                        "output_index": output_index,
+                        "text": "",
+                    }
+                    output_index += 1
+                    yield _send_event(
+                        openai_responses_types.ResponseOutputItemAddedEvent(
+                            type="response.output_item.added",
+                            sequence_number=-1,
+                            output_index=reasoning_state["output_index"],
+                            item=openai_responses_types.ResponseReasoningItem(
+                                type="reasoning",
+                                id=reasoning_state["item_id"],
+                                summary=[],
+                                status="in_progress",
+                            ),
+                        )
+                    )
+                reasoning_state["text"] += delta.reasoning_content
+                yield _send_event(
+                    openai_responses_types.ResponseReasoningTextDeltaEvent(
+                        type="response.reasoning_text.delta",
+                        item_id=reasoning_state["item_id"],
+                        output_index=reasoning_state["output_index"],
+                        content_index=0,
+                        delta=delta.reasoning_content,
+                        sequence_number=-1,
+                    )
+                )
+
+            if delta.content:
+                if text_state is None:
+                    text_state = {
+                        "item_id": _allocate_item_id("msg"),
+                        "output_index": output_index,
+                        "text": "",
+                    }
+                    output_index += 1
+                    yield _send_event(
+                        openai_responses_types.ResponseOutputItemAddedEvent(
+                            type="response.output_item.added",
+                            sequence_number=-1,
+                            output_index=text_state["output_index"],
+                            item=openai_responses_types.ResponseOutputMessage(
+                                id=text_state["item_id"],
+                                type="message",
+                                role="assistant",
+                                content=[],
+                                status="in_progress",
+                            ),
+                        )
+                    )
+                    yield _send_event(
+                        openai_responses_types.ResponseContentPartAddedEvent(
+                            type="response.content_part.added",
+                            sequence_number=-1,
+                            output_index=text_state["output_index"],
+                            item_id=text_state["item_id"],
+                            content_index=0,
+                            part=openai_responses_types.ResponseOutputText(
+                                type="output_text",
+                                text="",
+                                annotations=[],
+                                logprobs=None,
+                            ),
+                        )
+                    )
+                text_state["text"] += delta.content
+                yield _send_event(
+                    openai_responses_types.ResponseTextDeltaEvent(
+                        type="response.output_text.delta",
+                        sequence_number=-1,
+                        content_index=0,
+                        output_index=text_state["output_index"],
+                        item_id=text_state["item_id"],
+                        delta=delta.content,
+                        logprobs=[],
+                    )
+                )
+
+            for tool_call in delta.tool_calls or []:
+                tool_index = tool_call.index or 0
+                if tool_index not in tool_states:
+                    tool_states[tool_index] = {
+                        "item_id": _allocate_item_id("fc"),
+                        "output_index": output_index,
+                        "call_id": None,
+                        "name": None,
+                        "arguments": "",
+                    }
+                    output_index += 1
+                state = tool_states[tool_index]
+                if tool_call.id:
+                    state["call_id"] = tool_call.id
+                if tool_call.function.name:
+                    state["name"] = tool_call.function.name
+                if tool_call.function.arguments:
+                    state["arguments"] += tool_call.function.arguments
+
+            if choice.finish_reason is not None:
+                for event in _finalize_reasoning():
+                    yield event
+                for event in _finalize_tools():
+                    yield event
+                for event in _finalize_text():
+                    yield event
+
+        for event in _finalize_reasoning():
+            yield event
+        for event in _finalize_tools():
+            yield event
+        for event in _finalize_text():
+            yield event
+
+        output = [item for _, item in sorted(completed_items, key=lambda item: item[0])]
+        final_response = ResponsesResponse.from_request(
+            request,
+            adapted_request.sampling_params,
+            model_name=final_model_name,
+            created_time=created_time,
+            output=output,
+            status="completed",
+            usage=final_usage,
+        )
+
+        history = [message.model_dump() for message in chat_request.messages]
+        if output:
+            assistant_message: dict[str, Any] = {"role": "assistant", "content": None}
+            for item in output:
+                if isinstance(item, ResponseReasoningItem):
+                    if item.content:
+                        assistant_message["reasoning_content"] = item.content[0].text
+                elif isinstance(item, ResponseOutputMessage):
+                    if item.content:
+                        assistant_message["content"] = item.content[0].text
+                elif isinstance(item, ResponseFunctionToolCall):
+                    assistant_message.setdefault("tool_calls", []).append(
+                        {
+                            "id": item.call_id,
+                            "type": "function",
+                            "function": {
+                                "name": item.name,
+                                "arguments": item.arguments,
+                            },
+                        }
+                    )
+            history.append(assistant_message)
+
+        if request.store:
+            async with self.response_store_lock:
+                self.response_store[final_response.id] = final_response
+            self.msg_store[final_response.id] = history
+
+        response_dict = final_response.model_dump()
+        if response_dict.get("usage"):
+            usage_info = response_dict["usage"]
+            response_dict["usage"] = {
+                "input_tokens": usage_info.get("prompt_tokens", 0),
+                "input_tokens_details": {
+                    "cached_tokens": (
+                        usage_info.get("prompt_tokens_details", {}).get(
+                            "cached_tokens", 0
+                        )
+                        if isinstance(usage_info.get("prompt_tokens_details"), dict)
+                        else 0
+                    )
+                },
+                "output_tokens": usage_info.get("completion_tokens", 0),
+                "output_tokens_details": {
+                    "reasoning_tokens": usage_info.get("reasoning_tokens", 0)
+                },
+                "total_tokens": usage_info.get("total_tokens", 0),
+            }
+
+        yield _send_event(
+            openai_responses_types.ResponseCompletedEvent(
+                type="response.completed",
+                sequence_number=-1,
+                response=response_dict,
+            )
+        )
+
     async def create_responses(
         self,
         request: ResponsesRequest,
@@ -182,6 +1036,11 @@ class OpenAIServingResponses(OpenAIServingChat):
                 return self._make_not_found_error(prev_response_id)
         else:
             prev_response = None
+
+        if not self.use_harmony:
+            return await self._create_non_harmony_response(
+                request, prev_response, raw_request
+            )
 
         try:
             model_name = request.model
@@ -624,7 +1483,10 @@ class OpenAIServingResponses(OpenAIServingChat):
         if isinstance(request.input, str):
             messages.append({"role": "user", "content": request.input})
         else:
-            messages.extend(request.input)  # type: ignore
+            for response_msg in request.input:
+                messages.extend(
+                    self._response_input_item_to_chat_messages(response_msg)
+                )
         return messages
 
     def _construct_input_messages_with_harmony(
@@ -698,8 +1560,10 @@ class OpenAIServingResponses(OpenAIServingChat):
                 prev_outputs = []
             for response_msg in request.input:
                 messages.append(parse_response_input(response_msg, prev_outputs))
-                if isinstance(response_msg, ResponseFunctionToolCall):
-                    prev_outputs.append(response_msg)
+                if isinstance(response_msg, ResponseInputFunctionCallItem):
+                    prev_outputs.append(
+                        self._response_function_call_item_to_output(response_msg)
+                    )
         return messages
 
     async def _run_background_request(

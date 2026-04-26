@@ -58,6 +58,7 @@ from fastapi import (
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
+from pydantic import ValidationError
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
@@ -1666,7 +1667,20 @@ async def v1_score_request(request: ScoringRequest, raw_request: Request):
 async def v1_responses_request(request: dict, raw_request: Request):
     """Endpoint for the responses API with reasoning support."""
 
-    request_obj = ResponsesRequest(**request)
+    try:
+        request_obj = ResponsesRequest(**request)
+    except ValidationError as e:
+        return ORJSONResponse(
+            status_code=400,
+            content={
+                "error": {
+                    "message": str(e),
+                    "type": "invalid_request_error",
+                    "param": None,
+                    "code": 400,
+                }
+            },
+        )
     result = await raw_request.app.state.openai_serving_responses.create_responses(
         request_obj, raw_request
     )
