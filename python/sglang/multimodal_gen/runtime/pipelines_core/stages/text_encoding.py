@@ -8,6 +8,8 @@ This module contains implementations of prompt encoding stages for diffusion pip
 """
 
 import inspect
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -26,6 +28,15 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class TextEncodingFingerprint:
+    prompt: Any
+    negative_prompt: Any
+    do_classifier_free_guidance: bool
+    prompt_template: Any
+    max_sequence_length: int | None
 
 
 class TextEncodingStage(PipelineStage):
@@ -116,35 +127,37 @@ class TextEncodingStage(PipelineStage):
             batches, server_args, self._copy_text_outputs
         )
 
-    def get_dedup_key(self, batch: Req, server_args: ServerArgs):
-        return (
-            self._freeze_for_dedup_key(batch.prompt),
-            self._freeze_for_dedup_key(batch.negative_prompt),
-            bool(batch.do_classifier_free_guidance),
-            self._freeze_for_dedup_key(batch.prompt_template),
-            batch.max_sequence_length,
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> TextEncodingFingerprint:
+        return TextEncodingFingerprint(
+            prompt=self.freeze_for_dedup(batch.prompt),
+            negative_prompt=self.freeze_for_dedup(batch.negative_prompt),
+            do_classifier_free_guidance=bool(batch.do_classifier_free_guidance),
+            prompt_template=self.freeze_for_dedup(batch.prompt_template),
+            max_sequence_length=batch.max_sequence_length,
         )
 
     @staticmethod
     def _copy_text_outputs(src: Req, dst: Req) -> None:
-        dst.prompt_embeds = list(src.prompt_embeds)
+        dst.prompt_embeds = PipelineStage.copy_stage_output(src.prompt_embeds)
         dst.negative_prompt_embeds = (
-            list(src.negative_prompt_embeds)
+            PipelineStage.copy_stage_output(src.negative_prompt_embeds)
             if src.negative_prompt_embeds is not None
             else None
         )
         dst.prompt_attention_mask = (
-            list(src.prompt_attention_mask)
+            PipelineStage.copy_stage_output(src.prompt_attention_mask)
             if src.prompt_attention_mask is not None
             else None
         )
         dst.negative_attention_mask = (
-            list(src.negative_attention_mask)
+            PipelineStage.copy_stage_output(src.negative_attention_mask)
             if src.negative_attention_mask is not None
             else None
         )
-        dst.pooled_embeds = list(src.pooled_embeds)
-        dst.neg_pooled_embeds = list(src.neg_pooled_embeds)
+        dst.pooled_embeds = PipelineStage.copy_stage_output(src.pooled_embeds)
+        dst.neg_pooled_embeds = PipelineStage.copy_stage_output(src.neg_pooled_embeds)
         dst.clip_embedding_pos = src.clip_embedding_pos
         dst.clip_embedding_neg = src.clip_embedding_neg
         dst.is_prompt_processed = src.is_prompt_processed

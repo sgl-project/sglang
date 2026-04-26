@@ -233,35 +233,42 @@ class PipelineStage(ABC):
         not override this method keep exactly the same behavior as before.
 
         Stage overrides decide their own reuse granularity. A simple stage may
-        group by a single full-stage key, compute once, then copy or split the
-        stage-local outputs back to every request. A mixed stage may instead
-        reuse only one subprocess, such as positive prompt encoding, while
-        still running another subprocess per request. Overrides must preserve
-        input order and return one result per input request.
+        group by a single full-stage fingerprint, compute once, then copy or
+        split the stage-local outputs back to every request. A mixed stage may
+        instead reuse only one subprocess, such as positive prompt encoding,
+        while still running another subprocess per request. Overrides must
+        preserve input order and return one result per input request.
 
-        ``get_dedup_key`` and ``_group_requests_by_dedup_key`` are convenience
-        helpers for the full-stage case. They are not required for stages that
-        need finer internal grouping.
+        ``build_dedup_fingerprint`` and ``run_deduplicated_group`` are the
+        helpers for the full-stage case. They are intentionally small: they
+        define the grouping contract, but the stage still owns the semantic
+        decision of what is equivalent and how its outputs should be copied.
 
         This hook is deliberately not a global cache: deduplication is local to
-        the current stage and current group. A dedup key must only contain
-        fields that can change this stage's outputs. Request metadata such as
-        request id, output path, or seed should be excluded unless this stage
-        actually reads it.
+        the current stage and current group. A dedup fingerprint must only
+        contain fields that can change this stage's outputs. Request metadata
+        such as request id, output path, or seed should be excluded unless this
+        stage actually reads it.
         """
         return [self(batch, server_args) for batch in batches]
 
-    def get_dedup_key(self, batch: Req, server_args: ServerArgs) -> Any:
-        """Return the stage-local equivalence key for grouped execution.
+    def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs) -> Any:
+        """Return this stage's semantic input fingerprint for grouped dedup.
 
-        The key describes the inputs that determine this stage's complete
-        output. Stages that do not implement full-stage grouped dedup can ignore
-        this method; the default key is unique per request, which means "never
-        merge by key".
+        A fingerprint is not a request identity and not a cache key shared
+        across stages. It is the stage-local set of input values that fully
+        determines the outputs this stage writes. Two requests may share a
+        fingerprint only when this stage would produce equivalent outputs for
+        both of them.
 
-        When overriding, include every field that can affect this stage and
-        exclude fields that only matter to other stages. For tensor or nested
-        values, use ``_freeze_for_dedup_key`` so the key is hashable.
+        The default fingerprint is unique per request, so stages opt into
+        deduplication explicitly. Overrides should prefer a named frozen
+        dataclass whose field names document the stage inputs. Include every
+        request/config field read by this stage, and exclude fields that only
+        matter to later stages, such as output path. If this stage reads seed or
+        mutable inputs, include them or disable dedup for that request. Use
+        ``freeze_for_dedup`` for tensors and nested containers so the
+        fingerprint remains hashable and deterministic.
         """
         return id(batch)
 
@@ -271,20 +278,30 @@ class PipelineStage(ABC):
         server_args: ServerArgs,
         copy_outputs,
     ) -> list[Req]:
-        """Run equivalent requests once and copy stage outputs to duplicates.
+        """Run full-stage-equivalent requests once and fan out stage outputs.
 
-        This helper covers the common full-stage dedup pattern used by many
-        stages: group requests by ``get_dedup_key``, execute the first request in
-        each group through the normal ``self(batch, server_args)`` path, then let
-        ``copy_outputs(src, dst)`` transfer only this stage's outputs to the
-        remaining requests. Stages with partial subprocess reuse should override
-        ``run_grouped_requests`` directly instead of forcing their logic through
-        this full-stage helper.
+        This helper is for the common case where the whole stage is reusable for
+        a group of requests. It groups requests by
+        ``build_dedup_fingerprint()``, executes only the first request in each
+        group through the normal ``self(batch, server_args)`` path, and calls
+        ``copy_outputs(src, dst)`` to transfer this stage's outputs to the
+        remaining requests.
+
+        The helper intentionally does not know which ``Req`` fields belong to a
+        stage. ``copy_outputs`` is stage-specific and must copy only the fields
+        written by this stage; unrelated request metadata should stay on the
+        destination request. The result list preserves input order and contains
+        one ``Req`` per input request.
+
+        Do not force partial reuse through this helper. If only a subprocess is
+        reusable, such as one text-encoder branch but not the whole stage,
+        override ``run_grouped_requests`` and do the finer-grained grouping
+        inside that stage.
         """
         results: list[Req | None] = [None] * len(batches)
 
-        for _, group in self._group_requests_by_dedup_key(
-            batches, lambda batch: self.get_dedup_key(batch, server_args)
+        for _, group in self._group_requests_by_fingerprint(
+            batches, lambda batch: self.build_dedup_fingerprint(batch, server_args)
         ):
             first_index, first_batch = group[0]
             first_result = self(first_batch, server_args)
@@ -297,24 +314,56 @@ class PipelineStage(ABC):
         return [result for result in results if result is not None]
 
     @classmethod
-    def copy_stage_value(cls, value):
-        """Copy a reusable stage output while preserving tensor ownership."""
+    def copy_stage_output(cls, value):
+        """Copy a reusable output with the default low-overhead ownership model.
+
+        The default is a shallow container copy: lists/tuples/dicts get a new
+        container, while tensor objects inside are shared by reference. This is
+        deliberate. Most shared stage outputs, such as prompt embeddings, are
+        read-only after the stage, and cloning every tensor would add GPU memory
+        traffic that can erase the benefit of deduplication.
+
+        Use ``clone_tensor_tree`` instead for outputs that downstream code may
+        mutate in-place or whose object identity carries request-local state.
+        Scheduler runtimes are a separate case and should be deep-copied by the
+        stage-specific copy function when isolation is required.
+        """
+        if isinstance(value, list):
+            return list(value)
+        if isinstance(value, tuple):
+            return tuple(value)
+        if isinstance(value, dict):
+            return dict(value)
+        return value
+
+    @classmethod
+    def clone_tensor_tree(cls, value):
+        """Recursively clone tensors in a small output tree.
+
+        This is intentionally opt-in. It is appropriate for outputs like custom
+        timestep tensors or sigma lists that should not share mutable tensor
+        storage across duplicated requests. It should not be used as the default
+        copier for large embedding trees unless a stage has a concrete
+        mutation/ownership requirement.
+        """
         if isinstance(value, torch.Tensor):
             return value.clone()
         if isinstance(value, list):
-            return [cls.copy_stage_value(item) for item in value]
+            return [cls.clone_tensor_tree(item) for item in value]
         if isinstance(value, tuple):
-            return tuple(cls.copy_stage_value(item) for item in value)
+            return tuple(cls.clone_tensor_tree(item) for item in value)
+        if isinstance(value, dict):
+            return {key: cls.clone_tensor_tree(item) for key, item in value.items()}
         return value
 
     @staticmethod
-    def _freeze_for_dedup_key(value: Any) -> Any:
-        """Convert common nested values into a hashable dedup-key fragment.
+    def freeze_for_dedup(value: Any) -> Any:
+        """Convert common nested values into a hashable fingerprint fragment.
 
         Small tensors include their values so scheduler/timestep overrides can
         distinguish user-provided tensors. Larger tensors include shape, dtype,
-        and device only; they should not normally be part of a dedup key unless
-        the stage has a stronger equivalence guarantee.
+        and device only; they should not normally be part of a fingerprint
+        unless the stage has a stronger equivalence guarantee.
         """
         if isinstance(value, torch.Tensor):
             if value.numel() <= 256:
@@ -328,34 +377,40 @@ class PipelineStage(ABC):
         if isinstance(value, dict):
             return tuple(
                 sorted(
-                    (key, PipelineStage._freeze_for_dedup_key(item))
+                    (key, PipelineStage.freeze_for_dedup(item))
                     for key, item in value.items()
                 )
             )
         if isinstance(value, (list, tuple)):
-            return tuple(PipelineStage._freeze_for_dedup_key(item) for item in value)
+            return tuple(PipelineStage.freeze_for_dedup(item) for item in value)
         if isinstance(value, set):
             return tuple(
-                sorted(PipelineStage._freeze_for_dedup_key(item) for item in value)
+                sorted(PipelineStage.freeze_for_dedup(item) for item in value)
             )
         return value
 
     @staticmethod
-    def _group_requests_by_dedup_key(
+    def _group_requests_by_fingerprint(
         batches: list[Req],
-        key_fn,
+        fingerprint_fn,
     ) -> list[tuple[Any, list[tuple[int, Req]]]]:
-        """Group requests by a stage-local dedup key while preserving order.
+        """Group requests by a stage-local fingerprint while preserving order.
 
-        The return value is ``[(key, [(original_index, req), ...]), ...]``.
-        Group order follows the first appearance of each key, and requests
-        inside a group keep their original relative order. Callers can fill a
-        result list by ``original_index`` to preserve input/output ordering.
+        The return value is
+        ``[(fingerprint, [(original_index, req), ...]), ...]``. Group order
+        follows the first appearance of each fingerprint, and requests inside a
+        group keep their original relative order. Callers can fill a result
+        list by ``original_index`` to preserve input/output ordering.
+
+        This helper is deliberately private to the stage layer. It does not
+        choose the fingerprint, does not execute a stage, and does not copy
+        outputs; it only provides the stable ordering behavior shared by
+        full-stage dedup and finer-grained stage-local reuse.
         """
         groups: dict[Any, list[tuple[int, Req]]] = {}
         for index, batch in enumerate(batches):
-            key = key_fn(batch)
-            groups.setdefault(key, []).append((index, batch))
+            fingerprint = fingerprint_fn(batch)
+            groups.setdefault(fingerprint, []).append((index, batch))
         return list(groups.items())
 
     @abstractmethod

@@ -8,6 +8,8 @@ This module contains implementations of image encoding stages for diffusion pipe
 """
 
 import inspect
+from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import PIL
@@ -43,23 +45,65 @@ from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 logger = init_logger(__name__)
 
 
-def _image_value_dedup_key(value):
+@dataclass(frozen=True)
+class ImageEncodingFingerprint:
+    image_source: Any
+    prompt: Any
+    negative_prompt: Any
+    do_classifier_free_guidance: bool
+    height: int | None
+    width: int | None
+    num_frames: int | None
+
+
+@dataclass(frozen=True)
+class LTX2ImageEncodingFingerprint:
+    image_source: Any
+    height: int | None
+    width: int | None
+    num_frames: int | None
+    latent_dtype: str
+    condition_encoder_subdir: str
+    encode_sample_mode: str
+
+
+@dataclass(frozen=True)
+class ImageVAEEncodingFingerprint:
+    image_source: Any
+    height: int | None
+    width: int | None
+    num_frames: int | None
+    encode_sample_mode: str
+    vae_precision: Any
+    vae_tiling: bool
+
+
+def _freeze_image_source_value(value):
+    """Build a hashable identity fragment for image inputs.
+
+    Image inputs are often PIL/numpy/tensor objects. For file paths we can use
+    the path value; for in-memory objects we only dedup when the exact same
+    object instance is shared by multiple requests. This avoids expensive image
+    hashing and avoids treating two mutable image objects as equivalent just
+    because they currently have the same shape.
+    """
     if isinstance(value, (list, tuple)):
-        return tuple(_image_value_dedup_key(item) for item in value)
+        return tuple(_freeze_image_source_value(item) for item in value)
     if isinstance(value, (str, int, float, bool, type(None))):
         return value
     return ("object", id(value))
 
 
-def _image_source_dedup_key(batch: Req, *, prefer_vae_image: bool = False):
+def _build_image_source_fingerprint(batch: Req, *, prefer_vae_image: bool = False):
+    """Return the image input fragment used by image encoding fingerprints."""
     if batch.image_path is not None:
-        return ("path", PipelineStage._freeze_for_dedup_key(batch.image_path))
+        return ("path", PipelineStage.freeze_for_dedup(batch.image_path))
     image = (
         batch.vae_image if prefer_vae_image and batch.vae_image is not None else None
     )
     if image is None:
         image = batch.condition_image
-    return ("image", _image_value_dedup_key(image))
+    return ("image", _freeze_image_source_value(image))
 
 
 class ImageEncodingStage(PipelineStage):
@@ -236,23 +280,25 @@ class ImageEncodingStage(PipelineStage):
             batches, server_args, self._copy_image_encoding_outputs
         )
 
-    def get_dedup_key(self, batch: Req, server_args: ServerArgs):
-        return (
-            _image_source_dedup_key(batch),
-            self._freeze_for_dedup_key(batch.prompt),
-            self._freeze_for_dedup_key(batch.negative_prompt),
-            bool(batch.do_classifier_free_guidance),
-            batch.height,
-            batch.width,
-            batch.num_frames,
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> ImageEncodingFingerprint:
+        return ImageEncodingFingerprint(
+            image_source=_build_image_source_fingerprint(batch),
+            prompt=self.freeze_for_dedup(batch.prompt),
+            negative_prompt=self.freeze_for_dedup(batch.negative_prompt),
+            do_classifier_free_guidance=bool(batch.do_classifier_free_guidance),
+            height=batch.height,
+            width=batch.width,
+            num_frames=batch.num_frames,
         )
 
     @staticmethod
     def _copy_image_encoding_outputs(src: Req, dst: Req) -> None:
-        dst.image_embeds = list(src.image_embeds)
-        dst.prompt_embeds = list(src.prompt_embeds)
+        dst.image_embeds = PipelineStage.copy_stage_output(src.image_embeds)
+        dst.prompt_embeds = PipelineStage.copy_stage_output(src.prompt_embeds)
         dst.negative_prompt_embeds = (
-            list(src.negative_prompt_embeds)
+            PipelineStage.copy_stage_output(src.negative_prompt_embeds)
             if src.negative_prompt_embeds is not None
             else None
         )
@@ -616,7 +662,9 @@ class LTX2ImageEncodingStage(PipelineStage):
             batches, server_args, self._copy_ltx2_outputs
         )
 
-    def get_dedup_key(self, batch: Req, server_args: ServerArgs):
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> LTX2ImageEncodingFingerprint | int:
         if batch.image_path is None or batch.image_latent is not None:
             return id(batch)
 
@@ -627,14 +675,14 @@ class LTX2ImageEncodingStage(PipelineStage):
             return id(batch)
 
         latent_dtype = batch.latents.dtype if batch.latents is not None else None
-        return (
-            _image_source_dedup_key(batch),
-            batch.height,
-            batch.width,
-            batch.num_frames,
-            str(latent_dtype),
-            encoder_subdir,
-            sample_mode,
+        return LTX2ImageEncodingFingerprint(
+            image_source=_build_image_source_fingerprint(batch),
+            height=batch.height,
+            width=batch.width,
+            num_frames=batch.num_frames,
+            latent_dtype=str(latent_dtype),
+            condition_encoder_subdir=encoder_subdir,
+            encode_sample_mode=sample_mode,
         )
 
     @staticmethod
@@ -804,7 +852,9 @@ class ImageVAEEncodingStage(PipelineStage):
             batches, server_args, self._copy_image_vae_outputs
         )
 
-    def get_dedup_key(self, batch: Req, server_args: ServerArgs):
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> ImageVAEEncodingFingerprint | int:
         if batch.condition_image is None:
             return id(batch)
 
@@ -812,14 +862,14 @@ class ImageVAEEncodingStage(PipelineStage):
         if sample_mode == "sample":
             return id(batch)
 
-        return (
-            _image_source_dedup_key(batch, prefer_vae_image=True),
-            batch.height,
-            batch.width,
-            batch.num_frames,
-            sample_mode,
-            server_args.pipeline_config.vae_precision,
-            bool(server_args.pipeline_config.vae_tiling),
+        return ImageVAEEncodingFingerprint(
+            image_source=_build_image_source_fingerprint(batch, prefer_vae_image=True),
+            height=batch.height,
+            width=batch.width,
+            num_frames=batch.num_frames,
+            encode_sample_mode=sample_mode,
+            vae_precision=server_args.pipeline_config.vae_precision,
+            vae_tiling=bool(server_args.pipeline_config.vae_tiling),
         )
 
     @staticmethod
@@ -827,7 +877,9 @@ class ImageVAEEncodingStage(PipelineStage):
         dst.image_latent = src.image_latent
         dst.condition_image_latent_ids = src.condition_image_latent_ids
         dst.vae_image_sizes = (
-            list(src.vae_image_sizes) if src.vae_image_sizes is not None else None
+            PipelineStage.copy_stage_output(src.vae_image_sizes)
+            if src.vae_image_sizes is not None
+            else None
         )
 
     def retrieve_latents(

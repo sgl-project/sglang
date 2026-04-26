@@ -5,6 +5,9 @@
 Latent preparation stage for diffusion pipelines.
 """
 
+from dataclasses import dataclass
+from typing import Any
+
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
@@ -23,6 +26,16 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class LatentPreparationFingerprint:
+    height: int | None
+    width: int | None
+    num_frames: int | None
+    latent_num_frames: int | None
+    prompt_dtype: Any
+    generator_device: str | None
 
 
 class LatentPreparationStage(PipelineStage):
@@ -121,10 +134,20 @@ class LatentPreparationStage(PipelineStage):
         batches: list[Req],
         server_args: ServerArgs,
     ) -> list[Req]:
+        """Group only the deterministic latent-preparation subprocess.
+
+        Latent preparation is not a pure full-stage copy: each request still
+        owns its RNG stream, so raw noise must be drawn once per request with
+        that request's generator. The reusable part is the deterministic work
+        after raw noise generation, such as packing latent tokens and applying
+        scheduler scaling. For that reason this stage uses the common
+        fingerprint grouping helper but implements its own grouped execution
+        instead of ``run_deduplicated_group``.
+        """
         results: list[Req | None] = [None] * len(batches)
 
-        for _, group in self._group_requests_by_dedup_key(
-            batches, lambda batch: self.get_dedup_key(batch, server_args)
+        for _, group in self._group_requests_by_fingerprint(
+            batches, lambda batch: self.build_dedup_fingerprint(batch, server_args)
         ):
             indexed_batches = group
             group_batches = [batch for _, batch in indexed_batches]
@@ -144,20 +167,22 @@ class LatentPreparationStage(PipelineStage):
 
         return [result for result in results if result is not None]
 
-    def get_dedup_key(self, batch: Req, server_args: ServerArgs):
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> LatentPreparationFingerprint:
         prompt_dtype = (
             batch.prompt_embeds[0].dtype
             if isinstance(batch.prompt_embeds, list) and batch.prompt_embeds
             else None
         )
         latent_num_frames = self.adjust_video_length(batch, server_args)
-        return (
-            batch.height,
-            batch.width,
-            batch.num_frames,
-            latent_num_frames,
-            prompt_dtype,
-            batch.generator_device,
+        return LatentPreparationFingerprint(
+            height=batch.height,
+            width=batch.width,
+            num_frames=batch.num_frames,
+            latent_num_frames=latent_num_frames,
+            prompt_dtype=prompt_dtype,
+            generator_device=batch.generator_device,
         )
 
     @staticmethod

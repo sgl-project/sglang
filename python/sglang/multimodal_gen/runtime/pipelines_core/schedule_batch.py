@@ -128,7 +128,6 @@ class Req:
     paired_timesteps: torch.Tensor | None = None
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
-    scheduler: Any | None = None
 
     # request-local scheduler used by timestep/denoising stages.
     # This is optional because the normal worker path executes one request at a time, so it can

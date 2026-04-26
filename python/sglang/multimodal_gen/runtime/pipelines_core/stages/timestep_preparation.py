@@ -9,6 +9,7 @@ This module contains implementations of timestep preparation stages for diffusio
 
 import inspect
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Callable, Tuple
 
 import torch
@@ -32,6 +33,17 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+@dataclass(frozen=True)
+class TimestepPreparationFingerprint:
+    num_inference_steps: int
+    timesteps: Any
+    sigmas: Any
+    n_tokens: int | None
+    height: int | None
+    width: int | None
+    num_frames: int | None
 
 
 class TimestepPreparationStage(PipelineStage):
@@ -155,21 +167,23 @@ class TimestepPreparationStage(PipelineStage):
         )
 
     def _copy_timestep_outputs(self, src: Req, dst: Req) -> None:
-        dst.timesteps = self.copy_stage_value(src.timesteps)
-        dst.sigmas = self.copy_stage_value(src.sigmas)
+        dst.timesteps = self.clone_tensor_tree(src.timesteps)
+        dst.sigmas = self.clone_tensor_tree(src.sigmas)
         dst.scheduler = deepcopy(src.scheduler)
         if "mu" in src.extra:
-            dst.extra["mu"] = self.copy_stage_value(src.extra["mu"])
+            dst.extra["mu"] = self.clone_tensor_tree(src.extra["mu"])
 
-    def get_dedup_key(self, batch: Req, server_args: ServerArgs):
-        return (
-            batch.num_inference_steps,
-            self._freeze_for_dedup_key(batch.timesteps),
-            self._freeze_for_dedup_key(batch.sigmas),
-            batch.n_tokens,
-            batch.height,
-            batch.width,
-            batch.num_frames,
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> TimestepPreparationFingerprint:
+        return TimestepPreparationFingerprint(
+            num_inference_steps=batch.num_inference_steps,
+            timesteps=self.freeze_for_dedup(batch.timesteps),
+            sigmas=self.freeze_for_dedup(batch.sigmas),
+            n_tokens=batch.n_tokens,
+            height=batch.height,
+            width=batch.width,
+            num_frames=batch.num_frames,
         )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
