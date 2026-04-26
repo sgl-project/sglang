@@ -23,3 +23,6 @@ RUN pip install https://github.com/tile-ai/tilelang/releases/download/v0.1.8/til
 
 # Install hadamard transform
 RUN pip install --no-build-isolation git+https://github.com/Dao-AILab/fast-hadamard-transform.git
+
+# Install mooncake
+RUN pip install mooncake-transfer-engine-cuda13
