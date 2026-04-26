@@ -131,7 +131,7 @@ def normalize_output_seeds(
     prompt_index: int = 0,
 ) -> list[int]:
     """
-        return a list of seed with size equal to `num_outputs_per_prompt`
+    return a list of seed with size equal to `num_outputs_per_prompt`
     """
     if num_outputs_per_prompt <= 0:
         raise ValueError(
@@ -196,7 +196,7 @@ def expand_request_outputs(
     prompt_index: int = 0,
 ) -> list[Req]:
     """
-        Expand a req to a list with size equal to `num_prompts`
+    Expand a req to a list with size equal to `num_prompts`
     """
     num_outputs = int(req.num_outputs_per_prompt)
     # each req must has different seed

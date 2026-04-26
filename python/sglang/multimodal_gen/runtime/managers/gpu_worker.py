@@ -284,8 +284,8 @@ class GPUWorker:
         error_context: str,
     ) -> OutputBatch | Req:
         """
-            Args:
-                forward_fn: the actual forward function for reqs
+        Args:
+            forward_fn: the actual forward function for reqs
         """
         output_batch = None
         try:
@@ -467,9 +467,7 @@ class GPUWorker:
         """Return all metrics objects carried by an output batch."""
         if output_batch.metrics_list is not None:
             return [
-                metrics
-                for metrics in output_batch.metrics_list
-                if metrics is not None
+                metrics for metrics in output_batch.metrics_list if metrics is not None
             ]
         if output_batch.metrics is not None:
             return [output_batch.metrics]
@@ -496,7 +494,9 @@ class GPUWorker:
         )
 
     @staticmethod
-    def _merge_expanded_output_batches(output_batches: list[OutputBatch]) -> OutputBatch:
+    def _merge_expanded_output_batches(
+        output_batches: list[OutputBatch],
+    ) -> OutputBatch:
         """Merge per-output batches produced by grouped execution."""
         merged = OutputBatch()
         parts = _ExpandedOutputParts()
@@ -535,6 +535,7 @@ class GPUWorker:
     def _collect_expanded_parts(
         parts: _ExpandedOutputParts, output_batch: OutputBatch
     ) -> None:
+        """Collect expanded outputs"""
         parts.metrics_list.append(output_batch.metrics)
         if output_batch.output_file_paths:
             parts.output_file_paths.extend(output_batch.output_file_paths)
@@ -569,6 +570,9 @@ class GPUWorker:
         *,
         audio_sample_rate: int | None,
     ) -> None:
+        """
+            merge batched output
+        """
         if parts.output_file_paths:
             merged.output_file_paths = parts.output_file_paths
         if any(metrics is not None for metrics in parts.metrics_list):

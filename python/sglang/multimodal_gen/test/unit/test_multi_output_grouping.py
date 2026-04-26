@@ -54,9 +54,9 @@ class CountingLatentStage(LatentPreparationStage):
     ) -> Req:
         self.prepare_group_calls += 1
         first_batch = batches[0]
-        first_batch.latents = torch.arange(
-            len(batches), dtype=torch.float32
-        ).reshape(len(batches), 1, 1)
+        first_batch.latents = torch.arange(len(batches), dtype=torch.float32).reshape(
+            len(batches), 1, 1
+        )
         first_batch.latent_ids = first_batch.latents + 10
         first_batch.raw_latent_shape = first_batch.latents.shape
         return first_batch

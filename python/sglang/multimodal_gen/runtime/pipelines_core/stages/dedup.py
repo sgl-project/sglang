@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from typing import Any, ClassVar, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import torch
 

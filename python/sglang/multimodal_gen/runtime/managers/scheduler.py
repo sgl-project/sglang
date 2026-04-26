@@ -232,9 +232,7 @@ class Scheduler(SchedulerDisaggMixin):
             self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
 
     def get_next_batch_to_run(self) -> list[tuple[bytes, Any]] | None:
-        """pull a req from waiting_queue
-
-        """
+        """pull a req from waiting_queue"""
         if not self.waiting_queue:
             return None
 
