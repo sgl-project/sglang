@@ -406,9 +406,13 @@ def handle_rerun_stage(
         if kernel_changes and not is_amd_stage:
             inputs["include_wheel_build"] = "true"
             # include_wheel_build relies on filter-api detecting kernel changes, which
-            # requires pr_head_sha. Ensure it's set even for non-fork PRs.
+            # requires pr_head_sha. Ensure it's set even for non-fork PRs, and keep
+            # the local pr_head_sha in sync so find_workflow_run_url builds the
+            # expected display_title with the SHA suffix (the workflow's run-name
+            # includes the SHA whenever inputs.pr_head_sha is set).
             if not is_fork:
                 inputs["pr_head_sha"] = pr.head.sha
+                pr_head_sha = pr.head.sha
 
         # Record dispatch time before triggering
         dispatch_time = time.time()
