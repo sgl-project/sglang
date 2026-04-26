@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-DEFAULT_SEED = 1024
+DEFAULT_SEED = None
 VERTEX_ROUTE = os.environ.get("AIP_PREDICT_ROUTE", "/vertex_generate")
 
 
