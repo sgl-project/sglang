@@ -15,7 +15,10 @@ if _is_cuda or _is_hip:
 
 
 def moe_align_block_size(
-    topk_ids: torch.Tensor, block_size: int, num_experts: int
+    topk_ids: torch.Tensor,
+    block_size: int,
+    num_experts: int,
+    ignore_invalid_expert: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Aligns the token distribution across experts to be compatible with block
@@ -81,5 +84,6 @@ def moe_align_block_size(
         num_tokens_post_pad,
         cumsum_buffer,
         True,
+        ignore_invalid_expert,
     )
     return sorted_ids, expert_ids, num_tokens_post_pad

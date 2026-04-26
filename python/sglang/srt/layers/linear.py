@@ -66,6 +66,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "IPEXAWQLinearMethod",
     "PetitNvFp4LinearMethod",
     "QuarkInt4Fp8LinearMethod",
+    "HummingLinearMethod",
 ]
 
 _is_cpu = is_cpu()
@@ -209,6 +210,7 @@ class ReplicatedLinear(LinearBase):
 
         # All the linear layer supports quant method.
         assert self.quant_method is not None
+        self.with_bias = bias
         self.quant_method.create_weights(
             self,
             self.input_size,
@@ -315,6 +317,7 @@ class ColumnParallelLinear(LinearBase):
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
         )
 
+        self.with_bias = bias
         self.gather_output = gather_output
         self.use_presharded_weights = use_presharded_weights
 
@@ -502,6 +505,7 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         tp_size: Optional[int] = None,
         use_presharded_weights: bool = False,
     ):
+        self.with_bias = bias
         self.output_sizes = output_sizes
         if tp_rank is None:
             tp_rank = get_tensor_model_parallel_rank()
@@ -589,8 +593,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 # If quantized, we need to adjust the offset and size to account
                 # for the packing.
                 if packed_dim == output_dim:
-                    shard_size = shard_size // param.pack_factor
-                    shard_offset = shard_offset // param.pack_factor
+                    shard_size = round(shard_size // param.pack_factor)
+                    shard_offset = round(shard_offset // param.pack_factor)
                     # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
                         param, shard_size, shard_offset
@@ -622,8 +626,8 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             # for the packing.
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
-                shard_size = shard_size // param.pack_factor
-                shard_offset = shard_offset // param.pack_factor
+                shard_size = round(shard_size // param.pack_factor)
+                shard_offset = round(shard_offset // param.pack_factor)
                 # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
                     param, shard_size, shard_offset
@@ -825,6 +829,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         v_head_size: Optional[int] = None,
         skip_block_quant_check: bool = False,
     ):
+        self.with_bias = bias
         self.hidden_size = hidden_size
         self.head_size = head_size
         self.v_head_size = v_head_size if v_head_size is not None else head_size
@@ -1086,8 +1091,8 @@ class QKVParallelLinear(ColumnParallelLinear):
                 # If quantized, we need to adjust the offset and size to account
                 # for the packing.
                 if packed_dim == output_dim:
-                    shard_size = shard_size // param.pack_factor
-                    shard_offset = shard_offset // param.pack_factor
+                    shard_size = round(shard_size // param.pack_factor)
+                    shard_offset = round(shard_offset // param.pack_factor)
 
                     # Special case for Marlin.
                     shard_size, shard_offset = adjust_marlin_shard(
@@ -1143,8 +1148,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             # for the packing.
             packed_dim = getattr(param, "packed_dim", None)
             if packed_dim == output_dim:
-                shard_size = shard_size // param.pack_factor
-                shard_offset = shard_offset // param.pack_factor
+                shard_size = round(shard_size // param.pack_factor)
+                shard_offset = round(shard_offset // param.pack_factor)
 
                 # Special case for Marlin.
                 shard_size, shard_offset = adjust_marlin_shard(
@@ -1272,6 +1277,7 @@ class RowParallelLinear(LinearBase):
             input_size, output_size, skip_bias_add, params_dtype, quant_config, prefix
         )
 
+        self.with_bias = bias
         self.input_is_parallel = input_is_parallel
         self.reduce_results = reduce_results
 

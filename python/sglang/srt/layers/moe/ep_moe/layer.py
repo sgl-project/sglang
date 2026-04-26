@@ -101,6 +101,9 @@ class DeepEPMoE(FusedMoE):
             quant_config, Fp8Config
         ):
             self.deprecate_flag = True
+        elif quant_config is not None and quant_config.get_name() == "humming":
+            envs.SGLANG_DEEPEP_BF16_DISPATCH.set(True)
+            self.deprecate_flag = True
         else:
             self.deprecate_flag = False
 

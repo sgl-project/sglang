@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import warnings
@@ -108,6 +109,16 @@ class EnvTuple(EnvField):
 class EnvStr(EnvField):
     def parse(self, value: str) -> str:
         return value
+
+
+class EnvJSON(EnvField):
+    def parse(self, value: str | None) -> list | dict | None:
+        if not value:
+            return None
+        if os.path.exists(value):
+            with open(value) as f:
+                return json.load(f)
+        return json.loads(value)
 
 
 class EnvBool(EnvField):
@@ -306,6 +317,12 @@ class Envs:
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
     SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
+
+    # Quantization (Humming)
+    SGLANG_HUMMING_ONLINE_QUANT_CONFIG = EnvJSON(None)
+    SGLANG_HUMMING_INPUT_QUANT_CONFIG = EnvJSON(None)
+    SGLANG_HUMMING_USE_F16_ACCUM = EnvBool(False)
+    SGLANG_HUMMING_MOE_GEMM_TYPE = EnvStr("")
 
     # Flashinfer
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
