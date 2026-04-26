@@ -1,0 +1,131 @@
+name: Build and Push DeepSeek-V4 Docker Images
+
+# Builds the 4 Dockerfiles added in #23600 from the deepseek_v4 branch and
+# pushes them to Docker Hub. Each Dockerfile is single-arch and does its own
+# `git clone -b deepseek_v4` inside, so no build context source is required
+# beyond the Dockerfiles themselves and `--no-cache` is mandatory.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: "Docker Hub destination repository. Default: lmsysorg/sglang-staging (set to lmsysorg/sglang for production release)."
+        required: false
+        default: "lmsysorg/sglang-staging"
+      build_hopper:
+        description: "Build and push the Hopper (H200) image."
+        required: false
+        type: boolean
+        default: true
+      build_blackwell:
+        description: "Build and push the Blackwell (B200) image."
+        required: false
+        type: boolean
+        default: true
+      build_b300:
+        description: "Build and push the B300 image."
+        required: false
+        type: boolean
+        default: true
+      build_grace_blackwell:
+        description: "Build and push the Grace Blackwell (ARM) image."
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-docker-deepseek-v4-${{ inputs.repository }}
+  cancel-in-progress: true
+
+jobs:
+  build-matrix:
+    if: ${{ github.repository == 'sgl-project/sglang' }}
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.set.outputs.include }}
+    steps:
+      - id: set
+        env:
+          BUILD_HOPPER: ${{ inputs.build_hopper }}
+          BUILD_BLACKWELL: ${{ inputs.build_blackwell }}
+          BUILD_B300: ${{ inputs.build_b300 }}
+          BUILD_GRACE_BLACKWELL: ${{ inputs.build_grace_blackwell }}
+        run: |
+          entries=()
+          if [ "$BUILD_HOPPER" = "true" ]; then
+            entries+=('{"runner":"x64-docker-build-node","platform":"linux/amd64","dockerfile":"docker/deepseek_v4_h200.Dockerfile","tag":"deepseek-v4-hopper"}')
+          fi
+          if [ "$BUILD_BLACKWELL" = "true" ]; then
+            entries+=('{"runner":"x64-docker-build-node","platform":"linux/amd64","dockerfile":"docker/deepseek_v4_b200.Dockerfile","tag":"deepseek-v4-blackwell"}')
+          fi
+          if [ "$BUILD_B300" = "true" ]; then
+            entries+=('{"runner":"x64-docker-build-node","platform":"linux/amd64","dockerfile":"docker/deepseek_v4_b300.Dockerfile","tag":"deepseek-v4-b300"}')
+          fi
+          if [ "$BUILD_GRACE_BLACKWELL" = "true" ]; then
+            entries+=('{"runner":"arm-docker-build-node","platform":"linux/arm64","dockerfile":"docker/deepseek_v4_grace_blackwell.Dockerfile","tag":"deepseek-v4-grace-blackwell"}')
+          fi
+          if [ ${#entries[@]} -eq 0 ]; then
+            echo "::error::At least one build_* input must be true."
+            exit 1
+          fi
+          joined=$(IFS=,; echo "${entries[*]}")
+          echo "include=[${joined}]" >> "$GITHUB_OUTPUT"
+          echo "Selected matrix: [${joined}]"
+
+  build-deepseek-v4:
+    needs: build-matrix
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.build-matrix.outputs.include) }}
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout deepseek_v4 sources
+        uses: actions/checkout@v4
+        with:
+          ref: deepseek_v4
+
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          docker-images: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+
+      - name: Prune Docker to reclaim disk space
+        run: |
+          docker buildx prune --filter "until=72h" -f
+          docker system prune -af --filter "until=72h"
+          docker volume prune -af
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and Push DeepSeek-V4 image
+        run: |
+          IMAGE="${{ inputs.repository }}:${{ matrix.tag }}"
+          echo "Will push: ${IMAGE}"
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            -f ${{ matrix.dockerfile }} \
+            -t "${IMAGE}" \
+            --push \
+            --no-cache \
+            .
+          echo "Published ${IMAGE}"
