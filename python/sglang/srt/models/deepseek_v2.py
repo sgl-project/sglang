@@ -189,6 +189,7 @@ if _use_aiter:
     pass
 
 if _is_cuda:
+    from flashinfer.gemm import mm_M1_16_K6144_N256 as _raw_glm_dsa_router_gemm
     from flashinfer.gemm import mm_M1_16_K7168_N256 as _raw_dsv3_router_gemm
     from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
 elif _is_npu:
@@ -472,9 +473,10 @@ class MoEGate(nn.Module):
             logits = F.linear(hidden_states, self.weight, None)
         else:
             # NOTE: For some unknown reason, router_gemm seems degrade accept length.
+            router_gemm_max_m = 8 if _device_sm in [100, 103] else 16
             if (
                 _is_cuda
-                and hidden_states.shape[0] <= 16
+                and hidden_states.shape[0] <= router_gemm_max_m
                 and hidden_states.shape[1] == 7168
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
@@ -493,6 +495,21 @@ class MoEGate(nn.Module):
                     logits = dsv3_router_gemm(
                         hidden_states, self.weight, out_dtype=torch.float32
                     )
+
+            elif (
+                _is_cuda
+                and _device_sm in [100, 103]
+                and hidden_states.shape[0] <= 10
+                and hidden_states.shape[1] == 6144
+                and self.weight.shape[0] == 256
+            ):
+                logits = torch.empty(
+                    hidden_states.shape[0],
+                    self.weight.shape[0],
+                    device=hidden_states.device,
+                    dtype=torch.float32,
+                )
+                flashinfer_glm_dsa_router_gemm(logits, hidden_states, self.weight)
 
             elif _use_aiter:
                 logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
@@ -2757,6 +2774,24 @@ def flashinfer_dsv3_router_gemm(
     weight: torch.Tensor,
 ) -> None:
     _raw_dsv3_router_gemm(
+        hidden_states,
+        weight.t(),
+        logits,
+        launch_with_pdl=True,
+    )
+
+
+@register_custom_op(
+    op_name="flashinfer_glm_dsa_router_gemm",
+    mutates_args=[],
+    fake_impl=lambda logits, hidden_states, weight: None,
+)
+def flashinfer_glm_dsa_router_gemm(
+    logits: torch.Tensor,
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+) -> None:
+    _raw_glm_dsa_router_gemm(
         hidden_states,
         weight.t(),
         logits,
