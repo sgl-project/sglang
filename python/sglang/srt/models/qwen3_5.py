@@ -79,6 +79,7 @@ from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
 
 # Models
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models.utils import fused_qk_gemma_rmsnorm
 from sglang.srt.server_args import get_global_server_args
 
 # Utils
@@ -105,7 +106,6 @@ _is_gfx95 = is_gfx95_supported()
 _is_hip = is_hip()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_amx_available = cpu_has_amx_support()
-
 
 cached_get_processor = lru_cache(get_processor)
 
@@ -791,6 +791,15 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 k_by_head = k.reshape(-1, self.head_dim)
                 k_by_head = self.k_norm(k_by_head)
             current_stream.wait_stream(self.alt_stream)
+        elif _is_hip:
+            q_by_head, k_by_head = fused_qk_gemma_rmsnorm(
+                q,
+                k,
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.q_norm.variance_epsilon,
+                self.head_dim,
+            )
         else:
             q_by_head = q.reshape(-1, self.head_dim)
             q_by_head = self.q_norm(q_by_head)
