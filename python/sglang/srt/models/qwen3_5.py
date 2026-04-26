@@ -58,6 +58,7 @@ from sglang.srt.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -68,7 +69,10 @@ from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
@@ -964,6 +968,21 @@ class Qwen3_5ForCausalLM(nn.Module):
         else:
             self.norm = PPMissingLayer()
 
+        # Language modeling head
+        if self.pp_group.is_last_rank:
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                org_num_embeddings=config.vocab_size,
+                quant_config=quant_config,
+            )
+            if config.tie_word_embeddings:
+                self.lm_head.weight = self.embed_tokens.weight
+            self.logits_processor = LogitsProcessor(config)
+        else:
+            self.lm_head = PPMissingLayer()
+            self.logits_processor = PPMissingLayer()
+
         self.layers_to_capture = []
 
     def get_input_embeddings(self):
@@ -1050,10 +1069,17 @@ class Qwen3_5ForCausalLM(nn.Module):
             else:
                 hidden_states, _ = self.norm(hidden_states, residual)
 
-        if len(aux_hidden_states) == 0:
-            return hidden_states
+        # Process logits
+        logits_output = self.logits_processor(
+            input_ids, hidden_states, self.lm_head, forward_batch
+        )
 
-        return hidden_states, aux_hidden_states
+        if len(aux_hidden_states) > 0:
+            logits_output.hidden_states = (hidden_states, aux_hidden_states)
+        else:
+            logits_output.hidden_states = hidden_states
+
+        return logits_output
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
@@ -1072,7 +1098,12 @@ class Qwen3_5ForCausalLM(nn.Module):
 
         loaded_params: Set[str] = set()
         params_dict = dict(self.named_parameters(remove_duplicate=False))
+        logger.info(f"DEBUG Qwen3_5ForCausalLM: First 10 params_dict keys: {list(params_dict.keys())[:10]}")
+        first_weight_name = None
         for name, loaded_weight in weights:
+            if first_weight_name is None:
+                first_weight_name = name
+                logger.info(f"DEBUG Qwen3_5ForCausalLM: First checkpoint weight name: {name}")
             if "rotary_emb.inv_freq" in name:
                 continue
             if "mtp" in name:
@@ -1080,7 +1111,7 @@ class Qwen3_5ForCausalLM(nn.Module):
             if "visual" in name:
                 continue
             if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
+                name = name.replace("model.language_model.", "")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
             layer_id = get_layer_id(name)
@@ -1124,14 +1155,6 @@ class Qwen3_5ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-    @classmethod
-    def get_model_config_for_expert_location(cls, config):
-        return ModelConfigForExpertLocation(
-            num_layers=config.num_hidden_layers,
-            num_logical_experts=config.num_experts,
-            num_groups=None,
-        )
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
@@ -1223,7 +1246,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
             if "visual" in name:
                 continue
             if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
+                name = name.replace("model.language_model.", "")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
@@ -1343,6 +1366,14 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
         return loaded_params
 
+    @classmethod
+    def get_model_config_for_expert_location(cls, config):
+        return ModelConfigForExpertLocation(
+            num_layers=config.num_hidden_layers,
+            num_logical_experts=config.num_experts,
+            num_groups=None,
+        )
+
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     if _is_gfx95 or _is_npu:
@@ -1416,7 +1447,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if "mtp" in name:
                 continue
             if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
+                name = name.replace("model.language_model.", "")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
             if (
@@ -1645,7 +1676,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if "mtp" in name:
                 continue
             if "language_model" in name:
-                name = name.replace(r"model.language_model.", r"model.")
+                name = name.replace("model.language_model.", "")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
             if (
@@ -1857,4 +1888,4 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
         )
 
 
-EntryClass = [Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]
+EntryClass = [Qwen3_5ForCausalLM, Qwen3_5MoeForConditionalGeneration, Qwen3_5ForConditionalGeneration]

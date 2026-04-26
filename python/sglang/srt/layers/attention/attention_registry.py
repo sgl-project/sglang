@@ -194,11 +194,20 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
     Wrapper for special models like hybrid GDN, so we don't
     need to change the code of the original attention backend.
     """
+    logger.info(f"[DEBUG attn_backend_wrapper] Called")
+    logger.info(f"[DEBUG attn_backend_wrapper] runner.hybrid_gdn_config: {runner.hybrid_gdn_config}")
+    logger.info(f"[DEBUG attn_backend_wrapper] runner.use_mla_backend: {runner.use_mla_backend}")
+
     assert not (
         runner.hybrid_gdn_config is not None and runner.use_mla_backend
     ), "hybrid_gdn can only be used with non-MLA models."
 
-    if cfg := runner.mambaish_config:
+    logger.info(f"[DEBUG attn_backend_wrapper] About to check mambaish_config")
+    mambaish_cfg = runner.mambaish_config
+    logger.info(f"[DEBUG attn_backend_wrapper] mambaish_config result: {mambaish_cfg}")
+    logger.info(f"[DEBUG attn_backend_wrapper] mambaish_config type: {type(mambaish_cfg).__name__ if mambaish_cfg else 'None'}")
+
+    if cfg := mambaish_cfg:
         from sglang.srt.layers.attention.fla.utils import check_environments
         from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
             HybridLinearAttnBackend,
@@ -216,6 +225,8 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
         check_environments()
         initialize_linear_attn_config(runner.server_args)
+        logger.info(f"[DEBUG attn_backend_wrapper] Inside mambaish block, cfg={type(cfg).__name__}")
+        logger.info(f"[DEBUG attn_backend_wrapper] Checking runner.hybrid_gdn_config again: {runner.hybrid_gdn_config}")
         if runner.hybrid_gdn_config is not None:
             if is_blackwell():
                 assert (

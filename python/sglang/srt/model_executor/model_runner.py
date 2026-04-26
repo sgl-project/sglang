@@ -48,8 +48,15 @@ from sglang.srt.configs import (
     NemotronHConfig,
     Qwen3_5Config,
     Qwen3_5MoeConfig,
+    Qwen3_5TextConfig,
     Qwen3NextConfig,
 )
+
+# Import transformers version for isinstance checks
+try:
+    from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig as HF_Qwen3_5TextConfig
+except ImportError:
+    HF_Qwen3_5TextConfig = None
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
@@ -1944,16 +1951,90 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def hybrid_gdn_config(self):
-        config = self.model_config.hf_config.get_text_config()
-        if isinstance(
-            config,
-            Qwen3NextConfig
-            | Qwen3_5Config
-            | Qwen3_5MoeConfig
-            | JetNemotronConfig
-            | JetVLMConfig,
-        ):
+        # For text-only models, hf_config is already the text config
+        # For VLM models, need to call get_text_config()
+        if hasattr(self.model_config.hf_config, 'get_text_config'):
+            config = self.model_config.hf_config.get_text_config()
+        else:
+            config = self.model_config.hf_config
+
+        logger.info(f"[DEBUG hybrid_gdn_config] config type: {type(config).__name__}")
+        logger.info(f"[DEBUG hybrid_gdn_config] config.__class__: {config.__class__}")
+        logger.info(f"[DEBUG hybrid_gdn_config] Checking isinstance for hybrid GDN types...")
+
+        # Check both sglang and HF transformers versions of config classes
+        types_to_check = [
+            Qwen3NextConfig,
+            Qwen3_5Config,
+            Qwen3_5TextConfig,
+            Qwen3_5MoeConfig,
+            JetNemotronConfig,
+            JetVLMConfig,
+        ]
+
+        # Add HF transformers version if available
+        if HF_Qwen3_5TextConfig is not None:
+            types_to_check.append(HF_Qwen3_5TextConfig)
+
+        if isinstance(config, tuple(types_to_check)):
+            # Add missing properties for HF transformers Qwen3_5TextConfig
+            if not hasattr(config, 'full_attention_layer_ids'):
+                if hasattr(config, 'layers_block_type'):
+                    # Compute from layers_block_type
+                    config.full_attention_layer_ids = [
+                        i for i, layer_type in enumerate(config.layers_block_type)
+                        if layer_type in ('attention', 'full_attention')
+                    ]
+                    logger.info(f"[DEBUG hybrid_gdn_config] Set full_attention_layer_ids: {config.full_attention_layer_ids}")
+                elif hasattr(config, 'full_attention_interval'):
+                    # Compute from interval pattern
+                    config.full_attention_layer_ids = [
+                        i for i in range(config.num_hidden_layers)
+                        if (i + 1) % config.full_attention_interval == 0
+                    ]
+                    logger.info(f"[DEBUG hybrid_gdn_config] Set full_attention_layer_ids from interval: {config.full_attention_layer_ids}")
+
+            # Add linear_layer_ids if not present
+            if not hasattr(config, 'linear_layer_ids'):
+                if hasattr(config, 'layers_block_type'):
+                    config.linear_layer_ids = [
+                        i for i, layer_type in enumerate(config.layers_block_type)
+                        if layer_type == 'linear_attention'
+                    ]
+                    logger.info(f"[DEBUG hybrid_gdn_config] Set linear_layer_ids: {config.linear_layer_ids}")
+
+            # Add mamba2_cache_params property if not present
+            if not hasattr(config, 'mamba2_cache_params'):
+                from sglang.srt.configs.mamba_utils import (
+                    Mamba2CacheParams,
+                    Mamba2StateShape,
+                    mamba2_state_dtype,
+                )
+                from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+                def _get_mamba2_cache_params():
+                    shape = Mamba2StateShape.create(
+                        tp_world_size=get_attention_tp_size(),
+                        intermediate_size=config.linear_value_head_dim * config.linear_num_value_heads,
+                        n_groups=config.linear_num_key_heads,
+                        num_heads=config.linear_num_value_heads,
+                        head_dim=config.linear_value_head_dim,
+                        state_size=config.linear_key_head_dim,
+                        conv_kernel=config.linear_conv_kernel_dim,
+                    )
+                    return Mamba2CacheParams(
+                        shape=shape,
+                        layers=config.linear_layer_ids,
+                        dtype=mamba2_state_dtype(config)
+                    )
+
+                # Add as a property
+                type(config).mamba2_cache_params = property(lambda self: _get_mamba2_cache_params())
+                logger.info(f"[DEBUG hybrid_gdn_config] Added mamba2_cache_params property")
+
+            logger.info(f"[DEBUG hybrid_gdn_config] Returning config: {config}")
             return config
+        logger.info(f"[DEBUG hybrid_gdn_config] No match, returning None")
         return None
 
     @property
@@ -2018,6 +2099,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
     @property
     def mambaish_config(self):
+        logger.info(f"[DEBUG mambaish_config] Called")
+        logger.info(f"[DEBUG mambaish_config] mamba2_config: {self.mamba2_config}")
+        logger.info(f"[DEBUG mambaish_config] hybrid_gdn_config: {self.hybrid_gdn_config}")
+        logger.info(f"[DEBUG mambaish_config] kimi_linear_config: {self.kimi_linear_config}")
+        logger.info(f"[DEBUG mambaish_config] hybrid_lightning_config: {self.hybrid_lightning_config}")
+
         existing = (
             self.mamba2_config
             or self.hybrid_gdn_config
@@ -2025,8 +2112,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             or self.hybrid_lightning_config
         )
         if existing:
+            logger.info(f"[DEBUG mambaish_config] Returning existing: {type(existing).__name__}")
             return existing
         result = self._get_linear_attn_registry_result()
+        logger.info(f"[DEBUG mambaish_config] Registry result: {result}")
         return result[1] if result else None
 
     def configure_kv_cache_dtype(self):

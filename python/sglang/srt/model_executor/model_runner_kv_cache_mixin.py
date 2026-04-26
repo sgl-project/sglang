@@ -64,7 +64,8 @@ class ModelRunnerKVCacheMixin:
         rest_memory = post_model_load_memory - pre_model_load_memory * (
             1 - self.mem_fraction_static
         )
-        if self.mambaish_config is not None:
+        # Call handle_max_mamba_cache for models with mamba state (Mamba2 and hybrid GDN)
+        if self.mamba2_config is not None or self.hybrid_gdn_config is not None:
             rest_memory = self.handle_max_mamba_cache(rest_memory)
 
         return int(rest_memory * (1 << 30))  # return in bytes
@@ -246,7 +247,7 @@ class ModelRunnerKVCacheMixin:
                         enable_memory_saver=self.server_args.enable_memory_saver,
                         pre_alloc_size=pre_alloc_size,
                     )
-            elif config := self.mambaish_config:
+            elif config := (self.mamba2_config or self.hybrid_gdn_config):
                 self.req_to_token_pool = HybridReqToTokenPool(
                     size=max_num_reqs,
                     mamba_size=self.server_args.max_mamba_cache_size,
@@ -493,7 +494,7 @@ class ModelRunnerKVCacheMixin:
                     device=self.device,
                     **kwargs,
                 )
-            elif config := self.mambaish_config:
+            elif config := (self.mamba2_config or self.hybrid_gdn_config):
                 extra_args = {}
                 if self.use_mla_backend:
                     extra_args = {
@@ -708,7 +709,8 @@ class ModelRunnerKVCacheMixin:
         else:
             max_num_reqs = min(estimated, token_capacity // 2)
 
-        if self.mambaish_config is not None:
+        # Apply mamba cache size limitation for models with mamba state
+        if self.mamba2_config is not None or self.hybrid_gdn_config is not None:
             ratio = self._calculate_mamba_ratio()
             max_num_reqs = min(
                 max_num_reqs, self.server_args.max_mamba_cache_size // ratio
