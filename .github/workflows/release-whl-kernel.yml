@@ -50,6 +50,15 @@ jobs:
             runner: arm-kernel-build-node
     runs-on: ${{ matrix.runner }}
     steps:
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
+      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
+      # container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
@@ -149,6 +158,15 @@ jobs:
             runner: arm-kernel-build-node
     runs-on: ${{ matrix.runner }}
     steps:
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
+      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
+      # container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
@@ -235,6 +253,15 @@ jobs:
         python-version: ["3.10"]
         rocm-version: ["700", "720"]
     steps:
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
+      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
+      # container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
@@ -370,6 +397,15 @@ jobs:
         python-version: ["3.10"]
         musa-version: ["43"]
     steps:
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
+      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
+      # container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
