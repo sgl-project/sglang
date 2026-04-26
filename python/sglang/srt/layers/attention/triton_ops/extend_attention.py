@@ -17,9 +17,9 @@ It supports page size = 1 and prefill with KV cache (i.e. extend).
 """
 
 import torch
+
 import triton
 import triton.language as tl
-
 from sglang.srt.layers.attention.triton_ops.prefill_attention import (
     context_attention_fwd,
 )
@@ -382,7 +382,6 @@ def _fwd_kernel(
                 mask=(mask_n[None, :]) & (mask_d[:, None]),
                 other=0.0,
             )
-
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
@@ -887,7 +886,6 @@ def _fwd_kernel_unified(
                 other=0.0,
             )
 
-            # Compute QK
             qk = tl.dot(q.to(k.dtype), k)
             if BLOCK_DPE > 0:
                 offs_kpe = (
