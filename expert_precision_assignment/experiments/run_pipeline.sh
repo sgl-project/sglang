@@ -109,6 +109,12 @@ CALIB_TRACE="$CALIB_DIR/details_mc${RECIPE_CALIBRATION__MC}.jsonl"
 RESULTS_DIR="$DATA_DIR/results/${NAME}"
 SCORER="$PIPELINE_DIR/scoring/score_traces_${TASK}.py"
 META_JSONL="$PIPELINE_DIR/prompt/${NAME}.meta.jsonl"
+PREP_SCRIPT="$PIPELINE_DIR/prompt/prepare_prompts_${TASK}.py"
+# Tasks without a prepare_prompts script (e.g., gsm8k) run in bench_eval
+# mode — lm-eval pulls the dataset itself, so prep is a no-op and the
+# calib/score stages must not gate on the openai-mode prompts file.
+HAS_PREP=0
+[ -f "$PREP_SCRIPT" ] && HAS_PREP=1
 
 echo "============================================================"
 echo "  recipe         $RECIPE"
@@ -126,17 +132,28 @@ run_stage() {
     echo "=================== STAGE: $stage ==========================="
     case "$stage" in
         prep)
-            "$PYTHON" "$PIPELINE_DIR/prompt/prepare_prompts_${TASK}.py" \
-                --recipe "$RECIPE"
+            if [ "$HAS_PREP" = "1" ]; then
+                "$PYTHON" "$PREP_SCRIPT" --recipe "$RECIPE"
+            else
+                echo "  no prepare_prompts_${TASK}.py — bench_eval mode pulls the dataset itself, skipping prep."
+            fi
             ;;
         calib)
-            [ -f "$PROMPTS_JSONL" ] || { echo "Run 'prep' first: missing $PROMPTS_JSONL" >&2; exit 3; }
+            if [ "$HAS_PREP" = "1" ] && [ ! -f "$PROMPTS_JSONL" ]; then
+                echo "Run 'prep' first: missing $PROMPTS_JSONL" >&2
+                exit 3
+            fi
             # Pass calibration knobs via env (run_calib.sh already reads these).
+            # BENCH_TASK lets bench_eval get the lm-eval task name (TASK) while
+            # the run_calib script still scopes outputs by NAME (compound).
+            # CALIB_LIMIT caps bench_eval docs to recipe.calibration.num_prompts.
             CALIB_MC="${CALIB_MC:-$RECIPE_CALIBRATION__MC}" \
             NUM_PROMPTS="${NUM_PROMPTS:-$CALIB_N}" \
+            CALIB_LIMIT="${CALIB_LIMIT:-$CALIB_N}" \
             CALIB_GPU="${CALIB_GPU:-$RECIPE_CALIBRATION__GPU}" \
             CALIB_PORT="${CALIB_PORT:-$RECIPE_CALIBRATION__PORT}" \
             CALIB_NCCL_PORT="${CALIB_NCCL_PORT:-$RECIPE_CALIBRATION__NCCL_PORT}" \
+            BENCH_TASK="${BENCH_TASK:-$TASK}" \
                 bash "$PIPELINE_DIR/kv_calib/run_calib.sh" "$NAME"
             ;;
         gen)
@@ -148,16 +165,25 @@ run_stage() {
                 "$PYTHON" "$PIPELINE_DIR/gen_config/gen_all.py" --task "$NAME" --calib_json "$CALIB_JSON"
             ;;
         sweep)
-            [ -f "$PROMPTS_JSONL" ] || { echo "Run 'prep' first: missing $PROMPTS_JSONL" >&2; exit 3; }
+            if [ "$HAS_PREP" = "1" ] && [ ! -f "$PROMPTS_JSONL" ]; then
+                echo "Run 'prep' first: missing $PROMPTS_JSONL" >&2
+                exit 3
+            fi
             # Recipe convention: sweep.num_prompts=0 means "all".  Shell's
             # ${x:-default} keeps the literal "0" because it's non-empty, so
             # translate it here explicitly before exporting to run_sweep.sh.
             sweep_np="${OPENAI_NUM_PROMPTS:-${RECIPE_SWEEP__NUM_PROMPTS:-999999}}"
             [ "$sweep_np" = "0" ] && sweep_np=999999
+            # Recipe sweep.limit=0 means "no cap" (full task) — translate
+            # to empty so run_sweep.sh's `[ -n "$LIMIT" ]` skips the flag.
+            sweep_lim="${LIMIT:-${RECIPE_SWEEP__LIMIT:-}}"
+            [ "$sweep_lim" = "0" ] && sweep_lim=""
             MC_LIST="${MC_LIST:-${RECIPE_SWEEP__MC_LIST:-}}" \
             VARIANTS="${VARIANTS:-$RECIPE_SWEEP__VARIANTS}" \
             GPUS="${GPUS:-$RECIPE_SWEEP__GPUS}" \
             OPENAI_NUM_PROMPTS="$sweep_np" \
+            LIMIT="$sweep_lim" \
+            BENCH_TASK="${BENCH_TASK:-$TASK}" \
                 bash "$PIPELINE_DIR/run_sweep.sh" "$NAME"
             ;;
         score)

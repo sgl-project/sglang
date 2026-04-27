@@ -76,6 +76,10 @@ _DEFAULTS: dict[str, Any] = {
         ],
         "gpus": [4, 5, 6, 7],
         "num_prompts": 0,
+        # bench_eval-only: caps `--limit` for short smoke runs against
+        # large lm-eval tasks (gsm8k, mmlu, …). 0 = no cap (full task).
+        # Ignored in openai/sharegpt modes.
+        "limit": 0,
     },
     "scoring": {
         # When false, `run_pipeline.sh --stage score` becomes a no-op — the

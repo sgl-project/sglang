@@ -279,9 +279,9 @@ else
     [ -n "$CALIB_LIMIT" ] && lim_flag=(--limit "$CALIB_LIMIT")
     meta_flag=()
     [ -n "$RULER_MAX_SEQ" ] && meta_flag=(--metadata "{\"max_seq_lengths\":[$RULER_MAX_SEQ]}")
-    echo "Running bench_eval (task=$TASK) with per-doc output..."
+    echo "Running bench_eval (task=${BENCH_TASK:-$TASK}) with per-doc output..."
     python3 -m sglang.bench_eval \
-        --task "$TASK" \
+        --task "${BENCH_TASK:-$TASK}" \
         --base-url "http://${HOST}:${PORT}" \
         --backend sglang-oai \
         --model "$BF16_MODEL" \

@@ -424,7 +424,7 @@ case "$MODE" in
         echo "             num_prompts=$OPENAI_NUM_PROMPTS (scoring offline via pipeline/scoring/score_traces_${TASK}.py)"
         ;;
     bench_eval)
-        echo "  bench:     bench_eval --task=$TASK (fewshot=$NUM_FEWSHOT, max_gen=$MAX_GEN_TOKS, T=$TEMPERATURE)"
+        echo "  bench:     bench_eval --task=${BENCH_TASK:-$TASK} (fewshot=$NUM_FEWSHOT, max_gen=$MAX_GEN_TOKS, T=$TEMPERATURE)"
         echo "             apply_chat_template=$APPLY_CHAT_TEMPLATE  fewshot_as_multiturn=$FEWSHOT_AS_MULTITURN"
         [ -n "$SYSTEM_INSTRUCTION" ] && echo "  sys_instr: $SYSTEM_INSTRUCTION"
         ;;
