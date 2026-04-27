@@ -362,7 +362,6 @@ The most important performance-related groups are:
   - `prefill_max_requests`
   - `max_prefill_tokens`
   - `schedule_conservativeness`
-  - `num_continuous_decode_steps`
   - `stream_interval`
 - Memory / cache
   - `max_total_tokens`

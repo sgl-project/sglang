@@ -437,7 +437,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--triton-attention-reduce-in-fp32` | Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16. This only affects Triton attention kernels. | `False` | bool flag (set to enable) |
 | `--triton-attention-num-kv-splits` | The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8. | `8` | Type: int |
 | `--triton-attention-split-tile-size` | The size of split KV tile in flash decoding Triton kernel. Used for deterministic inference. | `None` | Type: int |
-| `--num-continuous-decode-steps` | Run multiple continuous decoding steps to reduce scheduling overhead. This can potentially increase throughput but may also increase time-to-first-token latency. The default value is 1, meaning only run one decoding step at a time. | `1` | Type: int |
 | `--delete-ckpt-after-loading` | Delete the model checkpoint after loading the model. | `False` | bool flag (set to enable) |
 | `--enable-memory-saver` | Allow saving memory using release_memory_occupation and resume_memory_occupation | `False` | bool flag (set to enable) |
 | `--enable-weights-cpu-backup` | Save model weights to CPU memory during release_weights_occupation and resume_weights_occupation | `False` | bool flag (set to enable) |
