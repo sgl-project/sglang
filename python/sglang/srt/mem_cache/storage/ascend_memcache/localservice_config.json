@@ -1,0 +1,8 @@
+{
+    "protocol": "device_rdma",
+    "dram_size": "10GB",
+    "max_dram_size": "64GB",
+    "device_id": 0,
+    "init_bm": true,
+    "conf_file_path": "/usr/local/memcache_hybrid/latest/config/mmc-local.conf"
+}

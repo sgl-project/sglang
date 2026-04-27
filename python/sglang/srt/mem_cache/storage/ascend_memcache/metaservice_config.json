@@ -1,0 +1,7 @@
+{
+    "meta_service_url": "tcp://141.61.39.233:5001",
+    "config_store_url": "tcp://141.61.39.233:6000",
+    "metrics_url": "http://141.61.39.233:8000",
+    "ha_enable": false,
+    "log_level": "info"
+}
