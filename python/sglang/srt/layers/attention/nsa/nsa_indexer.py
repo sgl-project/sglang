@@ -42,6 +42,25 @@ if _is_cuda:
     except ImportError as e:
         deep_gemm = e
 
+from sglang.srt.utils.custom_op import register_custom_op
+
+
+# torch.mm supports out_dtype=fp32 for bf16 inputs, keeping the fp32
+# accumulator instead of rounding to bf16 then casting up.
+# TODO(b8zhong): drop the custom op wrapper once on torch 2.10+. torch
+# 2.9.1's meta_mm doesn't accept out_dtype, breaking torch.compile.
+@register_custom_op(
+    op_name="weights_proj_bf16_in_fp32_out",
+    fake_impl=lambda x, weight: torch.empty(
+        (x.shape[0], weight.shape[0]), dtype=torch.float32, device=x.device
+    ),
+)
+def weights_proj_bf16_in_fp32_out_op(
+    x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    return torch.mm(x, weight.t(), out_dtype=torch.float32)
+
+
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
@@ -266,15 +285,8 @@ class Indexer(MultiPlatformOp):
         # avoiding an expensive FP8-to-bf16 dequantization.
         if _use_aiter and _is_gfx95_supported and isinstance(x, tuple) and len(x) == 3:
             x = x[2]
-        if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-            weight = self.weights_proj.weight
-            out = torch.empty(
-                (x.shape[0], weight.shape[0]),
-                dtype=torch.float32,
-                device=x.device,
-            )
-            deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
-            return out
+        if _is_cuda:
+            return weights_proj_bf16_in_fp32_out_op(x, self.weights_proj.weight)
 
         weights, _ = self.weights_proj(x)
         if _is_hip:
