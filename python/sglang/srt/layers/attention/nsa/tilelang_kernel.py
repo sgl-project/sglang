@@ -1,13 +1,16 @@
 import functools
+import logging
 from typing import Any, Optional, Tuple
 
 import tilelang
 import tilelang.language as T
 import torch
 
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_sm120_supported
 
 tilelang.set_log_level("WARNING")
+
+logger = logging.getLogger(__name__)
 
 pass_configs = {
     tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
@@ -787,8 +790,13 @@ def tilelang_sparse_fwd(
             num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, num_stages=1
         )
     else:
+        # SM120 (consumer Blackwell) has only ~99KB shared memory per block.
+        # The v2 kernel with default block_I=64 and double-buffered KV
+        # allocates ~206KB shared memory, far exceeding the 99KB limit.
+        # Use smaller block_I=32 to reduce shared memory to ~90KB.
+        block_I = 32 if is_sm120_supported() else 64
         kernel = sparse_attention_fwd_kernel_v2(
-            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, block_I=block_I
         )
     return kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
 

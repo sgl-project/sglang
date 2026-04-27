@@ -32,7 +32,12 @@ constexpr size_t kSmem = static_cast<size_t>(SGL_TOPK_DYNAMIC_SMEM_BYTES);
 constexpr size_t kSmem = 48 * 1024;  // bytes
 #endif
 #else
-constexpr size_t kSmem = 32 * 1024 * sizeof(uint32_t);  // 128KB (bytes)
+// SM120 (consumer Blackwell, e.g. RTX PRO 6000) has only ~99KB shared memory
+// per block (101376 bytes optin). Static shared memory in this kernel uses
+// ~11.5KB (histograms + s_indices in transform variants), leaving ~88KB for
+// dynamic shared memory. Use 80KB to stay within limits on SM120 while keeping
+// 10240 entries per ping-pong buffer, which is 5x the TopK=2048 requirement.
+constexpr size_t kSmem = 20 * 1024 * sizeof(uint32_t);  // 80KB (bytes)
 #endif
 
 struct FastTopKParams {

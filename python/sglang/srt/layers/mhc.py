@@ -9,6 +9,7 @@ import torch
 from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 from sglang.srt.layers.utils.common import strict_contiguous
+from sglang.srt.utils import is_sm120_supported
 
 tilelang.set_log_level("WARNING")
 
@@ -493,8 +494,13 @@ def mhc_pre(
 
     if num_tokens <= 2048:
         assert n_splits == 1
+        # SM120 (consumer Blackwell) has only ~99KB shared memory per block.
+        # The splitk kernel with hidden_block=256 and 2-stage pipelining uses
+        # ~96KB shared memory (x_smem*2 + fn_smem*2), which is very close to
+        # the 99KB limit. Use hidden_block=128 on SM120 to stay well within limits.
+        _is_sm120 = is_sm120_supported()
         if hc_hidden_size == 16384:
-            hidden_block = 256
+            hidden_block = 128 if _is_sm120 else 256
         elif hc_hidden_size == 28672:
             hidden_block = 128
         else:
