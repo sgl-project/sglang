@@ -100,12 +100,34 @@ export const MiMoV25Deployment = () => {
     `#   <node0-ip>  = IP of the head node (reachable from all others)\n` +
     `${cmd}`;
 
-  const resolveItems = (option) => option.items;
+  // Toggles whose `enabled` choice is incompatible with the current variant +
+  // hardware are returned as a map { optionName -> reason }. The render layer
+  // grays out the matching radio item, and a useEffect snaps any disallowed
+  // value back to `disabled` so the visible UI never disagrees with the
+  // command we actually generate.
+  const computeForcedOff = (variant, hardware) => {
+    const isPro = variant === "pro";
+    const spec = HW_VARIANT_SPEC[`${variant}|${hardware}`];
+    const blackwell = spec ? spec.blackwell : false;
+    const forced = {};
+    if (!isPro) forced.eagleMtp = "EAGLE MTP applies to V2.5-Pro only.";
+    if (blackwell) forced.deepep = "Blackwell uses flashinfer_trtllm; DeepEP is Hopper / Ampere only.";
+    return forced;
+  };
+
+  const resolveItems = (option, forced) => {
+    const reason = forced[option.name];
+    if (!reason) return option.items;
+    return option.items.map((item) =>
+      item.id === "enabled" ? { ...item, disabled: true, disabledReason: reason } : item,
+    );
+  };
 
   const getInitialState = () => {
     const initialState = {};
+    const forced = computeForcedOff("pro", "h200");
     for (const [key, option] of Object.entries(options)) {
-      const items = resolveItems(option);
+      const items = resolveItems(option, forced);
       const def = items.find((i) => i.default && !i.disabled) || items.find((i) => !i.disabled) || items[0];
       initialState[key] = def.id;
     }
@@ -132,6 +154,20 @@ export const MiMoV25Deployment = () => {
     });
     return () => observer.disconnect();
   }, []);
+
+  // Snap forced-off toggles back to "disabled" whenever variant/hardware
+  // changes — keeps the visible radio in sync with generated command.
+  useEffect(() => {
+    const forced = computeForcedOff(values.modelVariant, values.hardware);
+    let patch = null;
+    for (const key of Object.keys(forced)) {
+      if (values[key] === "enabled") {
+        patch = patch || {};
+        patch[key] = "disabled";
+      }
+    }
+    if (patch) setValues((prev) => ({ ...prev, ...patch }));
+  }, [values.modelVariant, values.hardware]);
 
   const handleRadioChange = (optionName, value) => {
     setValues((prev) => ({ ...prev, [optionName]: value }));
@@ -278,10 +314,12 @@ export const MiMoV25Deployment = () => {
     border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
   };
 
+  const forcedOff = computeForcedOff(values.modelVariant, values.hardware);
+
   return (
     <div style={containerStyle} className="not-prose">
       {Object.entries(options).map(([key, option]) => {
-        const items = resolveItems(option);
+        const items = resolveItems(option, forcedOff);
         return (
           <div key={key} style={cardStyle}>
             <div style={titleStyle}>{option.title}</div>
