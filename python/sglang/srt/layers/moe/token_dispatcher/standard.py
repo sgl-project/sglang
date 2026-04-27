@@ -99,12 +99,14 @@ class StandardDispatcher(BaseDispatcher):
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
         self.num_experts = moe_runner_config.num_experts
+        self.num_local_experts = moe_runner_config.num_local_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
         self.num_local_routed_experts = (
-            moe_runner_config.num_local_experts - self.num_local_shared_experts
+            self.num_local_experts - self.num_local_shared_experts
         )
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.local_expert_mapping = None
+        self.expert_mask_gpu = None
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -187,13 +189,23 @@ class StandardDispatcher(BaseDispatcher):
                         )
                     )
 
-        if self.local_expert_mapping is not None and not _use_aiter:
-            if TopKOutputChecker.format_is_standard(topk_output):
-                topk_output = topk_output._replace(
-                    topk_ids=self.local_expert_mapping[topk_output.topk_ids]
+        if self.local_expert_mapping is not None:
+            if _use_aiter:
+                self.expert_mask_gpu = (
+                    (
+                        (self.local_expert_mapping >= 0)
+                        & (self.local_expert_mapping < self.num_local_experts)
+                    )
+                    .to(torch.int32)
+                    .to(device="cuda")
                 )
-            elif TopKOutputChecker.format_is_triton_kernels(topk_output):
-                raise NotImplementedError()
+            else:
+                if TopKOutputChecker.format_is_standard(topk_output):
+                    topk_output = topk_output._replace(
+                        topk_ids=self.local_expert_mapping[topk_output.topk_ids]
+                    )
+                elif TopKOutputChecker.format_is_triton_kernels(topk_output):
+                    raise NotImplementedError()
 
         return StandardDispatchOutput(
             hidden_states=hidden_states,

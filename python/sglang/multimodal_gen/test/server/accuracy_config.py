@@ -142,17 +142,6 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
             "Representative text encoder accuracy is already covered by flux_2_image_t2i for the same source component and topology"
         ),
     },
-    "wan2_1_t2v_1.3b_text_encoder_cpu_offload": {
-        ComponentType.VAE: ComponentSkip(
-            "Representative VAE accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
-        ),
-        ComponentType.TRANSFORMER: ComponentSkip(
-            "Representative transformer accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
-        ),
-        ComponentType.TEXT_ENCODER: ComponentSkip(
-            "Representative text encoder accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
-        ),
-    },
     "wan2_1_t2v_1.3b_teacache_enabled": {
         ComponentType.VAE: ComponentSkip(
             "Representative VAE accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
