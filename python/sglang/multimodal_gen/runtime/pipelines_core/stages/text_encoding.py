@@ -8,6 +8,8 @@ This module contains implementations of prompt encoding stages for diffusion pip
 """
 
 import inspect
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 
@@ -28,6 +30,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class TextEncodingFingerprint:
+    prompt: Any
+    negative_prompt: Any
+    do_classifier_free_guidance: bool
+    prompt_template: Any
+    max_sequence_length: int | None
+
+
 class TextEncodingStage(PipelineStage):
     """
     Stage for encoding text prompts into embeddings for diffusion models.
@@ -35,6 +46,18 @@ class TextEncodingStage(PipelineStage):
     This stage handles the encoding of text prompts into the embedding space
     expected by the diffusion model.
     """
+
+    deduplicated_output_fields = (
+        "prompt_embeds",
+        "negative_prompt_embeds",
+        "prompt_attention_mask",
+        "negative_attention_mask",
+        "pooled_embeds",
+        "neg_pooled_embeds",
+        "clip_embedding_pos",
+        "clip_embedding_neg",
+        "is_prompt_processed",
+    )
 
     def __init__(self, text_encoders, tokenizers) -> None:
         """
@@ -106,6 +129,17 @@ class TextEncodingStage(PipelineStage):
                     batch.negative_attention_mask.append(nm)
 
         return batch
+
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> TextEncodingFingerprint:
+        return TextEncodingFingerprint(
+            prompt=self.freeze_for_dedup(batch.prompt),
+            negative_prompt=self.freeze_for_dedup(batch.negative_prompt),
+            do_classifier_free_guidance=bool(batch.do_classifier_free_guidance),
+            prompt_template=self.freeze_for_dedup(batch.prompt_template),
+            max_sequence_length=batch.max_sequence_length,
+        )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage inputs."""
