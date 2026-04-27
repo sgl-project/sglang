@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import inspect
 import json
 import logging
 import pickle
@@ -47,6 +48,9 @@ from sglang.multimodal_gen.runtime.disaggregation.transport.protocol import (
     is_transfer_message,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    clone_scheduler_runtime,
+)
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -86,6 +90,9 @@ _EXCLUDE_FIELDS = frozenset(
         "trajectory_audio_latents",
         "timestep",
         "step_index",
+        # Request scheduler is a local runtime object cloned from the pipeline
+        # scheduler template. It may hold live mutable state and is not JSON-safe.
+        "scheduler",
         "prompt_template",
         "max_sequence_length",
         # trace_ctx holds live OTel SDK objects that aren't JSON-serializable.
@@ -161,6 +168,45 @@ def _extract_extra_fields(extra: dict, scalar_fields: dict) -> None:
             scalar_fields[f"_extra_{key}"] = value
         except (TypeError, ValueError, OverflowError):
             pass
+
+
+def _init_request_scheduler_from_template(
+    scheduler_template: Any, req: Req, device: torch.device
+) -> None:
+    scheduler = clone_scheduler_runtime(scheduler_template)
+    extra_kwargs = {}
+    mu = req.extra.get("mu") if hasattr(req, "extra") else None
+    if mu is not None:
+        extra_kwargs["mu"] = mu
+
+    set_timesteps_params = inspect.signature(scheduler.set_timesteps).parameters
+    timesteps = getattr(req, "timesteps", None)
+    sigmas = getattr(req, "sigmas", None)
+    num_steps = getattr(req, "num_inference_steps", None)
+
+    if sigmas is not None and "sigmas" in set_timesteps_params:
+        if isinstance(sigmas, torch.Tensor):
+            sigmas = sigmas.detach().cpu()
+        scheduler.set_timesteps(sigmas=sigmas, device=device, **extra_kwargs)
+    elif timesteps is not None and "timesteps" in set_timesteps_params:
+        if isinstance(timesteps, torch.Tensor):
+            timesteps = timesteps.detach().cpu()
+        scheduler.set_timesteps(timesteps=timesteps, device=device, **extra_kwargs)
+    elif num_steps is not None:
+        scheduler.set_timesteps(num_steps, device=device, **extra_kwargs)
+    else:
+        return
+
+    req.scheduler = scheduler
+    req.timesteps = scheduler.timesteps
+
+
+def _init_disagg_request_scheduler(self: Scheduler, req: Req) -> None:
+    scheduler_template = self.worker.pipeline.get_module("scheduler")
+    if scheduler_template is None:
+        return
+    device = torch.device(f"cuda:{self.worker.local_rank}")
+    _init_request_scheduler_from_template(scheduler_template, req, device)
 
 
 def extract_transfer_fields(req) -> tuple[dict, dict]:
@@ -817,17 +863,7 @@ class SchedulerDisaggMixin:
                     # Init scheduler timesteps on main thread (safe — no
                     # concurrent denoising loop can be running here).
                     if self._disagg_role == RoleType.DENOISER:
-                        scheduler_mod = self.worker.pipeline.get_module("scheduler")
-                        num_steps = getattr(req, "num_inference_steps", None)
-                        if scheduler_mod is not None and num_steps is not None:
-                            device = torch.device(f"cuda:{self.worker.local_rank}")
-                            extra_kwargs = {}
-                            mu = req.extra.get("mu") if hasattr(req, "extra") else None
-                            if mu is not None:
-                                extra_kwargs["mu"] = mu
-                            scheduler_mod.set_timesteps(
-                                num_steps, device=device, **extra_kwargs
-                            )
+                        _init_disagg_request_scheduler(self, req)
                     # Run compute
                     if self._disagg_role == RoleType.DENOISER:
                         self._disagg_denoiser_compute(req, request_id, rn)
@@ -1194,15 +1230,7 @@ class SchedulerDisaggMixin:
 
         # 3. Init scheduler timesteps if denoiser (CPU work, overlapped)
         if self._disagg_role == RoleType.DENOISER:
-            scheduler_mod = self.worker.pipeline.get_module("scheduler")
-            num_steps = getattr(req, "num_inference_steps", None)
-            if scheduler_mod is not None and num_steps is not None:
-                device = torch.device(local_device)
-                extra_kwargs = {}
-                mu = req.extra.get("mu") if hasattr(req, "extra") else None
-                if mu is not None:
-                    extra_kwargs["mu"] = mu
-                scheduler_mod.set_timesteps(num_steps, device=device, **extra_kwargs)
+            _init_disagg_request_scheduler(self, req)
 
         # 4. Wait for load before compute (GPU must see the data)
         if load_event is not None:
@@ -1246,15 +1274,7 @@ class SchedulerDisaggMixin:
         """
         if self._disagg_role == RoleType.DENOISER:
             # Initialize scheduler timesteps (same as rank 0)
-            scheduler_mod = self.worker.pipeline.get_module("scheduler")
-            num_steps = getattr(req, "num_inference_steps", None)
-            if scheduler_mod is not None and num_steps is not None:
-                device = torch.device(f"cuda:{self.worker.local_rank}")
-                extra_kwargs = {}
-                mu = req.extra.get("mu") if hasattr(req, "extra") else None
-                if mu is not None:
-                    extra_kwargs["mu"] = mu
-                scheduler_mod.set_timesteps(num_steps, device=device, **extra_kwargs)
+            _init_disagg_request_scheduler(self, req)
 
             with self._disagg_trace_dispatch(req):
                 self.worker.execute_forward([req], return_req=True)

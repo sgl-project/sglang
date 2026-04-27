@@ -13,7 +13,7 @@ from sglang.srt.layers.attention.fla.kda import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=12, suite="stage-b-test-1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
