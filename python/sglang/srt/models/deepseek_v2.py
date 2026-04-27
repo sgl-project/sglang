@@ -458,17 +458,17 @@ class DeepseekV2MoE(nn.Module):
 
         # For waterfill: TopK doesn't append shared expert (balancer does expand_topk instead).
         # Pass 0 so TopK produces (batch, 8), then waterfill expands to (batch, 9).
-        _topk_num_fused_shared = (
+        num_fused_shared_experts_for_base_topk = (
             0 if _enable_deepep_waterfill else self.num_fused_shared_experts
         )
 
         self.topk = TopK(
-            top_k=config.num_experts_per_tok + _topk_num_fused_shared,
+            top_k=config.num_experts_per_tok + num_fused_shared_experts_for_base_topk,
             layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
-            num_fused_shared_experts=_topk_num_fused_shared,
+            num_fused_shared_experts=num_fused_shared_experts_for_base_topk,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             quant_config=quant_config,
