@@ -255,7 +255,6 @@ export const DeepSeekV4Deployment = () => {
 
     // ---- env ----
     // _LAUNCH_HEAD always prepends these:
-    const COMMON_ENV = ["SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
     // Per-hardware env (whitelist #1: NVSHMEM removed for B200).
     const HW_ENV = {
       h200:  ["SGLANG_DSV4_FP4_EXPERTS=0"],   // allinone _ENV_H200
@@ -521,7 +520,6 @@ export const DeepSeekV4Deployment = () => {
     // NCCL_MNNVL_ENABLE / NCCL_CUMEM_ENABLE may also be needed depending on the
     // GB300 cluster's NVLink/IB topology — see §3.2 "Configuration Tips" note.
     const MNNVL_ENV = isGB300 ? ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True"] : [];
-    const COMMON_ENV = ["SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
 
     const buildRole = (mode, port, distPort) => {
       const roleEnv = [];
