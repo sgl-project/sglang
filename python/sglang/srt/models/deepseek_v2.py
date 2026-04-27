@@ -456,19 +456,14 @@ class DeepseekV2MoE(nn.Module):
             prefix=add_prefix("experts", prefix),
         )
 
-        # For waterfill: TopK doesn't append shared expert (balancer does expand_topk instead).
-        # Pass 0 so TopK produces (batch, 8), then waterfill expands to (batch, 9).
-        num_fused_shared_experts_for_base_topk = (
-            0 if _enable_deepep_waterfill else self.num_fused_shared_experts
-        )
-
         self.topk = TopK(
-            top_k=config.num_experts_per_tok + num_fused_shared_experts_for_base_topk,
+            top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
             layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
             num_expert_group=config.n_group,
-            num_fused_shared_experts=num_fused_shared_experts_for_base_topk,
+            num_fused_shared_experts=self.num_fused_shared_experts,
+            enable_deepep_waterfill=_enable_deepep_waterfill,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             quant_config=quant_config,
@@ -582,26 +577,6 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_flashinfer()
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
-
-        # DeepEP waterfill: wrap self.topk so that the shared expert is
-        # dispatched to the least-loaded EP rank via expand_topk.
-        self._enable_deepep_waterfill = _enable_deepep_waterfill
-        if self._enable_deepep_waterfill:
-            from sglang.srt.distributed import get_moe_expert_parallel_rank
-            from sglang.srt.layers.moe.deepep_waterfill import (
-                DeepEPWaterfillBalancer,
-                WaterfillTopK,
-            )
-
-            balancer = DeepEPWaterfillBalancer(
-                num_routed_experts=config.n_routed_experts,
-                world_size=self.moe_ep_size,
-                rank=get_moe_expert_parallel_rank(),
-                layer_id=self.layer_id,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
-            balancer.update_static_weights()
-            self.topk = WaterfillTopK(self.topk, balancer)
 
     def get_moe_weights(self):
         return [
@@ -865,20 +840,6 @@ class DeepseekV2MoE(nn.Module):
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
-            if (
-                not self._enable_deepep_waterfill
-                and is_deepep_class_backend()
-                and self.num_fused_shared_experts > 0
-            ):
-                n = self.num_fused_shared_experts
-                topk_output = topk_output._replace(
-                    topk_ids=topk_output.topk_ids.new_empty(
-                        (0, topk_output.topk_ids.shape[-1] + n)
-                    ),
-                    topk_weights=topk_output.topk_weights.new_empty(
-                        (0, topk_output.topk_weights.shape[-1] + n)
-                    ),
-                )
 
         if sbo_overlap_dispatch_flag:
             shared_output = None

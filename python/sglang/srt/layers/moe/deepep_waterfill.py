@@ -527,27 +527,3 @@ class DeepEPWaterfillBalancer:
             topk_ids=expanded_ids,
             router_logits=topk_output.router_logits,
         )
-
-
-class WaterfillTopK(torch.nn.Module):
-    """TopK wrapper: dispatches the shared expert via DeepEP waterfill.
-
-    Drop-in replacement for a base TopK when waterfill is enabled. forward
-    and empty_topk_output return output already expanded from (N, 8) to
-    (N, 9) with the shared expert routed to the least-loaded EP rank.
-    """
-
-    def __init__(self, base_topk, balancer: DeepEPWaterfillBalancer):
-        super().__init__()
-        self.base = base_topk
-        self.balancer = balancer
-
-    def forward(self, hidden_states, router_logits, **kwargs):
-        self.balancer.update_static_weights()
-        topk_output = self.base(hidden_states, router_logits, **kwargs)
-        return self.balancer.expand_topk(topk_output, hidden_states.shape[0])
-
-    def empty_topk_output(self, device):
-        self.balancer.update_static_weights()
-        topk_output = self.base.empty_topk_output(device)
-        return self.balancer.expand_topk(topk_output, 0)
