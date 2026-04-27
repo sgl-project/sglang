@@ -1418,6 +1418,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
 
 
 @dataclass
@@ -1445,6 +1447,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Optional: Determine whether to disable updating the draft model
     disable_draft_model: Optional[bool] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
 
 
 @dataclass
@@ -1479,6 +1483,8 @@ class UpdateWeightsFromIPCReqInput(BaseReq):
     flush_cache: bool = True
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
 
 
 @dataclass
