@@ -771,7 +771,18 @@ class UMBPStore(HiCacheStorage):
         else:
             sizes = list(buffer_sizes)
 
+        total_bytes = sum(sizes)
+        logger.info(
+            '[UMBPStore] batch_get_v1: calling UMBP BatchGet: '
+            'keys=%d expanded_keys=%d total_bytes=%d',
+            len(keys), len(key_strs), total_bytes,
+        )
         get_results = self.client.batch_get_into_ptr(key_strs, list(buffer_ptrs), sizes)
+        success_count = sum(1 for r in get_results if r)
+        logger.info(
+            '[UMBPStore] batch_get_v1: UMBP BatchGet done: success=%d/%d',
+            success_count, len(get_results),
+        )
         return self._batch_postprocess(get_results)
 
     def _compute_expanded_depths(
@@ -827,6 +838,13 @@ class UMBPStore(HiCacheStorage):
 
         expanded_depths = self._compute_expanded_depths(keys, extra_info)
 
+        total_bytes = sum(sizes)
+        logger.info(
+            '[UMBPStore] batch_set_v1: calling UMBP BatchPut: '
+            'keys=%d expanded_keys=%d total_bytes=%d with_depth=%s',
+            len(keys), len(key_strs), total_bytes, bool(expanded_depths),
+        )
+
         if expanded_depths:
             put_results = self.client.batch_put_from_ptr_with_depth(
                 key_strs, list(buffer_ptrs), sizes, expanded_depths
@@ -836,6 +854,11 @@ class UMBPStore(HiCacheStorage):
                 key_strs, list(buffer_ptrs), sizes
             )
 
+        success_count = sum(1 for r in put_results if r)
+        logger.info(
+            '[UMBPStore] batch_set_v1: UMBP BatchPut done: success=%d/%d',
+            success_count, len(put_results),
+        )
         return self._batch_postprocess(put_results, is_set_operate=True)
 
     def batch_exists(

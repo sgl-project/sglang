@@ -48,6 +48,12 @@ Environment variables (override defaults):
   ROUTER_HOST               Router bind address (default: 0.0.0.0)
   ROUTER_PORT               Router port (default: 8000)
 
+  # KV Events (ZMQ publisher on SGLang + subscriber in UMBP)
+  ENABLE_KV_EVENTS          Enable KV events publisher on sglang server (default: true)
+  KV_EVENTS_PUBLISHER       Publisher backend (default: zmq)
+  KV_EVENTS_ENDPOINT        ZMQ bind endpoint (default: tcp://*:5557)
+  KV_EVENTS_TOPIC           ZMQ topic prefix (default: empty)
+
   # Cache tiers
   ENABLE_HICACHE            Enable L2 DRAM cache (default: true)
   ENABLE_UMBP               Enable L3 UMBP (DRAM+SSD) (default: true)
@@ -104,6 +110,7 @@ USE_DUMMY_WEIGHTS="${USE_DUMMY_WEIGHTS:-false}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-8}"
 PAGE_SIZE="${PAGE_SIZE:-64}"
+MEM_FRACTION_STATIC="${MEM_FRACTION_STATIC:-}"
 
 # PD Disaggregation
 DISAGG_TRANSFER_BACKEND="${DISAGG_TRANSFER_BACKEND:-mori}"
@@ -147,6 +154,12 @@ UMBP_IO_ENGINE_PORT="${UMBP_IO_ENGINE_PORT:-}"
 UMBP_PEER_SERVICE_PORT="${UMBP_PEER_SERVICE_PORT:-}"
 UMBP_CACHE_REMOTE_FETCHES="${UMBP_CACHE_REMOTE_FETCHES:-true}"
 UMBP_MASTER_AUTO_START="${UMBP_MASTER_AUTO_START:-true}"
+
+# KV Events
+ENABLE_KV_EVENTS="${ENABLE_KV_EVENTS:-true}"
+KV_EVENTS_PUBLISHER="${KV_EVENTS_PUBLISHER:-zmq}"
+KV_EVENTS_ENDPOINT="${KV_EVENTS_ENDPOINT:-tcp://*:5557}"
+KV_EVENTS_TOPIC="${KV_EVENTS_TOPIC:-}"
 UMBP_MASTER_BIN="${UMBP_MASTER_BIN:-}"
 UMBP_MASTER_LISTEN="${UMBP_MASTER_LISTEN:-}"
 
@@ -486,7 +499,11 @@ build_umbp_extra_config() {
     if [[ "${UMBP_SSD_BYTES}" -le 0 ]]; then
         ssd_enabled_json="false"
     fi
-    echo "{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}}"
+    local kv_events_fields=""
+    if bool_is_true "$ENABLE_KV_EVENTS"; then
+        kv_events_fields=", \"kv_events_subscriber\": true"
+    fi
+    echo "{\"dram_capacity_bytes\": ${UMBP_DRAM_BYTES}, \"ssd_enabled\": ${ssd_enabled_json}, \"ssd_storage_dir\": \"${UMBP_SSD_DIR}\", \"ssd_capacity_bytes\": ${UMBP_SSD_BYTES}, \"auto_promote_on_read\": true, \"eviction_policy\": \"prefix_aware_lru\", \"ssd_durability_mode\": \"${UMBP_SSD_DURABILITY_MODE}\", \"copy_to_ssd_async\": ${UMBP_COPY_TO_SSD_ASYNC}, \"ssd_writer_threads\": ${UMBP_SSD_WRITER_THREADS}${spdk_fields}${dist_fields}${kv_events_fields}}"
 }
 
 # ---- Launch server (unified for both roles) -----------------
@@ -513,6 +530,9 @@ launch_pd_server() {
     )
     if [[ -n "$KV_CACHE_DTYPE" ]]; then
         cmd+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
+    fi
+    if [[ -n "$MEM_FRACTION_STATIC" ]]; then
+        cmd+=(--mem-fraction-static "$MEM_FRACTION_STATIC")
     fi
 
     # Disaggregation args
@@ -572,6 +592,10 @@ launch_pd_server() {
         cmd+=(--load-format dummy)
     fi
     cmd+=(${EXTRA_SERVER_ARGS_ARR[@]+"${EXTRA_SERVER_ARGS_ARR[@]}"})
+
+    if bool_is_true "$ENABLE_KV_EVENTS"; then
+        cmd+=(--kv-events-config "{\"publisher\": \"${KV_EVENTS_PUBLISHER}\", \"endpoint\": \"${KV_EVENTS_ENDPOINT}\", \"topic\": \"${KV_EVENTS_TOPIC}\"}")
+    fi
 
     "${cmd[@]}"
 }

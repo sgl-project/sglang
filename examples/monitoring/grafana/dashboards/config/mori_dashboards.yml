@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: mori
+    folder: UMBP
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/mori_dashboards
