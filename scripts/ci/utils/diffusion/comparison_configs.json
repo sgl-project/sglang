@@ -138,8 +138,11 @@
         {
             "id": "ltx2.3_twostage_ti2v_2gpus",
             "model": "Lightricks/LTX-2.3",
-            "task": "image-to-video",
+            "task": "text-image-to-video",
             "prompt": "The cat starts walking slowly towards the camera.",
+            "reference_image": true,
+            "width": 768,
+            "height": 512,
             "num_frames": 121,
             "seed": 42,
             "num_gpus": 2,

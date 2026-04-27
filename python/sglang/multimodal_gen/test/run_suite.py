@@ -20,10 +20,12 @@ from pathlib import Path
 import tabulate
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.server.testcase_configs import (
-    BASELINE_CONFIG,
+from sglang.multimodal_gen.test.server.gpu_cases import (
     ONE_GPU_CASES,
     TWO_GPU_CASES,
+)
+from sglang.multimodal_gen.test.server.testcase_configs import (
+    BASELINE_CONFIG,
     DiffusionTestCase,
 )
 
@@ -63,16 +65,9 @@ FILE_SUITES = {
         "test_component_accuracy_2_gpu.py",
     ],
     "1-gpu-b200": [
-        "test_server_c.py",
+        "test_server_b200.py",
     ],
 }
-
-suites_ascend = {
-    "1-npu": ["ascend/test_server_1_npu.py"],
-    "2-npu": ["ascend/test_server_2_npu.py"],
-    "8-npu": ["ascend/test_server_8_npu.py"],
-}
-FILE_SUITES.update(suites_ascend)
 
 PARAMETRIZED_CASE_GROUPS = {
     "1-gpu": [
@@ -87,8 +82,11 @@ STANDALONE_FILES = {
     "1-gpu": [
         "../cli/test_generate_t2i_perf.py",
         "test_update_weights_from_disk.py",
+        "test_tracing.py",
     ],
-    "2-gpu": [],
+    "2-gpu": [
+        "test_disagg_server.py",
+    ],
 }
 
 # New standalone files may omit an estimate once to learn the real CI runtime.
@@ -98,8 +96,13 @@ STANDALONE_FILE_EST_TIMES = {
     "1-gpu": {
         "../cli/test_generate_t2i_perf.py": 240.0,
         "test_update_weights_from_disk.py": 480.0,
+        "test_tracing.py": 120.0,
     },
-    "2-gpu": {},
+    "2-gpu": {
+        # Two disagg clusters × (~3 min startup + ~1 min generate) ≈ 8 min.
+        # Raise if CI reports a higher measured time.
+        "test_disagg_server.py": 600.0,
+    },
 }
 
 # Backward-compatible suite view for scripts that still operate on file lists.
@@ -558,7 +561,23 @@ def _summary_has_retryable_failure(summary_lines: list[str]) -> bool:
     return False
 
 
+def _is_consistency_failure(full_output: str) -> bool:
+    summary_lines = _extract_short_test_summary(full_output)
+    for line in summary_lines:
+        if "Consistency check failed for" in line or "GT not found for" in line:
+            return True
+
+    return (
+        "Consistency check failed for " in full_output
+        or "GT not found for " in full_output
+        or "--- MISSING GROUND TRUTH DETECTED ---" in full_output
+    )
+
+
 def _is_retryable_failure(full_output: str) -> bool:
+    if _is_consistency_failure(full_output):
+        return False
+
     summary_lines = _extract_short_test_summary(full_output)
     is_perf_assertion = (
         "multimodal_gen/test/server/test_server_utils.py" in full_output

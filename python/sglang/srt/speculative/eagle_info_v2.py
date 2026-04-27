@@ -127,6 +127,8 @@ class EagleDraftInputV2Mixin:
             num_needed_tokens += x
             r.kv_allocated_len += x
             r.decode_batch_idx += 1
+            # Pre-claim bonus slot here (like normal decode); resolve subtracts 1.
+            r.kv_committed_len += 1
 
         cur_kv_lens_cpu = torch.tensor(cur_kv_lens_cpu, dtype=torch.int32, device="cpu")
         nxt_kv_lens_cpu = torch.tensor(nxt_kv_lens_cpu, dtype=torch.int32, device="cpu")
@@ -371,9 +373,9 @@ class EagleVerifyInputV2Mixin:
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
                 candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
+                retrieve_index=self.retrieve_index,
+                retrieve_next_token=self.retrieve_next_token,
+                retrieve_next_sibling=self.retrieve_next_sibling,
                 target_predict=target_predict,
                 topk=self.topk,
             )
@@ -413,9 +415,10 @@ class EagleVerifyInputV2Mixin:
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
                 candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
+                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+                retrive_index=self.retrieve_index,
+                retrive_next_token=self.retrieve_next_token,
+                retrive_next_sibling=self.retrieve_next_sibling,
                 uniform_samples=coins,
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,
