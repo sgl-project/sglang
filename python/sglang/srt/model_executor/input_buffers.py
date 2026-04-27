@@ -82,11 +82,16 @@ class GraphInputBuffers:
             if pp_size > 1:
                 # For mHC models (e.g. DeepSeek-V4), hc_hidden_size =
                 # hc_mult * hidden_size, as hidden_states are flattened for PP.
+                # mHC fuses residual into the 3D hidden_states, so no separate
+                # residual buffer is needed.
                 hs = hc_hidden_size or hidden_size
                 pp_proxy_tensors = {
                     "hidden_states": torch.zeros((max_bs, hs), dtype=dtype),
-                    "residual": torch.zeros((max_bs, hidden_size), dtype=dtype),
                 }
+                if hc_hidden_size is None:
+                    pp_proxy_tensors["residual"] = torch.zeros(
+                        (max_bs, hidden_size), dtype=dtype
+                    )
             else:
                 pp_proxy_tensors = None
 
