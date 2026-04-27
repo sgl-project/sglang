@@ -42,7 +42,7 @@ calibration: # one short live run on full BF16 to measure KV usage
 
 sweep: # 6 × 11 grid, round-robin across GPUs
   mc_list: [8, 16, 32, 64, 128, 256]
-  variants:
+  dynamic_variants:
     [
       hot0,
       hot20,

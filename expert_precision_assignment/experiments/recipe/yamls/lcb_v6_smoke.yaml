@@ -33,7 +33,7 @@ calibration:
 
 sweep:
   mc_list: [32]
-  variants: [thr128]
+  dynamic_variants: [thr128]
   gpus: [5]                    # stay on GPU 5 (GPU 4 reserved for supergpqa smoke)
   num_prompts: 4
 

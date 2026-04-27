@@ -34,13 +34,11 @@ calibration:
 
 sweep:
   mc_list: [64]
-  variants: [hess0]
+  dynamic_variants: [hess0]
+  attention_num_bits: 4    # swap qkv_proj + o_proj to INT4 GPTQ-Marlin at load time
   gpus: [7]
   num_prompts: 0
   limit: 8
 
 scoring:
   enabled: false           # bench_eval reports word_perplexity / byte_perplexity / bits_per_byte
-
-quant:
-  attention_num_bits: 4    # swap qkv_proj + o_proj to INT4 GPTQ-Marlin at load time

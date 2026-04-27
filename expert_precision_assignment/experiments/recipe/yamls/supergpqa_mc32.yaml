@@ -26,7 +26,7 @@ calibration:
 
 sweep:
   mc_list: [32]
-  variants: [hot0, hot20, hot40, hot60, hot80, hot100]
+  dynamic_variants: [hot0, hot20, hot40, hot60, hot80, hot100]
   gpus: [0, 1, 2, 3]
   num_prompts: 0
 

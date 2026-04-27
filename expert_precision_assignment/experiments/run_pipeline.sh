@@ -159,15 +159,18 @@ run_stage() {
         gen)
             [ -f "$CALIB_JSON" ] || { echo "Run 'calib' first: missing $CALIB_JSON" >&2; exit 3; }
             # Forward recipe knobs so gen_heter_configs.py / gen_dyna_variants.py
-            # honor the YAML's sweep.mc_list and sweep.variants.
-            # quant.attention_num_bits flows through as a CLI flag so the
-            # produced heter_config.json carries it (runtime then swaps
-            # qkv_proj+o_proj to INT4 at server load — see heter_moe.py).
+            # honor the YAML's sweep.* block. The full surface lives under
+            # `sweep` post-rename: dynamic_variants (was `variants`),
+            # attention_num_bits (was `quant.attention_num_bits`),
+            # heter_residence (new — picks the static-assignment policy),
+            # bf16_promotion_threshold (new — runtime BF16 promotion floor).
             MC_LIST="${MC_LIST:-${RECIPE_SWEEP__MC_LIST:-}}" \
-            VARIANTS="${VARIANTS:-${RECIPE_SWEEP__VARIANTS:-}}" \
+            VARIANTS="${VARIANTS:-${RECIPE_SWEEP__DYNAMIC_VARIANTS:-}}" \
                 "$PYTHON" "$PIPELINE_DIR/gen_config/gen_all.py" \
                     --task "$NAME" --calib_json "$CALIB_JSON" \
-                    --attention_num_bits "${RECIPE_QUANT__ATTENTION_NUM_BITS:-16}"
+                    --attention_num_bits "${RECIPE_SWEEP__ATTENTION_NUM_BITS:-16}" \
+                    --heter_residence "${RECIPE_SWEEP__HETER_RESIDENCE:-hessian_importance}" \
+                    --bf16_promotion_threshold "${RECIPE_SWEEP__BF16_PROMOTION_THRESHOLD:-72}"
             ;;
         sweep)
             if [ "$HAS_PREP" = "1" ] && [ ! -f "$PROMPTS_JSONL" ]; then
@@ -184,7 +187,7 @@ run_stage() {
             sweep_lim="${LIMIT:-${RECIPE_SWEEP__LIMIT:-}}"
             [ "$sweep_lim" = "0" ] && sweep_lim=""
             MC_LIST="${MC_LIST:-${RECIPE_SWEEP__MC_LIST:-}}" \
-            VARIANTS="${VARIANTS:-$RECIPE_SWEEP__VARIANTS}" \
+            VARIANTS="${VARIANTS:-$RECIPE_SWEEP__DYNAMIC_VARIANTS}" \
             GPUS="${GPUS:-$RECIPE_SWEEP__GPUS}" \
             OPENAI_NUM_PROMPTS="$sweep_np" \
             LIMIT="$sweep_lim" \

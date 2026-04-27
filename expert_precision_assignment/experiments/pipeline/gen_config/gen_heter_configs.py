@@ -1,21 +1,35 @@
 """Generate per-mc heter (base) configs for the experiments sweep.
 
 For each mc in MC_LIST, computes the VRAM budget (KV reserve scales with
-mc) and emits `data/configs/mc{mc}/{int4_only_experts, heter_config,
-assignment_report}.json + mfs.txt` tailored to that SLO. Composite
-scores are derived once from per-layer PPL + per-expert L2 sensitivity
-and reused across mc levels.
+mc) and emits ``data/configs/mc{mc}/{int4_only_experts, heter_config,
+expert_importance, assignment_report}.json + mfs.txt`` tailored to that
+SLO.
 
-KV sizing:
+Three ranking policies select which (layer, expert) pairs go BF16:
+
+  --hessian_importance (default)
+      Top-K signed Hessian (½·dᵀHd) capped at the |first-order|-mean
+      noise floor. Always uses the floor cap; experts below it are
+      statistically indistinguishable from zero.
+
+  --activation_frequency
+      Pure routed-token-count ranking; top-K by token_count globally.
+      No noise-floor cap — fills the full VRAM budget.
+
+  --hybrid
+      Top fo_cap by Hessian, then fill the leftover VRAM with the
+      next-highest experts by token_count (drawn from the experts NOT
+      already chosen by Hessian).
+
+KV sizing (orthogonal to ranking):
     * Default: worst-case envelope (max_prompt_len + max_output_len)
       scaled by ``BudgetKnobs.kv_reserve_frac``.
     * With ``--calib_json data/kv_calib/<task>.json`` (produced by
       ``pipeline/kv_calib/run_calib.sh``): amortized ``μ + k·σ`` per
       request, using the task's measured ``total_len`` distribution.
-      Much tighter and defensible for a fixed workload.
 
-Pair with `gen_dyna_variants.py` (runtime dispatch variants per mc) and
-`pipeline/run_sweep.sh <task>` (efficiency or accuracy sweep).
+Pair with ``gen_dyna_variants.py`` (runtime dispatch variants per mc) and
+``pipeline/run_sweep.sh <task>`` (efficiency or accuracy sweep).
 """
 from __future__ import annotations
 
@@ -25,6 +39,7 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -38,10 +53,10 @@ sys.path.insert(0, str(POLICY_DIR))
 import vram_estimator as vest  # noqa: E402
 from assign_experts import (  # noqa: E402
     _assign,
-    _composite_scores,
+    _assign_hybrid,
     _load_hessian_scores,
     _load_model_config,
-    _load_sensitivity_inputs,
+    _load_token_counts,
     _write_outputs,
 )
 
@@ -63,9 +78,8 @@ INT4_CKPT = (
     "/data/huggingface/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/"
     "snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441"
 )
-LAYER_SENS = SENS_DIR / "per_moe_layer" / "results" / "summary.json"
-EXPERT_SENS = SENS_DIR / "per_expert" / "results" / "summary.json"
 HESSIAN_SCORES = ROOT_DIR / "hessian" / "results" / "hessian_scores.json"
+TOKEN_COUNTS = SENS_DIR / "per_expert" / "results" / "summary.json"
 
 MAX_PROMPT_LEN = 2048
 MAX_OUTPUT_LEN = 2048
@@ -82,10 +96,9 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--calib_json",
         type=Path,
-        help="Path to a calib_kv.py output JSON "
-             "(e.g. data/kv_calib/sharegpt/calib.json). "
-             "When its recommended_slo has mean_total_len + std_total_len, "
-             "kv_bytes uses the amortized μ+k·σ branch.",
+        help="Path to a calib_kv.py output JSON. When its recommended_slo "
+             "has mean_total_len + std_total_len, kv_bytes uses the "
+             "amortized μ+k·σ branch.",
     )
     ap.add_argument(
         "--max_prompt_len", type=int, default=MAX_PROMPT_LEN,
@@ -100,21 +113,32 @@ def _parse_args() -> argparse.Namespace:
 
     ranking = ap.add_mutually_exclusive_group()
     ranking.add_argument(
-        "--hessian", dest="ranking", action="store_const", const="hessian",
-        help="Rank experts by per-expert ½·dᵀHd from hessian_scores.json "
-             "(default). Signed score: positive = INT4 hurts; negative = "
-             "INT4 is neutral or helpful.",
+        "--hessian_importance", dest="ranking",
+        action="store_const", const="hessian_importance",
+        help="(default) Rank by signed Hessian; cap K at experts above the "
+             "|first-order|-mean noise floor.",
     )
     ranking.add_argument(
-        "--sensitivity", dest="ranking", action="store_const", const="sensitivity",
-        help="Legacy ranking: max(0, ppl_increase[L]) × L2[L][E] / ΣL2[L]. "
-             "Requires sensitivity summaries in --layer_sens / --expert_sens.",
+        "--activation_frequency", dest="ranking",
+        action="store_const", const="activation_frequency",
+        help="Rank purely by routed-token count; fill the full VRAM budget.",
     )
-    ap.set_defaults(ranking="hessian")
+    ranking.add_argument(
+        "--hybrid", dest="ranking",
+        action="store_const", const="hybrid",
+        help="Top fo_cap by Hessian, then fill the leftover VRAM (budget_k − "
+             "fo_cap) with the highest-token-count experts among the rest.",
+    )
+    ap.set_defaults(ranking="hessian_importance")
 
     ap.add_argument(
         "--hessian_path", type=Path, default=HESSIAN_SCORES,
-        help="Path to hessian_scores.json (only used when --hessian).",
+        help="hessian_scores.json (used by --hessian_importance and --hybrid).",
+    )
+    ap.add_argument(
+        "--token_count_path", type=Path, default=TOKEN_COUNTS,
+        help="per-expert summary with token_count (used by "
+             "--activation_frequency and --hybrid).",
     )
     ap.add_argument(
         "--dry_run", action="store_true",
@@ -122,35 +146,21 @@ def _parse_args() -> argparse.Namespace:
              "summaries, K, |fo|_mean) but do not create any files.",
     )
 
-    fo = ap.add_mutually_exclusive_group()
-    fo.add_argument(
-        "--fo_threshold", dest="fo_threshold", action="store_true",
-        help="Cap K at the number of experts whose hessian_score exceeds the "
-             "mean |first_order_score| (default). Experts below this noise "
-             "floor are statistically indistinguishable from zero — spending "
-             "BF16 budget on them doesn't improve accuracy.",
-    )
-    fo.add_argument(
-        "--no_fo_threshold", dest="fo_threshold", action="store_false",
-        help="Disable the |fo|-mean cap: fill the full VRAM-budget K with top "
-             "scores even when most are near-noise-floor. Useful for A/B.",
-    )
-    ap.set_defaults(fo_threshold=True)
-
-    ap.add_argument(
-        "--layer_sens", type=Path, default=LAYER_SENS,
-        help="Per-layer PPL sensitivity summary (only used when --sensitivity).",
-    )
-    ap.add_argument(
-        "--expert_sens", type=Path, default=EXPERT_SENS,
-        help="Per-expert L2 sensitivity summary (only used when --sensitivity).",
-    )
     ap.add_argument(
         "--attention_num_bits", type=int, choices=(16, 4), default=16,
         help="Embedded into the produced heter_config.json. 4 = the runtime "
              "swaps every layer's self_attn.qkv_proj+o_proj to INT4 GPTQ-Marlin "
              "at server load (reusing the INT4 group's checkpoint). 16 (default) "
              "leaves attention BF16.",
+    )
+    ap.add_argument(
+        "--bf16_promotion_threshold", type=int, required=True,
+        help="Required. Routed-token count above which the runtime promotes "
+             "an expert to BF16 (universal, applies on top of any scoring "
+             "policy). Profile-derived for the target GPU/kernel stack: e.g. "
+             "Qwen3-30B-A3B GPTQ-Marlin INT4 vs BF16 crossover sits at ~72 "
+             "on A100. Embedded as a top-level field in the produced "
+             "heter_config.json.",
     )
     return ap.parse_args()
 
@@ -181,6 +191,127 @@ def _load_calib(path: Path, logger: logging.Logger) -> dict:
             "worst-case KV.", path,
         )
     return stats
+
+
+def _build_importance_hessian(
+    scores: Dict[Tuple[int, int], float],
+    fo_mean: float,
+    num_layers: int,
+    num_experts: int,
+    logger: logging.Logger,
+) -> Dict[int, List[float]]:
+    """Per-layer importance row: hessian where above fo_mean, else 0.
+
+    Layers with no above-floor experts fall back to all-ones (the runtime
+    dispatch policy can't sort by an all-zero importance vector).
+    """
+    importance: Dict[int, List[float]] = {}
+    fallback_layers: List[int] = []
+    above_per_layer: List[int] = []
+    for L in range(num_layers):
+        row = [
+            (scores[(L, E)] if scores[(L, E)] > fo_mean else 0.0)
+            for E in range(num_experts)
+        ]
+        zeros = sum(1 for v in row if v == 0.0)
+        if zeros == num_experts:
+            row = [1.0] * num_experts
+            fallback_layers.append(L)
+        importance[L] = row
+        above_per_layer.append(num_experts - zeros)
+    logger.info(
+        "  importance: per-layer #above fo_mean min/med/max=%d/%d/%d; "
+        "%d layers fell back to all-ones",
+        min(above_per_layer),
+        sorted(above_per_layer)[len(above_per_layer) // 2],
+        max(above_per_layer),
+        len(fallback_layers),
+    )
+    return importance
+
+
+def _build_importance_tokencount(
+    token_counts: Dict[Tuple[int, int], int],
+    num_layers: int,
+    num_experts: int,
+    logger: logging.Logger,
+) -> Dict[int, List[float]]:
+    """Per-layer importance row = token_count.
+
+    Layers with all-zero token counts fall back to all-ones so runtime
+    dispatch can still order experts within that layer.
+    """
+    importance: Dict[int, List[float]] = {}
+    fallback_layers: List[int] = []
+    for L in range(num_layers):
+        row = [float(token_counts[(L, E)]) for E in range(num_experts)]
+        if sum(row) == 0.0:
+            row = [1.0] * num_experts
+            fallback_layers.append(L)
+        importance[L] = row
+    logger.info(
+        "  importance: token_count rows; %d layers fell back to all-ones",
+        len(fallback_layers),
+    )
+    return importance
+
+
+def _build_importance_hybrid(
+    hessian_scores: Dict[Tuple[int, int], float],
+    token_counts: Dict[Tuple[int, int], int],
+    fo_mean: float,
+    heter_pairs: List[Tuple[int, int]],
+    kind_by_pair: Dict[Tuple[int, int], str],
+    num_layers: int,
+    num_experts: int,
+    logger: logging.Logger,
+) -> Dict[int, List[float]]:
+    """Per-layer importance for hybrid: Hessian-chosen experts get their
+    Hessian score; gap-fill experts get token_count rescaled per-layer to
+    sit strictly below the smallest Hessian-chosen score in that layer
+    (so Hessian-critical experts always win contested promotions); other
+    experts get 0.
+
+    A layer with neither Hessian-chosen nor gap-fill experts falls back
+    to all-ones.
+    """
+    importance: Dict[int, List[float]] = {}
+    fallback_layers: List[int] = []
+    by_layer: Dict[int, List[Tuple[int, str]]] = {L: [] for L in range(num_layers)}
+    for (L, E) in heter_pairs:
+        by_layer[L].append((E, kind_by_pair[(L, E)]))
+
+    for L in range(num_layers):
+        row = [0.0] * num_experts
+        hess_experts = [E for E, k in by_layer[L] if k == "hessian"]
+        fill_experts = [E for E, k in by_layer[L] if k == "tokencount"]
+
+        for E in hess_experts:
+            row[E] = hessian_scores[(L, E)]
+
+        if fill_experts:
+            tc_max = max(token_counts[(L, E)] for E in fill_experts)
+            if hess_experts:
+                h_min = min(row[E] for E in hess_experts)
+                # Strictly below the lowest Hessian-chosen value in this layer.
+                ceiling = max(0.0, h_min) * 0.99
+            else:
+                ceiling = 1.0
+            scale = ceiling / tc_max if tc_max > 0 else 0.0
+            for E in fill_experts:
+                row[E] = scale * token_counts[(L, E)]
+
+        if not hess_experts and not fill_experts:
+            row = [1.0] * num_experts
+            fallback_layers.append(L)
+
+        importance[L] = row
+
+    logger.info(
+        "  importance: hybrid rows; %d layers fell back to all-ones",
+        len(fallback_layers),
+    )
+    return importance
 
 
 def main() -> int:
@@ -214,70 +345,43 @@ def main() -> int:
         num_layers, num_experts, num_experts * num_layers,
     )
 
-    fo_mean: float | None = None
-    fo_cap: int | None = None
-    expert_importance: dict | None = None
-    if args.ranking == "hessian":
-        logger.info("Ranking policy: hessian (%s)", args.hessian_path)
-        scores, first_order = _load_hessian_scores(
+    # Load whichever signals the chosen policy needs.
+    hessian_scores: Optional[Dict[Tuple[int, int], float]] = None
+    first_order: Optional[Dict[Tuple[int, int], float]] = None
+    token_counts: Optional[Dict[Tuple[int, int], int]] = None
+    fo_mean: Optional[float] = None
+    fo_cap: Optional[int] = None
+
+    if args.ranking in ("hessian_importance", "hybrid"):
+        logger.info("Loading hessian scores: %s", args.hessian_path)
+        hessian_scores, first_order = _load_hessian_scores(
             str(args.hessian_path), num_layers, num_experts
         )
-        ppl: dict = {}
-        npos = sum(1 for v in scores.values() if v > 0)
-        nneg = sum(1 for v in scores.values() if v < 0)
+        npos = sum(1 for v in hessian_scores.values() if v > 0)
+        nneg = sum(1 for v in hessian_scores.values() if v < 0)
         logger.info(
             "  %d experts with positive hessian (BF16-critical), "
             "%d negative (INT4-preferred), %d zero",
-            npos, nneg, len(scores) - npos - nneg,
+            npos, nneg, len(hessian_scores) - npos - nneg,
         )
-
         fo_abs = [abs(v) for v in first_order.values()]
         fo_mean = sum(fo_abs) / len(fo_abs) if fo_abs else 0.0
-        fo_cap = sum(1 for v in scores.values() if v > fo_mean)
+        fo_cap = sum(1 for v in hessian_scores.values() if v > fo_mean)
         logger.info(
-            "  |fo|_mean=%.3e → %d experts above noise floor "
-            "(fo_threshold=%s)",
-            fo_mean, fo_cap, args.fo_threshold,
+            "  |fo|_mean=%.3e → %d experts above noise floor",
+            fo_mean, fo_cap,
         )
 
-        expert_importance = {}
-        fallback_layers: list[int] = []
-        zero_counts: list[int] = []
-        for L in range(num_layers):
-            row = [
-                (scores[(L, E)] if scores[(L, E)] > fo_mean else 0.0)
-                for E in range(num_experts)
-            ]
-            zeros = sum(1 for v in row if v == 0.0)
-            if zeros == num_experts:
-                row = [1.0] * num_experts
-                fallback_layers.append(L)
-            expert_importance[L] = row
-            zero_counts.append(zeros)
-        above = [num_experts - z for z in zero_counts]
-        logger.info(
-            "  importance: per-layer #above fo_mean min/med/max="
-            "%d/%d/%d; %d layers fell back to all-ones",
-            min(above), sorted(above)[len(above) // 2], max(above),
-            len(fallback_layers),
+    if args.ranking in ("activation_frequency", "hybrid"):
+        logger.info("Loading token counts: %s", args.token_count_path)
+        token_counts = _load_token_counts(
+            str(args.token_count_path), num_layers, num_experts
         )
-    else:
-        if args.fo_threshold and args.ranking != "hessian":
-            logger.info(
-                "fo_threshold has no effect with --sensitivity ranking; ignored."
-            )
-        logger.info(
-            "Ranking policy: sensitivity (layer=%s expert=%s)",
-            args.layer_sens, args.expert_sens,
-        )
-        ppl, l2 = _load_sensitivity_inputs(
-            str(args.layer_sens), str(args.expert_sens),
-            num_layers, num_experts,
-        )
-        scores = _composite_scores(ppl, l2, num_experts)
 
+    logger.info("Ranking policy: %s", args.ranking)
     logger.info("Sweeping max_concurrency ∈ %s (task=%s, out=%s)",
                 MC_LIST, args.task or "<default>", out_root)
+
     summary = []
     for mc in MC_LIST:
         slo = vest.SLO(
@@ -296,8 +400,15 @@ def main() -> int:
                 "[mc=%d] bf16_budget=0; writing outputs with K=0 (all INT4).", mc
             )
 
-        fo_report: dict | None = None
-        if args.ranking == "hessian" and args.fo_threshold:
+        # Policy dispatch: select pairs, build score-for-reporting, build
+        # expert_importance, fill in policy-specific report fields.
+        fo_report: Optional[dict] = None
+        hybrid_split: Optional[dict] = None
+        kind_by_pair: Optional[Dict[Tuple[int, int], str]] = None
+        expert_importance: Dict[int, List[float]]
+
+        if args.ranking == "hessian_importance":
+            assert hessian_scores is not None and fo_cap is not None
             k = min(budget_k, fo_cap)
             fo_report = {
                 "enabled": True,
@@ -312,29 +423,70 @@ def main() -> int:
                     "[mc=%d] capping K: budget=%d, |fo|-above=%d → K=%d",
                     mc, budget_k, fo_cap, k,
                 )
-        else:
-            k = budget_k
-            if args.ranking == "hessian":
-                fo_report = {
-                    "enabled": False,
-                    "fo_mean": fo_mean,
-                    "fo_cap": fo_cap,
-                    "budget_k": budget_k,
-                    "effective_k": k,
-                    "capped": False,
-                }
+            heter, int4_only = _assign(hessian_scores, k)
+            score_by_pair = hessian_scores
+            expert_importance = _build_importance_hessian(
+                hessian_scores, fo_mean, num_layers, num_experts, logger
+            )
 
-        heter, int4_only = _assign(scores, k)
+        elif args.ranking == "activation_frequency":
+            assert token_counts is not None
+            tc_scores = {k: float(v) for k, v in token_counts.items()}
+            k = budget_k
+            heter, int4_only = _assign(tc_scores, k)
+            score_by_pair = tc_scores
+            expert_importance = _build_importance_tokencount(
+                token_counts, num_layers, num_experts, logger
+            )
+
+        else:  # hybrid
+            assert (
+                hessian_scores is not None
+                and token_counts is not None
+                and fo_cap is not None
+            )
+            k_hess = min(budget_k, fo_cap)
+            k_fill = max(0, budget_k - k_hess)
+            logger.info(
+                "[mc=%d] hybrid split: hessian=%d, tokencount_fill=%d "
+                "(budget_k=%d, fo_cap=%d)",
+                mc, k_hess, k_fill, budget_k, fo_cap,
+            )
+            heter, int4_only, kind_by_pair = _assign_hybrid(
+                hessian_scores, token_counts, k_hess, k_fill
+            )
+            # For top_scores reporting: use the score that drove each pair's
+            # selection. Hessian segment shows hessian; gap-fill shows
+            # token_count. Units differ — kind_by_pair disambiguates.
+            score_by_pair = {}
+            for p in heter:
+                if kind_by_pair[p] == "hessian":
+                    score_by_pair[p] = hessian_scores[p]
+                else:
+                    score_by_pair[p] = float(token_counts[p])
+            for p in int4_only:
+                score_by_pair[p] = hessian_scores[p]
+            hybrid_split = {
+                "fo_mean": fo_mean,
+                "fo_cap": fo_cap,
+                "budget_k": budget_k,
+                "k_hessian": k_hess,
+                "k_tokencount_fill": k_fill,
+            }
+            expert_importance = _build_importance_hybrid(
+                hessian_scores, token_counts, fo_mean,
+                heter, kind_by_pair,
+                num_layers, num_experts, logger,
+            )
 
         mc_dir = out_root / f"mc{mc}"
         if args.dry_run:
             planned = [
                 "int4_only_experts.json",
                 "heter_config.json",
+                "expert_importance.json",
                 "assignment_report.json",
             ]
-            if expert_importance is not None:
-                planned.append("expert_importance.json")
             logger.info(
                 "[mc=%d] DRY-RUN would write to %s: %s (K=%d heter / %d int4-only)",
                 mc, mc_dir, ", ".join(planned), len(heter), len(int4_only),
@@ -349,13 +501,15 @@ def main() -> int:
                 budget=budget,
                 slo=slo,
                 knobs=knobs,
-                scores=scores,
-                ppl=ppl,
+                scores=score_by_pair,
                 num_layers=num_layers,
+                bf16_promotion_threshold=args.bf16_promotion_threshold,
                 ranking_policy=args.ranking,
                 fo_threshold=fo_report,
                 expert_importance=expert_importance,
                 attention_num_bits=args.attention_num_bits,
+                kind_by_pair=kind_by_pair,
+                hybrid_split=hybrid_split,
             )
             logger.info(
                 "[mc=%d] K=%d heter / %d int4-only → %s",

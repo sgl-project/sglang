@@ -14,6 +14,13 @@ Flags forwarded to both:
                         attention qkv_proj+o_proj to INT4 GPTQ-Marlin
                         (only applies to gen_heter_configs; variants
                         deep-copy the base config so they inherit it).
+  --heter_residence {hessian_importance, activation_frequency, hybrid}
+                        static-assignment ranking policy. Forwarded to
+                        gen_heter_configs.py as --<value>.
+  --bf16_promotion_threshold N
+                        runtime threshold for routed-token-count → BF16
+                        promotion. Required by gen_heter_configs.py;
+                        passed through unchanged.
 
 After this, run `bash pipeline/run_sweep.sh <task>`.
 """
@@ -25,6 +32,8 @@ import sys
 from pathlib import Path
 
 THIS_DIR = Path(__file__).resolve().parent
+
+_RANKING_POLICIES = ("hessian_importance", "activation_frequency", "hybrid")
 
 
 def _run(script: str, extra: list[str]) -> int:
@@ -46,6 +55,20 @@ def main() -> int:
         default=16,
         help="Forwarded to gen_heter_configs.py; baked into heter_config.json.",
     )
+    ap.add_argument(
+        "--heter_residence",
+        choices=_RANKING_POLICIES,
+        default="hessian_importance",
+        help="Static-assignment ranking policy. Forwarded to "
+             "gen_heter_configs.py as --<value>.",
+    )
+    ap.add_argument(
+        "--bf16_promotion_threshold",
+        type=int,
+        required=True,
+        help="Routed-token-count threshold for BF16 promotion. "
+             "Required by gen_heter_configs.py.",
+    )
     args = ap.parse_args()
 
     heter_args: list[str] = []
@@ -56,6 +79,8 @@ def main() -> int:
     if args.calib_json:
         heter_args += ["--calib_json", args.calib_json]
     heter_args += ["--attention_num_bits", str(args.attention_num_bits)]
+    heter_args += ["--bf16_promotion_threshold", str(args.bf16_promotion_threshold)]
+    heter_args += [f"--{args.heter_residence}"]
 
     steps = [
         ("gen_heter_configs.py", heter_args),

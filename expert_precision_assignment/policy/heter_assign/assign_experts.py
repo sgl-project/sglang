@@ -1,17 +1,24 @@
 """Static expert precision assignment helpers for HeterFusedMoE.
 
-Pure library module: given per-layer PPL sensitivity and per-expert L2
-sensitivity plus a VRAM budget, pick which experts are heter (dual
-BF16+INT4) vs INT4-only and write out the three config files sglang
-needs.
+Pure library module: given a VRAM budget and per-(layer, expert) signals
+(Hessian sensitivity and/or routed-token counts), pick which experts are
+heter (dual BF16+INT4) vs INT4-only and write out the config files
+sglang needs.
+
+Three ranking policies are supported:
+  * ``hessian_importance``: signed ½·dᵀHd from ``hessian/`` capped at the
+    |first-order|-mean noise floor.
+  * ``activation_frequency``: token_count from
+    ``legacy/sensitivity/per_expert/`` (raw routed-token counts).
+  * ``hybrid``: top fo_cap by Hessian, then fill the leftover VRAM with
+    the next-highest experts by token_count.
 
 Called by ``experiments/pipeline/gen_config/gen_heter_configs.py`` (the only entry point).
 Writes to ``out_dir``:
   int4_only_experts.json  -- per-layer expert-id lists
   heter_config.json       -- ready for ``--heter-precision-config``
   assignment_report.json  -- VRAM breakdown, K, per-layer counts, top scores
-
-See docs/superpowers/specs/2026-04-19-static-expert-assignment-design.md.
+  expert_importance.json  -- per-layer per-expert prior for runtime dispatch
 """
 from __future__ import annotations
 
@@ -20,7 +27,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 sys.path.insert(0, str(Path(__file__).parent))
 import vram_estimator as vest  # noqa: E402
@@ -43,68 +50,41 @@ def _load_model_config(model_path: str):
     )
 
 
-def _load_sensitivity_inputs(
-    layer_path: str,
-    expert_path: str,
+def _load_token_counts(
+    summary_path: str,
     num_layers: int,
     num_experts: int,
-) -> Tuple[Dict[int, float], Dict[int, Dict[int, Tuple[float, int]]]]:
-    """Return (ppl_increase_by_layer, l2_and_tokencount_by_layer_expert)."""
-    with open(layer_path) as f:
-        layer_d = json.load(f)
-    with open(expert_path) as f:
-        expert_d = json.load(f)
+) -> Dict[Tuple[int, int], int]:
+    """Load per-(layer, expert) routed-token counts from the per-expert
+    sensitivity summary at ``legacy/sensitivity/per_expert/results/summary.json``.
 
-    ppl: Dict[int, float] = {}
-    for k, v in layer_d["per_layer"].items():
-        ppl[int(k)] = float(v["ppl_increase"])
+    The file's ``sensitivity`` column is unused here — only ``token_count``
+    is consumed. Layers / experts missing from the file fail loud.
+    """
+    with open(summary_path) as f:
+        d = json.load(f)
+    per_layer = d.get("per_layer")
+    if per_layer is None:
+        raise ValueError(f"{summary_path}: missing 'per_layer'")
 
-    l2: Dict[int, Dict[int, Tuple[float, int]]] = {}
-    for k, v in expert_d["per_layer"].items():
-        L = int(k)
-        row: Dict[int, Tuple[float, int]] = {}
-        for ek, ev in v["experts"].items():
-            row[int(ek)] = (float(ev["sensitivity"]), int(ev["token_count"]))
-        l2[L] = row
+    tc: Dict[Tuple[int, int], int] = {}
+    for L_str, layer_d in per_layer.items():
+        L = int(L_str)
+        for E_str, e_d in layer_d.get("experts", {}).items():
+            tc[(L, int(E_str))] = int(e_d["token_count"])
 
-    # Coverage validation — fail loud if anything is missing.
-    missing_layers = [L for L in range(num_layers) if L not in ppl]
-    if missing_layers:
+    missing = [
+        (L, E)
+        for L in range(num_layers)
+        for E in range(num_experts)
+        if (L, E) not in tc
+    ]
+    if missing:
         raise ValueError(
-            f"layer_sensitivity missing layers: {missing_layers[:10]}"
-            f"{' ...' if len(missing_layers) > 10 else ''}"
+            f"token_count missing {len(missing)} (layer, expert) pairs, "
+            f"first 10: {missing[:10]}"
         )
-    for L in range(num_layers):
-        if L not in l2:
-            raise ValueError(f"expert_sensitivity missing layer {L}")
-        missing_experts = [E for E in range(num_experts) if E not in l2[L]]
-        if missing_experts:
-            raise ValueError(
-                f"expert_sensitivity layer {L} missing experts: "
-                f"{missing_experts[:10]}"
-                f"{' ...' if len(missing_experts) > 10 else ''}"
-            )
-    return ppl, l2
-
-
-def _composite_scores(
-    ppl: Dict[int, float],
-    l2: Dict[int, Dict[int, Tuple[float, int]]],
-    num_experts: int,
-) -> Dict[Tuple[int, int], float]:
-    """score(L, E) = max(0, ppl_increase[L]) * l2[L][E] / sum_E l2[L]
-    Forced to 0 when ppl<=0 or token_count==0."""
-    scores: Dict[Tuple[int, int], float] = {}
-    for L, experts in l2.items():
-        layer_ppl = max(0.0, ppl[L])
-        sum_l2 = sum(s for s, _ in experts.values())
-        if sum_l2 <= 0 or layer_ppl <= 0:
-            for E in range(num_experts):
-                scores[(L, E)] = 0.0
-            continue
-        for E, (s, tc) in experts.items():
-            scores[(L, E)] = 0.0 if tc == 0 else layer_ppl * s / sum_l2
-    return scores
+    return tc
 
 
 def _load_hessian_scores(
@@ -160,8 +140,10 @@ def _assign(
     scores: Dict[Tuple[int, int], float],
     K: int,
 ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]]]:
-    """Return (heter_experts, int4_only_experts). Top-K by score → heter."""
-    # Deterministic ordering: score DESC, layer ASC, expert ASC.
+    """Return (heter_experts, int4_only_experts). Top-K by score → heter.
+
+    Deterministic ordering: score DESC, layer ASC, expert ASC.
+    """
     ranked = sorted(
         scores.items(),
         key=lambda kv: (-kv[1], kv[0][0], kv[0][1]),
@@ -169,6 +151,36 @@ def _assign(
     heter = [k for k, _ in ranked[:K]]
     int4_only = [k for k, _ in ranked[K:]]
     return heter, int4_only
+
+
+def _assign_hybrid(
+    hessian_scores: Dict[Tuple[int, int], float],
+    token_counts: Dict[Tuple[int, int], int],
+    k_hess: int,
+    k_fill: int,
+) -> Tuple[
+    List[Tuple[int, int]],
+    List[Tuple[int, int]],
+    Dict[Tuple[int, int], str],
+]:
+    """Two-stage selection: top ``k_hess`` by Hessian, then top ``k_fill``
+    by token_count from the remainder.
+
+    Returns (heter, int4_only, kind_by_pair) where kind_by_pair maps every
+    selected pair to either ``"hessian"`` or ``"tokencount"``.
+    """
+    hess_top, rest = _assign(hessian_scores, k_hess)
+    rest_token_counts = {k: float(token_counts[k]) for k in rest}
+    fill_top, fill_rest = _assign(rest_token_counts, k_fill)
+
+    heter = hess_top + fill_top
+    int4_only = fill_rest
+    kind_by_pair: Dict[Tuple[int, int], str] = {}
+    for k in hess_top:
+        kind_by_pair[k] = "hessian"
+    for k in fill_top:
+        kind_by_pair[k] = "tokencount"
+    return heter, int4_only, kind_by_pair
 
 
 def _write_outputs(
@@ -181,12 +193,14 @@ def _write_outputs(
     slo: vest.SLO,
     knobs: vest.BudgetKnobs,
     scores: Dict[Tuple[int, int], float],
-    ppl: Dict[int, float],
     num_layers: int,
-    ranking_policy: str = "sensitivity",
-    fo_threshold: dict | None = None,
-    expert_importance: Dict[int, List[float]] | None = None,
+    bf16_promotion_threshold: int,
+    ranking_policy: str,
+    fo_threshold: Optional[dict] = None,
+    expert_importance: Optional[Dict[int, List[float]]] = None,
     attention_num_bits: int = 16,
+    kind_by_pair: Optional[Dict[Tuple[int, int], str]] = None,
+    hybrid_split: Optional[dict] = None,
 ) -> Tuple[Path, Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -199,7 +213,7 @@ def _write_outputs(
     with open(int4_path, "w") as f:
         json.dump(by_layer, f, indent=2)
 
-    importance_path: Path | None = None
+    importance_path: Optional[Path] = None
     if expert_importance is not None:
         importance_path = out_dir / "expert_importance.json"
         # Keep keys as strings so the runtime loader can index by str(layer_id).
@@ -221,10 +235,9 @@ def _write_outputs(
             {"name": "hot", "num_bits": 16},
         ],
         "policy": "expert_batch",
-        "policy_params": {"threshold": 128},
+        "policy_params": {},
+        "bf16_promotion_threshold": int(bf16_promotion_threshold),
         "int4_only_experts_file": str(int4_path.resolve()),
-        # 4 = runtime swaps self_attn.{qkv_proj,o_proj} to INT4 GPTQ-Marlin
-        # using the cold group's checkpoint above. 16 = leave attention BF16.
         "attention_num_bits": attention_num_bits,
     }
     if importance_path is not None:
@@ -246,15 +259,17 @@ def _write_outputs(
         }
         for L in range(num_layers)
     }
-    top_scores = [
-        {"layer": L, "expert": E, "score": scores[(L, E)]}
-        for (L, E) in heter[:20]
-    ]
-    zero_layers = sorted(L for L, v in ppl.items() if v <= 0)
+    top_scores = []
+    for (L, E) in heter[:20]:
+        entry = {"layer": L, "expert": E, "score": scores[(L, E)]}
+        if kind_by_pair is not None:
+            entry["kind"] = kind_by_pair.get((L, E), "?")
+        top_scores.append(entry)
 
     report = {
         "ranking_policy": ranking_policy,
         "fo_threshold": fo_threshold,
+        "hybrid_split": hybrid_split,
         "slo": {
             "max_concurrency": slo.max_concurrency,
             "max_prompt_len": slo.max_prompt_len,
@@ -276,7 +291,6 @@ def _write_outputs(
         "num_int4_only": len(int4_only),
         "per_layer_counts": per_layer_counts,
         "top_scores": top_scores,
-        "zero_layers": zero_layers,
     }
     report_path = out_dir / "assignment_report.json"
     with open(report_path, "w") as f:

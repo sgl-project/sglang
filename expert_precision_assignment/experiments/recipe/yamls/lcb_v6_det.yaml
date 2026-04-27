@@ -30,7 +30,7 @@ calibration:
 
 sweep:
   mc_list: [8, 16, 32, 64, 128, 256]
-  variants: [hot0, hot20, hot40, hot60, hot80, hot100,
+  dynamic_variants: [hot0, hot20, hot40, hot60, hot80, hot100,
              thr32, thr64, thr128, thr256, thr512]
   gpus: [4, 5, 6, 7]          # split pool — supergpqa_det runs on 0-3
   num_prompts: 0

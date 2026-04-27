@@ -31,7 +31,7 @@ calibration:
 
 sweep:
   mc_list: [32]      # single cell at mc=32
-  variants: [hess0]  # single hessian-routing variant
+  dynamic_variants: [hess0]  # single hessian-routing variant
   gpus: [4]
   num_prompts: 0     # ignored in bench_eval mode
   limit: 8           # bench_eval --limit (8 docs per cell)

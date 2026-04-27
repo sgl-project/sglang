@@ -8,8 +8,9 @@ Variant naming convention — the prefix encodes the policy:
   - hess<N>  policy=hessian_weighted_routing_weights, hot ratio N%
              (importance × per-expert total routing weight)
              Requires the base heter_config.json to carry
-             ``expert_importance_file`` (produced by
-             ``gen_heter_configs.py --hessian``, the default).
+             ``expert_importance_file`` — produced by every ranking
+             policy in ``gen_heter_configs.py`` (--hessian_importance
+             default, --activation_frequency, --hybrid).
   - hot<N>   policy=expert_load,                       hot ratio N%
   - thr<N>   policy=expert_batch,                      threshold=N
 
@@ -93,7 +94,10 @@ def _build_variant(base: dict, name: str) -> dict:
     if name.startswith("thr"):
         param = int(name[len("thr"):])
         cfg["policy"] = "expert_batch"
-        cfg["policy_params"] = {"threshold": param}
+        # ``expert_batch`` is the no-scoring trivial policy; the threshold is
+        # universal and lives top-level, not under ``policy_params``.
+        cfg["policy_params"] = {}
+        cfg["bf16_promotion_threshold"] = param
         for g in cfg["groups"]:
             g.pop("size_ratio", None)
         return cfg

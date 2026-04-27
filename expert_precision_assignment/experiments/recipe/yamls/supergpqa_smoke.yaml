@@ -26,6 +26,6 @@ calibration:
 
 sweep:
   mc_list: [32]                # single cell at mc=32
-  variants: [thr128]           # single variant
+  dynamic_variants: [thr128]           # single variant
   gpus: [4]                    # stay on GPU 4 (GPU 5 reserved for lcb_v6 smoke)
   num_prompts: 8               # all 8 prompts

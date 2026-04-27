@@ -36,7 +36,7 @@ calibration:
 
 sweep:
   mc_list: [64]
-  variants: [hess0, hess20, hess40, hess60, hess80, hess100]
+  dynamic_variants: [hess0, hess20, hess40, hess60, hess80, hess100]
   gpus: [4]
   num_prompts: 0          # ignored in bench_eval mode
   limit: 8                # 8 docs per cell — fast smoke
