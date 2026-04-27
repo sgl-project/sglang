@@ -48,6 +48,22 @@ export const MiMoV25Deployment = () => {
         { id: "disabled", label: "Disabled", default: false },
       ],
     },
+    dpAttention: {
+      name: "dpAttention",
+      title: "DP Attention",
+      items: [
+        { id: "enabled",  label: "Enabled",  default: false, subtitle: "auto for V2.5" },
+        { id: "disabled", label: "Disabled", default: true },
+      ],
+    },
+    expertParallelism: {
+      name: "expertParallelism",
+      title: "Expert Parallelism",
+      items: [
+        { id: "enabled",  label: "Enabled",  default: false, subtitle: "Pro Hopper" },
+        { id: "disabled", label: "Disabled", default: true },
+      ],
+    },
     deepep: {
       name: "deepep",
       title: "DeepEP",
@@ -100,34 +116,46 @@ export const MiMoV25Deployment = () => {
     `#   <node0-ip>  = IP of the head node (reachable from all others)\n` +
     `${cmd}`;
 
-  // Toggles whose `enabled` choice is incompatible with the current variant +
-  // hardware are returned as a map { optionName -> reason }. The render layer
-  // grays out the matching radio item, and a useEffect snaps any disallowed
-  // value back to `disabled` so the visible UI never disagrees with the
-  // command we actually generate.
-  const computeForcedOff = (variant, hardware) => {
+  // Toggles whose value is forced by the current variant + hardware. Returns
+  // { optionName -> { force: "enabled" | "disabled", reason } }. The render
+  // layer grays out the OTHER radio, and a useEffect snaps the value to the
+  // forced choice so the UI never disagrees with the generated command.
+  const computeConstraints = (variant, hardware) => {
     const isPro = variant === "pro";
     const spec = HW_VARIANT_SPEC[`${variant}|${hardware}`];
     const blackwell = spec ? spec.blackwell : false;
-    const forced = {};
-    if (!isPro) forced.eagleMtp = "EAGLE MTP applies to V2.5-Pro only.";
-    if (blackwell) forced.deepep = "Blackwell uses flashinfer_trtllm; DeepEP is Hopper / Ampere only.";
-    return forced;
+    const c = {};
+    if (!isPro) {
+      c.eagleMtp = { force: "disabled", reason: "EAGLE MTP applies to V2.5-Pro only." };
+      c.expertParallelism = { force: "disabled", reason: "Expert parallelism not used for V2.5." };
+      // V2.5 checkpoint forces DP-attn when tp/dp split > 1, otherwise dp=1 single group.
+      if (spec && spec.dp > 1) {
+        c.dpAttention = { force: "enabled", reason: "V2.5 checkpoint is TP=4-interleaved; DP-attention is required (--dp = tp/4)." };
+      } else {
+        c.dpAttention = { force: "disabled", reason: "Single attention group on this hardware (tp=4, dp=1)." };
+      }
+    }
+    if (blackwell) {
+      c.deepep = { force: "disabled", reason: "Blackwell uses flashinfer_trtllm; DeepEP is Hopper / Ampere only." };
+      if (isPro) c.expertParallelism = { force: "disabled", reason: "Blackwell uses flashinfer_trtllm; --ep-size is not used." };
+    }
+    return c;
   };
 
-  const resolveItems = (option, forced) => {
-    const reason = forced[option.name];
-    if (!reason) return option.items;
+  const resolveItems = (option, constraints) => {
+    const c = constraints[option.name];
+    if (!c) return option.items;
+    const grayId = c.force === "enabled" ? "disabled" : "enabled";
     return option.items.map((item) =>
-      item.id === "enabled" ? { ...item, disabled: true, disabledReason: reason } : item,
+      item.id === grayId ? { ...item, disabled: true, disabledReason: c.reason } : item,
     );
   };
 
   const getInitialState = () => {
     const initialState = {};
-    const forced = computeForcedOff("pro", "h200");
+    const constraints = computeConstraints("pro", "h200");
     for (const [key, option] of Object.entries(options)) {
-      const items = resolveItems(option, forced);
+      const items = resolveItems(option, constraints);
       const def = items.find((i) => i.default && !i.disabled) || items.find((i) => !i.disabled) || items[0];
       initialState[key] = def.id;
     }
@@ -155,15 +183,15 @@ export const MiMoV25Deployment = () => {
     return () => observer.disconnect();
   }, []);
 
-  // Snap forced-off toggles back to "disabled" whenever variant/hardware
-  // changes — keeps the visible radio in sync with generated command.
+  // Snap forced toggles to their required value whenever variant/hardware
+  // changes — keeps the visible radio in sync with the generated command.
   useEffect(() => {
-    const forced = computeForcedOff(values.modelVariant, values.hardware);
+    const constraints = computeConstraints(values.modelVariant, values.hardware);
     let patch = null;
-    for (const key of Object.keys(forced)) {
-      if (values[key] === "enabled") {
+    for (const [key, c] of Object.entries(constraints)) {
+      if (values[key] !== c.force) {
         patch = patch || {};
-        patch[key] = "disabled";
+        patch[key] = c.force;
       }
     }
     if (patch) setValues((prev) => ({ ...prev, ...patch }));
@@ -174,19 +202,19 @@ export const MiMoV25Deployment = () => {
   };
 
   const generateCommand = () => {
-    const { modelVariant, hardware, eagleMtp, deepep, reasoningParser, toolcall } = values;
+    const { modelVariant, hardware, eagleMtp, dpAttention, expertParallelism, deepep, reasoningParser, toolcall } = values;
     const specKey = `${modelVariant}|${hardware}`;
     const spec = HW_VARIANT_SPEC[specKey];
     const { slug, tp, multinode, nnodes, blackwell } = spec;
     const isPro = modelVariant === "pro";
-    // EAGLE MTP only applies to Pro. DeepEP only applies to Hopper paths
-    // (Blackwell uses flashinfer_trtllm); on Blackwell Pro the DeepEP toggle is a no-op.
+    // Toggles. EAGLE MTP / EP / DeepEP / DP-attn are gated by hardware + variant
+    // through computeConstraints; here we just read the (already-snapped) value.
     const useMtp = isPro && eagleMtp === "enabled";
     const useDeepep = !blackwell && deepep === "enabled";
-    // V2.5 (base) requires DP-attention with effective attention-TP = 4 per group;
-    // dp comes from the spec table. dp=1 on B200/GB300 means single attention group.
-    const baseDp = !isPro ? spec.dp : 0;
-    const useDpAttn = !isPro && baseDp > 1;
+    const useEp = isPro && !blackwell && expertParallelism === "enabled";
+    const useDpAttn = dpAttention === "enabled";
+    // dp size: V2.5 picks tp/4 from spec; Pro picks tp.
+    const dpSize = !isPro ? spec.dp : tp;
 
     // ---- env (kept inline before `sglang serve`, matching the verified launch style) ----
     const envVars = [];
@@ -203,11 +231,15 @@ export const MiMoV25Deployment = () => {
     flags.push(`  --tp ${tp}`);
 
     if (useDpAttn) {
-      flags.push(`  --dp ${baseDp}`);
+      flags.push(`  --dp ${dpSize}`);
       flags.push("  --enable-dp-attention");
-      flags.push("  --enable-dp-lm-head");
-      flags.push("  --mm-enable-dp-encoder");
+      if (!isPro) {
+        flags.push("  --enable-dp-lm-head");
+        flags.push("  --mm-enable-dp-encoder");
+      }
     }
+
+    if (useEp) flags.push(`  --ep ${tp}`);
 
     if (multinode) flags.push(...multiNodeFlags(nnodes));
 
@@ -218,7 +250,6 @@ export const MiMoV25Deployment = () => {
     } else if (useDeepep) {
       flags.push("  --moe-a2a-backend deepep");
       if (!isPro) flags.push("  --deepep-mode auto");
-      if (isPro) flags.push(`  --ep ${tp}`);
       flags.push("  --moe-dense-tp-size 1");
     }
 
@@ -314,12 +345,12 @@ export const MiMoV25Deployment = () => {
     border: `1px solid ${isDark ? "#374151" : "#e5e7eb"}`,
   };
 
-  const forcedOff = computeForcedOff(values.modelVariant, values.hardware);
+  const constraints = computeConstraints(values.modelVariant, values.hardware);
 
   return (
     <div style={containerStyle} className="not-prose">
       {Object.entries(options).map(([key, option]) => {
-        const items = resolveItems(option, forcedOff);
+        const items = resolveItems(option, constraints);
         return (
           <div key={key} style={cardStyle}>
             <div style={titleStyle}>{option.title}</div>
