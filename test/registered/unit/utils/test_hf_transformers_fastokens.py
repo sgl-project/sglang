@@ -24,6 +24,11 @@ except ImportError:
 @unittest.skipUnless(HAS_FASTOKENS, "fastokens package not installed")
 class TestFastokensBackend(CustomTestCase):
     def test_shim_is_applied(self):
+        # `_TokenizerShim` is fastokens' private compat shim. SGLang's
+        # integration relies on `tokenizer._tokenizer` being an instance of
+        # this class to confirm fastokens is wired up. If fastokens renames
+        # or restructures it, update both this assertion and any code in
+        # SGLang that depends on the same private name.
         from fastokens._compat import _TokenizerShim
 
         from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
