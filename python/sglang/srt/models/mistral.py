@@ -13,6 +13,7 @@
 # ==============================================================================
 """Inference-only Mistral model."""
 
+import logging
 from collections.abc import Iterable
 from typing import List
 
@@ -22,6 +23,8 @@ from transformers.models.mistral3.modeling_mistral3 import Mistral3MultiModalPro
 
 from sglang.srt.managers.schedule_batch import MultimodalDataItem
 from sglang.srt.models.llama import LlamaForCausalLM
+
+logger = logging.getLogger(__name__)
 
 
 class MistralForCausalLM(LlamaForCausalLM):
@@ -64,12 +67,10 @@ class MistralForCausalLMMistralFormat(MistralForCausalLM):
             for k, v in self.remapping.items():
                 match = re.fullmatch(k, name)
                 if match:
-                    name = re.sub(k, v, name)
+                    name = match.expand(v)
                     break
             else:
-                import logging
-
-                logging.warning(f"Unrecognized weight: {name}. Skipping.")
+                logger.warning(f"Unrecognized weight: {name}. Skipping.")
                 continue
 
             if name.endswith(".qscale_act"):
@@ -143,7 +144,7 @@ class Mistral3ForConditionalGeneration:
     def __call__(self, *args, **kwargs):
         return self.inner(*args, **kwargs)
 
-    def load_weights(self, weights):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         """Normalize transformers v5 Mistral3 weight names for
         LlavaForConditionalGeneration.load_weights.
 
