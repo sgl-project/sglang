@@ -69,6 +69,30 @@ def _parse_heter_config(config_path: str) -> Dict[str, Any]:
         assert abs(total_ratio - 1.0) < 1e-3, (
             f"size_ratios must sum to 1.0, got {total_ratio}"
         )
+
+    # ``bf16_promotion_threshold`` is a required top-level field. The runtime
+    # promotes any expert with routed-token count >= threshold to BF16 in the
+    # ABC dispatch loop, regardless of which scoring policy is in use. It is
+    # NOT a policy-specific parameter -- do not nest it under ``policy_params``.
+    if "bf16_promotion_threshold" not in cfg:
+        # Old configs put the threshold under ``policy_params.threshold`` --
+        # surface a clear migration error rather than silently defaulting.
+        legacy = (cfg.get("policy_params") or {}).get("threshold")
+        legacy_hint = (
+            f" (legacy ``policy_params.threshold``={legacy} found -- "
+            "move it to top-level ``bf16_promotion_threshold`` and remove "
+            "from policy_params)"
+            if legacy is not None else ""
+        )
+        raise ValueError(
+            f"heter_config {config_path}: missing required top-level "
+            f"``bf16_promotion_threshold``{legacy_hint}"
+        )
+    thr = cfg["bf16_promotion_threshold"]
+    if not isinstance(thr, int) or isinstance(thr, bool) or thr < 0:
+        raise ValueError(
+            f"bf16_promotion_threshold must be a non-negative int, got {thr!r}"
+        )
     # Load per-layer INT4-only expert lists if specified.
     # Format: {"layer_id": [expert_ids...], ...}
     # These experts have NO BF16 weights — always routed to INT4 kernel.
@@ -228,6 +252,11 @@ class HeterFusedMoE(nn.Module):
 
         policy_name = heter_config.get("policy", "expert_load")
         policy_kwargs = dict(heter_config.get("policy_params", {}))
+        # Universal BF16 promotion threshold lives at the top level, not under
+        # policy_params. Strip any stray legacy ``threshold`` from policy_params
+        # so it isn't double-passed to the policy ctor.
+        policy_kwargs.pop("threshold", None)
+        bf16_promotion_threshold = int(heter_config["bf16_promotion_threshold"])
 
         importance_file = heter_config.get("expert_importance_file")
         self.expert_importance: Optional[torch.Tensor] = None
@@ -260,6 +289,7 @@ class HeterFusedMoE(nn.Module):
             policy_name,
             num_experts=num_experts,
             group_size_ratios=self.group_ratios,
+            bf16_promotion_threshold=bf16_promotion_threshold,
             device=self.device,
             int4_only_mask=self._int4_only_mask,
             int4_group_idx=self._int4_group_idx,

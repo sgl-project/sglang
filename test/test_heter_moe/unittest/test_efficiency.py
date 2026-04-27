@@ -274,6 +274,7 @@ def bf16_layer(layer_shared_weights):
         "groups": [{"name": "all", "num_bits": 16, "size_ratio": 1.0}],
         "policy": "random",
         "policy_params": {"seed": SEED},
+        "bf16_promotion_threshold": 10**9,
     }
     layer = _make_layer(cfg)
     layer.w13_weight.data.copy_(bf16_w13)
@@ -296,6 +297,7 @@ def mixed_layer(layer_shared_weights):
         ],
         "policy": "random",
         "policy_params": {"seed": SEED},
+        "bf16_promotion_threshold": 10**9,
     }
     layer = _make_layer(cfg)
     layer.w13_weight.data.copy_(bf16_w13)
