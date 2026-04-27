@@ -155,6 +155,9 @@ def patch_prefill_only_deterministic_inference_for_cuda_graph(
             server_args, "enable_flashinfer_allreduce_fusion", False
         ),
         "rl_on_policy_target": getattr(server_args, "rl_on_policy_target", None),
+        "true_on_policy_contract": getattr(
+            server_args, "true_on_policy_contract", None
+        ),
         "disable_custom_all_reduce": getattr(
             server_args, "disable_custom_all_reduce", False
         ),
@@ -170,6 +173,9 @@ def patch_prefill_only_deterministic_inference_for_cuda_graph(
             ),
             "rl_on_policy_target": getattr(
                 global_server_args, "rl_on_policy_target", None
+            ),
+            "true_on_policy_contract": getattr(
+                global_server_args, "true_on_policy_contract", None
             ),
             "disable_custom_all_reduce": getattr(
                 global_server_args, "disable_custom_all_reduce", False
@@ -201,6 +207,7 @@ def patch_prefill_only_deterministic_inference_for_cuda_graph(
         obj.enable_deterministic_inference = False
         obj.enable_flashinfer_allreduce_fusion = True
         obj.rl_on_policy_target = None
+        obj.true_on_policy_contract = None
         obj.disable_custom_all_reduce = False
 
     def _restore(obj: Any, state: dict[str, Any]) -> None:

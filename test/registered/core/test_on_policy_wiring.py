@@ -445,6 +445,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
             enable_deterministic_inference=True,
             enable_flashinfer_allreduce_fusion=False,
             rl_on_policy_target="fsdp_tp",
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
             disable_custom_all_reduce=True,
         )
         global_server_args = SimpleNamespace(
@@ -452,6 +453,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
             enable_deterministic_inference=True,
             enable_flashinfer_allreduce_fusion=False,
             rl_on_policy_target="fsdp_tp",
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
             disable_custom_all_reduce=True,
         )
         attn_backend = SimpleNamespace(num_splits=1)
@@ -492,6 +494,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
                     self.assertFalse(server_args.enable_deterministic_inference)
                     self.assertTrue(server_args.enable_flashinfer_allreduce_fusion)
                     self.assertIsNone(server_args.rl_on_policy_target)
+                    self.assertIsNone(server_args.true_on_policy_contract)
+                    self.assertIsNone(global_server_args.rl_on_policy_target)
+                    self.assertIsNone(global_server_args.true_on_policy_contract)
                     self.assertEqual(attn_backend.num_splits, 0)
                     self.assertEqual(
                         os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"], "0"
@@ -505,6 +510,15 @@ class TestOnPolicyHelpers(unittest.TestCase):
                 self.assertTrue(server_args.enable_deterministic_inference)
                 self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
                 self.assertEqual(server_args.rl_on_policy_target, "fsdp_tp")
+                self.assertEqual(
+                    server_args.true_on_policy_contract,
+                    QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                )
+                self.assertEqual(global_server_args.rl_on_policy_target, "fsdp_tp")
+                self.assertEqual(
+                    global_server_args.true_on_policy_contract,
+                    QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                )
                 self.assertTrue(server_args.disable_custom_all_reduce)
                 self.assertEqual(attn_backend.num_splits, 1)
                 self.assertEqual(
