@@ -466,8 +466,12 @@ async def async_request_openai_chat_completions(
                                 # Check if this chunk contains content
                                 delta = data.get("choices", [{}])[0].get("delta", {})
                                 content = delta.get("content", "")
+                                reasoning_content = delta.get("reasoning_content", "")
+                                # Merge content and reasoning_content to support
+                                # reasoning models (e.g., DeepSeek-R1, QwQ, o1)
+                                effective_content = content or reasoning_content or ""
 
-                                if content:
+                                if effective_content:
                                     timestamp = time.perf_counter()
                                     # First token
                                     if ttft == 0.0:
@@ -476,13 +480,13 @@ async def async_request_openai_chat_completions(
 
                                     # Decoding phase
                                     else:
-                                        output.text_chunks.append(content)
+                                        output.text_chunks.append(effective_content)
                                         output.itl.append(
                                             timestamp - most_recent_timestamp
                                         )
 
                                     most_recent_timestamp = timestamp
-                                    generated_text += content
+                                    generated_text += effective_content
 
                                 # Check for usage info in final chunk
                                 output_len = (data.get("usage") or {}).get(
