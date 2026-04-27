@@ -91,9 +91,7 @@ class TestHiSparseNsaBackendPolicy(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, r"backend\(s\) \[tilelang\]"):
-            server_args._validate_hisparse_nsa_backend(
-                "nsa_prefill_backend", "prefill"
-            )
+            server_args._validate_hisparse_nsa_backend("nsa_prefill_backend", "prefill")
 
     @patch("sglang.srt.server_args.is_hip", return_value=False)
     def test_hisparse_rejects_rocm_backend_on_cuda(self, _mock_is_hip):
@@ -104,9 +102,7 @@ class TestHiSparseNsaBackendPolicy(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(ValueError, r"backend\(s\) \[flashmla_sparse\]"):
-            server_args._validate_hisparse_nsa_backend(
-                "nsa_decode_backend", "decode"
-            )
+            server_args._validate_hisparse_nsa_backend("nsa_decode_backend", "decode")
 
 
 class TestPortArgs(unittest.TestCase):

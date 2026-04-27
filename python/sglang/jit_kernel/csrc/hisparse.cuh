@@ -22,8 +22,8 @@ __device__ __forceinline__ int hash_slot(int32_t key, int hash_size) {
 }
 
 #ifdef USE_ROCM
-__device__ __forceinline__ void transfer_item_serial(
-    const void* __restrict__ src_addr, void* __restrict__ dst_addr, int64_t item_size_bytes) {
+__device__ __forceinline__ void
+transfer_item_serial(const void* __restrict__ src_addr, void* __restrict__ dst_addr, int64_t item_size_bytes) {
   const auto src = static_cast<const char*>(src_addr);
   auto dst = static_cast<char*>(dst_addr);
   for (int64_t i = 0; i < item_size_bytes; ++i) {
