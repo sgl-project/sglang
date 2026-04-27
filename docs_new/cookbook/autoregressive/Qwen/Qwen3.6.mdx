@@ -489,3 +489,75 @@ for chunk in response:
 
 print()
 ```
+
+## 5. Benchmarks
+
+### 5.1 Environment
+
+| Hardware | Model | TP | SGLang version |
+|---|---|---|---|
+| 1× NVIDIA H100 NVL (95 GB) | Qwen/Qwen3.6-35B-A3B-FP8 | 1 | 0.0.0.dev11998 |
+
+EAGLE speculative decoding was enabled (`--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`). The accept length of ~3.0–3.3 tokens per step reflects speculative decoding throughput gains.
+
+### 5.2 Chat (1K input / 1K output)
+
+| Concurrency | Req/s | Output tok/s | TTFT (ms) | TPOT (ms) | ITL (ms) |
+|---|---|---|---|---|---|
+| 1 | 0.78 | 329 | 229 | 2.5 | 2.5 |
+| 16 | 2.83 | 1,443 | 374 | 9.5 | 9.3 |
+| 100 | 4.66 | 2,355 | 11,087 | 17.7 | 17.8 |
+
+### 5.3 Reasoning (1K input / 8K output)
+
+| Concurrency | Req/s | Output tok/s | TTFT (ms) | TPOT (ms) | ITL (ms) |
+|---|---|---|---|---|---|
+| 1 | 0.10 | 435 | 89.3 | 2.4 | 2.3 |
+| 16 | 0.65 | 2,599 | 135 | 5.7 | 5.4 |
+| 64 | 1.14 | 4,440 | 15,843 | 9.8 | 9.5 |
+
+### 5.4 Summarization (8K input / 1K output)
+
+| Concurrency | Req/s | Output tok/s | TTFT (ms) | TPOT (ms) | ITL (ms) |
+|---|---|---|---|---|---|
+| 1 | 0.83 | 350 | 182 | 2.4 | 2.4 |
+| 16 | 2.82 | 1,470 | 355 | 9.6 | 9.4 |
+| 100 | 3.86 | 1,938 | 13,533 | 21.5 | 21.6 |
+
+<Note>
+The high TTFT at concurrency=100 for chat and summarization, and at concurrency=64 for reasoning, reflects queue saturation: requests wait while earlier ones with long outputs (8K tokens) or large prefills (8K input tokens) are being processed. TPOT and ITL remain stable, confirming the GPU is processing efficiently once a request is scheduled.
+</Note>
+
+### 5.5 Benchmark commands
+
+```bash
+# Start the server
+SGLANG_ENABLE_SPEC_V2=1 python -m sglang.launch_server \
+  --model-path Qwen/Qwen3.6-35B-A3B-FP8 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --mem-fraction-static 0.8 \
+  --tp 1 \
+  --host 0.0.0.0 \
+  --port 30000
+
+# Chat: 1K in / 1K out
+python -m sglang.bench_serving --backend sglang \
+  --model Qwen/Qwen3.6-35B-A3B-FP8 \
+  --dataset-name random --random-input-len 1000 --random-output-len 1000 \
+  --num-prompts 500 --max-concurrency 100
+
+# Reasoning: 1K in / 8K out
+python -m sglang.bench_serving --backend sglang \
+  --model Qwen/Qwen3.6-35B-A3B-FP8 \
+  --dataset-name random --random-input-len 1000 --random-output-len 8000 \
+  --num-prompts 500 --max-concurrency 64
+
+# Summarization: 8K in / 1K out
+python -m sglang.bench_serving --backend sglang \
+  --model Qwen/Qwen3.6-35B-A3B-FP8 \
+  --dataset-name random --random-input-len 8000 --random-output-len 1000 \
+  --num-prompts 500 --max-concurrency 100
+```
