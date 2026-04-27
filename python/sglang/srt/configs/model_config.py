@@ -337,9 +337,8 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
-        if (
-            is_draft_model
-            and self.hf_config.architectures[0] == "MiMoV2FlashForCausalLM"
+        if is_draft_model and self.hf_config.architectures[0] in (
+            "MiMoV2FlashForCausalLM", "MiMoV2ProForCausalLM",
         ):
             self.hf_config.architectures[0] = "MiMoV2MTP"
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
@@ -398,6 +397,7 @@ class ModelConfig:
 
         self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
             "MiMoV2FlashForCausalLM",
+            "MiMoV2ProForCausalLM",
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
@@ -416,7 +416,14 @@ class ModelConfig:
             return True
 
         # MiMoV2 creates sinks only when the config flags are set.
-        if any(a in archs for a in ("MiMoV2FlashForCausalLM", "MiMoV2MTP")):
+        if any(
+            a in archs
+            for a in (
+                "MiMoV2FlashForCausalLM",
+                "MiMoV2ProForCausalLM",
+                "MiMoV2MTP",
+            )
+        ):
             return getattr(
                 self.hf_text_config, "add_swa_attention_sink_bias", False
             ) or getattr(self.hf_text_config, "add_full_attention_sink_bias", False)
@@ -1514,6 +1521,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
         "GptOssForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
+        "MiMoV2ProForCausalLM",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
         "Gemma4ForCausalLM",
@@ -1542,7 +1550,7 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
-    elif "MiMoV2FlashForCausalLM" in model_architectures:
+    elif any(x in model_architectures for x in ("MiMoV2FlashForCausalLM", "MiMoV2ProForCausalLM")):
         hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
