@@ -462,6 +462,7 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
             data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
             weight_loader=weight_loader,
         )
+        set_weight_attrs(weight_scale_2, {"missing_param_init": "ones"})
         layer.register_parameter("weight_scale_2", weight_scale_2)
 
         weight_scale = ModelWeightParameter(

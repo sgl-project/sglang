@@ -11,8 +11,10 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils import support_triton
+from sglang.srt.utils import is_hip, support_triton
 from sglang.srt.utils.common import ceil_align
+
+_is_hip = is_hip()
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -129,10 +131,24 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    if (
-        get_global_server_args().attention_backend != "ascend"
-        and get_global_server_args().attention_backend != "torch_native"
-    ):
+    attn_backend = get_global_server_args().attention_backend
+    uses_triton_dispatch = attn_backend not in ("ascend", "torch_native")
+
+    if _is_hip and uses_triton_dispatch:
+        # HIP-only: the legacy get_last_loc_triton kernel emits a
+        # mixed-width int32->int64 store that Triton mis-compiles on HIP,
+        # producing out-of-range last_loc values under EAGLE +
+        # page_size>1 (e.g. with aiter unified attention or the triton
+        # attention backend). The bug is in the Triton HIP codegen, not
+        # in any particular attention backend, so route every HIP path
+        # that would otherwise use get_last_loc_triton through the
+        # int32-safe variant. Non-HIP hardware keeps the original
+        # dispatcher below.
+        return get_last_loc_triton_safe(
+            req_to_token, req_pool_indices_tensor, prefix_lens_tensor
+        )
+
+    if uses_triton_dispatch:
         impl = get_last_loc_triton
     else:
         impl = get_last_loc_torch
@@ -150,6 +166,67 @@ def get_last_loc_torch(
         req_to_token[req_pool_indices_tensor, prefix_lens_tensor - 1],
         torch.full_like(prefix_lens_tensor, -1),
     )
+
+
+@triton.jit
+def _get_last_loc_safe_kernel(
+    req_to_token,
+    req_pool_indices_tensor,
+    prefix_lens_tensor,
+    result_i32,
+    num_tokens,
+    req_to_token_stride,
+    BLOCK_SIZE: tl.constexpr,
+    PREFIX_DTYPE_IS_I64: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offset = tl.arange(0, BLOCK_SIZE) + pid * BLOCK_SIZE
+    mask = offset < num_tokens
+
+    if PREFIX_DTYPE_IS_I64:
+        prefix_lens = tl.load(prefix_lens_tensor + offset, mask=mask, other=0)
+        req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
+        token_index = req_pool_indices * req_to_token_stride + (prefix_lens - 1)
+    else:
+        prefix_lens = tl.load(prefix_lens_tensor + offset, mask=mask, other=0)
+        req_pool_indices = tl.load(req_pool_indices_tensor + offset, mask=mask, other=0)
+        token_index = req_pool_indices.to(tl.int64) * req_to_token_stride + (
+            prefix_lens.to(tl.int64) - 1
+        )
+
+    token_mask = mask & (prefix_lens > 0)
+    tokens = tl.load(req_to_token + token_index, mask=token_mask, other=-1)
+    # Result stays int32 (req_to_token dtype); caller promotes after return.
+    tl.store(result_i32 + offset, tokens, mask=mask)
+
+
+def get_last_loc_triton_safe(
+    req_to_token: torch.Tensor,
+    req_pool_indices_tensor: torch.Tensor,
+    prefix_lens_tensor: torch.Tensor,
+) -> torch.Tensor:
+    """Fused `last_loc` Triton kernel whose in-kernel result buffer is int32
+    (the dtype of req_to_token). The consumer-dtype promotion happens in
+    torch after the kernel returns, so Triton never issues a mixed-width
+    store — avoiding the HIP int32->int64 store bug hit by the legacy kernel.
+    """
+    num_tokens = prefix_lens_tensor.shape[0]
+    BLOCK_SIZE = 256
+    result_i32 = torch.empty(
+        num_tokens, dtype=torch.int32, device=prefix_lens_tensor.device
+    )
+    grid = (triton.cdiv(num_tokens, BLOCK_SIZE),)
+    _get_last_loc_safe_kernel[grid](
+        req_to_token,
+        req_pool_indices_tensor,
+        prefix_lens_tensor,
+        result_i32,
+        num_tokens,
+        req_to_token.stride(0),
+        BLOCK_SIZE=BLOCK_SIZE,
+        PREFIX_DTYPE_IS_I64=(prefix_lens_tensor.dtype == torch.int64),
+    )
+    return result_i32.to(prefix_lens_tensor.dtype)
 
 
 @triton.jit
@@ -478,7 +555,7 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
 
     tree_cache.cache_finished_req(req, is_insert=is_insert)
 
-    # SessionAwareCache.cache_finished_req handles speculative tail trim
+    # StreamingSession.cache_finished_req handles speculative tail trim
     # and bookkeeping flag sync internally, then sets req_pool_idx = None.
     if req.req_pool_idx is None:
         return
@@ -489,7 +566,9 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
     page_size = global_server_args.page_size
     spec_algo = global_server_args.speculative_algorithm
 
-    if spec_algo is None:
+    # strip_thinking_cache intentionally reports output tokens as overallocated
+    # so they fall into the free path below (#22373).
+    if spec_algo is None and not global_server_args.strip_thinking_cache:
         assert (
             start_p == end_p
         ), f"Unexpected overallocated KV cache, {req.kv_committed_len=}, {req.kv_allocated_len=}"

@@ -119,6 +119,10 @@ class BenchArgs:
     backend: str = "sglang"
     fake_prefill: bool = False
     server_args_for_metrics: Optional[List[str]] = None
+    lora_name: Optional[List[str]] = None
+    lora_request_distribution: str = "uniform"
+    lora_zipf_alpha: float = 1.1
+    enable_multi_batch: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -261,6 +265,56 @@ class BenchArgs:
             nargs="*",
             default=None,
             help="Server launch arguments to record in metrics output (for tracking configurations).",
+        )
+        parser.add_argument(
+            "--lora-name",
+            type=str,
+            nargs="*",
+            default=BenchArgs.lora_name,
+            help="Name(s) of pre-loaded LoRA adapter(s) to apply to the batch "
+            "(sent as `lora_path` in the SGLang /generate payload). Requires "
+            "the server to be launched with --enable-lora and --lora-paths "
+            "<name>=<path> for every name listed here. Pass one name to apply "
+            "a single adapter to every prompt, or multiple names to sample a "
+            "per-prompt adapter per --lora-request-distribution.",
+        )
+        parser.add_argument(
+            "--lora-request-distribution",
+            type=str,
+            default=BenchArgs.lora_request_distribution,
+            choices=["uniform", "distinct", "skewed"],
+            help="How to sample a LoRA adapter per prompt when more than one "
+            "is listed in --lora-name. Mirrors bench_serving.py. "
+            "'uniform' picks uniformly at random, 'distinct' round-robins so "
+            "consecutive prompts get different adapters, 'skewed' samples "
+            "from a Zipf distribution over --lora-name (alpha controls the "
+            "skew; see --lora-zipf-alpha).",
+        )
+        parser.add_argument(
+            "--lora-zipf-alpha",
+            type=float,
+            default=BenchArgs.lora_zipf_alpha,
+            help="Zipf exponent for 'skewed' LoRA sampling: the number of "
+            "requests to adapter i is alpha times the number to adapter i+1. "
+            "Must be > 1. Only used when --lora-request-distribution=skewed.",
+        )
+        parser.add_argument(
+            "--enable-multi-batch",
+            action="store_true",
+            help=(
+                "Allow --batch-size to exceed the server's "
+                "effective_max_running_requests_per_dp * dp_size. The surplus "
+                "requests are queued by the scheduler and promoted as slots "
+                "free, so the batch is served as multiple sequential batches "
+                "at the running-batch cap. Useful for stabilizing throughput "
+                "measurements: driving more total prompts through a "
+                "fixed running batch amortizes per-request prefill and "
+                "first-step transients into steady-state decode. "
+                "NOTE: only `overall_throughput` (= total_tokens / wall_time) "
+                "is meaningful in this mode; input_throughput, "
+                "output_throughput, last_ttft, and ITL assume one-shot "
+                "batching and will be misleading."
+            ),
         )
 
     @classmethod
@@ -440,6 +494,9 @@ def run_one_case(
     gsp_question_len: int = BenchArgs.gsp_question_len,
     gsp_output_len: int = BenchArgs.gsp_output_len,
     fake_prefill: bool = False,
+    lora_name: Optional[List[str]] = None,
+    lora_request_distribution: str = BenchArgs.lora_request_distribution,
+    lora_zipf_alpha: float = BenchArgs.lora_zipf_alpha,
 ):
     if backend == "vllm":
         # You need to have export VLLM_SERVER_DEV_MODE=1 in your environment to use this endpoint.
@@ -537,6 +594,31 @@ def run_one_case(
         if fake_prefill:
             payload["bootstrap_host"] = FAKE_BOOTSTRAP_HOST
             payload["bootstrap_room"] = 0
+        if lora_name:
+            # SGLang /generate accepts lora_path as either a string (applied
+            # to every prompt) or a list matching the batch size (per-prompt
+            # adapter). See io_struct.GenerateReqInput._normalize_lora_path.
+            if len(lora_name) == 1:
+                payload["lora_path"] = lora_name[0]
+            elif lora_request_distribution == "uniform":
+                payload["lora_path"] = [
+                    random.choice(lora_name) for _ in range(batch_size)
+                ]
+            elif lora_request_distribution == "distinct":
+                payload["lora_path"] = [
+                    lora_name[i % len(lora_name)] for i in range(batch_size)
+                ]
+            elif lora_request_distribution == "skewed":
+                weights = np.array([lora_zipf_alpha**-i for i in range(len(lora_name))])
+                probs = weights / np.sum(weights)
+                payload["lora_path"] = list(
+                    np.random.choice(lora_name, size=batch_size, p=probs)
+                )
+            else:
+                raise ValueError(
+                    f"Unexpected lora_request_distribution: "
+                    f"{lora_request_distribution!r}"
+                )
         gen_url = url + "/generate"
 
     # Warm up cache if cache_hit_rate > 0.0
@@ -851,6 +933,47 @@ def run_benchmark_internal(
         print(f"{skip_max_running_requests_threshold=}")
         print(f"{skip_token_capacity_threshold=}")
 
+    # Under --enable-multi-batch the client intentionally sends more prompts
+    # than the server's running cap; surplus requests are queued (no KV
+    # reservation) and promoted batch-by-batch. Peak live KV footprint is
+    # bounded by the running cap, not by bs, so re-scope both guards:
+    #   * max_running_requests: disabled (the whole point of the flag).
+    #   * token_capacity: check against min(bs, running_cap) * (il + ol).
+    effective_running_cap: Optional[int] = None
+    if bench_args.enable_multi_batch:
+        if skip_max_running_requests_threshold != float("inf"):
+            effective_running_cap = skip_max_running_requests_threshold
+        skip_max_running_requests_threshold = float("inf")
+
+        # Multi-batch only kicks in when the client sends strictly more prompts
+        # than the server's running cap; otherwise every prompt fits in a
+        # single wave and the flag is a no-op for that case (but its metric
+        # caveats — misleading input/output throughput and TTFT — still apply).
+        # Warn loudly so the user can fix the batch-size sweep.
+        if effective_running_cap is not None:
+            noop_bs = sorted(
+                {bs for bs in bench_args.batch_size if bs <= effective_running_cap}
+            )
+            if noop_bs:
+                print(
+                    f"WARNING: --enable-multi-batch is set but batch size(s) "
+                    f"{noop_bs} are <= running cap ({effective_running_cap}); "
+                    f"those cases will run as a single wave and the flag is a "
+                    f"no-op for them. Use batch_size > {effective_running_cap} "
+                    f"to actually exercise multi-batch."
+                )
+
+    # LoRA distribution args: mirror bench_serving.py semantics so multi-LoRA
+    # benchmarks behave consistently across harnesses.
+    if bench_args.lora_request_distribution in ("distinct", "skewed"):
+        assert bench_args.lora_name is not None and len(bench_args.lora_name) > 1, (
+            "--lora-request-distribution=distinct/skewed requires more than "
+            "one adapter via --lora-name."
+        )
+    assert (
+        bench_args.lora_zipf_alpha > 1
+    ), f"--lora-zipf-alpha must be > 1, got {bench_args.lora_zipf_alpha}"
+
     gsp_kwargs = dict(
         gsp_num_groups=bench_args.gsp_num_groups,
         gsp_system_prompt_len=bench_args.gsp_system_prompt_len,
@@ -882,6 +1005,9 @@ def run_benchmark_internal(
                 backend=bench_args.backend,
                 model_name=model_name,
                 fake_prefill=bench_args.fake_prefill,
+                lora_name=bench_args.lora_name,
+                lora_request_distribution=bench_args.lora_request_distribution,
+                lora_zipf_alpha=bench_args.lora_zipf_alpha,
                 **gsp_kwargs,
             )
         print("=" * 8 + " Warmup End   " + "=" * 8 + "\n")
@@ -893,10 +1019,13 @@ def run_benchmark_internal(
         for bs, il, ol in itertools.product(
             bench_args.batch_size, bench_args.input_len, bench_args.output_len
         ):
+            kv_footprint_bs = (
+                bs if effective_running_cap is None else min(bs, effective_running_cap)
+            )
             if should_skip_due_to_max_running_requests(
                 bs, skip_max_running_requests_threshold
             ) or should_skip_due_to_token_capacity(
-                bs, il, ol, skip_token_capacity_threshold
+                kv_footprint_bs, il, ol, skip_token_capacity_threshold
             ):
                 continue
             results.append(
@@ -919,6 +1048,9 @@ def run_benchmark_internal(
                     backend=bench_args.backend,
                     model_name=model_name,
                     fake_prefill=bench_args.fake_prefill,
+                    lora_name=bench_args.lora_name,
+                    lora_request_distribution=bench_args.lora_request_distribution,
+                    lora_zipf_alpha=bench_args.lora_zipf_alpha,
                     **gsp_kwargs,
                 )
             )
@@ -929,10 +1061,15 @@ def run_benchmark_internal(
                 for bs, il, ol in itertools.product(
                     bench_args.batch_size, bench_args.input_len, bench_args.output_len
                 ):
+                    kv_footprint_bs = (
+                        bs
+                        if effective_running_cap is None
+                        else min(bs, effective_running_cap)
+                    )
                     if should_skip_due_to_max_running_requests(
                         bs, skip_max_running_requests_threshold
                     ) or should_skip_due_to_token_capacity(
-                        bs, il, ol, skip_token_capacity_threshold
+                        kv_footprint_bs, il, ol, skip_token_capacity_threshold
                     ):
                         continue
                     profile_prefix = (
@@ -965,6 +1102,9 @@ def run_benchmark_internal(
                             backend=bench_args.backend,
                             model_name=model_name,
                             fake_prefill=bench_args.fake_prefill,
+                            lora_name=bench_args.lora_name,
+                            lora_request_distribution=bench_args.lora_request_distribution,
+                            lora_zipf_alpha=bench_args.lora_zipf_alpha,
                             **gsp_kwargs,
                         )
                     )

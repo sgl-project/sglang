@@ -22,9 +22,12 @@ from typing import Dict, List, Optional
 
 # Mapping from list variable names to suite names
 CASE_LIST_TO_SUITE = {
+    "ONE_GPU_CASES": "1-gpu",
     "ONE_GPU_CASES_A": "1-gpu",
     "ONE_GPU_CASES_B": "1-gpu",
     "ONE_GPU_CASES_C": "1-gpu-b200",
+    "ONE_GPU_MODELOPT_CASES": "1-gpu-b200",
+    "TWO_GPU_CASES": "2-gpu",
     "TWO_GPU_CASES_A": "2-gpu",
     "TWO_GPU_CASES_B": "2-gpu",
 }
@@ -85,22 +88,60 @@ class DiffusionTestCaseVisitor(ast.NodeVisitor):
             self._process_assignment([node.target], node.value)
         self.generic_visit(node)
 
+    def visit_AugAssign(self, node: ast.AugAssign):
+        self._process_aug_assignment(node.target, node.op, node.value)
+        self.generic_visit(node)
+
     def _process_assignment(self, targets: List[ast.AST], value: ast.AST):
-        """Process an assignment to extract case IDs if it's a known list."""
+        """Process an assignment to extract case IDs."""
         for target in targets:
-            if isinstance(target, ast.Name) and target.id in CASE_LIST_TO_SUITE:
+            if isinstance(target, ast.Name):
                 list_name = target.id
-                case_ids = self._extract_case_ids_from_list(value)
+                case_ids = self._extract_case_ids(value)
                 if case_ids is not None:
                     self.cases[list_name] = case_ids
 
-    def _extract_case_ids_from_list(self, node: ast.AST) -> Optional[List[str]]:
-        """Extract case IDs from a literal list of DiffusionTestCase calls."""
-        if not isinstance(node, ast.List):
-            return None
+    def _process_aug_assignment(self, target: ast.AST, op: ast.AST, value: ast.AST):
+        """Process `+=` style assignment to merge case lists."""
+        if not isinstance(target, ast.Name) or not isinstance(op, ast.Add):
+            return
 
+        rhs_case_ids = self._extract_case_ids(value)
+        if rhs_case_ids is None:
+            return
+
+        lhs_case_ids = self.cases.get(target.id, [])
+        self.cases[target.id] = [*lhs_case_ids, *rhs_case_ids]
+
+    def _extract_case_ids(self, node: ast.AST) -> Optional[List[str]]:
+        """Extract case IDs from a supported expression."""
+        if isinstance(node, ast.List):
+            return self._extract_case_ids_from_list(node)
+
+        if isinstance(node, ast.Name):
+            # Reference to a previously parsed list variable.
+            if node.id not in self.cases:
+                return None
+            return list(self.cases[node.id])
+
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left_ids = self._extract_case_ids(node.left)
+            right_ids = self._extract_case_ids(node.right)
+            if left_ids is None or right_ids is None:
+                return None
+            return [*left_ids, *right_ids]
+
+        return None
+
+    def _extract_case_ids_from_list(self, node: ast.List) -> List[str]:
+        """Extract case IDs from a literal list of DiffusionTestCase calls."""
         case_ids = []
         for elt in node.elts:
+            if isinstance(elt, ast.Starred):
+                starred_case_ids = self._extract_case_ids(elt.value)
+                if starred_case_ids:
+                    case_ids.extend(starred_case_ids)
+                continue
             case_id = self._extract_case_id_from_call(elt)
             if case_id:
                 case_ids.append(case_id)
@@ -368,5 +409,16 @@ def collect_diffusion_suites(
                 ),
             )
         suites[suite].cases.extend(cases)
+
+    # Dedupe duplicated case IDs while preserving first-seen order.
+    for suite_info in suites.values():
+        seen_case_ids = set()
+        deduped_cases = []
+        for case in suite_info.cases:
+            if case.case_id in seen_case_ids:
+                continue
+            seen_case_ids.add(case.case_id)
+            deduped_cases.append(case)
+        suite_info.cases = deduped_cases
 
     return suites
