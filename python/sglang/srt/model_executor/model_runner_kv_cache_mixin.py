@@ -89,9 +89,7 @@ class ModelRunnerKVCacheMixin:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
                     server_args.max_running_requests
-                    // (
-                        self.dp_size if server_args.enable_dp_attention else 1
-                    ),
+                    // (self.dp_size if server_args.enable_dp_attention else 1),
                     server_args.max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
@@ -99,9 +97,7 @@ class ModelRunnerKVCacheMixin:
                     * capped_reqs
                     * server_args.speculative_num_draft_tokens
                 )
-                total_rest_memory = total_rest_memory - (
-                    intermediate_size / (1 << 30)
-                )
+                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
             server_args.disable_radix_cache
             and server_args.max_running_requests is not None
@@ -117,9 +113,7 @@ class ModelRunnerKVCacheMixin:
                     * server_args.max_mamba_cache_size
                     * server_args.speculative_num_draft_tokens
                 )
-                total_rest_memory = total_rest_memory - (
-                    intermediate_size / (1 << 30)
-                )
+                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         else:
             # Use ratio-based calculation to auto-fit available memory
             assert config.mamba2_cache_params.mamba_cache_per_req > 0
@@ -142,28 +136,19 @@ class ModelRunnerKVCacheMixin:
                 D = server_args.speculative_num_draft_tokens
                 # Joint solve: main_state + intermediate = mamba_budget
                 server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes
-                    // (per_req * (1 + D / ratio))
+                    mamba_budget_bytes // (per_req * (1 + D / ratio))
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
                     server_args.max_running_requests
-                    // (
-                        self.dp_size if server_args.enable_dp_attention else 1
-                    ),
+                    // (self.dp_size if server_args.enable_dp_attention else 1),
                     server_args.max_mamba_cache_size // ratio,
                 )
-                intermediate_size = (
-                    per_req * capped_reqs * D
-                )
-                total_rest_memory = total_rest_memory - (
-                    intermediate_size / (1 << 30)
-                )
+                intermediate_size = per_req * capped_reqs * D
+                total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
-                server_args.max_mamba_cache_size = int(
-                    mamba_budget_bytes // per_req
-                )
+                server_args.max_mamba_cache_size = int(mamba_budget_bytes // per_req)
 
         # Validate: max_mamba_cache_size must be positive after memory allocation.
         # A non-positive value means GPU memory is insufficient for the requested

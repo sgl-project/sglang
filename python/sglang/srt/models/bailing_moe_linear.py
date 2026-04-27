@@ -969,7 +969,9 @@ class BailingMoELinearModel(nn.Module):
 
             decoder_kwargs = {"quant_config": quant_config, "layer_id": layer_idx}
             return BailingMoELinearDecoderLayer(
-                layer_config, **decoder_kwargs, prefix=prefix,
+                layer_config,
+                **decoder_kwargs,
+                prefix=prefix,
                 alt_stream=self.alt_stream,
             )
 
