@@ -39,19 +39,18 @@ python3 -m sglang.launch_server \
   --moe-a2a-backend deepep \
   --deepep-mode auto \
   --decode-log-interval 1 \
-  --page-size 1 \
+  --page-size 64 \
   --host 0.0.0.0 \
   --port 9001 \
   --trust-remote-code \
-  --watchdog-timeout 1000000 \
+  --watchdog-timeout 3600 \
   --mem-fraction-static 0.65 \
   --chunked-prefill-size 16384 \
-  --reasoning-parser qwen3 \
+  --reasoning-parser mimo \
   --tool-call-parser mimo \
   --context-length 262144 \
   --collect-tokens-histogram \
   --enable-metrics \
-  --load-balance-method round_robin \
   --allow-auto-truncate \
   --enable-metrics-for-all-schedulers \
   --quantization fp8 \
