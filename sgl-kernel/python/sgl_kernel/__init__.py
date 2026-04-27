@@ -62,8 +62,6 @@ from sgl_kernel.kvcacheio import (
 )
 from sgl_kernel.mamba import (
     causal_conv1d_fn_cpu,
-    causal_conv1d_fwd,
-    causal_conv1d_update,
     causal_conv1d_update_cpu,
     chunk_gated_delta_rule_cpu,
 )
@@ -118,8 +116,6 @@ _DEBUG_EXPORT_NAMES = [
     "awq_dequantize",
     "bmm_fp8",
     "build_tree_kernel_efficient",
-    "causal_conv1d_fwd",
-    "causal_conv1d_update",
     "concat_mla_absorb_q",
     "concat_mla_k",
     "copy_to_gpu_no_ce",
