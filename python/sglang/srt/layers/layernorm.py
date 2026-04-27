@@ -25,7 +25,10 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
-from sglang.srt.true_on_policy import is_true_on_policy_enabled
+from sglang.srt.true_on_policy import (
+    get_on_policy_rms_norm_kwargs,
+    is_true_on_policy_enabled,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
@@ -157,8 +160,29 @@ class RMSNorm(MultiPlatformOp):
         has_weight: bool = True,
         weight_dtype: Optional[torch.dtype] = None,
         override_orig_dtype: Optional[torch.dtype] = None,
+        true_on_policy_weight_dtype: Optional[torch.dtype] = None,
+        true_on_policy_override_orig_dtype: Optional[torch.dtype] = None,
+        true_on_policy_fp32_residual: bool = False,
     ) -> None:
         super().__init__()
+        if (
+            weight_dtype is None
+            and override_orig_dtype is None
+            and not cast_x_before_out_mul
+        ):
+            true_on_policy_kwargs = get_on_policy_rms_norm_kwargs(
+                weight_dtype=true_on_policy_weight_dtype,
+                override_orig_dtype=true_on_policy_override_orig_dtype,
+                fp32_residual=true_on_policy_fp32_residual,
+            )
+            cast_x_before_out_mul = true_on_policy_kwargs.get(
+                "cast_x_before_out_mul", cast_x_before_out_mul
+            )
+            fp32_residual = true_on_policy_kwargs.get("fp32_residual", fp32_residual)
+            weight_dtype = true_on_policy_kwargs.get("weight_dtype", weight_dtype)
+            override_orig_dtype = true_on_policy_kwargs.get(
+                "override_orig_dtype", override_orig_dtype
+            )
         self.has_weight = has_weight
         self.cast_x_before_out_mul = cast_x_before_out_mul
         self.fp32_residual = fp32_residual

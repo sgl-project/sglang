@@ -216,6 +216,50 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
         self.assertEqual(result["out_dtype"], "torch.float32")
         self.assertEqual(result["residual_dtype"], "torch.float32")
 
+    def test_rms_norm_can_self_configure_from_true_on_policy_role_hints(self):
+        result = _run_dense_math_script(
+            textwrap.dedent(
+                """
+                import json
+
+                import torch
+
+                from sglang.srt.layers.layernorm import RMSNorm
+                from sglang.srt.server_args import (
+                    ServerArgs,
+                    get_global_server_args,
+                    set_global_server_args_for_scheduler,
+                )
+
+                set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+                server_args = get_global_server_args()
+                server_args.rl_on_policy_target = "fsdp"
+                norm = RMSNorm(
+                    4,
+                    eps=1e-6,
+                    true_on_policy_weight_dtype=torch.float32,
+                    true_on_policy_override_orig_dtype=torch.float32,
+                    true_on_policy_fp32_residual=True,
+                )
+                print(
+                    json.dumps(
+                        {
+                            "weight_dtype": str(norm.weight.dtype),
+                            "cast_x_before_out_mul": norm.cast_x_before_out_mul,
+                            "fp32_residual": norm.fp32_residual,
+                            "override_orig_dtype": str(norm.override_orig_dtype),
+                        }
+                    )
+                )
+                """
+            )
+        )
+
+        self.assertEqual(result["weight_dtype"], "torch.float32")
+        self.assertTrue(result["cast_x_before_out_mul"])
+        self.assertTrue(result["fp32_residual"])
+        self.assertEqual(result["override_orig_dtype"], "torch.float32")
+
     def test_on_policy_lm_head_forces_bfloat16_matmul_inputs(self):
         result = _run_dense_math_script(
             textwrap.dedent(
