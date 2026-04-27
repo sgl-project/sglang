@@ -749,7 +749,9 @@ class HunyuanVideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
             img_mod2_shift,
             img_mod2_scale,
             img_mod2_gate,
-        ) = self.double_blocks[0].img_mod(vec_).chunk(6, dim=-1)
+        ) = (
+            self.double_blocks[0].img_mod(vec_).chunk(6, dim=-1)
+        )
         normed_inp = self.double_blocks[0].img_attn_norm.norm(inp)
         modulated_inp = modulate(normed_inp, shift=img_mod1_shift, scale=img_mod1_scale)
         if self.cnt == 0 or self.cnt == num_inference_steps - 1:
