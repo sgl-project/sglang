@@ -126,9 +126,10 @@ export const MiMoV25Deployment = () => {
     const blackwell = spec ? spec.blackwell : false;
     const c = {};
     if (!isPro) {
+      // V2.5 has no MTP module, so EAGLE MTP is genuinely unavailable.
       c.eagleMtp = { force: "disabled", reason: "EAGLE MTP applies to V2.5-Pro only." };
-      c.expertParallelism = { force: "disabled", reason: "Expert parallelism not used for V2.5." };
-      // V2.5 checkpoint forces DP-attn when tp/dp split > 1, otherwise dp=1 single group.
+      // V2.5 checkpoint is TP=4-interleaved; tp/dp must equal 4. With dp>1 we
+      // must use DP-attention; with dp=1 it must be off (single attention group).
       if (spec && spec.dp > 1) {
         c.dpAttention = { force: "enabled", reason: "V2.5 checkpoint is TP=4-interleaved; DP-attention is required (--dp = tp/4)." };
       } else {
@@ -136,8 +137,9 @@ export const MiMoV25Deployment = () => {
       }
     }
     if (blackwell) {
+      // DeepEP upstream targets Ampere/Hopper PTX; only experimental paths exist
+      // for sm_100 in sglang and the verified Blackwell stack uses flashinfer_trtllm.
       c.deepep = { force: "disabled", reason: "Blackwell uses flashinfer_trtllm; DeepEP is Hopper / Ampere only." };
-      if (isPro) c.expertParallelism = { force: "disabled", reason: "Blackwell uses flashinfer_trtllm; --ep-size is not used." };
     }
     return c;
   };
