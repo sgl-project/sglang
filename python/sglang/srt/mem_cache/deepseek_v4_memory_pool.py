@@ -551,7 +551,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         c128_state_pool_size = self.c128_state_pool_size
         total_L = len(self.compression_ratios)
         self.compress_state_pools: List[Optional[CompressStatePool]] = [None] * total_L
-        self.indexer_compress_state_pools: List[Optional[CompressStatePool]] = [None] * total_L
+        self.indexer_compress_state_pools: List[Optional[CompressStatePool]] = [
+            None
+        ] * total_L
 
         for idx in range(self._stage_start, self._stage_end):
             ratio = self.compression_ratios[idx]
@@ -642,7 +644,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack: NopeFp8RopeBf16Pack,
     ) -> None:
-        self.swa_kv_pool.set_key_buffer(self._swa_layer_id(layer_id), loc, cache_nope_fp8_rope_bf16_pack)
+        self.swa_kv_pool.set_key_buffer(
+            self._swa_layer_id(layer_id), loc, cache_nope_fp8_rope_bf16_pack
+        )
 
     def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor | None:
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
@@ -729,7 +733,9 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             swa_loc = self.cached_loc
         else:
             swa_loc = self.translate_loc_from_full_to_swa(raw_loc)
-        return self.swa_kv_pool.set_key_buffer_fused(self._swa_layer_id(layer_id), swa_loc, cache_k)
+        return self.swa_kv_pool.set_key_buffer_fused(
+            self._swa_layer_id(layer_id), swa_loc, cache_k
+        )
 
     def set_extra_key_buffer_fused(
         self,

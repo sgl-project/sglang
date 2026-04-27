@@ -760,9 +760,7 @@ class ModelConfig:
         self.spec_hidden_size = (
             self.hidden_size * hc_mult if hc_mult > 1 else self.hidden_size
         )
-        # Effective hidden size after mHC flattening: hc_mult * hidden_size.
-        # For non-mHC models this equals hidden_size.
-        # Same value as spec_hidden_size; TODO: unify into one field.
+        # mHC-flattened hidden size; equals hidden_size when not mHC.
         self.hc_hidden_size = self.spec_hidden_size
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers

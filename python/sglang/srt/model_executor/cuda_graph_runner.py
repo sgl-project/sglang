@@ -208,10 +208,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
             )
 
             if pp_size > 1:
-                # For mHC models (e.g. DeepSeek-V4), hc_hidden_size =
-                # hc_mult * hidden_size, as hidden_states are flattened for PP.
-                # mHC fuses residual into the 3D hidden_states, so no separate
-                # residual buffer is needed.
+                # mHC (e.g. DSV4) flattens residual into hidden_states (size = hc_hidden_size).
                 is_mhc = hc_hidden_size is not None
                 hs = hc_hidden_size if is_mhc else hidden_size
                 pp_proxy_tensors = {

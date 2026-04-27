@@ -846,6 +846,7 @@ class DeepseekV4Model(nn.Module):
     ) -> None:
         super().__init__()
         self.pp_group = get_pp_group()
+        self.hidden_size = config.hidden_size
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -920,11 +921,10 @@ class DeepseekV4Model(nn.Module):
         else:
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
-            # PP sends flattened 2D (seq_len, hc_mult*hidden_size).
-            # Unflatten back to 3D (seq_len, hc_mult, hidden_size) for mHC.
+            # Unflatten 2D PP IPC tensor back to 3D mHC shape.
             if hidden_states.ndim == 2:
                 hidden_states = hidden_states.view(
-                    hidden_states.shape[0], self.hc_mult, -1
+                    hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
 
         if get_attention_dp_size() > 1 and get_moe_a2a_backend().is_none():
@@ -953,7 +953,8 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        if nsa_use_prefill_cp(forward_batch):
+        # CP all-gather only on the last PP rank; PP IPC carries CP-split tensors.
+        if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
                 self.cp_size,
@@ -962,8 +963,7 @@ class DeepseekV4Model(nn.Module):
             )
 
         if not self.pp_group.is_last_rank:
-            # Flatten 3D (seq_len, hc_mult, hidden_size) → 2D (seq_len, hc_mult*hidden_size)
-            # so PP communication uses standard 2D tensor shape.
+            # Flatten 3D mHC tensor for PP IPC.
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
 
         pre_hc_head = hidden_states.flatten(1)
@@ -1013,7 +1013,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             lambda: {
                 layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
                 for layer_id in range(self.model.start_layer, self.model.end_layer)
-                if isinstance(self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE)
+                if isinstance(
+                    self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE
+                )
             }
         )
 
@@ -1386,7 +1388,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and not self.pp_group.is_first_rank
                             ):
                                 continue
-                            if name == "model.norm.weight" and not self.pp_group.is_last_rank:
+                            if (
+                                name == "model.norm.weight"
+                                and not self.pp_group.is_last_rank
+                            ):
                                 continue
                             if (
                                 name.startswith("model.hc_head_")
