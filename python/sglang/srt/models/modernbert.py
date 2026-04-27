@@ -39,6 +39,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix
 
+_UNFOLD_LOCAL_ATTENTION_MIN_LEN = 6144
+
 
 class ModernBertEmbeddings(nn.Module):
     """Token embedding + layer norm + dropout."""
@@ -175,6 +177,87 @@ class ModernBertSelfAttention(nn.Module):
         )
         self.dropout = nn.Dropout(config.attention_dropout)
 
+    def _get_model_state_cache(self, forward_batch: ForwardBatch) -> dict:
+        if forward_batch.model_specific_states is None:
+            forward_batch.model_specific_states = {}
+        return forward_batch.model_specific_states
+
+    def _get_local_attention_mask(
+        self,
+        cur_len: int,
+        device: torch.device,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        cache = self._get_model_state_cache(forward_batch).setdefault(
+            "modernbert_local_attention_masks", {}
+        )
+        cache_key = (str(device), cur_len, self.local_attention_window)
+        local_mask = cache.get(cache_key)
+        if local_mask is None:
+            token_positions = torch.arange(cur_len, device=device)
+            local_mask = (
+                token_positions[:, None] - token_positions[None, :]
+            ).abs() <= self.local_attention_window
+            cache[cache_key] = local_mask
+        return local_mask
+
+    def _get_local_attention_band_mask(
+        self,
+        cur_len: int,
+        device: torch.device,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        cache = self._get_model_state_cache(forward_batch).setdefault(
+            "modernbert_local_attention_band_masks", {}
+        )
+        cache_key = (str(device), cur_len, self.local_attention_window)
+        local_mask = cache.get(cache_key)
+        if local_mask is None:
+            token_positions = torch.arange(cur_len, device=device)
+            offsets = torch.arange(
+                -self.local_attention_window,
+                self.local_attention_window + 1,
+                device=device,
+            )
+            indices = token_positions[:, None] + offsets[None, :]
+            local_mask = (indices >= 0) & (indices < cur_len)
+            cache[cache_key] = local_mask
+        return local_mask
+
+    def _forward_local_attention_unfold(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        cur_len, _, head_dim = q.shape
+        local_mask = self._get_local_attention_band_mask(
+            cur_len, q.device, forward_batch
+        )
+        span = 2 * self.local_attention_window + 1
+
+        pad = (0, 0, 0, 0, self.local_attention_window, self.local_attention_window)
+        k = F.pad(k, pad)
+        v = F.pad(v, pad)
+
+        stride_0, stride_1, stride_2 = k.stride()
+        k_window = k.as_strided(
+            (cur_len, span, self.num_kv_heads, head_dim),
+            (stride_0, stride_0, stride_1, stride_2),
+        )
+        v_window = v.as_strided(
+            (cur_len, span, self.num_kv_heads, head_dim),
+            (stride_0, stride_0, stride_1, stride_2),
+        )
+
+        scores = torch.einsum("lhd,lshd->lhs", q, k_window) * self.scaling
+        scores = scores.masked_fill(
+            ~local_mask[:, None, :], torch.finfo(scores.dtype).min
+        )
+        probs = torch.softmax(scores, dim=-1)
+        return torch.einsum("lhs,lshd->lhd", probs, v_window)
+
     def _forward_local_attention(
         self,
         q: torch.Tensor,
@@ -206,10 +289,16 @@ class ModernBertSelfAttention(nn.Module):
                 break
 
             cur_len = end - start
-            token_positions = torch.arange(cur_len, device=q.device)
-            local_mask = (
-                token_positions[:, None] - token_positions[None, :]
-            ).abs() <= self.local_attention_window
+            if cur_len >= _UNFOLD_LOCAL_ATTENTION_MIN_LEN:
+                output[start:end] = self._forward_local_attention_unfold(
+                    q[start:end], k[start:end], v[start:end], forward_batch
+                )
+                start = end
+                continue
+
+            local_mask = self._get_local_attention_mask(
+                cur_len, q.device, forward_batch
+            )
 
             q_seq = q[start:end].transpose(0, 1).unsqueeze(0)
             k_seq = k[start:end].transpose(0, 1).unsqueeze(0)
