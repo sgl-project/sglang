@@ -81,9 +81,9 @@ import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deploym
 - **Tool Call Parser**: `--tool-call-parser mimo` enables structured function calling.
 
 **MiMo-V2.5 (310B):**
-- Single-node deployment: H100/H200 8× GPUs (TP=8), B200 4× GPUs (TP=4), GB300 2× GPUs (TP=2). FP8 quantization.
-- `--deepep-mode auto` lets SGLang pick the optimal DeepEP dispatch mode per batch.
-- `--mm-enable-dp-encoder` and `--enable-dp-lm-head` are required when DP attention is enabled to keep encoder and LM head sharding consistent.
+- The checkpoint has a TP=4-interleaved fused `qkv_proj`; attention-TP per DP group **must** be 4. So DP-attention is always required (`--dp = TP / 4`), and total GPUs must be a multiple of 4. A bare `--tp 8` without `--dp 2` will fail to load with `MiMoV2Omni fused qkv_proj checkpoint is TP=4-interleaved; got tp_size=8`.
+- Single-node deployments: H100/H200 8× GPUs (`--tp 8 --dp 2`), B200 4× GPUs (`--tp 4`, dp=1, no DP-attn flag needed), GB300 4× GPUs (`--tp 4`, single NVL4 node). FP8 quantization.
+- `--enable-dp-lm-head` and `--mm-enable-dp-encoder` are required whenever `--enable-dp-attention` is on, to keep LM head and encoder sharding consistent.
 - **Reasoning Parser**: `--reasoning-parser mimo` separates thinking content into `message.reasoning_content`; final answer in `message.content`.
 - **Multimodal**: Supports image, video, and audio understanding; see Section 4.3 for invocation examples.
 
@@ -366,9 +366,9 @@ python3 -m sglang.test.run_eval \
     ```
   - MiMo-V2.5 (FP8, 8× H200)
     ```
-    Score:           98.0% (196/200)
-    Total latency:   464.7 s
-    Output tput:     92.4 tok/s
+    Score:             0.980  (196 / 200)
+    Latency:           477.52 s
+    Output throughput: 88.9 tok/s
     ```
 
 #### 5.1.2 MMMU (V2.5 only)

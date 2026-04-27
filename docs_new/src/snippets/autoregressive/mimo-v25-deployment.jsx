@@ -7,16 +7,17 @@ export const MiMoV25Deployment = () => {
   //     H100  → tp=16, 2 nodes,     FP8 (Hopper: fa3 + DeepEP)
   //     B200  → tp=8,  single-node, FP8 (Blackwell verified: fa4 + flashinfer_trtllm)
   //     GB300 → tp=8,  2 nodes,     FP8 (Blackwell verified: fa4 + flashinfer_trtllm + NCCL_MNNVL)
-  //   V2.5 (310B / 15B active) — multimodal:
-  //     H200  → tp=8, single-node, FP8
-  //     H100  → tp=8, single-node, FP8
-  //     B200  → tp=4, single-node, FP8
-  //     GB300 → tp=2, single-node, FP8
+  //   V2.5 (310B / 15B active) — multimodal. Checkpoint is TP=4 interleaved,
+  //   so attention-TP per DP group must be 4; effective parallelism = TP/DP = 4.
+  //     H200  → tp=8, dp=2, single-node, FP8 (verified)
+  //     H100  → tp=8, dp=2, single-node, FP8
+  //     B200  → tp=4, dp=1, single-node, FP8
+  //     GB300 → tp=4, dp=1, single-node, FP8
   //
   //   Recipes:
-  //     low-latency    → TP only (no DP), V2.5-Pro includes EAGLE MTP
-  //     balanced       → DP-attn + EAGLE (V2.5-Pro) / DP-attn (V2.5)
-  //     max-throughput → DP-attn, no MTP
+  //     low-latency    → V2.5-Pro: TP only (no DP). V2.5: DP-attn (always required).
+  //     balanced       → V2.5-Pro: DP-attn + EAGLE.
+  //     max-throughput → V2.5-Pro: DP-attn, no MTP.
 
   const options = {
     modelVariant: {
@@ -65,15 +66,17 @@ export const MiMoV25Deployment = () => {
   };
 
   // Per (variant, hardware): HF slug, tp, multinode info, Blackwell flag.
+  // V2.5 (base) checkpoint has TP=4-interleaved fused qkv_proj, so attention
+  // TP per DP group MUST be 4. Effective TP/DP = 4. With tp=8 → dp=2; tp=4 → dp=1.
   const HW_VARIANT_SPEC = {
     "pro|h200":   { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 16, multinode: true,  nnodes: 2, blackwell: false },
     "pro|h100":   { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 16, multinode: true,  nnodes: 2, blackwell: false },
     "pro|b200":   { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 8,  multinode: false,            blackwell: true  },
     "pro|gb300":  { slug: "XiaomiMiMo/MiMo-V2.5-Pro", tp: 8,  multinode: true,  nnodes: 2, blackwell: true  },
-    "base|h200":  { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 8,  multinode: false,            blackwell: false },
-    "base|h100":  { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 8,  multinode: false,            blackwell: false },
-    "base|b200":  { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 4,  multinode: false,            blackwell: true  },
-    "base|gb300": { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 2,  multinode: false,            blackwell: true  },
+    "base|h200":  { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 8,  multinode: false,            blackwell: false, dp: 2 },
+    "base|h100":  { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 8,  multinode: false,            blackwell: false, dp: 2 },
+    "base|b200":  { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 4,  multinode: false,            blackwell: true,  dp: 1 },
+    "base|gb300": { slug: "XiaomiMiMo/MiMo-V2.5",     tp: 4,  multinode: false,            blackwell: true,  dp: 1 },
   };
 
   const multiNodeFlags = (nnodes) => [
@@ -128,9 +131,16 @@ export const MiMoV25Deployment = () => {
   const generateCommand = () => {
     const { modelVariant, hardware, recipe, reasoningParser, toolcall } = values;
     const specKey = `${modelVariant}|${hardware}`;
-    const { slug, tp, multinode, nnodes, blackwell } = HW_VARIANT_SPEC[specKey];
+    const spec = HW_VARIANT_SPEC[specKey];
+    const { slug, tp, multinode, nnodes, blackwell } = spec;
     const isPro = modelVariant === "pro";
     const useMtp = isPro && recipe !== "max-throughput";
+    // V2.5 (base) requires DP-attention with effective attention-TP = 4 per group;
+    // dp comes from the spec table. Pro uses optional DP-attn driven by recipe.
+    const baseDp = !isPro ? spec.dp : 0;
+    const proDp = isPro && recipe !== "low-latency" ? tp : 0;
+    const dp = isPro ? proDp : baseDp;
+    const useDpAttn = !isPro ? baseDp > 1 : proDp > 0;
 
     // ---- env (kept inline before `sglang serve`, matching the verified launch style) ----
     const envVars = [];
@@ -146,8 +156,8 @@ export const MiMoV25Deployment = () => {
     flags.push(`  --model-path ${slug}`);
     flags.push(`  --tp ${tp}`);
 
-    if (recipe !== "low-latency") {
-      flags.push(`  --dp ${tp}`);
+    if (useDpAttn) {
+      flags.push(`  --dp ${dp}`);
       flags.push("  --enable-dp-attention");
       if (!isPro) {
         flags.push("  --enable-dp-lm-head");
