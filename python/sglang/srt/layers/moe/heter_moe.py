@@ -122,6 +122,9 @@ class HeterFusedMoE(nn.Module):
         # Only used by the per-layer sensitivity sweep for VRAM savings,
         # not in normal online serving.
         bf16_only_experts: Optional[list] = None,
+        # Required when heter_config has "expert_importance_file" so we can
+        # select this layer's per-expert importance slice.
+        layer_id: Optional[int] = None,
     ):
         super().__init__()
         self.num_experts = num_experts  # local expert count
@@ -195,7 +198,35 @@ class HeterFusedMoE(nn.Module):
         self.group_ratios = [g["size_ratio"] for g in self.group_cfgs]
 
         policy_name = heter_config.get("policy", "expert_load")
-        policy_kwargs = heter_config.get("policy_params", {})
+        policy_kwargs = dict(heter_config.get("policy_params", {}))
+
+        importance_file = heter_config.get("expert_importance_file")
+        self.expert_importance: Optional[torch.Tensor] = None
+        if importance_file is not None:
+            if layer_id is None:
+                raise ValueError(
+                    "heter_config.expert_importance_file is set but "
+                    "layer_id was not passed to HeterFusedMoE"
+                )
+            with open(importance_file) as f:
+                importance_by_layer = json.load(f)
+            key = str(layer_id)
+            if key not in importance_by_layer:
+                raise KeyError(
+                    f"expert_importance_file {importance_file} missing "
+                    f"entry for layer {layer_id}"
+                )
+            row = importance_by_layer[key]
+            if len(row) != num_experts:
+                raise ValueError(
+                    f"expert_importance layer {layer_id}: length "
+                    f"{len(row)} != num_experts {num_experts}"
+                )
+            self.expert_importance = torch.tensor(
+                row, dtype=torch.float32, device=self.device
+            )
+            policy_kwargs.setdefault("importance", self.expert_importance)
+
         self.policy: HeterDispatchPolicy = create_policy(
             policy_name,
             num_experts=num_experts,
@@ -259,6 +290,7 @@ class HeterFusedMoE(nn.Module):
         heter_config: Dict[str, Any],
         int4_only_experts: Optional[list] = None,
         bf16_only_experts: Optional[list] = None,
+        layer_id: Optional[int] = None,
     ) -> "HeterFusedMoE":
         """Create HeterFusedMoE from an already-loaded BF16 FusedMoE.
 
@@ -294,6 +326,7 @@ class HeterFusedMoE(nn.Module):
             moe_tp_size=moe_tp_size,
             int4_only_experts=int4_only_experts,
             bf16_only_experts=bf16_only_experts,
+            layer_id=layer_id,
         )
 
         # Copy BF16 weights: compact (dual-precision only) or full
@@ -847,6 +880,7 @@ def apply_heter_precision(
             fused_moe, heter_config,
             int4_only_experts=int4_only_experts,
             bf16_only_experts=bf16_only_experts,
+            layer_id=layer_id,
         )
 
         # Load INT4 expert weights (skip entirely if all experts are bf16-only)

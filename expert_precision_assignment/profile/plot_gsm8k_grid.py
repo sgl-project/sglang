@@ -17,17 +17,24 @@ from __future__ import annotations
 
 import argparse
 import csv
+import re
 from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
 
 
-MC_ORDER = [8, 16, 32, 64, 128, 256]
-HOT_VARIANTS = ["hot0", "hot20", "hot40", "hot60", "hot80", "hot100"]
-
 ACC_KEY = "acc_exact_match__flexible-extract"
 ACC_STDERR_KEY = "acc_exact_match_stderr__flexible-extract"
+
+_VARIANT_NUM_RE = re.compile(r"^(?P<prefix>[A-Za-z]+)(?P<num>\d+)$")
+
+
+def _variant_key(v: str) -> tuple:
+    m = _VARIANT_NUM_RE.match(v)
+    if m:
+        return (m.group("prefix"), int(m.group("num")))
+    return (v, 0)
 
 
 def _fmt(x, d: int = 3) -> str:
@@ -50,16 +57,16 @@ def _get(r: dict, key: str):
 
 
 def _render(values, labels, title, cbar_label, out_path,
-            lower_is_better: bool = False):
-    ncol, nrow = len(MC_ORDER), len(HOT_VARIANTS)
+            mc_order, variants, lower_is_better: bool = False):
+    ncol, nrow = len(mc_order), len(variants)
     fig, ax = plt.subplots(figsize=(1.5 * ncol + 1.3, 0.75 * nrow + 1.5))
     cmap = "viridis_r" if lower_is_better else "viridis"
     im = ax.imshow(values, cmap=cmap, aspect="auto")
 
     ax.set_xticks(range(ncol))
-    ax.set_xticklabels([f"mc={m}" for m in MC_ORDER])
+    ax.set_xticklabels([f"mc={m}" for m in mc_order])
     ax.set_yticks(range(nrow))
-    ax.set_yticklabels(HOT_VARIANTS)
+    ax.set_yticklabels(variants)
 
     vmax = np.nanmax(values)
     vmin = np.nanmin(values)
@@ -88,12 +95,12 @@ def _render(values, labels, title, cbar_label, out_path,
     print(f"Wrote {out}")
 
 
-def _plot_accuracy(cells, out_path):
-    ncol, nrow = len(MC_ORDER), len(HOT_VARIANTS)
+def _plot_accuracy(cells, out_path, mc_order, variants):
+    ncol, nrow = len(mc_order), len(variants)
     acc = np.full((nrow, ncol), np.nan)
     labels = [[""] * ncol for _ in range(nrow)]
-    for i, v in enumerate(HOT_VARIANTS):
-        for j, mc in enumerate(MC_ORDER):
+    for i, v in enumerate(variants):
+        for j, mc in enumerate(mc_order):
             r = cells.get((mc, v))
             if not r:
                 continue
@@ -113,6 +120,8 @@ def _plot_accuracy(cells, out_path):
         ),
         cbar_label="exact_match (flexible-extract)",
         out_path=out_path,
+        mc_order=mc_order,
+        variants=variants,
     )
 
 
@@ -129,14 +138,14 @@ def _rank(values: np.ndarray) -> np.ndarray:
     return ranks.reshape(values.shape)
 
 
-def _plot_slo(cells, out_path):
-    ncol, nrow = len(MC_ORDER), len(HOT_VARIANTS)
+def _plot_slo(cells, out_path, mc_order, variants):
+    ncol, nrow = len(mc_order), len(variants)
     tput = np.full((nrow, ncol), np.nan)
     ttft_m = np.full((nrow, ncol), np.nan)
     itl_m = np.full((nrow, ncol), np.nan)
     conc_m = np.full((nrow, ncol), np.nan)
-    for i, v in enumerate(HOT_VARIANTS):
-        for j, mc in enumerate(MC_ORDER):
+    for i, v in enumerate(variants):
+        for j, mc in enumerate(mc_order):
             r = cells.get((mc, v))
             if not r:
                 continue
@@ -174,6 +183,8 @@ def _plot_slo(cells, out_path):
         ),
         cbar_label="mean rank across (TTFT, ITL) — 1 = best",
         out_path=out_path,
+        mc_order=mc_order,
+        variants=variants,
         lower_is_better=True,
     )
 
@@ -187,11 +198,20 @@ def main() -> int:
 
     rows = list(csv.DictReader(open(args.csv)))
     cells: dict[tuple[int, str], dict] = {}
+    mc_set: set[int] = set()
+    variant_set: set[str] = set()
     for r in rows:
-        cells[(int(r["mc"]), r["variant"])] = r
+        mc = int(r["mc"])
+        v = r["variant"]
+        cells[(mc, v)] = r
+        mc_set.add(mc)
+        variant_set.add(v)
 
-    _plot_accuracy(cells, args.out_acc)
-    _plot_slo(cells, args.out_slo)
+    mc_order = sorted(mc_set)
+    variants = sorted(variant_set, key=_variant_key)
+
+    _plot_accuracy(cells, args.out_acc, mc_order, variants)
+    _plot_slo(cells, args.out_slo, mc_order, variants)
     return 0
 
 

@@ -22,12 +22,20 @@ Example — bench_eval prompt calibration:
     python calib_kv.py \\
         --task gsm8k --model <snapshot> \\
         --num_samples 64 --num_fewshot 5 --max_gen_toks 8196 \\
-        --out_file kv_calib/gsm8k.json
+        --out_file kv_calib/gsm8k/calib.json
 
 Example — amortized from a past bench_serving run:
     python calib_kv.py \\
         --bench_details_jsonl .../sharegpt/mc128_thr128_n1024.jsonl \\
-        --out_file kv_calib/sharegpt.json
+        --out_file kv_calib/sharegpt/calib.json
+
+Example — RULER NIAH at 8k input (metadata forwarded to lm_eval):
+    python calib_kv.py \\
+        --task niah_single_2 --model <snapshot> \\
+        --num_samples 32 --num_fewshot 0 --max_gen_toks 128 \\
+        --no_apply_chat_template \\
+        --metadata '{"max_seq_lengths":[8192]}' \\
+        --out_file kv_calib/ruler/calib_8k.json
 """
 from __future__ import annotations
 
@@ -171,6 +179,17 @@ def _run_prompt_calibration(args) -> Dict[str, Any]:
     import lm_eval
     from lm_eval.tasks import TaskManager
 
+    # Opt-in disk cache for RULER niah_* dataset construction. No-op when
+    # NIAH_CACHE_DIR is unset. Importing lazily so this module stays
+    # independent of sglang when someone uses it standalone.
+    try:
+        from sglang.benchmark.eval_harness.niah_cache import (
+            install_niah_disk_cache,
+        )
+        install_niah_disk_cache()
+    except ImportError:
+        pass
+
     hf_name = _resolve_hf_path(args.model)
     logger.info("Loading tokenizer: %s", hf_name)
     tok = AutoTokenizer.from_pretrained(
@@ -179,11 +198,19 @@ def _run_prompt_calibration(args) -> Dict[str, Any]:
 
     lm = _make_tokenize_only_lm(tok, args.enable_thinking)
 
-    task_manager = TaskManager()
+    metadata: Dict[str, Any] = {}
+    if args.metadata:
+        metadata = json.loads(args.metadata)
+    # RULER's custom_dataset fns need a tokenizer= kwarg (asserted in
+    # lm_eval/tasks/ruler/common_utils.get_tokenizer). Inject unless the
+    # caller already set one.
+    metadata.setdefault("tokenizer", hf_name)
+
+    task_manager = TaskManager(metadata=metadata)
     logger.info(
-        "Running lm_eval (task=%s, num_fewshot=%d, limit=%d, chat=%s, thinking=%s)",
+        "Running lm_eval (task=%s, num_fewshot=%d, limit=%d, chat=%s, thinking=%s, metadata=%s)",
         args.task, args.num_fewshot, args.num_samples,
-        args.apply_chat_template, args.enable_thinking,
+        args.apply_chat_template, args.enable_thinking, metadata,
     )
     # simple_evaluate may raise at the scoring step because our generations
     # are empty; we only care about prompts captured in generate_until,
@@ -197,6 +224,7 @@ def _run_prompt_calibration(args) -> Dict[str, Any]:
             apply_chat_template=args.apply_chat_template,
             task_manager=task_manager,
             gen_kwargs=f"max_gen_toks={args.max_gen_toks}",
+            metadata=metadata,
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(
@@ -235,6 +263,11 @@ def main() -> int:
     ap.add_argument("--no_apply_chat_template",
                     dest="apply_chat_template", action="store_false")
     ap.add_argument("--enable_thinking", action="store_true")
+    ap.add_argument("--metadata", default=None,
+                    help="JSON string passed to lm_eval.simple_evaluate as "
+                         "metadata. Used by tasks like RULER — e.g. "
+                         "--metadata='{\"max_seq_lengths\":[8192,65536]}'. "
+                         "The tokenizer= key is auto-injected from --model.")
     ap.add_argument("--margin_frac", type=float, default=0.10,
                     help="Safety margin on top of observed prompt max when "
                          "recommending max_prompt_len (default 10%%).")

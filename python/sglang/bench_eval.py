@@ -35,6 +35,8 @@ def run_bench_eval(
     flush_cache: bool = False,
     extra_request_body: Optional[Dict[str, Any]] = None,
     system_instruction: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+    gen_kwargs_overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     import lm_eval
     from transformers import AutoTokenizer
@@ -42,6 +44,12 @@ def run_bench_eval(
     from sglang.benchmark.eval_harness import (
         BenchServingLM, merge_report, write_report,
     )
+    from sglang.benchmark.eval_harness.niah_cache import install_niah_disk_cache
+
+    # Opt-in disk cache for RULER niah_* dataset construction. No-op when
+    # NIAH_CACHE_DIR is unset; required for any task using the niah builders
+    # if you want to amortize the ~minutes-per-rebuild cost across a sweep.
+    install_niah_disk_cache()
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
 
@@ -57,7 +65,20 @@ def run_bench_eval(
         extra_request_body=extra_request_body,
     )
 
-    gen_kwargs = f"max_gen_toks={max_gen_toks}"
+    # gen_kwargs is passed to lm_eval.simple_evaluate, which merges it into the
+    # task's YAML-configured generation_kwargs. Pass as dict (not string) so
+    # list values like `until=[...]` survive — simple_parse_args_string would
+    # otherwise leave them as raw strings and break stop-sequence handling.
+    gen_kwargs: Dict[str, Any] = {"max_gen_toks": max_gen_toks}
+    if gen_kwargs_overrides:
+        gen_kwargs.update(gen_kwargs_overrides)
+
+    effective_metadata: Optional[Dict[str, Any]] = None
+    if metadata:
+        effective_metadata = dict(metadata)
+        # RULER's custom_dataset asserts tokenizer= in its kwargs. Inject the
+        # caller's tokenizer path unless they've set one explicitly.
+        effective_metadata.setdefault("tokenizer", tokenizer_path)
 
     results = lm_eval.simple_evaluate(
         model=lm,
@@ -69,6 +90,7 @@ def run_bench_eval(
         system_instruction=system_instruction,
         gen_kwargs=gen_kwargs,
         batch_size=max_concurrency or "auto",
+        metadata=effective_metadata,
     )
 
     if lm.last_perf is None:
@@ -99,8 +121,21 @@ def run_bench_eval(
     )
 
     if include_per_doc:
-        # Raw lm-eval samples are in results["samples"][task].
-        report["per_doc"] = results.get("samples", {}).get(task, [])
+        # Raw lm-eval samples live in results["samples"][<subtask>]. For a
+        # leaf task that key is the task itself; for a group (bbh, mmlu, ...)
+        # samples are spread across each subtask — flatten them and tag each
+        # record with its originating subtask so the JSONL stays groupable.
+        samples = results.get("samples", {}) or {}
+        flat: list = []
+        if task in samples:
+            flat = list(samples[task])
+        else:
+            for sub, recs in samples.items():
+                for rec in recs:
+                    if isinstance(rec, dict):
+                        rec = {**rec, "_subtask": sub}
+                    flat.append(rec)
+        report["per_doc"] = flat
 
     if output_file:
         write_report(output_file, report)
@@ -157,6 +192,17 @@ def build_parser() -> argparse.ArgumentParser:
                    help="System message prepended to every prompt. "
                         "Math: 'Please reason step by step, and put your final answer within \\boxed{}.' "
                         "MCQ: 'Please show your choice in the answer field with only the choice letter, e.g., \"answer\": \"C\".'")
+    p.add_argument("--metadata", default=None,
+                   help="JSON string passed to lm_eval.simple_evaluate as "
+                        "metadata. Used by RULER — e.g. "
+                        "--metadata='{\"max_seq_lengths\":[8192,65536]}'. "
+                        "tokenizer= is auto-injected from --tokenizer.")
+    p.add_argument("--gen-kwargs-json", default=None,
+                   help="JSON dict merged into generation_kwargs (overrides "
+                        "the task YAML's values). Use for list-valued keys "
+                        "the comma-string format can't express — e.g. "
+                        "--gen-kwargs-json='{\"until\":[\"\\nQ:\",\"</s>\"]}' "
+                        "to fix BBH CoT's bare-\"Q\" substring stop.")
     return p
 
 
@@ -178,6 +224,10 @@ def main(argv=None) -> int:
     if args.presence_penalty != 0.0:
         sampling["presence_penalty"] = args.presence_penalty
 
+    import json as _json
+    metadata_dict = _json.loads(args.metadata) if args.metadata else None
+    gen_overrides = _json.loads(args.gen_kwargs_json) if args.gen_kwargs_json else None
+
     report = run_bench_eval(
         task=args.task,
         base_url=args.base_url,
@@ -197,6 +247,8 @@ def main(argv=None) -> int:
         flush_cache=args.flush_cache,
         extra_request_body=sampling,
         system_instruction=args.system_instruction,
+        metadata=metadata_dict,
+        gen_kwargs_overrides=gen_overrides,
     )
 
     print("=" * 60)

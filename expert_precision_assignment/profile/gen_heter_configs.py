@@ -22,6 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -42,7 +43,15 @@ from assign_experts import (  # noqa: E402
     _write_outputs,
 )
 
-MC_LIST = [8, 16, 32, 64, 128, 256]
+# Default sweep targets moderate-context / moderate-batch serving (gsm8k,
+# sharegpt). For long-context workloads (RULER), KV dominates and even mc=8
+# can blow the budget — override with e.g. MC_LIST="1 2 4 8 16 32 64" to
+# explore the low-concurrency range where heter-moe still has runway.
+_DEFAULT_MC_LIST = [8, 16, 32, 64, 128, 256]
+MC_LIST = (
+    [int(x) for x in os.environ["MC_LIST"].split()]
+    if os.environ.get("MC_LIST") else _DEFAULT_MC_LIST
+)
 
 MODEL_PATH = (
     "/data/huggingface/hub/models--Qwen--Qwen3-30B-A3B/"
@@ -73,7 +82,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--calib_json",
         type=Path,
-        help="Path to a calib_kv.py output JSON (e.g. kv_calib/sharegpt.json). "
+        help="Path to a calib_kv.py output JSON (e.g. kv_calib/sharegpt/calib.json). "
              "When its recommended_slo has mean_total_len + std_total_len, "
              "kv_bytes uses the amortized μ+k·σ branch.",
     )
@@ -105,6 +114,11 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--hessian_path", type=Path, default=HESSIAN_SCORES,
         help="Path to hessian_scores.json (only used when --hessian).",
+    )
+    ap.add_argument(
+        "--dry_run", action="store_true",
+        help="Print the artifacts that would be written per mc (importance "
+             "summaries, K, |fo|_mean) but do not create any files.",
     )
 
     fo = ap.add_mutually_exclusive_group()
@@ -194,6 +208,7 @@ def main() -> int:
 
     fo_mean: float | None = None
     fo_cap: int | None = None
+    expert_importance: dict | None = None
     if args.ranking == "hessian":
         logger.info("Ranking policy: hessian (%s)", args.hessian_path)
         scores, first_order = _load_hessian_scores(
@@ -215,6 +230,28 @@ def main() -> int:
             "  |fo|_mean=%.3e → %d experts above noise floor "
             "(fo_threshold=%s)",
             fo_mean, fo_cap, args.fo_threshold,
+        )
+
+        expert_importance = {}
+        fallback_layers: list[int] = []
+        zero_counts: list[int] = []
+        for L in range(num_layers):
+            row = [
+                (scores[(L, E)] if scores[(L, E)] > fo_mean else 0.0)
+                for E in range(num_experts)
+            ]
+            zeros = sum(1 for v in row if v == 0.0)
+            if zeros == num_experts:
+                row = [1.0] * num_experts
+                fallback_layers.append(L)
+            expert_importance[L] = row
+            zero_counts.append(zeros)
+        above = [num_experts - z for z in zero_counts]
+        logger.info(
+            "  importance: per-layer #above fo_mean min/med/max="
+            "%d/%d/%d; %d layers fell back to all-ones",
+            min(above), sorted(above)[len(above) // 2], max(above),
+            len(fallback_layers),
         )
     else:
         if args.fo_threshold and args.ranking != "hessian":
@@ -282,25 +319,39 @@ def main() -> int:
         heter, int4_only = _assign(scores, k)
 
         mc_dir = out_root / f"mc{mc}"
-        _write_outputs(
-            out_dir=mc_dir,
-            int4_only=int4_only,
-            heter=heter,
-            int4_checkpoint=INT4_CKPT,
-            group_size=knobs.group_size,
-            budget=budget,
-            slo=slo,
-            knobs=knobs,
-            scores=scores,
-            ppl=ppl,
-            num_layers=num_layers,
-            ranking_policy=args.ranking,
-            fo_threshold=fo_report,
-        )
-        logger.info(
-            "[mc=%d] K=%d heter / %d int4-only → %s",
-            mc, len(heter), len(int4_only), mc_dir,
-        )
+        if args.dry_run:
+            planned = [
+                "int4_only_experts.json",
+                "heter_config.json",
+                "assignment_report.json",
+            ]
+            if expert_importance is not None:
+                planned.append("expert_importance.json")
+            logger.info(
+                "[mc=%d] DRY-RUN would write to %s: %s (K=%d heter / %d int4-only)",
+                mc, mc_dir, ", ".join(planned), len(heter), len(int4_only),
+            )
+        else:
+            _write_outputs(
+                out_dir=mc_dir,
+                int4_only=int4_only,
+                heter=heter,
+                int4_checkpoint=INT4_CKPT,
+                group_size=knobs.group_size,
+                budget=budget,
+                slo=slo,
+                knobs=knobs,
+                scores=scores,
+                ppl=ppl,
+                num_layers=num_layers,
+                ranking_policy=args.ranking,
+                fo_threshold=fo_report,
+                expert_importance=expert_importance,
+            )
+            logger.info(
+                "[mc=%d] K=%d heter / %d int4-only → %s",
+                mc, len(heter), len(int4_only), mc_dir,
+            )
         summary.append((mc, len(heter), len(int4_only)))
 
     logger.info("Summary:")

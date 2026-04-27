@@ -339,6 +339,62 @@ class TotalWeightHeterDispatch(HeterDispatchPolicy):
             self._expert_to_group_buf, self._group_labels)
 
 
+class HessianWeightedRoutingWeightsDispatch(HeterDispatchPolicy):
+    """Assign by importance(E) × per-expert total routing weight.
+
+    Importance is a static, non-negative per-expert vector (typically
+    derived offline from Hessian sensitivity, zeroed below the first-order
+    noise floor, or all-ones when a layer has no statistically meaningful
+    hessian signal). High product -> last group (high-precision).
+    Falls back to random when signals are unavailable.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        group_size_ratios: List[float],
+        importance: torch.Tensor,
+        fallback_seed: int = 42,
+        device: Optional[torch.device] = None,
+        int4_only_mask: Optional[torch.Tensor] = None,
+        int4_group_idx: int = 0,
+        bf16_only_mask: Optional[torch.Tensor] = None,
+        bf16_group_idx: int = 1,
+    ):
+        super().__init__(num_experts, group_size_ratios, device=device,
+                         int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
+                         bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx)
+        assert importance.shape == (num_experts,), (
+            f"importance shape {tuple(importance.shape)} "
+            f"!= (num_experts={num_experts},)"
+        )
+        self._importance = importance.to(
+            device=self._device, dtype=torch.float32)
+        self._fallback = RandomHeterDispatch(
+            num_experts, group_size_ratios, seed=fallback_seed, device=device,
+            int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
+            bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx)
+        self._weight_sum_buf = torch.empty(
+            num_experts, device=self._device, dtype=torch.float32)
+
+    def _assign(self, token_selected_experts, token_final_scales):
+        if token_selected_experts is None or token_final_scales is None:
+            return self._fallback._assign(
+                token_selected_experts, token_final_scales)
+
+        buf = self._weight_sum_buf
+        flat_experts = token_selected_experts.reshape(-1).long()
+        flat_scales = token_final_scales.reshape(-1)
+
+        buf.zero_()
+        buf.scatter_add_(0, flat_experts, flat_scales)
+        buf.mul_(self._importance)
+
+        return _assign_by_score_gpu(
+            buf, self._num_experts, self._group_size_ratios,
+            self._expert_to_group_buf, self._group_labels)
+
+
 class ExpertLoadHeterDispatch(HeterDispatchPolicy):
     """Assign by expert activation frequency.
 
@@ -460,6 +516,7 @@ _POLICY_REGISTRY = {
     "expert_load": ExpertLoadHeterDispatch,
     "confidence": ConfidenceThresholdHeterDispatch,
     "total_weight": TotalWeightHeterDispatch,
+    "hessian_weighted_routing_weights": HessianWeightedRoutingWeightsDispatch,
     "random": RandomHeterDispatch,
     "expert_batch": ExpertBatchGatedHeterDispatch,
 }
