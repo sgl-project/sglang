@@ -15,6 +15,7 @@
 
 import dataclasses
 import logging
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -61,6 +62,26 @@ from sglang.srt.utils.common import is_npu, use_intel_amx_backend
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+# When set, LogitsProcessor.forward returns an empty output and skips the
+# LM head + tensor-parallel all-gather. Used by FlashInfer autotune dummy
+# runs, where the all-gather output [batch * dp_size, vocab] would OOM
+# under DP attention but is not needed by the autotune cache.
+_in_autotune_dummy_run = False
+
+
+def get_in_autotune_dummy_run() -> bool:
+    return _in_autotune_dummy_run
+
+
+@contextmanager
+def autotune_dummy_run_mode():
+    global _in_autotune_dummy_run
+    _in_autotune_dummy_run = True
+    try:
+        yield
+    finally:
+        _in_autotune_dummy_run = False
 
 
 @dataclasses.dataclass
@@ -296,6 +317,14 @@ class LogitsProcessor(nn.Module):
         if isinstance(logits_metadata, ForwardBatch):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
+
+        # Skip LM head + tensor-parallel all-gather during FlashInfer autotune
+        # dummy runs. The autotune cache only needs attention/MoE/GEMM kernel
+        # timings; the [batch * dp_size, vocab] all-gather buffer would OOM
+        # under DP attention on tight memory budgets (e.g. mem_fraction_static
+        # close to the model+KV-cache footprint).
+        if _in_autotune_dummy_run:
+            return LogitsProcessorOutput(next_token_logits=None)
 
         # Multi-item scoring only for prefill-only requests with pre-computed indices.
         if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:

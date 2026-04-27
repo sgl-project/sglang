@@ -2407,13 +2407,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         """Run flashinfer autotune."""
         from flashinfer.autotuner import autotune
 
+        from sglang.srt.layers.logits_processor import autotune_dummy_run_mode
+
         logger.info("Running FlashInfer autotune...")
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
+        # autotune_dummy_run_mode() makes LogitsProcessor.forward short-circuit so the
+        # dummy run skips the LM head + tensor-parallel all-gather (which would OOM
+        # at [batch * dp_size, vocab] under DP attention).
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
-            with torch.inference_mode(), autotune():
+            with torch.inference_mode(), autotune(), autotune_dummy_run_mode():
                 self._dummy_run(
                     batch_size=self.req_to_token_pool.size, run_ctx=autotune()
                 )
