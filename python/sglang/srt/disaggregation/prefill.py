@@ -123,6 +123,8 @@ class PrefillBootstrapQueue:
         kv_args.decode_tp_size = self.decode_tp_size // self.decode_dp_size
         kv_args.prefill_pp_size = self.pp_size
         kv_args.prefill_start_layer = self.token_to_kv_pool.start_layer
+        kv_args.prefill_end_layer = self.token_to_kv_pool.end_layer
+        kv_args.mla_compression_ratios = None
         kv_data_ptrs, kv_data_lens, kv_item_lens = (
             self.token_to_kv_pool.get_contiguous_buf_infos()
         )
@@ -151,9 +153,10 @@ class PrefillBootstrapQueue:
         kv_args.gpu_id = self.scheduler.gpu_id
 
         if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
-            assert self.pp_size == 1, (
-                "V4 PD disaggregation requires PP=1 "
-                "(get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized flat list)"
+            # V4's KVCache is organized by compression-ratio
+            # buckets rather than by layer.
+            kv_args.mla_compression_ratios = list(
+                self.token_to_kv_pool.compression_ratios
             )
             assert (
                 self.decode_tp_size == self.scheduler.tp_size

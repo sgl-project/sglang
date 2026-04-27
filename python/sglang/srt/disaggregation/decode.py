@@ -281,12 +281,6 @@ class DecodePreallocQueue:
             self.metadata_buffers.get_buf_infos()
         )
 
-        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
-            assert self.prefill_pp_size == 1, (
-                "V4 PD disaggregation requires PP=1 "
-                "(get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized flat list)"
-            )
-
         if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
             state_data_ptrs, state_data_lens, state_item_lens = (
                 self.token_to_kv_pool.get_state_buf_infos()
