@@ -20,6 +20,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_REQ_WAITING_TIMEOUT`              | Timeout (in seconds) for requests waiting in the queue before being scheduled                                                    | `-1`                         |
 | `SGLANG_REQ_RUNNING_TIMEOUT`              | Timeout (in seconds) for requests running in the decode batch                                                                    | `-1`                         |
 | `SGLANG_CACHE_DIR`                        | Cache directory for model weights and other data | `~/.cache/sglang` |
+| `SGLANG_PREFETCH_BLOCK_SIZE_MB`           | Block size (in MB) for sequential checkpoint prefetch reads that warm the OS page cache before workers load weights via mmap | `16` |
 
 ## Performance Tuning
 
@@ -83,6 +84,7 @@ SGLang supports various environment variables that can be used to configure its 
 | `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | Maximum number of dispatch tokens per rank for MORI-EP buffer allocation | `4096` |
 | `SGLANG_MORI_DISPATCH_INTER_KERNEL_SWITCH_THRESHOLD` | Threshold for switching between `InterNodeV1` and `InterNodeV1LL` kernel types. `InterNodeV1LL` is used if `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` is less than or equal to this threshold; otherwise, `InterNodeV1` is used. | `256` |
 | `SGLANG_MORI_PREALLOC_MAX_RECV_TOKENS` | This argument devives `SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK` which indicates customized amount of tokens preallocated for a rank, valid range from 1 to world_size*SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK, by default `0` means maximum. Setting a smaller value will reduce memory footprint but too small value could cause buffer overflow. | `0` |
+| `SGLANG_MORI_MOE_MAX_INPUT_TOKENS` | Truncate the dispatch buffer to this many rows before MoE computation, reducing kernel overhead on padding tokens. The value must be >= the actual number of received tokens (`totalRecvTokenNum`); setting it too small causes incorrect results. `0` disables truncation (use full buffer). | `0` |
 | `SGLANG_MORI_QP_PER_TRANSFER` | Number of RDMA Queue Pairs (QPs) used per transfer operation | `1` |
 | `SGLANG_MORI_POST_BATCH_SIZE` | Number of RDMA work requests posted in a single batch to each QP | `-1` |
 | `SGLANG_MORI_NUM_WORKERS` | Number of worker threads in the RDMA executor thread pool | `1` |

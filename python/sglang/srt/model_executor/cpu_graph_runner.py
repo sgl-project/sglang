@@ -140,6 +140,7 @@ def register_fake_ops():
         "causal_conv1d_fwd_cpu",
         "gemma_rmsnorm_cpu",
         "gemma3_rmsnorm_cpu",
+        "gemma4_rmsnorm_cpu",
     ]:
 
         @torch.library.register_fake(f"sgl_kernel::{op}")

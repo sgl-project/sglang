@@ -96,8 +96,8 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-    from sglang.srt.managers.session_controller import Session
     from sglang.srt.observability.scheduler_metrics_mixin import PrefillStats
+    from sglang.srt.session.session_controller import Session
     from sglang.srt.speculative.eagle_info import EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -596,6 +596,7 @@ class Req(ReqDllmMixin):
         time_stats: Optional[
             Union[APIServerReqTimeStats, DPControllerReqTimeStats]
         ] = None,
+        return_pooled_hidden_states: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -871,6 +872,10 @@ class Req(ReqDllmMixin):
 
         # For Matryoshka embeddings
         self.dimensions = dimensions
+
+        # Whether to return pooled hidden states (pre-head transformer output)
+        self.return_pooled_hidden_states = return_pooled_hidden_states
+        self.pooled_hidden_state = None
 
         # For diffusion LLM
         self.init_diffusion_llm(dllm_config)
@@ -1403,6 +1408,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 
+    # Whether to return pooled hidden states (pre-head transformer output)
+    return_pooled_hidden_states: bool = False
+
     # For split prefill
     split_index: int = 0
     split_prefill_finished: bool = False
@@ -1593,6 +1601,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 r.dimensions if r.dimensions else self.model_config.hidden_size
                 for r in reqs
             ]
+
+        # OR across the batch so ForwardBatch matches a single fused forward; requests
+        # that did not ask for PHS still skip attaching it in the output processor.
+        self.return_pooled_hidden_states = any(
+            r.return_pooled_hidden_states for r in reqs
+        )
 
         token_type_ids = [
             r.token_type_ids for r in reqs if r.token_type_ids is not None
@@ -1966,6 +1980,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
             return new_pages * page_size
 
+        if self.is_spec_v2:
+            return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
+
         server_args = get_global_server_args()
         len_per_topk = server_args.speculative_num_steps or 1
         spec_topk = server_args.speculative_eagle_topk or 1
@@ -1981,9 +1998,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_tokens = ceil_align(spec_tokens, page_size)
 
         num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
+        return num_tokens
 
-        # v2 eagle has over-allocation
-        return num_tokens * (1 + self.is_spec_v2)
+    def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
+        """Tight estimate matching eagle_info_v2.prepare_for_decode allocation."""
+        from sglang.srt.managers.utils import get_alloc_len_per_decode
+
+        alloc_len = get_alloc_len_per_decode()
+        total = 0
+        for r in requests:
+            x = max(0, r.kv_committed_len + 2 * alloc_len - r.kv_allocated_len)
+            cur = r.kv_allocated_len
+            nxt = cur + x
+            total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
+        return total
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
@@ -2123,8 +2151,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
-        if hasattr(self, "nsa_cp_metadata") and self.nsa_cp_metadata is not None:
-            self.nsa_cp_metadata = None
 
         if self.is_spec_v2:
             # TODO(spec-v2): all spec v2 should go through this path
@@ -2439,6 +2465,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             extend_input_logprob_token_ids=self.extend_input_logprob_token_ids,
             is_prefill_only=self.is_prefill_only,
             dimensions=self.dimensions,
+            return_pooled_hidden_states=self.return_pooled_hidden_states,
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
             reqs=self.reqs,
@@ -2631,6 +2658,9 @@ class ModelWorkerBatch:
 
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
+
+    # Whether to return pooled hidden states (pre-head transformer output)
+    return_pooled_hidden_states: bool = False
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
