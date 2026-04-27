@@ -2302,17 +2302,6 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             return
 
         self.num_fused_shared_experts = self.config.n_shared_experts
-        if is_deepep_class_backend():
-            mode = (
-                "waterfill dispatch"
-                if server_args.enable_deepep_waterfill
-                else "home EP rank local slot"
-            )
-            log_info_on_rank0(
-                logger,
-                f"DeepEP shared expert fusion: fusing shared expert into MoE kernel "
-                f"via {mode}.",
-            )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
