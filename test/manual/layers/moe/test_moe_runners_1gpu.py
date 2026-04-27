@@ -73,6 +73,20 @@ class TestMoERunner(CustomTestCase):
                 "pytorch",
             ],
         },
+        "moe_runner_flashinfer_cutlass_fp8_block": {
+            "model": DEFAULT_MODEL_NAME_FOR_TEST_FP8_WITH_MOE,
+            "timeout": 3600,
+            "other_args": [
+                "--trust-remote-code",
+                "--moe-runner-backend",
+                "flashinfer_cutlass",
+                "--attention-backend",
+                "triton",
+                "--sampling-backend",
+                "pytorch",
+                "--disable-cuda-graph",
+            ],
+        },
         "moe_runner_deep_gemm": {
             "model": DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_CHAT,
             "other_args": [

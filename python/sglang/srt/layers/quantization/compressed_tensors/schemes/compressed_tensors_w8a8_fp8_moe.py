@@ -55,6 +55,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self.weight_quant = weight_quant
         self.input_quant = input_quant
         self.use_flashinfer_trtllm = get_moe_runner_backend().is_flashinfer_trtllm()
+        self.use_flashinfer_cutlass = (
+            get_moe_runner_backend().is_flashinfer_cutlass()
+            and torch.cuda.get_device_capability()[0] == 9  # SM90 only
+        )
 
         per_tensor = (
             self.weight_quant.strategy == QuantizationStrategy.TENSOR
@@ -330,7 +334,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         if (
             self.weight_quant.strategy == QuantizationStrategy.BLOCK
-            and self.use_flashinfer_trtllm
+            and (self.use_flashinfer_trtllm or self.use_flashinfer_cutlass)
         ):
             layer.w13_weight = torch.nn.Parameter(
                 swap_w13_to_w31(layer.w13_weight.data),
@@ -345,6 +349,10 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if self.use_flashinfer_cutlass and self.block_quant:
+            # FlashInfer cutlass MoE bypasses the MoeRunner framework
+            self.runner = None
+            return
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto():
             moe_runner_backend = MoeRunnerBackend.TRITON
@@ -397,7 +405,29 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             )
             return StandardCombineInput(hidden_states=output)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
-            if self.use_flashinfer_trtllm:
+            if self.use_flashinfer_cutlass:
+                from flashinfer.fused_moe import cutlass_fused_moe
+
+                topk_weights, topk_ids, _ = topk_output
+                output = cutlass_fused_moe(
+                    input=x.to(torch.bfloat16),
+                    token_selected_experts=topk_ids.to(torch.int32),
+                    token_final_scales=topk_weights,
+                    fc1_expert_weights=layer.w13_weight,
+                    fc2_expert_weights=layer.w2_weight,
+                    output_dtype=x.dtype,
+                    quant_scales=[
+                        layer.w13_weight_scale,
+                        layer.w2_weight_scale,
+                    ],
+                    use_deepseek_fp8_block_scale=True,
+                    tp_size=layer.moe_tp_size,
+                    tp_rank=layer.moe_tp_rank,
+                    ep_size=layer.moe_ep_size,
+                    ep_rank=layer.moe_ep_rank,
+                )[0]  # cutlass_fused_moe returns a list, take first element
+                return StandardCombineInput(hidden_states=output)
+            elif self.use_flashinfer_trtllm:
                 quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
