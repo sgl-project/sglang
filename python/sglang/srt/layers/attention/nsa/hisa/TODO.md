@@ -6,6 +6,42 @@ Legend: `[ ]` pending, `[/]` in progress, `[x]` done, `[?]` needs investigation.
 
 ---
 
+## Phase-3 — Small-K (k_block_size < 64) support (2026-04-27)
+
+Goal: 让 hisa 在 `k_block_size ∈ {8, 16, 32, 64, 128}` 全范围工作，cache 默认开启；调用方只需改一个参数。
+
+之前 tilelang 的 `fp8_native_paged_mean_pooling*` / `update_pool_for_completed_blocks` / `tail_only_v3` 都断言 `pooling_block_size % paged_block_size == 0`，导致 k<64 直接失效。本阶段把所有 cache 路径上的 tilelang kernel 都补齐了 triton 端口，按 K 分发。
+
+**Done — kernels (`hisa_triton/kernels.py`)**
+- `[x]` SK1–SK4：grouped 版 block_mean_pooling / paged_mean_pooling / sparse_paged_mqa / block_sparse_mqa，`GEMM_TILE = G·K ≥ 64`，覆盖 K∈{8,16,32,64,128}。两类 grouping：mean-pool 用连续 group，sparse 用 per-row gather。
+- `[x]` SK7/9/10/11/12：各 K 下 BLOCK_N 实测最优值定下（block_sparse_mqa 256；block_mean_pooling 128 for k=128；batch_pool_mqa 自适应；sparse_paged_mqa k=128 走 grouped G=1 tile=128，B=1 −20~27%）。
+- `[x]` **SK15 `update_pool_for_completed_blocks_triton`** — tilelang 同名 kernel 的 triton 端口；K∈{8,16,32,64,128}，per-row gather via ReqToToken；K≤64 → GEMM_TILE = G·K = 64，K>64 → GEMM_TILE = K。
+- `[x]` **SK16 `tail_only_v3_triton`** — tilelang `fp8_native_paged_mean_pooling_tail_only_v3` 的 triton 端口；per-CTA per-req，按 `cur_size`（不是 K）做除法，paged 写回。
+
+**Done — orchestrator / cache / indexer**
+- `[x]` `orchestrator.fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v4`：tail-refresh 按 `k_block_size < paged_block_size` 分发，k<paged 走 SK16 triton，否则走 tilelang；后续 block-MQA / topk / sparse-MQA 全部 triton。
+- `[x]` `orchestrator.fp8_native_hierarchy_paged_mqa_logits_triton`：no-cache 全 triton fallback orchestrator（仅在 `DISABLE_POOL_CACHE=1` 时用）。
+- `[x]` `pool_k_cache.update_pool_for_completed_blocks` 内部按 K 分发：k<page_size 走 SK15 triton，否则走 tilelang。对调用方完全透明。
+- `[x]` `hierarchy_indexer._get_topk_paged`：cache 默认开启的前提下，k<64 也能跑通；只有 `DISABLE_POOL_CACHE=1` 才会落到 no-cache triton orchestrator。**用户只需改 `hisa_k_block_size` 一个参数。**
+- `[x]` `_store_index_k_cache` 去掉临时 SK14 guard，统一交给 `update_pool` 内部分发。
+
+**Done — tests**
+- `[x]` `hisa_triton/test_precision.py::test_cross_k_block_size`：K∈{8,16,32,64,128} 对四个 hisa 内核 fp8-strict 容差，新增 `_make_paged_kv_cache_soa` 修正之前 AoS 测试数据。
+- `[x]` 与 tilelang 对比：k=128 byte_diff=1（fp8 ULP）；与 torch ref：k<64 byte_diff≤3。
+- `[x]` 用户已 e2e 验证正确性（cache 默认开启路径）。
+
+**Pending — bench**
+- `[ ]` **bench serving 性能验证（最重要的 next）**
+    - `[ ]` k=128 默认路径 — 对齐 v4 baseline，无回归
+    - `[ ]` k∈{32,16,8} cache 开启 — TTFT / decode 延迟、吞吐
+    - `[ ]` longbench samsum 端到端 ROUGE
+    - 启动后 grep `HisaNSATokenToKVPool` 确认 cache 真分配（cache 关闭时不打这行）
+- `[ ]` 若 bench 表现良好，再考虑把 `hisa_k_block_size` 默认值下调
+- `[ ]` 若 K≥64 也想统一走 SK15/SK16 triton（减少 tilelang 维护面），需要先确认无回归
+- `[?]` SK1–SK4 的 group 维度 G 当前是按 K 静态选；后续可以做更细的 auto-tune
+
+---
+
 ## P0 — Kernel-level perf (attack the sparse_paged 80% hotspot)
 
 **Status 2026-04-24 update:** The 80% hotspot claim was pre-triton-port. After porting, the triton `sparse_paged_mqa_triton` is 5-20× faster than the original tilelang baseline. Rechecked kernel bench numbers on H200 (kernels.py, default config):

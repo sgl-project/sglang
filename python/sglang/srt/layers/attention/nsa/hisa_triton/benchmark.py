@@ -78,6 +78,44 @@ class MqaDims:
     dim: int = 128
 
 
+def _make_paged_kv_cache_soa(
+    num_phys: int, paged_block_size: int, D: int, seed: int = 0,
+) -> torch.Tensor:
+    """Build a paged KV cache with the production SoA byte layout per page.
+
+    Bytes within one page (paged_block_size * (D+4) total):
+      [0, paged_block_size * D)             : token-major fp8 (t0_d0..D-1, t1_d0..D-1, ...)
+      [paged_block_size * D, page_bytes)    : f32 per-token scales (t0_s, t1_s, ...)
+
+    The triton/tilelang kernels read per this SoA layout. Returned as 4D
+    ``[num_phys, paged_block_size, 1, D+4]`` for caller-signature compat —
+    the 4D shape is decorative; the actual bytes are SoA, NOT
+    token-AoS-with-tail-scale-bytes.
+    """
+    torch.manual_seed(seed)
+    page_bytes = paged_block_size * (D + 4)
+    kv2d = torch.empty(num_phys, page_bytes, device=DEVICE, dtype=torch.uint8)
+
+    # SoA fp8 region.
+    fp8 = (
+        torch.randn(num_phys, paged_block_size, D, device=DEVICE, dtype=torch.bfloat16)
+        .to(torch.float8_e4m3fn)
+    )
+    kv2d[:, : paged_block_size * D].copy_(
+        fp8.view(torch.uint8).reshape(num_phys, paged_block_size * D)
+    )
+
+    # SoA scale region.
+    scale = 0.05 + 0.02 * torch.rand(
+        num_phys, paged_block_size, device=DEVICE, dtype=torch.float32,
+    )
+    kv2d[:, paged_block_size * D :].copy_(
+        scale.view(torch.uint8).reshape(num_phys, paged_block_size * 4)
+    )
+
+    return kv2d.view(num_phys, paged_block_size, 1, D + 4)
+
+
 def _make_batch_pool_mqa_inputs(
     B: int, nb: int, dims: MqaDims, seed: int = 0,
 ) -> dict:
@@ -220,18 +258,10 @@ def _make_sparse_paged_mqa_inputs(
 
     q = torch.randn(B, seq_len, H, D, device=DEVICE, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
 
-    # Paged KV cache: [num_phys, paged_block_size, 1, D+4] uint8.
+    # Paged KV cache: SoA byte layout (matches production).
     max_logical_blocks = (ctx_len + paged_block_size - 1) // paged_block_size
     num_phys = max_logical_blocks * B + 8  # small slack
-    kv = torch.empty(num_phys, paged_block_size, 1, D + 4, device=DEVICE, dtype=torch.uint8)
-    kv[..., :D].copy_(
-        torch.randn(num_phys, paged_block_size, 1, D, device=DEVICE, dtype=torch.bfloat16)
-        .to(torch.float8_e4m3fn).view(torch.uint8)
-    )
-    scale = 0.05 + 0.02 * torch.rand(
-        num_phys, paged_block_size, 1, 1, device=DEVICE, dtype=torch.float32
-    )
-    kv[..., D:].copy_(scale.view(torch.uint8).reshape(num_phys, paged_block_size, 1, 4))
+    kv = _make_paged_kv_cache_soa(num_phys, paged_block_size, D, seed=seed)
 
     # Block tables: each request's logical blocks map to a disjoint set.
     block_tables = torch.arange(
@@ -361,6 +391,10 @@ def _parse_args():
     # sparse_paged_mqa
     p.add_argument("--context-lens", type=int, nargs="+", default=[16384, 32768, 65536, 131072])
     p.add_argument("--topk", type=int, default=64, help="block_topk for sparse_paged_mqa")
+    p.add_argument(
+        "--k-block-sizes", type=int, nargs="+", default=[128],
+        help="hisa k_block_size values to bench (8/16/32/64/128)",
+    )
     p.add_argument("--num-warmups", type=int, default=5)
     p.add_argument("--num-iters", type=int, default=30)
     p.add_argument("--seed", type=int, default=0)
@@ -398,11 +432,13 @@ def main():
     if args.kernel in ("paged_mean_pooling", "all"):
         bench_paged_mean_pooling(
             args.batch_sizes, ctx_lens=[16384, 65536], dims=dims,
+            k_block_sizes=args.k_block_sizes,
             num_warmups=args.num_warmups, num_iters=args.num_iters,
         )
     if args.kernel in ("block_mean_pooling", "all"):
         bench_block_mean_pooling(
             seq_kvs=[4096, 16384, 65536], dims=dims,
+            k_block_sizes=args.k_block_sizes,
             num_warmups=args.num_warmups, num_iters=args.num_iters,
         )
 
@@ -576,19 +612,10 @@ def _make_paged_mean_pool_inputs(
     B: int, ctx_len: int, dims: MqaDims,
     k_block_size: int = 128, paged_block_size: int = 64, seed: int = 0,
 ) -> dict:
-    torch.manual_seed(seed)
     D = dims.dim
     max_logical = (ctx_len + paged_block_size - 1) // paged_block_size
     num_phys = max_logical * B + 4
-    kv = torch.empty(num_phys, paged_block_size, 1, D + 4, device=DEVICE, dtype=torch.uint8)
-    kv[..., :D].copy_(
-        torch.randn(num_phys, paged_block_size, 1, D, device=DEVICE, dtype=torch.bfloat16)
-        .to(torch.float8_e4m3fn).view(torch.uint8)
-    )
-    scale = 0.05 + 0.02 * torch.rand(
-        num_phys, paged_block_size, 1, 1, device=DEVICE, dtype=torch.float32,
-    )
-    kv[..., D:].copy_(scale.view(torch.uint8).reshape(num_phys, paged_block_size, 1, 4))
+    kv = _make_paged_kv_cache_soa(num_phys, paged_block_size, D, seed=seed)
     block_tables = torch.arange(
         max_logical * B, device=DEVICE, dtype=torch.int32,
     ).reshape(B, max_logical)
@@ -601,49 +628,161 @@ def _make_paged_mean_pool_inputs(
     )
 
 
+def _paged_mean_pool_torch_ref(inp: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    """Torch reference for paged mean-pool (any k_block_size).
+
+    NOTE: the main KV cache and pool_k_pages share the same SoA byte
+    layout per page: first ``paged_block_size * D`` bytes are all tokens'
+    fp8 data concatenated (token-major × dim-minor), then
+    ``paged_block_size * 4`` bytes of f32 scales (one per token). The
+    triton/tilelang kernels read it that way; the 4D view shape
+    ``[num_phys, paged_block_size, 1, D+4]`` is just for caller
+    convenience and is NOT the actual byte layout.
+    """
+    kv = inp["kv_cache"]
+    block_tables = inp["block_tables"]
+    ctx_lens = inp["context_lens"]
+    k_block = inp["k_block_size"]
+    paged = inp["paged_block_size"]
+    max_num_pool = inp["max_num_pooling_blocks"]
+    B, max_log = block_tables.shape
+    num_phys, _, _, DPlus4 = kv.shape
+    D = DPlus4 - 4
+
+    # SoA reinterpretation matching what the kernels read.
+    kv_flat = kv.reshape(num_phys, paged * DPlus4).contiguous()
+    kv_fp8 = (
+        kv_flat[:, : paged * D]
+        .contiguous()
+        .view(torch.float8_e4m3fn)
+        .reshape(num_phys, paged, D)
+    )
+    kv_scale = (
+        kv_flat[:, paged * D :]
+        .contiguous()
+        .view(torch.float32)
+        .reshape(num_phys, paged)
+    )
+
+    out_k = torch.zeros(B, max_num_pool, D, dtype=torch.float8_e4m3fn, device=kv.device)
+    out_s = torch.zeros(B, max_num_pool, dtype=torch.float32, device=kv.device)
+    for b in range(B):
+        seq = int(ctx_lens[b].item())
+        n_pool = (seq + k_block - 1) // k_block
+        for p in range(n_pool):
+            t_s = p * k_block
+            t_e = min(t_s + k_block, seq)
+            acc = torch.zeros(D, dtype=torch.float32, device=kv.device)
+            cnt = 0
+            for t in range(t_s, t_e):
+                logical = t // paged
+                row = t % paged
+                phys = int(block_tables[b, logical].item())
+                acc += kv_fp8[phys, row].to(torch.float32) * kv_scale[phys, row].item()
+                cnt += 1
+            mean = acc / cnt
+            mx = mean.abs().max()
+            scale = max(mx.item() * (1.0 / 448.0), 1e-10)
+            out_k[b, p] = (mean / scale).to(torch.float8_e4m3fn)
+            out_s[b, p] = scale
+    return out_k, out_s
+
+
 def bench_paged_mean_pooling(
     batch_sizes: list[int], ctx_lens: list[int], dims: MqaDims,
+    k_block_sizes: list[int] | None = None,
     num_warmups: int = 5, num_iters: int = 20,
 ) -> None:
-    print("\n" + "=" * 110)
-    print(f"paged_mean_pooling (v1 full)  dim={dims.dim}  k_block_size=128")
-    print("=" * 110)
-    hdr = f"{'B':>4} | {'ctx':>6} | {'tilelang (ms)':>15} | {'triton (ms)':>13} | {'speedup':>8} | fp8 corr (max|byte Δ|)"
+    if k_block_sizes is None:
+        k_block_sizes = [128]
+    print("\n" + "=" * 130)
+    print(f"paged_mean_pooling (v1 full)  dim={dims.dim}  k_block_sizes={k_block_sizes}")
+    print("=" * 130)
+    hdr = (
+        f"{'k':>4} | {'B':>4} | {'ctx':>6} | {'ref (ms)':>15} | {'triton (ms)':>13} | "
+        f"{'speedup':>8} | path | corr"
+    )
     print(hdr); print("-" * len(hdr))
-    for B in batch_sizes:
-        for ctx in ctx_lens:
-            inp = _make_paged_mean_pool_inputs(B, ctx, dims)
-            bk_tl, bks_tl, _ = fp8_native_paged_mean_pooling_interface(
-                max_num_pooling_blocks=inp["max_num_pooling_blocks"],
-                kv_cache=inp["kv_cache"], context_lens=inp["context_lens"],
-                block_tables=inp["block_tables"], k_block_size=inp["k_block_size"],
-            )
-            bk_tr, bks_tr, _ = paged_mean_pooling_triton(
-                max_num_pooling_blocks=inp["max_num_pooling_blocks"],
-                kv_cache=inp["kv_cache"], context_lens=inp["context_lens"],
-                block_tables=inp["block_tables"], k_block_size=inp["k_block_size"],
-            )
-            # fp8 correctness: max byte diff + scale rel.
-            byte_diff = (bk_tl.view(torch.uint8).to(torch.int32)
-                         - bk_tr.view(torch.uint8).to(torch.int32)).abs().max().item()
-            scale_rel = ((bks_tl - bks_tr).abs() / (bks_tl.abs() + 1e-9)).max().item()
-            corr_msg = f"max|byte Δ|={byte_diff} scale_rel={scale_rel:.2e}"
-            def fn_tl():
-                fp8_native_paged_mean_pooling_interface(
+    for k_block in k_block_sizes:
+        is_grouped = k_block < 64
+        path = "grouped" if is_grouped else "legacy"
+        ref_label = "torch ref" if is_grouped else "tilelang"
+        for B in batch_sizes:
+            for ctx in ctx_lens:
+                if ctx % k_block != 0:
+                    continue
+                inp = _make_paged_mean_pool_inputs(B, ctx, dims, k_block_size=k_block)
+                if is_grouped:
+                    # Tilelang doesn't support k<paged_block_size; use a
+                    # CPU-bound torch reference (small B/ctx only).
+                    if B * ctx > 8 * 4096:
+                        ref_msg = "ref too slow (skipped)"
+                        ref_ms = float("nan"); ref_std = 0.0
+                        bk_tr, bks_tr, _ = paged_mean_pooling_triton(
+                            max_num_pooling_blocks=inp["max_num_pooling_blocks"],
+                            kv_cache=inp["kv_cache"], context_lens=inp["context_lens"],
+                            block_tables=inp["block_tables"], k_block_size=inp["k_block_size"],
+                        )
+                        def fn_tr(_inp=inp):
+                            paged_mean_pooling_triton(
+                                max_num_pooling_blocks=_inp["max_num_pooling_blocks"],
+                                kv_cache=_inp["kv_cache"], context_lens=_inp["context_lens"],
+                                block_tables=_inp["block_tables"], k_block_size=_inp["k_block_size"],
+                            )
+                        tr_ms, tr_std = cuda_bench(fn_tr, num_warmups, num_iters)
+                        speedup = float("nan")
+                        print(
+                            f"{k_block:>4} | {B:>4} | {ctx:>6} | "
+                            f"{'(skipped)':>15} | {tr_ms:>7.3f} ±{tr_std:>4.2f} | "
+                            f"{'n/a':>8} | {path:>7} | {ref_msg}"
+                        )
+                        continue
+                    bk_ref, bks_ref = _paged_mean_pool_torch_ref(inp)
+                else:
+                    bk_ref, bks_ref, _ = fp8_native_paged_mean_pooling_interface(
+                        max_num_pooling_blocks=inp["max_num_pooling_blocks"],
+                        kv_cache=inp["kv_cache"], context_lens=inp["context_lens"],
+                        block_tables=inp["block_tables"], k_block_size=inp["k_block_size"],
+                    )
+
+                bk_tr, bks_tr, _ = paged_mean_pooling_triton(
                     max_num_pooling_blocks=inp["max_num_pooling_blocks"],
                     kv_cache=inp["kv_cache"], context_lens=inp["context_lens"],
                     block_tables=inp["block_tables"], k_block_size=inp["k_block_size"],
                 )
-            def fn_tr():
-                paged_mean_pooling_triton(
-                    max_num_pooling_blocks=inp["max_num_pooling_blocks"],
-                    kv_cache=inp["kv_cache"], context_lens=inp["context_lens"],
-                    block_tables=inp["block_tables"], k_block_size=inp["k_block_size"],
+                byte_diff = (bk_ref.view(torch.uint8).to(torch.int32)
+                             - bk_tr.view(torch.uint8).to(torch.int32)).abs().max().item()
+                scale_rel = ((bks_ref - bks_tr).abs() / (bks_ref.abs() + 1e-9)).max().item()
+                corr_msg = f"max|Δbyte|={byte_diff} scale_rel={scale_rel:.2e}"
+
+                def fn_tr(_inp=inp):
+                    paged_mean_pooling_triton(
+                        max_num_pooling_blocks=_inp["max_num_pooling_blocks"],
+                        kv_cache=_inp["kv_cache"], context_lens=_inp["context_lens"],
+                        block_tables=_inp["block_tables"], k_block_size=_inp["k_block_size"],
+                    )
+                tr_ms, tr_std = cuda_bench(fn_tr, num_warmups, num_iters)
+
+                if is_grouped:
+                    ref_ms, ref_std = float("nan"), 0.0
+                    speedup_str = "n/a"
+                    ref_str = "torch ref"
+                else:
+                    def fn_tl(_inp=inp):
+                        fp8_native_paged_mean_pooling_interface(
+                            max_num_pooling_blocks=_inp["max_num_pooling_blocks"],
+                            kv_cache=_inp["kv_cache"], context_lens=_inp["context_lens"],
+                            block_tables=_inp["block_tables"], k_block_size=_inp["k_block_size"],
+                        )
+                    ref_ms, ref_std = cuda_bench(fn_tl, num_warmups, num_iters)
+                    speedup_str = f"{ref_ms / tr_ms:>7.2f}x" if tr_ms > 0 else "nan"
+                    ref_str = f"{ref_ms:>9.3f} ±{ref_std:>4.2f}"
+
+                print(
+                    f"{k_block:>4} | {B:>4} | {ctx:>6} | {ref_str:>15} | "
+                    f"{tr_ms:>7.3f} ±{tr_std:>4.2f} | "
+                    f"{speedup_str:>8} | {path:>7} | {corr_msg}"
                 )
-            tl_ms, tl_std = cuda_bench(fn_tl, num_warmups, num_iters)
-            tr_ms, tr_std = cuda_bench(fn_tr, num_warmups, num_iters)
-            speedup = tl_ms / tr_ms if tr_ms > 0 else float("nan")
-            print(f"{B:>4} | {ctx:>6} | {tl_ms:>9.3f} ±{tl_std:>4.2f} | {tr_ms:>7.3f} ±{tr_std:>4.2f} | {speedup:>7.2f}x | {corr_msg}")
 
 
 # =============================================================================
@@ -653,32 +792,45 @@ def bench_paged_mean_pooling(
 
 def bench_block_mean_pooling(
     seq_kvs: list[int], dims: MqaDims,
+    k_block_sizes: list[int] | None = None,
     num_warmups: int = 5, num_iters: int = 20,
 ) -> None:
-    print("\n" + "=" * 110)
-    print(f"block_mean_pooling (ragged)  dim={dims.dim}  k_block_size=128")
-    print("=" * 110)
-    hdr = f"{'seq_kv':>8} | {'tilelang (ms)':>15} | {'triton (ms)':>13} | {'speedup':>8} | fp8 corr"
-    print(hdr); print("-" * len(hdr))
+    if k_block_sizes is None:
+        k_block_sizes = [128]
     D = dims.dim
-    for skv in seq_kvs:
-        torch.manual_seed(0)
-        k = torch.randn(skv, D, device=DEVICE, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
-        ks = 0.05 + 0.02 * torch.rand(skv, device=DEVICE, dtype=torch.float32)
+    print("\n" + "=" * 120)
+    print(f"block_mean_pooling (ragged)  dim={D}  k_block_sizes={k_block_sizes}")
+    print("=" * 120)
+    hdr = (
+        f"{'k':>4} | {'seq_kv':>8} | {'tilelang (ms)':>15} | {'triton (ms)':>13} | "
+        f"{'speedup':>8} | path | fp8 corr"
+    )
+    print(hdr); print("-" * len(hdr))
+    for k_block in k_block_sizes:
+        path = "grouped" if k_block < 64 else "legacy"
+        for skv in seq_kvs:
+            if skv % k_block != 0:
+                continue
+            torch.manual_seed(0)
+            k = torch.randn(skv, D, device=DEVICE, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+            ks = 0.05 + 0.02 * torch.rand(skv, device=DEVICE, dtype=torch.float32)
 
-        bk_tl, bks_tl = fp8_native_block_mean_pooling_interface(k, ks, 128)
-        bk_tr, bks_tr = block_mean_pooling_triton(k, ks, 128)
-        byte_diff = (bk_tl.view(torch.uint8).to(torch.int32)
-                     - bk_tr.view(torch.uint8).to(torch.int32)).abs().max().item()
-        scale_rel = ((bks_tl - bks_tr).abs() / (bks_tl.abs() + 1e-9)).max().item()
-        corr_msg = f"max|byte Δ|={byte_diff} scale_rel={scale_rel:.2e}"
+            bk_tl, bks_tl = fp8_native_block_mean_pooling_interface(k, ks, k_block)
+            bk_tr, bks_tr = block_mean_pooling_triton(k, ks, k_block)
+            byte_diff = (bk_tl.view(torch.uint8).to(torch.int32)
+                         - bk_tr.view(torch.uint8).to(torch.int32)).abs().max().item()
+            scale_rel = ((bks_tl - bks_tr).abs() / (bks_tl.abs() + 1e-9)).max().item()
+            corr_msg = f"max|byte Δ|={byte_diff} scale_rel={scale_rel:.2e}"
 
-        def fn_tl(): fp8_native_block_mean_pooling_interface(k, ks, 128)
-        def fn_tr(): block_mean_pooling_triton(k, ks, 128)
-        tl_ms, tl_std = cuda_bench(fn_tl, num_warmups, num_iters)
-        tr_ms, tr_std = cuda_bench(fn_tr, num_warmups, num_iters)
-        speedup = tl_ms / tr_ms if tr_ms > 0 else float("nan")
-        print(f"{skv:>8} | {tl_ms:>9.3f} ±{tl_std:>4.2f} | {tr_ms:>7.3f} ±{tr_std:>4.2f} | {speedup:>7.2f}x | {corr_msg}")
+            def fn_tl(): fp8_native_block_mean_pooling_interface(k, ks, k_block)
+            def fn_tr(): block_mean_pooling_triton(k, ks, k_block)
+            tl_ms, tl_std = cuda_bench(fn_tl, num_warmups, num_iters)
+            tr_ms, tr_std = cuda_bench(fn_tr, num_warmups, num_iters)
+            speedup = tl_ms / tr_ms if tr_ms > 0 else float("nan")
+            print(
+                f"{k_block:>4} | {skv:>8} | {tl_ms:>9.3f} ±{tl_std:>4.2f} | "
+                f"{tr_ms:>7.3f} ±{tr_std:>4.2f} | {speedup:>7.2f}x | {path:>7} | {corr_msg}"
+            )
 
 if __name__ == "__main__":
     main()

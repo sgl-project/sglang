@@ -47,6 +47,7 @@ from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
 )
 from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import HisaNSATokenToKVPool
 from sglang.srt.layers.attention.nsa.hisa_triton.orchestrator import (
+    fp8_native_hierarchy_paged_mqa_logits_triton,
     fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v4,
 )
 from sglang.srt.layers.attention.nsa.hisa.triton_kernel import hisa_coord_transform
@@ -475,15 +476,31 @@ class HisaIndexer(MultiPlatformOp):
         q_offset = sum(metadata.get_nsa_extend_len_cpu())
 
         # ---- hisa kernel ----
-        # Three-way dispatch between the paged-pool-cache orchestrators:
-        #   v4 (default)  — paged pool cache + triton hotspot kernels
-        #   v3            — paged pool cache + tilelang (set SGLANG_HISA_DISABLE_TRITON=1)
-        #   v1 (no cache) — fresh mean-pool every step, tilelang (happens when
-        #                   HisaNSATokenToKVPool isn't installed, e.g. via
-        #                   SGLANG_HISA_DISABLE_POOL_CACHE=1 in the pool ctor)
+        # Dispatch:
+        #   cache enabled (default) + DISABLE_TRITON=1 → v3 (tilelang hot)
+        #   cache enabled (default) + default          → v4 (triton hot)
+        #   cache disabled (DISABLE_POOL_CACHE=1) + k>=64 → v1 tilelang baseline
+        #   cache disabled (DISABLE_POOL_CACHE=1) + k<64  → all-triton no-cache (SK14)
+        # SK15+SK16 made the v4 path k<64 capable (tail_only and update_pool
+        # tilelang kernels can't handle k<64; their dispatch in this layer
+        # routes through the triton ports). So k<64 + cache enabled stays on v4.
         kv_pool = forward_batch.token_to_kv_pool
         use_pool_cache = isinstance(kv_pool, HisaNSATokenToKVPool)
-        if use_pool_cache:
+        small_k_block = self.hisa_k_block_size < 64
+        if small_k_block and not use_pool_cache:
+            block_sparse_logits, topk_block_indices = (
+                fp8_native_hierarchy_paged_mqa_logits_triton(
+                    q_fp8=q_fp8[:q_offset],
+                    kv_cache_fp8=kv_cache_fp8,
+                    weights=weights[:q_offset],
+                    context_lens=seqlens_32[:q_offset],
+                    block_tables=block_tables[:q_offset],
+                    k_block_size=self.hisa_k_block_size,
+                    block_topk=self.hisa_block_topk,
+                    max_seq_len=max_seq_len,
+                )
+            )
+        elif use_pool_cache:
             use_triton = os.environ.get("SGLANG_HISA_DISABLE_TRITON") != "1"
             pool_k_pages = kv_pool.get_pool_k_pages(layer_id)
             pool_page_tables = kv_pool.get_pool_page_tables(
@@ -1279,6 +1296,8 @@ class HisaIndexer(MultiPlatformOp):
         # (no Python list → tensor alloc, no .cpu() / .item()).
         kv_pool = forward_batch.token_to_kv_pool
         if isinstance(kv_pool, HisaNSATokenToKVPool):
+            # update_pool_for_completed_blocks dispatches tilelang/triton
+            # internally by self.k_block_size (SK15 covers k<64 case).
             seq_lens_src = forward_batch.seq_lens
             B = seq_lens_src.shape[0]
             # Both prev and new need to be int32 for the kernel, and live

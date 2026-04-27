@@ -25,11 +25,15 @@ from sglang.srt.layers.attention.nsa.hisa_triton.benchmark import (
     MqaDims,
     _make_batch_pool_mqa_inputs,
     _make_batch_pool_mqa_v3_inputs,
+    _make_paged_kv_cache_soa,
     _make_sparse_paged_mqa_inputs,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
     batch_decode_pool_mqa_v3_triton,
     batch_pool_mqa_triton,
+    block_mean_pooling_triton,
+    block_sparse_mqa_triton,
+    paged_mean_pooling_triton,
     sparse_paged_mqa_triton,
 )
 
@@ -248,6 +252,247 @@ def test_batch_decode_pool_mqa_v3():
             )
 
 
+# ---------------------------------------------------------------------------
+# Cross-k_block_size correctness — torch references for all 4 hisa kernels.
+#
+# These references mirror the kernel's fp32-accumulator + fp8-input arithmetic
+# (cast fp8→fp32, do reductions in fp32, cast outputs back to fp8). They are
+# slow (Python loops) but unambiguous: any disagreement at fp8-strict
+# tolerance (rtol=1e-3, atol=1e-2) is a real bug, not fp8 ULP noise.
+# ---------------------------------------------------------------------------
+
+
+def _ref_block_mean_pooling(k_fp8, k_scale, k_block_size):
+    """Ragged mean-pool reference: pool every k_block_size tokens of K."""
+    seq_kv, D = k_fp8.shape
+    n_pool = (seq_kv + k_block_size - 1) // k_block_size
+    out_k = torch.zeros(n_pool, D, dtype=torch.float8_e4m3fn, device=k_fp8.device)
+    out_s = torch.zeros(n_pool, dtype=torch.float32, device=k_fp8.device)
+    k_f32 = k_fp8.to(torch.float32) * k_scale[:, None]   # [seq_kv, D]
+    for p in range(n_pool):
+        s, e = p * k_block_size, min((p + 1) * k_block_size, seq_kv)
+        if s >= e:
+            continue
+        mean = k_f32[s:e].sum(dim=0) / float(e - s)      # [D]
+        mx = mean.abs().max().item()
+        scale = max(mx * (1.0 / 448.0), 1e-10)
+        out_k[p] = (mean / scale).to(torch.float8_e4m3fn)
+        out_s[p] = scale
+    return out_k, out_s
+
+
+def _ref_paged_mean_pooling(kv, block_tables, ctx_lens, k_block_size, paged_block_size):
+    """Paged mean-pool reference (SoA byte layout)."""
+    num_phys, _, _, DPlus4 = kv.shape
+    D = DPlus4 - 4
+    B, max_log = block_tables.shape
+    kv_flat = kv.reshape(num_phys, paged_block_size * DPlus4).contiguous()
+    kv_fp8 = (
+        kv_flat[:, : paged_block_size * D].contiguous()
+        .view(torch.float8_e4m3fn).reshape(num_phys, paged_block_size, D)
+    )
+    kv_scale = (
+        kv_flat[:, paged_block_size * D :].contiguous()
+        .view(torch.float32).reshape(num_phys, paged_block_size)
+    )
+    max_n_pool = max(int((int(ctx_lens[b].item()) + k_block_size - 1) // k_block_size)
+                      for b in range(B))
+    out_k = torch.zeros(B, max_n_pool, D, dtype=torch.float8_e4m3fn, device=kv.device)
+    out_s = torch.zeros(B, max_n_pool, dtype=torch.float32, device=kv.device)
+    for b in range(B):
+        seq = int(ctx_lens[b].item())
+        n_pool = (seq + k_block_size - 1) // k_block_size
+        for p in range(n_pool):
+            s, e = p * k_block_size, min((p + 1) * k_block_size, seq)
+            if s >= e:
+                continue
+            acc = torch.zeros(D, dtype=torch.float32, device=kv.device)
+            for t in range(s, e):
+                logical = t // paged_block_size
+                row = t % paged_block_size
+                phys = int(block_tables[b, logical].item())
+                acc += kv_fp8[phys, row].to(torch.float32) * kv_scale[phys, row].item()
+            mean = acc / float(e - s)
+            mx = mean.abs().max().item()
+            scale = max(mx * (1.0 / 448.0), 1e-10)
+            out_k[b, p] = (mean / scale).to(torch.float8_e4m3fn)
+            out_s[b, p] = scale
+    return out_k, out_s
+
+
+def _ref_block_sparse_mqa(q_fp8, k_fp8, k_scale, topk_idx, kv_block_size,
+                          weights, cu_ks, cu_ke):
+    """Ragged block-sparse MQA reference."""
+    seq_q, H, D = q_fp8.shape
+    seq_kv = k_fp8.shape[0]
+    topk = topk_idx.shape[1]
+    out = torch.full((seq_q, topk * kv_block_size), float("-inf"),
+                      dtype=torch.float32, device=q_fp8.device)
+    q_f32 = q_fp8.to(torch.float32)                       # [seq_q, H, D]
+    k_f32 = k_fp8.to(torch.float32)                       # [seq_kv, D]
+    for s_i in range(seq_q):
+        ks_min = int(cu_ks[s_i].item())
+        ke_max = int(cu_ke[s_i].item())
+        w = weights[s_i]                                  # [H]
+        for n_i in range(topk):
+            tid = int(topk_idx[s_i, n_i].item())
+            for j in range(kv_block_size):
+                t_abs = tid * kv_block_size + j
+                if t_abs < 0 or t_abs >= seq_kv:
+                    continue
+                if t_abs < ks_min or t_abs >= ke_max:
+                    continue
+                # GEMM row: [H] = q_f32[s_i] @ k_f32[t_abs] * scale
+                kv = k_f32[t_abs]
+                s = (q_f32[s_i] @ kv) * k_scale[t_abs].item()  # [H]
+                s = torch.clamp(s, min=0)
+                logit = (s * w).sum().item()
+                out[s_i, n_i * kv_block_size + j] = logit
+    return out
+
+
+def _ref_sparse_paged_mqa(q_fp8, kv, topk_idx, kv_block_size,
+                           weights, ctx_lens, block_tables, paged_block_size):
+    """Decode paged sparse MQA reference (SoA byte layout)."""
+    B, seq_q, H, D = q_fp8.shape
+    topk = topk_idx.shape[2]
+    num_phys, _, _, DPlus4 = kv.shape
+    kv_flat = kv.reshape(num_phys, paged_block_size * DPlus4).contiguous()
+    kv_fp8 = (
+        kv_flat[:, : paged_block_size * D].contiguous()
+        .view(torch.float8_e4m3fn).reshape(num_phys, paged_block_size, D)
+    )
+    kv_scale = (
+        kv_flat[:, paged_block_size * D :].contiguous()
+        .view(torch.float32).reshape(num_phys, paged_block_size)
+    )
+    weights = weights.view(B, seq_q, H)
+    out = torch.full((B, seq_q, topk * kv_block_size), float("-inf"),
+                      dtype=torch.float32, device=q_fp8.device)
+    q_f32 = q_fp8.to(torch.float32)
+    max_blocks = block_tables.shape[1]
+    for b in range(B):
+        ctx = int(ctx_lens[b].item())
+        for s_i in range(seq_q):
+            w = weights[b, s_i]
+            for n_i in range(topk):
+                tid = int(topk_idx[b, s_i, n_i].item())
+                for j in range(kv_block_size):
+                    t_abs = tid * kv_block_size + j
+                    if t_abs < 0 or t_abs >= ctx:
+                        continue
+                    logical = t_abs // paged_block_size
+                    if logical < 0 or logical >= max_blocks:
+                        continue
+                    row = t_abs % paged_block_size
+                    phys = int(block_tables[b, logical].item())
+                    kv_vec = kv_fp8[phys, row].to(torch.float32)
+                    s = (q_f32[b, s_i] @ kv_vec) * kv_scale[phys, row].item()
+                    s = torch.clamp(s, min=0)
+                    out[b, s_i, n_i * kv_block_size + j] = (s * w).sum().item()
+    return out
+
+
+@torch.inference_mode()
+def test_cross_k_block_size():
+    """Verify all 4 hisa kernels at k ∈ {8, 16, 32, 64, 128} agree with a
+    torch reference (fp8 → fp32 → ops → fp8) at fp8-strict tolerance.
+    Small sizes for speed; the goal is correctness coverage of grouped
+    paths, not perf."""
+    print("\n" + "=" * 90)
+    print("CROSS-k_block_size correctness (torch ref @ fp8-strict tolerance)")
+    print("=" * 90)
+    print(f"{'kernel':>22} | {'k':>4} | {'config':>20} | {'level':>22} | diag")
+    print("-" * 130)
+
+    K_VALS = [8, 16, 32, 64, 128]
+    dims = MqaDims(heads=64, dim=128)
+    H, D = dims.heads, dims.dim
+
+    # --- 1. block_mean_pooling ---
+    for k in K_VALS:
+        seq_kv = 256  # small for speed
+        torch.manual_seed(0)
+        k_fp8 = torch.randn(seq_kv, D, device=DEVICE, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        k_scale = 0.05 + 0.02 * torch.rand(seq_kv, device=DEVICE, dtype=torch.float32)
+        bk_t, bks_t = block_mean_pooling_triton(k_fp8, k_scale, k)
+        bk_r, bks_r = _ref_block_mean_pooling(k_fp8, k_scale, k)
+        # Compare in fp32 space for fp8 tensors (cast both to fp32).
+        level, diag = _strictest_passing_tolerance(bk_t.to(torch.float32), bk_r.to(torch.float32))
+        cfg = f"seq_kv={seq_kv}"
+        print(f"{'block_mean_pooling':>22} | {k:>4} | {cfg:>20} | {level:>22} | {diag}")
+
+    # --- 2. paged_mean_pooling ---
+    paged = 64
+    for k in K_VALS:
+        B = 2
+        ctx = 256
+        max_logical = (ctx + paged - 1) // paged
+        num_phys = max_logical * B + 4
+        kv = _make_paged_kv_cache_soa(num_phys, paged, D, seed=0)
+        block_tables = torch.arange(max_logical * B, dtype=torch.int32, device=DEVICE).reshape(B, max_logical)
+        ctx_lens = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
+        max_n_pool = (ctx + k - 1) // k
+        bk_t, bks_t, _ = paged_mean_pooling_triton(max_n_pool, kv, ctx_lens, block_tables, k)
+        bk_r, bks_r = _ref_paged_mean_pooling(kv, block_tables, ctx_lens, k, paged)
+        level, diag = _strictest_passing_tolerance(bk_t.to(torch.float32), bk_r.to(torch.float32))
+        cfg = f"B={B} ctx={ctx}"
+        print(f"{'paged_mean_pooling':>22} | {k:>4} | {cfg:>20} | {level:>22} | {diag}")
+
+    # --- 3. block_sparse_mqa (prefill ragged) ---
+    # SK11: GEMM_TILE=256 → GROUP_SIZE=256/k (max=32 for k=8). topk must be
+    # divisible by GROUP_SIZE; use topk=32 to satisfy all k.
+    for k in K_VALS:
+        seq_q = 8
+        seq_kv = 4096
+        topk = 32
+        torch.manual_seed(0)
+        q = torch.randn(seq_q, H, D, device=DEVICE, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        k_fp8 = torch.randn(seq_kv, D, device=DEVICE, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        k_scale = 0.05 + 0.02 * torch.rand(seq_kv, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(seq_q, H, device=DEVICE, dtype=torch.float32)
+        cu_ks = torch.zeros(seq_q, device=DEVICE, dtype=torch.int32)
+        cu_ke = torch.full((seq_q,), seq_kv, device=DEVICE, dtype=torch.int32)
+        max_block = seq_kv // k
+        topk_idx = torch.stack([torch.randperm(max_block, device=DEVICE)[:topk] for _ in range(seq_q)]).to(torch.int64)
+        out_t = block_sparse_mqa_triton(q, k_fp8, k_scale, topk_idx, k, w, cu_ks, cu_ke)
+        out_r = _ref_block_sparse_mqa(q, k_fp8, k_scale, topk_idx, k, w, cu_ks, cu_ke)
+        inf_ok, inf_msg = _inf_match(out_t, out_r)
+        level, diag = _strictest_passing_tolerance(out_t, out_r)
+        cfg = f"sq={seq_q} skv={seq_kv}"
+        status = "OK" if inf_ok else "INF-MISMATCH"
+        print(f"{'block_sparse_mqa':>22} | {k:>4} | {cfg:>20} | {level:>22} | [{status}] {diag}")
+
+    # --- 4. sparse_paged_mqa (decode) — INCLUDES SK12's k=128 cross-page path ---
+    # SK3: GEMM_TILE=64 → GROUP_SIZE=64/k (max=8 for k=8). Use topk=8.
+    for k in K_VALS:
+        B = 2
+        ctx = 1024
+        topk = 8
+        torch.manual_seed(0)
+        q = torch.randn(B, 1, H, D, device=DEVICE, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        max_logical = (ctx + paged - 1) // paged
+        num_phys = max_logical * B + 4
+        kv = _make_paged_kv_cache_soa(num_phys, paged, D, seed=0)
+        block_tables = torch.arange(max_logical * B, dtype=torch.int32, device=DEVICE).reshape(B, max_logical)
+        ctx_lens = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
+        weights = torch.randn(B, H, device=DEVICE, dtype=torch.float32)
+        max_block = ctx // k
+        topk_idx = torch.stack([torch.randperm(max_block, device=DEVICE)[:topk] for _ in range(B)]).unsqueeze(1).to(torch.int64)
+        out_t = sparse_paged_mqa_triton(
+            q_fp8=q, kv_cache_fp8=kv, topk_block_index=topk_idx,
+            kv_block_size=k, weights=weights, context_lens=ctx_lens,
+            block_tables=block_tables,
+        )
+        out_r = _ref_sparse_paged_mqa(q, kv, topk_idx, k, weights, ctx_lens, block_tables, paged)
+        inf_ok, inf_msg = _inf_match(out_t, out_r)
+        level, diag = _strictest_passing_tolerance(out_t, out_r)
+        cfg = f"B={B} ctx={ctx}"
+        path_note = "k=128 cross-page" if k == 128 else f"G={64//k if k<64 else 1}"
+        status = "OK" if inf_ok else "INF-MISMATCH"
+        print(f"{'sparse_paged_mqa':>22} | {k:>4} | {cfg:>20} | {level:>22} | [{status}] [{path_note}] {diag}")
+
+
 def main() -> int:
     print(f"GPU: {torch.cuda.get_device_name(0)}")
     print("\nTolerance ladder:")
@@ -259,6 +504,7 @@ def main() -> int:
     test_batch_pool_mqa()
     test_sparse_paged_mqa()
     test_batch_decode_pool_mqa_v3()
+    test_cross_k_block_size()
     return 0
 
 
