@@ -30,6 +30,11 @@ def float_triplet(seq: Any):
     return a, b, c
 
 
+NEMOTRON_ARCH_ALIASES = {
+    "NemotronH_Nano_Omni_Reasoning_V3": "NemotronH_Nano_VL_V2",
+}
+
+
 class NemotronH_Nano_VL_V2_Config(PretrainedConfig):
     model_type = "NemotronH_Nano_VL_V2"
     is_composition = True
