@@ -58,6 +58,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.oot_device import get_oot_device_config
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -65,6 +66,9 @@ _is_xpu = is_xpu()
 _is_musa = is_musa()
 
 TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
+
+# OOT communicator factory: plugins register via GroupCoordinator.register_oot_communicator()
+_oot_communicator_factory: Optional[Callable] = None
 
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
@@ -231,6 +235,20 @@ class GroupCoordinator:
     ca_comm: Optional[Any]  # Custom allreduce communicator
     torch_symm_mem_comm: Optional[Any]  # Torch symm mem communicator
     mq_broadcaster: Optional[Any]  # shared memory broadcaster
+    oot_communicator: Optional[Any]  # OOT plugin communicator
+
+    @classmethod
+    def register_oot_communicator(cls, factory_fn: Callable) -> None:
+        """Register an OOT communicator factory (called by plugins).
+
+        Args:
+            factory_fn: Callable(group, device) -> communicator instance.
+                The communicator must implement all_reduce(tensor),
+                and optionally reduce_scatter/all_gather.
+        """
+        global _oot_communicator_factory
+        _oot_communicator_factory = factory_fn
+        logger.info("Registered OOT communicator factory")
 
     def __init__(
         self,
@@ -260,7 +278,11 @@ class GroupCoordinator:
         self.cpu_group = None
         self.local_size = get_int_env_var("LOCAL_SIZE", 0)
 
-        if is_cuda_alike():
+        # OOT device config takes priority over built-in device selection
+        _oot_dev_cfg = get_oot_device_config()
+        if _oot_dev_cfg is not None:
+            self.device = _oot_dev_cfg.get_device(local_rank)
+        elif is_cuda_alike():
             device_id = (
                 0 if envs.SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS.get() else local_rank
             )
@@ -426,6 +448,17 @@ class GroupCoordinator:
         if use_npu_communicator and self.world_size > 1:
             self.npu_communicator = NpuCommunicator(group=self.device_group)
 
+        # OOT communicator — plugin-registered factory takes priority
+        self.oot_communicator: Optional[Any] = None
+        if _oot_communicator_factory is not None and self.world_size > 1:
+            try:
+                self.oot_communicator = _oot_communicator_factory(
+                    group=self.cpu_group, device=self.device
+                )
+                logger.info("OOT communicator created successfully")
+            except Exception as e:
+                logger.warning(f"Failed to create OOT communicator: {e}")
+
         # Create message queue
         from sglang.srt.distributed.device_communicators.shm_broadcast import (
             MessageQueue,
@@ -566,6 +599,10 @@ class GroupCoordinator:
             else:
                 torch.distributed.all_reduce(input_, group=self.device_group)
             return input_
+
+        # OOT communicator takes priority over built-in hardware communicators
+        if self.oot_communicator is not None and not getattr(self.oot_communicator, "disabled", False):
+            return self.oot_communicator.all_reduce(input_)
 
         if self.hpu_communicator is not None and not self.hpu_communicator.disabled:
             return self.hpu_communicator.all_reduce(input_)
@@ -727,7 +764,9 @@ class GroupCoordinator:
         return output
 
     def reduce_scatter_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu:
+        if self.oot_communicator is not None and hasattr(self.oot_communicator, "reduce_scatter"):
+            self.oot_communicator.reduce_scatter(output, input)
+        elif _is_npu:
             self._reduce_scatter_tensor(output, input)
         else:
             reg_reduce_scatter_tensor(output, input, group_name=self.unique_name)
@@ -787,7 +826,9 @@ class GroupCoordinator:
             )
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
-        if _is_npu or _is_xpu:
+        if self.oot_communicator is not None and hasattr(self.oot_communicator, "all_gather"):
+            self.oot_communicator.all_gather(output, input)
+        elif _is_npu or _is_xpu:
             self._all_gather_into_tensor(output, input)
         else:
             reg_all_gather_into_tensor(output, input, group_name=self.unique_name)
@@ -1574,6 +1615,10 @@ _DEVICE_TO_DISTRIBUTED_BACKEND = {
 
 
 def get_default_distributed_backend(device: str) -> str:
+    # OOT plugin can override the distributed backend (e.g. "flagcx")
+    cfg = get_oot_device_config()
+    if cfg is not None and cfg.dist_backend:
+        return cfg.dist_backend
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 
