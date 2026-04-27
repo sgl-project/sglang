@@ -25,6 +25,7 @@ class SGLangTrueOnPolicyRuntimePolicy:
     disable_flashinfer_allreduce_fusion: bool
     tp_invariant_row_linear: bool
     deterministic_tree_all_reduce: bool
+    disable_fused_qk_norm_mrope: bool
 
 
 DEFAULT_RUNTIME_POLICY = SGLangTrueOnPolicyRuntimePolicy(
@@ -37,6 +38,7 @@ DEFAULT_RUNTIME_POLICY = SGLangTrueOnPolicyRuntimePolicy(
     disable_flashinfer_allreduce_fusion=False,
     tp_invariant_row_linear=False,
     deterministic_tree_all_reduce=False,
+    disable_fused_qk_norm_mrope=False,
 )
 
 
@@ -63,6 +65,7 @@ class SGLangTrueOnPolicyContract:
             disable_flashinfer_allreduce_fusion=uses_tp_invariant_rollout,
             tp_invariant_row_linear=uses_tp_invariant_rollout,
             deterministic_tree_all_reduce=uses_tp_invariant_rollout,
+            disable_fused_qk_norm_mrope=True,
         )
 
 

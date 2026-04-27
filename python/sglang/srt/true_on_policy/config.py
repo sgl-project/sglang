@@ -77,6 +77,14 @@ def should_force_bfloat16_lm_head(
     )
 
 
+def should_disable_fused_qk_norm_mrope(
+    server_args: Optional[Any] = None,
+) -> bool:
+    return resolve_true_on_policy_runtime_policy(
+        _get_server_args(server_args)
+    ).disable_fused_qk_norm_mrope
+
+
 def get_on_policy_rms_norm_kwargs(
     server_args: Optional[Any] = None,
     *,

@@ -15,7 +15,10 @@ from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.true_on_policy import should_force_bfloat16_dense_tensor_math
+from sglang.srt.true_on_policy import (
+    should_disable_fused_qk_norm_mrope,
+    should_force_bfloat16_dense_tensor_math,
+)
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -281,7 +284,7 @@ class Qwen3Attention(nn.Module):
         use_aiter_fused = (
             self.use_fused_qk_norm_mrope
             and forward_batch.forward_mode.is_decode()
-            and get_global_server_args().rl_on_policy_target is None
+            and not should_disable_fused_qk_norm_mrope()
         )
 
         if use_aiter_fused:

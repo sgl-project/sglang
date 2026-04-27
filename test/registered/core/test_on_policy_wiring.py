@@ -19,6 +19,7 @@ from sglang.srt.true_on_policy import (
     patch_prefill_only_deterministic_inference_for_cuda_graph,
     resolve_true_on_policy_runtime_policy,
     should_disable_flashinfer_allreduce_fusion,
+    should_disable_fused_qk_norm_mrope,
     should_disable_mlp_allreduce_fusion_for_on_policy,
     should_disable_reduce_scatter_for_on_policy,
     should_use_tp_invariant_row_linear,
@@ -363,6 +364,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertTrue(policy.disable_flashinfer_allreduce_fusion)
         self.assertTrue(policy.tp_invariant_row_linear)
         self.assertTrue(policy.deterministic_tree_all_reduce)
+        self.assertTrue(policy.disable_fused_qk_norm_mrope)
 
     def test_contract_resolver_rejects_contract_without_target(self):
         with self.assertRaisesRegex(ValueError, "requires --rl-on-policy-target"):
@@ -606,6 +608,18 @@ class TestOnPolicyHelpers(unittest.TestCase):
         )
         self.assertFalse(
             should_disable_flashinfer_allreduce_fusion(
+                SimpleNamespace(rl_on_policy_target=None)
+            )
+        )
+
+    def test_fused_qk_norm_mrope_helper_follows_true_on_policy_contract(self):
+        self.assertTrue(
+            should_disable_fused_qk_norm_mrope(
+                SimpleNamespace(rl_on_policy_target="fsdp")
+            )
+        )
+        self.assertFalse(
+            should_disable_fused_qk_norm_mrope(
                 SimpleNamespace(rl_on_policy_target=None)
             )
         )
