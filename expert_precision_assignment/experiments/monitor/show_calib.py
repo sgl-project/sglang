@@ -14,16 +14,16 @@ Six flags only:
                  (with <|im_start|>…, and the pre-injected <think>\n\n</think>\n\n
                  when enable_thinking=False). Uses the model's own tokenizer.
 
-Examples:
-    python show_calib.py kv_calib/calib_ifbench_n16.jsonl            # summary + row 0
-    python show_calib.py kv_calib/calib_ifbench_n16.jsonl -n 5       # first 5, truncated
-    python show_calib.py kv_calib/calib_ifbench_n16.jsonl -n 5 --full   # first 5, full text
-    python show_calib.py kv_calib/calib_ifbench_n16.jsonl --row 3    # row 3, full
-    python show_calib.py kv_calib/calib_ifbench_n16.jsonl --errors   # only failures
-    python show_calib.py kv_calib/calib_ifbench_n16.jsonl --row 1 --raw > row1.txt  # raw dump
+Examples (paths relative to experiments/):
+    python monitor/show_calib.py data/kv_calib/calib_ifbench_n16.jsonl            # summary + row 0
+    python monitor/show_calib.py data/kv_calib/calib_ifbench_n16.jsonl -n 5       # first 5, truncated
+    python monitor/show_calib.py data/kv_calib/calib_ifbench_n16.jsonl -n 5 --full   # first 5, full text
+    python monitor/show_calib.py data/kv_calib/calib_ifbench_n16.jsonl --row 3    # row 3, full
+    python monitor/show_calib.py data/kv_calib/calib_ifbench_n16.jsonl --errors   # only failures
+    python monitor/show_calib.py data/kv_calib/calib_ifbench_n16.jsonl --row 1 --raw > row1.txt  # raw dump
 
-Prompts + meta files are auto-joined from prompts/<task>.jsonl and
-prompts/<task>.meta.jsonl when <task> can be inferred from the trace
+Prompts + meta files are auto-joined from pipeline/prompt/<task>.jsonl and
+pipeline/prompt/<task>.meta.jsonl when <task> can be inferred from the trace
 filename (e.g. calib_ifbench_n16.jsonl → task=ifbench).
 """
 from __future__ import annotations
@@ -35,6 +35,7 @@ import statistics
 from pathlib import Path
 
 THIS_DIR = Path(__file__).resolve().parent
+EXPERIMENTS_DIR = THIS_DIR.parent
 
 
 def _load_trace(path: Path) -> dict:
@@ -76,7 +77,7 @@ def _auto_prompts(trace_path: Path) -> tuple[Path | None, Path | None]:
     task, variant = _guess_task(trace_path)
     if not task:
         return None, None
-    pdir = THIS_DIR / "prompts"
+    pdir = EXPERIMENTS_DIR / "pipeline" / "prompt"
     # Prefer a variant-specific snapshot (e.g. ifbench_nothink.jsonl) when present.
     candidates: list[tuple[Path, Path]] = []
     if variant:

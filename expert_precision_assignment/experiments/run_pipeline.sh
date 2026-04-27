@@ -2,25 +2,26 @@
 # One entrypoint for the full eval pipeline driven by a recipe YAML.
 #
 # Stages (in order):
-#   prep     → prepare_prompts_<task>.py --recipe <yaml>
-#              writes prompts/<task>_<variant>.jsonl + .meta.jsonl
-#   calib    → run_calib.sh <task>_<variant>   (KV calibration on BF16 baseline)
-#              writes kv_calib/calib_<task>_<variant>_n<N>.jsonl + .json
-#   gen      → gen_all.py --task <task>_<variant> --calib_json <path>
-#              writes configs/<task>_<variant>/mc{mc}/...
-#   sweep    → run_sweep.sh <task>_<variant>   (6×11 grid)
-#              writes results/<task>_<variant>/mc{mc}_{variant}.jsonl
-#   score    → score_traces_<task>.py per trace
-#              writes results/<task>_<variant>/mc{mc}_{variant}.scores.json
-#   collect  → collect_results.py
-#              writes results/<task>_<variant>/summary.csv
+#   prep     → pipeline/prompt/prepare_prompts_<task>.py --recipe <yaml>
+#              writes pipeline/prompt/<task>_<variant>.jsonl + .meta.jsonl
+#   calib    → pipeline/kv_calib/run_calib.sh <task>_<variant>
+#              (KV calibration on BF16 baseline)
+#              writes data/kv_calib/calib_<task>_<variant>_n<N>.jsonl + .json
+#   gen      → pipeline/gen_config/gen_all.py --task <task>_<variant> --calib_json <path>
+#              writes data/configs/<task>_<variant>/mc{mc}/...
+#   sweep    → pipeline/run_sweep.sh <task>_<variant>   (6×11 grid)
+#              writes data/results/<task>_<variant>/mc{mc}_{variant}.jsonl
+#   score    → pipeline/scoring/score_traces_<task>.py per trace
+#              writes data/results/<task>_<variant>/mc{mc}_{variant}.scores.json
+#   collect  → pipeline/collect_result/collect_results.py
+#              writes data/results/<task>_<variant>/summary.csv
 #
 # Usage:
-#   bash run_pipeline.sh recipes/ifbench_nothink.yaml               # full pipeline
-#   bash run_pipeline.sh recipes/ifbench_nothink.yaml --stage prep  # only prep
-#   bash run_pipeline.sh recipes/ifbench_nothink.yaml --stage calib
-#   bash run_pipeline.sh recipes/ifbench_nothink.yaml --stages prep,calib,gen
-#   bash run_pipeline.sh recipes/ifbench_nothink.yaml --from sweep  # sweep onwards
+#   bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml               # full pipeline
+#   bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --stage prep  # only prep
+#   bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --stage calib
+#   bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --stages prep,calib,gen
+#   bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --from sweep  # sweep onwards
 #
 # Env overrides still work per-stage — e.g. you can pass NUM_PROMPTS=16 to
 # override the recipe's calibration.num_prompts when debugging.
@@ -28,9 +29,11 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
+PIPELINE_DIR="$SCRIPT_DIR/pipeline"
+DATA_DIR="$SCRIPT_DIR/data"
 
 usage() {
-    sed -n '1,30p' "$0" | sed 's/^#\{1,2\} \{0,1\}//' >&2
+    sed -n '1,32p' "$0" | sed 's/^#\{1,2\} \{0,1\}//' >&2
     exit 2
 }
 
@@ -75,7 +78,7 @@ else
 fi
 
 # Pull recipe fields into RECIPE_* env vars.
-eval "$("$BOOTSTRAP_PYTHON" "$SCRIPT_DIR/recipe.py" "$RECIPE" env)"
+eval "$("$BOOTSTRAP_PYTHON" "$PIPELINE_DIR/recipe.py" "$RECIPE" env)"
 
 # Resolve the real runtime python: user $PYTHON env > recipe.runtime.python > bootstrap default.
 PYTHON="${PYTHON:-${RECIPE_RUNTIME__PYTHON:-$BOOTSTRAP_PYTHON}}"
@@ -98,12 +101,12 @@ export RECIPE_RUNTIME__PYTHON RECIPE_RUNTIME__MODEL_PATH RECIPE_RUNTIME__HOST
 TASK="$RECIPE_TASK"
 NAME="$RECIPE_NAME"
 CALIB_N="${RECIPE_CALIBRATION__NUM_PROMPTS}"
-PROMPTS_JSONL="$SCRIPT_DIR/prompts/${NAME}.jsonl"
-CALIB_JSON="$SCRIPT_DIR/kv_calib/${NAME}.json"
-CALIB_TRACE="$SCRIPT_DIR/kv_calib/calib_${NAME}_n${CALIB_N}.jsonl"
-RESULTS_DIR="$SCRIPT_DIR/results/${NAME}"
-SCORER="$SCRIPT_DIR/scoring/score_traces_${TASK}.py"
-META_JSONL="$SCRIPT_DIR/prompts/${NAME}.meta.jsonl"
+PROMPTS_JSONL="$PIPELINE_DIR/prompt/${NAME}.jsonl"
+CALIB_JSON="$DATA_DIR/kv_calib/${NAME}.json"
+CALIB_TRACE="$DATA_DIR/kv_calib/calib_${NAME}_n${CALIB_N}.jsonl"
+RESULTS_DIR="$DATA_DIR/results/${NAME}"
+SCORER="$PIPELINE_DIR/scoring/score_traces_${TASK}.py"
+META_JSONL="$PIPELINE_DIR/prompt/${NAME}.meta.jsonl"
 
 echo "============================================================"
 echo "  recipe         $RECIPE"
@@ -111,7 +114,7 @@ echo "  name           $NAME   (task=$TASK  variant=$RECIPE_VARIANT)"
 echo "  stages         ${STAGES[*]}"
 echo "  prompts →      $PROMPTS_JSONL"
 echo "  calib   →      $CALIB_JSON  ($CALIB_TRACE)"
-echo "  configs →      configs/${NAME}/"
+echo "  configs →      data/configs/${NAME}/"
 echo "  results →      $RESULTS_DIR/"
 echo "============================================================"
 
@@ -121,7 +124,7 @@ run_stage() {
     echo "=================== STAGE: $stage ==========================="
     case "$stage" in
         prep)
-            "$PYTHON" "$SCRIPT_DIR/prompts/prepare_prompts_${TASK}.py" \
+            "$PYTHON" "$PIPELINE_DIR/prompt/prepare_prompts_${TASK}.py" \
                 --recipe "$RECIPE"
             ;;
         calib)
@@ -132,11 +135,11 @@ run_stage() {
             CALIB_GPU="${CALIB_GPU:-$RECIPE_CALIBRATION__GPU}" \
             CALIB_PORT="${CALIB_PORT:-$RECIPE_CALIBRATION__PORT}" \
             CALIB_NCCL_PORT="${CALIB_NCCL_PORT:-$RECIPE_CALIBRATION__NCCL_PORT}" \
-                bash "$SCRIPT_DIR/run_calib.sh" "$NAME"
+                bash "$PIPELINE_DIR/kv_calib/run_calib.sh" "$NAME"
             ;;
         gen)
             [ -f "$CALIB_JSON" ] || { echo "Run 'calib' first: missing $CALIB_JSON" >&2; exit 3; }
-            "$PYTHON" "$SCRIPT_DIR/gen_all.py" --task "$NAME" --calib_json "$CALIB_JSON"
+            "$PYTHON" "$PIPELINE_DIR/gen_config/gen_all.py" --task "$NAME" --calib_json "$CALIB_JSON"
             ;;
         sweep)
             [ -f "$PROMPTS_JSONL" ] || { echo "Run 'prep' first: missing $PROMPTS_JSONL" >&2; exit 3; }
@@ -149,7 +152,7 @@ run_stage() {
             VARIANTS="${VARIANTS:-$RECIPE_SWEEP__VARIANTS}" \
             GPUS="${GPUS:-$RECIPE_SWEEP__GPUS}" \
             OPENAI_NUM_PROMPTS="$sweep_np" \
-                bash "$SCRIPT_DIR/run_sweep.sh" "$NAME"
+                bash "$PIPELINE_DIR/run_sweep.sh" "$NAME"
             ;;
         score)
             # Opt-out via recipe: scoring.enabled=false turns this stage into
@@ -189,7 +192,7 @@ run_stage() {
             ;;
         collect)
             [ -d "$RESULTS_DIR" ] || { echo "Missing $RESULTS_DIR" >&2; exit 3; }
-            "$PYTHON" "$SCRIPT_DIR/collect_results.py" \
+            "$PYTHON" "$PIPELINE_DIR/collect_result/collect_results.py" \
                 --results_dir "$RESULTS_DIR" \
                 --out_csv "$RESULTS_DIR/summary.csv"
             echo "  → $RESULTS_DIR/summary.csv"

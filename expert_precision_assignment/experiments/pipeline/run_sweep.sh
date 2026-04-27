@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# Unified 6×11 sweep for profile/. Dispatches based on $TASK (three modes):
-#   sharegpt                    → MODE=sharegpt   (bench_serving --dataset-name sharegpt)
-#   prompts/<task>.jsonl exists → MODE=openai     (bench_serving --dataset-name openai;
-#                                                  accuracy scored offline via
-#                                                  scoring/score_traces_<task>.py)
-#   else                        → MODE=bench_eval (lm-eval tasks: gsm8k, mmlu_*, etc.)
+# Unified 6×11 sweep. Dispatches based on $TASK (three modes):
+#   sharegpt                       → MODE=sharegpt
+#                                    (bench_serving --dataset-name sharegpt)
+#   prompt/<task>.jsonl exists     → MODE=openai
+#                                    (bench_serving --dataset-name openai;
+#                                     accuracy scored offline via
+#                                     scoring/score_traces_<task>.py)
+#   else                           → MODE=bench_eval
+#                                    (lm-eval tasks: gsm8k, mmlu_*, etc.)
 #
-# Same config grid (profile/configs/mc{mc}/variants/*.json) and the same
+# Same config grid (data/configs/mc{mc}/variants/*.json) and the same
 # (mc, variant) × GPU round-robin scheduling for every mode — the only
 # thing that changes is the bench command and the results subdir.
 #
@@ -14,9 +17,9 @@
 #   bash run_sweep.sh sharegpt
 #   bash run_sweep.sh gsm8k
 #   bash run_sweep.sh mmlu_flan_cot_zeroshot
-#   bash run_sweep.sh supergpqa           # after `python prompts/prepare_prompts_supergpqa.py`
-#   bash run_sweep.sh ifbench             # after `python prompts/prepare_prompts_ifbench.py`
-#   bash run_sweep.sh livecodebench_v6    # after `python prompts/prepare_prompts_lcb_v6.py`
+#   bash run_sweep.sh supergpqa           # after `python prompt/prepare_prompts_supergpqa.py`
+#   bash run_sweep.sh ifbench             # after `python prompt/prepare_prompts_ifbench.py`
+#   bash run_sweep.sh livecodebench_v6    # after `python prompt/prepare_prompts_lcb_v6.py`
 #
 # Env overrides:
 #   NUM_PROMPTS=1024                   (sharegpt only)
@@ -47,7 +50,9 @@ if [ -z "$TASK" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROMPTS_DIR="$SCRIPT_DIR/prompts"
+EXPERIMENTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+DATA_DIR="$EXPERIMENTS_DIR/data"
+PROMPTS_DIR="$SCRIPT_DIR/prompt"
 PROMPTS_JSONL="$PROMPTS_DIR/${TASK}.jsonl"
 
 if [ "$TASK" = "sharegpt" ]; then
@@ -58,14 +63,14 @@ else
     MODE="bench_eval"
 fi
 
-if [ -d "$SCRIPT_DIR/configs/$TASK" ]; then
-    CFG_DIR="$SCRIPT_DIR/configs/$TASK"
+if [ -d "$DATA_DIR/configs/$TASK" ]; then
+    CFG_DIR="$DATA_DIR/configs/$TASK"
     CFG_SOURCE="per-task (calibrated)"
 else
-    CFG_DIR="$SCRIPT_DIR/configs"
+    CFG_DIR="$DATA_DIR/configs"
     CFG_SOURCE="flat (worst-case)"
 fi
-OUT_DIR="$SCRIPT_DIR/results/$TASK"
+OUT_DIR="$DATA_DIR/results/$TASK"
 mkdir -p "$OUT_DIR"
 
 # Runtime knobs — precedence: explicit env > recipe's runtime.* > hardcoded default.
@@ -401,7 +406,7 @@ case "$MODE" in
         ;;
     openai)
         echo "  bench:     bench_serving --dataset-name openai --dataset-path $PROMPTS_JSONL"
-        echo "             num_prompts=$OPENAI_NUM_PROMPTS (scoring is offline via scoring/score_traces_${TASK}.py)"
+        echo "             num_prompts=$OPENAI_NUM_PROMPTS (scoring offline via pipeline/scoring/score_traces_${TASK}.py)"
         ;;
     bench_eval)
         echo "  bench:     bench_eval --task=$TASK (fewshot=$NUM_FEWSHOT, max_gen=$MAX_GEN_TOKS, T=$TEMPERATURE)"
@@ -431,6 +436,6 @@ echo "============================================================"
 
 echo ""
 echo "Collecting summary..."
-"$PYTHON" "$SCRIPT_DIR/collect_results.py" --results_dir "$OUT_DIR" \
+"$PYTHON" "$SCRIPT_DIR/collect_result/collect_results.py" --results_dir "$OUT_DIR" \
     --out_csv "$OUT_DIR/summary.csv" || true
 echo "  → $OUT_DIR/summary.csv"

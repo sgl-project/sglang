@@ -1,28 +1,29 @@
 """Shared recipe loader for the end-to-end eval pipeline.
 
-A *recipe* is a YAML file under `recipes/` describing one eval run:
+A *recipe* is a YAML file under `recipe/yamls/` describing one eval run:
  - which dataset (`task: ifbench`)
  - which variant label (`variant: nothink`) — artifacts get `<task>_<variant>` prefix
  - sampling knobs (thinking on/off, max_tokens, temperature, penalties)
  - calibration knobs (num_prompts, mc, gpu, port)
  - sweep knobs (mc_list, variants, gpus, num_prompts)
 
-Pipeline stages (`prepare_prompts_*.py`, `run_calib.sh`, `gen_all.py`,
-`run_sweep.sh`, `score_traces_*.py`, `collect_results.py`) all read the
-same recipe. CLI flags still override recipe values.
+Pipeline stages (`prompt/prepare_prompts_*.py`, `kv_calib/run_calib.sh`,
+`gen_config/gen_all.py`, `run_sweep.sh`, `scoring/score_traces_*.py`,
+`collect_result/collect_results.py`) all read the same recipe.
+CLI flags still override recipe values.
 
-Python API:
+Python API (after `sys.path.insert(0, <experiments>/pipeline)`):
     from recipe import load_recipe, compound_name, sampling_kwargs
-    recipe = load_recipe("recipes/ifbench_nothink.yaml")
+    recipe = load_recipe("recipe/yamls/ifbench_nothink.yaml")
     name = compound_name(recipe)          # "ifbench_nothink"
     base = recipe["task"]                 # "ifbench"
     kw = sampling_kwargs(recipe)          # {"max_tokens":2048, ...}
 
-Shell API:
-    eval "$(python recipe.py recipes/ifbench_nothink.yaml env)"
+Shell API (paths are relative to experiments/):
+    eval "$(python pipeline/recipe.py recipe/yamls/ifbench_nothink.yaml env)"
     echo $RECIPE_NAME $RECIPE_TASK $RECIPE_VARIANT
-    python recipe.py recipes/ifbench_nothink.yaml get sampling.max_tokens
-    python recipe.py recipes/ifbench_nothink.yaml name
+    python pipeline/recipe.py recipe/yamls/ifbench_nothink.yaml get sampling.max_tokens
+    python pipeline/recipe.py recipe/yamls/ifbench_nothink.yaml name
 """
 from __future__ import annotations
 

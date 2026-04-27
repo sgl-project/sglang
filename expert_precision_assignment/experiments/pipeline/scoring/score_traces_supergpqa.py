@@ -1,8 +1,8 @@
 """Score a SuperGPQA trace JSONL against its meta sidecar.
 
-Inputs:
-    --trace  results/supergpqa/mc{mc}_{variant}.jsonl   (bench_serving output)
-    --meta   prompts/supergpqa.meta.jsonl               (from prepare_prompts_supergpqa.py)
+Inputs (paths relative to experiments/):
+    --trace  data/results/supergpqa/mc{mc}_{variant}.jsonl  (bench_serving output)
+    --meta   pipeline/prompt/supergpqa.meta.jsonl           (from prepare_prompts_supergpqa.py)
 
 Matches trace.generated_texts[i] against meta[i].answer_letter.  The two
 files are parallel by index because bench_serving preserves input order
@@ -100,9 +100,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--trace", type=Path, required=True,
                     help="Path to the bench_serving output JSONL "
-                         "(results/supergpqa/mc*_*.jsonl).")
+                         "(data/results/supergpqa/mc*_*.jsonl).")
     ap.add_argument("--meta", type=Path, required=True,
-                    help="Path to prompts/supergpqa.meta.jsonl.")
+                    help="Path to pipeline/prompt/supergpqa.meta.jsonl.")
     ap.add_argument("--out", type=Path,
                     help="Output path for .scores.json. Defaults to "
                          "the trace file with .jsonl → .scores.json.")

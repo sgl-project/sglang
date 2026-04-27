@@ -5,11 +5,12 @@ Runs:
   2. gen_dyna_variants.py  → 11 runtime-dispatch variants per mc
 
 Flags forwarded to both:
-  --task <name>         write to configs/<task>/ instead of flat configs/
+  --task <name>         write to data/configs/<task>/ instead of flat
+                        data/configs/
   --calib_json <path>   amortized KV sizing from calib_kv.py output
                         (only applies to gen_heter_configs)
 
-After this, run `bash run_sweep.sh <task>`.
+After this, run `bash pipeline/run_sweep.sh <task>`.
 """
 from __future__ import annotations
 
@@ -52,7 +53,9 @@ def main() -> int:
         if rc != 0:
             print(f"FAILED: {script} (exit {rc})", file=sys.stderr)
             return rc
-    dest = f"configs/{args.task}/mc*/" if args.task else "configs/mc*/"
+    dest = (
+        f"data/configs/{args.task}/mc*/" if args.task else "data/configs/mc*/"
+    )
     print(f"\nAll configs generated under {dest}")
     return 0
 

@@ -17,9 +17,9 @@ The legacy hot0..hot100 / thr32..thr512 variant loops are preserved
 below as ``if False:`` blocks — flip them back on to regenerate the full
 sweep matrix.
 
-Use --task=<name> to point at configs/<task>/ (per-task amortized
+Use --task=<name> to point at data/configs/<task>/ (per-task amortized
 assignments from `gen_heter_configs.py --task`). Default is the flat
-configs/ layout.
+data/configs/ layout.
 """
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ import sys
 from pathlib import Path
 
 THIS_DIR = Path(__file__).resolve().parent
+EXPERIMENTS_DIR = THIS_DIR.parent.parent
 
 # Env override (matches gen_heter_configs.py + run_sweep.sh). For RULER or
 # other long-context tasks, use e.g. MC_LIST="1 2 4 8 16 32 64".
@@ -47,8 +48,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--task",
-        help="When set, operate on configs/<task>/ instead of flat configs/. "
-             "Must match the --task value passed to gen_heter_configs.py.",
+        help="When set, operate on data/configs/<task>/ instead of "
+             "data/configs/. Must match the --task value passed to "
+             "gen_heter_configs.py.",
     )
     ap.add_argument(
         "--dry_run", action="store_true",
@@ -58,7 +60,7 @@ def main() -> int:
     )
     args = ap.parse_args()
 
-    cfg_dir = THIS_DIR / "configs"
+    cfg_dir = EXPERIMENTS_DIR / "data" / "configs"
     if args.task:
         cfg_dir = cfg_dir / args.task
 

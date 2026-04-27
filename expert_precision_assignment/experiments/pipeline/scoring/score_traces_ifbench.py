@@ -1,9 +1,9 @@
 """Score an IFBench trace JSONL against its meta sidecar.
 
-Inputs:
-    --trace    results/ifbench/mc{mc}_{variant}.jsonl   (bench_serving output)
-    --meta     prompts/ifbench.meta.jsonl               (from prepare_prompts_ifbench.py)
-    --vendored scoring/vendored/ifbench                 (AllenAI verifiers)
+Inputs (paths relative to experiments/):
+    --trace    data/results/ifbench/mc{mc}_{variant}.jsonl  (bench_serving output)
+    --meta     pipeline/prompt/ifbench.meta.jsonl           (from prepare_prompts_ifbench.py)
+    --vendored pipeline/scoring/vendored/ifbench            (AllenAI verifiers)
 
 Matches trace.generated_texts[i] against meta[i] by index (bench_serving
 preserves input order).  Calls AllenAI's official verifiers to compute
@@ -18,25 +18,25 @@ the four standard IFBench metrics:
 (strip first line, strip last line, strip both, strip `*` markers, and
 combinations) — a pass in any variant counts as a pass.
 
-VENDORING (one-time, before running this script):
+VENDORING (one-time, before running this script; paths relative to experiments/):
 
-    mkdir -p scoring/vendored
-    cd scoring/vendored
+    mkdir -p pipeline/scoring/vendored
+    cd pipeline/scoring/vendored
     git clone https://github.com/allenai/IFBench.git ifbench_repo
     cd ifbench_repo && git checkout cb932e352a505306ad0115272211df14bb8f628f
     cd ../ && ln -sfn ifbench_repo/instructions.py .
     ln -sfn ifbench_repo/instructions_registry.py .
     ln -sfn ifbench_repo/instructions_util.py .
     ln -sfn ifbench_repo/evaluation_lib.py .
-    cd ../..
+    cd ../../../..
     pip install absl-py langdetect nltk immutabledict spacy emoji syllapy
     python -c "import nltk; nltk.download('punkt'); nltk.download('stopwords')"
     python -m spacy download en_core_web_sm
 
 Then run:
-    python scoring/score_traces_ifbench.py \
-        --trace results/ifbench/mc128_thr128.jsonl \
-        --meta prompts/ifbench.meta.jsonl
+    python pipeline/scoring/score_traces_ifbench.py \
+        --trace data/results/ifbench/mc128_thr128.jsonl \
+        --meta pipeline/prompt/ifbench.meta.jsonl
 """
 from __future__ import annotations
 

@@ -4,12 +4,12 @@ Reads allenai/IFBench_test from HuggingFace (300 test prompts with 58 OOD
 instruction-following constraints, distinct from Google's IFEval) and
 emits two parallel JSONLs:
 
-    prompts/ifbench.jsonl       ← openai-chat format, bench_serving input
-    prompts/ifbench.meta.jsonl  ← per-row prompt + constraint list + kwargs
+    prompt/ifbench.jsonl       ← openai-chat format, bench_serving input
+    prompt/ifbench.meta.jsonl  ← per-row prompt + constraint list + kwargs
 
-Scoring is offline via scoring/score_traces_ifbench.py, which needs the
-vendored AllenAI verifiers at scoring/vendored/ifbench/ — see that
-script's header for the one-shot `git clone` command.
+Scoring is offline via ../scoring/score_traces_ifbench.py, which needs
+the vendored AllenAI verifiers at ../scoring/vendored/ifbench/ — see
+that script's header for the one-shot `git clone` command.
 
 No shuffle: IFBench is only 300 prompts, calibration can just use the
 first N.
@@ -22,9 +22,9 @@ import sys
 from pathlib import Path
 
 THIS_DIR = Path(__file__).resolve().parent
-PROFILE_DIR = THIS_DIR.parent
-if str(PROFILE_DIR) not in sys.path:
-    sys.path.insert(0, str(PROFILE_DIR))
+PIPELINE_DIR = THIS_DIR.parent
+if str(PIPELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(PIPELINE_DIR))
 
 HF_REPO = "allenai/IFBench_test"
 PREFERRED_SPLITS = ("test", "train", "validation")
@@ -52,9 +52,9 @@ def _load_recipe_defaults(recipe_path: Path | None) -> tuple[dict, str]:
     """Return (argparse defaults dict, output stem).
 
     If no --recipe is given, defaults come from this script's constants and
-    output goes to `prompts/ifbench.jsonl` (backward compat).  With a recipe,
+    output goes to `prompt/ifbench.jsonl` (backward compat).  With a recipe,
     defaults come from `recipe.sampling.*` and output goes to
-    `prompts/<task>_<variant>.jsonl`.
+    `prompt/<task>_<variant>.jsonl`.
     """
     if recipe_path is None:
         return {}, "ifbench"
@@ -90,7 +90,7 @@ def main() -> int:
     ap.add_argument("--recipe", type=Path, default=None,
                     help="Path to a recipe YAML. Seeds all sampling defaults "
                          "and switches the output file to "
-                         "`prompts/<task>_<variant>.jsonl`.")
+                         "`prompt/<task>_<variant>.jsonl`.")
     ap.add_argument("--limit", type=int, default=dflt.get("limit", 0),
                     help="Cap on # of prompts (0 = all 300).")
     ap.add_argument("--split", default=None,

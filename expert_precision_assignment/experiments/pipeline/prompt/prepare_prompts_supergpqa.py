@@ -4,8 +4,8 @@ Reads m-a-p/SuperGPQA from HuggingFace (26,529 MCQs, 4–10 options per
 question, across 13 disciplines / 72 fields / 285 subfields) and emits
 two parallel JSONLs:
 
-    prompts/supergpqa.jsonl       ← openai-chat format, bench_serving input
-    prompts/supergpqa.meta.jsonl  ← per-row ground truth + metadata, same index
+    prompt/supergpqa.jsonl       ← openai-chat format, bench_serving input
+    prompt/supergpqa.meta.jsonl  ← per-row ground truth + metadata, same index
 
 The two files have exactly the same number of lines in exactly the same
 order, so scoring works by zipping them with the trace JSONL's
@@ -23,9 +23,9 @@ import sys
 from pathlib import Path
 
 THIS_DIR = Path(__file__).resolve().parent
-PROFILE_DIR = THIS_DIR.parent
-if str(PROFILE_DIR) not in sys.path:
-    sys.path.insert(0, str(PROFILE_DIR))
+PIPELINE_DIR = THIS_DIR.parent
+if str(PIPELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(PIPELINE_DIR))
 
 HF_REPO = "m-a-p/SuperGPQA"
 PREFERRED_SPLITS = ("test", "train", "validation")
@@ -69,8 +69,8 @@ def _format_question(question: str, options: list[str]) -> str:
 def _load_recipe_defaults(recipe_path: Path | None) -> tuple[dict, str]:
     """Return (argparse defaults dict, output stem).
 
-    Without --recipe: output goes to `prompts/supergpqa.jsonl` (backward compat).
-    With --recipe: output goes to `prompts/<task>_<variant>.jsonl` and sampling
+    Without --recipe: output goes to `prompt/supergpqa.jsonl` (backward compat).
+    With --recipe: output goes to `prompt/<task>_<variant>.jsonl` and sampling
     defaults come from `recipe.sampling.*`, `--limit` from `recipe.dataset.limit`,
     `--seed` from `recipe.dataset.seed`.
     """
@@ -108,7 +108,7 @@ def main() -> int:
     ap.add_argument("--recipe", type=Path, default=None,
                     help="Path to a recipe YAML. Seeds all sampling defaults "
                          "and switches the output file to "
-                         "`prompts/<task>_<variant>.jsonl`.")
+                         "`prompt/<task>_<variant>.jsonl`.")
     ap.add_argument("--limit", type=int, default=dflt.get("limit", 0),
                     help="Cap on # of prompts (0 = all 26,529).")
     ap.add_argument("--seed", type=int, default=dflt.get("seed", 1234),

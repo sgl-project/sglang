@@ -1,7 +1,7 @@
-"""Generate per-mc heter (base) configs for the profile sweep.
+"""Generate per-mc heter (base) configs for the experiments sweep.
 
 For each mc in MC_LIST, computes the VRAM budget (KV reserve scales with
-mc) and emits `configs/mc{mc}/{int4_only_experts, heter_config,
+mc) and emits `data/configs/mc{mc}/{int4_only_experts, heter_config,
 assignment_report}.json + mfs.txt` tailored to that SLO. Composite
 scores are derived once from per-layer PPL + per-expert L2 sensitivity
 and reused across mc levels.
@@ -9,13 +9,13 @@ and reused across mc levels.
 KV sizing:
     * Default: worst-case envelope (max_prompt_len + max_output_len)
       scaled by ``BudgetKnobs.kv_reserve_frac``.
-    * With ``--calib_json kv_calib/<task>.json`` (produced by
-      ``run_calib.sh``): amortized ``μ + k·σ`` per request, using the
-      task's measured ``total_len`` distribution. Much tighter and
-      defensible for a fixed workload.
+    * With ``--calib_json data/kv_calib/<task>.json`` (produced by
+      ``pipeline/kv_calib/run_calib.sh``): amortized ``μ + k·σ`` per
+      request, using the task's measured ``total_len`` distribution.
+      Much tighter and defensible for a fixed workload.
 
 Pair with `gen_dyna_variants.py` (runtime dispatch variants per mc) and
-`run_sweep.sh <task>` (efficiency or accuracy sweep).
+`pipeline/run_sweep.sh <task>` (efficiency or accuracy sweep).
 """
 from __future__ import annotations
 
@@ -29,8 +29,10 @@ from pathlib import Path
 import torch
 
 THIS_DIR = Path(__file__).resolve().parent
-POLICY_DIR = THIS_DIR.parent / "policy" / "heter_assign"
-SENS_DIR = THIS_DIR.parent / "sensitivity"
+EXPERIMENTS_DIR = THIS_DIR.parent.parent
+ROOT_DIR = EXPERIMENTS_DIR.parent
+POLICY_DIR = ROOT_DIR / "policy" / "heter_assign"
+SENS_DIR = ROOT_DIR / "legacy" / "sensitivity"
 
 sys.path.insert(0, str(POLICY_DIR))
 import vram_estimator as vest  # noqa: E402
@@ -63,9 +65,7 @@ INT4_CKPT = (
 )
 LAYER_SENS = SENS_DIR / "per_moe_layer" / "results" / "summary.json"
 EXPERT_SENS = SENS_DIR / "per_expert" / "results" / "summary.json"
-HESSIAN_SCORES = (
-    THIS_DIR.parent / "hessian" / "results" / "hessian_scores.json"
-)
+HESSIAN_SCORES = ROOT_DIR / "hessian" / "results" / "hessian_scores.json"
 
 MAX_PROMPT_LEN = 2048
 MAX_OUTPUT_LEN = 2048
@@ -76,13 +76,14 @@ def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument(
         "--task",
-        help="Task name; when set, configs go to configs/<task>/mc{mc}/ "
-             "instead of configs/mc{mc}/. Default keeps the flat layout.",
+        help="Task name; when set, configs go to data/configs/<task>/mc{mc}/ "
+             "instead of data/configs/mc{mc}/. Default keeps the flat layout.",
     )
     ap.add_argument(
         "--calib_json",
         type=Path,
-        help="Path to a calib_kv.py output JSON (e.g. kv_calib/sharegpt/calib.json). "
+        help="Path to a calib_kv.py output JSON "
+             "(e.g. data/kv_calib/sharegpt/calib.json). "
              "When its recommended_slo has mean_total_len + std_total_len, "
              "kv_bytes uses the amortized μ+k·σ branch.",
     )
@@ -182,7 +183,7 @@ def main() -> int:
     logger = logging.getLogger(__name__)
     args = _parse_args()
 
-    out_root = THIS_DIR / "configs"
+    out_root = EXPERIMENTS_DIR / "data" / "configs"
     if args.task:
         out_root = out_root / args.task
     out_root.mkdir(parents=True, exist_ok=True)

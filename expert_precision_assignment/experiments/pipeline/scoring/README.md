@@ -1,6 +1,6 @@
 # scoring/ — offline accuracy scoring for openai-mode sweeps
 
-One script per task, each taking a `results/<task>/mc*_*.jsonl` trace + its `prompts/<task>.meta.jsonl` sidecar, and emitting a sibling `mc*_*.scores.json` that `collect_results.py` will pick up.
+One script per task, each taking a `data/results/<task>/mc*_*.jsonl` trace + its `pipeline/prompt/<task>.meta.jsonl` sidecar, and emitting a sibling `mc*_*.scores.json` that `pipeline/collect_result/collect_results.py` will pick up.
 
 | task | script | vendoring required? |
 |---|---|---|
@@ -10,7 +10,7 @@ One script per task, each taking a `results/<task>/mc*_*.jsonl` trace + its `pro
 
 ## Vendoring
 
-Both IFBench and LCB depend on upstream verifier / executor code. Pinned SHAs ensure reproducibility.
+Both IFBench and LCB depend on upstream verifier / executor code. Pinned SHAs ensure reproducibility. Run from this `pipeline/scoring/` directory:
 
 ### IFBench — 3 Python files + pip deps
 
@@ -46,24 +46,32 @@ pip install pebble datasets
 
 ## Usage
 
+All commands run from `experiments/`:
+
 ```bash
 # SuperGPQA — runs directly, no vendoring
-for t in ../results/supergpqa/mc*_*.jsonl; do
-    python score_traces_supergpqa.py --trace "$t" --meta ../prompts/supergpqa.meta.jsonl
+for t in data/results/supergpqa/mc*_*.jsonl; do
+    python pipeline/scoring/score_traces_supergpqa.py \
+        --trace "$t" --meta pipeline/prompt/supergpqa.meta.jsonl
 done
 
-# IFBench — needs vendored/ifbench/
-for t in ../results/ifbench/mc*_*.jsonl; do
-    python score_traces_ifbench.py --trace "$t" --meta ../prompts/ifbench.meta.jsonl
+# IFBench — needs pipeline/scoring/vendored/ifbench/
+for t in data/results/ifbench/mc*_*.jsonl; do
+    python pipeline/scoring/score_traces_ifbench.py \
+        --trace "$t" --meta pipeline/prompt/ifbench.meta.jsonl
 done
 
-# LCB v6 — needs vendored/lcb_runner/. EXECUTES MODEL-GENERATED CODE; see security note.
-for t in ../results/livecodebench_v6/mc*_*.jsonl; do
-    python score_traces_lcb_v6.py --trace "$t" --meta ../prompts/livecodebench_v6.meta.jsonl
+# LCB v6 — needs pipeline/scoring/vendored/lcb_runner/.
+# EXECUTES MODEL-GENERATED CODE; see security note.
+for t in data/results/livecodebench_v6/mc*_*.jsonl; do
+    python pipeline/scoring/score_traces_lcb_v6.py \
+        --trace "$t" --meta pipeline/prompt/livecodebench_v6.meta.jsonl
 done
 
 # Summary CSV (auto-picks up .scores.json sidecars when present).
-python ../collect_results.py --results_dir ../results/supergpqa --out_csv ../results/supergpqa/summary.csv
+python pipeline/collect_result/collect_results.py \
+    --results_dir data/results/supergpqa \
+    --out_csv data/results/supergpqa/summary.csv
 ```
 
 ## Security note for LCB scoring

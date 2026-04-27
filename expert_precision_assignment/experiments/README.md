@@ -1,10 +1,10 @@
-# profile/ — heter-precision config generation + sweep
+# experiments/ — heter-precision config generation + sweep
 
 End-to-end pipeline for generating task-specific heter-MoE configs
 (BF16/INT4 expert assignment) and running the efficiency/accuracy
 sweep on Qwen3-30B-A3B.
 
-All commands run from `profile/`. The conda `sglang` env must be
+All commands run from `experiments/`. The conda `sglang` env must be
 activated (the shell scripts activate it themselves; the Python CLIs
 expect it to already be active).
 
@@ -12,34 +12,37 @@ expect it to already be active).
 
 ## TL;DR — regeneration
 
-`configs/`, `kv_calib/`, and every per-run JSON/JSONL under `results/`
-are gitignored and fully reproducible. Only aggregated artifacts
-(summary CSVs + plots under `results/<task>/`) are committed. To
-rebuild everything from a clean checkout:
+`data/configs/`, `data/kv_calib/`, and every per-run JSON/JSONL under
+`data/results/` are gitignored and fully reproducible. Only aggregated
+artifacts (summary CSVs + plots under `data/results/<task>/`) are
+committed. To rebuild everything from a clean checkout:
 
 ```bash
 conda activate sglang
-cd profile/
+cd experiments/
 
 # 1. Flat worst-case configs (fallback for tasks without a calib).
-python gen_all.py
+python pipeline/gen_config/gen_all.py
 
 # 2. Per-task pipelines (see sections below for details).
-#    Each re-creates configs/<task>/ and kv_calib/<task>-or-ruler/.
-bash run_calib.sh sharegpt                                         # generic
-python gen_all.py --task sharegpt --calib_json kv_calib/sharegpt/calib.json
-NUM_PROMPTS=2048 bash run_sweep.sh sharegpt
+#    Each re-creates data/configs/<task>/ and data/kv_calib/<task>-or-ruler/.
+bash pipeline/kv_calib/run_calib.sh sharegpt                                    # generic
+python pipeline/gen_config/gen_all.py --task sharegpt \
+    --calib_json data/kv_calib/sharegpt/calib.json
+NUM_PROMPTS=2048 bash pipeline/run_sweep.sh sharegpt
 
-RULER_MAX_SEQ=65536 NIAH_CACHE_DIR=$(pwd)/kv_calib/ruler/niah_cache \
-    bash run_calib.sh niah_single_2                                # RULER NIAH
-# → python gen_all.py --task ruler_niah_64k --calib_json kv_calib/ruler/calib_65536_niah_single_2.json
-# → bash run_sweep.sh ruler_niah_64k   (with the env knobs below)
+RULER_MAX_SEQ=65536 NIAH_CACHE_DIR=$(pwd)/data/kv_calib/ruler/niah_cache \
+    bash pipeline/kv_calib/run_calib.sh niah_single_2                           # RULER NIAH
+# → python pipeline/gen_config/gen_all.py --task ruler_niah_64k \
+#       --calib_json data/kv_calib/ruler/calib_65536_niah_single_2.json
+# → bash pipeline/run_sweep.sh ruler_niah_64k   (with the env knobs below)
 
 MAX_GEN_TOKS=32 RULER_MAX_SEQ=65536 \
-    NIAH_CACHE_DIR=$(pwd)/kv_calib/ruler/niah_cache \
-    bash run_calib.sh ruler_qa_squad                               # RULER QA
-# → python gen_all.py --task ruler_qa1_64k --calib_json kv_calib/ruler/calib_65536_ruler_qa_squad.json
-# → bash run_sweep.sh ruler_qa1_64k    (with the env knobs below)
+    NIAH_CACHE_DIR=$(pwd)/data/kv_calib/ruler/niah_cache \
+    bash pipeline/kv_calib/run_calib.sh ruler_qa_squad                          # RULER QA
+# → python pipeline/gen_config/gen_all.py --task ruler_qa1_64k \
+#       --calib_json data/kv_calib/ruler/calib_65536_ruler_qa_squad.json
+# → bash pipeline/run_sweep.sh ruler_qa1_64k    (with the env knobs below)
 ```
 
 Full details below.
@@ -67,13 +70,13 @@ Full details below.
 
 ## One-time: worst-case configs
 
-Generate the flat `configs/mc{mc}/...` tree sized against the
+Generate the flat `data/configs/mc{mc}/...` tree sized against the
 worst-case envelope (`max_prompt=2048, max_output=2048`). Used both as
-a conservative fallback and as the server config that `run_calib.sh`
-runs against for generic tasks.
+a conservative fallback and as the server config that
+`pipeline/kv_calib/run_calib.sh` runs against for generic tasks.
 
 ```bash
-python gen_all.py
+python pipeline/gen_config/gen_all.py
 ```
 
 (runs `gen_heter_configs.py` then `gen_dyna_variants.py` — the
@@ -90,22 +93,23 @@ regenerate the full matrix.)
 ### 1. Calibrate KV
 
 ```bash
-bash run_calib.sh <task>          # sharegpt, gsm8k, mmlu_flan_cot_zeroshot, …
+bash pipeline/kv_calib/run_calib.sh <task>          # sharegpt, gsm8k, mmlu_flan_cot_zeroshot, …
 ```
 
 Launches one full-BF16 server on `CALIB_GPU` (default GPU 4), drives
 it with `bench_serving` (sharegpt) or `bench_eval` (bench_eval tasks),
 captures per-request `(input_len, output_len)`, feeds into
-`calib_kv.py --bench_details_jsonl` → `kv_calib/<task>/calib.json`
+`calib_kv.py --bench_details_jsonl` → `data/kv_calib/<task>/calib.json`
 with `mean_total_len` + `std_total_len`. Shuts server down on exit.
 
 ### 2. Regenerate configs with amortized KV
 
 ```bash
-python gen_all.py --task <task> --calib_json kv_calib/<task>/calib.json
+python pipeline/gen_config/gen_all.py --task <task> \
+    --calib_json data/kv_calib/<task>/calib.json
 ```
 
-Writes `configs/<task>/mc{mc}/{heter_config,int4_only_experts,expert_importance,variants/*}.json`.
+Writes `data/configs/<task>/mc{mc}/{heter_config,int4_only_experts,expert_importance,variants/*}.json`.
 KV is sized as `mc × (μ + k·σ)` instead of worst-case
 `mc × 0.5 × (max_in + max_out)`, typically freeing several GB that
 become additional BF16 experts. `expert_importance.json` carries
@@ -121,20 +125,23 @@ Equivalent to running `gen_heter_configs.py` then
 ### 3. Run the sweep
 
 ```bash
-NUM_PROMPTS=2048 bash run_sweep.sh <task>
+NUM_PROMPTS=2048 bash pipeline/run_sweep.sh <task>
 ```
 
-Auto-picks `configs/<task>/mc{mc}/` when that directory exists (falls
-back to the flat `configs/mc{mc}/`). mc × variant grid fans out
-across `GPUS` with round-robin scheduling; each pair launches an
-sglang server on its assigned GPU, runs the bench, and tears down.
+Auto-picks `data/configs/<task>/mc{mc}/` when that directory exists
+(falls back to the flat `data/configs/mc{mc}/`). mc × variant grid
+fans out across `GPUS` with round-robin scheduling; each pair launches
+an sglang server on its assigned GPU, runs the bench, and tears down.
 
 ### 4. Collect results
 
-`run_sweep.sh` runs `collect_results.py` at the end. To recollect:
+`pipeline/run_sweep.sh` runs `collect_results.py` at the end. To
+recollect:
 
 ```bash
-python collect_results.py --results_dir results/<task> --out_csv results/<task>/summary.csv
+python pipeline/collect_result/collect_results.py \
+    --results_dir data/results/<task> \
+    --out_csv data/results/<task>/summary.csv
 ```
 
 ---
@@ -144,8 +151,9 @@ python collect_results.py --results_dir results/<task> --out_csv results/<task>/
 RULER subtasks (`niah_single_1..3`, `niah_multikey_*`, `niah_multiquery`,
 `niah_multivalue`, `ruler_qa_squad`, `ruler_qa_hotpot`, `ruler_vt`,
 `ruler_cwe`, `ruler_fwe`) differ from generic tasks in several ways.
-Setting `RULER_MAX_SEQ=<bytes>` on both `run_calib.sh` and
-`run_sweep.sh` flips the appropriate defaults automatically.
+Setting `RULER_MAX_SEQ=<bytes>` on both `pipeline/kv_calib/run_calib.sh`
+and `pipeline/run_sweep.sh` flips the appropriate defaults
+automatically.
 
 1. **Fixed output length.** Every RULER task YAML sets `until: []`
    plus a task-specific `max_gen_toks`. Every request decodes exactly
@@ -174,8 +182,8 @@ Setting `RULER_MAX_SEQ=<bytes>` on both `run_calib.sh` and
 
 3. **Zero-shot.** `NUM_FEWSHOT=0` — RULER is raw completion.
 
-4. **Server context window + YaRN.** `run_sweep.sh` in RULER mode
-   launches the server with `--context-length $((RULER_MAX_SEQ+512))`
+4. **Server context window + YaRN.** `pipeline/run_sweep.sh` in RULER
+   mode launches the server with `--context-length $((RULER_MAX_SEQ+512))`
    and, when that exceeds Qwen3's native 40960, injects YaRN via
    `--json-model-override-args` (rope_parameters: yarn, factor =
    ctx/40960, original_max_position_embeddings = 40960) plus
@@ -219,7 +227,7 @@ the same seq_len instantly skip the rebuild in every worker.
 Cache layout:
 
 ```
-kv_calib/ruler/niah_cache/
+data/kv_calib/ruler/niah_cache/
   <fn_name>/<hash12>/           # HF Dataset (arrow + metadata)
   niah_single_2/4b1ff37453e8/   # e.g. seq=8192, tokenizer=Qwen3
   niah_single_2/180b0208a237/   # seq=16384
@@ -233,26 +241,26 @@ When the bench_eval task doesn't uniquely identify the config (you
 want separate configs for the same task at different seq lengths),
 use `ruler_<subtask>_<seqtag>` for the config dir and pass
 `BENCH_TASK=<actual lm_eval task>` to the sweep. This keeps
-`configs/ruler_niah_8k/`, `configs/ruler_niah_64k/`,
-`configs/ruler_qa1_64k/`, etc. independent while all routing to the
-right lm_eval task internally.
+`data/configs/ruler_niah_8k/`, `data/configs/ruler_niah_64k/`,
+`data/configs/ruler_qa1_64k/`, etc. independent while all routing to
+the right lm_eval task internally.
 
 ### Worked example — NIAH at 64k (single-needle retrieval)
 
 ```bash
-export NIAH_CACHE_DIR=$(pwd)/kv_calib/ruler/niah_cache
+export NIAH_CACHE_DIR=$(pwd)/data/kv_calib/ruler/niah_cache
 
 # 1. Calibrate all seq lengths in parallel (CPU-only, ~3 min).
 for seq in 8192 16384 32768 65536 131072; do
-  (RULER_MAX_SEQ=$seq bash run_calib.sh niah_single_2) &
+  (RULER_MAX_SEQ=$seq bash pipeline/kv_calib/run_calib.sh niah_single_2) &
 done
 wait
-# → kv_calib/ruler/calib_{8192,…,131072}_niah_single_2.json
+# → data/kv_calib/ruler/calib_{8192,…,131072}_niah_single_2.json
 
 # 2. Amortized configs for the 64k sweep (mc ladder capped at 64).
 MC_LIST="1 2 4 8 16 32 64" \
-  python gen_all.py --task ruler_niah_64k \
-    --calib_json kv_calib/ruler/calib_65536_niah_single_2.json
+  python pipeline/gen_config/gen_all.py --task ruler_niah_64k \
+    --calib_json data/kv_calib/ruler/calib_65536_niah_single_2.json
 
 # 3. Sweep — mc=4 × 6 variants × n=128 on 8 GPUs, ~20 min on A100-80GB.
 MC_LIST="4" \
@@ -260,25 +268,25 @@ MC_LIST="4" \
   LIMIT=128 \
   RULER_MAX_SEQ=65536 \
   BENCH_TASK=niah_single_2 \
-  bash run_sweep.sh ruler_niah_64k
-# → results/ruler_niah_64k/{mc4_hess*,summary.csv}
+  bash pipeline/run_sweep.sh ruler_niah_64k
+# → data/results/ruler_niah_64k/{mc4_hess*,summary.csv}
 ```
 
 ### Worked example — QA at 64k (RULER qa_1)
 
 ```bash
-export NIAH_CACHE_DIR=$(pwd)/kv_calib/ruler/niah_cache
+export NIAH_CACHE_DIR=$(pwd)/data/kv_calib/ruler/niah_cache
 
 # 1. Calibrate — note MAX_GEN_TOKS=32 for qa_squad (not the 128 default).
 for seq in 8192 16384 32768 65536 131072; do
-  (MAX_GEN_TOKS=32 RULER_MAX_SEQ=$seq bash run_calib.sh ruler_qa_squad) &
+  (MAX_GEN_TOKS=32 RULER_MAX_SEQ=$seq bash pipeline/kv_calib/run_calib.sh ruler_qa_squad) &
 done
 wait
 
 # 2. Configs (same MC_LIST as NIAH since KV budget scales identically).
 MC_LIST="1 2 4 8 16 32 64" \
-  python gen_all.py --task ruler_qa1_64k \
-    --calib_json kv_calib/ruler/calib_65536_ruler_qa_squad.json
+  python pipeline/gen_config/gen_all.py --task ruler_qa1_64k \
+    --calib_json data/kv_calib/ruler/calib_65536_ruler_qa_squad.json
 
 # 3. Sweep — BENCH_TASK routes to the lm_eval task; MAX_GEN_TOKS must
 #    match the qa_squad YAML or bench_eval over-decodes.
@@ -288,7 +296,7 @@ MC_LIST="4" \
   RULER_MAX_SEQ=65536 \
   BENCH_TASK=ruler_qa_squad \
   MAX_GEN_TOKS=32 \
-  bash run_sweep.sh ruler_qa1_64k
+  bash pipeline/run_sweep.sh ruler_qa1_64k
 ```
 
 ---
@@ -315,44 +323,68 @@ group in lm_eval aggregates these with equal weight and
 ## Directory layout
 
 ```
-profile/
-  gen_all.py                # gen_heter_configs + gen_dyna_variants oneshot
-  gen_heter_configs.py      # VRAM budget → K experts → BF16/INT4 split (respects MC_LIST)
-  gen_dyna_variants.py      # emit hess0..hess100 variants per mc (respects MC_LIST)
-  run_calib.sh              # KV calibration; RULER_MAX_SEQ → CPU tokenize-only
-  run_sweep.sh              # mc × variant sweep dispatcher; RULER_MAX_SEQ → YaRN server
-  collect_results.py        # summary CSV aggregation
-  plot_sharegpt_grid.py     # sharegpt heatmap
-  plot_gsm8k_grid.py        # gsm8k heatmap
+experiments/
+  README.md                    # this file
+  PIPELINE.md                  # one-recipe-per-yaml pipeline guide
+  run_pipeline.sh              # top-level driver (recipe → 6 stages)
 
-  configs/                  # gitignored — regenerate via gen_all.py
-    mc{mc}/...              # flat worst-case (fallback)
-    <task>/mc{mc}/          # per-task amortized
-      heter_config.json     # policy + group ratios + pointers
-      int4_only_experts.json
-      expert_importance.json  # hessian score grid (loaded by HeterFusedMoE)
-      assignment_report.json  # K_heter, fo_cap, SLO breakdown
-      variants/hess{pct}.json
+  pipeline/                    # all stage code lives here
+    recipe.py                  # shared YAML-recipe loader (imported by stages)
+    run_sweep.sh               # mc × variant sweep dispatcher
+    run_bench_eval_all.sh      # post-sharegpt sweep across canonical tasks
+    run_calib_think_compare.sh # IFBench think-on/off A/B
+    prompt/                    # prep stage
+      prepare_prompts_*.py     # one per task (ifbench, supergpqa, lcb_v6, …)
+    kv_calib/                  # calib stage
+      run_calib.sh             # KV calibration; RULER_MAX_SEQ → CPU tokenize-only
+    gen_config/                # gen stage
+      gen_all.py               # gen_heter_configs + gen_dyna_variants oneshot
+      gen_heter_configs.py     # VRAM budget → K experts → BF16/INT4 split
+      gen_dyna_variants.py     # emit hess0..hess100 variants per mc
+    scoring/                   # score stage
+      score_traces_*.py        # one per task (offline accuracy)
+      vendored/                # third-party scorer code (ifbench, lcb_runner)
+    collect_result/            # collect stage
+      collect_results.py       # summary CSV aggregation
 
-  kv_calib/                 # gitignored — regenerate via run_calib.sh
-    <task>/calib.json       # generic tasks (gsm8k, sharegpt, …)
-    ruler/
-      calib_<seq>_<subtask>.json  # RULER calibs (one per seq × subtask)
-      niah_cache/<fn>/<hash>/     # HF Dataset on disk (opt-in via NIAH_CACHE_DIR)
+  recipe/
+    yamls/                     # eval recipes (ifbench_*, supergpqa_*, lcb_v6_*)
 
-  results/                  # PARTIALLY gitignored — keep only summary.csv + plots
-    <task>/
-      mc{mc}_{variant}.{json,jsonl}   # gitignored per-run artifacts
-      server.log / bench.log          # gitignored
-      summary.csv                     # committed
-      *.png                           # committed (from plot_*.py)
+  plots/
+    plot_sharegpt_grid.py      # sharegpt heatmap
+    plot_gsm8k_grid.py         # gsm8k heatmap
+
+  data/                        # all runtime outputs (mostly gitignored)
+    configs/                   # gitignored — regenerate via gen_all.py
+      mc{mc}/...               # flat worst-case (fallback)
+      <task>/mc{mc}/           # per-task amortized
+        heter_config.json      # policy + group ratios + pointers
+        int4_only_experts.json
+        expert_importance.json # hessian score grid (loaded by HeterFusedMoE)
+        assignment_report.json # K_heter, fo_cap, SLO breakdown
+        variants/hess{pct}.json
+    kv_calib/                  # gitignored — regenerate via run_calib.sh
+      <task>/calib.json        # generic tasks (gsm8k, sharegpt, …)
+      ruler/
+        calib_<seq>_<subtask>.json    # RULER calibs (one per seq × subtask)
+        niah_cache/<fn>/<hash>/       # HF Dataset on disk (opt-in via NIAH_CACHE_DIR)
+    results/                   # PARTIALLY gitignored — keep only summary.csv + plots
+      <task>/
+        mc{mc}_{variant}.{json,jsonl}   # gitignored per-run artifacts
+        server.log / bench.log          # gitignored
+        summary.csv                     # committed
+        *.png                           # committed (from plots/plot_*.py)
+
+  monitor/
+    monitor.sh                 # one-shot sweep progress snapshot
+    show_calib.py              # inspect calib/sweep trace JSONL
 ```
 
 Dependencies in sibling dirs:
 
 - `../policy/heter_assign/` — `vram_estimator.py`, `assign_experts.py`,
   `calib_kv.py`, `test_configs.py`
-- `../sensitivity/` — per-layer PPL and per-expert L2 sensitivity summaries
+- `../legacy/sensitivity/` — per-layer PPL and per-expert L2 sensitivity summaries
 - `../hessian/` — per-expert hessian scores (`hessian_scores.json`)
 
 Cache module:
@@ -367,15 +399,15 @@ Cache module:
 
 | path | status | regenerate with |
 |---|---|---|
-| `configs/` | gitignored | `python gen_all.py [--task X --calib_json …]` |
-| `kv_calib/` | gitignored | `bash run_calib.sh <task>` |
-| `results/<task>/*.json` `*.jsonl` `*.log` | gitignored | `bash run_sweep.sh <task>` |
-| `results/<task>/summary.csv` | **committed** | `python collect_results.py --results_dir …` |
-| `results/<task>/*.png` | **committed** | `python plot_*_grid.py` |
+| `data/configs/` | gitignored | `python pipeline/gen_config/gen_all.py [--task X --calib_json …]` |
+| `data/kv_calib/` | gitignored | `bash pipeline/kv_calib/run_calib.sh <task>` |
+| `data/results/<task>/*.json` `*.jsonl` `*.log` | gitignored | `bash pipeline/run_sweep.sh <task>` |
+| `data/results/<task>/summary.csv` | **committed** | `python pipeline/collect_result/collect_results.py --results_dir …` |
+| `data/results/<task>/*.png` | **committed** | `python plots/plot_*_grid.py` |
 
-Deleting `configs/ kv_calib/ results/` and following the TL;DR at the
-top of this README will rebuild everything except the committed CSVs
-and plots — those come back from `git checkout`. The 1+ GB
-`niah_cache/` subdir is also safe to delete; it's a pure speedup
+Deleting `data/configs/ data/kv_calib/ data/results/` and following the
+TL;DR at the top of this README will rebuild everything except the
+committed CSVs and plots — those come back from `git checkout`. The
+1+ GB `niah_cache/` subdir is also safe to delete; it's a pure speedup
 cache, first call after deletion takes ~3 min (parallel across 5 seq
 lengths) to rebuild.

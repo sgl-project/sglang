@@ -5,7 +5,7 @@ sensitivity plus a VRAM budget, pick which experts are heter (dual
 BF16+INT4) vs INT4-only and write out the three config files sglang
 needs.
 
-Called by ``profile/gen_heter_configs.py`` (the only entry point).
+Called by ``experiments/pipeline/gen_config/gen_heter_configs.py`` (the only entry point).
 Writes to ``out_dir``:
   int4_only_experts.json  -- per-layer expert-id lists
   heter_config.json       -- ready for ``--heter-precision-config``

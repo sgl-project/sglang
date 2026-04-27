@@ -19,10 +19,13 @@ Output is a wide CSV with a stable leading column set
 (mc, variant, schema, task) plus the union of every metric that appears
 across the scanned rows.
 
-Usage:
-    python collect_results.py --results_dir results/sharegpt     --out_csv results/sharegpt/summary.csv
-    python collect_results.py --results_dir results/gsm8k        --out_csv results/gsm8k/summary.csv
-    python collect_results.py --results_dir results/supergpqa    --out_csv results/supergpqa/summary.csv
+Usage (paths relative to experiments/):
+    python pipeline/collect_result/collect_results.py \
+        --results_dir data/results/sharegpt --out_csv data/results/sharegpt/summary.csv
+    python pipeline/collect_result/collect_results.py \
+        --results_dir data/results/gsm8k --out_csv data/results/gsm8k/summary.csv
+    python pipeline/collect_result/collect_results.py \
+        --results_dir data/results/supergpqa --out_csv data/results/supergpqa/summary.csv
 """
 from __future__ import annotations
 

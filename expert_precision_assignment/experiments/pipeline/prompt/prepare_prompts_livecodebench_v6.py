@@ -3,12 +3,12 @@
 Reads livecodebench/code_generation_lite at release_v6 (1,055 problems
 from LeetCode, Codeforces, AtCoder; Apr 2025) and emits THREE files:
 
-    prompts/livecodebench_v6.jsonl                ← openai-chat prompts, sweep input (~2 MB)
-    prompts/livecodebench_v6.meta.jsonl           ← light metadata, join key question_id (~500 KB):
-                                                    question_id, platform, difficulty, contest_date,
-                                                    starter_code, fn_name, public_test_cases
-    prompts/livecodebench_v6.private_tests.pkl    ← pickle: {question_id: b64z_string}
-                                                    (~4 GB; one problem alone is 92 MB compressed)
+    prompt/livecodebench_v6.jsonl                ← openai-chat prompts, sweep input (~2 MB)
+    prompt/livecodebench_v6.meta.jsonl           ← light metadata, join key question_id (~500 KB):
+                                                   question_id, platform, difficulty, contest_date,
+                                                   starter_code, fn_name, public_test_cases
+    prompt/livecodebench_v6.private_tests.pkl    ← pickle: {question_id: b64z_string}
+                                                   (~4 GB; one problem alone is 92 MB compressed)
 
 The split is required because the private-test-case blobs are base64+zlib+pickle-
 encoded and average 4 MB per problem; inlining them would make meta.jsonl
@@ -16,7 +16,7 @@ unusable (4+ GB, one 92 MB row).  Keeping them in a separate sidecar lets
 the meta file stay small and fast-to-iterate, while the scorer loads the
 pickle once at startup and looks up by question_id.
 
-Scoring: scoring/score_traces_lcb_v6.py reads all three files, extracts
+Scoring: ../scoring/score_traces_lcb_v6.py reads all three files, extracts
 the Python code from each response, and runs the vendored lcb_runner
 checker per problem.  See that script's header for vendoring instructions.
 
@@ -38,9 +38,9 @@ import sys
 from pathlib import Path
 
 THIS_DIR = Path(__file__).resolve().parent
-PROFILE_DIR = THIS_DIR.parent
-if str(PROFILE_DIR) not in sys.path:
-    sys.path.insert(0, str(PROFILE_DIR))
+PIPELINE_DIR = THIS_DIR.parent
+if str(PIPELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(PIPELINE_DIR))
 
 HF_REPO = "livecodebench/code_generation_lite"
 HF_CONFIG = "release_v6"
@@ -132,8 +132,8 @@ def _within_date_window(contest_date: str, start: str | None, end: str | None) -
 def _load_recipe_defaults(recipe_path: Path | None) -> tuple[dict, str]:
     """Return (argparse defaults dict, output stem).
 
-    Without --recipe: output → `prompts/livecodebench_v6.*` (backward compat).
-    With --recipe:    output → `prompts/<task>_<variant>.*` and sampling
+    Without --recipe: output → `prompt/livecodebench_v6.*` (backward compat).
+    With --recipe:    output → `prompt/<task>_<variant>.*` and sampling
                       defaults come from recipe.sampling.* / dataset.*.
     """
     if recipe_path is None:
@@ -171,7 +171,7 @@ def main() -> int:
     ap.add_argument("--recipe", type=Path, default=None,
                     help="Path to a recipe YAML. Seeds all sampling defaults "
                          "and switches output files to "
-                         "`prompts/<task>_<variant>.{jsonl,meta.jsonl,private_tests.pkl}`.")
+                         "`prompt/<task>_<variant>.{jsonl,meta.jsonl,private_tests.pkl}`.")
     ap.add_argument("--limit", type=int, default=dflt.get("limit", 0),
                     help="Cap on # of prompts (0 = all ~1,055).")
     ap.add_argument("--start_date", default=dflt.get("start_date"),

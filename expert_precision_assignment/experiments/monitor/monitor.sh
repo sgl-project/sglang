@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # One-shot sweep progress snapshot.
-# Usage:
-#   bash monitor.sh                         # sharegpt (default)
-#   DATASET=gsm8k bash monitor.sh           # different dataset
-#   watch -n 30 bash monitor.sh             # live monitor (refresh 30s)
+# Usage (paths relative to experiments/):
+#   bash monitor/monitor.sh                         # sharegpt (default)
+#   DATASET=gsm8k bash monitor/monitor.sh           # different dataset
+#   watch -n 30 bash monitor/monitor.sh             # live monitor (refresh 30s)
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EXPERIMENTS_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 DATASET="${DATASET:-sharegpt}"
-R="$SCRIPT_DIR/results/$DATASET"
+R="$EXPERIMENTS_DIR/data/results/$DATASET"
 
 total=66
 done=$(ls "$R"/*.jsonl 2>/dev/null | wc -l)

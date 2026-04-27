@@ -3,7 +3,7 @@
 Think of the pipeline as one function:
 
 ```
-run_pipeline(recipe.yaml) → results/<name>/summary.csv
+run_pipeline(recipe.yaml) → data/results/<name>/summary.csv
 ```
 
 Where `recipe.yaml` is a single config file that describes the whole run
@@ -16,7 +16,7 @@ in order**: `prep → calib → gen → sweep → score → collect`.
 
 ### 1a. Pick (or write) a recipe
 
-Recipes live in `profile/recipes/`. Four starters ship with the repo:
+Recipes live in `experiments/recipe/yamls/`. Four starters ship with the repo:
 
 | recipe | task | thinking | use when |
 |---|---|---|---|
@@ -39,7 +39,7 @@ dataset:
   start_date: null           # lcb_v6 contest date window lower bound (optional)
   end_date:   null           # lcb_v6 contest date window upper bound (optional)
 
-sampling:                    # written into every prompt_record in prompts/<name>.jsonl
+sampling:                    # written into every prompt_record in pipeline/prompt/<name>.jsonl
   enable_thinking: true      # Qwen3 thinking toggle
   max_tokens: 8192           # output budget per request
   temperature: 0.6           # Qwen3 thinking recipe: 0.6 (NOT 0)
@@ -72,7 +72,7 @@ scoring:                     # optional — controls the `score` stage
 
 | field | meaning | when to change it |
 |---|---|---|
-| `task` | which `prepare_prompts_<task>.py` and `score_traces_<task>.py` to call | add a new supported dataset |
+| `task` | which `pipeline/prompt/prepare_prompts_<task>.py` and `pipeline/scoring/score_traces_<task>.py` to call | add a new supported dataset |
 | `variant` | artifact suffix; `<task>_<variant>` prevents collisions across runs | any time you want side-by-side comparison |
 | `dataset.limit` | 0 = all prompts, N = first N | smoke tests (`limit: 16`) before the full run |
 | `sampling.enable_thinking` | Qwen3 `<think>` block on/off | off is usually better for IFBench, on for math/code/reasoning |
@@ -84,7 +84,7 @@ scoring:                     # optional — controls the `score` stage
 | `sweep.variants` | heter-precision variants per mc | subset to test one policy at a time |
 | `sweep.gpus` | round-robin GPU pool | adjust to your hardware |
 | `scoring.enabled` | run the offline scorer in the `score` stage | set `false` for perf-only runs, for LCB-on-untrusted-models (safety), or when the vendored scorer deps aren't installed |
-| `scoring.extra_args` | CLI args forwarded to `score_traces_<task>.py` | e.g. `["--per-doc"]` to emit per-row records, or `["--timeout", "6"]` for LCB |
+| `scoring.extra_args` | CLI args forwarded to `pipeline/scoring/score_traces_<task>.py` | e.g. `["--per-doc"]` to emit per-row records, or `["--timeout", "6"]` for LCB |
 
 ---
 
@@ -93,44 +93,44 @@ scoring:                     # optional — controls the `score` stage
 ### 2a. Full pipeline (all 6 stages)
 
 ```bash
-cd expert_precision_assignment/profile
-bash run_pipeline.sh recipes/ifbench_nothink.yaml
+cd expert_precision_assignment/experiments
+bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml
 ```
 
 ### 2b. One stage at a time
 
 ```bash
-bash run_pipeline.sh recipes/ifbench_nothink.yaml --stage prep
-bash run_pipeline.sh recipes/ifbench_nothink.yaml --stage calib
-bash run_pipeline.sh recipes/ifbench_nothink.yaml --stage gen
-bash run_pipeline.sh recipes/ifbench_nothink.yaml --stage sweep
-bash run_pipeline.sh recipes/ifbench_nothink.yaml --stage score
-bash run_pipeline.sh recipes/ifbench_nothink.yaml --stage collect
+bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --stage prep
+bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --stage calib
+bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --stage gen
+bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --stage sweep
+bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --stage score
+bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --stage collect
 ```
 
 ### 2c. Resume from a stage / subset
 
 ```bash
-bash run_pipeline.sh recipes/ifbench_nothink.yaml --from sweep         # sweep → score → collect
-bash run_pipeline.sh recipes/ifbench_nothink.yaml --stages gen,sweep   # exactly these two
+bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --from sweep         # sweep → score → collect
+bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --stages gen,sweep   # exactly these two
 ```
 
 ### 2d. Env overrides (one-off tweaks without editing the recipe)
 
 ```bash
 # Quick 16-prompt calib smoke test
-NUM_PROMPTS=16 bash run_pipeline.sh recipes/ifbench_nothink.yaml --stage calib
+NUM_PROMPTS=16 bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --stage calib
 
 # Sweep only two variants on GPU 0
 VARIANTS="thr128 hot0" GPUS="0" \
-  bash run_pipeline.sh recipes/ifbench_nothink.yaml --stage sweep
+  bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml --stage sweep
 ```
 
 ### 2e. Two variants side-by-side
 
 ```bash
-bash run_pipeline.sh recipes/ifbench_think.yaml    &
-bash run_pipeline.sh recipes/ifbench_nothink.yaml  &
+bash run_pipeline.sh recipe/yamls/ifbench_think.yaml    &
+bash run_pipeline.sh recipe/yamls/ifbench_nothink.yaml  &
 wait
 ```
 
@@ -145,27 +145,27 @@ Each stage writes to a predictable path. Let `<name>` = `<task>_<variant>`
 
 | stage | produces | contains |
 |---|---|---|
-| `prep`    | `prompts/<name>.jsonl`                       | openai-chat prompts — one JSON line per request, with sampling knobs baked in |
-|           | `prompts/<name>.meta.jsonl`                  | ground-truth per prompt (instruction IDs, kwargs, answer letter, …) |
-|           | `prompts/<name>.private_tests.pkl`           | LCB only — compressed private test cases, 1.5–4 GB |
-| `calib`   | `kv_calib/calib_<name>_n<N>.jsonl`           | bench_serving trace — per-request `input_lens`, `output_lens`, `generated_texts`, timings |
-|           | `kv_calib/<name>.json`                       | summary μ/σ of `total_len` — input to `gen_heter_configs.py` for amortized KV sizing |
-|           | `kv_calib/server_<name>_bf16.log`            | raw sglang server log for the calib run |
-| `gen`     | `configs/<name>/mc<mc>/heter_config.json`    | per-mc base heter assignment (which experts → INT4 vs BF16) |
-|           | `configs/<name>/mc<mc>/int4_only_experts.json` | fallback int4 list |
-|           | `configs/<name>/mc<mc>/variants/<variant>.json` | 11 runtime-dispatch variants (hot0..hot100, thr32..thr512) |
-| `sweep`   | `results/<name>/mc<mc>_<variant>.jsonl`      | full bench_serving trace for one (mc, variant) cell — 66 files by default |
-|           | `results/<name>/mc<mc>_<variant>_server.log` | per-cell sglang server log |
-|           | `results/<name>/mc<mc>_<variant>_bench.log`  | per-cell bench_serving log |
-|           | `results/<name>/gpu<g>_worker.log`           | per-GPU orchestration log |
-| `score`   | `results/<name>/mc<mc>_<variant>.scores.json` | sidecar with task-specific accuracy fields (e.g. IFBench's 4 metrics) |
-| `collect` | `results/<name>/summary.csv`                 | one row per cell — mc, variant, throughput, latency, accuracy — joins sweep traces with scores sidecars |
+| `prep`    | `pipeline/prompt/<name>.jsonl`                       | openai-chat prompts — one JSON line per request, with sampling knobs baked in |
+|           | `pipeline/prompt/<name>.meta.jsonl`                  | ground-truth per prompt (instruction IDs, kwargs, answer letter, …) |
+|           | `pipeline/prompt/<name>.private_tests.pkl`           | LCB only — compressed private test cases, 1.5–4 GB |
+| `calib`   | `data/kv_calib/calib_<name>_n<N>.jsonl`              | bench_serving trace — per-request `input_lens`, `output_lens`, `generated_texts`, timings |
+|           | `data/kv_calib/<name>.json`                          | summary μ/σ of `total_len` — input to `gen_heter_configs.py` for amortized KV sizing |
+|           | `data/kv_calib/server_<name>_bf16.log`               | raw sglang server log for the calib run |
+| `gen`     | `data/configs/<name>/mc<mc>/heter_config.json`       | per-mc base heter assignment (which experts → INT4 vs BF16) |
+|           | `data/configs/<name>/mc<mc>/int4_only_experts.json`  | fallback int4 list |
+|           | `data/configs/<name>/mc<mc>/variants/<variant>.json` | 11 runtime-dispatch variants (hot0..hot100, thr32..thr512) |
+| `sweep`   | `data/results/<name>/mc<mc>_<variant>.jsonl`         | full bench_serving trace for one (mc, variant) cell — 66 files by default |
+|           | `data/results/<name>/mc<mc>_<variant>_server.log`    | per-cell sglang server log |
+|           | `data/results/<name>/mc<mc>_<variant>_bench.log`     | per-cell bench_serving log |
+|           | `data/results/<name>/gpu<g>_worker.log`              | per-GPU orchestration log |
+| `score`   | `data/results/<name>/mc<mc>_<variant>.scores.json`   | sidecar with task-specific accuracy fields (e.g. IFBench's 4 metrics) |
+| `collect` | `data/results/<name>/summary.csv`                    | one row per cell — mc, variant, throughput, latency, accuracy — joins sweep traces with scores sidecars |
 
 ---
 
 ## 4. UNDERSTANDING THE OUTPUT
 
-### 4a. `kv_calib/<name>.json` (calibration summary)
+### 4a. `data/kv_calib/<name>.json` (calibration summary)
 
 ```json
 {
@@ -183,7 +183,7 @@ Each stage writes to a predictable path. Let `<name>` = `<task>_<variant>`
 `max_tokens` — that's fine for sizing but means your model saturated the
 output budget (see §5 pathologies).
 
-### 4b. `results/<name>/summary.csv` (the final answer)
+### 4b. `data/results/<name>/summary.csv` (the final answer)
 
 Columns you'll actually read:
 
@@ -201,27 +201,27 @@ Plot `output_throughput` vs. `score_*` across variants to see the
 efficiency-accuracy frontier per mc. Higher `hotN` → more experts in BF16;
 higher `thrN` → more experts above the |f·o| threshold.
 
-### 4c. `results/<name>/mc<mc>_<variant>.jsonl` (raw trace)
+### 4c. `data/results/<name>/mc<mc>_<variant>.jsonl` (raw trace)
 
-Use `show_calib.py` to inspect:
+Use `monitor/show_calib.py` to inspect:
 
 ```bash
-python show_calib.py results/ifbench_nothink/mc128_thr128.jsonl          # summary + row 0
-python show_calib.py results/ifbench_nothink/mc128_thr128.jsonl -n 5     # first 5 answers
-python show_calib.py results/ifbench_nothink/mc128_thr128.jsonl --row 3  # row 3 in full
-python show_calib.py results/ifbench_nothink/mc128_thr128.jsonl --raw    # raw bytes, no framing
+python monitor/show_calib.py data/results/ifbench_nothink/mc128_thr128.jsonl          # summary + row 0
+python monitor/show_calib.py data/results/ifbench_nothink/mc128_thr128.jsonl -n 5     # first 5 answers
+python monitor/show_calib.py data/results/ifbench_nothink/mc128_thr128.jsonl --row 3  # row 3 in full
+python monitor/show_calib.py data/results/ifbench_nothink/mc128_thr128.jsonl --raw    # raw bytes, no framing
 ```
 
-It auto-joins with the matching `prompts/<name>.jsonl` + `prompts/<name>.meta.jsonl`
+It auto-joins with the matching `pipeline/prompt/<name>.jsonl` + `pipeline/prompt/<name>.meta.jsonl`
 so you see the prompt, constraint, and answer side-by-side.
 
-### 4d. `kv_calib/calib_<name>_n<N>.jsonl` (calibration trace)
+### 4d. `data/kv_calib/calib_<name>_n<N>.jsonl` (calibration trace)
 
 Same format as sweep traces. Inspect the same way:
 
 ```bash
-python show_calib.py kv_calib/calib_ifbench_nothink_n16.jsonl            # summary
-python show_calib.py kv_calib/calib_ifbench_nothink_n16.jsonl --errors   # only failed requests
+python monitor/show_calib.py data/kv_calib/calib_ifbench_nothink_n16.jsonl            # summary
+python monitor/show_calib.py data/kv_calib/calib_ifbench_nothink_n16.jsonl --errors   # only failed requests
 ```
 
 ---
@@ -248,11 +248,13 @@ Before trusting a full sweep's numbers, spot-check the calib trace:
 
 ## 6. ADDING A NEW TASK
 
-1. Write `prompts/prepare_prompts_<newtask>.py` (use `prepare_prompts_ifbench.py`
-   as a template — it has the `--recipe` two-pass argparse + compound output path).
-2. Write `scoring/score_traces_<newtask>.py` (task-specific accuracy metric).
-3. Copy an existing recipe and set `task: <newtask>` + whatever variant name.
-4. `bash run_pipeline.sh recipes/<newtask>_<variant>.yaml` — the rest Just Works.
+1. Write `pipeline/prompt/prepare_prompts_<newtask>.py` (use
+   `prepare_prompts_ifbench.py` as a template — it has the `--recipe`
+   two-pass argparse + compound output path).
+2. Write `pipeline/scoring/score_traces_<newtask>.py` (task-specific accuracy metric).
+3. Copy an existing recipe under `recipe/yamls/` and set `task: <newtask>`
+   + whatever variant name.
+4. `bash run_pipeline.sh recipe/yamls/<newtask>_<variant>.yaml` — the rest Just Works.
 
 ---
 
@@ -262,9 +264,9 @@ The old per-stage invocations still work for one-off debugging — none of
 them require `--recipe`:
 
 ```bash
-python prompts/prepare_prompts_ifbench.py            # writes prompts/ifbench.jsonl (no suffix)
-bash run_calib.sh sharegpt                           # still works
-bash run_sweep.sh ifbench                            # still works (no variant suffix)
+python pipeline/prompt/prepare_prompts_ifbench.py    # writes pipeline/prompt/ifbench.jsonl (no suffix)
+bash pipeline/kv_calib/run_calib.sh sharegpt         # still works
+bash pipeline/run_sweep.sh ifbench                   # still works (no variant suffix)
 ```
 
 `--recipe` is additive: pass it and artifact paths gain the `<task>_<variant>`

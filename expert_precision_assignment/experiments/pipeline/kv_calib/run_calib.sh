@@ -4,41 +4,44 @@
 # baseline, independent of any heter-precision policy.
 #
 # Dispatches on $TASK (three modes, auto-detected):
-#   sharegpt                    → MODE=sharegpt   (bench_serving --dataset-name sharegpt)
-#   prompts/<task>.jsonl exists → MODE=openai     (bench_serving --dataset-name openai,
-#                                                  for user-prepared prompts e.g. supergpqa,
-#                                                  ifbench, livecodebench_v6 — scoring is
-#                                                  offline via scoring/score_traces_<task>.py)
-#   else                        → MODE=bench_eval (lm-eval-harness tasks like gsm8k, mmlu*)
+#   sharegpt                       → MODE=sharegpt
+#                                    (bench_serving --dataset-name sharegpt)
+#   ../prompt/<task>.jsonl exists  → MODE=openai
+#                                    (bench_serving --dataset-name openai,
+#                                     for user-prepared prompts e.g. supergpqa,
+#                                     ifbench, livecodebench_v6 — scoring offline
+#                                     via ../scoring/score_traces_<task>.py)
+#   else                           → MODE=bench_eval
+#                                    (lm-eval-harness tasks like gsm8k, mmlu*)
 #
 # Then invokes calib_kv.py --bench_details_jsonl on the produced JSONL
-# to emit kv_calib/<task>/calib.json with μ/σ of total_len.
+# to emit data/kv_calib/<task>/calib.json with μ/σ of total_len.
 # gen_heter_configs.py --calib_json consumes that file.
 #
-# Usage:
-#   bash run_calib.sh sharegpt
-#   bash run_calib.sh gsm8k
-#   bash run_calib.sh supergpqa            # after `python prompts/prepare_prompts_supergpqa.py`
-#   NUM_PROMPTS=512 bash run_calib.sh sharegpt
-#   CALIB_MC=64 MAX_GEN_TOKS=512 bash run_calib.sh gsm8k
-#   FEWSHOT_AS_MULTITURN=0 bash run_calib.sh gsm8k   # disable multiturn wrap
-#   CALIB_LIMIT=256 bash run_calib.sh gsm8k          # use 256 docs instead of 128
-#   CALIB_LIMIT= bash run_calib.sh gsm8k             # full task (no cap)
-#   NIAH_CACHE_DIR=kv_calib/ruler/niah_cache RULER_MAX_SEQ=65536 \
-#       bash run_calib.sh niah_single_2              # disk-cache RULER dataset
-#                                                     (cold build once; warm
-#                                                      reloads for run_sweep.sh)
+# Usage (paths relative to experiments/):
+#   bash pipeline/kv_calib/run_calib.sh sharegpt
+#   bash pipeline/kv_calib/run_calib.sh gsm8k
+#   bash pipeline/kv_calib/run_calib.sh supergpqa  # after prepare_prompts_supergpqa.py
+#   NUM_PROMPTS=512 bash pipeline/kv_calib/run_calib.sh sharegpt
+#   CALIB_MC=64 MAX_GEN_TOKS=512 bash pipeline/kv_calib/run_calib.sh gsm8k
+#   FEWSHOT_AS_MULTITURN=0 bash pipeline/kv_calib/run_calib.sh gsm8k
+#   CALIB_LIMIT=256 bash pipeline/kv_calib/run_calib.sh gsm8k
+#   CALIB_LIMIT= bash pipeline/kv_calib/run_calib.sh gsm8k          # full task
+#   NIAH_CACHE_DIR=data/kv_calib/ruler/niah_cache RULER_MAX_SEQ=65536 \
+#       bash pipeline/kv_calib/run_calib.sh niah_single_2           # disk-cache RULER
 set -uo pipefail
 
 TASK="${1:-}"
 if [ -z "$TASK" ]; then
-    echo "Usage: bash run_calib.sh <task>   (e.g. sharegpt, gsm8k)" >&2
+    echo "Usage: bash pipeline/kv_calib/run_calib.sh <task>   (e.g. sharegpt, gsm8k)" >&2
     exit 2
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-POLICY_DIR="$(cd "$SCRIPT_DIR/../policy/heter_assign" && pwd)"
-OUT_DIR="$SCRIPT_DIR/kv_calib/$TASK"
+EXPERIMENTS_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+ROOT_DIR="$(cd "$EXPERIMENTS_DIR/.." && pwd)"
+POLICY_DIR="$ROOT_DIR/policy/heter_assign"
+OUT_DIR="$EXPERIMENTS_DIR/data/kv_calib/$TASK"
 mkdir -p "$OUT_DIR"
 
 if [ "$TASK" = "sharegpt" ]; then
@@ -115,9 +118,9 @@ eval "$(conda shell.bash hook 2>/dev/null)" || true
 conda activate sglang 2>/dev/null || source activate sglang
 
 if [ -n "$RULER_MAX_SEQ" ]; then
-    # Group all RULER runs under kv_calib/ruler/ regardless of which subtask
+    # Group all RULER runs under data/kv_calib/ruler/ regardless of which subtask
     # (niah_single_2, ruler_qa_hotpot, etc.) so 8k/64k/128k sit side by side.
-    OUT_DIR="$SCRIPT_DIR/kv_calib/ruler"
+    OUT_DIR="$EXPERIMENTS_DIR/data/kv_calib/ruler"
     mkdir -p "$OUT_DIR"
     DETAILS_JSONL="$OUT_DIR/details_${RULER_MAX_SEQ}_${TASK}_mc${CALIB_MC}.jsonl"
     CALIB_JSON="$OUT_DIR/calib_${RULER_MAX_SEQ}_${TASK}.json"
@@ -305,8 +308,8 @@ if n:
 "
 elif [ "$MODE" = "openai" ]; then
     echo ""
-    echo "Note: accuracy for MODE=openai is computed offline via scoring/score_traces_${TASK}.py"
-    echo "      against $DETAILS_JSONL + prompts/${TASK}.meta.jsonl"
+    echo "Note: accuracy for MODE=openai is computed offline via pipeline/scoring/score_traces_${TASK}.py"
+    echo "      against $DETAILS_JSONL + pipeline/prompt/${TASK}.meta.jsonl"
 fi
 
 echo "============================================================"

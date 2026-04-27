@@ -1,10 +1,10 @@
 """Score a LiveCodeBench v6 trace JSONL against its meta + private-tests sidecars.
 
-Inputs:
-    --trace          results/livecodebench_v6/mc{mc}_{variant}.jsonl  (bench_serving)
-    --meta           prompts/livecodebench_v6.meta.jsonl              (prep output)
-    --private-tests  prompts/livecodebench_v6.private_tests.pkl       (prep output)
-    --vendored       scoring/vendored/lcb_runner                      (lcb checker)
+Inputs (paths relative to experiments/):
+    --trace          data/results/livecodebench_v6/mc{mc}_{variant}.jsonl   (bench_serving)
+    --meta           pipeline/prompt/livecodebench_v6.meta.jsonl            (prep output)
+    --private-tests  pipeline/prompt/livecodebench_v6.private_tests.pkl     (prep output)
+    --vendored       pipeline/scoring/vendored/lcb_runner                   (lcb checker)
 
 The private-tests pickle is a dict {question_id: base64_zlib_pickle_string}.
 Loaded once at startup and looked up by meta[i].question_id.
@@ -25,20 +25,20 @@ harness from lcb_runner which applies a CPU time limit; however, that
 is not a security sandbox.  For untrusted models, run this scorer in
 an isolated container / VM.
 
-VENDORING (one-time, before running):
+VENDORING (one-time, before running; paths relative to experiments/):
 
-    mkdir -p scoring/vendored
-    cd scoring/vendored
+    mkdir -p pipeline/scoring/vendored
+    cd pipeline/scoring/vendored
     git clone https://github.com/LiveCodeBench/LiveCodeBench.git lcb_runner_repo
     cd lcb_runner_repo && git checkout 28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24
     cd .. && ln -sfn lcb_runner_repo/lcb_runner lcb_runner
-    cd ../..
+    cd ../../..
     pip install pebble datasets
 
 Then run:
-    python scoring/score_traces_lcb_v6.py \
-        --trace results/livecodebench_v6/mc128_thr128.jsonl \
-        --meta prompts/livecodebench_v6.meta.jsonl
+    python pipeline/scoring/score_traces_lcb_v6.py \
+        --trace data/results/livecodebench_v6/mc128_thr128.jsonl \
+        --meta pipeline/prompt/livecodebench_v6.meta.jsonl
 """
 from __future__ import annotations
 
@@ -201,7 +201,7 @@ def main() -> int:
     if not args.private_tests.exists():
         raise FileNotFoundError(
             f"private-tests sidecar not found: {args.private_tests}\n"
-            f"Run `python prompts/prepare_prompts_lcb_v6.py` first."
+            f"Run `python pipeline/prompt/prepare_prompts_lcb_v6.py` first."
         )
     with open(args.private_tests, "rb") as f:
         private_tests: dict[str, str] = pickle.load(f)

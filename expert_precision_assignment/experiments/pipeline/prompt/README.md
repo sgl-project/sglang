@@ -1,16 +1,18 @@
-# prompts/ — openai-format prompt JSONLs for the sweep pipeline
+# prompt/ — openai-format prompt JSONLs for the sweep pipeline
 
 Custom-task prompts live here. Each task writes at least two parallel files:
 
 | file | role |
 |---|---|
-| `<task>.jsonl` | openai-chat-format prompts; `run_sweep.sh <task>` feeds this to `bench_serving --dataset-name openai` |
+| `<task>.jsonl` | openai-chat-format prompts; `pipeline/run_sweep.sh <task>` feeds this to `bench_serving --dataset-name openai` |
 | `<task>.meta.jsonl` | per-row ground truth + metadata; scored against trace by index |
 | `livecodebench_v6.private_tests.pkl` | **LCB only** — pickle dict `{question_id: b64z}` carrying the bulky base64+zlib-encoded test cases. Kept out of `.meta.jsonl` because one problem alone can be 92 MB compressed; inlining would bloat meta to ~4 GB. Scorer loads this once at startup and looks up by `question_id`. |
 
 **Prompts and meta are parallel by index.** Row `i` of `.jsonl` is the prompt that produces `generated_texts[i]` in the trace, which is scored against row `i` of `.meta.jsonl`. `bench_serving` preserves input order, so offline scoring works by `zip(trace.generated_texts, open(meta.jsonl))`. For LCB, the scorer additionally joins on `meta[i].question_id → private_tests[question_id]`.
 
 ## Generate the JSONL pair
+
+All commands run from this `pipeline/prompt/` directory:
 
 ```bash
 # SuperGPQA (26,529 MCQs; seeded shuffle so first N covers all disciplines)
@@ -31,25 +33,31 @@ Each prep script writes two files to this directory.
 
 ## Run the sweep against prepared prompts
 
-Once `prompts/<task>.jsonl` exists, `run_calib.sh` and `run_sweep.sh` auto-detect it and switch to `MODE=openai`:
+Once `pipeline/prompt/<task>.jsonl` exists, `pipeline/kv_calib/run_calib.sh`
+and `pipeline/run_sweep.sh` auto-detect it and switch to `MODE=openai`.
+The commands below run from `experiments/`:
 
 ```bash
 # Calibrate KV against the BF16 baseline (first 128 prompts by default).
-NUM_PROMPTS=128 bash ../run_calib.sh supergpqa
+NUM_PROMPTS=128 bash pipeline/kv_calib/run_calib.sh supergpqa
 
 # Regenerate task-specific configs with amortized KV sizing.
-python ../gen_all.py --task supergpqa --calib_json ../kv_calib/supergpqa.json
+python pipeline/gen_config/gen_all.py --task supergpqa \
+    --calib_json data/kv_calib/supergpqa.json
 
 # Full sweep (all 26,529 SuperGPQA prompts × 66 configs).
-bash ../run_sweep.sh supergpqa
+bash pipeline/run_sweep.sh supergpqa
 
 # Score traces offline.
-for t in ../results/supergpqa/mc*_*.jsonl; do
-    python ../scoring/score_traces_supergpqa.py --trace "$t" --meta supergpqa.meta.jsonl
+for t in data/results/supergpqa/mc*_*.jsonl; do
+    python pipeline/scoring/score_traces_supergpqa.py \
+        --trace "$t" --meta pipeline/prompt/supergpqa.meta.jsonl
 done
 
 # Collect summary CSV (auto-merges .scores.json sidecars).
-python ../collect_results.py --results_dir ../results/supergpqa --out_csv ../results/supergpqa/summary.csv
+python pipeline/collect_result/collect_results.py \
+    --results_dir data/results/supergpqa \
+    --out_csv data/results/supergpqa/summary.csv
 ```
 
 The same flow applies for `ifbench` and `livecodebench_v6` — substitute the task name.

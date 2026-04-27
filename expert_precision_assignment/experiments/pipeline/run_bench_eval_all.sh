@@ -5,13 +5,13 @@
 # curve and want to fine-tune it; the hot% sweep gives a 0-100% BF16
 # coverage curve per task that's more diagnostic).
 #
-# Waits for any running `bash run_sweep.sh sharegpt` to finish before
-# starting. Each task's failures (e.g. unknown lm_eval task name,
+# Waits for any running `bash pipeline/run_sweep.sh sharegpt` to finish
+# before starting. Each task's failures (e.g. unknown lm_eval task name,
 # gated dataset) are absorbed by run_sweep.sh's per-cell `|| true`, so
 # one bad task doesn't block the others.
 #
 # Usage:
-#   bash run_bench_eval_all.sh
+#   bash pipeline/run_bench_eval_all.sh
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,7 +37,7 @@ for task in "${TASKS[@]}"; do
     echo "============================================================"
     echo "  [$(date '+%F %T')] Task: $task  (6 variants × 6 mc = 36 cells)"
     echo "============================================================"
-    bash run_sweep.sh "$task" || true
+    bash "$SCRIPT_DIR/run_sweep.sh" "$task" || true
 done
 
 echo "[$(date '+%F %T')] All bench_eval tasks complete."
