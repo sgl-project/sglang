@@ -82,5 +82,76 @@ def benchmark(op_name: str, dim: int, batch_size: int, provider: str):
     return run_benchmark(f, scale=NUM_LAYERS)
 
 
+FILTER_OPS = ["silu", "gelu"]
+FILTER_BS = get_benchmark_range(
+    full_range=[64, 256, 1024, 4096, 16384], ci_range=[1024]
+)
+FILTER_DIMS = get_benchmark_range(full_range=[1024, 4096, 8192], ci_range=[4096])
+FILTER_RATIOS = get_benchmark_range(full_range=[0.0, 0.25, 0.5], ci_range=[0.25])
+FILTER_CONFIGS = list(
+    itertools.product(FILTER_OPS, FILTER_DIMS, FILTER_BS, FILTER_RATIOS)
+)
+
+
+def _make_expert_ids(num_tokens: int, skip_ratio: float) -> torch.Tensor:
+    expert_ids = torch.randint(
+        low=0, high=8, size=(num_tokens,), dtype=torch.int32, device=DEFAULT_DEVICE
+    )
+    if skip_ratio > 0:
+        skip = torch.rand(num_tokens, device=DEFAULT_DEVICE) < skip_ratio
+        expert_ids[skip] = -1
+    return expert_ids
+
+
+@triton.testing.perf_report(
+    triton.testing.Benchmark(
+        x_names=["op_name", "dim", "batch_size", "skip_ratio"],
+        x_vals=FILTER_CONFIGS,
+        line_arg="provider",
+        line_vals=["unfiltered", "filtered"],
+        line_names=["JIT (no filter_expert)", "JIT (with expert_ids)"],
+        styles=[("blue", "--"), ("orange", "-")],
+        ylabel="us",
+        plot_name="activation-filter-expert",
+        args={},
+    )
+)
+def benchmark_filter(
+    op_name: str, dim: int, batch_size: int, skip_ratio: float, provider: str
+):
+    x = torch.randn(
+        NUM_LAYERS,
+        batch_size,
+        2 * dim,
+        dtype=DEFAULT_DTYPE,
+        device=DEFAULT_DEVICE,
+    )
+    out = torch.empty(
+        NUM_LAYERS,
+        batch_size,
+        dim,
+        dtype=DEFAULT_DTYPE,
+        device=DEFAULT_DEVICE,
+    )
+    expert_ids = _make_expert_ids(batch_size, skip_ratio)
+
+    jit_fn = silu_and_mul_jit if op_name == "silu" else gelu_and_mul_jit
+
+    if provider == "unfiltered":
+
+        def f():
+            for i in range(NUM_LAYERS):
+                jit_fn(x[i], out[i])
+
+    else:  # filtered
+
+        def f():
+            for i in range(NUM_LAYERS):
+                jit_fn(x[i], out[i], expert_ids=expert_ids, expert_step=1)
+
+    return run_benchmark(f, scale=NUM_LAYERS)
+
+
 if __name__ == "__main__":
     benchmark.run(print_data=True)
+    benchmark_filter.run(print_data=True)
