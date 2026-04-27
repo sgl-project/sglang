@@ -147,9 +147,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             output_size=T2I_sampling_params.output_size,
             extras={"guidance_scale": 3.5, "num_inference_steps": 8},
         ),
-        run_perf_check=False,
-        run_consistency_check=False,
-        run_lora_basic_api_check=True,
     ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
