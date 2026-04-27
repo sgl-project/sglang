@@ -1612,9 +1612,7 @@ async def openai_v1_audio_transcriptions(
             temperature=temperature,
             stream=stream,
             timestamp_granularities=timestamp_granularities,
-            processor_kwargs=_parse_optional_json(
-                "processor_kwargs", processor_kwargs
-            ),
+            processor_kwargs=_parse_optional_json("processor_kwargs", processor_kwargs),
             mm_process_config=_parse_optional_json(
                 "mm_process_config", mm_process_config
             ),

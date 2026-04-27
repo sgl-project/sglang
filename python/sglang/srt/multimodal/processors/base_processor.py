@@ -323,9 +323,7 @@ class BaseMultimodalProcessor(ABC):
     ) -> Dict[str, Any]:
         request_obj = self._get_runtime_request()
         value = (
-            getattr(request_obj, field_name, None)
-            if request_obj is not None
-            else None
+            getattr(request_obj, field_name, None) if request_obj is not None else None
         )
         if value is None:
             return {}
@@ -339,9 +337,7 @@ class BaseMultimodalProcessor(ABC):
                     )
         return value
 
-    def _get_effective_modality_process_config(
-        self, modality: str
-    ) -> Dict[str, Any]:
+    def _get_effective_modality_process_config(self, modality: str) -> Dict[str, Any]:
         base_config = getattr(self, f"{modality}_config", {}) or {}
         runtime_config = self._get_runtime_request_dict(
             "mm_process_config", validate_modalities=True
@@ -354,9 +350,7 @@ class BaseMultimodalProcessor(ABC):
     def _get_runtime_io_kwargs(self) -> Dict[str, Any]:
         return self._get_runtime_request_dict("io_kwargs", validate_modalities=True)
 
-    def _merge_runtime_processor_kwargs(
-        self, kwargs: Dict[str, Any]
-    ) -> Dict[str, Any]:
+    def _merge_runtime_processor_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         runtime_kwargs = self._get_runtime_processor_kwargs()
         if not runtime_kwargs:
             return kwargs

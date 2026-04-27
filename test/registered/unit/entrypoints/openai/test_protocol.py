@@ -187,9 +187,7 @@ class TestChatCompletionRequest(unittest.TestCase):
             request.processor_kwargs, {"images_kwargs": {"max_pixels": 1024}}
         )
         self.assertEqual(request.mm_process_config, {"image": {"max_pixels": 2048}})
-        self.assertEqual(
-            request.io_kwargs, {"image": {"discard_alpha_channel": False}}
-        )
+        self.assertEqual(request.io_kwargs, {"image": {"discard_alpha_channel": False}})
 
     def test_chat_completion_reasoning_effort(self):
         """Test chat completion with reasoning effort"""
