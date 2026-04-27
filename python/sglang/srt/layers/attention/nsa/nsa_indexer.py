@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_xpu,
 )
 
 global _use_multi_stream
@@ -40,10 +41,10 @@ _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
-
 _is_cpu = is_cpu()
 _cpu_amx = cpu_has_amx_support()
+_is_xpu = is_xpu()
+
 if _is_cuda:
     try:
         import deep_gemm
@@ -180,12 +181,34 @@ class BaseIndexerMetadata(ABC):
         """
 
 
+def _torch_hadamard_transform(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Pure-torch FWHT fallback for backends without a fused kernel.
+
+    Iterative Cooley-Tukey-style Walsh-Hadamard transform along the last
+    dim. Hidden size must be a power of two; same contract as the fused
+    ``hadamard_transform`` op.
+    """
+    n = x.size(-1)
+    leading = x.shape[:-1]
+    out = x.reshape(-1, n).clone()
+    h = 1
+    while h < n:
+        out = out.view(-1, n // (2 * h), 2, h)
+        a = out[:, :, 0, :]
+        b = out[:, :, 1, :]
+        out = torch.stack((a + b, a - b), dim=2).view(-1, n)
+        h *= 2
+    return out.view(*leading, n) * scale
+
+
 def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     # from sgl_kernel import hadamard_transform
     if _is_hip:
         from fast_hadamard_transform import hadamard_transform
     elif _is_cpu and _cpu_amx:
         hadamard_transform = torch.ops.sgl_kernel.fast_hadamard_transform_cpu
+    elif _is_xpu:
+        hadamard_transform = _torch_hadamard_transform
     else:
         from sglang.jit_kernel.hadamard import hadamard_transform
 
