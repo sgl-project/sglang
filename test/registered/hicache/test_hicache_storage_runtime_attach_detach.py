@@ -6,9 +6,7 @@ any storage backend at startup, then attaches/detaches a storage backend via the
 HTTP endpoints.
 
 Usage:
-    python3 -m pytest test/manual/hicache/test_hicache_storage_runtime_attach_detach.py -v
-# TODO: Segmentation fault occurs when upgraded to Cu13. Ref: https://github.com/sgl-project/sglang/actions/runs/24603159715/job/71945537414?pr=23119")
-# Should move back to registered test after it's fixed
+    python3 -m pytest test/registered/hicache/test_hicache_storage_runtime_attach_detach.py -v
 """
 
 import json
