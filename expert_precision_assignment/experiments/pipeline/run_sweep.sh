@@ -254,6 +254,19 @@ run_bench() {
             --num-prompts "$NUM_PROMPTS" \
             --max-concurrency "$mc" \
             --output-file "$out" > "$log" 2>&1
+    elif [ "$MODE" = "openai" ]; then
+        # --output-details is required so the trace has per-request
+        # generated_texts/input_lens/output_lens that the offline scorer
+        # zips against pipeline/prompt/<task>.meta.jsonl.
+        python3 -m sglang.bench_serving \
+            --backend sglang-oai-chat \
+            --base-url "http://${HOST}:${port}" \
+            --dataset-name openai \
+            --dataset-path "$PROMPTS_JSONL" \
+            --num-prompts "$OPENAI_NUM_PROMPTS" \
+            --max-concurrency "$mc" \
+            --output-details \
+            --output-file "$out" > "$log" 2>&1
     else
         local ct_flag=()
         [ "$APPLY_CHAT_TEMPLATE" = "1" ] && ct_flag=(--apply-chat-template)

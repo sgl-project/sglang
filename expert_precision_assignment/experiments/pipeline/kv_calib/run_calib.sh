@@ -44,6 +44,10 @@ POLICY_DIR="$ROOT_DIR/policy/heter_assign"
 OUT_DIR="$EXPERIMENTS_DIR/data/kv_calib/$TASK"
 mkdir -p "$OUT_DIR"
 
+# Auto-detect openai-mode prompts at the canonical location. Caller may
+# also pre-export PROMPTS_JSONL to override.
+PROMPTS_JSONL="${PROMPTS_JSONL:-$EXPERIMENTS_DIR/pipeline/prompt/${TASK}.jsonl}"
+
 if [ "$TASK" = "sharegpt" ]; then
     MODE="sharegpt"
 elif [ -f "$PROMPTS_JSONL" ]; then
@@ -243,12 +247,23 @@ echo "Server ready after ${elapsed}s"
 
 # 3. Run bench pass with per-request input_lens / output_lens capture.
 if [ "$TASK" = "sharegpt" ]; then
-    echo "Running bench_serving (n=$NUM_PROMPTS)..."
+    echo "Running bench_serving (sharegpt, n=$NUM_PROMPTS)..."
     python3 -m sglang.bench_serving \
         --backend sglang \
         --base-url "http://${HOST}:${PORT}" \
         --dataset-name sharegpt \
         --sharegpt-context-len "$SHAREGPT_CONTEXT_LEN" \
+        --num-prompts "$NUM_PROMPTS" \
+        --max-concurrency "$CALIB_MC" \
+        --output-details \
+        --output-file "$DETAILS_JSONL"
+elif [ "$MODE" = "openai" ]; then
+    echo "Running bench_serving (openai-chat, dataset=$PROMPTS_JSONL, n=$NUM_PROMPTS)..."
+    python3 -m sglang.bench_serving \
+        --backend sglang-oai-chat \
+        --base-url "http://${HOST}:${PORT}" \
+        --dataset-name openai \
+        --dataset-path "$PROMPTS_JSONL" \
         --num-prompts "$NUM_PROMPTS" \
         --max-concurrency "$CALIB_MC" \
         --output-details \

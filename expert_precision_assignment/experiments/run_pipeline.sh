@@ -102,8 +102,10 @@ TASK="$RECIPE_TASK"
 NAME="$RECIPE_NAME"
 CALIB_N="${RECIPE_CALIBRATION__NUM_PROMPTS}"
 PROMPTS_JSONL="$PIPELINE_DIR/prompt/${NAME}.jsonl"
-CALIB_JSON="$DATA_DIR/kv_calib/${NAME}.json"
-CALIB_TRACE="$DATA_DIR/kv_calib/calib_${NAME}_n${CALIB_N}.jsonl"
+# run_calib.sh nests its outputs under data/kv_calib/<name>/.
+CALIB_DIR="$DATA_DIR/kv_calib/${NAME}"
+CALIB_JSON="$CALIB_DIR/calib.json"
+CALIB_TRACE="$CALIB_DIR/details_mc${RECIPE_CALIBRATION__MC}.jsonl"
 RESULTS_DIR="$DATA_DIR/results/${NAME}"
 SCORER="$PIPELINE_DIR/scoring/score_traces_${TASK}.py"
 META_JSONL="$PIPELINE_DIR/prompt/${NAME}.meta.jsonl"
@@ -139,7 +141,11 @@ run_stage() {
             ;;
         gen)
             [ -f "$CALIB_JSON" ] || { echo "Run 'calib' first: missing $CALIB_JSON" >&2; exit 3; }
-            "$PYTHON" "$PIPELINE_DIR/gen_config/gen_all.py" --task "$NAME" --calib_json "$CALIB_JSON"
+            # Forward recipe knobs so gen_heter_configs.py / gen_dyna_variants.py
+            # honor the YAML's sweep.mc_list and sweep.variants.
+            MC_LIST="${MC_LIST:-${RECIPE_SWEEP__MC_LIST:-}}" \
+            VARIANTS="${VARIANTS:-${RECIPE_SWEEP__VARIANTS:-}}" \
+                "$PYTHON" "$PIPELINE_DIR/gen_config/gen_all.py" --task "$NAME" --calib_json "$CALIB_JSON"
             ;;
         sweep)
             [ -f "$PROMPTS_JSONL" ] || { echo "Run 'prep' first: missing $PROMPTS_JSONL" >&2; exit 3; }

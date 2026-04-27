@@ -2,20 +2,20 @@
 
 For each mc in MC_LIST, reads `<cfg_dir>/mc{mc}/heter_config.json` (the
 per-mc base assignment produced by `gen_heter_configs.py`) and emits the
-variant files into `<cfg_dir>/mc{mc}/variants/`.
+requested variant files into `<cfg_dir>/mc{mc}/variants/`.
 
-Current primary variants:
-  - hess0..hess100  (policy=hessian_weighted_routing_weights)
-    score(E) = importance(E) × per-expert total routing weight.
-    Six hot/cold splits (0/20/40/60/80/100%) drop straight into the
-    existing sweep slot that hot0..hot100 used for expert_load.
-    Requires the base heter_config.json to carry
-    ``expert_importance_file`` (produced by ``gen_heter_configs.py
-    --hessian``, the default).
+Variant naming convention — the prefix encodes the policy:
+  - hess<N>  policy=hessian_weighted_routing_weights, hot ratio N%
+             (importance × per-expert total routing weight)
+             Requires the base heter_config.json to carry
+             ``expert_importance_file`` (produced by
+             ``gen_heter_configs.py --hessian``, the default).
+  - hot<N>   policy=expert_load,                       hot ratio N%
+  - thr<N>   policy=expert_batch,                      threshold=N
 
-The legacy hot0..hot100 / thr32..thr512 variant loops are preserved
-below as ``if False:`` blocks — flip them back on to regenerate the full
-sweep matrix.
+`VARIANTS` and `MC_LIST` env vars control what gets generated. The
+recipe pipeline exports both via run_pipeline.sh, so the YAML is the
+single source of truth at runtime.
 
 Use --task=<name> to point at data/configs/<task>/ (per-task amortized
 assignments from `gen_heter_configs.py --task`). Default is the flat
@@ -40,8 +40,67 @@ MC_LIST = (
     [int(x) for x in os.environ["MC_LIST"].split()]
     if os.environ.get("MC_LIST") else _DEFAULT_MC_LIST
 )
-HOT_PCTS = [0, 20, 40, 60, 80, 100]
-THRESHOLDS = [32, 64, 128, 256, 512]
+
+# `VARIANTS` env var lets the recipe pipeline (run_pipeline.sh) drive
+# exactly which variant files to emit. Default mirrors the historical
+# six-point hess ladder so standalone calls still produce the canonical
+# sweep matrix.
+_DEFAULT_VARIANTS = ["hess0", "hess20", "hess40", "hess60", "hess80", "hess100"]
+VARIANTS = (
+    os.environ["VARIANTS"].split()
+    if os.environ.get("VARIANTS") else _DEFAULT_VARIANTS
+)
+
+
+def _build_variant(base: dict, name: str) -> dict:
+    """Return a deep-copied variant config for the given variant name.
+
+    Variant names parse as a literal prefix + integer parameter:
+      hess<N>  → hessian_weighted_routing_weights, hot ratio N%
+      hot<N>   → expert_load,                      hot ratio N%
+      thr<N>   → expert_batch,                     threshold=N
+    """
+    cfg = copy.deepcopy(base)
+
+    if name.startswith("hess"):
+        param = int(name[len("hess"):])
+        if not 0 <= param <= 100:
+            raise ValueError(f"hess hot ratio out of [0,100]: {name}")
+        cfg["policy"] = "hessian_weighted_routing_weights"
+        cfg.pop("policy_params", None)
+        hot_r = param / 100.0
+        for g in cfg["groups"]:
+            if g["name"] == "cold":
+                g["size_ratio"] = 1.0 - hot_r
+            elif g["name"] == "hot":
+                g["size_ratio"] = hot_r
+        return cfg
+
+    if name.startswith("hot"):
+        param = int(name[len("hot"):])
+        if not 0 <= param <= 100:
+            raise ValueError(f"hot ratio out of [0,100]: {name}")
+        cfg["policy"] = "expert_load"
+        cfg.pop("policy_params", None)
+        hot_r = param / 100.0
+        for g in cfg["groups"]:
+            if g["name"] == "cold":
+                g["size_ratio"] = 1.0 - hot_r
+            elif g["name"] == "hot":
+                g["size_ratio"] = hot_r
+        return cfg
+
+    if name.startswith("thr"):
+        param = int(name[len("thr"):])
+        cfg["policy"] = "expert_batch"
+        cfg["policy_params"] = {"threshold": param}
+        for g in cfg["groups"]:
+            g.pop("size_ratio", None)
+        return cfg
+
+    raise ValueError(
+        f"Unknown variant prefix: {name!r}. Expected hess<N>/hot<N>/thr<N>."
+    )
 
 
 def main() -> int:
@@ -76,63 +135,17 @@ def main() -> int:
             base = json.load(f)
 
         variants_dir = cfg_dir / f"mc{mc}" / "variants"
-        planned: list[str] = []
-
-        # --- Primary variants: hessian-weighted routing weights × hot% ---
-        # Six hot/cold splits, same ratios as the legacy hot0..hot100 set,
-        # with the new hessian-weighted scoring policy replacing expert_load.
         if not args.dry_run:
             variants_dir.mkdir(parents=True, exist_ok=True)
-        for hot_pct in HOT_PCTS:
-            cfg = copy.deepcopy(base)
-            cfg["policy"] = "hessian_weighted_routing_weights"
-            cfg.pop("policy_params", None)
-            hot_r = hot_pct / 100.0
-            cold_r = 1.0 - hot_r
-            for g in cfg["groups"]:
-                if g["name"] == "cold":
-                    g["size_ratio"] = cold_r
-                elif g["name"] == "hot":
-                    g["size_ratio"] = hot_r
-            out = variants_dir / f"hess{hot_pct}.json"
+
+        planned: list[str] = []
+        for variant in VARIANTS:
+            cfg = _build_variant(base, variant)
+            out = variants_dir / f"{variant}.json"
             planned.append(out.name)
             if not args.dry_run:
                 with open(out, "w") as f:
                     json.dump(cfg, f, indent=2)
-
-        # --- Legacy variants (disabled). Flip `if False` to `if True` to
-        # regenerate the hot0..hot100 + thr32..thr512 matrix alongside
-        # hess.json. Kept close to the primary path so re-enabling is a
-        # single edit rather than a git archaeology expedition.
-        if False:
-            for hot_pct in HOT_PCTS:
-                cfg = copy.deepcopy(base)
-                cfg["policy"] = "expert_load"
-                cfg.pop("policy_params", None)
-                hot_r = hot_pct / 100.0
-                cold_r = 1.0 - hot_r
-                for g in cfg["groups"]:
-                    if g["name"] == "cold":
-                        g["size_ratio"] = cold_r
-                    elif g["name"] == "hot":
-                        g["size_ratio"] = hot_r
-                out = variants_dir / f"hot{hot_pct}.json"
-                planned.append(out.name)
-                if not args.dry_run:
-                    with open(out, "w") as f:
-                        json.dump(cfg, f, indent=2)
-
-            for thr in THRESHOLDS:
-                cfg = copy.deepcopy(base)
-                cfg["policy"] = "expert_batch"
-                cfg["policy_params"] = {"threshold": thr}
-                for g in cfg["groups"]:
-                    g.pop("size_ratio", None)
-                out = variants_dir / f"thr{thr}.json"
-                planned.append(out.name)
-                if not args.dry_run:
-                    with open(out, "w") as f:
-                        json.dump(cfg, f, indent=2)
 
         verb = "DRY-RUN would write" if args.dry_run else "wrote"
         print(
