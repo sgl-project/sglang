@@ -766,6 +766,8 @@ class Scheduler(
             self.tp_worker.model_runner.hybrid_gdn_config is not None
             or self.tp_worker.model_runner.mamba2_config is not None
             or _registry_needs_mamba
+            or self.tp_worker.model_runner.kimi_linear_config is not None
+            or self.tp_worker.model_runner.hybrid_lightning_config is not None
         )
 
         self.sliding_window_size = None
