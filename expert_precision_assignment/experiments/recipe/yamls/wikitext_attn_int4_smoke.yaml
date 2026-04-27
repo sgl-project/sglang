@@ -1,0 +1,46 @@
+# SMOKE TEST — wikitext perplexity with INT4 attention swap.
+# Same bench_eval pipeline as wikitext_smoke.yaml, but with
+# `quant.attention_num_bits: 4` so the runtime swaps every layer's
+# self_attn.qkv_proj+o_proj to INT4 GPTQ-Marlin at server load. Single
+# variant + tiny doc limit so the whole pipeline finishes in a few
+# minutes — enough to verify the YAML knob plumbs end-to-end and the
+# resulting PPL is in a sensible range.
+#
+# Usage:
+#   NUM_FEWSHOT=0 APPLY_CHAT_TEMPLATE=0 FEWSHOT_AS_MULTITURN=0 \
+#     CALIB_GPU=7 GPUS=7 \
+#     bash run_pipeline.sh recipe/yamls/wikitext_attn_int4_smoke.yaml
+task: wikitext
+variant: attn_int4_smoke
+
+dataset:
+  limit: 0
+
+sampling:
+  enable_thinking: false
+  max_tokens: 0           # PPL doesn't generate
+  temperature: 0
+  top_p: 1.0
+  top_k: 0
+  presence_penalty: 0
+  frequency_penalty: 0
+
+calibration:
+  num_prompts: 8
+  mc: 64
+  gpu: 7
+  port: 31309
+  nccl_port: 41309
+
+sweep:
+  mc_list: [64]
+  variants: [hess0]
+  gpus: [7]
+  num_prompts: 0
+  limit: 8
+
+scoring:
+  enabled: false           # bench_eval reports word_perplexity / byte_perplexity / bits_per_byte
+
+quant:
+  attention_num_bits: 4    # swap qkv_proj + o_proj to INT4 GPTQ-Marlin at load time

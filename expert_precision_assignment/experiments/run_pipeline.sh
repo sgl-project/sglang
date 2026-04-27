@@ -160,9 +160,14 @@ run_stage() {
             [ -f "$CALIB_JSON" ] || { echo "Run 'calib' first: missing $CALIB_JSON" >&2; exit 3; }
             # Forward recipe knobs so gen_heter_configs.py / gen_dyna_variants.py
             # honor the YAML's sweep.mc_list and sweep.variants.
+            # quant.attention_num_bits flows through as a CLI flag so the
+            # produced heter_config.json carries it (runtime then swaps
+            # qkv_proj+o_proj to INT4 at server load — see heter_moe.py).
             MC_LIST="${MC_LIST:-${RECIPE_SWEEP__MC_LIST:-}}" \
             VARIANTS="${VARIANTS:-${RECIPE_SWEEP__VARIANTS:-}}" \
-                "$PYTHON" "$PIPELINE_DIR/gen_config/gen_all.py" --task "$NAME" --calib_json "$CALIB_JSON"
+                "$PYTHON" "$PIPELINE_DIR/gen_config/gen_all.py" \
+                    --task "$NAME" --calib_json "$CALIB_JSON" \
+                    --attention_num_bits "${RECIPE_QUANT__ATTENTION_NUM_BITS:-16}"
             ;;
         sweep)
             if [ "$HAS_PREP" = "1" ] && [ ! -f "$PROMPTS_JSONL" ]; then

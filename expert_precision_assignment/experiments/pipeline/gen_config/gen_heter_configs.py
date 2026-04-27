@@ -145,6 +145,13 @@ def _parse_args() -> argparse.Namespace:
         "--expert_sens", type=Path, default=EXPERT_SENS,
         help="Per-expert L2 sensitivity summary (only used when --sensitivity).",
     )
+    ap.add_argument(
+        "--attention_num_bits", type=int, choices=(16, 4), default=16,
+        help="Embedded into the produced heter_config.json. 4 = the runtime "
+             "swaps every layer's self_attn.qkv_proj+o_proj to INT4 GPTQ-Marlin "
+             "at server load (reusing the INT4 group's checkpoint). 16 (default) "
+             "leaves attention BF16.",
+    )
     return ap.parse_args()
 
 
@@ -348,6 +355,7 @@ def main() -> int:
                 ranking_policy=args.ranking,
                 fo_threshold=fo_report,
                 expert_importance=expert_importance,
+                attention_num_bits=args.attention_num_bits,
             )
             logger.info(
                 "[mc=%d] K=%d heter / %d int4-only → %s",

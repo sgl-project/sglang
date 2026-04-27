@@ -9,6 +9,11 @@ Flags forwarded to both:
                         data/configs/
   --calib_json <path>   amortized KV sizing from calib_kv.py output
                         (only applies to gen_heter_configs)
+  --attention_num_bits {16,4}
+                        baked into heter_config.json so the runtime swaps
+                        attention qkv_proj+o_proj to INT4 GPTQ-Marlin
+                        (only applies to gen_heter_configs; variants
+                        deep-copy the base config so they inherit it).
 
 After this, run `bash pipeline/run_sweep.sh <task>`.
 """
@@ -34,6 +39,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--task")
     ap.add_argument("--calib_json")
+    ap.add_argument(
+        "--attention_num_bits",
+        type=int,
+        choices=(16, 4),
+        default=16,
+        help="Forwarded to gen_heter_configs.py; baked into heter_config.json.",
+    )
     args = ap.parse_args()
 
     heter_args: list[str] = []
@@ -43,6 +55,7 @@ def main() -> int:
         variants_args += ["--task", args.task]
     if args.calib_json:
         heter_args += ["--calib_json", args.calib_json]
+    heter_args += ["--attention_num_bits", str(args.attention_num_bits)]
 
     steps = [
         ("gen_heter_configs.py", heter_args),

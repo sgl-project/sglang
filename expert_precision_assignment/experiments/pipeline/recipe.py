@@ -93,6 +93,15 @@ _DEFAULTS: dict[str, Any] = {
         # (e.g. ["--per-doc"] to include per-row records, or LCB's --timeout).
         "extra_args": [],
     },
+    "quant": {
+        # Precision of self_attn.{qkv_proj, o_proj} in the served model.
+        # 16 = leave attention BF16 (default).  4 = swap to INT4 GPTQ-Marlin
+        # at server load time, using the same checkpoint as the INT4 expert
+        # group.  Honored end-to-end via gen_heter_configs.py →
+        # heter_config.json["attention_num_bits"] → runtime _parse_heter_config
+        # in python/sglang/srt/layers/moe/heter_moe.py.
+        "attention_num_bits": 16,
+    },
 }
 
 

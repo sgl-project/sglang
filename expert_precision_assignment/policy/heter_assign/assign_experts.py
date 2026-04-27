@@ -186,6 +186,7 @@ def _write_outputs(
     ranking_policy: str = "sensitivity",
     fo_threshold: dict | None = None,
     expert_importance: Dict[int, List[float]] | None = None,
+    attention_num_bits: int = 16,
 ) -> Tuple[Path, Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -222,6 +223,9 @@ def _write_outputs(
         "policy": "expert_batch",
         "policy_params": {"threshold": 128},
         "int4_only_experts_file": str(int4_path.resolve()),
+        # 4 = runtime swaps self_attn.{qkv_proj,o_proj} to INT4 GPTQ-Marlin
+        # using the cold group's checkpoint above. 16 = leave attention BF16.
+        "attention_num_bits": attention_num_bits,
     }
     if importance_path is not None:
         heter_config["expert_importance_file"] = str(importance_path.resolve())
