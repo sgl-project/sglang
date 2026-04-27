@@ -456,12 +456,21 @@ class PiecewiseCudaGraphRunner:
         Called after `attn_backend.init_forward_metadata(forward_batch)` so the
         live metadata is built. The first NSA layer's metadata is used; the
         underlying tensors are shared across layers so any layer_id is fine.
+        Also asserts the SM-count invariant required by the PCG-inlined indexer
+        path (host-side check; cannot live inside the compiled region).
         """
         if self.buffers.nsa_metadata_buffers is None or not self.nsa_indexers:
             return
         from sglang.srt.layers.attention.nsa.metadata_staging import (
             stage_prefill_nsa_metadata_buffers,
         )
+        from sglang.srt.layers.attention.nsa.nsa_indexer import (
+            _assert_pcg_indexer_sm_count_invariants,
+        )
+
+        # SM count must not have drifted; PP-recv must be off. Validated once
+        # per step on the first indexer (deep_gemm SM count is global).
+        _assert_pcg_indexer_sm_count_invariants(self.nsa_indexers[0])
 
         first_layer_id = self.nsa_indexers[0].layer_id
         metadata = forward_batch.attn_backend.get_indexer_metadata(

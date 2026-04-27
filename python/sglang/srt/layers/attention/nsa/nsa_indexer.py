@@ -78,45 +78,56 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
 if _is_cuda:
-    from sglang.srt.compilation.compilation_config import register_split_op
     from sglang.srt.utils.custom_op import register_custom_op
 
-    @register_custom_op(mutates_args=["topk_result"])
-    @register_split_op()
-    def topk_ragged_pcg(
-        layer_id: int,
-        q_fp8: torch.Tensor,
-        weights: torch.Tensor,
-        topk_result: torch.Tensor,
-    ) -> None:
-        """Opaque-op wrapper for `_get_topk_ragged` under piecewise CUDA graph.
+    # Upper bound on (q_offset * k_offset * 4 bytes) the no-chunk fp8_mqa_logits
+    # path may allocate for its float32 logits tensor under PCG. Picked to leave
+    # ample headroom on H100 80GB / B200 192GB and to cover all current PCG
+    # buckets (8192*8192*4 = 256 MiB << 4 GiB). Tighten if smaller cards are
+    # ever targeted with PCG.
+    _PCG_LOGITS_BUDGET_BYTES = 4 * 1024 * 1024 * 1024  # 4 GiB
 
-        The K-cache store is CUDA-graphable (see fused_store_index_k_cache with
-        extend_num_tokens) and runs inside the compiled region, so it is no
-        longer wrapped here. This op shields only the ragged-topk kernel, whose
-        per-batch metadata + .item() chunking is not torch.compile-traceable.
+    def _assert_pcg_no_chunk_safe(q_offset: int, k_offset: int) -> None:
+        """Validates the no-chunk fp8_mqa_logits path is safe at the given sizes.
+
+        Under PCG the chunking decision is constant-folded to never-chunk, since:
+        - bucket is a Dynamo compile-time constant per capture,
+        - torch.cuda.mem_get_info is host-side and ungraphable,
+        - the chunk path's `while start < q_offset` loop has data-dependent
+          iteration count.
+
+        This assertion fires at trace/replay time and catches any bucket choice
+        whose logits tensor would exceed _PCG_LOGITS_BUDGET_BYTES.
         """
-        assert (
-            _is_cuda
-        ), "Internal error: piecewise CUDA graph is only supported on CUDA"
-
-        forward_batch = get_forward_context().forward_batch
-        indexer = get_forward_context().nsa_indexers[layer_id]
-        metadata = forward_batch.attn_backend.get_indexer_metadata(
-            layer_id, forward_batch
+        logits_bytes = q_offset * k_offset * 4
+        assert logits_bytes <= _PCG_LOGITS_BUDGET_BYTES, (
+            f"PCG no-chunk fp8_mqa_logits would allocate {logits_bytes} bytes "
+            f"for q_offset={q_offset}, k_offset={k_offset}, exceeding the PCG "
+            f"budget of {_PCG_LOGITS_BUDGET_BYTES} bytes. Either lower the bucket "
+            f"size or raise _PCG_LOGITS_BUDGET_BYTES."
         )
 
-        # slice off padding from piecewise CUDA graph
-        extend_num_tokens = forward_batch.extend_num_tokens
+    def _assert_pcg_indexer_sm_count_invariants(indexer: "Indexer") -> None:
+        """PCG-mode invariants for the NSA indexer's deep_gemm SM count:
 
-        indexer._get_topk_ragged(
-            False,
-            forward_batch,
-            layer_id,
-            q_fp8[:extend_num_tokens],
-            weights,
-            metadata,
-            topk_result,
+        (1) PP-recv must be off. With PP-recv on, _with_real_sm_count would
+            mutate deep_gemm SM count per call (host-side, ungraphable), and
+            captured/replayed kernels would see different SM counts than at
+            capture, breaking determinism.
+        (2) deep_gemm.get_num_sms() must match the value cached at indexer
+            __init__ time. Drift would mean some other code path persistently
+            called set_num_sms outside the transient _with_real_sm_count CM.
+        """
+        assert not indexer.logits_with_pp_recv, (
+            "PCG cannot run with PP-recv SM-steal: _with_real_sm_count would "
+            "mutate deep_gemm.set_num_sms() per call, which is host-side and "
+            "non-capturable."
+        )
+        current = deep_gemm.get_num_sms()
+        assert current == indexer.sm_count, (
+            f"deep_gemm SM count drifted since indexer init: "
+            f"cached={indexer.sm_count}, observed={current}. Some other code "
+            f"persistently mutated set_num_sms outside _with_real_sm_count."
         )
 
     def _logits_head_gate_pcg_fake_impl(
@@ -149,6 +160,151 @@ if _is_cuda:
         weights = out * n_heads_inv_sqrt
         weights = weights.unsqueeze(-1) * q_scale * softmax_scale
         return weights
+
+    # deep_gemm.fp8_mqa_logits allocates the output with stride (k_offset + _DG_LOGITS_ROW_PAD, 1)
+    # for alignment. The fake_impl must match exactly or Inductor's assert_size_stride trips.
+    _DG_LOGITS_ROW_PAD = 256
+
+    def _fp8_mqa_logits_pcg_fake_impl(
+        q_fp8: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+    ) -> torch.Tensor:
+        q_offset = q_fp8.shape[0]
+        k_offset = k_fp8.shape[0]
+        return torch.empty_strided(
+            (q_offset, k_offset),
+            (k_offset + _DG_LOGITS_ROW_PAD, 1),
+            dtype=torch.float32,
+            device=q_fp8.device,
+        )
+
+    @register_custom_op(fake_impl=_fp8_mqa_logits_pcg_fake_impl)
+    def fp8_mqa_logits_pcg(
+        q_fp8: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        weights: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+    ) -> torch.Tensor:
+        out = deep_gemm.fp8_mqa_logits(
+            q_fp8, (k_fp8, k_scale), weights, ks, ke, clean_logits=False
+        )
+        # Validate the row-pad assumption baked into the fake_impl.
+        assert out.stride() == (k_fp8.shape[0] + _DG_LOGITS_ROW_PAD, 1), (
+            f"deep_gemm.fp8_mqa_logits output stride changed: got {out.stride()}, "
+            f"expected ({k_fp8.shape[0] + _DG_LOGITS_ROW_PAD}, 1). Update _DG_LOGITS_ROW_PAD."
+        )
+        return out
+
+    def _topk_transform_pcg_paged_fake_impl(
+        score: torch.Tensor,
+        seqlens_expanded: torch.Tensor,
+        page_table_1: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        ks: torch.Tensor,
+        topk: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (score.shape[0], topk), dtype=torch.int32, device=score.device
+        )
+
+    @register_custom_op(fake_impl=_topk_transform_pcg_paged_fake_impl)
+    def topk_transform_pcg_paged(
+        score: torch.Tensor,
+        seqlens_expanded: torch.Tensor,
+        page_table_1: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        ks: torch.Tensor,
+        topk: int,
+    ) -> torch.Tensor:
+        from sgl_kernel import fast_topk_transform_fused
+
+        return fast_topk_transform_fused(
+            score=score,
+            lengths=seqlens_expanded,
+            page_table_size_1=page_table_1,
+            cu_seqlens_q=cu_seqlens_q,
+            topk=topk,
+            row_starts=ks,
+        )
+
+    def _topk_transform_pcg_ragged_fake_impl(
+        score: torch.Tensor,
+        seqlens_expanded: torch.Tensor,
+        topk_indices_offset: torch.Tensor,
+        ks: torch.Tensor,
+        topk: int,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (score.shape[0], topk), dtype=torch.int32, device=score.device
+        )
+
+    @register_custom_op(fake_impl=_topk_transform_pcg_ragged_fake_impl)
+    def topk_transform_pcg_ragged(
+        score: torch.Tensor,
+        seqlens_expanded: torch.Tensor,
+        topk_indices_offset: torch.Tensor,
+        ks: torch.Tensor,
+        topk: int,
+    ) -> torch.Tensor:
+        from sgl_kernel import fast_topk_transform_ragged_fused
+
+        return fast_topk_transform_ragged_fused(
+            score=score,
+            lengths=seqlens_expanded,
+            topk_indices_offset=topk_indices_offset,
+            topk=topk,
+            row_starts=ks,
+        )
+
+    def topk_transform_pcg(
+        method: int,
+        score: torch.Tensor,
+        seqlens_expanded: torch.Tensor,
+        page_table_1: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        topk_indices_offset: torch.Tensor,
+        ks: torch.Tensor,
+        topk: int,
+    ) -> torch.Tensor:
+        """Pure-tensor topk transform for the PCG-inlined `_get_topk_ragged` path.
+
+        `method` is a `TopkTransformMethod` int (PAGED=1, RAGGED=2). All other
+        arguments are tensors (no metadata reads), sourced from the staged
+        `PrefillNsaMetadataBuffers` slots. Each branch dispatches to a
+        registered custom op (`topk_transform_pcg_paged` /
+        `topk_transform_pcg_ragged`); Dynamo specializes on `method` at trace
+        time, so only one branch enters the captured graph.
+        """
+        from sglang.srt.layers.attention.nsa_backend import TopkTransformMethod
+
+        if method == TopkTransformMethod.PAGED:
+            return topk_transform_pcg_paged(
+                score=score,
+                seqlens_expanded=seqlens_expanded,
+                page_table_1=page_table_1,
+                cu_seqlens_q=cu_seqlens_q,
+                ks=ks,
+                topk=topk,
+            )
+        elif method == TopkTransformMethod.RAGGED:
+            return topk_transform_pcg_ragged(
+                score=score,
+                seqlens_expanded=seqlens_expanded,
+                topk_indices_offset=topk_indices_offset,
+                ks=ks,
+                topk=topk,
+            )
+        else:
+            raise AssertionError(
+                f"topk_transform_pcg: unsupported method={method!r}; expected "
+                f"TopkTransformMethod.PAGED or RAGGED."
+            )
 
     def topk_construct_k_only_pcg(
         method: int,
@@ -737,7 +893,14 @@ class Indexer(MultiPlatformOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
-        need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
+        if is_in_piecewise_cuda_graph():
+            # PCG constant-folds to never-chunk. Validate the bucket fits.
+            _assert_pcg_no_chunk_safe(q_offset, k_offset)
+            need_chunk, free_mem = False, 0
+        else:
+            need_chunk, free_mem = self._should_chunk_mqa_logits(
+                q_offset, k_offset, device
+            )
 
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
@@ -839,6 +1002,106 @@ class Indexer(MultiPlatformOp):
             start = end
 
         return topk_result
+
+    def _get_topk_ragged_pcg(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        """Inlined PCG path for ragged topk.
+
+        All metadata is read from the staged `PrefillNsaMetadataBuffers` slots
+        on `ForwardContext`; no `metadata.X()` method calls or `.item()` syncs.
+        Fresh-prefill at any `bs ∈ [1, max_bs]` is supported: every staged
+        buffer is sized to its PCG upper bound and zero-padded beyond the
+        real region by `_stage_1d` / `_stage_2d`, so the K-fetch Triton
+        kernel masks padded batches off via `seq_len == 0`, and the topk
+        kernel short-circuits padded query rows (`seqlens_expanded[i] == 0`)
+        to all -1 before touching `page_table_1` / `topk_indices_offset`.
+        `seq_len_sum` and `max_seq_len` are kept at the bucket as a safe
+        compile-time-constant upper bound on `sum(L_r)` and `max(L_r)`.
+        Prefix-cache (kv_len > qo_len) remains out of scope — it'd break
+        the bucket upper bound. The SM-count + PP-recv invariants are
+        asserted host-side in
+        `PiecewiseCudaGraphRunner._stage_nsa_metadata_if_present` once per
+        step, so no host-side check is needed inside the compiled region.
+        """
+        bucket = q_fp8.shape[0]
+
+        ctx = get_forward_context()
+        bufs = ctx.nsa_metadata_buffers
+        assert bufs is not None, (
+            "PCG inlined ragged topk requires staged NSA metadata buffers"
+        )
+        method = bufs.topk_transform_method
+        assert method is not None, (
+            "PCG inlined ragged topk requires topk_transform_method to have "
+            "been pinned by stage_prefill_nsa_metadata_buffers"
+        )
+
+        # bucket is a compile-time-constant upper bound on both seq_len_sum
+        # (= sum of per-request lengths = num_tokens) and max_seq_len
+        # (= max per-request length) under fresh prefill. The K-fetch
+        # kernel writes `[0:num_tokens)` rows of K and leaves the rest
+        # uninitialized; queries beyond num_tokens have ks=ke=0 (zeroed
+        # by staging) so fp8_mqa_logits never reads those rows.
+        seq_len_sum = bucket
+        max_seq_len = bucket
+
+        # Validate the no-chunk budget for this bucket (compile-time const).
+        _assert_pcg_no_chunk_safe(bucket, bucket)
+
+        # Read staged metadata. Stable addresses (mark_static_address); Dynamo
+        # treats these as graph inputs. Pass full `(max_bs, ...)` /
+        # `(max_bs+1,)` shapes — slicing to `[:bs]` would drop request 1+'s
+        # routing. Padded batches are zero-length and masked off by both
+        # the K-fetch and topk kernels.
+        page_table_64 = bufs.page_table_64
+        page_table_1 = bufs.page_table_1
+        ks = bufs.ks[:bucket]
+        ke = bufs.ke[:bucket]
+        seqlens_expanded = bufs.seqlens_expanded[:bucket]
+        cu_seqlens_q = bufs.cu_seqlens_q
+        topk_indices_offset = bufs.topk_indices_offset[:bucket]
+        indexer_seq_len = bufs.indexer_seq_len
+
+        # weights from forward_cuda is (token_nums, n_heads, 1); squeeze head dim.
+        weights_sq = weights.squeeze(-1)
+
+        # Fetch K cache from the NSA pool. With bucket-as-int sizing this is
+        # a Triton kernel call with compile-time-constant launch params; under
+        # PCG the layer_transfer_counter wait is gated off.
+        k_fp8_raw, k_scale_raw = (
+            forward_batch.token_to_kv_pool.get_index_k_scale_buffer(
+                layer_id,
+                indexer_seq_len,
+                page_table_64,
+                seq_len_sum,
+                max_seq_len,
+            )
+        )
+        k_fp8 = k_fp8_raw.view(torch.float8_e4m3fn)
+        k_scale = k_scale_raw.view(torch.float32).squeeze(-1)
+
+        # MQA logits via the registered custom op (no _with_real_sm_count CM
+        # under PCG; the PP-recv invariant pinned at staging time guarantees
+        # the kernel's SM count is stable).
+        logits = fp8_mqa_logits_pcg(q_fp8, k_fp8, k_scale, weights_sq, ks, ke)
+
+        # Topk transform via the pure-tensor dispatcher (PAGED or RAGGED is
+        # specialized at trace time).
+        return topk_transform_pcg(
+            method=method,
+            score=logits,
+            seqlens_expanded=seqlens_expanded,
+            page_table_1=page_table_1,
+            cu_seqlens_q=cu_seqlens_q,
+            topk_indices_offset=topk_indices_offset,
+            ks=ks,
+            topk=self.index_topk,
+        )
 
     def _forward_cuda_k_only(
         self,
@@ -1469,17 +1732,8 @@ class Indexer(MultiPlatformOp):
                         not enable_dual_stream
                     ), "Internal error: piecewise CUDA graph should not be enabled with dual stream"
 
-                    topk_result = torch.full(
-                        (q_fp8.shape[0], self.index_topk),
-                        -1,
-                        device=q_fp8.device,
-                        dtype=torch.int32,
-                    )
-                    topk_ragged_pcg(
-                        layer_id=layer_id,
-                        q_fp8=q_fp8,
-                        weights=weights,
-                        topk_result=topk_result,
+                    topk_result = self._get_topk_ragged_pcg(
+                        forward_batch, layer_id, q_fp8, weights
                     )
                 else:
                     topk_result = self._get_topk_ragged(
