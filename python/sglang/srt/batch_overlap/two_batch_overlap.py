@@ -220,24 +220,26 @@ def split_spec_info(
         positions = spec_info.positions[start_token_index:end_token_index]
     else:
         positions = None
-    if spec_info.retrive_index is not None:
-        retrive_index = spec_info.retrive_index[start_seq_index:end_seq_index]
+    if spec_info.retrieve_index is not None:
+        retrieve_index = spec_info.retrieve_index[start_seq_index:end_seq_index]
     else:
-        retrive_index = None
-    if spec_info.retrive_next_token is not None:
-        retrive_next_token = spec_info.retrive_next_token[start_seq_index:end_seq_index]
-    else:
-        retrive_next_token = None
-    if spec_info.retrive_next_sibling is not None:
-        retrive_next_sibling = spec_info.retrive_next_sibling[
+        retrieve_index = None
+    if spec_info.retrieve_next_token is not None:
+        retrieve_next_token = spec_info.retrieve_next_token[
             start_seq_index:end_seq_index
         ]
     else:
-        retrive_next_sibling = None
-    if spec_info.retrive_cum_len is not None:
-        retrive_cum_len = spec_info.retrive_cum_len[start_seq_index:end_seq_index]
+        retrieve_next_token = None
+    if spec_info.retrieve_next_sibling is not None:
+        retrieve_next_sibling = spec_info.retrieve_next_sibling[
+            start_seq_index:end_seq_index
+        ]
     else:
-        retrive_cum_len = None
+        retrieve_next_sibling = None
+    if spec_info.retrieve_cum_len is not None:
+        retrieve_cum_len = spec_info.retrieve_cum_len[start_seq_index:end_seq_index]
+    else:
+        retrieve_cum_len = None
 
     if spec_info.seq_lens_cpu is not None:
         seq_lens_cpu = spec_info.seq_lens_cpu[start_seq_index:end_seq_index]
@@ -252,10 +254,10 @@ def split_spec_info(
         custom_mask=custom_mask,
         draft_token=draft_token,
         positions=positions,
-        retrive_index=retrive_index,
-        retrive_next_token=retrive_next_token,
-        retrive_next_sibling=retrive_next_sibling,
-        retrive_cum_len=retrive_cum_len,
+        retrieve_index=retrieve_index,
+        retrieve_next_token=retrieve_next_token,
+        retrieve_next_sibling=retrieve_next_sibling,
+        retrieve_cum_len=retrieve_cum_len,
         seq_lens_cpu=seq_lens_cpu,
         seq_lens_sum=seq_lens_sum,
     )

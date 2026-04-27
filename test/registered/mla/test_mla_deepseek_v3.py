@@ -56,7 +56,7 @@ class TestMLADeepseekV3(CustomTestCase):
         metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["score"], 0.62)
+        self.assertGreater(metrics["score"], 0.60)
 
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")

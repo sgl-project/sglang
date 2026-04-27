@@ -1,0 +1,774 @@
+---
+title: Qwen3-Next
+metatags:
+    description: "Deploy Qwen3-Next with SGLang - hybrid attention architecture supporting 262K context, 80B MoE with 3B active parameters, and multi-token prediction."
+---
+
+import { Qwen3NextDeployment } from '/src/snippets/autoregressive/qwen3-next-deployment.jsx';
+
+## 1. Model Introduction
+
+[Qwen3-Next](https://huggingface.co/collections/Qwen/qwen3-next) is an advanced large language model architecture developed by Alibaba's Qwen team, designed to enhance efficiency and performance in handling extensive contexts and large-scale parameters. It features advanced capabilities in reasoning, function calling, and multilingual understanding.
+
+Qwen3-Next introduces several groundbreaking innovations:
+
+- **Hybrid Attention Mechanism**: Replaces standard attention with a combination of **Gated DeltaNet** (linear attention) and **Full Attention**, enabling efficient processing of context lengths up to 262,144 tokens. This hybrid approach makes it ideal for analyzing lengthy documents such as entire books or contracts.
+
+- **Highly Sparse Mixture-of-Experts (MoE)**: Features an 80-billion parameter architecture where only 3 billion parameters are active during inference. This design reduces computational costs by up to 90% while maintaining high performance, drastically reducing FLOPs per token without compromising model capacity.
+
+- **Multi-Token Prediction (MTP)**: Enables generation of multiple tokens per inference step, significantly reducing latency and enhancing user experience in real-time applications. This innovation boosts both pretraining performance and inference speed.
+
+- **Multilingual Support**: Natively supports 119 languages, facilitating seamless cross-lingual tasks and making it versatile for global applications.
+
+- **Enterprise-Ready Deployment**: Released under the Apache 2.0 license, offering flexible deployment options including on-premises, virtual private cloud (VPC), and private cloud environments, ensuring security and compliance for enterprise use.
+
+- **Advanced Reasoning & Stability**: Demonstrates clear improvement in reasoning performance with support for tool use during inference. Includes stability optimizations such as **zero-centered** and **weight-decayed layernorm** for robust pre-training and post-training.
+
+For more details, please refer to the [official Qwen3-Next blog](https://qwen.ai/blog?id=4074cca80393150c248e508aa62983f9cb7d27cd&from=research.latest-advancements-list).
+
+## 2. SGLang Installation
+
+SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+The Qwen3-Next series comes in only one size but offers different thinking modes. Recommended starting configurations vary depending on hardware.
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, quantization method, and thinking capabilities.
+
+<Qwen3NextDeployment />
+
+### 3.2 Configuration Tips
+
+- `--max-mamba-cache-size`: Adjust `--max-mamba-cache-size` to increase mamba cache space and max running requests capability. It will decrease KV cache space as a trade-off. You can adjust it according to workload.
+
+- `--mamba-ssm-dtype`: `bfloat16` or `float32`, use `bfloat16` to save mamba cache size and `float32` to get more accurate results. The default setting is `float32`.
+
+- `--mamba-full-memory-ratio`: Adjust `--mamba-full-memory-ratio` to set the ratio of mamba state memory to full kv cache memory. The default setting is `0.9`.
+
+- **Mamba Radix Cache**: Qwen3-Next's hybrid Gated Delta Networks architecture supports two mamba scheduling strategies via `--mamba-scheduler-strategy`:
+  - **V1 (`no_buffer`)**: Default. No overlap scheduler, lower memory usage.
+  - **V2 (`extra_buffer`)**: Enables overlap scheduling and branching point caching with `--mamba-scheduler-strategy extra_buffer --page-size 64`. Requires FLA kernel backend. Trades higher mamba state memory for better throughput. Strictly superior in non-KV-cache-bound scenarios; in KV-cache-bound cases, weigh the overlap scheduling benefit against reduced max concurrency. `--page-size` must satisfy `FLA_CHUNK_SIZE % page_size == 0` or `page_size % FLA_CHUNK_SIZE == 0` (`FLA_CHUNK_SIZE` is currently 64).
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For basic API usage and request examples, please refer to:
+
+- [SGLang Basic Usage Guide](../../../docs/basic_usage/send_request)
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Reasoning Parser
+
+1. **Streaming with Thinking Process:**
+
+   Qwen3-Next-80B-A3B-Thinking only supports thinking mode. Enable the reasoning parser during deployment to separate the thinking and the content sections.
+
+```shell Command
+python -m sglang.launch_server \
+  --model Qwen/Qwen3-Next-80B-A3B-Thinking \
+  --reasoning-parser qwen3 \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+# Enable streaming to see the thinking process in real-time
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-Next-80B-A3B-Thinking",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    temperature=0.7,
+    max_tokens=2048,
+    stream=True
+)
+
+# Process the stream
+has_thinking = False
+has_answer = False
+thinking_started = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print answer content
+        if delta.content:
+            # Close thinking section and add content header
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+Okay, let's see. I need to find 15% of 240. Hmm, percentages. Right, "percent" means per hundred, so 15% is 15 per 100, or 15/100. To find a percentage of a number, I think you multiply the number by the percentage as a decimal. So first, maybe convert 15% to a decimal. To convert a percentage to a decimal, you divide by 100. So 15 divided by 100 is 0.15. Then, multiply that by 240. Let me check that. So 0.15 times 240. Let's calculate that. Maybe break it down. 10% of 240 is 24, because 10% is just moving the decimal one place left, so 240 becomes 24. Then 5% would be half of 10%, so half of 24 is 12. So 10% + 5% = 15%, so 24 + 12 = 36. Oh, that's another way to do it. Let me verify with the multiplication. 0.15 * 240. Let's do 240 * 0.1 = 24, 240 * 0.05 = 12, so 24 + 12 = 36. Yep, that works. Alternatively, 240 * 15 = 3600, then divide by 100, which is 36. Because 15% of 240 is (15/100)*240 = (15*240)/100. 15*240: 10*240=2400, 5*240=1200, so 2400+1200=3600. Then 3600/100=36. So that's 36. So the answer should be 36. Let me make sure. 15% of 240. If I take 240 and multiply by 0.15, 240*0.15. Let's compute 240*0.1=24, 240*0.05=12, so 24+12=36. Yep, that's right. So 15% of 240 is 36.
+
+=============== Content =================
+
+To find **15% of 240**, follow these steps:
+
+---
+
+### **Step 1: Understand what "percent" means**
+- "Percent" means **per hundred**, so **15% = 15/100 = 0.15** in decimal form.
+
+---
+
+### **Step 2: Multiply the number by the decimal**
+- To find 15% of 240, multiply:
+  $$
+  240 \times 0.15
+  $$
+
+---
+
+### **Step 3: Break it down for clarity (optional but helpful)**
+- **10% of 240** = $ 240 \times 0.1 = 24 $
+- **5% of 240** = $ 240 \times 0.05 = 12 $
+- Add them together:
+  $$
+  24 + 12 = 36
+  $$
+
+---
+
+### **Step 4: Confirm with direct multiplication**
+- $ 240 \times 0.15 = 36 $
+
+---
+
+### ✅ Final Answer:
+$$
+\boxed{36}
+$$
+```
+
+**Note:** The reasoning parser captures the model's step-by-step thinking process, allowing you to see how the model arrives at its conclusions.
+
+2. **Turn off Thinking:**
+
+   Qwen3-Next-80B-A3B-Instruct only supports instruct (non-thinking) mode.
+
+```shell Command
+python -m sglang.launch_server \
+  --model Qwen/Qwen3-Next-80B-A3B-Instruct \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+# Turn off thinking process
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-Next-80B-A3B-Instruct",
+    messages=[
+        {"role": "user", "content": "Solve this problem step by step: What is 15% of 240?"}
+    ],
+    temperature=0.7,
+    max_tokens=2048,
+    stream=True,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+)
+
+# Process the stream
+has_thinking = False
+has_answer = False
+thinking_started = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print answer content
+        if delta.content:
+            # Close thinking section and add content header
+            if has_thinking and not has_answer:
+                print("\n=============== Content =================", flush=True)
+                has_answer = True
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+To find **15% of 240**, follow these steps:
+
+---
+
+### **Step 1: Understand what percentage means**
+"Percent" means "per hundred," so **15%** is the same as **15 per 100**, or the fraction:
+
+$$
+\frac{15}{100}
+$$
+
+---
+
+### **Step 2: Multiply the fraction by the number**
+To find 15% of 240, multiply:
+
+$$
+\frac{15}{100} \times 240
+$$
+
+---
+
+### **Step 3: Simplify the multiplication**
+You can simplify this in a couple of ways.
+
+#### **Option A: Multiply first, then divide**
+$$
+15 \times 240 = 3600
+$$
+Then divide by 100:
+$$
+\frac{3600}{100} = 36
+$$
+
+#### **Option B: Simplify the fraction first**
+$$
+\frac{15}{100} = \frac{3}{20} \quad \text{(divided numerator and denominator by 5)}
+$$
+Now multiply:
+$$
+\frac{3}{20} \times 240 = \frac{3 \times 240}{20} = \frac{720}{20} = 36
+$$
+
+---
+
+### **Step 4: Final Answer**
+$$
+\boxed{36}
+$$
+
+So, **15% of 240 is 36**.
+```
+
+#### 4.2.2 Tool Calling
+
+Qwen/Qwen3-Next-80B-A3B-Instruct | Qwen/Qwen3-Next-80B-A3B-Thinking both support tool calling capabilities. Enable the tool call parser:
+
+**Python Example (without Thinking Process):**
+
+Start sglang server:
+
+```shell Command
+python -m sglang.launch_server \
+  --model Qwen/Qwen3-Next-80B-A3B-Instruct \
+  --tool-call-parser qwen \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+# Make request with streaming to see thinking process
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-Next-80B-A3B-Instruct",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools,
+    temperature=0.7,
+    stream=True
+)
+
+# Process streaming response
+thinking_started = False
+has_thinking = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print tool calls
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            # Close thinking section if needed
+            if has_thinking and thinking_started:
+                print("\n=============== Content =================", flush=True)
+                thinking_started = False
+
+            for tool_call in delta.tool_calls:
+                if tool_call.function:
+                    print(f"🔧 Tool Call: {tool_call.function.name}")
+                    print(f"   Arguments: {tool_call.function.arguments}")
+
+        # Print content
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+<tool_call>
+{"name": "get_weather", "arguments": {"location": "Beijing"}}
+</tool_call>
+```
+
+**Python Example (with Thinking Process):**
+
+Start sglang server:
+
+```shell Command
+python -m sglang.launch_server \
+  --model Qwen/Qwen3-Next-80B-A3B-Thinking \
+  --reasoning-parser qwen3 \
+  --tool-call-parser qwen \
+  --tp 8 \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:8000/v1",
+    api_key="EMPTY"
+)
+
+# Define available tools
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "The city name"
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                        "description": "Temperature unit"
+                    }
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+# Make request with streaming to see thinking process
+response = client.chat.completions.create(
+    model="Qwen/Qwen3-Next-80B-A3B-Thinking",
+    messages=[
+        {"role": "user", "content": "What's the weather in Beijing?"}
+    ],
+    tools=tools,
+    temperature=0.7,
+    stream=True
+)
+
+# Process streaming response
+thinking_started = False
+has_thinking = False
+
+for chunk in response:
+    if chunk.choices and len(chunk.choices) > 0:
+        delta = chunk.choices[0].delta
+
+        # Print thinking process
+        if hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+            if not thinking_started:
+                print("=============== Thinking =================", flush=True)
+                thinking_started = True
+            has_thinking = True
+            print(delta.reasoning_content, end="", flush=True)
+
+        # Print tool calls
+        if hasattr(delta, 'tool_calls') and delta.tool_calls:
+            # Close thinking section if needed
+            if has_thinking and thinking_started:
+                print("\n=============== Content =================", flush=True)
+                thinking_started = False
+
+            for tool_call in delta.tool_calls:
+                if tool_call.function:
+                    print(f"🔧 Tool Call: {tool_call.function.name}")
+                    print(f"   Arguments: {tool_call.function.arguments}")
+
+        # Print content
+        if delta.content:
+            print(delta.content, end="", flush=True)
+
+print()
+```
+
+**Output Example:**
+
+```text Output
+=============== Thinking =================
+Okay, the user is asking for the weather in Beijing. Let me check the available tools. There's a get_weather function that requires location and optionally unit. The location is needed, so I need to provide Beijing as the location. The unit is optional, but the user didn't specify Celsius or Fahrenheit. Since the default might be Celsius, but maybe I should check if the parameters require unit. Wait, the required field is only location, so unit is optional. So I can just call get_weather with location "Beijing" and not include the unit. Let me confirm the parameters. The parameters for get_weather have location as required, and unit is an enum with celsius or fahrenheit, but not required. So the correct call is to send location as Beijing, and omit unit. So the tool call should be {"name": "get_weather", "arguments": {"location": "Beijing"}}.
+
+<tool_call>
+{"name": "get_weather", "arguments": {"location": "Beijing"}}
+</tool_call>
+```
+
+**Note:**
+
+- The reasoning parser shows how the model decides to use a tool
+- Tool calls are clearly marked with the function name and arguments
+- You can then execute the function and send the result back to continue the conversation
+
+**Handling Tool Call Results:**
+
+```python Example
+# After getting the tool call, execute the function
+def get_weather(location, unit="celsius"):
+    # Your actual weather API call here
+    return f"The weather in {location} is 22°{unit[0].upper()} and sunny."
+
+# Send tool result back to the model
+messages = [
+    {"role": "user", "content": "What's the weather in Beijing?"},
+    {
+        "role": "assistant",
+        "content": None,
+        "tool_calls": [{
+            "id": "call_123",
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "arguments": '{"location": "Beijing", "unit": "celsius"}'
+            }
+        }]
+    },
+    {
+        "role": "tool",
+        "tool_call_id": "call_123",
+        "content": get_weather("Beijing", "celsius")
+    }
+]
+
+final_response = client.chat.completions.create(
+    model="Qwen/Qwen3-Next-80B-A3B-Thinking",
+    messages=messages,
+    temperature=0.7
+)
+
+print(final_response.choices[0].message.content)
+# Output: "The weather in Beijing is currently 22°C and sunny."
+```
+
+#### 4.2.3 Processing Ultra-Long Texts
+
+Qwen3-Next natively supports context lengths of up to 262,144 tokens. For conversations where the total length (including both input and output) significantly exceeds this limit, we recommend using RoPE scaling techniques to handle long texts effectively. We have validated the model's performance on context lengths of up to 1 million tokens using the YaRN method.
+
+**Qwen3-Next-80B-A3B-Instruct**
+
+```shell Command
+SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 python -m sglang.launch_server --model Qwen/Qwen3-Next-80B-A3B-Instruct    --tp 8   --host 0.0.0.0   --port 8000 --json-model-override-args '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}}' --context-length 1010000
+
+```
+
+**Qwen3-Next-80B-A3B-Thinking**
+
+```shell Command
+SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1 python -m sglang.launch_server --model Qwen/Qwen3-Next-80B-A3B-Thinking   --reasoning-parser qwen3     --tp 8   --host 0.0.0.0   --port 8000 --json-model-override-args '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":262144}}' --context-length 1010000
+
+```
+
+## 5. Benchmark
+
+### 5.1 Speed Benchmark
+
+**Test Environment:**
+
+- Hardware: NVIDIA B200 GPU (8x)
+- Tensor Parallelism: 8
+- Model: Qwen/Qwen3-Next-80B-A3B-Instruct
+- sglang version: 0.5.6
+
+We use SGLang's built-in benchmarking tool to conduct performance evaluation on the [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) dataset. This dataset contains real conversation data and can better reflect performance in actual use scenarios.
+
+#### 5.1.1 Latency-Sensitive Benchmark
+
+- Server Command:
+
+```shell Command
+python -m sglang.launch_server \
+  --model Qwen/Qwen3-Next-80B-A3B-Instruct \
+  --tp 8
+```
+
+- Test Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --num-prompt 100 \
+  --max-concurrency 1
+```
+
+- Test Results:
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     100
+Benchmark duration (s):                  146.52
+Total input tokens:                      33839
+Total input text tokens:                 33839
+Total input vision tokens:               0
+Total generated tokens:                  21640
+Total generated tokens (retokenized):    21619
+Request throughput (req/s):              0.68
+Input token throughput (tok/s):          230.95
+Output token throughput (tok/s):         147.70
+Peak output token throughput (tok/s):    164.00
+Peak concurrent requests:                6
+Total token throughput (tok/s):          378.65
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   1464.81
+Median E2E Latency (ms):                 1077.48
+---------------Time to First Token----------------
+Mean TTFT (ms):                          127.88
+Median TTFT (ms):                        132.88
+P99 TTFT (ms):                           212.85
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          6.19
+Median TPOT (ms):                        6.17
+P99 TPOT (ms):                           6.64
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           6.21
+Median ITL (ms):                         6.16
+P95 ITL (ms):                            6.51
+P99 ITL (ms):                            6.71
+Max ITL (ms):                            10.07
+==================================================
+```
+
+#### 5.1.2 Throughput-Sensitive Benchmark
+
+- Server Command:
+
+```shell Command
+python -m sglang.launch_server \
+  --model Qwen/Qwen3-Next-80B-A3B-Instruct \
+  --tp 8 \
+```
+
+- Test Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --num-prompt 1000 \
+  --max-concurrency 100
+```
+
+**Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  100.32
+Total input tokens:                      302118
+Total input text tokens:                 302118
+Total input vision tokens:               0
+Total generated tokens:                  195775
+Total generated tokens (retokenized):    195016
+Request throughput (req/s):              9.97
+Input token throughput (tok/s):          3011.69
+Output token throughput (tok/s):         1951.60
+Peak output token throughput (tok/s):    5909.00
+Peak concurrent requests:                120
+Total token throughput (tok/s):          4963.29
+Concurrency:                             93.05
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   9333.98
+Median E2E Latency (ms):                 6054.12
+---------------Time to First Token----------------
+Mean TTFT (ms):                          161.77
+Median TTFT (ms):                        137.94
+P99 TTFT (ms):                           503.29
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          50.87
+Median TPOT (ms):                        50.28
+P99 TPOT (ms):                           122.87
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           47.11
+Median ITL (ms):                         13.84
+P95 ITL (ms):                            195.33
+P99 ITL (ms):                            289.56
+Max ITL (ms):                            486.38
+==================================================
+```
+
+### 5.2 Accuracy Benchmark
+
+### 5.2.1 GSM8K Benchmark
+
+- **Benchmark Command:**
+
+```shell Command
+python3 -m sglang.test.few_shot_gsm8k --num-questions 200 --port 8000
+```
+
+- **Results**:
+
+  - Qwen3-Next-80B-A3B-Instruct
+
+    ```
+    Accuracy: 0.960
+    Invalid: 0.000
+    Latency: 12.673 s
+    Output throughput: 2538.255 token/s
+    ```
+
+  - Qwen3-Next-80B-A3B-Thinking
+    ```
+    Accuracy: 0.935
+    Invalid: 0.000
+    Latency: 9.912 s
+    Output throughput: 3288.737 token/s
+    ```
+
+### 5.2.2 MMLU Benchmark
+
+- **Benchmark Command:**
+
+```shell Command
+cd sglang
+bash benchmark/mmlu/download_data.sh
+python3 benchmark/mmlu/bench_sglang.py --nsub 10
+```
+
+- **Results**:
+
+  - Qwen3-Next-80B-A3B-Instruct
+
+    ```
+    subject: abstract_algebra, #q:100, acc: 0.800
+    subject: anatomy, #q:135, acc: 0.807
+    subject: astronomy, #q:152, acc: 0.947
+    subject: business_ethics, #q:100, acc: 0.810
+    subject: clinical_knowledge, #q:265, acc: 0.894
+    subject: college_biology, #q:144, acc: 0.972
+    subject: college_chemistry, #q:100, acc: 0.680
+    subject: college_computer_science, #q:100, acc: 0.860
+    subject: college_mathematics, #q:100, acc: 0.780
+    subject: college_medicine, #q:173, acc: 0.861
+    Total latency: 10.098
+    Average accuracy: 0.856
+    ```
+
+  - Qwen3-Next-80B-A3B-Thinking
+    ```
+    subject: abstract_algebra, #q:100, acc: 0.780
+    subject: anatomy, #q:135, acc: 0.815
+    subject: astronomy, #q:152, acc: 0.941
+    subject: business_ethics, #q:100, acc: 0.870
+    subject: clinical_knowledge, #q:265, acc: 0.894
+    subject: college_biology, #q:144, acc: 0.965
+    subject: college_chemistry, #q:100, acc: 0.670
+    subject: college_computer_science, #q:100, acc: 0.840
+    subject: college_mathematics, #q:100, acc: 0.770
+    subject: college_medicine, #q:173, acc: 0.861
+    Total latency: 10.236
+    Average accuracy: 0.855
+    ```

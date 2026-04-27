@@ -1097,21 +1097,85 @@ def gguf_quant_weights_iterator(
 
     reader = gguf.GGUFReader(gguf_file)
 
+    # MoE expert weight name patterns
+    MOE_WEIGHT_PATTERNS = {
+        "ffn_gate_exps": "gate_proj",  # gate projection
+        "ffn_up_exps": "up_proj",  # up projection
+        "ffn_down_exps": "down_proj",  # down projection
+    }
+
+    # First pass: yield weight types
     for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
+        weight_type = tensor.tensor_type
+        tensor_name = tensor.name
+
+        # Check if this is a MoE expert weight (packed format)
+        is_moe_weight = any(
+            pattern in tensor_name for pattern in MOE_WEIGHT_PATTERNS.keys()
+        )
+
+        if is_moe_weight:
+            # MoE weights need special handling - extract layer_id and weight type
+            # Format: blk.{layer_id}.ffn_gate_exps.weight
+            import re
+
+            match = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight", tensor_name)
+            if match:
+                layer_id = int(match.group(1))
+                weight_pattern = match.group(2)
+                hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
+
+                if hf_weight_name and weight_type.name != "F32":
+                    # Yield weight type for each expert
+                    weight = tensor.data
+                    num_experts = weight.shape[0]
+                    for expert_id in range(num_experts):
+                        hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight_type"
+                        yield hf_name, torch.tensor(weight_type)
+        elif tensor_name in gguf_to_hf_name_map:
+            # Normal weight handling
+            name = gguf_to_hf_name_map[tensor_name]
 
             if weight_type.name != "F32":
                 weight_type_name = name.replace("weight", "qweight_type")
-                weight_type = torch.tensor(weight_type)
-                yield weight_type_name, weight_type
+                yield weight_type_name, torch.tensor(weight_type)
 
+    # Second pass: yield actual weights
     for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight = tensor.data
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
+        weight = tensor.data
+        weight_type = tensor.tensor_type
+        tensor_name = tensor.name
+
+        # Check if this is a MoE expert weight (packed format)
+        is_moe_weight = any(
+            pattern in tensor_name for pattern in MOE_WEIGHT_PATTERNS.keys()
+        )
+
+        if is_moe_weight:
+            # MoE weights: split packed format into individual expert weights
+            import re
+
+            match = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight", tensor_name)
+            if match:
+                layer_id = int(match.group(1))
+                weight_pattern = match.group(2)
+                hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
+
+                if hf_weight_name:
+                    # Packed format: [num_experts, ...]
+                    num_experts = weight.shape[0]
+                    for expert_id in range(num_experts):
+                        expert_weight = weight[expert_id]
+
+                        if weight_type.name != "F32":
+                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight"
+                        else:
+                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.weight"
+
+                        yield hf_name, torch.tensor(expert_weight)
+        elif tensor_name in gguf_to_hf_name_map:
+            # Normal weight handling
+            name = gguf_to_hf_name_map[tensor_name]
 
             if weight_type.name != "F32":
                 name = name.replace("weight", "qweight")
@@ -1184,7 +1248,11 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
         if (
             is_cpu()
-            and loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
+            and (
+                loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
+                or loaded_weight.size(0)
+                < get_tensor_model_parallel_world_size() * shard_size
+            )
             and loaded_weight.dim() == 1
         ):
             param_data = param.data  # view copy on param for uneven padding
@@ -1559,3 +1627,33 @@ def narrow_padded_param_and_loaded_weight(
     param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
 
     return param_data, loaded_weight
+
+
+def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
+    # This function is for padding zeros when loaded_weight is less than output_sizes.
+    # Most cases, sum(output_sizes) = loaded_weight.size(output_dim),
+    # while in some TP cases like TP6, output_sizes will be padded, thus loaded_weight needs padding.
+    total_output_size = sum(output_sizes)
+    raw_output_size = loaded_weight.size(output_dim)
+    if total_output_size > raw_output_size:
+        loaded_weight_pad = []
+        weight_split_size = [
+            int(output_size / total_output_size * raw_output_size)
+            for output_size in output_sizes
+        ]
+        assert (
+            sum(weight_split_size) == raw_output_size
+        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+
+        split_weight = loaded_weight.split_with_sizes(weight_split_size, dim=output_dim)
+        for i, output_size in enumerate(output_sizes):
+            pad_size = output_size - weight_split_size[i]
+            target_pad_shape = list(loaded_weight.size())
+            target_pad_shape[output_dim] = pad_size
+            pad_tensor = torch.zeros(target_pad_shape).to(loaded_weight.dtype)
+            loaded_weight_pad.append(
+                torch.cat([split_weight[i], pad_tensor], dim=output_dim)
+            )
+        return torch.cat(loaded_weight_pad, dim=output_dim)
+    else:
+        return loaded_weight
