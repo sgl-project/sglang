@@ -36,10 +36,12 @@ from typing import Any
 _DEFAULTS: dict[str, Any] = {
     "variant": "default",
     "runtime": {
-        # Interpreter + env that every stage uses.  Override per recipe to
-        # target a different venv / conda env.  Explicit $PYTHON in the shell
-        # still wins; after that comes `runtime.python`, then this default.
-        "python": "/data/junzhou/.venv-bfcl/bin/python",
+        # Interpreter env stages use.  Precedence: explicit $PYTHON in the
+        # shell > recipe `runtime.python` > whatever `python3` resolves to on
+        # PATH (i.e., the active conda env). Leave unset by default so the
+        # caller's environment wins — pinning a specific venv path here
+        # breaks portability across machines.
+        "python": "",
         # BF16 baseline checkpoint used by run_calib.sh and run_sweep.sh.
         # Pinning a specific snapshot hash avoids silent model drift when the
         # HF cache re-downloads.

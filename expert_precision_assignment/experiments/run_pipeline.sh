@@ -46,8 +46,8 @@ RECIPE="$1"; shift
 
 # Bootstrap python — just enough to parse the recipe.  The real runtime
 # python is re-resolved below, using the recipe's `runtime.python` field.
-BOOTSTRAP_PYTHON="${PYTHON:-/data/junzhou/.venv-bfcl/bin/python}"
-[ -x "$BOOTSTRAP_PYTHON" ] || BOOTSTRAP_PYTHON="python3"
+# Resolve to an absolute path so the executability check below is meaningful.
+BOOTSTRAP_PYTHON="${PYTHON:-$(command -v python3 || command -v python)}"
 
 ALL_STAGES=(prep calib gen sweep score collect)
 STAGES_REQ=""

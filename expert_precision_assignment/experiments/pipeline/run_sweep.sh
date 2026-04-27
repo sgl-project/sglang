@@ -213,14 +213,16 @@ for gpu in "${GPUS[@]}"; do
     GPU_NCCL_PORT[$gpu]=$((41300 + gpu))
 done
 
-# Resolve Python: explicit $PYTHON > recipe's runtime.python > hardcoded default.
-# Hard-fail if the chosen interpreter can't import sglang — the previous silent
-# fallback to system python3 created a trap where the server died with
-# ModuleNotFoundError only after 60+ seconds of startup.
-PYTHON="${PYTHON:-${RECIPE_RUNTIME__PYTHON:-/data/junzhou/.venv-bfcl/bin/python}}"
+# Resolve Python: explicit $PYTHON > recipe's runtime.python > python3 on PATH
+# (i.e., the active conda env). Hard-fail if the chosen interpreter can't
+# import sglang — silent fallback to a stray system python3 created a trap
+# where the server died with ModuleNotFoundError only after 60+ seconds.
+PYTHON="${PYTHON:-${RECIPE_RUNTIME__PYTHON:-}}"
+[ -n "$PYTHON" ] || PYTHON="$(command -v python3 || command -v python)"
 if [ ! -x "$PYTHON" ]; then
     echo "ERROR: runtime python not executable: $PYTHON" >&2
-    echo "  Fix: set PYTHON=/path/to/venv/bin/python, or runtime.python in the recipe." >&2
+    echo "  Fix: activate the right conda/venv, or set PYTHON=/path/to/venv/bin/python," >&2
+    echo "       or set runtime.python in the recipe." >&2
     exit 1
 fi
 if ! "$PYTHON" -c "import sglang" >/dev/null 2>&1; then

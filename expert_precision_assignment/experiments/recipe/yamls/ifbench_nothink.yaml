@@ -29,7 +29,7 @@ sampling: # written into every prompt_record in prompts/<name>.jsonl
 # different venv or a newer model snapshot.
 #
 # runtime:
-#   python: /data/junzhou/.venv-bfcl/bin/python
+#   python: /path/to/your/venv/bin/python   # leave empty/unset to use $(which python3)
 #   model_path: /data/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39
 #   host: 127.0.0.1
 

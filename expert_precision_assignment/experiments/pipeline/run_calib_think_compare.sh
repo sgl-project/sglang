@@ -34,7 +34,7 @@ CALIB_NCCL_PORT="${CALIB_NCCL_PORT:-41400}"
 THINK_MAX_TOK="${THINK_MAX_TOK:-8192}"
 NOTHINK_MAX_TOK="${NOTHINK_MAX_TOK:-2048}"
 
-PY="${PY:-/data/junzhou/.venv-bfcl/bin/python}"
+PY="${PY:-$(command -v python3 || command -v python)}"
 TASK=ifbench
 KV_DIR="$EXPERIMENTS_DIR/data/kv_calib"
 PROMPT_DIR="$SCRIPT_DIR/prompt"
