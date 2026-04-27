@@ -78,6 +78,10 @@ LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
 
 
+def _default_diffusion_log_level() -> str:
+    return envs.SGLANG_DIFFUSION_LOGGING_LEVEL.lower()
+
+
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
     if mode is None:
         return None
@@ -279,7 +283,7 @@ class ServerArgs(DisaggArgsMixin):
     pool_result_endpoint: str | None = None
 
     # Logging
-    log_level: str = "info"
+    log_level: str = field(default_factory=_default_diffusion_log_level)
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
 
     # Tracing
@@ -1096,7 +1100,7 @@ class ServerArgs(DisaggArgsMixin):
         parser.add_argument(
             "--log-level",
             type=str,
-            default=ServerArgs.log_level,
+            default=_default_diffusion_log_level(),
             help="The logging level of all loggers.",
         )
 
