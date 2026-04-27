@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.flashattention_backend import (
     merge_state_v2_wrapper,
     prepare_swa_spec_page_table_triton,
 )
+from sglang.srt.layers.attention.dsv4_sparse_attention import dsv4_sparse_attn
 from sglang.srt.managers.schedule_batch import get_global_server_args
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -21,6 +22,23 @@ if TYPE_CHECKING:
 
 from sgl_kernel import merge_state_v2
 from sgl_kernel.flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+
+def _gather_kv_from_page_table(
+    kv_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    batch_idx: int,
+    kv_len: int,
+    page_size: int,
+) -> torch.Tensor:
+    positions = torch.arange(kv_len, device=page_table.device)
+    if page_size == 1:
+        block_ids = page_table[batch_idx, :kv_len].to(torch.long)
+        offsets = torch.zeros_like(block_ids)
+    else:
+        block_ids = page_table[batch_idx, positions // page_size].to(torch.long)
+        offsets = positions % page_size
+    return kv_cache[block_ids, offsets.to(torch.long)]
 
 
 class XPUAttentionBackend(AttentionBackend):
@@ -388,6 +406,7 @@ class XPUAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ):
         if k is not None:
@@ -496,6 +515,22 @@ class XPUAttentionBackend(AttentionBackend):
                 cache_seqlens = metadata.encoder_lens_int32
                 cu_seqlens_k = metadata.encoder_cu_seqlens_k
                 window_size = (-1, -1)
+
+            if topk_indices is not None:
+                if sinks is None:
+                    raise ValueError("DSV4 sparse attention requires attention sinks")
+                o = self._forward_dsv4_sparse_attn(
+                    q=q,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    page_table=page_table,
+                    cache_seqlens=cache_seqlens,
+                    cu_seqlens_q=cu_seqlens_q,
+                    topk_indices=topk_indices,
+                    sinks=sinks,
+                    layer=layer,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             result = flash_attn_with_kvcache(
                 q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -680,6 +715,7 @@ class XPUAttentionBackend(AttentionBackend):
         # For multi-head latent attention
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
         sinks: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if k is not None:
@@ -755,6 +791,26 @@ class XPUAttentionBackend(AttentionBackend):
             value_cache = value_cache.view(
                 -1, self.page_size, layer.tp_v_head_num, layer.head_dim
             )
+
+            if topk_indices is not None:
+                if sinks is None:
+                    raise ValueError("DSV4 sparse attention requires attention sinks")
+                if layer.is_cross_attention or use_local_attn:
+                    raise NotImplementedError(
+                        "DSV4 sparse attention is only supported for regular self-attention on XPU"
+                    )
+                o = self._forward_dsv4_sparse_attn(
+                    q=q,
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    page_table=metadata.page_table,
+                    cache_seqlens=metadata.cache_seqlens_int32,
+                    cu_seqlens_q=metadata.cu_seqlens_q,
+                    topk_indices=topk_indices,
+                    sinks=sinks,
+                    layer=layer,
+                )
+                return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
             if layer.is_cross_attention:
                 # Always use non-chunked logic for cross-attention
@@ -927,6 +983,52 @@ class XPUAttentionBackend(AttentionBackend):
                 o = result
 
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+    def _forward_dsv4_sparse_attn(
+        self,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        topk_indices: torch.Tensor,
+        sinks: torch.Tensor,
+        layer: RadixAttention,
+    ) -> torch.Tensor:
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        output = q.new_empty((q.shape[0], layer.tp_q_head_num, layer.v_head_dim))
+        batch_size = cache_seqlens.numel()
+
+        for batch_idx in range(batch_size):
+            q_start = int(cu_seqlens_q[batch_idx].item())
+            q_end = int(cu_seqlens_q[batch_idx + 1].item())
+            kv_len = int(cache_seqlens[batch_idx].item())
+            if q_end == q_start:
+                continue
+
+            key_states = _gather_kv_from_page_table(
+                key_cache, page_table, batch_idx, kv_len, self.page_size
+            ).unsqueeze(0)
+            value_states = _gather_kv_from_page_table(
+                value_cache, page_table, batch_idx, kv_len, self.page_size
+            ).unsqueeze(0)
+
+            if topk_indices.dim() == 3:
+                topk_idxs = topk_indices[batch_idx : batch_idx + 1]
+            else:
+                topk_idxs = topk_indices[q_start:q_end].unsqueeze(0)
+
+            output[q_start:q_end] = dsv4_sparse_attn(
+                q[q_start:q_end].unsqueeze(0),
+                key_states,
+                value_states,
+                sinks,
+                topk_idxs,
+                layer.scaling,
+            ).squeeze(0)
+
+        return output
 
     def get_cuda_graph_seq_len_fill_value(self):
         """Get the fill value for sequence length in CUDA graph."""
