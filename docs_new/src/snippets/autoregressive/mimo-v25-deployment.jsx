@@ -14,10 +14,12 @@ export const MiMoV25Deployment = () => {
   //     B200  → tp=4, dp=1, single-node, FP8
   //     GB300 → tp=4, dp=1, single-node, FP8
   //
-  //   Recipes:
-  //     low-latency    → V2.5-Pro: TP only (no DP). V2.5: DP-attn (always required).
-  //     balanced       → V2.5-Pro: DP-attn + EAGLE.
-  //     max-throughput → V2.5-Pro: DP-attn, no MTP.
+  //   Optional toggles:
+  //     EAGLE MTP — Pro only. Adds --speculative-* flags + SGLANG_ENABLE_SPEC_V2=1.
+  //     DeepEP    — Hopper only (Blackwell uses flashinfer_trtllm). Adds
+  //                 --moe-a2a-backend deepep + --moe-dense-tp-size 1
+  //                 (and --ep on Pro) + SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256.
+  //                 Requires `pip install deep_ep`.
 
   const options = {
     modelVariant: {
@@ -38,13 +40,20 @@ export const MiMoV25Deployment = () => {
         { id: "gb300", label: "GB300", default: false },
       ],
     },
-    recipe: {
-      name: "recipe",
-      title: "Recipe",
+    eagleMtp: {
+      name: "eagleMtp",
+      title: "EAGLE MTP",
       items: [
-        { id: "low-latency",    label: "Low-Latency",    default: true  },
-        { id: "balanced",       label: "Balanced",       default: false },
-        { id: "max-throughput", label: "Max-Throughput", default: false },
+        { id: "enabled",  label: "Enabled",  default: true,  subtitle: "Pro only" },
+        { id: "disabled", label: "Disabled", default: false },
+      ],
+    },
+    deepep: {
+      name: "deepep",
+      title: "DeepEP",
+      items: [
+        { id: "disabled", label: "Disabled", default: true,  subtitle: "default" },
+        { id: "enabled",  label: "Enabled",  default: false, subtitle: "needs deep_ep" },
       ],
     },
     reasoningParser: {
@@ -129,18 +138,19 @@ export const MiMoV25Deployment = () => {
   };
 
   const generateCommand = () => {
-    const { modelVariant, hardware, recipe, reasoningParser, toolcall } = values;
+    const { modelVariant, hardware, eagleMtp, deepep, reasoningParser, toolcall } = values;
     const specKey = `${modelVariant}|${hardware}`;
     const spec = HW_VARIANT_SPEC[specKey];
     const { slug, tp, multinode, nnodes, blackwell } = spec;
     const isPro = modelVariant === "pro";
-    const useMtp = isPro && recipe !== "max-throughput";
+    // EAGLE MTP only applies to Pro. DeepEP only applies to Hopper paths
+    // (Blackwell uses flashinfer_trtllm); on Blackwell Pro the DeepEP toggle is a no-op.
+    const useMtp = isPro && eagleMtp === "enabled";
+    const useDeepep = !blackwell && deepep === "enabled";
     // V2.5 (base) requires DP-attention with effective attention-TP = 4 per group;
-    // dp comes from the spec table. Pro uses optional DP-attn driven by recipe.
+    // dp comes from the spec table. dp=1 on B200/GB300 means single attention group.
     const baseDp = !isPro ? spec.dp : 0;
-    const proDp = isPro && recipe !== "low-latency" ? tp : 0;
-    const dp = isPro ? proDp : baseDp;
-    const useDpAttn = !isPro ? baseDp > 1 : proDp > 0;
+    const useDpAttn = !isPro && baseDp > 1;
 
     // ---- env (kept inline before `sglang serve`, matching the verified launch style) ----
     const envVars = [];
@@ -148,7 +158,7 @@ export const MiMoV25Deployment = () => {
       envVars.push("NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1");
     }
     if (useMtp) envVars.push("SGLANG_ENABLE_SPEC_V2=1");
-    if (isPro && !blackwell) envVars.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
+    if (useDeepep) envVars.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
 
     // ---- flags ----
     const flags = [];
@@ -157,20 +167,19 @@ export const MiMoV25Deployment = () => {
     flags.push(`  --tp ${tp}`);
 
     if (useDpAttn) {
-      flags.push(`  --dp ${dp}`);
+      flags.push(`  --dp ${baseDp}`);
       flags.push("  --enable-dp-attention");
-      if (!isPro) {
-        flags.push("  --enable-dp-lm-head");
-        flags.push("  --mm-enable-dp-encoder");
-      }
+      flags.push("  --enable-dp-lm-head");
+      flags.push("  --mm-enable-dp-encoder");
     }
 
     if (multinode) flags.push(...multiNodeFlags(nnodes));
 
-    // MoE backend: Blackwell uses flashinfer_trtllm; Hopper uses DeepEP.
+    // MoE backend: Blackwell uses flashinfer_trtllm (hardware-driven); Hopper
+    // optionally uses DeepEP (toggle).
     if (isPro && blackwell) {
       flags.push("  --moe-runner-backend flashinfer_trtllm");
-    } else {
+    } else if (useDeepep) {
       flags.push("  --moe-a2a-backend deepep");
       if (!isPro) flags.push("  --deepep-mode auto");
       if (isPro) flags.push(`  --ep ${tp}`);
