@@ -79,7 +79,7 @@ should give the same text output and very similar prefill logits:
 To ensure the new model is well maintained, add it to the test suite by including it in the `ALL_OTHER_MODELS` list in
 the [test_generation_models.py](https://github.com/sgl-project/sglang/blob/main/test/registered/models/test_generation_models.py)
 file, test the new model on your local machine and report the results on demonstrative benchmarks (GSM8K, MMLU, MMMU,
-MMMU-Pro, etc.) in your PR. \\
+MMMU-Pro, etc.) in your PR.
 For VLMs, also include a test in `test_vision_openai_server_&#123;x&#125;.py` (e.g. [test_vision_openai_server_a.py](https://github.com/sgl-project/sglang/blob/main/test/registered/vlm/test_vision_openai_server_a.py)).
 
 This is an example command to run to test a new model on your local machine:
