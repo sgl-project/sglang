@@ -1,0 +1,45 @@
+# SMOKE TEST — wikitext perplexity (loglikelihood_rolling) across the
+# 6-point hessian-routing variant ladder at mc=64. Same bench_eval
+# pipeline as gsm8k, no offline scoring (lm-eval reports PPL directly
+# inside the bench_eval trace).
+#
+# Override NUM_FEWSHOT=0 / APPLY_CHAT_TEMPLATE=0 / FEWSHOT_AS_MULTITURN=0
+# on the command line — wikitext is raw-text PPL, not a fewshot prompt
+# task; chat-template wrapping mangles the per-token logprobs the rolling
+# evaluator depends on.
+#
+# Usage:
+#   NUM_FEWSHOT=0 APPLY_CHAT_TEMPLATE=0 FEWSHOT_AS_MULTITURN=0 \
+#     CALIB_GPU=6 GPUS=6 \
+#     bash run_pipeline.sh recipe/yamls/wikitext_smoke.yaml
+task: wikitext
+variant: smoke
+
+dataset:
+  limit: 0
+
+sampling:
+  enable_thinking: false
+  max_tokens: 0           # PPL doesn't generate
+  temperature: 0
+  top_p: 1.0
+  top_k: 0
+  presence_penalty: 0
+  frequency_penalty: 0
+
+calibration:
+  num_prompts: 8          # → CALIB_LIMIT for bench_eval (8 docs)
+  mc: 64
+  gpu: 4
+  port: 31304
+  nccl_port: 41304
+
+sweep:
+  mc_list: [64]
+  variants: [hess0, hess20, hess40, hess60, hess80, hess100]
+  gpus: [4]
+  num_prompts: 0          # ignored in bench_eval mode
+  limit: 8                # 8 docs per cell — fast smoke
+
+scoring:
+  enabled: false          # bench_eval reports word_perplexity / byte_perplexity / bits_per_byte
