@@ -335,16 +335,14 @@ class DecodePreallocQueue:
 
         kv_args.pp_rank = self.pp_rank
         kv_args.system_dp_rank = self.scheduler.dp_rank
-        if self.scheduler.enable_hisparse:
-            # Direct-to-host: register host pool pointers so P writes to D's host memory
-            host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
-            kv_data_ptrs, kv_data_lens, kv_item_lens = (
-                host_pool.get_contiguous_buf_infos()
-            )
-        else:
-            kv_data_ptrs, kv_data_lens, kv_item_lens = (
-                self.token_to_kv_pool.get_contiguous_buf_infos()
-            )
+        transfer_kv_pool = (
+            self.scheduler.hisparse_coordinator.mem_pool_host
+            if self.scheduler.enable_hisparse
+            else self.token_to_kv_pool
+        )
+        kv_data_ptrs, kv_data_lens, kv_item_lens = (
+            transfer_kv_pool.get_contiguous_buf_infos()
+        )
         if self.draft_token_to_kv_pool is not None:
             # We should also transfer draft model kv cache. The indices are
             # always shared with a target model.
@@ -358,11 +356,7 @@ class DecodePreallocQueue:
         kv_args.kv_data_ptrs = kv_data_ptrs
         kv_args.kv_data_lens = kv_data_lens
         kv_args.kv_item_lens = kv_item_lens
-        kv_args.page_size = (
-            self.scheduler.hisparse_coordinator.mem_pool_host.page_size
-            if self.scheduler.enable_hisparse
-            else self.token_to_kv_pool.page_size
-        )
+        kv_args.page_size = self.token_to_kv_pool.page_size
 
         kv_args.aux_data_ptrs, kv_args.aux_data_lens, kv_args.aux_item_lens = (
             self.metadata_buffers.get_buf_infos()
@@ -828,6 +822,7 @@ class DecodePreallocQueue:
             )
             decode_req.req.cache_protected_len = prefix_len
 
+            page_size = self.token_to_kv_pool_allocator.page_size
             if self.scheduler.enable_hisparse:
                 # Must cast to int32 for ZMQ serialization -- from_zmq reads np.int32.
                 kv_indices = (
@@ -836,7 +831,6 @@ class DecodePreallocQueue:
                     .numpy()
                     .astype(np.int32)
                 )
-                page_size = self.scheduler.hisparse_coordinator.mem_pool_host.page_size
             else:
                 # Only send delta indices (beyond prefix) to prefill.
                 kv_indices = (
@@ -846,7 +840,6 @@ class DecodePreallocQueue:
                     .cpu()
                     .numpy()
                 )
-                page_size = self.token_to_kv_pool_allocator.page_size
 
             # Prepare extra pool indices for hybrid models
             if isinstance(self.token_to_kv_pool, HybridLinearKVPool):
@@ -1564,6 +1557,4 @@ class SchedulerDisaggregationDecodeMixin:
                 for req in transferred_reqs:
                     # Direct-to-host: KV data already in host pool, skip staging
                     self.hisparse_coordinator.admit_request_direct(req)
-                self.waiting_queue.extend(transferred_reqs)
-            else:
-                self.waiting_queue.extend(transferred_reqs)
+            self.waiting_queue.extend(transferred_reqs)

@@ -62,15 +62,13 @@ class HiSparseCoordinator:
             layout="layer_first",
             override_kv_cache_dim=self.mem_pool_device.kv_cache_dim,
         )
-        self.page_size = self.mem_pool_host.page_size
+        self.page_size = self.mem_pool_device.page_size
 
         max_num_reqs = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
 
         # to have an extra page for new tokens
-        self.padded_buffer_size = (
-            self.device_buffer_size + self.mem_pool_device.page_size
-        )
+        self.padded_buffer_size = self.device_buffer_size + self.page_size
 
         self.req_to_device_buffer = torch.zeros(
             (max_num_reqs, self.padded_buffer_size), dtype=torch.int64, device=device
