@@ -3,8 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from sglang.srt.true_on_policy.schema import (
+    QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
+    TrueOnPolicyContractName,
+    TrueOnPolicyContractSchema,
+)
 
-QWEN3_DENSE_TRUE_ON_POLICY_V1 = "qwen3_dense_true_on_policy_v1"
+QWEN3_DENSE_TRUE_ON_POLICY_V1 = QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA.name
 
 
 @dataclass(frozen=True)
@@ -35,6 +40,53 @@ DEFAULT_RUNTIME_POLICY = SGLangTrueOnPolicyRuntimePolicy(
 )
 
 
+@dataclass(frozen=True)
+class SGLangTrueOnPolicyContract:
+    """SGLang-local adapter from a shared contract schema to runtime policy."""
+
+    schema: TrueOnPolicyContractSchema
+
+    @property
+    def name(self) -> TrueOnPolicyContractName:
+        return self.schema.name
+
+    def policy_for(self, server_args: Any) -> SGLangTrueOnPolicyRuntimePolicy:
+        target = getattr(server_args, "rl_on_policy_target", None)
+        uses_tp_invariant_rollout = target == "fsdp_tp"
+        return SGLangTrueOnPolicyRuntimePolicy(
+            contract_name=self.name,
+            enabled=True,
+            force_bfloat16_dense_tensor_math=True,
+            force_bfloat16_lm_head=True,
+            disable_reduce_scatter=True,
+            disable_mlp_allreduce_fusion=True,
+            disable_flashinfer_allreduce_fusion=uses_tp_invariant_rollout,
+            tp_invariant_row_linear=uses_tp_invariant_rollout,
+            deterministic_tree_all_reduce=uses_tp_invariant_rollout,
+        )
+
+
+QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT = SGLangTrueOnPolicyContract(
+    schema=QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
+)
+
+
+_CONTRACT_BY_NAME = {
+    QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT.name: QWEN3_DENSE_TRUE_ON_POLICY_CONTRACT,
+}
+
+
+def get_true_on_policy_contract(contract_name: str) -> SGLangTrueOnPolicyContract:
+    try:
+        return _CONTRACT_BY_NAME[contract_name]
+    except KeyError as exc:
+        supported = ", ".join(sorted(_CONTRACT_BY_NAME))
+        raise ValueError(
+            f"Unsupported SGLang true-on-policy contract {contract_name!r}. "
+            f"Supported contracts: {supported}"
+        ) from exc
+
+
 def _contract_name_for(server_args: Any) -> Optional[str]:
     target = getattr(server_args, "rl_on_policy_target", None)
     contract_name = getattr(server_args, "true_on_policy_contract", None)
@@ -55,29 +107,15 @@ def validate_true_on_policy_contract(server_args: Any) -> None:
             "--true-on-policy-contract requires --rl-on-policy-target so the "
             "runtime policy cannot silently become a no-op."
         )
-    if contract_name != QWEN3_DENSE_TRUE_ON_POLICY_V1:
-        raise ValueError(f"Unsupported SGLang true-on-policy contract: {contract_name!r}")
+    get_true_on_policy_contract(contract_name)
 
 
 def resolve_true_on_policy_runtime_policy(
     server_args: Any,
 ) -> SGLangTrueOnPolicyRuntimePolicy:
-    target = getattr(server_args, "rl_on_policy_target", None)
     contract_name = _contract_name_for(server_args)
     if contract_name is None:
         return DEFAULT_RUNTIME_POLICY
 
     validate_true_on_policy_contract(server_args)
-
-    uses_tp_invariant_rollout = target == "fsdp_tp"
-    return SGLangTrueOnPolicyRuntimePolicy(
-        contract_name=contract_name,
-        enabled=True,
-        force_bfloat16_dense_tensor_math=True,
-        force_bfloat16_lm_head=True,
-        disable_reduce_scatter=True,
-        disable_mlp_allreduce_fusion=True,
-        disable_flashinfer_allreduce_fusion=uses_tp_invariant_rollout,
-        tp_invariant_row_linear=uses_tp_invariant_rollout,
-        deterministic_tree_all_reduce=uses_tp_invariant_rollout,
-    )
+    return get_true_on_policy_contract(contract_name).policy_for(server_args)

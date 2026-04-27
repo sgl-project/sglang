@@ -2,7 +2,9 @@
 
 from .contracts import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    SGLangTrueOnPolicyContract,
     SGLangTrueOnPolicyRuntimePolicy,
+    get_true_on_policy_contract,
     resolve_true_on_policy_runtime_policy,
     validate_true_on_policy_contract,
 )
@@ -25,7 +27,9 @@ from .config import (
 __all__ = [
     "QWEN3_DENSE_TRUE_ON_POLICY_V1",
     "ROW_LINEAR_INV_BLOCK_K",
+    "SGLangTrueOnPolicyContract",
     "SGLangTrueOnPolicyRuntimePolicy",
+    "get_true_on_policy_contract",
     "get_on_policy_rms_norm_kwargs",
     "get_rl_on_policy_target",
     "is_tp_invariant_target",

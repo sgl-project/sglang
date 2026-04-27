@@ -12,6 +12,7 @@ import torch
 
 from sglang.srt.true_on_policy import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    get_true_on_policy_contract,
     get_rl_on_policy_target,
     is_tp_invariant_target,
     is_true_on_policy_enabled,
@@ -341,6 +342,27 @@ class TestOnPolicyHelpers(unittest.TestCase):
                 row_linear_enable_inv=True,
             )
         )
+
+    def test_contract_object_owns_sglang_runtime_policy_values(self):
+        contract = get_true_on_policy_contract(QWEN3_DENSE_TRUE_ON_POLICY_V1)
+        server_args = SimpleNamespace(
+            rl_on_policy_target="fsdp_tp",
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+        )
+
+        policy = contract.policy_for(server_args)
+
+        self.assertEqual(contract.schema.name, QWEN3_DENSE_TRUE_ON_POLICY_V1)
+        self.assertEqual(contract.schema.model_family, "qwen3_dense")
+        self.assertEqual(policy.contract_name, QWEN3_DENSE_TRUE_ON_POLICY_V1)
+        self.assertTrue(policy.enabled)
+        self.assertTrue(policy.force_bfloat16_dense_tensor_math)
+        self.assertTrue(policy.force_bfloat16_lm_head)
+        self.assertTrue(policy.disable_reduce_scatter)
+        self.assertTrue(policy.disable_mlp_allreduce_fusion)
+        self.assertTrue(policy.disable_flashinfer_allreduce_fusion)
+        self.assertTrue(policy.tp_invariant_row_linear)
+        self.assertTrue(policy.deterministic_tree_all_reduce)
 
     def test_contract_resolver_rejects_contract_without_target(self):
         with self.assertRaisesRegex(ValueError, "requires --rl-on-policy-target"):
