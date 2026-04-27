@@ -48,5 +48,9 @@ Compressed-tensors (LLM Compressor) on Ascend support:
 | [W8A8 dynamic](https://github.com/sgl-project/sglang/pull/14504)                              | MoE                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
 
 [GGUF on Ascend support](https://github.com/sgl-project/sglang/pull/17883)
+| Quantization scheme                                       | Layer type               |               A2 Supported               |               A3 Supported               |               A5 Supported                |
+|-----------------------------------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|:-----------------------------------------:|
+| [GGUF (all types)](https://github.com/sgl-project/sglang/pull/17883) | Linear                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
+| [GGUF (all types)](https://github.com/sgl-project/sglang/pull/17883) | MoE                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
 
-in progress
+> Note: On Ascend, GGUF weights are pre-dequantized to FP16/BF16 during model loading to ensure optimal inference performance. This enables support for all GGUF quantization types (Q2_K, Q4_K_M, IQ4_XS, etc.) while maintaining high inference speed.
