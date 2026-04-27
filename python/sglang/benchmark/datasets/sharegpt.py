@@ -1,4 +1,3 @@
-import json
 import random
 from argparse import Namespace
 from dataclasses import dataclass
@@ -16,7 +15,7 @@ from sglang.benchmark.datasets.common import (
 )
 from sglang.benchmark.utils import (
     download_and_cache_hf_file,
-    is_file_valid_json,
+    load_json_file,
     remove_suffix,
 )
 
@@ -69,15 +68,12 @@ def sample_sharegpt_requests(
         raise ValueError("output_len too small")
 
     # Download sharegpt if necessary
-    if not is_file_valid_json(dataset_path) and dataset_path == "":
+    if dataset_path == "":
         dataset_path = download_and_cache_hf_file(
             repo_id=SHAREGPT_REPO_ID,
             filename=SHAREGPT_FILENAME,
         )
-
-    # Load the dataset.
-    with open(dataset_path) as f:
-        dataset = json.load(f)
+    dataset = load_json_file(dataset_path)
 
     # Filter out the conversations with less than 2 turns.
     dataset = [
