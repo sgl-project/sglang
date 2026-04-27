@@ -230,7 +230,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         if self.req_index_to_mamba_index_mapping.shape[0] < mapping_size:
             pad_size = mapping_size - self.req_index_to_mamba_index_mapping.shape[0]
             self.req_index_to_mamba_index_mapping = torch.nn.functional.pad(
-                self.req_index_to_mamba_index_mapping, (0, pad_size)
+                self.req_index_to_mamba_index_mapping, (0, pad_size), value=-1
             )
         if self.enable_mamba_extra_buffer:
             if (
@@ -245,6 +245,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
                     torch.nn.functional.pad(
                         self.req_index_to_mamba_ping_pong_track_buffer_mapping,
                         (0, 0, 0, pad_size),
+                        value=-1,
                     )
                 )
 
