@@ -317,6 +317,9 @@ def mixed_layer(layer_shared_weights):
 
 
 PER_EXPERT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+# Granular sweep around the BF16↔INT4 crossover identified from the coarse
+# sweep above (BF16 wins at M/e=128, INT4 wins at M/e=64). Step 8.
+CROSSOVER_BATCH_SIZES = list(range(48, 96 + 1, 8))
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
@@ -479,6 +482,78 @@ class TestFusedLatencyOrdering:
             "Mixed kernel has unexpected overhead vs sequential cold+hot:\n  "
             + "\n  ".join(failures)
         )
+
+    def test_int4_bf16_crossover(self):
+        """Granular sweep to locate the BF16↔INT4 crossover.
+
+        Times pure BF16 vs pure INT4 (Marlin) at M/e ∈ {64, 80, 96, 112,
+        128}. Diagnostic only — no latency assertion. Reports the
+        smallest M/e where BF16 ≤ INT4.
+        """
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            outplace_fused_experts,
+        )
+
+        device = torch.device("cuda")
+        bf16_w13, bf16_w2 = _make_bf16_weights(device)
+        int4_w1, int4_w2, int4_s1, int4_s2 = _make_int4_weights(device)
+
+        rows = []
+        for m_per_expert in CROSSOVER_BATCH_SIZES:
+            x, topk_w, topk_ids, gating = _make_kernel_inputs(m_per_expert, device)
+            M_global = x.shape[0]
+
+            lat_bf16 = _bench(
+                lambda: outplace_fused_experts(
+                    x, bf16_w13, bf16_w2, topk_w, topk_ids
+                ),
+                device,
+            )
+            lat_int4 = _bench(
+                lambda: fused_marlin_moe(
+                    x, int4_w1, int4_w2, int4_s1, int4_s2,
+                    gating, topk_w, topk_ids,
+                    num_bits=KERN_NUM_BITS, is_k_full=True,
+                ),
+                device,
+            )
+            rows.append((m_per_expert, M_global, lat_bf16, lat_int4))
+
+        W = 72
+        print(f"\n{'=' * W}")
+        print(
+            f"BF16↔INT4 crossover sweep  "
+            f"(E={KERN_E}, K={KERN_K}, N={KERN_N}, top_k={KERN_TOP_K})"
+        )
+        print("-" * W)
+        print(
+            f"{'M/e':>5} {'Mglob':>6} | "
+            f"{'a16w16':>9} {'a16w4':>9} | "
+            f"{'BF16/INT4':>10} {'winner':>8}"
+        )
+        print("-" * W)
+        crossover = None
+        for M, M_g, bf16, int4 in rows:
+            ratio = bf16 / int4
+            winner = "BF16" if bf16 < int4 else "INT4"
+            if crossover is None and bf16 <= int4:
+                crossover = M
+            print(
+                f"{M:>5} {M_g:>6} | "
+                f"{bf16:9.3f} {int4:9.3f} | "
+                f"{ratio:>10.3f} {winner:>8}"
+            )
+        print("=" * W)
+        if crossover is not None:
+            print(f"Crossover: BF16 first wins at M/e = {crossover}")
+        else:
+            print(
+                f"No crossover within {CROSSOVER_BATCH_SIZES} "
+                f"— INT4 wins through M/e={CROSSOVER_BATCH_SIZES[-1]}"
+            )
 
 
 # ---------------------------------------------------------------------------
