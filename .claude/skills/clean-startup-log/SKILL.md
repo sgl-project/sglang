@@ -1,6 +1,6 @@
 ---
 name: clean-startup-log
-description: Clean up noisy startup warnings and spurious prints in SGLang server logs. Use when there are unwanted warnings, deprecation messages, or third-party noise in the server startup output.
+description: Clean up noisy startup warnings and spurious prints in SGLang server logs. Use when users ask to clean up unwanted warnings, deprecation messages, or third-party noise in the server startup output.
 disable-model-invocation: true
 ---
 
@@ -13,16 +13,14 @@ Goal: ensure the server startup log is clean and minimal, with no spurious warni
 ### 1. Launch a server and capture the log
 
 ```bash
-LD_PRELOAD=/usr/lib64/libnuma.so.1 CUDA_HOME=/usr/local/cuda-13.0 HF_HUB_OFFLINE=1 \
-  uv run sglang serve --model-path Qwen/Qwen3-8B 2>&1 | tee /tmp/startup_log.txt
+uv run sglang serve --model-path Qwen/Qwen3-8B 2>&1 | tee /tmp/startup_log.txt
 ```
 
 Wait until the server prints `The server is fired up and ready to roll!`, then Ctrl-C.
 
 For TP>1 testing:
 ```bash
-LD_PRELOAD=/usr/lib64/libnuma.so.1 CUDA_HOME=/usr/local/cuda-13.0 HF_HUB_OFFLINE=1 \
-  uv run sglang serve --model-path Qwen/Qwen3-8B --tp 2 2>&1 | tee /tmp/startup_log.txt
+uv run sglang serve --model-path Qwen/Qwen3-8B --tp 2 2>&1 | tee /tmp/startup_log.txt
 ```
 
 ### 2. Compare against the clean reference log
