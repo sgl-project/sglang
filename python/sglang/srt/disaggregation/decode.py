@@ -228,30 +228,25 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         # index-out-of-bounds when req_pool_idx >= effective_mamba_size.
         mapping_size = size + pre_alloc_size
         if self.req_index_to_mamba_index_mapping.shape[0] < mapping_size:
-            new_mapping = torch.zeros(
-                mapping_size, dtype=torch.int32, device=self.device
+            pad_size = mapping_size - self.req_index_to_mamba_index_mapping.shape[0]
+            self.req_index_to_mamba_index_mapping = torch.nn.functional.pad(
+                self.req_index_to_mamba_index_mapping, (0, pad_size)
             )
-            new_mapping[: self.req_index_to_mamba_index_mapping.shape[0]] = (
-                self.req_index_to_mamba_index_mapping
-            )
-            self.req_index_to_mamba_index_mapping = new_mapping
         if self.enable_mamba_extra_buffer:
             if (
                 self.req_index_to_mamba_ping_pong_track_buffer_mapping.shape[0]
                 < mapping_size
             ):
-                new_pp_mapping = torch.zeros(
-                    (mapping_size, self.mamba_ping_pong_track_buffer_size),
-                    dtype=torch.int32,
-                    device=self.device,
+                pad_size = (
+                    mapping_size
+                    - self.req_index_to_mamba_ping_pong_track_buffer_mapping.shape[0]
                 )
-                old_size = self.req_index_to_mamba_ping_pong_track_buffer_mapping.shape[
-                    0
-                ]
-                new_pp_mapping[:old_size] = (
-                    self.req_index_to_mamba_ping_pong_track_buffer_mapping
+                self.req_index_to_mamba_ping_pong_track_buffer_mapping = (
+                    torch.nn.functional.pad(
+                        self.req_index_to_mamba_ping_pong_track_buffer_mapping,
+                        (0, 0, 0, pad_size),
+                    )
                 )
-                self.req_index_to_mamba_ping_pong_track_buffer_mapping = new_pp_mapping
 
     def clear(self):
         self.free_slots = list(range(self.size + self.pre_alloc_size))
