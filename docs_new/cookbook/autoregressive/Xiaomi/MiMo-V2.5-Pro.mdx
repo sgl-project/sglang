@@ -27,7 +27,7 @@ Refer to the [official SGLang installation guide](/docs/get-started/install). Us
 
 ## 3. Model Deployment
 
-The following command mirrors the launch configuration from the MiMo-V2.5-Pro SGLang support PR. It targets a multi-node NVIDIA CUDA deployment with DP attention, Expert Parallelism, DeepEP, FP8 quantization, and EAGLE speculative decoding.
+Use the configuration selector below to generate the deployment command. The generator mirrors the MiMo-V2.5-Pro launch configuration from the SGLang support PR and emits `sglang serve` syntax for current SGLang CLI usage.
 
 Set these distributed placeholders for your cluster before launch:
 
@@ -35,44 +35,9 @@ Set these distributed placeholders for your cluster before launch:
 - `LWS_WORKER_INDEX`: node rank.
 - `LWS_GROUP_SIZE`: total number of nodes.
 
-```bash Command
-SGLANG_ENABLE_SPEC_V2=1 \
-SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256 \
-python3 -m sglang.launch_server \
-  --model-path XiaomiMiMo/MiMo-V2.5-Pro \
-  --trust-remote-code \
-  --pp-size 1 \
-  --dp-size 2 \
-  --ep-size 16 \
-  --tp-size 16 \
-  --moe-dense-tp-size 1 \
-  --enable-dp-attention \
-  --moe-a2a-backend deepep \
-  --dist-init-addr ${LWS_LEADER_IP}:20000 \
-  --node-rank ${LWS_WORKER_INDEX} \
-  --nnodes ${LWS_GROUP_SIZE} \
-  --page-size 64 \
-  --attention-backend fa3 \
-  --quantization fp8 \
-  --mem-fraction-static 0.7 \
-  --max-running-requests 128 \
-  --cuda-graph-max-bs 64 \
-  --chunked-prefill-size 32768 \
-  --context-length 1048576 \
-  --tokenizer-worker-num 64 \
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --enable-multi-layer-eagle \
-  --host 0.0.0.0 \
-  --port 9001 \
-  --reasoning-parser mimo \
-  --tool-call-parser mimo \
-  --watchdog-timeout 3600 \
-  --model-loader-extra-config '{"enable_multithread_load": "true", "num_threads": 64}' \
-  --swa-full-tokens-ratio 0.3
-```
+import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deployment.jsx'
+
+<MiMoV25Deployment defaultModel="pro" />
 
 ### Configuration tips
 

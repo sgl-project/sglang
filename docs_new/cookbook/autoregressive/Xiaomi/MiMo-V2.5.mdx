@@ -24,44 +24,11 @@ Refer to the [official SGLang installation guide](/docs/get-started/install). Us
 
 ## 3. Model Deployment
 
-The following command mirrors the launch configuration from the MiMo-V2.5 SGLang support PR. It targets an NVIDIA CUDA deployment with DP attention, DeepEP, FA3 attention, FP8 quantization, and multimodal encoder data parallelism.
+Use the configuration selector below to generate the deployment command. The generator mirrors the MiMo-V2.5 launch configuration from the SGLang support PR and emits `sglang serve` syntax for current SGLang CLI usage.
 
-```bash Command
-python3 -m sglang.launch_server \
-  --model-path XiaomiMiMo/MiMo-V2.5 \
-  --served-model-name mimo-v2.5 \
-  --log-level-http warning \
-  --enable-cache-report \
-  --pp-size 1 \
-  --dp-size 2 \
-  --tp-size 8 \
-  --enable-dp-attention \
-  --moe-a2a-backend deepep \
-  --deepep-mode auto \
-  --decode-log-interval 1 \
-  --page-size 64 \
-  --host 0.0.0.0 \
-  --port 9001 \
-  --trust-remote-code \
-  --watchdog-timeout 3600 \
-  --mem-fraction-static 0.65 \
-  --chunked-prefill-size 16384 \
-  --reasoning-parser mimo \
-  --tool-call-parser mimo \
-  --context-length 262144 \
-  --collect-tokens-histogram \
-  --enable-metrics \
-  --allow-auto-truncate \
-  --enable-metrics-for-all-schedulers \
-  --quantization fp8 \
-  --skip-server-warmup \
-  --moe-dense-tp-size 1 \
-  --enable-dp-lm-head \
-  --disable-tokenizer-batch-decode \
-  --mm-enable-dp-encoder \
-  --attention-backend fa3 \
-  --mm-attention-backend fa3
-```
+import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deployment.jsx'
+
+<MiMoV25Deployment defaultModel="standard" />
 
 ### Configuration tips
 
