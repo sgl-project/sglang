@@ -128,6 +128,29 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_lora_dynamic_switch_check=True,
         run_multi_lora_api_check=True,
     ),
+    # Regression case for Z-Image-Turbo + LoRA + non-zero CFG.
+    # The default Turbo guidance_scale is 0.0, so the standard multi-LoRA case
+    # never engages CFG. This case pins the exact bug repro reported by users
+    # (8 steps, guidance_scale=3.5) so a regression in the CFG combine formula
+    # or the negative_prompt default is caught by an e2e generation pass.
+    # TODO: enable run_consistency_check after a GT image for this case is
+    # uploaded to sglang-bot/sglang-ci-data and a threshold entry is added to
+    # consistency_threshold.json.
+    DiffusionTestCase(
+        "zimage_image_t2i_lora_cfg",
+        DiffusionServerArgs(
+            model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            lora_path="reverentelusarca/elusarca-anime-style-lora-z-image-turbo",
+        ),
+        DiffusionSamplingParams(
+            prompt=T2I_sampling_params.prompt,
+            output_size=T2I_sampling_params.output_size,
+            extras={"guidance_scale": 3.5, "num_inference_steps": 8},
+        ),
+        run_perf_check=False,
+        run_consistency_check=False,
+        run_lora_basic_api_check=True,
+    ),
     # === Text and Image to Image (TI2I) ===
     DiffusionTestCase(
         "qwen_image_edit_ti2i",
