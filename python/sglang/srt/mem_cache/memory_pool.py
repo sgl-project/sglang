@@ -541,12 +541,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
         self.device = device
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
-            size, dtype=torch.int32, device=self.device
+            mamba_spec_state_size, dtype=torch.int32, device=self.device
         )
         if enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
-                    (size, self.mamba_ping_pong_track_buffer_size),
+                    (mamba_spec_state_size, self.mamba_ping_pong_track_buffer_size),
                     dtype=torch.int32,
                     device=self.device,
                 )

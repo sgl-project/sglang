@@ -221,34 +221,6 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
             speculative_num_draft_tokens=speculative_num_draft_tokens,
         )
 
-        # req_index_to_mamba_index_mapping must cover all possible req_pool_idx values,
-        # which range from [0, size + pre_alloc_size). The _init_mamba_pool above may
-        # create a smaller mapping (sized by effective_mamba_size / mamba_size) to save
-        # mamba cache memory, but the mapping table itself must be large enough to avoid
-        # index-out-of-bounds when req_pool_idx >= effective_mamba_size.
-        mapping_size = size + pre_alloc_size
-        if self.req_index_to_mamba_index_mapping.shape[0] < mapping_size:
-            pad_size = mapping_size - self.req_index_to_mamba_index_mapping.shape[0]
-            self.req_index_to_mamba_index_mapping = torch.nn.functional.pad(
-                self.req_index_to_mamba_index_mapping, (0, pad_size), value=-1
-            )
-        if self.enable_mamba_extra_buffer:
-            if (
-                self.req_index_to_mamba_ping_pong_track_buffer_mapping.shape[0]
-                < mapping_size
-            ):
-                pad_size = (
-                    mapping_size
-                    - self.req_index_to_mamba_ping_pong_track_buffer_mapping.shape[0]
-                )
-                self.req_index_to_mamba_ping_pong_track_buffer_mapping = (
-                    torch.nn.functional.pad(
-                        self.req_index_to_mamba_ping_pong_track_buffer_mapping,
-                        (0, 0, 0, pad_size),
-                        value=-1,
-                    )
-                )
-
     def clear(self):
         self.free_slots = list(range(self.size + self.pre_alloc_size))
         self.mamba_pool.clear()
