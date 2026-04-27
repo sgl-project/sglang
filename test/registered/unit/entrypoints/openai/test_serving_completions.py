@@ -282,9 +282,7 @@ class ServingCompletionTestCase(unittest.TestCase):
 
         loop = get_or_create_event_loop()
         response = loop.run_until_complete(
-            self.sc._handle_streaming_request(
-                Mock(), req, self.fastapi_request
-            )
+            self.sc._handle_streaming_request(Mock(), req, self.fastapi_request)
         )
 
         self.assertIsInstance(response, ORJSONResponse)
