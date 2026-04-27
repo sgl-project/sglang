@@ -2647,17 +2647,33 @@ class AiterAttnBackend(AttentionBackend):
                         if self.forward_metadata.swa_page_table is not None:
                             page_table = self.forward_metadata.swa_page_table
 
+                    q_unified = q.view(
+                        -1, layer.tp_q_head_num, layer.qk_head_dim
+                    )
+                    k_unified = k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    )
+                    v_unified = v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    )
+                    if layer.tp_k_head_num == 1 and layer.tp_q_head_num > 1:
+                        # Qwen3.5 can replicate one KV head across multiple TP ranks.
+                        # Present the local KV head as per-Q-head stride-0 views so
+                        # target_verify uses the same local head mapping as the model.
+                        k_unified = k_unified.expand(
+                            -1, -1, layer.tp_q_head_num, -1
+                        )
+                        v_unified = v_unified.expand(
+                            -1, -1, layer.tp_q_head_num, -1
+                        )
+
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
                     # each replay and break the captured pointer.
                     unified_attention(
-                        q=q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                        k=k_cache.view(
-                            -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
-                        ),
-                        v=v_cache.view(
-                            -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
-                        ),
+                        q=q_unified,
+                        k=k_unified,
+                        v=v_unified,
                         out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
                         seqused_k=forward_batch.seq_lens + self.num_draft_tokens,
@@ -2857,7 +2873,13 @@ class AiterAttnBackend(AttentionBackend):
                 layer.layer_id
             )
 
-            o = torch.empty_like(q, dtype=self.input_dtype)
+            if layer.qk_head_dim != layer.v_head_dim:
+                o = q.new_empty(
+                    (q.shape[0], layer.tp_q_head_num * layer.v_head_dim),
+                    dtype=self.input_dtype,
+                )
+            else:
+                o = torch.empty_like(q, dtype=self.input_dtype)
 
             if self.use_triton_unified_attention:
                 bs = forward_batch.batch_size
@@ -2882,7 +2904,7 @@ class AiterAttnBackend(AttentionBackend):
                     v=v_cache.view(
                         -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                     ),
-                    out=o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                     cu_seqlens_q=self.forward_metadata.qo_indptr,
                     seqused_k=forward_batch.seq_lens,
                     max_seqlen_q=self.forward_metadata.max_q_len,
@@ -2903,7 +2925,7 @@ class AiterAttnBackend(AttentionBackend):
                     v_cache = v_cache.to(self.input_dtype)
 
                 paged_attention_ragged(
-                    o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                     self.workspace_buffer,
                     q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                     k_cache.view(-1, 1, layer.tp_k_head_num, layer.qk_head_dim),
