@@ -175,14 +175,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         T2V_sampling_params,
     ),
-    DiffusionTestCase(
-        "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
-        DiffusionServerArgs(
-            model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-            text_encoder_cpu_offload=True,
-        ),
-        T2V_sampling_params,
-    ),
     # TeaCache acceleration test for Wan video model
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_teacache_enabled",

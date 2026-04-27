@@ -346,6 +346,39 @@ def should_use_dp_reduce_scatterv():
     )
 
 
+def should_skip_post_experts_all_reduce(
+    *,
+    is_tp_path: bool,
+    use_reduce_scatter: bool = False,
+    should_allreduce_fusion: bool = False,
+) -> bool:
+    """Whether to skip the post-experts all-reduce (EP or TP) because a
+    downstream component will fuse, replace, or absorb it.
+
+    Skip reasons, in order:
+      - ``should_allreduce_fusion``: LayerCommunicator will fuse the all-reduce
+        with the next layer's residual all-reduce.
+      - ``use_reduce_scatter``: LayerCommunicator's post-attention scatter will
+        do reduce-scatter, which would double-reduce on top of an all-reduce.
+      - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
+        path replaces the all-reduce with a reduce-scatterv.
+      - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
+        the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
+        the post-experts TP all-reduce. Not relevant to the EP all-reduce.
+
+    The first two args are layer-context flags from ``LayerCommunicator`` and
+    default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
+    for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
+    """
+    if should_allreduce_fusion or use_reduce_scatter:
+        return True
+    if should_use_dp_reduce_scatterv():
+        return True
+    if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        return True
+    return False
+
+
 @contextmanager
 def speculative_moe_backend_context():
     """

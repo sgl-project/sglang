@@ -73,7 +73,15 @@ class InputValidationStage(PipelineStage):
         num_videos_per_prompt = batch.num_outputs_per_prompt
 
         assert seed is not None
-        seeds = [seed + i for i in range(num_videos_per_prompt)]
+        if isinstance(seed, list):
+            if len(seed) != num_videos_per_prompt:
+                raise ValueError(
+                    f"seed list length must match num_outputs_per_prompt "
+                    f"({num_videos_per_prompt}), got {len(seed)}"
+                )
+            seeds = [int(item) for item in seed]
+        else:
+            seeds = [int(seed) + i for i in range(num_videos_per_prompt)]
         batch.seeds = seeds
 
         # Create generators based on generator_device parameter
@@ -393,7 +401,18 @@ class InputValidationStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify input validation stage inputs."""
         result = VerificationResult()
-        result.add_check("seed", batch.seed, [V.not_none, V.non_negative_int])
+        result.add_check(
+            "seed",
+            batch.seed,
+            [
+                V.not_none,
+                lambda x: (
+                    V.non_negative_int(x)
+                    if not isinstance(x, list)
+                    else bool(x) and all(V.non_negative_int(item) for item in x)
+                ),
+            ],
+        )
         result.add_check(
             "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
         )

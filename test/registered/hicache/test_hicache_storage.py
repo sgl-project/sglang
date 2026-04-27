@@ -3,11 +3,6 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(est_time=99, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 
-"""
-# TODO: Segmentation fault occurs when upgraded to Cu13. Ref: https://github.com/sgl-project/sglang/actions/runs/24603159715/job/71945537414?pr=23119")
-# Should move back to registered test after it's fixed
-"""
-
 import time
 import unittest
 

@@ -127,19 +127,21 @@ class MOVATimestepPreparationStage(PipelineStage):
         self.scheduler = scheduler
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        self.scheduler.set_timesteps(
+        scheduler = self.scheduler
+        scheduler.set_timesteps(
             batch.num_inference_steps,
             denoising_strength=1.0,
-            shift=getattr(batch, "sigma_shift", self.scheduler.shift),
+            shift=getattr(batch, "sigma_shift", scheduler.shift),
         )
-        self.scheduler.set_pair_postprocess_by_name(
+        scheduler.set_pair_postprocess_by_name(
             "dual_sigma_shift",
             visual_shift=getattr(batch, "visual_shift", 5.0),
             audio_shift=getattr(batch, "audio_shift", 5.0),
         )
-        paired = self.scheduler.get_pairs()
+        paired = scheduler.get_pairs()
         batch.paired_timesteps = paired
         batch.timesteps = paired
+        batch.scheduler = scheduler
         return batch
 
 
@@ -349,13 +351,17 @@ class MOVADenoisingStage(PipelineStage):
             model_to_use.to(get_local_torch_device())
 
     def _select_visual_dit(
-        self, timestep: float, boundary_ratio: float | None, server_args: ServerArgs
+        self,
+        timestep: float,
+        boundary_ratio: float | None,
+        server_args: ServerArgs,
+        scheduler,
     ):
         if boundary_ratio is None or self.video_dit_2 is None:
             self._manage_device_placement(self.video_dit, None, server_args)
             return self.video_dit
 
-        boundary_timestep = boundary_ratio * self.scheduler.num_train_timesteps
+        boundary_timestep = boundary_ratio * scheduler.num_train_timesteps
         if timestep >= boundary_timestep:
             current_model = self.video_dit
             model_to_offload = self.video_dit_2
@@ -405,6 +411,9 @@ class MOVADenoisingStage(PipelineStage):
         paired_timesteps = batch.paired_timesteps
         if paired_timesteps is None:
             raise ValueError("paired_timesteps must be set for MOVA")
+        scheduler = batch.scheduler
+        if scheduler is None:
+            raise ValueError("scheduler must be set for MOVA denoising")
 
         y = batch.y if batch.y is not None else batch.image_latent
         if getattr(self.video_dit, "require_vae_embedding", False) and y is None:
@@ -417,7 +426,7 @@ class MOVADenoisingStage(PipelineStage):
 
         is_warmup = batch.is_warmup
         extra_step_kwargs = self.prepare_extra_func_kwargs(
-            self.scheduler.step_from_to,
+            scheduler.step_from_to,
             getattr(batch, "extra_step_kwargs", None) or {},
         )
 
@@ -441,7 +450,7 @@ class MOVADenoisingStage(PipelineStage):
                         audio_timestep = pair_t
 
                     cur_visual_dit = self._select_visual_dit(
-                        timestep.item(), boundary_ratio, server_args
+                        timestep.item(), boundary_ratio, server_args, scheduler
                     )
 
                     timestep = timestep.unsqueeze(0).to(device=get_local_torch_device())
@@ -569,14 +578,14 @@ class MOVADenoisingStage(PipelineStage):
                             next_timestep = None
                             next_audio_timestep = None
 
-                        batch.latents = self.scheduler.step_from_to(
+                        batch.latents = scheduler.step_from_to(
                             visual_noise_pred,
                             timestep,
                             next_timestep,
                             batch.latents,
                             **extra_step_kwargs,
                         )
-                        batch.audio_latents = self.scheduler.step_from_to(
+                        batch.audio_latents = scheduler.step_from_to(
                             audio_noise_pred,
                             audio_timestep,
                             next_audio_timestep,

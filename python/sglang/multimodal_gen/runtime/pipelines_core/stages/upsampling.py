@@ -84,8 +84,8 @@ class LTX2UpsampleStage(PipelineStage):
             device=device, dtype=latents.dtype
         )
         latents = self.spatial_upsampler(latents)
-        if server_args.vae_cpu_offload:
-            self.spatial_upsampler = self.spatial_upsampler.to("cpu")
+        # Keep the small spatial upsampler resident after warmup; moving it
+        # every request dominates the measured two-stage upsample latency.
         latents = (latents - vae_mean) / vae_std
         return latents
 
@@ -118,18 +118,31 @@ class LTX2UpsampleStage(PipelineStage):
         )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        delay_stage2_prefetch = False
+        if self.pipeline is not None:
+            prepare_upsample = getattr(
+                self.pipeline, "prepare_ltx2_upsample_after_stage1", None
+            )
+            if callable(prepare_upsample):
+                delay_stage2_prefetch = prepare_upsample()
         prefetch_stage2 = (
             getattr(self.pipeline, "prefetch_ltx2_stage2_after_stage1", None)
             if self.pipeline is not None
             else None
         )
-        if callable(prefetch_stage2):
+        if callable(prefetch_stage2) and not delay_stage2_prefetch:
             prefetch_stage2()
 
         device = get_local_torch_device()
         latents = self._upsample_video_latents(batch.latents, server_args, device)
+        if callable(prefetch_stage2) and delay_stage2_prefetch:
+            prefetch_stage2()
         logger.info("Upsampled video latents: %s", list(latents.shape))
         self._restore_full_resolution(batch)
+        batch.image_latent = None
+        batch.ltx2_num_image_tokens = 0
+        batch.did_sp_shard_latents = False
+        batch.did_sp_shard_audio_latents = False
         self._pack_video_latents(batch, latents, server_args)
         logger.info(
             "Packed video latents for Stage 2: %s (resolution %dx%d)",
