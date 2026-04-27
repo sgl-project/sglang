@@ -710,7 +710,7 @@ class OpenAIServingChat(OpenAIServingBase):
         adapted_request: GenerateReqInput,
         request: ChatCompletionRequest,
         raw_request: Request,
-    ) -> Union[StreamingResponse, ErrorResponse]:
+    ) -> Union[StreamingResponse, ErrorResponse, ORJSONResponse]:
         """Handle streaming chat completion request"""
         generator = self._generate_chat_stream(adapted_request, request, raw_request)
 
@@ -722,6 +722,7 @@ class OpenAIServingChat(OpenAIServingBase):
         except ValueError as e:
             return self.create_error_response(str(e))
         if error_response := self.maybe_convert_pre_stream_bad_request(first_chunk):
+            await generator.aclose()
             return error_response
 
         async def prepend_first_chunk():

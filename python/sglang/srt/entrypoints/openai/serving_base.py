@@ -254,11 +254,18 @@ class OpenAIServingBase(ABC):
         same flat HTTP 400 error payload used by non-streaming requests.
         """
         if isinstance(first_chunk, bytes):
-            first_chunk = first_chunk.decode()
-        if not isinstance(first_chunk, str) or not first_chunk.startswith("data: "):
+            try:
+                first_chunk = first_chunk.decode()
+            except UnicodeDecodeError:
+                return None
+        if not isinstance(first_chunk, str):
             return None
 
-        payload = first_chunk[len("data: ") :].strip()
+        first_chunk = first_chunk.strip()
+        if not first_chunk.startswith("data:"):
+            return None
+
+        payload = first_chunk[len("data:") :].strip()
         if payload == "[DONE]":
             return None
 
@@ -267,18 +274,33 @@ class OpenAIServingBase(ABC):
         except json.JSONDecodeError:
             return None
 
+        if not isinstance(data, dict):
+            return None
+
         error = data.get("error")
         if not isinstance(error, dict):
             return None
 
-        if error.get("code") != HTTPStatus.BAD_REQUEST.value:
+        try:
+            status_code = int(error.get("code"))
+        except (TypeError, ValueError):
             return None
 
+        if status_code != HTTPStatus.BAD_REQUEST.value:
+            return None
+
+        message = error.get("message")
+        if not isinstance(message, str) or not message:
+            message = "Bad request"
+        param = error.get("param")
+        if not isinstance(param, str):
+            param = None
+
         return self.create_error_response(
-            message=error.get("message", "Bad request"),
+            message=message,
             err_type="BadRequest",
-            status_code=HTTPStatus.BAD_REQUEST.value,
-            param=error.get("param"),
+            status_code=status_code,
+            param=param,
         )
 
     def extract_custom_labels(self, raw_request):

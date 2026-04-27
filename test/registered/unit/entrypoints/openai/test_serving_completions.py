@@ -259,15 +259,20 @@ class ServingCompletionTestCase(unittest.TestCase):
 
     def test_handle_streaming_request_returns_http_400_for_pre_stream_bad_request(self):
         err_msg = "Requested token count exceeds the model's maximum context length."
+        generator_closed = False
 
         async def _mock_pre_stream_bad_request(*args, **kwargs):
-            error = self.sc.create_streaming_error_response(
-                err_msg,
-                HTTPStatus.BAD_REQUEST.name,
-                HTTPStatus.BAD_REQUEST.value,
-            )
-            yield f"data: {error}\n\n"
-            yield "data: [DONE]\n\n"
+            nonlocal generator_closed
+            try:
+                error = self.sc.create_streaming_error_response(
+                    err_msg,
+                    HTTPStatus.BAD_REQUEST.name,
+                    HTTPStatus.BAD_REQUEST.value,
+                )
+                yield f"data: {error}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                generator_closed = True
 
         self.sc._generate_completion_stream = Mock(
             return_value=_mock_pre_stream_bad_request()
@@ -292,6 +297,7 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.assertEqual(body["code"], HTTPStatus.BAD_REQUEST.value)
         self.assertEqual(body["type"], "BadRequest")
         self.sc.tokenizer_manager.create_abort_task.assert_not_called()
+        self.assertTrue(generator_closed)
 
 
 if __name__ == "__main__":

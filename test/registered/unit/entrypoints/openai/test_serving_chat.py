@@ -778,15 +778,20 @@ class ServingChatTestCase(unittest.TestCase):
 
     def test_handle_streaming_request_returns_http_400_for_pre_stream_bad_request(self):
         err_msg = "Requested token count exceeds the model's maximum context length."
+        generator_closed = False
 
         async def _mock_pre_stream_bad_request(*args, **kwargs):
-            error = self.chat.create_streaming_error_response(
-                err_msg,
-                HTTPStatus.BAD_REQUEST.name,
-                HTTPStatus.BAD_REQUEST.value,
-            )
-            yield f"data: {error}\n\n"
-            yield "data: [DONE]\n\n"
+            nonlocal generator_closed
+            try:
+                error = self.chat.create_streaming_error_response(
+                    err_msg,
+                    HTTPStatus.BAD_REQUEST.name,
+                    HTTPStatus.BAD_REQUEST.value,
+                )
+                yield f"data: {error}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                generator_closed = True
 
         self.chat._generate_chat_stream = Mock(
             return_value=_mock_pre_stream_bad_request()
@@ -806,6 +811,35 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(body["code"], HTTPStatus.BAD_REQUEST.value)
         self.assertEqual(body["type"], "BadRequest")
         self.tm.create_abort_task.assert_not_called()
+        self.assertTrue(generator_closed)
+
+    def test_maybe_convert_pre_stream_bad_request_accepts_string_code(self):
+        err_msg = "String status code should still be recognized."
+        chunk = (
+            "data: "
+            + json.dumps(
+                {
+                    "error": {
+                        "message": err_msg,
+                        "type": "BadRequestError",
+                        "param": "max_tokens",
+                        "code": str(HTTPStatus.BAD_REQUEST.value),
+                    }
+                }
+            )
+            + "\n\n"
+        )
+
+        response = self.chat.maybe_convert_pre_stream_bad_request(chunk)
+
+        self.assertIsInstance(response, ORJSONResponse)
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST.value)
+        body = json.loads(response.body)
+        self.assertEqual(body["message"], err_msg)
+        self.assertEqual(body["param"], "max_tokens")
+        self.assertIsNone(
+            self.chat.maybe_convert_pre_stream_bad_request("data: []\n\n")
+        )
 
     def test_handle_streaming_request_keeps_sse_for_post_start_abort(self):
         err_msg = "Backend failed after streaming started"
