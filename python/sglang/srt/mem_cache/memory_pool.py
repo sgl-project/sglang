@@ -1126,10 +1126,11 @@ class MHATokenToKVPool(KVCache):
 class NoOpMHATokenToKVPool(MHATokenToKVPool):
     """KV cache pool that skips physical K/V buffer allocation.
 
-    Used in prefill-only workloads (today: embedding mode with FA3 +
-    fa_skip_kv_cache, future: scoring etc.) where no layer reads or writes
-    KV cache because attention uses raw K/V via flash_attn_varlen_func. The
-    normal ~tens of GB of GPU allocation is pure waste in those modes.
+    Used in embedding-mode prefill-only workloads with the FA
+    fa_skip_kv_cache path, where no layer reads or writes KV cache because
+    attention uses raw K/V via flash_attn_varlen_func. Other prefill-only paths
+    such as scoring/MIS may benefit from the same idea later, but some still
+    stage K/V through paged cache today.
 
     This class keeps the scheduler's view of pool capacity (self.size is
     honored for admission) but allocates only (page_size, head_num, head_dim)

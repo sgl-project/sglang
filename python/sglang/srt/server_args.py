@@ -831,19 +831,30 @@ class ServerArgs:
 
     def __post_init__(self):
         if self.prefill_only_disable_kv_cache:
-            # Two structural preconditions for the FA backend's fa_skip_kv_cache
-            # path (the only path that doesn't read or write the pool today):
+            # This flag is intentionally scoped to embedding mode for now. Other
+            # prefill-only paths (for example scoring and MIS) can benefit from
+            # the same idea later, but some of them still stage K/V through the
+            # paged cache today.
+            if not self.is_embedding:
+                raise ValueError(
+                    "--prefill-only-disable-kv-cache currently requires --is-embedding. "
+                    "Other prefill-only workloads may be supported in a future change once "
+                    "their attention paths stop reading or writing the paged KV cache."
+                )
+            if self.kv_cache_dtype == "fp4_e2m1":
+                raise ValueError(
+                    "--prefill-only-disable-kv-cache does not currently support "
+                    "--kv-cache-dtype=fp4_e2m1 because the FP4 pool uses a separate "
+                    "allocation path."
+                )
+
+            # Structural preconditions for the FA backend's fa_skip_kv_cache
+            # path, which is the only embedding path that doesn't read or write
+            # the pool today:
             # - chunked_prefill_size == -1 keeps a request in a single forward,
             #   so K/V never has to be reused across prefill chunks.
             # - disable_radix_cache stops the prefix cache from indexing pool
             #   slots that no longer hold real data.
-            #
-            # We deliberately don't gate on is_embedding here; the same skip
-            # path applies to any prefill-only workload (scoring, rerank, etc.)
-            # that arranges for fa_skip_kv_cache to be active. If a user enables
-            # this flag in a mode that still does decode, NoOpMHATokenToKVPool's
-            # set_kv_buffer raises on the first cache write, surfacing the
-            # misuse loudly at the first forward instead of corrupting outputs.
             if self.chunked_prefill_size != -1:
                 raise ValueError(
                     "--prefill-only-disable-kv-cache requires --chunked-prefill-size=-1 so the FA backend "
@@ -933,6 +944,15 @@ class ServerArgs:
         # Handle multi-item scoring constraints. Must run after the above so
         # the final attention backend and chunked_prefill_size are in effect.
         self._handle_multi_item_scoring()
+
+        if self.prefill_only_disable_kv_cache:
+            prefill_backend, _ = self.get_attention_backends()
+            if prefill_backend not in ("fa3", "fa4"):
+                raise ValueError(
+                    "--prefill-only-disable-kv-cache currently requires the FA prefill backend "
+                    f"(fa3/fa4), but got prefill backend {prefill_backend!r}. Other prefill-only "
+                    "workloads and backends may be supported in a future change."
+                )
 
         # Handle Hicache settings.
         self._handle_hicache()
@@ -4386,7 +4406,7 @@ class ServerArgs:
         parser.add_argument(
             "--prefill-only-disable-kv-cache",
             action="store_true",
-            help="Skip the physical KV cache allocation for prefill-only workloads. Only valid when --is-embedding and --chunked-prefill-size=-1 are set so the FA backend takes the fa_skip_kv_cache path (no layer reads or writes the cache). The scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
+            help="Skip the physical KV cache allocation for embedding-mode prefill-only workloads. Currently only valid with --is-embedding, --chunked-prefill-size=-1, --disable-radix-cache, an FA prefill backend, and non-FP4 KV cache so the fa_skip_kv_cache path is active (no layer reads or writes the cache). Other prefill-only workloads such as scoring/MIS may benefit from this later once their attention paths stop using paged KV. Scheduler admission accounting is unchanged; per-layer K/V tensors are sized to (page_size, head_num, head_dim) placeholders so GPU memory is not wasted.",
         )
         parser.add_argument(
             "--enable-multimodal",
