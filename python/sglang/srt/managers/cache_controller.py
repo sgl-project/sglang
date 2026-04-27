@@ -322,6 +322,8 @@ class HiCacheController:
 
         self.write_stream = device_module.Stream()
         self.load_stream = device_module.Stream()
+        self.producer_stream = None
+        self.last_write_finish_event = None
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -336,6 +338,10 @@ class HiCacheController:
             except ValueError as e:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
+
+    def set_producer_stream(self, stream) -> None:
+        """Register the forward stream so write_stream can wait on it."""
+        self.producer_stream = stream
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -691,9 +697,14 @@ class HiCacheController:
         start_event = device_module.Event()
         finish_event = device_module.Event()
 
-        start_event.record()
+        current_stream = device_module.current_stream()
         with device_module.stream(self.write_stream):
-            start_event.wait(self.write_stream)
+            # Ensure write_stream waits for both schedule and forward streams
+            # before reading KV data for D2H transfer.
+            self.write_stream.wait_stream(current_stream)
+            if self.producer_stream is not None:
+                self.write_stream.wait_stream(self.producer_stream)
+            start_event.record()
             self.mem_pool_host.backup_from_device_all_layer(
                 self.mem_pool_device, host_indices, device_indices, self.io_backend
             )
@@ -705,6 +716,10 @@ class HiCacheController:
                 host_indices.record_stream(self.write_stream)
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_stream)
+
+        # Expose finish event so scheduler can fence forward_stream
+        # before the next forward kernel launch.
+        self.last_write_finish_event = finish_event
 
         self.ack_write_queue.append(HiCacheAck(start_event, finish_event, op.node_ids))
 
