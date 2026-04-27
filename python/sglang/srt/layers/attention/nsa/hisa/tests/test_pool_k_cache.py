@@ -72,6 +72,9 @@ def make_mini_pool(
     pool.req_to_pool_page = HisaReqToPoolPagePool(max_req, max_pool_pages_per_req, DEVICE)
     pool._scratch_prev_lens_i32 = torch.zeros(max_req, dtype=torch.int32, device=DEVICE)
     pool._scratch_new_lens_i32 = torch.zeros(max_req, dtype=torch.int32, device=DEVICE)
+    pool._pool_watermark_i32 = torch.zeros(
+        (layer_num, max_req), dtype=torch.int32, device=DEVICE,
+    )
     return pool
 
 
@@ -173,6 +176,131 @@ def test_alloc_for_decode_crossing_page():
     print("    alloc_for_decode_crossing_page OK: 1 → 2 pages")
 
 
+def test_alloc_for_extend_prefix_cache_hit():
+    """Regression test for the cache-hit stale-page bug (A4a).
+
+    Scenario: req 0 allocates 3 pool pages, finishes, frees. Then enough
+    other requests run to circle the FIFO free list back to req 0's
+    pages — those page IDs become LIVE under different ownership. Now
+    req 0's slot is reused by a NEW request that arrives with a
+    prefix-cache hit (prefix_lens > 0). The new alloc must allocate
+    FRESH pool pages covering the prefix range — not skip the prefix
+    alloc and leave ``req_to_pool_page[0, 0..prev_pages]`` pointing at
+    page IDs that are NOW LIVE under another request, which the
+    "always pool from 0" mitigation would then corrupt.
+    """
+    # Pool sized so that consecutive non-cache-hit allocs drain the
+    # fresh pages, forcing the FIFO allocator to recycle req 0's freed
+    # page IDs to a different request.
+    pool = make_mini_pool(num_pages=64, k_block_size=128, max_req=8,
+                          num_pool_pages_global=9)
+    # req 0: alloc 3 → [0,1,2], free.
+    pool.alloc_pool_pages_for_extend(
+        req_pool_indices=[0], prefix_lens=[0], seq_lens=[20000],
+    )
+    ids_r0 = pool.req_to_pool_page.get_ids(0).clone()
+    assert ids_r0.numel() == 3 and ids_r0.tolist() == [0, 1, 2]
+    pool.free_req_pool_pages(0)
+
+    # Drain the 6 fresh pages so allocator's free list cycles back
+    # to ids_r0 = [0, 1, 2] for the next allocation.
+    pool.alloc_pool_pages_for_extend(
+        req_pool_indices=[1], prefix_lens=[0], seq_lens=[20000],
+    )
+    ids_r1 = pool.req_to_pool_page.get_ids(1).clone()  # [3, 4, 5]
+    pool.alloc_pool_pages_for_extend(
+        req_pool_indices=[2], prefix_lens=[0], seq_lens=[20000],
+    )
+    ids_r2 = pool.req_to_pool_page.get_ids(2).clone()  # [6, 7, 8]
+
+    # req 3 grabs page 0 (formerly req 0's slot 0). It is now LIVE.
+    pool.alloc_pool_pages_for_extend(
+        req_pool_indices=[3], prefix_lens=[0], seq_lens=[100],
+    )
+    ids_r3 = pool.req_to_pool_page.get_ids(3).clone()  # [0]
+    assert 0 in ids_r3.tolist(), (
+        f"setup failure: page 0 not recycled to req 3, got {ids_r3.tolist()}"
+    )
+
+    # Slot 0 in req_to_pool_page still holds the stale [0, 1, 2] from
+    # the freed req 0 — and page 0 is now ALIVE under req 3.
+    stale_row = pool.req_to_pool_page.req_to_pool_page[0, :3].tolist()
+    assert stale_row == [0, 1, 2]
+
+    # Now: req 0 slot reused with a CACHE HIT. Buggy code would compute
+    # prev_pages=ceil(4096/8192)=1, alloc only 1 page for the new range,
+    # and leave req_to_pool_page[0, 0] = 0 — aliasing req 3's live page.
+    pool.alloc_pool_pages_for_extend(
+        req_pool_indices=[0], prefix_lens=[4096], seq_lens=[10000],
+    )
+    ids_r0_v2 = pool.req_to_pool_page.get_ids(0).clone()
+    # Fix expectation: 2 pool pages covering the full [0, 10000) range.
+    assert ids_r0_v2.numel() == 2, f"expected 2 pages, got {ids_r0_v2.numel()}"
+
+    # Critical: slot 0 of req 0's table must NOT alias any LIVE page of
+    # any other request. With the bug, slot 0 would still be 0 (== r3's
+    # live page).
+    live_pages = set(ids_r1.tolist() + ids_r2.tolist() + ids_r3.tolist())
+    r0_v2_pages = set(ids_r0_v2.tolist())
+    overlap = r0_v2_pages & live_pages
+    assert not overlap, (
+        f"FRESH alloc must not collide with live pages: "
+        f"r0_v2={ids_r0_v2.tolist()} live={sorted(live_pages)} overlap={overlap}"
+    )
+    # And the actual stored slot 0 must hold one of r0_v2's IDs (fresh).
+    slot0 = int(pool.req_to_pool_page.req_to_pool_page[0, 0].item())
+    assert slot0 in r0_v2_pages, (
+        f"slot 0 = {slot0} not in fresh alloc {sorted(r0_v2_pages)}"
+    )
+    assert slot0 not in live_pages, (
+        f"slot 0 = {slot0} aliases live page (would corrupt that req)"
+    )
+    print(
+        f"    cache-hit fresh-alloc OK: r0_v2={ids_r0_v2.tolist()}, "
+        f"slot 0 = {slot0} disjoint from live={sorted(live_pages)}"
+    )
+
+
+def test_pool_watermark_advance_and_reset():
+    """A4b: watermark advances on extend, resets to 0 on free."""
+    pool = make_mini_pool(num_pages=64, k_block_size=128, max_req=4,
+                          layer_num=2, num_pool_pages_global=8)
+    K = pool.k_block_size  # 128
+    # Initial state: all watermarks zero.
+    assert pool._pool_watermark_i32.eq(0).all()
+
+    pool.alloc_pool_pages_for_extend(
+        req_pool_indices=[0, 1], prefix_lens=[0, 0], seq_lens=[10000, 5000],
+    )
+    # Simulate extend store hook for layer 0.
+    new_seq = torch.tensor([10000, 5000], dtype=torch.int32, device=DEVICE)
+    req_idx = torch.tensor([0, 1], dtype=torch.int64, device=DEVICE)
+    pool.advance_pool_watermark(layer_id=0, req_pool_indices=req_idx,
+                                new_seq_lens=new_seq)
+    # Watermark = floor(seq, K). 10000 // 128 * 128 = 9984; 5000 // 128 * 128 = 4992.
+    wm = pool._pool_watermark_i32
+    assert int(wm[0, 0]) == 9984, f"got {int(wm[0, 0])}"
+    assert int(wm[0, 1]) == 4992, f"got {int(wm[0, 1])}"
+    # Layer 1 untouched.
+    assert int(wm[1, 0]) == 0
+    assert int(wm[1, 1]) == 0
+
+    # Read-back via load_extend_prev_seq_lens_from_watermark.
+    out_prev = torch.zeros(2, dtype=torch.int32, device=DEVICE)
+    pool.load_extend_prev_seq_lens_from_watermark(
+        layer_id=0, req_pool_indices=req_idx, out_prev=out_prev,
+    )
+    assert out_prev.tolist() == [9984, 4992]
+
+    # Free req 0 → watermark for req 0 resets across all layers.
+    pool.free_req_pool_pages(0)
+    assert int(wm[0, 0]) == 0
+    assert int(wm[1, 0]) == 0
+    # req 1 untouched.
+    assert int(wm[0, 1]) == 4992
+    print("    pool_watermark_advance_and_reset OK")
+
+
 def test_free_req_pool_pages():
     pool = make_mini_pool(num_pages=32, k_block_size=128)
     pool.alloc_pool_pages_for_extend(
@@ -271,6 +399,8 @@ TESTS = [
     ("allocator_basic", test_allocator_basic),
     ("req_to_pool_page_mapping", test_req_to_pool_page_mapping),
     ("alloc_for_extend_single_chunk", test_alloc_for_extend_single_chunk),
+    ("alloc_for_extend_prefix_cache_hit", test_alloc_for_extend_prefix_cache_hit),
+    ("pool_watermark_advance_and_reset", test_pool_watermark_advance_and_reset),
     ("alloc_for_decode_crossing_page", test_alloc_for_decode_crossing_page),
     ("free_req_pool_pages", test_free_req_pool_pages),
     ("update_pool_for_completed_blocks_v3", test_update_pool_for_completed_blocks_v3),

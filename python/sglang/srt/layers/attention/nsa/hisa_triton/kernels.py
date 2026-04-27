@@ -114,9 +114,12 @@ def _batch_pool_mqa_kernel(
     pos_mask_valid = (k_offs < k_e) & k_mask
     pos_mask_maintain = ((k_offs == 0) | (k_offs == (k_e - 1))) & k_mask
     # Start with -inf, overwrite with logits where valid, then set +inf at
-    # position 0 and last-valid pos.
-    out = tl.where(pos_mask_valid, logits, float("-inf"))
-    out = tl.where(pos_mask_maintain, float("inf"), out)
+    # position 0 and last-valid pos. Single nested tl.where (D4 pattern —
+    # let triton compiler emit one fused select chain).
+    out = tl.where(
+        pos_mask_maintain, float("inf"),
+        tl.where(pos_mask_valid, logits, float("-inf")),
+    )
 
     # --- Store ---
     logits_ptrs = Logits_ptr + b * stride_logits_b + k_offs * stride_logits_n
@@ -567,13 +570,16 @@ def _batch_decode_pool_mqa_v3_kernel(
     logits = tl.sum(s, axis=1)  # [PP] f32
 
     # Mask by ContextLensPool: positions >= k_e become -inf, and apply
-    # force_maintain (+inf at pos 0 and at k_e - 1).
+    # force_maintain (+inf at pos 0 and at k_e - 1). Single nested
+    # tl.where → one select chain instead of two.
     k_e = tl.load(ContextLensPool_ptr + b)
     pool_idx = lp * PP + bn_offs
     pos_valid = pool_idx < k_e
     pos_maintain = (pool_idx == 0) | (pool_idx == (k_e - 1))
-    logits = tl.where(pos_valid, logits, float("-inf"))
-    logits = tl.where(pos_maintain, float("inf"), logits)
+    logits = tl.where(
+        pos_maintain, float("inf"),
+        tl.where(pos_valid, logits, float("-inf")),
+    )
 
     tl.store(
         Logits_ptr + b * stride_logits_b + pool_idx * stride_logits_n,

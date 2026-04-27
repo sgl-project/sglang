@@ -16,9 +16,13 @@ Legend: `[ ]` pending, `[/]` in progress, `[x]` done, `[?]` needs investigation.
 
 At B=64 we're at ~73% of HBM peak bandwidth already. At B=1-8 we're launch/occupancy-limited, not bandwidth-limited.
 
-Tried optimizations (2026-04-24):
+Tried optimizations (2026-04-24, 2026-04-25):
 1. `[~]` **Pipeline stages (`num_stages=2/3`)** — NO WIN. Both sparse_paged and v3 kernels are 1-tile-per-CTA with no inner loop; nothing to overlap. `num_stages=3 + num_warps=4` regressed B=1 by 40%. Reverted.
 2. `[~]` **Q reuse via chunked topk (A1)** — NO WIN. Tested CHUNK ∈ {1, 2, 4, 8, 16} with `tl.range(num_stages=2)`. Best case: CHUNK=2 at B=64 saved 5%; all other configs equal-or-worse. Root cause: at small B the kernel is instruction-latency-bound (Q bandwidth isn't the bottleneck); at B=64 we're near HBM peak anyway. Reverted.
+7. `[x]` **Merge two `tl.where` calls into nested expression (D4)** — WORKS on v3 kernel: 12-22% faster across all (B, num_pool). Same trick FAILED to help on sparse_paged (only one tl.where there) and FAILED to help on v3's post-GEMM mul/max/mul (D9: +1μs regression). Conclusion: the benefit is specific to merging sequential **control-flow selects** (where chains), not arithmetic chains.
+8. `[~]` **`cache_modifier=".ca"` for read-only metadata loads (D6)** — NO WIN. v3 kernel +1-2 μs (10-25% slower); sparse_paged neutral. Triton's default LDG already routes small read-only loads through L1 read-only cache on H100; explicit .ca perturbs codegen. Reverted.
+9. `[~]` **Drop `q.trans(1, 0)` (D5)** — NO WIN. Two variants: (a) hoist `tl.trans(q)` early — neutral; (b) swap GEMM direction `tl.dot(q, k.T)` with reduce axis=0 — large regression (B=64 +30%). Triton's `q.trans(1, 0)` in tl.dot is a free WGMMA descriptor hint, not a register shuffle. Reverted.
+10. `[~]` **Simplify `pos_valid` mask (D8)** — counter-intuitive REGRESSION. Dropping the `(k_i >= 0)` clause (redundant given valid_page) made B=1/B=8 -18~20% SLOWER. Triton picked a different codegen path. Reverted.
 3. `[ ]` **`nsys profile` on one real workload** to determine memory- vs compute-bound. Numbers we need: HBM throughput (GB/s vs H200's 4.8 TB/s peak), SM occupancy, L2 hit rate. Informs all downstream moves. Still useful to quantify.
 4. `[ ]` **Warp specialization (producer/consumer warps)** — FlashMLA / DeepGEMM (`sm90_fp8_paged_mqa_logits`) use kNumTMAThreads + kNumMathThreads pattern w/ mbarrier sync. Potentially 30-50% win, but requires switching back to tilelang (triton doesn't expose `cp.async.bulk`) and 1-2 weeks of work. Hold until/unless sparse_paged shows up as the hotspot in a real profile.
 5. `[ ]` **Persistent kernel (A2)** — expected win dominated by launch overhead savings. Under CUDA graph replay (production decode), launch overhead is ~0. Non-graph (prefill, warmup): could save ~60μs per call. Low ROI.

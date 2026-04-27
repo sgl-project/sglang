@@ -700,7 +700,11 @@ class HisaIndexer(MultiPlatformOp):
                 )
 
     def _should_chunk_mqa_logits(
-        self, num_q: int, num_k: int, device: torch.device
+        self,
+        num_q: int,
+        num_k: int,
+        device: torch.device,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> Tuple[bool, int]:
         """
         Detect whether we need to chunk the MQA logits computation to avoid OOM
@@ -721,6 +725,12 @@ class HisaIndexer(MultiPlatformOp):
         - coord_transform output [M, index_topk] int32              = 4 * M * index_topk
           (The triton kernel keeps abs_block/raw/valid in registers — no
            int64 intermediate materialization as before the fusion.)
+
+        Cache (D13): when ``forward_batch`` is provided, the (need_chunk,
+        free_mem) result is memoized on it keyed by (num_q, num_k) so the
+        per-forward cudaMemGetInfo cost is paid once instead of 61× per
+        forward. profile showed mem_get_info accounting for ~24 GS of CPU
+        time across the bench (770μs × 31232 calls).
         """
         hisa_cols = self.hisa_block_topk * self.hisa_k_block_size
         pool_cols = (num_k + self.hisa_k_block_size - 1) // self.hisa_k_block_size
@@ -745,9 +755,19 @@ class HisaIndexer(MultiPlatformOp):
         if peak_bytes < 32_000_000:
             return False, 0
 
+        # Per-forward cache: same (num_q, num_k) across all 61 layers in one
+        # forward → query free memory once and reuse.
+        cache_key = (num_q, num_k)
+        if forward_batch is not None:
+            cache = getattr(forward_batch, "_hisa_chunk_decision_cache", None)
+            if cache is not None and cache[0] == cache_key:
+                return cache[1], cache[2]
+
         free_mem, total_mem = torch.cuda.mem_get_info(device)
         # Peak should not exceed 50% of free memory or 30% of total memory.
         need_chunk = (peak_bytes * 2 > free_mem) or (peak_bytes > total_mem * 0.3)
+        if forward_batch is not None:
+            forward_batch._hisa_chunk_decision_cache = (cache_key, need_chunk, free_mem)
         return need_chunk, free_mem
 
     def _get_topk_ragged(
@@ -826,7 +846,9 @@ class HisaIndexer(MultiPlatformOp):
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
-        need_chunk, free_mem = self._should_chunk_mqa_logits(q_offset, k_offset, device)
+        need_chunk, free_mem = self._should_chunk_mqa_logits(
+            q_offset, k_offset, device, forward_batch=forward_batch,
+        )
 
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
@@ -1264,28 +1286,42 @@ class HisaIndexer(MultiPlatformOp):
             # arrive int32 (captured decode) or int64 (prefill); copy_ casts.
             prev_scratch = kv_pool._scratch_prev_lens_i32[:B]
             new_scratch = kv_pool._scratch_new_lens_i32[:B]
-            new_scratch.copy_(seq_lens_src)
+            # seq_lens doesn't change across layers within one forward, so
+            # only refresh new_scratch on the first hisa layer (D12). Other
+            # layers reuse the value from the same step. Under CUDA-graph
+            # capture both branches are captured but only the first-layer
+            # one is hot; under non-graph this is ~60 fewer copies/step.
+            if layer_id == kv_pool.start_layer:
+                new_scratch.copy_(seq_lens_src)
 
-            # Extend path: ALWAYS pool from 0 so that any prefix-cached
-            # blocks (K already in main buffer from a previous request
-            # sharing this prefix, but pool_k_pages were never written for
-            # this request's freshly-allocated pool pages) get warmed up.
-            # Redundant-but-idempotent for same-request chunked prefill
-            # (blocks already pooled get recomputed to the same values).
-            # Decode path: prev = new - 1 (pure 1-token steps).
+            # Decode: prev = new - 1 (single-token steps).
+            # Extend (A4b): prev = pool_watermark[layer, req] — only pool
+            # newly completed K blocks since the last extend. Cache-hit
+            # reuse of a slot is correct because free resets watermark
+            # to 0, so the new request will pool [0, new_seq) covering
+            # its full prefix. After update_pool, advance the watermark.
             if forward_batch.forward_mode.is_decode_or_idle():
-                prev_scratch.fill_(0)
+                # torch.sub(out=) overwrites prev_scratch unconditionally,
+                # so no fill_(0) needed first.
                 torch.sub(new_scratch, 1, out=prev_scratch)
                 max_pool_per_req_grid = 2
+                advance_watermark = False
             else:
-                prev_scratch.zero_()
-                # Grid y must cover ``max new_complete`` across the batch —
-                # for cross-request prefix-cache hits this can be >>> the
-                # chunk's own new tokens.
+                kv_pool.load_extend_prev_seq_lens_from_watermark(
+                    layer_id=layer_id,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    out_prev=prev_scratch,
+                )
+                # Grid y bound: max(new_complete - prev_complete) + 1 =
+                # max( ceildiv(new) - floor(prev,K)/K ) + 1. With
+                # watermark = floor(prev,K), the worst case is
+                # ceildiv(new_seq) - floor(prev_seq,K)/K. Compute a safe
+                # upper bound from seq_lens_cpu.
                 max_new_seq = int(forward_batch.seq_lens_cpu.max().item())
                 max_pool_per_req_grid = (
                     max_new_seq + kv_pool.k_block_size - 1
                 ) // kv_pool.k_block_size + 1
+                advance_watermark = True
 
             kv_pool.update_pool_for_completed_blocks(
                 layer_id=layer_id,
@@ -1295,6 +1331,12 @@ class HisaIndexer(MultiPlatformOp):
                 new_seq_lens=new_scratch,
                 max_pool_per_req_grid=max_pool_per_req_grid,
             )
+            if advance_watermark:
+                kv_pool.advance_pool_watermark(
+                    layer_id=layer_id,
+                    req_pool_indices=forward_batch.req_pool_indices,
+                    new_seq_lens=new_scratch,
+                )
 
     def forward_cuda(
         self,

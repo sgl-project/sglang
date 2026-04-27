@@ -207,6 +207,21 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
             (max_running_requests, max_pool_pages_per_req),
             dtype=torch.int32, device=self.device,
         )
+        # Per-layer pool watermark: ``pool_watermark[layer, req]`` is the
+        # token position up to which we've already mean-pooled K for that
+        # (layer, request). On the next extend we only pool from the
+        # watermark forward, instead of re-pooling [0, new_seq) every
+        # time (the previous mitigation for the prefix-cache bug; see
+        # A4a). Watermark resets to 0 on free, so a slot reused by a
+        # cache-hit request naturally pools its full prefix range.
+        # Per-layer (not shared) because layers run sequentially and
+        # each layer's update_pool both reads and writes the watermark —
+        # a shared watermark would be advanced by layer 0 and silently
+        # skip layers 1..N-1.
+        self._pool_watermark_i32 = torch.zeros(
+            (self.layer_num, max_running_requests),
+            dtype=torch.int32, device=self.device,
+        )
 
         logger.info(
             "HisaNSATokenToKVPool(v3): k_block_size=%d, pool_page_size=%d, "
@@ -238,14 +253,27 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         covers ``pool_page_size * k_block_size`` real tokens.
 
         Called right after ``alloc_for_extend``'s main-buffer alloc.
+
+        Uses ``num_pool_pages_cpu[req_idx]`` (the actual count of allocated
+        pool pages on this slot) as the start of the new alloc, NOT
+        ``ceildiv(prefix_lens)``. This is critical for prefix-cache hits:
+        a freshly-reused slot has ``num_pages_cpu == 0`` even though
+        ``prefix_lens > 0``, so we (correctly) allocate fresh pool pages
+        for the prefix range. The old behaviour skipped that alloc and
+        left ``req_to_pool_page[req_idx, 0..prev_pages]`` pointing at the
+        previous tenant's pool pages — which the "pool from 0" mitigation
+        in ``_store_index_k_cache`` then wrote through, corrupting other
+        requests' pool data. ``prefix_lens`` is now unused but kept in the
+        signature for caller compatibility.
         """
+        del prefix_lens  # see docstring
         K = self.k_block_size
         P = self.pool_page_size
         tokens_per_page = K * P
         for i, req_idx in enumerate(req_pool_indices):
-            prev_pages = self._ceildiv(prefix_lens[i], tokens_per_page)
+            existing_pages = self.req_to_pool_page.num_pages(req_idx)
             new_pages = self._ceildiv(seq_lens[i], tokens_per_page)
-            num_new = new_pages - prev_pages
+            num_new = new_pages - existing_pages
             if num_new <= 0:
                 continue
             new_page_ids = self.pool_page_allocator.alloc(num_new)
@@ -254,7 +282,7 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
                     f"HisaPoolPageAllocator OOM on extend: need {num_new}, "
                     f"have {self.pool_page_allocator.available_size()}"
                 )
-            self.req_to_pool_page.write(req_idx, prev_pages, new_page_ids)
+            self.req_to_pool_page.write(req_idx, existing_pages, new_page_ids)
 
     def alloc_pool_pages_for_decode(
         self,
@@ -287,10 +315,56 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
         if ids.numel() > 0:
             self.pool_page_allocator.free(ids)
         self.req_to_pool_page.free(req_pool_idx)
+        # Reset watermark across all layers so a cache-hit reuse of this
+        # slot pools its full prefix range from 0 (see A4b).
+        self._pool_watermark_i32[:, req_pool_idx] = 0
 
     # ------------------------------------------------------------------
     # Store-side hook (called per layer from HisaIndexer._store_index_k_cache)
     # ------------------------------------------------------------------
+
+    def load_extend_prev_seq_lens_from_watermark(
+        self,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        out_prev: torch.Tensor,
+    ) -> None:
+        """Fill ``out_prev[:B] = pool_watermark[layer_local, req_pool_indices]``.
+
+        Used by the extend path of ``_store_index_k_cache`` so each layer's
+        update_pool only re-pools blocks from the last-pooled position
+        forward, instead of starting from 0 every time. ``out_prev`` must
+        be sized at least ``[B]`` and dtype int32 (passed-through
+        ``_scratch_prev_lens_i32[:B]``).
+        """
+        layer_local = layer_id - self.start_layer
+        torch.index_select(
+            self._pool_watermark_i32[layer_local], 0, req_pool_indices,
+            out=out_prev,
+        )
+
+    def advance_pool_watermark(
+        self,
+        layer_id: int,
+        req_pool_indices: torch.Tensor,
+        new_seq_lens: torch.Tensor,
+    ) -> None:
+        """Advance ``pool_watermark[layer, req] = floor(new_seq_lens, K)``.
+
+        Called after ``update_pool_for_completed_blocks`` on the extend
+        path. Floors to the K-block boundary because update_pool only
+        writes COMPLETED blocks; the residual tail (seq_len % K tokens)
+        is the responsibility of ``tail_only_v3``.
+        """
+        layer_local = layer_id - self.start_layer
+        K = self.k_block_size
+        new_floored = (new_seq_lens // K) * K
+        # int32 indices are accepted by index_copy_ as long as the source
+        # is int32 and target is int32.
+        idx = req_pool_indices
+        if idx.dtype != torch.int64:
+            idx = idx.to(torch.int64)
+        self._pool_watermark_i32[layer_local].index_copy_(0, idx, new_floored)
 
     def update_pool_for_completed_blocks(
         self,
