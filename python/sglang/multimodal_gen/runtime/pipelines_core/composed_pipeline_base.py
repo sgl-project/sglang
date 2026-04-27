@@ -739,3 +739,28 @@ class ComposedPipelineBase(ABC):
             )
 
         return self.executor.execute_with_profiling(self.stages, batch, server_args)
+
+    @torch.no_grad()
+    def forward_batch(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        if len(batches) == 1:
+            return [self.forward(batches[0], server_args)]
+
+        if self.is_lora_set() and not self.is_lora_effective():
+            logger.warning(
+                "LoRA adapter is set, but not effective. Please make sure the LoRA weights are merged"
+            )
+
+        if not batches[0].is_warmup and not batches[0].suppress_logs:
+            logger.info(
+                "Running grouped pipeline stages: %s",
+                list(self._stage_name_mapping.keys()),
+                main_process_only=True,
+            )
+
+        return self.executor.execute_group_with_profiling(
+            self.stages, batches, server_args
+        )

@@ -8,11 +8,15 @@ This module contains implementations of timestep preparation stages for diffusio
 """
 
 import inspect
+from dataclasses import dataclass
 from typing import Any, Callable, Tuple
 
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    get_or_create_request_scheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -30,6 +34,17 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class TimestepPreparationFingerprint:
+    num_inference_steps: int
+    timesteps: Any
+    sigmas: Any
+    n_tokens: int | None
+    height: int | None
+    width: int | None
+    num_frames: int | None
+
+
 class TimestepPreparationStage(PipelineStage):
     """
     Stage for preparing timesteps for the diffusion process.
@@ -37,6 +52,10 @@ class TimestepPreparationStage(PipelineStage):
     This stage handles the preparation of the timestep sequence that will be used
     during the diffusion process.
     """
+
+    deduplicated_tensor_tree_output_fields = ("timesteps", "sigmas")
+    deduplicated_deepcopy_output_fields = ("scheduler",)
+    deduplicated_extra_tensor_tree_output_keys = ("mu",)
 
     def __init__(
         self,
@@ -68,7 +87,10 @@ class TimestepPreparationStage(PipelineStage):
         Returns:
             The batch with prepared timesteps.
         """
-        scheduler = self.scheduler
+        if batch.scheduler is not None and batch.timesteps is not None:
+            return batch
+
+        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
         timesteps = batch.timesteps
@@ -133,9 +155,23 @@ class TimestepPreparationStage(PipelineStage):
 
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
+        batch.scheduler = scheduler
         if not batch.is_warmup:
             self.log_debug("timesteps: %s", timesteps)
         return batch
+
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> TimestepPreparationFingerprint:
+        return TimestepPreparationFingerprint(
+            num_inference_steps=batch.num_inference_steps,
+            timesteps=self.freeze_for_dedup(batch.timesteps),
+            sigmas=self.freeze_for_dedup(batch.sigmas),
+            n_tokens=batch.n_tokens,
+            height=batch.height,
+            width=batch.width,
+            num_frames=batch.num_frames,
+        )
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify timestep preparation stage inputs."""

@@ -17,6 +17,8 @@ from sglang.srt.mem_cache.memory_pool_host import (
 )
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
     from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
@@ -94,6 +96,8 @@ def build_kv_only_stack(
     page_size: int,
     tp_group,
     load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
@@ -131,6 +135,8 @@ def build_kv_only_stack(
         page_size,
         tp_group,
         load_cache_event=load_cache_event,
+        attn_cp_group=attn_cp_group,
+        attn_tp_group=attn_tp_group,
         write_policy=server_args.hicache_write_policy,
         io_backend=server_args.hicache_io_backend,
         storage_backend=storage_backend,
@@ -158,6 +164,8 @@ def build_hybrid_mamba_stack(
     page_size: int,
     tp_group,
     load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     host_mamba_evict_fn: Optional[Callable[[int], Any]] = None,
@@ -211,6 +219,8 @@ def build_hybrid_mamba_stack(
         page_size,
         tp_group,
         load_cache_event=load_cache_event,
+        attn_cp_group=attn_cp_group,
+        attn_tp_group=attn_tp_group,
         write_policy=server_args.hicache_write_policy,
         io_backend=server_args.hicache_io_backend,
         storage_backend=storage_backend,
@@ -237,6 +247,8 @@ def build_shared_anchor_stack(
     page_size: int,
     tp_group,
     load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
     storage_backend: Optional[str],
     use_mla: bool,
     override_kv_cache_dim: Optional[int] = None,
@@ -284,6 +296,8 @@ def build_shared_anchor_stack(
         page_size,
         tp_group,
         load_cache_event=load_cache_event,
+        attn_cp_group=attn_cp_group,
+        attn_tp_group=attn_tp_group,
         write_policy=server_args.hicache_write_policy,
         io_backend=server_args.hicache_io_backend,
         storage_backend=storage_backend,
@@ -306,6 +320,8 @@ def attach_hybrid_pool_to_unified_cache(
     server_args: ServerArgs,
     *,
     load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -342,6 +358,8 @@ def attach_hybrid_pool_to_unified_cache(
                 page_size=cache.page_size,
                 tp_group=params.tp_cache_group,
                 load_cache_event=load_cache_event,
+                attn_cp_group=attn_cp_group,
+                attn_tp_group=attn_tp_group,
                 storage_backend=None,
                 use_mla=use_mla,
                 host_mamba_evict_fn=lambda n: cache.evict_host(n, ComponentType.MAMBA),
@@ -375,6 +393,8 @@ def attach_hybrid_pool_to_unified_cache(
                 page_size=cache.page_size,
                 tp_group=params.tp_cache_group,
                 load_cache_event=load_cache_event,
+                attn_cp_group=attn_cp_group,
+                attn_tp_group=attn_tp_group,
                 storage_backend=None,
                 use_mla=use_mla,
                 pp_rank=params.pp_rank,
@@ -411,6 +431,8 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
     prefetch_threshold: int,
     enable_storage_metrics: bool,
     load_cache_event,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> None:
     """Attach HostPoolGroup (KV + indexer) + HybridCacheController for HiRadixCache.
 
@@ -428,6 +450,8 @@ def attach_hybrid_nsa_pool_to_hiradix_cache(
             page_size=radix_cache.page_size,
             tp_group=radix_cache.tp_group,
             load_cache_event=load_cache_event,
+            attn_cp_group=attn_cp_group,
+            attn_tp_group=attn_tp_group,
             storage_backend=server_args.hicache_storage_backend,
             use_mla=True,
             prefetch_threshold=prefetch_threshold,
@@ -467,6 +491,8 @@ def attach_hybrid_pool_to_mamba_cache(
     prefetch_threshold: int,
     load_cache_event,
     enable_storage_metrics: bool = False,
+    attn_cp_group: Optional["torch.distributed.ProcessGroup"] = None,
+    attn_tp_group: Optional["torch.distributed.ProcessGroup"] = None,
 ) -> None:
     """Attach HostPoolGroup (KV + Mamba) + HybridCacheController for HiMambaRadixCache.
 
@@ -487,6 +513,8 @@ def attach_hybrid_pool_to_mamba_cache(
             page_size=params.page_size,
             tp_group=params.tp_cache_group,
             load_cache_event=load_cache_event,
+            attn_cp_group=attn_cp_group,
+            attn_tp_group=attn_tp_group,
             storage_backend=server_args.hicache_storage_backend,
             use_mla=hybrid_kv.use_mla,
             host_mamba_evict_fn=mamba_cache.evict_mamba_host,
