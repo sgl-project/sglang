@@ -73,6 +73,7 @@ from sglang.srt.utils import (
     make_layers,
     maybe_torch_compile,
 )
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -450,7 +451,7 @@ class MQALayer(nn.Module):
             assert self.head_dim == config.v_head_dim
         assert config.num_key_value_heads == 1
 
-        rope_scaling = config.rope_scaling
+        rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
@@ -458,9 +459,7 @@ class MQALayer(nn.Module):
             assert (
                 config.compress_rope_theta == 160000
             ), f"{config.compress_rope_theta=}"
-        rope_base = (
-            config.compress_rope_theta if self.compress_ratio else config.rope_theta
-        )
+        rope_base = config.compress_rope_theta if self.compress_ratio else rope_theta
 
         self.rotary_emb = get_rope_wrapper(
             head_size=self.rope_head_dim,
