@@ -68,6 +68,10 @@ TensorMetadata = namedtuple("TensorMetadata", ["device", "dtype", "size"])
 # use int value instead of ReduceOp.SUM to support torch compile
 REDUCE_OP_SUM = int(torch.distributed.ReduceOp.SUM)
 
+# Reuse the user-provided distributed timeout for model-parallel subgroup
+# creation so runtime collectives do not silently fall back to backend defaults.
+_MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
+
 
 def get_torch_distributed_pg_options(group_name=None):
     if not _is_npu:
@@ -277,6 +281,7 @@ class GroupCoordinator:
         for ranks in group_ranks:
             active_ranks = torch.ones(len(ranks), dtype=torch.int32, device=self.device)
             active_ranks_cpu = torch.ones(len(ranks), dtype=torch.int32)
+            subgroup_timeout = _MODEL_PARALLEL_GROUP_TIMEOUT
             if "mooncake" in torch_distributed_backend:
                 from mooncake.ep import MooncakeBackendOptions
 
@@ -284,16 +289,21 @@ class GroupCoordinator:
                     ranks,
                     backend="mooncake",
                     pg_options=MooncakeBackendOptions(active_ranks),
+                    timeout=subgroup_timeout,
                 )
                 cpu_group = torch.distributed.new_group(
                     ranks,
                     backend="mooncake-cpu",
                     pg_options=MooncakeBackendOptions(active_ranks_cpu),
+                    timeout=subgroup_timeout,
                 )
             else:
                 pg_options = get_torch_distributed_pg_options(group_name)
                 device_group = torch.distributed.new_group(
-                    ranks, backend=torch_distributed_backend, pg_options=pg_options
+                    ranks,
+                    backend=torch_distributed_backend,
+                    pg_options=pg_options,
+                    timeout=subgroup_timeout,
                 )
                 # a group with `gloo` backend, to allow direct coordination
                 # between processes through the CPU.
@@ -1662,6 +1672,7 @@ def init_distributed_environment(
         mooncake_ep.set_host_ip(get_local_ip_auto())
 
     if not torch.distributed.is_initialized():
+        global _MODEL_PARALLEL_GROUP_TIMEOUT
         assert distributed_init_method is not None, (
             "distributed_init_method must be provided when initializing "
             "distributed environment"
@@ -1670,7 +1681,7 @@ def init_distributed_environment(
             assert isinstance(timeout, (int)), "timeout must be a number"
             assert timeout > 0, "timeout must be positive"
             timeout = timedelta(seconds=timeout)
-
+        _MODEL_PARALLEL_GROUP_TIMEOUT = timeout
         pg_options = get_torch_distributed_pg_options()
 
         # this backend is used for WORLD
@@ -2231,10 +2242,11 @@ def destroy_model_parallel():
 
 
 def destroy_distributed_environment():
-    global _WORLD
+    global _WORLD, _MODEL_PARALLEL_GROUP_TIMEOUT
     if _WORLD:
         _WORLD.destroy()
     _WORLD = None
+    _MODEL_PARALLEL_GROUP_TIMEOUT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
 
@@ -2339,20 +2351,20 @@ vllm_get_world_group = None
 
 def monkey_patch_vllm_parallel_state(reverse: bool = False):
     try:
-        import vllm.distributed.parallel_state as vllm_parrlel_state
+        import vllm.distributed.parallel_state as vllm_parallel_state
     except ImportError:
         return
 
     global vllm_get_pp_group, vllm_get_tp_group, vllm_get_world_group
     if vllm_get_pp_group is None:
-        vllm_get_pp_group = vllm_parrlel_state.get_pp_group
-        vllm_get_tp_group = vllm_parrlel_state.get_tp_group
-        vllm_get_world_group = vllm_parrlel_state.get_world_group
+        vllm_get_pp_group = vllm_parallel_state.get_pp_group
+        vllm_get_tp_group = vllm_parallel_state.get_tp_group
+        vllm_get_world_group = vllm_parallel_state.get_world_group
     if reverse:
-        setattr(vllm_parrlel_state, "get_pp_group", vllm_get_pp_group)
-        setattr(vllm_parrlel_state, "get_tp_group", vllm_get_tp_group)
-        setattr(vllm_parrlel_state, "get_world_group", vllm_get_world_group)
+        setattr(vllm_parallel_state, "get_pp_group", vllm_get_pp_group)
+        setattr(vllm_parallel_state, "get_tp_group", vllm_get_tp_group)
+        setattr(vllm_parallel_state, "get_world_group", vllm_get_world_group)
     else:
-        setattr(vllm_parrlel_state, "get_pp_group", get_pp_group)
-        setattr(vllm_parrlel_state, "get_tp_group", get_tp_group)
-        setattr(vllm_parrlel_state, "get_world_group", get_world_group)
+        setattr(vllm_parallel_state, "get_pp_group", get_pp_group)
+        setattr(vllm_parallel_state, "get_tp_group", get_tp_group)
+        setattr(vllm_parallel_state, "get_world_group", get_world_group)
