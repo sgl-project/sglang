@@ -10,7 +10,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sglang-kernel"
-version = "0.4.1"
+version = "0.4.1.post1"
 description = "Kernel Library for SGLang"
 readme = "README.md"
 requires-python = ">=3.10"

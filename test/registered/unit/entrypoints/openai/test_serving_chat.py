@@ -31,7 +31,7 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.utils import get_or_create_event_loop
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=11, suite="stage-a-test-cpu")
 
 
 class _MockTokenizerManager:
@@ -899,6 +899,25 @@ class ServingChatTestCase(unittest.TestCase):
             )
         self.assertEqual(context.exception.status_code, 400)
         self.assertIn("must be an integer", context.exception.detail)
+
+    def test_hunyuan_reasoning_effort_dispatch(self):
+        tm = _MockTokenizerManager()
+        tm.server_args.reasoning_parser = "hunyuan"
+        chat = OpenAIServingChat(tm, _MockTemplateManager())
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        cases = [
+            ("no_think", False),
+            ("none", False),
+            (None, False),
+            ("high", True),
+            ("low", True),
+        ]
+        for effort, expected in cases:
+            with self.subTest(effort=effort):
+                req.reasoning_effort = effort
+                self.assertEqual(chat._get_reasoning_from_request(req), expected)
 
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
