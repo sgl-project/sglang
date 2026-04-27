@@ -27,7 +27,7 @@ class NpuCommunicator:
     def quant_all_reduce(self, x: torch.Tensor) -> torch.Tensor:
         """
         Note:
-        All reduce is splitted into All gather + reduce.
+        All reduce is split into All gather + reduce.
         All gather is performed in low precision, but reduce in full precision.
         """
         world_size = self.world_size
@@ -36,12 +36,16 @@ class NpuCommunicator:
         x_q, scale = npu_dynamic_quant(x, dst_type=torch.int8)
         # Allocate output tensor.
         output_tensor = torch.empty(output_size, dtype=x_q.dtype, device=x.device)
-        output_scale = torch.empty(output_size[:1], dtype=scale.dtype, device=scale.device)
+        output_scale = torch.empty(
+            output_size[:1], dtype=scale.dtype, device=scale.device
+        )
         # All-gather.
         dist.all_gather_into_tensor(output_tensor, x_q, group=self.group)
         dist.all_gather_into_tensor(output_scale, scale, group=self.group)
 
-        output_tensor = output_tensor.to(x.dtype) * output_scale.unsqueeze(-1).to(x.dtype)
+        output_tensor = output_tensor.to(x.dtype) * output_scale.unsqueeze(-1).to(
+            x.dtype
+        )
         # Reshape
         output_tensor = output_tensor.reshape((world_size,) + input_size)
 

@@ -628,7 +628,7 @@ class GroupCoordinator:
         # Bypass the function if we are using only 1 GPU.
         if self.world_size == 1:
             return input_
-        
+
         if self.npu_communicator is not None and not self.npu_communicator.disabled:
             return self.npu_communicator.quant_all_reduce(input_)
         else:
