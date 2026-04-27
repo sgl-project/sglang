@@ -528,10 +528,10 @@ class TestQwen3ASRTranscription(CustomTestCase):
         With chunk_size_sec = 2.0 and frames of 0.5s, sending exactly 4.0s
         of PCM triggers inferences at the 2.0s and 4.0s marks (last_inf
         lands on the end of the buffer). On session.end, ``has_new_audio``
-        is False but ``state.full_transcript`` is set, so _handle_session_end
-        takes the elif branch and flushes the words that ``state.update``
-        held back (``unfixed_token_num`` tail) via ``state.finalize`` —
-        without running another inference.
+        is False but ``state.full_transcript`` is set, so the session-end
+        handler takes the elif branch and flushes the words that
+        ``state.update`` held back (``unfixed_token_num`` tail) via
+        ``state.finalize`` — without running another inference.
 
         Uses the English clip because it has continuous speech from t=0
         (the mp3 kungfu clip starts with silence, which could leave
