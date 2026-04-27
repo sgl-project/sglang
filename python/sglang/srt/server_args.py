@@ -768,6 +768,8 @@ class ServerArgs:
         self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+        # Validate transcription/ASR-specific server args (model-independent).
+        self._handle_asr_validation()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -3905,6 +3907,14 @@ class ServerArgs:
                 "Mixed chunked prefill is disabled because of using diffusion LLM inference."
             )
             self.enable_mixed_chunk = False
+
+    def _handle_asr_validation(self):
+        """Validate transcription/ASR-specific server args."""
+        if self.asr_max_buffer_seconds <= 0:
+            raise ValueError(
+                f"--asr-max-buffer-seconds must be positive "
+                f"(got {self.asr_max_buffer_seconds})."
+            )
 
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
