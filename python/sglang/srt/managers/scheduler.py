@@ -702,7 +702,7 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        if get_global_server_args().pp_max_micro_batch_size is None:
+        if not get_global_server_args().pp_max_micro_batch_size:
             get_global_server_args().pp_max_micro_batch_size = max(
                 self.max_running_requests // self.pp_size, 1
             )

@@ -825,7 +825,8 @@
                   "docs/developer_guide/bench_serving"
                 ]
               },
-              "docs/developer_guide/evaluating_new_models"
+              "docs/developer_guide/evaluating_new_models",
+              "docs/developer_guide/msprobe_debugging_guide"
             ]
           },
           {
