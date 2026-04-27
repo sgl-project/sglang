@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.layers.on_policy_utils import (
+from sglang.srt.true_on_policy import (
     get_rl_on_policy_target,
     is_tp_invariant_target,
     is_true_on_policy_enabled,
@@ -571,6 +571,19 @@ class TestOnPolicyHelpers(unittest.TestCase):
         import sglang.srt.tp_invariant_ops as tp_invariant_ops
 
         self.assertTrue(hasattr(tp_invariant_ops, "matmul_tp_inv"))
+
+    def test_legacy_on_policy_utils_import_matches_true_on_policy_namespace(self):
+        from sglang.srt.layers import on_policy_utils as legacy
+        from sglang.srt import true_on_policy
+
+        self.assertIs(
+            legacy.should_use_tp_invariant_row_linear,
+            true_on_policy.should_use_tp_invariant_row_linear,
+        )
+        self.assertIs(
+            legacy.patch_prefill_only_deterministic_inference_for_cuda_graph,
+            true_on_policy.patch_prefill_only_deterministic_inference_for_cuda_graph,
+        )
         self.assertTrue(hasattr(torch.ops, "tp_inv_ops"))
 
 

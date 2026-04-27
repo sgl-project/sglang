@@ -30,7 +30,7 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
-from sglang.srt.layers.on_policy_utils import (
+from sglang.srt.true_on_policy import (
     should_disable_flashinfer_allreduce_fusion,
 )
 from sglang.srt.lora.lora_registry import LoRARef

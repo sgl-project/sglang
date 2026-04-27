@@ -25,7 +25,7 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.on_policy_utils import is_true_on_policy_enabled
+from sglang.srt.true_on_policy import is_true_on_policy_enabled
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (

@@ -59,7 +59,7 @@ from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
-from sglang.srt.layers.on_policy_utils import (
+from sglang.srt.true_on_policy import (
     should_disable_mlp_allreduce_fusion_for_on_policy,
     should_disable_reduce_scatter_for_on_policy,
     should_use_tp_invariant_tree_all_reduce,

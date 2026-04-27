@@ -40,7 +40,7 @@ from sglang.srt.layers.dp_attention import (
     get_dp_dtype,
     get_dp_hidden_size,
 )
-from sglang.srt.layers.on_policy_utils import should_force_bfloat16_lm_head
+from sglang.srt.true_on_policy import should_force_bfloat16_lm_head
 from sglang.srt.layers.utils.logprob import (
     InputLogprobsResult,
     compute_temp_top_p_normalized_logprobs,

@@ -28,7 +28,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_allocation_symmetric,
 )
-from sglang.srt.layers.on_policy_utils import (
+from sglang.srt.true_on_policy import (
     should_use_tp_invariant_row_linear,
     should_use_tp_invariant_tree_all_reduce,
 )

@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.layers.on_policy_utils import (
+from sglang.srt.true_on_policy import (
     get_on_policy_rms_norm_kwargs,
     should_force_bfloat16_dense_tensor_math,
     should_force_bfloat16_lm_head,
@@ -183,7 +183,7 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                 import torch
 
                 from sglang.srt.layers.layernorm import RMSNorm
-                from sglang.srt.layers.on_policy_utils import get_on_policy_rms_norm_kwargs
+                from sglang.srt.true_on_policy import get_on_policy_rms_norm_kwargs
 
                 server_args = SimpleNamespace(rl_on_policy_target="fsdp")
                 norm = RMSNorm(

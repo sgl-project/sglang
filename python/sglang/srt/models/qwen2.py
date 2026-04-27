@@ -36,7 +36,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.on_policy_utils import (
+from sglang.srt.true_on_policy import (
     get_on_policy_rms_norm_kwargs,
     should_force_bfloat16_dense_tensor_math,
 )
