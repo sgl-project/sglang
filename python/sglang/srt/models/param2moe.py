@@ -6,7 +6,7 @@
 # per-expert bias correction, shared (always-active) experts, and SwiGLU MLP.
 #
 # Reference: vLLM implementation merged at
-#   https://github.com/vllm-project/vllm/pull/38000 (param2moe branch)
+#   https://github.com/vllm-project/vllm/pull/38000
 """SGLang Param2MoE model."""
 
 import logging
@@ -96,6 +96,7 @@ class Param2MoEMLP(nn.Module):
         tp_size: Optional[int] = None,
     ) -> None:
         super().__init__()
+        self.tp_size = tp_size
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [intermediate_size] * 2,
@@ -131,7 +132,7 @@ class Param2MoEMLP(nn.Module):
     ) -> torch.Tensor:
         # Early-exit for empty batches (avoids NCCL hangs in TP > 1 when
         # the rank receives zero tokens).
-        if hidden_states.shape[0] == 0:
+        if self.tp_size == 1 and hidden_states.shape[0] == 0:
             return hidden_states
         gate_up, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(gate_up)
@@ -329,7 +330,7 @@ class Param2MoESparseMoeBlock(nn.Module):
         )
 
         # ---- Shared (always-active) experts ------------------------------ #
-        if self.num_shared_experts is not None and self.num_shared_experts > 0:
+        if config.num_shared_experts is not None:
             # If the config carries `moe_shared_expert_intermediate_size` it
             # already encodes the TOTAL intermediate size across all shared
             # experts (i.e. moe_intermediate_size * num_shared_experts).
@@ -402,7 +403,7 @@ class Param2MoESparseMoeBlock(nn.Module):
         self, hidden_states: torch.Tensor
     ) -> Optional[torch.Tensor]:
         """Return shared-expert output, or None when there are no shared experts."""
-        if self.num_shared_experts is not None and self.num_shared_experts > 0:
+        if self.num_shared_experts > 0:
             return self.shared_experts(hidden_states)
         return None
 
@@ -453,7 +454,7 @@ class Param2MoESparseMoeBlock(nn.Module):
             shared_output = self._forward_shared_experts(hidden_states)
             final_hidden_states = self._forward_router_experts(hidden_states)
 
-        if self.num_shared_experts is not None and self.num_shared_experts > 0:
+        if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
         if (
@@ -475,7 +476,7 @@ class Param2MoESparseMoeBlock(nn.Module):
         forward_mode = forward_batch.forward_mode
         if is_non_idle_and_non_empty(forward_mode, hidden_states):
             router_logits = self.gate(hidden_states)
-            if self.num_shared_experts is not None and self.num_shared_experts > 0:
+            if self.num_shared_experts > 0:
                 shared_output = self.shared_experts(hidden_states)
 
             topk_output = self.topk(
