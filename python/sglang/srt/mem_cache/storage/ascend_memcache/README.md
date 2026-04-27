@@ -1,24 +1,32 @@
-# Ascend MemCache 文件索引
+# Ascend MemCache 作为 L3 KV Cache
 
-此 README 仅保留以下两个文件的说明：
+本文档说明如何为 SGLang HiCache 的 `ascend_memcache` 后端安装 Ascend MemCache 依赖。
 
-- `python/sglang/srt/mem_cache/storage/ascend_memcache/ascend_memcache_store.py`
-- `python/sglang/srt/mem_cache/storage/test_storage_backend_mapping_unit.py`
+## 安装 Ascend MemCache
 
-## ascend_memcache_store.py
+**方式 1：使用 pip 安装**
 
-`AscendMemcacheStore` 是 `ascend_memcache` 后端的核心实现，负责：
+```bash
+pip install memcache_hybrid
+```
 
-- 对接 `memcache_hybrid.DistributedObjectStore` 完成 `setup/init/close`
-- 实现 HiCache 的 zero-copy 读写接口（含 v1/v2 路径）
-- 处理 MemCache 返回码与 HiCache 语义的适配（例如 `batch_get_into` 成功码转换）
-- 仿照Mooncake的实现方式
+**方式 2：从源码安装**
 
-## test_storage_backend_mapping_unit.py
+1. 从官方或内部代码仓库拉取 Ascend MemCache 源码。
+2. 按仓库提供的构建文档完成编译与安装。
+3. 确保在运行 SGLang 的同一 Python 环境中可以导入 `memcache_hybrid`。
 
-该测试文件用于验证存储后端映射和注册行为，重点覆盖：
+安装校验示例：
 
-- `ascend_memcache` 在后端工厂中的名称映射是否正确
-- 配置参数解析后是否落到预期后端
-- 与现有后端（如 `mooncake`）并存时的选择逻辑是否稳定
-- 关键错误路径的单元行为是否符合预期
+```bash
+git clone https://gitcode.com/Ascend/memcache.git --recursive
+```
+```bash
+mkdir build
+cd build
+cmake ..
+make -j
+```
+```bash
+sudo make install
+```
