@@ -330,26 +330,7 @@ Accuracy numbers come from `sglang.test.run_eval` (GSM8K standard 5-shot, MMMU v
 
 #### 5.1.1 GSM8K
 
-Standard 5-shot, `temperature=0`, `max_tokens=4096`, model defaults to thinking-on (responses contain `<think>...</think>` and the eval extracts the trailing number via regex).
-
-**Server Launch (accuracy-tuned, no speculative decoding):**
-
-```shell Command
-python3 -m sglang.launch_server \
-  --model-path XiaomiMiMo/MiMo-V2.5 \
-  --trust-remote-code \
-  --tp 8 \
-  --ep-size 8 \
-  --attention-backend fa3 \
-  --max-running-requests 8 \
-  --context-length 8192 \
-  --max-total-tokens 32768 \
-  --mem-fraction-static 0.92 \
-  --disable-cuda-graph \
-  --port 30000
-```
-
-> For MiMo-V2.5-Pro, swap the model path to `XiaomiMiMo/MiMo-V2.5-Pro` (and add multi-node flags as in [Section 3](#3-model-deployment)). Otherwise the eval-tuned launch flags are identical for both variants.
+Standard 5-shot, `temperature=0`, `max_tokens=4096`, model defaults to thinking-on (responses contain `<think>...</think>` and the eval extracts the trailing number via regex). Server launch: see [Section 3](#3-model-deployment).
 
 **Benchmark Command:**
 
