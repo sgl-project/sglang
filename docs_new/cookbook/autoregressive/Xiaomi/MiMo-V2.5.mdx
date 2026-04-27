@@ -58,11 +58,12 @@ Refer to the [official SGLang installation guide](../../../docs/get-started/inst
 
 | Variant | Hardware | Docker Image |
 | --- | --- | --- |
-| MiMo-V2.5 (310B) | H100 / H200 / B200 / GB300 | `lmsysorg/sglang:latest` |
+| **MiMo-V2.5 (310B)** | H100 / H200 (Hopper, CUDA 12.9) | `lmsysorg/sglang:dev-mimo-v2.5` |
+| **MiMo-V2.5 (310B)** | B200 / GB300 (Blackwell, CUDA 13.0) | `lmsysorg/sglang:dev-cu13-mimo-v2.5` |
 | **MiMo-V2.5-Pro (1.02T)** | H100 / H200 (Hopper, CUDA 12.9) | `lmsysorg/sglang:dev-mimo-v2.5-pro` |
 | **MiMo-V2.5-Pro (1.02T)** | B200 / GB300 (Blackwell, CUDA 13.0) | `lmsysorg/sglang:dev-cu13-mimo-v2.5-pro` |
 
-> MiMo-V2.5-Pro currently requires custom dev images that bundle the patches needed to load the 1.02T checkpoint and to run the verified `fa4 + flashinfer_trtllm` Blackwell stack. They are built by the upstream [release-docker-dev workflow](https://github.com/sgl-project/sglang/actions/workflows/release-docker-dev.yml) (CUDA 12.9 → `dev-mimo-v2.5-pro`, CUDA 13.0 → `dev-cu13-mimo-v2.5-pro`). Pull whichever matches the GPU's CUDA driver. The standard `lmsysorg/sglang:latest` image is sufficient for MiMo-V2.5 (310B).
+> Both variants currently require custom dev images that bundle the patches needed to load the MiMo-V2 checkpoints (TP=4-interleaved fused qkv for V2.5, 1.02T sharding for V2.5-Pro) and to run the verified `fa4 + flashinfer_trtllm` Blackwell stack. The images are built by the upstream [release-docker-dev workflow](https://github.com/sgl-project/sglang/actions/workflows/release-docker-dev.yml): CUDA 12.9 → `dev-mimo-v2.5{,-pro}`, CUDA 13.0 → `dev-cu13-mimo-v2.5{,-pro}`. Pull whichever matches the GPU's CUDA driver. The stock `lmsysorg/sglang:latest` image does **not** carry these patches and will fail to load either checkpoint.
 
 ## 3. Model Deployment
 
