@@ -3,10 +3,7 @@ import types
 import unittest
 from pathlib import Path
 
-
-SERVER_ARGS_PATH = (
-    Path(__file__).resolve().parents[2] / "runtime" / "server_args.py"
-)
+SERVER_ARGS_PATH = Path(__file__).resolve().parents[2] / "runtime" / "server_args.py"
 
 
 class TestDiffusionLoggingEnvDefaults(unittest.TestCase):
@@ -43,7 +40,10 @@ class TestDiffusionLoggingEnvDefaults(unittest.TestCase):
         server_args = self._get_server_args_class()
 
         for node in server_args.body:
-            if isinstance(node, ast.AnnAssign) and getattr(node.target, "id", None) == "log_level":
+            if (
+                isinstance(node, ast.AnnAssign)
+                and getattr(node.target, "id", None) == "log_level"
+            ):
                 self.assertIsInstance(node.value, ast.Call)
                 self.assertIsInstance(node.value.func, ast.Name)
                 self.assertEqual(node.value.func.id, "field")
