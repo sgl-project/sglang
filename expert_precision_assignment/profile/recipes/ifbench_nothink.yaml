@@ -1,0 +1,65 @@
+# IFBench with Qwen3 thinking mode DISABLED (primary recipe).
+# Artifact prefix: ifbench_nothink
+#
+# On the 16-prompt calib smoke test this variant scored higher than the
+# thinking variant (0.3125 vs 0.2500) and was 4× faster because every
+# response stays inside the 2048-token cap instead of saturating 8192.
+# Traces are also much cleaner (no spurious </think> spam, no email
+# rewrite loops).  This is the recipe you want for the paper baseline.
+task: ifbench # REQUIRED — chooses prep + scorer module
+variant: nothink # artifact suffix — all outputs named `<task>_<variant>`
+
+dataset:
+  limit: 0 # 0 = all prompts; N = first N only (for smoke tests)
+  seed: 1234 # supergpqa shuffle seed (optional)
+  start_date: null # lcb_v6 contest date window lower bound (optional)
+  end_date: null # lcb_v6 contest date window upper bound (optional)
+
+sampling: # written into every prompt_record in prompts/<name>.jsonl
+  enable_thinking: false # nothink variant — 4× faster and avoids Qwen3 think-mode repetition loops
+  max_tokens: 2048 # tighter output budget since there's no thinking block to accommodate
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5 # has-appeared penalty
+  frequency_penalty: 0.5 # scales-with-count penalty (breaks repetition loops)
+
+# Optional: override runtime defaults (interpreter / model checkpoint / host).
+# If omitted, recipe.py's _DEFAULTS['runtime'] is used.  Useful when targeting a
+# different venv or a newer model snapshot.
+#
+# runtime:
+#   python: /data/junzhou/.venv-bfcl/bin/python
+#   model_path: /data/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39
+#   host: 127.0.0.1
+
+calibration: # one short live run on full BF16 to measure KV usage
+  num_prompts: 256 # how many prompts to run
+  mc: 128 # max_running_requests (must match sweep if using it)
+  gpu: 4 # which GPU (single)
+  port: 31304
+  nccl_port: 41304
+
+sweep: # 6 × 11 grid, round-robin across GPUs
+  mc_list: [8, 16, 32, 64, 128, 256]
+  variants:
+    [
+      hot0,
+      hot20,
+      hot40,
+      hot60,
+      hot80,
+      hot100,
+      thr32,
+      thr64,
+      thr128,
+      thr256,
+      thr512,
+    ]
+  gpus: [0, 1, 2, 3, 4, 5, 6, 7]
+  num_prompts: 0 # 0 = all prompts
+
+scoring: # optional — controls the `score` stage
+  enabled: true # false → stage becomes a no-op; collect still runs
+  extra_args: [] # forwarded to score_traces_<task>.py per cell
+    # e.g. ["--per-doc"] or LCB's ["--timeout", "6"]

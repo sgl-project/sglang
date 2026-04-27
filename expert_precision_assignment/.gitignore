@@ -18,3 +18,5 @@ profile/kv_calib/
 # Python caches
 __pycache__/
 *.pyc
+*.pkl
+*.json

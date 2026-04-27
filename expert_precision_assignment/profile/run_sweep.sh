@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
-# Unified 6×11 sweep for profile/. Dispatches based on $TASK:
-#   sharegpt     → python -m sglang.bench_serving       (efficiency)
-#   <anything>   → python -m sglang.bench_eval --task <task>  (accuracy + perf)
+# Unified 6×11 sweep for profile/. Dispatches based on $TASK (three modes):
+#   sharegpt                    → MODE=sharegpt   (bench_serving --dataset-name sharegpt)
+#   prompts/<task>.jsonl exists → MODE=openai     (bench_serving --dataset-name openai;
+#                                                  accuracy scored offline via
+#                                                  scoring/score_traces_<task>.py)
+#   else                        → MODE=bench_eval (lm-eval tasks: gsm8k, mmlu_*, etc.)
 #
 # Same config grid (profile/configs/mc{mc}/variants/*.json) and the same
-# (mc, variant) × GPU round-robin scheduling for every task — the only
+# (mc, variant) × GPU round-robin scheduling for every mode — the only
 # thing that changes is the bench command and the results subdir.
 #
 # Usage:
 #   bash run_sweep.sh sharegpt
 #   bash run_sweep.sh gsm8k
 #   bash run_sweep.sh mmlu_flan_cot_zeroshot
+#   bash run_sweep.sh supergpqa           # after `python prompts/prepare_prompts_supergpqa.py`
+#   bash run_sweep.sh ifbench             # after `python prompts/prepare_prompts_ifbench.py`
+#   bash run_sweep.sh livecodebench_v6    # after `python prompts/prepare_prompts_lcb_v6.py`
 #
 # Env overrides:
 #   NUM_PROMPTS=1024                   (sharegpt only)
 #   SHAREGPT_CONTEXT_LEN=4096          (sharegpt only)
+#   OPENAI_NUM_PROMPTS=999999          (openai mode; 999999 ≈ all, set low for smoke tests)
 #   NUM_FEWSHOT=5  MAX_GEN_TOKS=512    (bench_eval only)
 #   APPLY_CHAT_TEMPLATE=1              (bench_eval only; default on)
 #   FEWSHOT_AS_MULTITURN=1             (bench_eval only; default on — wraps
@@ -40,10 +47,17 @@ if [ -z "$TASK" ]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# Prefer per-task configs (configs/<task>/mc{mc}/...) when present — these
-# are regenerated from a calibrated amortized SLO and give a tighter K.
-# Fall back to the flat configs/mc{mc}/... layout (worst-case SLO) if the
-# task-specific tree wasn't generated.
+PROMPTS_DIR="$SCRIPT_DIR/prompts"
+PROMPTS_JSONL="$PROMPTS_DIR/${TASK}.jsonl"
+
+if [ "$TASK" = "sharegpt" ]; then
+    MODE="sharegpt"
+elif [ -f "$PROMPTS_JSONL" ]; then
+    MODE="openai"
+else
+    MODE="bench_eval"
+fi
+
 if [ -d "$SCRIPT_DIR/configs/$TASK" ]; then
     CFG_DIR="$SCRIPT_DIR/configs/$TASK"
     CFG_SOURCE="per-task (calibrated)"
@@ -54,8 +68,11 @@ fi
 OUT_DIR="$SCRIPT_DIR/results/$TASK"
 mkdir -p "$OUT_DIR"
 
-BF16_MODEL="/data/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
-HOST="127.0.0.1"
+# Runtime knobs — precedence: explicit env > recipe's runtime.* > hardcoded default.
+# Recipe vars (RECIPE_RUNTIME__*) are set by run_pipeline.sh when called via
+# recipe; standalone `bash run_sweep.sh <task>` falls through to the defaults.
+BF16_MODEL="${BF16_MODEL:-${RECIPE_RUNTIME__MODEL_PATH:-/data/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39}}"
+HOST="${HOST:-${RECIPE_RUNTIME__HOST:-127.0.0.1}}"
 
 # sharegpt knobs
 NUM_PROMPTS="${NUM_PROMPTS:-1024}"
@@ -191,16 +208,30 @@ for gpu in "${GPUS[@]}"; do
     GPU_NCCL_PORT[$gpu]=$((41300 + gpu))
 done
 
-# shellcheck disable=SC1091
-eval "$(conda shell.bash hook 2>/dev/null)" || true
-conda activate sglang 2>/dev/null || source activate sglang
-
-# Per-task result-file extension & existence check.
-if [ "$TASK" = "sharegpt" ]; then
-    RESULT_EXT="_n${NUM_PROMPTS}.jsonl"
-else
-    RESULT_EXT=".json"
+# Resolve Python: explicit $PYTHON > recipe's runtime.python > hardcoded default.
+# Hard-fail if the chosen interpreter can't import sglang — the previous silent
+# fallback to system python3 created a trap where the server died with
+# ModuleNotFoundError only after 60+ seconds of startup.
+PYTHON="${PYTHON:-${RECIPE_RUNTIME__PYTHON:-/data/junzhou/.venv-bfcl/bin/python}}"
+if [ ! -x "$PYTHON" ]; then
+    echo "ERROR: runtime python not executable: $PYTHON" >&2
+    echo "  Fix: set PYTHON=/path/to/venv/bin/python, or runtime.python in the recipe." >&2
+    exit 1
 fi
+if ! "$PYTHON" -c "import sglang" >/dev/null 2>&1; then
+    echo "ERROR: sglang not importable under $PYTHON" >&2
+    echo "  Fix: set PYTHON=/path/to/venv with sglang, or runtime.python in the recipe." >&2
+    exit 1
+fi
+# Put the venv's bin dir on PATH so FlashInfer's JIT can find `ninja`.
+PYTHON_BIN_DIR="$(dirname "$PYTHON")"
+case ":$PATH:" in *":$PYTHON_BIN_DIR:"*) ;; *) export PATH="$PYTHON_BIN_DIR:$PATH" ;; esac
+
+case "$MODE" in
+    sharegpt)   RESULT_EXT="_n${NUM_PROMPTS}.jsonl" ;;
+    openai)     RESULT_EXT=".jsonl" ;;
+    bench_eval) RESULT_EXT=".json" ;;
+esac
 
 run_bench() {
     local port=$1
@@ -359,18 +390,25 @@ run_gpu_worker() {
 }
 
 echo "============================================================"
-echo "  Sweep: $TASK  (${#MC_LIST[@]} mc × ${#VARIANTS[@]} variants = $((${#MC_LIST[@]}*${#VARIANTS[@]})))"
+echo "  Sweep: $TASK  mode=$MODE  (${#MC_LIST[@]} mc × ${#VARIANTS[@]} variants = $((${#MC_LIST[@]}*${#VARIANTS[@]})))"
 echo "  GPUs:      ${GPUS[*]}"
 echo "  variants:  ${VARIANTS[*]}"
 echo "  configs:   $CFG_DIR  [$CFG_SOURCE]"
 echo "  out:       $OUT_DIR"
-if [ "$TASK" = "sharegpt" ]; then
-    echo "  bench:     bench_serving (n=$NUM_PROMPTS, ctx=$SHAREGPT_CONTEXT_LEN)"
-else
-    echo "  bench:     bench_eval --task=$TASK (fewshot=$NUM_FEWSHOT, max_gen=$MAX_GEN_TOKS, T=$TEMPERATURE)"
-    echo "             apply_chat_template=$APPLY_CHAT_TEMPLATE  fewshot_as_multiturn=$FEWSHOT_AS_MULTITURN"
-    [ -n "$SYSTEM_INSTRUCTION" ] && echo "  sys_instr: $SYSTEM_INSTRUCTION"
-fi
+case "$MODE" in
+    sharegpt)
+        echo "  bench:     bench_serving --dataset-name sharegpt (n=$NUM_PROMPTS, ctx=$SHAREGPT_CONTEXT_LEN)"
+        ;;
+    openai)
+        echo "  bench:     bench_serving --dataset-name openai --dataset-path $PROMPTS_JSONL"
+        echo "             num_prompts=$OPENAI_NUM_PROMPTS (scoring is offline via scoring/score_traces_${TASK}.py)"
+        ;;
+    bench_eval)
+        echo "  bench:     bench_eval --task=$TASK (fewshot=$NUM_FEWSHOT, max_gen=$MAX_GEN_TOKS, T=$TEMPERATURE)"
+        echo "             apply_chat_template=$APPLY_CHAT_TEMPLATE  fewshot_as_multiturn=$FEWSHOT_AS_MULTITURN"
+        [ -n "$SYSTEM_INSTRUCTION" ] && echo "  sys_instr: $SYSTEM_INSTRUCTION"
+        ;;
+esac
 for g in "${GPUS[@]}"; do
     npairs=$(echo ${GPU_PAIRS[$g]} | wc -w)
     echo "  gpu$g ($npairs pairs, port ${GPU_PORT[$g]}): ${GPU_PAIRS[$g]}"
@@ -393,6 +431,6 @@ echo "============================================================"
 
 echo ""
 echo "Collecting summary..."
-python3 "$SCRIPT_DIR/collect_results.py" --results_dir "$OUT_DIR" \
+"$PYTHON" "$SCRIPT_DIR/collect_results.py" --results_dir "$OUT_DIR" \
     --out_csv "$OUT_DIR/summary.csv" || true
 echo "  → $OUT_DIR/summary.csv"

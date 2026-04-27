@@ -3,12 +3,13 @@
 # so the measured output-length distribution and accuracy are a clean
 # baseline, independent of any heter-precision policy.
 #
-# Dispatches on $TASK:
-#   sharegpt     → bench_serving --output-details (JSONL has input_lens/
-#                  output_lens directly)
-#   <anything>   → bench_eval --output-file (merged report JSONL; this
-#                  script adds input_lens/output_lens at top level via
-#                  report.merge_report, and also reports accuracy)
+# Dispatches on $TASK (three modes, auto-detected):
+#   sharegpt                    → MODE=sharegpt   (bench_serving --dataset-name sharegpt)
+#   prompts/<task>.jsonl exists → MODE=openai     (bench_serving --dataset-name openai,
+#                                                  for user-prepared prompts e.g. supergpqa,
+#                                                  ifbench, livecodebench_v6 — scoring is
+#                                                  offline via scoring/score_traces_<task>.py)
+#   else                        → MODE=bench_eval (lm-eval-harness tasks like gsm8k, mmlu*)
 #
 # Then invokes calib_kv.py --bench_details_jsonl on the produced JSONL
 # to emit kv_calib/<task>/calib.json with μ/σ of total_len.
@@ -17,6 +18,7 @@
 # Usage:
 #   bash run_calib.sh sharegpt
 #   bash run_calib.sh gsm8k
+#   bash run_calib.sh supergpqa            # after `python prompts/prepare_prompts_supergpqa.py`
 #   NUM_PROMPTS=512 bash run_calib.sh sharegpt
 #   CALIB_MC=64 MAX_GEN_TOKS=512 bash run_calib.sh gsm8k
 #   FEWSHOT_AS_MULTITURN=0 bash run_calib.sh gsm8k   # disable multiturn wrap
@@ -39,8 +41,19 @@ POLICY_DIR="$(cd "$SCRIPT_DIR/../policy/heter_assign" && pwd)"
 OUT_DIR="$SCRIPT_DIR/kv_calib/$TASK"
 mkdir -p "$OUT_DIR"
 
-BF16_MODEL="/data/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39"
-HOST="127.0.0.1"
+if [ "$TASK" = "sharegpt" ]; then
+    MODE="sharegpt"
+elif [ -f "$PROMPTS_JSONL" ]; then
+    MODE="openai"
+else
+    MODE="bench_eval"
+fi
+
+# Runtime knobs — precedence: explicit env > recipe's runtime.* > hardcoded default.
+# Recipe vars (RECIPE_RUNTIME__*) are set by run_pipeline.sh when called via
+# recipe; standalone `bash run_calib.sh <task>` falls through to the defaults.
+BF16_MODEL="${BF16_MODEL:-${RECIPE_RUNTIME__MODEL_PATH:-/data/huggingface/hub/models--Qwen--Qwen3-30B-A3B/snapshots/ad44e777bcd18fa416d9da3bd8f70d33ebb85d39}}"
+HOST="${HOST:-${RECIPE_RUNTIME__HOST:-127.0.0.1}}"
 PORT="${CALIB_PORT:-31304}"
 NCCL_PORT="${CALIB_NCCL_PORT:-41304}"
 GPU="${CALIB_GPU:-4}"
@@ -188,7 +201,7 @@ fi
 # 1. Launch server (full BF16 — no --heter-precision-config).
 rm -f "$DETAILS_JSONL"
 echo "Launching server..."
-CUDA_VISIBLE_DEVICES="$GPU" python3 -m sglang.launch_server \
+CUDA_VISIBLE_DEVICES="$GPU" "$PYTHON" -m sglang.launch_server \
     --model-path "$BF16_MODEL" \
     --host "$HOST" --port "$PORT" \
     --nccl-port "$NCCL_PORT" \
@@ -272,14 +285,14 @@ fi
 # 4. Run calib_kv to parse μ/σ of total_len (input+output) from the
 #    per-request arrays.
 echo "Running calib_kv..."
-python3 "$POLICY_DIR/calib_kv.py" \
+"$PYTHON" "$POLICY_DIR/calib_kv.py" \
     --bench_details_jsonl "$DETAILS_JSONL" \
     --out_file "$CALIB_JSON"
 
-if [ "$TASK" != "sharegpt" ]; then
+if [ "$MODE" = "bench_eval" ]; then
     echo ""
     echo "Accuracy from bench_eval (BF16 baseline):"
-    python3 -c "
+    "$PYTHON" -c "
 import json, sys
 with open('$DETAILS_JSONL') as f:
     rec = json.loads(f.readline())
@@ -290,6 +303,10 @@ for k, v in acc.items():
 if n:
     print(f'  n_samples: {n}')
 "
+elif [ "$MODE" = "openai" ]; then
+    echo ""
+    echo "Note: accuracy for MODE=openai is computed offline via scoring/score_traces_${TASK}.py"
+    echo "      against $DETAILS_JSONL + prompts/${TASK}.meta.jsonl"
 fi
 
 echo "============================================================"

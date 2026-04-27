@@ -82,10 +82,15 @@ def sample_openai_requests(
         extra_body = {k: v for k, v in data.items() if k not in EXCLUDED_FIELDS}
 
         # Calculate prompt length by applying chat template
-        # This includes the messages but not the tools
+        # This includes the messages but not the tools.
+        # `return_dict=False` is required for transformers>=5.0, which flipped
+        # the default to a BatchEncoding dict (len() = 2 keys, not token count).
         prompt_len = len(
             tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=False,
             )
         )
 

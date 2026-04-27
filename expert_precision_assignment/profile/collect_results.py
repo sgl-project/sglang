@@ -1,20 +1,28 @@
 """Aggregate per-(mc, variant) results into a CSV.
 
-Handles two schemas, auto-detected by file content:
+Handles three schemas, auto-detected by file content:
 
   bench_serving (sharegpt)  — flat dict with `output_throughput`, `median_ttft_ms`, ...
       filename: mc{mc}_{variant}_n{N}.jsonl
+
+  bench_serving (openai-mode; supergpqa / ifbench / livecodebench_v6 / …)
+      — flat dict with `generated_texts`, `input_lens`, `output_lens`, plus
+        perf fields.  Scoring is offline; scored metrics live in a sibling
+        `mc{mc}_{variant}.scores.json` file and are merged in here when
+        present.
+      filename: mc{mc}_{variant}.jsonl (+ optional .scores.json sidecar)
 
   bench_eval (gsm8k / mmlu / ...) — nested {accuracy, perf, n_samples, run}
       filename: mc{mc}_{variant}.json  (JSONL-append; first record is used)
 
 Output is a wide CSV with a stable leading column set
-(mc, variant, schema) plus the union of every metric that appears
+(mc, variant, schema, task) plus the union of every metric that appears
 across the scanned rows.
 
 Usage:
-    python collect_results.py --results_dir results/sharegpt --out_csv results/sharegpt/summary.csv
-    python collect_results.py --results_dir results/gsm8k    --out_csv results/gsm8k/summary.csv
+    python collect_results.py --results_dir results/sharegpt     --out_csv results/sharegpt/summary.csv
+    python collect_results.py --results_dir results/gsm8k        --out_csv results/gsm8k/summary.csv
+    python collect_results.py --results_dir results/supergpqa    --out_csv results/supergpqa/summary.csv
 """
 from __future__ import annotations
 
@@ -90,15 +98,52 @@ def _row_from_record(
             for k, v in ns.items():
                 row[f"n_{k}"] = v
         return row
-    # bench_serving: flat top-level perf metrics.
+    schema = "bench_serving_openai" if "generated_texts" in rec else "bench_serving"
     row = {
-        "mc": mc, "variant": variant, "schema": "bench_serving",
-        "task": "sharegpt",
+        "mc": mc, "variant": variant, "schema": schema,
+        "task": "sharegpt" if schema == "bench_serving" else "",
     }
     for k in PERF_FIELDS:
         if k in rec:
             row[k] = rec[k]
     return row
+
+
+_SCORE_KEYS_TO_FLATTEN = {
+    "accuracy", "pass@1",
+    "prompt_level_strict_acc", "prompt_level_loose_acc",
+    "inst_level_strict_acc", "inst_level_loose_acc",
+    "n_total", "n_correct", "n_failed", "n_unparsed", "n_pass",
+    "n_failed_generation", "n_failed_execution",
+}
+
+
+def _merge_scores_sidecar(row: Dict[str, Any], trace_path: Path) -> None:
+    sidecar = trace_path.with_suffix(".scores.json")
+    if not sidecar.exists():
+        return
+    try:
+        with open(sidecar) as f:
+            scored = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    if scored.get("task"):
+        row["task"] = scored["task"]
+    for k in _SCORE_KEYS_TO_FLATTEN:
+        if k in scored:
+            row[f"score_{k}"] = scored[k]
+    for breakdown_key in (
+        "accuracy_by_discipline", "accuracy_by_difficulty",
+        "accuracy_by_is_calculation", "pass@1_by_platform",
+        "pass@1_by_difficulty",
+    ):
+        bd = scored.get(breakdown_key)
+        if isinstance(bd, dict):
+            for sub, stats in bd.items():
+                if isinstance(stats, dict) and "acc" in stats:
+                    row[f"score_{breakdown_key}__{sub}"] = stats["acc"]
+                elif isinstance(stats, dict) and "pass@1" in stats:
+                    row[f"score_{breakdown_key}__{sub}"] = stats["pass@1"]
 
 
 def main() -> int:
@@ -113,13 +158,17 @@ def main() -> int:
     results_dir = Path(args.results_dir)
     rows: List[Dict[str, Any]] = []
     for path in sorted(results_dir.glob("mc*_*.json*")):
+        if path.name.endswith(".scores.json"):
+            continue
         m = MC_VARIANT_RE.match(path.name)
         if not m:
             continue
         rec = _read_first_record(path)
         if rec is None:
             continue
-        rows.append(_row_from_record(int(m.group("mc")), m.group("variant"), rec))
+        row = _row_from_record(int(m.group("mc")), m.group("variant"), rec)
+        _merge_scores_sidecar(row, path)
+        rows.append(row)
 
     rows.sort(key=lambda r: (r["mc"], _variant_sort_key(r["variant"])))
 
