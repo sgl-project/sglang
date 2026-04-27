@@ -492,7 +492,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                             if moe_runner_config.activation == "silu"
                             else ActivationType.Gelu
                         ),
-                        expert_mask=layer.expert_mask_gpu,
+                        expert_mask=layer.dispatcher.expert_mask_gpu,
                     )
                     return StandardCombineInput(hidden_states=output)
                 except RuntimeError as e:
@@ -706,5 +706,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
+
+    def forward_musa(self, *args, **kwargs) -> CombineInput:
+        return self.forward_cuda(*args, **kwargs)
 
     forward_native = forward_cpu

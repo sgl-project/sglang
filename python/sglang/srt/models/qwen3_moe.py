@@ -50,6 +50,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -248,9 +249,15 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
                 f"the number of experts {config.num_experts}."
             )
 
+        from sglang.srt.layers.quantization.gguf import GGUFConfig
+
+        norm_topk_prob = getattr(config, "norm_topk_prob", True)
+        if isinstance(quant_config, GGUFConfig):
+            norm_topk_prob = False
+
         self.topk = TopK(
             top_k=config.num_experts_per_tok,
-            renormalize=config.norm_topk_prob,
+            renormalize=norm_topk_prob,
             use_grouped_topk=False,
             layer_id=layer_id,
         )
@@ -325,7 +332,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         topk_output = self.topk(hidden_states, router_logits)
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if self.ep_size > 1 and not should_allreduce_fusion:
+        if (
+            self.ep_size > 1
+            and not should_allreduce_fusion
+            and not use_reduce_scatter
+            and not should_use_dp_reduce_scatterv()
+        ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
         if (
@@ -333,6 +345,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             and not should_allreduce_fusion
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            and not should_use_dp_reduce_scatterv()
         ):
             final_hidden_states = moe_tensor_model_parallel_all_reduce(
                 final_hidden_states

@@ -260,6 +260,15 @@ class MambaPool:
                 for conv_shape in conv_state_shape
             ]
 
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    _init_npu_conv_state,
+                )
+
+                conv_state = _init_npu_conv_state(
+                    conv_state[0], conv_state_shape, speculative_num_draft_tokens
+                )
+
             if _is_cpu and _cpu_has_amx_support:
                 from sglang.srt.layers.amx_utils import _init_amx_conv_state
 

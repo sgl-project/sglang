@@ -511,6 +511,7 @@ class FlashInferAttnBackend(AttentionBackend):
                 spec_info=None,
                 fixed_split_size=self.prefill_split_tile_size,
                 multi_item_params=multi_item_params,
+                cross_attention_custom_mask=forward_batch.cross_attention_custom_mask,
             )
             self.forward_metadata = PrefillMetadata(
                 self.prefill_wrappers_paged,
@@ -1242,6 +1243,8 @@ class FlashInferIndicesUpdaterPrefill:
         encoder_lens: Optional[torch.Tensor],
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
+        multi_item_params: Optional[MultiItemScoringParams] = None,
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         # Keep the signature for type checking. It will be assigned during runtime.
         raise NotImplementedError()
@@ -1259,6 +1262,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         if use_ragged:
             # TODO: remove this device sync, we can use forward_batch.extend_prefix_lens_cpu
@@ -1299,6 +1303,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1348,6 +1353,7 @@ class FlashInferIndicesUpdaterPrefill:
         spec_info: Optional[SpecInput],
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         for wrapper_id in range(2):
             if wrapper_id == 0:
@@ -1375,6 +1381,9 @@ class FlashInferIndicesUpdaterPrefill:
                 use_ragged,
                 spec_info,
                 multi_item_params=multi_item_params,
+                cross_attention_custom_mask=(
+                    cross_attention_custom_mask if wrapper_id == 1 else None
+                ),
             )
 
     def call_begin_forward(
@@ -1394,6 +1403,7 @@ class FlashInferIndicesUpdaterPrefill:
         use_sliding_window_kv_pool: bool = False,
         fixed_split_size: Optional[int] = None,
         multi_item_params: Optional[MultiItemScoringParams] = None,
+        cross_attention_custom_mask: Optional[torch.Tensor] = None,
     ):
         bs = len(seq_lens)
         if spec_info is None:
@@ -1418,7 +1428,7 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr[1 : bs + 1] = torch.cumsum(seq_lens - prefix_lens, dim=0)
             qo_indptr = qo_indptr[: bs + 1]
 
-            custom_mask = None
+            custom_mask = cross_attention_custom_mask
         else:
             assert isinstance(spec_info, SpecInput)
             kv_indices, kv_indptr, qo_indptr, custom_mask = (

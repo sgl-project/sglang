@@ -40,6 +40,14 @@ class TestSamplingParamsValidate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"num_outputs_per_prompt"):
             SamplingParams(num_outputs_per_prompt=0)
 
+    def test_seed_accepts_int_or_non_empty_int_list(self):
+        self.assertEqual(SamplingParams(seed=7).seed, 7)
+        self.assertEqual(SamplingParams(seed=[7, 8]).seed, [7, 8])
+        with self.assertRaisesRegex(ValueError, r"seed list"):
+            SamplingParams(seed=[])
+        with self.assertRaisesRegex(ValueError, r"seed"):
+            SamplingParams(seed=[1, -1])
+
     def test_fps_must_be_positive_int(self):
         with self.assertRaisesRegex(ValueError, r"\bfps\b"):
             SamplingParams(fps=0)
@@ -202,6 +210,13 @@ class TestSamplingParamsCliArgs(unittest.TestCase):
         self.assertEqual(kwargs["guidance_scale"], SamplingParams.guidance_scale)
         self.assertEqual(kwargs["negative_prompt"], SamplingParams.negative_prompt)
         self.assertTrue(kwargs["save_output"])
+
+    def test_get_cli_args_accepts_seed_list(self):
+        self.assertEqual(self._parse_cli_kwargs(["--seed", "7"])["seed"], 7)
+        self.assertEqual(
+            self._parse_cli_kwargs(["--seed", "7", "8"])["seed"],
+            [7, 8],
+        )
 
     def test_qwen_image_cli_path_preserves_model_defaults(self):
         params = self._make_qwen_image_params([])

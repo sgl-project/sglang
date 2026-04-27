@@ -5,8 +5,6 @@ register_amd_ci(est_time=524, suite="stage-b-test-1-gpu-small-amd")
 """
 Consolidated HiCache variant tests.
 Tests HiCache with different configurations: standard, MLA, EAGLE, and page size variants.
-# TODO: Segmentation fault occurs when upgraded to Cu13. Ref: https://github.com/sgl-project/sglang/actions/runs/24603159715/job/71945537414?pr=23119")
-# Should move back to registered test after it's fixed
 """
 
 import unittest
