@@ -6619,6 +6619,13 @@ class ServerArgs:
             self.tp_size * self.pp_size
         ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
 
+        assert (
+            self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1
+        ), (
+            "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
+            f"Got: {self.pp_max_micro_batch_size}"
+        )
+
         if self.pp_size > 1:
             assert (
                 self.disable_overlap_schedule and self.speculative_algorithm is None

@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 # Standalone speculative decoding tests (FA3, Triton, FlashInfer backends)
-register_cuda_ci(est_time=294, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=406, suite="stage-b-test-1-gpu-large")
 
 GSM_DATASET_PATH = None
 
