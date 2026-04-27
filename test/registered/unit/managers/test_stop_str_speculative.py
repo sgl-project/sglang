@@ -6,6 +6,10 @@ This test uses pure mocks so it can run without sglang dependencies."""
 import unittest
 from unittest.mock import MagicMock
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=1, suite="stage-a-test-cpu")
+
 
 def tail_str_new(self, new_accepted_len: int = 1) -> str:
     """Fixed version of tail_str that expands window for speculative decoding."""
@@ -57,15 +61,18 @@ class TestStopStrSpeculative(unittest.TestCase):
         req.sampling_params.stop_strs = stop_strs
         req.sampling_params.stop_regex_strs = []
         req.sampling_params.stop_str_max_len = (
-            stop_str_max_len if stop_str_max_len is not None
+            stop_str_max_len
+            if stop_str_max_len is not None
             else max(len(s) for s in stop_strs)
         )
         req.sampling_params.stop_regex_max_len = 0
 
         # Simple tokenizer mock: decode token ids to characters
         tok = MagicMock()
+
         def fake_decode(ids):
             return "".join(chr(i) for i in ids)
+
         tok.decode = fake_decode
         req.tokenizer = tok
 
