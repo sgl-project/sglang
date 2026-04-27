@@ -64,9 +64,10 @@ logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 # When set, LogitsProcessor.forward returns an empty output and skips the
-# LM head + tensor-parallel all-gather. Used by FlashInfer autotune dummy
-# runs, where the all-gather output [batch * dp_size, vocab] would OOM
-# under DP attention but is not needed by the autotune cache.
+# LM head + tensor-parallel all-gather. FlashInfer autotune only profiles
+# attention/MoE/GEMM kernels, so the LM-head all-gather is wasted work --
+# and its [batch * dp_size, vocab] output OOMs under DP attention with a
+# tight mem_fraction_static.
 _in_autotune_dummy_run = False
 
 
@@ -318,11 +319,9 @@ class LogitsProcessor(nn.Module):
             multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
-        # Skip LM head + tensor-parallel all-gather during FlashInfer autotune
-        # dummy runs. The autotune cache only needs attention/MoE/GEMM kernel
-        # timings; the [batch * dp_size, vocab] all-gather buffer would OOM
-        # under DP attention on tight memory budgets (e.g. mem_fraction_static
-        # close to the model+KV-cache footprint).
+        # Autotune dummy run discards this output; see _in_autotune_dummy_run.
+        # Placed before the MIS / DLLM / common dispatch so all three LM-head
+        # paths are skipped.
         if _in_autotune_dummy_run:
             return LogitsProcessorOutput(next_token_logits=None)
 

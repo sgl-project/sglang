@@ -2413,9 +2413,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         # Run warmup on the non-default stream to avoid NCCL 2.29+ cudaMemcpyBatchAsync
         # calls on default stream (unsupported by CUDA) when --enable-symm-mem is used.
-        # autotune_dummy_run_mode() makes LogitsProcessor.forward short-circuit so the
-        # dummy run skips the LM head + tensor-parallel all-gather (which would OOM
-        # at [batch * dp_size, vocab] under DP attention).
         self.forward_stream.wait_stream(torch.cuda.current_stream())
         with torch.get_device_module(self.device).stream(self.forward_stream):
             with torch.inference_mode(), autotune(), autotune_dummy_run_mode():
