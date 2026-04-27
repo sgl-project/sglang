@@ -2647,9 +2647,7 @@ class AiterAttnBackend(AttentionBackend):
                         if self.forward_metadata.swa_page_table is not None:
                             page_table = self.forward_metadata.swa_page_table
 
-                    q_unified = q.view(
-                        -1, layer.tp_q_head_num, layer.qk_head_dim
-                    )
+                    q_unified = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
                     k_unified = k_cache.view(
                         -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
                     )
@@ -2660,12 +2658,8 @@ class AiterAttnBackend(AttentionBackend):
                         # Qwen3.5 can replicate one KV head across multiple TP ranks.
                         # Present the local KV head as per-Q-head stride-0 views so
                         # target_verify uses the same local head mapping as the model.
-                        k_unified = k_unified.expand(
-                            -1, -1, layer.tp_q_head_num, -1
-                        )
-                        v_unified = v_unified.expand(
-                            -1, -1, layer.tp_q_head_num, -1
-                        )
+                        k_unified = k_unified.expand(-1, -1, layer.tp_q_head_num, -1)
+                        v_unified = v_unified.expand(-1, -1, layer.tp_q_head_num, -1)
 
                     # The seq_lens + draft_num add has to run INSIDE the graph
                     # region; a host-side pre-add would allocate a new tensor
