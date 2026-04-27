@@ -773,17 +773,19 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         tbo_subbatch_index: Optional[int] = None,
+        input_deepstack_embeds: Optional[torch.Tensor] = None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         )
-        state.update(
-            dict(
-                forward_batch=forward_batch,
-                positions=positions,
-                tbo_subbatch_index=tbo_subbatch_index,
-            )
+        state_update = dict(
+            forward_batch=forward_batch,
+            positions=positions,
+            tbo_subbatch_index=tbo_subbatch_index,
         )
+        if input_deepstack_embeds is not None:
+            state_update["input_deepstack_embeds"] = input_deepstack_embeds
+        state.update(state_update)
 
     def op_attn_prepare(self, state):
         self.linear_attn.op_prepare(state)
@@ -821,6 +823,18 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             state.forward_batch,
         )
 
+        # Add deepstack embeddings for the first few layers
+        input_deepstack_embeds = state.get("input_deepstack_embeds")
+        if (
+            input_deepstack_embeds is not None
+            and input_deepstack_embeds.numel() > 0
+            and self.layer_id < 3
+        ):
+            sep = self.config.hidden_size * self.layer_id
+            hidden_states.add_(
+                input_deepstack_embeds[:, sep : sep + self.config.hidden_size]
+            )
+
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
@@ -828,9 +842,18 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
             forward_batch=state.forward_batch,
             tbo_subbatch_index=state.tbo_subbatch_index,
         )
+        if input_deepstack_embeds is not None:
+            output["input_deepstack_embeds"] = input_deepstack_embeds
 
         state.clear(
             expect_keys={
+                "positions",
+                "forward_batch",
+                "tbo_subbatch_index",
+                "input_deepstack_embeds",
+            }
+            if input_deepstack_embeds is not None
+            else {
                 "positions",
                 "forward_batch",
                 "tbo_subbatch_index",
@@ -1156,17 +1179,19 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
         tbo_subbatch_index: Optional[int] = None,
+        input_deepstack_embeds: Optional[torch.Tensor] = None,
     ):
         state.hidden_states_after_comm_pre_attn, state.residual_after_input_ln = (
             self.layer_communicator.prepare_attn(hidden_states, residual, forward_batch)
         )
-        state.update(
-            dict(
-                forward_batch=forward_batch,
-                positions=positions,
-                tbo_subbatch_index=tbo_subbatch_index,
-            )
+        state_update = dict(
+            forward_batch=forward_batch,
+            positions=positions,
+            tbo_subbatch_index=tbo_subbatch_index,
         )
+        if input_deepstack_embeds is not None:
+            state_update["input_deepstack_embeds"] = input_deepstack_embeds
+        state.update(state_update)
 
     def op_attn_prepare(self, state):
         hidden_states = state.pop("hidden_states_after_comm_pre_attn")
@@ -1245,6 +1270,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             state.forward_batch,
         )
 
+        # Add deepstack embeddings for the first few layers
+        input_deepstack_embeds = state.get("input_deepstack_embeds")
+        if (
+            input_deepstack_embeds is not None
+            and input_deepstack_embeds.numel() > 0
+            and self.layer_id < 3
+        ):
+            sep = self.config.hidden_size * self.layer_id
+            hidden_states.add_(
+                input_deepstack_embeds[:, sep : sep + self.config.hidden_size]
+            )
+
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
@@ -1252,9 +1289,18 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             forward_batch=state.forward_batch,
             tbo_subbatch_index=state.tbo_subbatch_index,
         )
+        if input_deepstack_embeds is not None:
+            output["input_deepstack_embeds"] = input_deepstack_embeds
 
         state.clear(
             expect_keys={
+                "positions",
+                "forward_batch",
+                "tbo_subbatch_index",
+                "input_deepstack_embeds",
+            }
+            if input_deepstack_embeds is not None
+            else {
                 "positions",
                 "forward_batch",
                 "tbo_subbatch_index",
@@ -1445,6 +1491,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
                 input_data_scatter_mode=ScatterMode.model_input_output(),
+                input_deepstack_embeds=input_deepstack_embeds,
             )
         else:
             for layer_idx in range(self.start_layer, self.end_layer):
