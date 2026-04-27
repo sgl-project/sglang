@@ -409,6 +409,18 @@ def register_fake_ops():
         return mixed_qkv, z, b, a
 
     @torch.library.register_fake(
+        "sgl_kernel::fused_qkvzba_split_reshape_cat_contiguous_cpu"
+    )
+    def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
+        batch = mixed_qkvz.shape[0]
+        qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+        mixed_qkv = mixed_qkvz.new_empty(batch, qkv_dim)
+        z = mixed_qkvz.new_empty(batch, num_heads_v, head_v)
+        b = mixed_ba.new_empty(batch, num_heads_v)
+        a = mixed_ba.new_empty(batch, num_heads_v)
+        return mixed_qkv, z, b, a
+
+    @torch.library.register_fake(
         "sgl_kernel::fused_sigmoid_gating_delta_rule_update_cpu"
     )
     def _(
@@ -842,10 +854,10 @@ class CPUGraphRunner:
                     draft_token=None,
                     custom_mask=self.custom_mask,
                     positions=None,
-                    retrive_index=None,
-                    retrive_next_token=None,
-                    retrive_next_sibling=None,
-                    retrive_cum_len=None,
+                    retrieve_index=None,
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
+                    retrieve_cum_len=None,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,

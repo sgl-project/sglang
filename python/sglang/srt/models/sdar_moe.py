@@ -34,6 +34,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -160,12 +161,13 @@ class SDARMoeSparseMoeBlock(nn.Module):
         topk_output = self.topk(hidden_states, router_logits)
         out = self.experts(hidden_states, topk_output)  # (T, H)
 
-        # TP all-reduce (unless fused / reduce_scatter / fp4 allgather path)
+        # TP all-reduce (unless fused / reduce_scatter / fp4 allgather / dp reduce_scatterv path)
         if (
             self.tp_size > 1
             and not should_allreduce_fusion
             and not use_reduce_scatter
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+            and not should_use_dp_reduce_scatterv()
         ):
             out = tensor_model_parallel_all_reduce(out)
 

@@ -28,6 +28,11 @@ jobs:
         with:
           fetch-depth: 0  # Required for git describe to find tags
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
       - name: "Set Date"
         run: |
           echo "DATE=$(date +%Y%m%d)" >> $GITHUB_ENV
@@ -35,8 +40,8 @@ jobs:
       - name: Get version from latest tag
         id: version
         run: |
-          # Get the latest version tag sorted by version number (e.g., v0.5.7 -> 0.5.7)
-          VERSION=$(git tag -l 'v[0-9]*' --sort=-v:refname | head -1 | sed 's/^v//')
+          # Use the shared helper so stable/post releases sort above rc tags.
+          VERSION=$(python3 python/tools/get_version_tag.py --tag-only | sed 's/^v//')
 
           if [ -z "$VERSION" ]; then
             echo "::error::Could not determine version from git tags"
@@ -79,7 +84,8 @@ jobs:
           tag=v${version}-${rocm_tag}
           echo "IMAGE_TAG=${tag}-${{ env.DATE }}" >> $GITHUB_ENV
 
-          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
+          # remove --build-arg NIC_BACKEND=ainic for auto detection nic support in mori
+          docker build . -f docker/rocm.Dockerfile --build-arg SGL_BRANCH=${{ github.ref_name }} --build-arg BUILD_TYPE=${{ matrix.build_type }} --build-arg GPU_ARCH=${{ matrix.gpu_arch }} --build-arg ENABLE_MORI=1 --build-arg SETUPTOOLS_SCM_PRETEND_VERSION=${pretend_version} -t rocm/sgl-dev:${tag}-${{ env.DATE }} --no-cache
           docker push rocm/sgl-dev:${tag}-${{ env.DATE }}
 
       # Persist the tag right after rocm/sgl-dev push succeeds so the local
@@ -150,7 +156,7 @@ jobs:
       - name: Mirror rocm/sgl-dev to local registry
         run: |
           src="rocm/sgl-dev:${{ env.IMAGE_TAG }}"
-          dst="172.29.8.23:5000/rocm/sgl-dev:${{ env.IMAGE_TAG }}"
+          dst="10.245.143.50:5000/rocm/sgl-dev:${{ env.IMAGE_TAG }}"
           docker pull "${src}"
           docker tag "${src}" "${dst}"
           docker push "${dst}"
