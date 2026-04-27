@@ -11,9 +11,12 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import triton
-import triton.language as tl
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.triton_ops.aiter_unified_attention import (
+    scatter_ragged_to_page_table_kernel,
+    scatter_req_to_token_to_page_table_kernel,
+)
 from sglang.srt.layers.attention.utils import (
     create_flashinfer_kv_indices_triton,
     create_flashmla_kv_indices_triton,
@@ -106,108 +109,6 @@ class ForwardMetadata:
 
 
 global_workspace_buffer = None
-
-
-@triton.jit
-def _scatter_ragged_to_page_table_kernel(
-    kv_flat_ptr,
-    kv_indptr_ptr,
-    dest_ptr,
-    dest_stride,
-    sw_page_table_ptr,
-    swa_slot_mapping_ptr,
-    PAGE_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    HAS_SWA: tl.constexpr,
-):
-    """Scatter ragged token-level kv_indices into a 2D block-level page table.
-    Output columns store block indices (token_id // PAGE_SIZE); per-request
-    row length is ceil(kv_len / PAGE_SIZE). Only writes rows [0, num_blocks);
-    `unified_attention` bounds reads by seqused_k, so the tail is never read.
-    """
-    pid = tl.program_id(0)
-    block_id = tl.program_id(1)
-
-    start = tl.load(kv_indptr_ptr + pid).to(tl.int64)
-    kv_len = tl.load(kv_indptr_ptr + pid + 1).to(tl.int64) - start
-    num_blocks = (kv_len + PAGE_SIZE - 1) // PAGE_SIZE
-
-    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    if block_id * BLOCK_SIZE >= num_blocks:
-        return
-    mask = offsets < num_blocks
-    token_idx = offsets.to(tl.int64) * PAGE_SIZE
-    vals = tl.load(kv_flat_ptr + start + token_idx, mask=mask, other=0)
-    block_vals = vals // PAGE_SIZE
-    tl.store(
-        dest_ptr + pid.to(tl.int64) * dest_stride + offsets,
-        block_vals,
-        mask=mask,
-    )
-
-    if HAS_SWA:
-        sw_vals = tl.load(swa_slot_mapping_ptr + vals)
-        block_vals = sw_vals // PAGE_SIZE
-        tl.store(
-            sw_page_table_ptr + pid.to(tl.int64) * dest_stride + offsets,
-            block_vals,
-            mask=mask,
-        )
-
-
-@triton.jit
-def _scatter_req_to_token_to_page_table_kernel(
-    req_to_token_ptr,
-    req_pool_indices_ptr,
-    seq_lens_ptr,
-    page_table_ptr,
-    req_to_token_stride,
-    page_table_stride,
-    sw_page_table_ptr,
-    swa_slot_mapping_ptr,
-    DRAFT_NUM: tl.constexpr,
-    PAGE_SIZE: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    HAS_SWA: tl.constexpr,
-):
-    """Build the 2D block-level page_table for target_verify directly from
-    req_to_token by sampling at PAGE_SIZE stride for rows [0, num_blocks).
-    Avoids a (bs * max_context_len) int32 intermediate scratch buffer.
-    """
-    pid = tl.program_id(0)
-    block_id = tl.program_id(1)
-
-    seq_len = tl.load(seq_lens_ptr + pid).to(tl.int64)
-    kv_len = seq_len + DRAFT_NUM
-    num_blocks = (kv_len + PAGE_SIZE - 1) // PAGE_SIZE
-
-    offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    if block_id * BLOCK_SIZE >= num_blocks:
-        return
-    mask = offsets < num_blocks
-
-    rp = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
-    token_idx = offsets.to(tl.int64) * PAGE_SIZE
-    vals = tl.load(
-        req_to_token_ptr + rp * req_to_token_stride + token_idx,
-        mask=mask,
-        other=0,
-    )
-    block_vals = vals // PAGE_SIZE
-    tl.store(
-        page_table_ptr + pid.to(tl.int64) * page_table_stride + offsets,
-        block_vals,
-        mask=mask,
-    )
-
-    if HAS_SWA:
-        sw_vals = tl.load(swa_slot_mapping_ptr + vals)
-        block_vals = sw_vals // PAGE_SIZE
-        tl.store(
-            sw_page_table_ptr + pid.to(tl.int64) * page_table_stride + offsets,
-            block_vals,
-            mask=mask,
-        )
 
 
 _AITER_PARTITION_SIZE_ROCM = 256
@@ -648,7 +549,7 @@ class AiterAttnBackend(AttentionBackend):
 
         BLOCK_SIZE = 1024
         grid = (bs, triton.cdiv(max(max_blocks, 1), BLOCK_SIZE))
-        _scatter_ragged_to_page_table_kernel[grid](
+        scatter_ragged_to_page_table_kernel[grid](
             kv_flat,
             kv_indptr,
             page_table,
@@ -710,7 +611,7 @@ class AiterAttnBackend(AttentionBackend):
 
         BLOCK_SIZE = 1024
         grid = (bs, triton.cdiv(max(max_blocks, 1), BLOCK_SIZE))
-        _scatter_req_to_token_to_page_table_kernel[grid](
+        scatter_req_to_token_to_page_table_kernel[grid](
             self.req_to_token,
             req_pool_indices,
             seq_lens,
@@ -985,18 +886,6 @@ class AiterAttnBackend(AttentionBackend):
                 else:
                     kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                     bs = kv_indptr.shape[0] - 1
-
-                    if self.use_sliding_window_kv_pool:
-                        swa_page_table = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                                kv_indices
-                            )
-                        )
-
-                        kv_indices = self._transform_table_1_to_real(kv_indices)
-                        swa_page_table = self._transform_table_1_to_real(swa_page_table)
-                    else:
-                        kv_indices = self._transform_table_1_to_real(kv_indices)
 
             if self.use_mla:
                 qo_indptr = self.qo_indptr_[: bs + 1]
@@ -1733,7 +1622,6 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.use_mla:
                 if _use_mla_ps_kernel:
-
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
@@ -1924,7 +1812,6 @@ class AiterAttnBackend(AttentionBackend):
                 max_q_len = num_tokens_per_bs
 
                 if _use_mla_ps_kernel:
-
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
@@ -2169,7 +2056,6 @@ class AiterAttnBackend(AttentionBackend):
 
             if self.use_mla:
                 if _use_mla_ps_kernel:
-
                     num_kv_splits = self.max_split_per_batch
 
                     self.make_mla_meta_data(
@@ -2297,7 +2183,6 @@ class AiterAttnBackend(AttentionBackend):
             max_q_len = num_tokens_per_bs
 
             if self.use_mla and _use_mla_ps_kernel:
-
                 num_kv_splits = self.max_split_per_batch
 
                 self.make_mla_meta_data(
@@ -2363,7 +2248,6 @@ class AiterAttnBackend(AttentionBackend):
             max_q_len = num_tokens_per_bs
 
             if self.use_mla and _use_mla_ps_kernel:
-
                 num_kv_splits = self.max_split_per_batch
 
                 self.make_mla_meta_data(
@@ -2456,7 +2340,6 @@ class AiterAttnBackend(AttentionBackend):
                     self.use_triton_unified_attention
                     and self.use_sliding_window_kv_pool
                 ):
-
                     token_to_kv_pool = forward_batch.token_to_kv_pool
                     k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                         layer.layer_id
@@ -2659,7 +2542,6 @@ class AiterAttnBackend(AttentionBackend):
                 forward_batch.forward_mode.is_draft_extend()
                 or forward_batch.forward_mode.is_draft_extend_v2()
             ):
-
                 work_metadata = self.forward_metadata.work_metadata
                 work_indptr = self.forward_metadata.work_indptr
                 work_info_set = self.forward_metadata.work_info_set
@@ -2776,7 +2658,7 @@ class AiterAttnBackend(AttentionBackend):
                         v=v_cache.view(
                             -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
                         ),
-                        out=o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                        out=o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                         cu_seqlens_q=self.forward_metadata.qo_indptr,
                         seqused_k=forward_batch.seq_lens + self.num_draft_tokens,
                         max_seqlen_q=self.forward_metadata.max_q_len,
@@ -2891,7 +2773,6 @@ class AiterAttnBackend(AttentionBackend):
             # use standard set_kv_buffer, as they lack SWA-specific attributes
             # like full_to_swa_index_mapping.
             if self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
-
                 token_to_kv_pool = forward_batch.token_to_kv_pool
                 k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(
                     layer.layer_id
@@ -2979,7 +2860,6 @@ class AiterAttnBackend(AttentionBackend):
             o = torch.empty_like(q, dtype=self.input_dtype)
 
             if self.use_triton_unified_attention:
-
                 bs = forward_batch.batch_size
                 window_size = (-1, -1)
                 page_table = self.forward_metadata.kv_indices
