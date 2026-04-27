@@ -2900,17 +2900,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
         elastic_ep_state = ElasticEPStateManager.instance()
-        if elastic_ep_state is not None:
-            if elastic_ep_state.consume_active_snapshot():
-                if self.eplb_manager is not None:
-                    logging.info("EPLB due to rank faults")
-                    gen = self.eplb_manager.rebalance()
-                    while True:
-                        try:
-                            next(gen)
-                        except StopIteration:
-                            break
-                elastic_ep_state.mark_snapshot_handled()
 
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,

@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_with_staging,
     prepare_abort,
 )
+from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.managers.schedule_batch import FINISH_ABORT, ScheduleBatch
@@ -1207,6 +1208,8 @@ class SchedulerDisaggregationDecodeMixin:
         self.result_queue = deque()
         self.last_batch: Optional[ScheduleBatch] = None
 
+        _elastic_state = ElasticEPStateManager.instance()
+
         while True:
             # Receive requests
             recv_reqs = self.recv_requests()
@@ -1229,6 +1232,12 @@ class SchedulerDisaggregationDecodeMixin:
             # Process the last batch
             if self.last_batch:
                 tmp_batch, tmp_result = self.result_queue.popleft()
+                if _elastic_state is not None:
+                    if tmp_result.copy_done is not None:
+                        tmp_result.copy_done.synchronize()
+                    if _elastic_state.is_stale_snapshot():
+                        self._retract_all_and_rebalance_on_rank_fault()
+                        continue
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 self.on_idle()
