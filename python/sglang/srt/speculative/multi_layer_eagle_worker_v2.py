@@ -684,6 +684,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
             assert verify_input.is_verify_input()
+            # Record a CUDA event after draft() GPU work is dispatched.
+            if self.plan_stream:
+                self._draft_done_event = torch.get_device_module(self.device).Event()
+                self._draft_done_event.record()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
@@ -707,6 +711,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
+            # Wait for the draft CUDA graph to finish before plan_stream
+            # begins its work.
+            if self.plan_stream and hasattr(self, "_draft_done_event"):
+                self.plan_stream.wait_event(self._draft_done_event)
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,

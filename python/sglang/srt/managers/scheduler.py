@@ -702,7 +702,7 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        if get_global_server_args().pp_max_micro_batch_size is None:
+        if not get_global_server_args().pp_max_micro_batch_size:
             get_global_server_args().pp_max_micro_batch_size = max(
                 self.max_running_requests // self.pp_size, 1
             )
@@ -3226,7 +3226,7 @@ class Scheduler(
 
         return DetachHiCacheStorageReqOutput(success=False, message=msg)
 
-    def flush_cache(self):
+    def flush_cache(self, empty_cache: bool = True):
         """Flush the memory pool and cache."""
         if self.is_fully_idle():
             self.cur_batch = None
@@ -3240,8 +3240,8 @@ class Scheduler(
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
 
-            # TODO: allow optional empty cache
-            torch.cuda.empty_cache()
+            if empty_cache:
+                torch.cuda.empty_cache()
             logger.info("Cache flushed successfully!")
             success = True
         else:

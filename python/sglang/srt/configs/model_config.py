@@ -180,10 +180,17 @@ class ModelConfig:
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
-        has_multimodal_subconfig = (
-            self.hf_config is not self.hf_text_config
-            or hasattr(self.hf_config, "vision_config")
-            or hasattr(self.hf_config, "audio_config")
+        # The vision_config/audio_config attribute heuristic is only applied when
+        # the transformers backend is explicitly requested. Some text-only models
+        # (e.g. xai-org/grok-2 with model_type="git") would otherwise be
+        # false-positively detected because their HF config auto-populates a
+        # `vision_config` in __post_init__.
+        has_multimodal_subconfig = self.hf_config is not self.hf_text_config or (
+            self.model_impl == ModelImpl.TRANSFORMERS
+            and (
+                hasattr(self.hf_config, "vision_config")
+                or hasattr(self.hf_config, "audio_config")
+            )
         )
         self.is_multimodal = enable_multimodal and (
             is_multimodal_model(self.hf_config.architectures)
@@ -200,11 +207,13 @@ class ModelConfig:
         # Models expose audio_config at different nesting levels:
         #   - top-level audio_config: e.g. Qwen2Audio
         #   - thinker_config.audio_config: Qwen3-Omni, Qwen3-ASR (nested thinker arch)
-        #   - is_audio_model(): Whisper, Qwen3-ASR (architecture-based fallback)\
+        #   - sound_config: Nemotron AVLM with Parakeet audio encoder
+        #   - is_audio_model(): Whisper, Qwen3-ASR (architecture-based fallback)
         # TODO: Handle this more robustly by standardizing the config structure in the future
         self.is_audio_understandable_model = enable_multimodal and (
             hasattr(self.hf_config, "audio_config")
             or hasattr(getattr(self.hf_config, "thinker_config", None), "audio_config")
+            or getattr(self.hf_config, "sound_config", None) is not None
             or is_audio_model(self.hf_config.architectures)
         )
 
@@ -364,6 +373,10 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
             self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
+            self.hf_config.num_nextn_predict_layers = 1
+
+        if is_draft_model and self.hf_config.architectures[0] == "HYV3ForCausalLM":
+            self.hf_config.architectures[0] = "HYV3ForCausalLMNextN"
             self.hf_config.num_nextn_predict_layers = 1
 
     def _derive_hybrid_model(self):
