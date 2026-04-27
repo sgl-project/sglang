@@ -290,7 +290,7 @@ class TestMooncakeBackendHybridLinearModel(
     @classmethod
     def _get_model_name(cls):
         """Use hybrid linear model for testing"""
-        return "Qwen/Qwen3.5-35B-A3B-FP8"
+        return "Qwen/Qwen3.5-27B"
 
     @classmethod
     def _get_additional_server_args_and_env(cls):

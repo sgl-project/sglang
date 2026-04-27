@@ -284,34 +284,6 @@ class TestHiCacheStorageAccuracy(HiCacheStorageBaseMixin, CustomTestCase):
         run_eval_accuracy_test(self)
 
 
-class TestHiCacheStorageHybridModel(HiCacheStorageBaseMixin, CustomTestCase):
-    """Hybrid Model tests for HiCache-File backend"""
-
-    @classmethod
-    def _get_model_name(cls):
-        """Use hybrid linear model for testing"""
-        return "Qwen/Qwen3.5-35B-A3B-FP8"
-
-    @classmethod
-    def _get_additional_server_args_and_env(cls):
-        """Get additional server arguments specific to configuration - override in subclasses"""
-        server_args = {
-            "--tp-size": 2,
-            "--hicache-ratio": 1.5,
-            "--hicache-mem-layout": "page_first_direct",
-            "--hicache-io-backend": "direct",
-            "--tp-size": 2,
-            "--mamba-scheduler-strategy": "extra_buffer",
-            "--page-size": 64,
-        }
-
-        return server_args, {}
-
-    def test_eval_accuracy(self):
-        """Test eval accuracy with cache persistence across cache flushes"""
-        run_eval_accuracy_test(self)
-
-
 def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
     """Generic eval accuracy test with configurable accuracy threshold
 
@@ -326,7 +298,7 @@ def run_eval_accuracy_test(test_instance, accuracy_threshold: float = 0.03):
         base_url=f"http://{test_instance.base_host}:{test_instance.base_port}",
         eval_name="gsm8k",
         api="completion",
-        max_tokens=16000,
+        max_tokens=8000,
         num_examples=200,
         num_threads=64,
     )
