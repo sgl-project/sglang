@@ -273,8 +273,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,  # last_loc for full layers
         extend_num_tokens: int,
     ):
-        assert self.page_size > 1
-
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
         )
@@ -308,9 +306,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             hisparse_last_loc,
             len(logical_indices),
         )
-        assert (
-            hisparse_indices is not None
-        ), "Hisparse allocation failed in alloc_extend"
+        if hisparse_indices is None:
+            self.logical_attn_allocator.free(logical_indices)
+            return None
 
         self.full_to_hisparse_device_index_mapping[logical_indices] = hisparse_indices
 
