@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "wheel"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0", "setuptools-rust>=1.10", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -22,21 +22,22 @@ dependencies = [
   "blobfile==3.0.0",
   "build",
   "compressed-tensors",
-  "cuda-python==12.9",
+  "cuda-python>=13.0",
   "decord2 ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.7.post3", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.7.post3",
+  "flashinfer_python==0.6.8.post1", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.8.post1",
   "gguf",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
   "msgspec",
   "ninja",
+  "easydict",  # Required by remote model code (e.g. DeepSeek-OCR) loaded via trust_remote_code; validated by transformers 5.4+ check_imports
   "numpy",
-  "nvidia-cutlass-dsl>=4.4.1",
+  "nvidia-cutlass-dsl==4.4.2",
   "nvidia-ml-py",
   "openai-harmony==0.0.4",
   "openai==2.6.1",
@@ -57,21 +58,21 @@ dependencies = [
   "scipy",
   "sentencepiece",
   "setproctitle",
-  "flash-attn-4>=4.0.0b4",
-  "sglang-kernel==0.4.1",
+  "flash-attn-4>=4.0.0b9",
+  "sglang-kernel==0.4.1.post1",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
   "torch_memory_saver==0.0.9",
   "torch==2.9.1",
-  "torchao==0.9.0",
+  "torchao==0.17.0",
   "torchaudio==2.9.1",
   "torchcodec==0.9.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec 0.9.1 for torch 2.9.x. Not available on Linux ARM.
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "torchvision",
   "tqdm",
-  "mistral_common>=1.9.0",
-  "transformers==5.3.0",
+  "mistral_common>=1.11.0",
+  "transformers==5.5.4",
   "uvicorn",
   "uvloop",
   "watchfiles",
@@ -86,15 +87,21 @@ url = "https://pypi.org/simple"
 default = true
 
 [[tool.uv.index]]
-name = "torch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
+name = "torch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+# To be removed after pypi sglang-kernel uses cu130
+[[tool.uv.index]]
+name = "sglang-kernel-cu130"
+url = "https://docs.sglang.ai/whl/cu130/"
 explicit = true
 
 [tool.uv.sources]
-torch = [
-  { index = "pypi", marker = "platform_machine == 'x86_64'"},
-  { index = "torch-cu129", marker = "platform_machine == 'aarch64'"},
-]
+torch = { index = "torch-cu130" }
+torchvision = { index = "torch-cu130" }
+torchaudio = { index = "torch-cu130" }
+sglang-kernel = { index = "sglang-kernel-cu130" }
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
@@ -106,6 +113,7 @@ diffusion = [
   "imageio==2.36.0",
   "imageio-ffmpeg==0.5.1",
   "moviepy>=2.0.0",
+  "nvidia-modelopt",
   "opencv-python-headless==4.10.0.84",
   "remote-pdb==2.1.0",
   "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
@@ -208,6 +216,11 @@ version_file = "sglang/_version.py"
 git_describe_command = ["python3", "python/tools/get_version_tag.py"]
 # Allow editable installs even when .git metadata is not available.
 fallback_version = "0.0.0.dev0"
+
+[[tool.setuptools-rust.ext-modules]]
+target = "sglang.srt.grpc._core"
+path = "../rust/sglang-grpc/Cargo.toml"
+binding = "PyO3"
 
 [tool.kernels.dependencies]
 "kernels-community/sgl-flash-attn3" = 1

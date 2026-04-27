@@ -10,6 +10,8 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
@@ -115,12 +117,12 @@ class NGRAMWorker:
             dtype=torch.int64,
             device=self.device,
         )
-        self.retrive_next_token = torch.empty(
+        self.retrieve_next_token = torch.empty(
             (self.max_batch_size, self.draft_token_num),
             dtype=torch.int64,
             device=self.device,
         )
-        self.retrive_next_sibling = torch.empty(
+        self.retrieve_next_sibling = torch.empty(
             (self.max_batch_size, self.draft_token_num),
             dtype=torch.int64,
             device=self.device,
@@ -135,14 +137,14 @@ class NGRAMWorker:
         self.draft_tokens_batch = []
         self.tree_mask_batch = []
         self.retrieve_indexes_batch = []
-        self.retrive_next_token_batch = []
-        self.retrive_next_sibling_batch = []
+        self.retrieve_next_token_batch = []
+        self.retrieve_next_sibling_batch = []
         self.positions_batch = []
 
         for bs in range(0, self.max_batch_size + 1):
             self.retrieve_indexes_batch.append(self.retrieve_indexes[:bs, :])
-            self.retrive_next_token_batch.append(self.retrive_next_token[:bs, :])
-            self.retrive_next_sibling_batch.append(self.retrive_next_sibling[:bs, :])
+            self.retrieve_next_token_batch.append(self.retrieve_next_token[:bs, :])
+            self.retrieve_next_sibling_batch.append(self.retrieve_next_sibling[:bs, :])
             self.positions_batch.append(self.positions[: bs * self.draft_token_num])
             self.draft_tokens_batch.append(
                 self.draft_tokens[: bs * self.draft_token_num]
@@ -184,9 +186,9 @@ class NGRAMWorker:
 
         bs = batch.batch_size()
 
-        retrive_index = self.retrieve_indexes_batch[bs]
-        retrive_next_token = self.retrive_next_token_batch[bs]
-        retrive_next_sibling = self.retrive_next_sibling_batch[bs]
+        retrieve_index = self.retrieve_indexes_batch[bs]
+        retrieve_next_token = self.retrieve_next_token_batch[bs]
+        retrieve_next_sibling = self.retrieve_next_sibling_batch[bs]
         positions = self.positions_batch[bs]
         tree_mask = self.tree_mask_batch[bs]
         draft_tokens = self.draft_tokens_batch[bs]
@@ -199,9 +201,9 @@ class NGRAMWorker:
             tree_mask,
             batch.seq_lens,
             positions,  # mutable
-            retrive_index,  # mutable
-            retrive_next_token,  # mutable
-            retrive_next_sibling,  # mutable
+            retrieve_index,  # mutable
+            retrieve_next_token,  # mutable
+            retrieve_next_sibling,  # mutable
             bs,
             self.draft_token_num,
         )
@@ -228,9 +230,9 @@ class NGRAMWorker:
             draft_tokens,
             tree_mask,
             positions,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             self.draft_token_num,
         )
         batch.spec_info.prepare_for_verify(batch, self.page_size)
@@ -250,7 +252,12 @@ class NGRAMWorker:
         self.ngram_corpus.batch_put(batch_tokens)
 
     def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
+
         self._prepare_for_speculative_decoding(batch)
+
+        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
+
         model_worker_batch = batch.get_model_worker_batch()
         spec_info = model_worker_batch.spec_info
         num_accepted_tokens = 0
@@ -259,11 +266,13 @@ class NGRAMWorker:
 
         if model_worker_batch.forward_mode.is_target_verify():
             if batch.has_grammar:
-                retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
-                retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+                retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
+                retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
                 draft_tokens_cpu = spec_info.draft_token.view(
-                    spec_info.retrive_next_token.shape
+                    spec_info.retrieve_next_token.shape
                 ).cpu()
+
+            set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
 
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
@@ -289,7 +298,7 @@ class NGRAMWorker:
 
                 if vocab_mask is not None:
                     assert verify_input.grammar is not None
-                    vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
+                    vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
                     # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
                     # and will be applied to produce wrong results
                     batch.sampling_info.vocab_mask = None
@@ -298,6 +307,16 @@ class NGRAMWorker:
                 batch, logits_output, self.page_size, vocab_mask
             )
             accept_length_per_req_cpu = verify_input.accept_length.cpu().tolist()
+
+            if get_global_tracing_enabled():
+                for idx, req in enumerate(batch.reqs):
+                    accepted = (
+                        verify_input.accept_length[idx].item()
+                        if verify_input.accept_length is not None
+                        else 0
+                    )
+                    req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+
             # Store accept_lens for per-request metrics
             accept_lens = verify_input.accept_length
             if batch.return_logprob:
