@@ -85,6 +85,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    should_skip_post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -141,6 +142,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_gfx95_supported,
     _is_hip,
+    _is_musa,
     _is_npu,
     _is_xpu,
     _use_aiter,
@@ -182,6 +184,8 @@ elif _is_npu:
         forward_mla_core_npu,
         forward_mla_prepare_npu,
     )
+elif _is_musa:
+    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
 else:
     pass
 
@@ -640,16 +644,17 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=dispatch_info,
             )
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
+            if not (_is_cuda or _is_musa) or isinstance(
+                self.experts.quant_method, KTEPWrapperMethod
+            ):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -725,6 +730,7 @@ class DeepseekV2MoE(nn.Module):
         )
         if (
             not _is_cuda
+            and not _is_musa
             and not _is_xpu
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
@@ -733,11 +739,10 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states += shared_output
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -1910,7 +1915,7 @@ class DeepseekV2Model(nn.Module):
 
         self.alt_stream = (
             torch.cuda.Stream()
-            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            if _is_cuda or _is_musa or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
 
@@ -2249,12 +2254,15 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Config does not support fused shared expert(s)."
-        elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
-            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
+        elif (
+            (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0))
+            and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
+            and (not _is_musa or torch.musa.get_device_capability("musa") < (3, 1))
         ):
             disable_reason = (
                 "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
+                "or MT-platform with capability >= 31 can use shared experts fusion optimization."
             )
         elif get_moe_expert_parallel_world_size() > 1 and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
