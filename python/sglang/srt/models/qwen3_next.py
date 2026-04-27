@@ -65,6 +65,14 @@ _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
 
 
+if _is_npu:
+    from sgl_kernel_npu.fla.utils import (
+        fused_qkvzba_split_reshape_cat as fused_qkvzba_split_reshape_cat_npu,
+    )
+
+    fused_qkvzba_split_reshape_cat = fused_qkvzba_split_reshape_cat_npu
+
+
 class Qwen3GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -223,11 +231,20 @@ class Qwen3GatedDeltaNet(nn.Module):
         ModelWeightParameter exposes weight_loader as a read-only property
         backed by _weight_loader, while plain parameters store it as a
         regular attribute.  This helper handles both cases."""
-        param = module.weight
-        if hasattr(param, "_weight_loader"):
-            param._weight_loader = new_loader
-        else:
-            param.weight_loader = new_loader
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "input_scale",
+            "weight_offset",
+        ):
+            param = getattr(module, attr_name, None)
+            if param is None:
+                continue
+            if hasattr(param, "_weight_loader"):
+                param._weight_loader = new_loader
+            else:
+                param.weight_loader = new_loader
 
     @staticmethod
     def _make_packed_weight_loader(module):

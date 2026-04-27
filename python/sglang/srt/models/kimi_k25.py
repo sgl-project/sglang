@@ -28,6 +28,7 @@ except ImportError:
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -661,7 +662,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 quant_config,
                 prefix=(
                     "language_model"
-                    if isinstance(quant_config, ModelSlimConfig)
+                    if isinstance(quant_config, (ModelSlimConfig, QuarkConfig))
                     else ""
                 ),
             )

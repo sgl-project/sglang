@@ -180,10 +180,17 @@ class ModelConfig:
         self.is_generation = is_generation_model(
             self.hf_config.architectures, is_embedding
         )
-        has_multimodal_subconfig = (
-            self.hf_config is not self.hf_text_config
-            or hasattr(self.hf_config, "vision_config")
-            or hasattr(self.hf_config, "audio_config")
+        # The vision_config/audio_config attribute heuristic is only applied when
+        # the transformers backend is explicitly requested. Some text-only models
+        # (e.g. xai-org/grok-2 with model_type="git") would otherwise be
+        # false-positively detected because their HF config auto-populates a
+        # `vision_config` in __post_init__.
+        has_multimodal_subconfig = self.hf_config is not self.hf_text_config or (
+            self.model_impl == ModelImpl.TRANSFORMERS
+            and (
+                hasattr(self.hf_config, "vision_config")
+                or hasattr(self.hf_config, "audio_config")
+            )
         )
         self.is_multimodal = enable_multimodal and (
             is_multimodal_model(self.hf_config.architectures)
