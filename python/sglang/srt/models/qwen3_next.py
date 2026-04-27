@@ -65,6 +65,14 @@ _is_cpu = is_cpu()
 _is_amx_available = cpu_has_amx_support()
 
 
+if _is_npu:
+    from sgl_kernel_npu.fla.utils import (
+        fused_qkvzba_split_reshape_cat as fused_qkvzba_split_reshape_cat_npu,
+    )
+
+    fused_qkvzba_split_reshape_cat = fused_qkvzba_split_reshape_cat_npu
+
+
 class Qwen3GatedDeltaNet(nn.Module):
     def __init__(
         self,
@@ -223,11 +231,20 @@ class Qwen3GatedDeltaNet(nn.Module):
         ModelWeightParameter exposes weight_loader as a read-only property
         backed by _weight_loader, while plain parameters store it as a
         regular attribute.  This helper handles both cases."""
-        param = module.weight
-        if hasattr(param, "_weight_loader"):
-            param._weight_loader = new_loader
-        else:
-            param.weight_loader = new_loader
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "input_scale",
+            "weight_offset",
+        ):
+            param = getattr(module, attr_name, None)
+            if param is None:
+                continue
+            if hasattr(param, "_weight_loader"):
+                param._weight_loader = new_loader
+            else:
+                param.weight_loader = new_loader
 
     @staticmethod
     def _make_packed_weight_loader(module):
@@ -245,14 +262,23 @@ class Qwen3GatedDeltaNet(nn.Module):
                 if output_dim is not None and module.tp_size > 1:
                     shard_size = param.data.shape[output_dim]
                     start_idx = module.tp_rank * shard_size
+                    if (
+                        _is_cpu and _is_amx_available
+                    ) and start_idx + shard_size > loaded_weight.shape[output_dim]:
+                        shard_size = loaded_weight.shape[output_dim] - start_idx
                     loaded_weight = loaded_weight.narrow(
                         output_dim, start_idx, shard_size
                     )
-                assert param.data.shape == loaded_weight.shape, (
-                    f"Shape mismatch: param {param.data.shape} vs "
-                    f"loaded {loaded_weight.shape}"
-                )
-                param.data.copy_(loaded_weight)
+                if _is_cpu and _is_amx_available:
+                    slices = tuple(slice(0, s) for s in loaded_weight.shape)
+                    param.data.zero_()
+                    param.data[slices].copy_(loaded_weight)
+                else:
+                    assert param.data.shape == loaded_weight.shape, (
+                        f"Shape mismatch: param {param.data.shape} vs "
+                        f"loaded {loaded_weight.shape}"
+                    )
+                    param.data.copy_(loaded_weight)
             else:
                 # Split checkpoint (int or tuple shard_id) → standard path
                 original_loader(param, loaded_weight, loaded_shard_id)

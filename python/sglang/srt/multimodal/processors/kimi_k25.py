@@ -233,7 +233,7 @@ class KimiGPUProcessorWrapper:
         self._gpu_norm_tensors = None
 
         # Explicitly expose attributes that base class process_mm_data needs:
-        # - image_processor: checked via isinstance(..., BaseImageProcessorFast)
+        # - image_processor: checked via isinstance(..., BaseImageProcessor)
         # - tokenizer: used for tokenization
         # - media_processor: used by CPU fallback path
         self.image_processor = hf_processor.image_processor
