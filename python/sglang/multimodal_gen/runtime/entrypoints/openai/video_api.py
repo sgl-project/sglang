@@ -56,10 +56,14 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
     seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
     fps = request.fps if request.fps is not None else DEFAULT_FPS
     num_frames = request.num_frames if request.num_frames is not None else fps * seconds
+    num_outputs = request.num_outputs_per_prompt
+    if num_outputs is None:
+        num_outputs = request.n or 1
 
     return build_sampling_params(
         request_id,
         prompt=request.prompt,
+        num_outputs_per_prompt=max(1, min(int(num_outputs), 10)),
         size=request.size,
         width=request.width,
         height=request.height,
@@ -156,6 +160,12 @@ async def _dispatch_job_async(
             "completed_at": int(time.time()),
             "url": cloud_url,
             "file_path": persistent_path,
+            "file_paths": (
+                [os.path.abspath(path) for path in save_file_path_list]
+                if output_persistent
+                else None
+            ),
+            "num_outputs": len(save_file_path_list),
         }
         update_fields = add_common_data_to_response(
             update_fields, request_id=job_id, result=result
@@ -180,6 +190,8 @@ async def create_video(
     input_reference: Optional[UploadFile] = File(None),
     reference_url: Optional[str] = Form(None),
     model: Optional[str] = Form(None),
+    n: Optional[int] = Form(1),
+    num_outputs_per_prompt: Optional[int] = Form(None),
     seconds: Optional[int] = Form(None),
     size: Optional[str] = Form(None),
     fps: Optional[int] = Form(None),
@@ -262,6 +274,8 @@ async def create_video(
             prompt=prompt,
             input_reference=input_path,
             model=model,
+            n=n,
+            num_outputs_per_prompt=num_outputs_per_prompt,
             seconds=seconds if seconds is not None else 4,
             size=size,
             fps=fps_val,
