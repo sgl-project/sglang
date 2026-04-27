@@ -91,6 +91,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
             stream=request.stream,
             modalities=["audio"],
             routing_key=self.extract_routing_key(raw_request),
+            processor_kwargs=request.processor_kwargs,
+            mm_process_config=request.mm_process_config,
+            io_kwargs=request.io_kwargs,
         )
 
         return adapted_request, request
@@ -117,6 +120,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
         stream: bool,
         raw_request: Request,
         timestamp_granularities: Optional[List[str]] = None,
+        processor_kwargs: Optional[dict] = None,
+        mm_process_config: Optional[dict] = None,
+        io_kwargs: Optional[dict] = None,
     ) -> Union[
         TranscriptionResponse,
         TranscriptionVerboseResponse,
@@ -154,6 +160,9 @@ class OpenAIServingTranscription(OpenAIServingBase):
             timestamp_granularities=timestamp_granularities,
             stream=stream,
             audio_duration_s=audio_duration_s,
+            processor_kwargs=processor_kwargs,
+            mm_process_config=mm_process_config,
+            io_kwargs=io_kwargs,
         )
         if use_fused:
             request._fused_autodetect = True

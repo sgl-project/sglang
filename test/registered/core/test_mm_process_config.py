@@ -201,6 +201,89 @@ class TestProcessMmDataKwargs(unittest.TestCase):
         self.assertFalse(audio_kw.get("truncation", True))
         self.assertEqual(audio_kw.get("sample_rate"), 16000)
 
+    def test_runtime_mm_process_config_merges_with_server_defaults(self):
+        config = {"image": {"max_pixels": 5000000, "do_resize": True}}
+        proc, mock_proc, _ = self._make_base_processor(config)
+        request = MagicMock(
+            processor_kwargs=None,
+            mm_process_config={"image": {"max_pixels": 1024}},
+            io_kwargs=None,
+        )
+
+        with proc.request_context(request):
+            proc.process_mm_data("test", images=["img1"])
+
+        call_kwargs = mock_proc.__call__.call_args
+        self.assertEqual(
+            call_kwargs.kwargs.get("images_kwargs"),
+            {"max_pixels": 1024, "do_resize": True},
+        )
+
+    def test_runtime_processor_kwargs_merge_after_mm_config(self):
+        config = {"image": {"max_pixels": 5000000}}
+        proc, mock_proc, _ = self._make_base_processor(config)
+        request = MagicMock(
+            processor_kwargs={
+                "images_kwargs": {"size": {"height": 512}},
+                "custom_flag": True,
+            },
+            mm_process_config={"image": {"max_pixels": 1024}},
+            io_kwargs=None,
+        )
+
+        with proc.request_context(request):
+            proc.process_mm_data("test", images=["img1"])
+
+        call_kwargs = mock_proc.__call__.call_args
+        self.assertEqual(
+            call_kwargs.kwargs.get("images_kwargs"),
+            {"max_pixels": 1024, "size": {"height": 512}},
+        )
+        self.assertTrue(call_kwargs.kwargs.get("custom_flag"))
+
+    def test_runtime_processor_kwargs_reject_reserved_keys(self):
+        proc, _, _ = self._make_base_processor({})
+        request = MagicMock(
+            processor_kwargs={"text": ["bad"]},
+            mm_process_config=None,
+            io_kwargs=None,
+        )
+
+        with proc.request_context(request):
+            with self.assertRaisesRegex(
+                ValueError, "processor_kwargs cannot override reserved processor inputs"
+            ):
+                proc.process_mm_data("test", images=["img1"])
+
+    def test_runtime_io_kwargs_apply_to_fast_load(self):
+        proc, _, _ = self._make_base_processor({})
+        proc._submit_mm_data_loading_tasks_simple = MagicMock(return_value=[])
+        request = MagicMock(
+            processor_kwargs=None,
+            mm_process_config=None,
+            io_kwargs={
+                "image": {"discard_alpha_channel": False},
+                "audio": {"audio_sample_rate": 22050},
+                "video": {"frame_count_limit": 8},
+            },
+        )
+
+        with proc.request_context(request):
+            proc.fast_load_mm_data(
+                prompt="test",
+                multimodal_tokens=MagicMock(),
+                image_data=["img1"],
+                video_data=["vid1"],
+                audio_data=["aud1"],
+            )
+
+        calls = proc._submit_mm_data_loading_tasks_simple.call_args_list
+        self.assertEqual(calls[0].args[2], None)
+        self.assertEqual(calls[0].args[3], 22050)
+        self.assertFalse(calls[0].args[4])
+        self.assertEqual(calls[1].args[2], 8)
+        self.assertEqual(calls[2].args[3], 22050)
+
 
 class TestOverrideProcessorsConfigInjection(unittest.TestCase):
     """Regression tests for processors that override process_mm_data."""
@@ -284,6 +367,66 @@ class TestOverrideProcessorsConfigInjection(unittest.TestCase):
         audio_kw = call_kwargs.kwargs.get("audio_kwargs", {})
         # User config can override truncation if they explicitly set it
         self.assertTrue(audio_kw.get("truncation"))
+
+    def test_midashenglm_runtime_kwargs_merged(self):
+        from sglang.srt.multimodal.processors.midashenglm import (
+            MiDashengLMMultimodalProcessor,
+        )
+
+        proc, mock_proc = self._make_override_processor(
+            MiDashengLMMultimodalProcessor, {"audio": {"sample_rate": 16000}}
+        )
+        request = MagicMock(
+            processor_kwargs={"audio_kwargs": {"padding": "longest"}},
+            mm_process_config={"audio": {"sample_rate": 22050}},
+            io_kwargs=None,
+        )
+
+        with proc.request_context(request):
+            proc.process_mm_data("test", audios=["aud1"])
+
+        call_kwargs = mock_proc.__call__.call_args
+        self.assertEqual(
+            call_kwargs.kwargs.get("audio_kwargs"),
+            {
+                "truncation": False,
+                "sample_rate": 22050,
+                "padding": "longest",
+            },
+        )
+
+
+class TestTransformersAutoRuntimeKwargs(unittest.TestCase):
+    def test_runtime_processor_kwargs_merged_for_transformers_auto(self):
+        from sglang.srt.multimodal.processors.transformers_auto import (
+            TransformersAutoMultimodalProcessor,
+        )
+
+        with patch.object(
+            TransformersAutoMultimodalProcessor, "__init__", lambda self: None
+        ):
+            proc = TransformersAutoMultimodalProcessor()
+
+        proc._processor = MagicMock()
+        proc._processor.return_value = {"input_ids": MagicMock(flatten=MagicMock())}
+        proc.image_config = {"max_pixels": 5000000}
+        proc.video_config = {}
+        proc.audio_config = {}
+
+        request = MagicMock(
+            processor_kwargs={"images_kwargs": {"size": {"height": 512}}},
+            mm_process_config={"image": {"max_pixels": 1024}},
+            io_kwargs=None,
+        )
+
+        with proc.request_context(request):
+            proc._apply_hf_processor("hello", images=["img1"])
+
+        call_kwargs = proc._processor.call_args.kwargs
+        self.assertEqual(
+            call_kwargs.get("images_kwargs"),
+            {"max_pixels": 1024, "size": {"height": 512}},
+        )
 
 
 if __name__ == "__main__":
