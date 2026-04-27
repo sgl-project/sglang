@@ -84,6 +84,11 @@ import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deploym
 - `--enable-dp-lm-head` and `--mm-enable-dp-encoder` are required whenever `--enable-dp-attention` is on, to keep LM head and encoder sharding consistent.
 - **Multimodal**: Supports image, video, and audio understanding; see Section 4.3 for invocation examples.
 
+**DeepEP (optional toggle, Hopper-only):**
+- DeepEP replaces the default MoE all-to-all dispatch with a fused [DeepEP](https://github.com/deepseek-ai/DeepEP) backend; it lowers expert dispatch latency and memory traffic, so it pays off under **high concurrency / throughput-bound workloads** on H100/H200. Under concurrency=1 / latency-bound workloads the gain is negligible — leave it off.
+- Enabling adds `--moe-a2a-backend deepep` + `--moe-dense-tp-size 1` (and `--ep <tp>` for Pro) plus `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256` env to cap the dispatch buffer. Requires `pip install deep_ep` (not part of the default sglang install).
+- On Blackwell (B200, GB300) the verified MoE backend is `flashinfer_trtllm`; the DeepEP toggle is a no-op there.
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
