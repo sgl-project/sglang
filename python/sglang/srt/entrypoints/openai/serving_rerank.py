@@ -125,12 +125,13 @@ def _get_jinja_env():
             "Rendering Qwen3 reranker prompts requires `jinja2`. "
             "Please install it in your runtime environment (e.g., `pip install jinja2`)."
         ) from e
-    # Using a sandboxed environement to stop malicious execution during model loading.
+    # Using a sandboxed environment to stop malicious execution during model loading.
     return ImmutableSandboxedEnvironment(
         loader=jinja2.BaseLoader(),
         autoescape=False,
         undefined=jinja2.Undefined,
     )
+
 
 def _render_jinja_chat_template(
     chat_template: str,
