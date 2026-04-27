@@ -6,6 +6,8 @@ from typing import Any, Iterator, Optional
 
 import torch
 
+from sglang.srt.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+
 ROW_LINEAR_INV_BLOCK_K = 128
 
 
@@ -33,25 +35,33 @@ def is_tp_invariant_target(server_args: Optional[Any] = None) -> bool:
 def should_disable_reduce_scatter_for_on_policy(
     server_args: Optional[Any] = None,
 ) -> bool:
-    return is_true_on_policy_enabled(server_args)
+    return resolve_true_on_policy_runtime_policy(
+        _get_server_args(server_args)
+    ).disable_reduce_scatter
 
 
 def should_disable_mlp_allreduce_fusion_for_on_policy(
     server_args: Optional[Any] = None,
 ) -> bool:
-    return is_true_on_policy_enabled(server_args)
+    return resolve_true_on_policy_runtime_policy(
+        _get_server_args(server_args)
+    ).disable_mlp_allreduce_fusion
 
 
 def should_disable_flashinfer_allreduce_fusion(
     server_args: Optional[Any] = None,
 ) -> bool:
-    return is_tp_invariant_target(server_args)
+    return resolve_true_on_policy_runtime_policy(
+        _get_server_args(server_args)
+    ).disable_flashinfer_allreduce_fusion
 
 
 def should_force_bfloat16_dense_tensor_math(
     server_args: Optional[Any] = None,
 ) -> bool:
-    return is_true_on_policy_enabled(server_args)
+    return resolve_true_on_policy_runtime_policy(
+        _get_server_args(server_args)
+    ).force_bfloat16_dense_tensor_math
 
 
 def should_force_bfloat16_lm_head(
@@ -59,7 +69,12 @@ def should_force_bfloat16_lm_head(
     server_args: Optional[Any] = None,
     use_fp32_lm_head: bool = False,
 ) -> bool:
-    return should_force_bfloat16_dense_tensor_math(server_args) and not use_fp32_lm_head
+    return (
+        resolve_true_on_policy_runtime_policy(
+            _get_server_args(server_args)
+        ).force_bfloat16_lm_head
+        and not use_fp32_lm_head
+    )
 
 
 def get_on_policy_rms_norm_kwargs(
@@ -92,7 +107,9 @@ def should_use_tp_invariant_row_linear(
         row_linear_enable_inv = os.environ.get("ROW_LINEAR_ENABLE_INV", "0") == "1"
 
     return (
-        is_tp_invariant_target(server_args)
+        resolve_true_on_policy_runtime_policy(
+            _get_server_args(server_args)
+        ).tp_invariant_row_linear
         and row_linear_enable_inv
         and k_size >= ROW_LINEAR_INV_BLOCK_K
         and k_size % ROW_LINEAR_INV_BLOCK_K == 0
@@ -106,7 +123,12 @@ def should_use_tp_invariant_tree_all_reduce(
     if accl_binary_tree_enabled is None:
         accl_binary_tree_enabled = os.environ.get("ACCL_BINARY_TREE_ENABLE") == "1"
 
-    return is_tp_invariant_target(server_args) and not accl_binary_tree_enabled
+    return (
+        resolve_true_on_policy_runtime_policy(
+            _get_server_args(server_args)
+        ).deterministic_tree_all_reduce
+        and not accl_binary_tree_enabled
+    )
 
 
 @contextlib.contextmanager

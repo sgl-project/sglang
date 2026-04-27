@@ -11,10 +11,12 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.true_on_policy import (
+    QWEN3_DENSE_TRUE_ON_POLICY_V1,
     get_rl_on_policy_target,
     is_tp_invariant_target,
     is_true_on_policy_enabled,
     patch_prefill_only_deterministic_inference_for_cuda_graph,
+    resolve_true_on_policy_runtime_policy,
     should_disable_flashinfer_allreduce_fusion,
     should_disable_mlp_allreduce_fusion_for_on_policy,
     should_disable_reduce_scatter_for_on_policy,
@@ -109,6 +111,7 @@ def _run_server_args_script(argv: list[str]) -> dict[str, object]:
                     "enable_prefill_only_deterministic_inference": server_args.enable_prefill_only_deterministic_inference,
                     "enable_flashinfer_allreduce_fusion": server_args.enable_flashinfer_allreduce_fusion,
                     "rl_on_policy_target": server_args.rl_on_policy_target,
+                    "true_on_policy_contract": server_args.true_on_policy_contract,
                     "sampling_backend": server_args.sampling_backend,
                 }
             )
@@ -161,6 +164,7 @@ class TestOnPolicyServerArgs(unittest.TestCase):
             ]
         )
         self.assertEqual(fsdp_tp_result["rl_on_policy_target"], "fsdp_tp")
+        self.assertIsNone(fsdp_tp_result["true_on_policy_contract"])
         self.assertTrue(fsdp_tp_result["enable_deterministic_inference"])
 
         fsdp_result = _run_server_args_script(
@@ -174,7 +178,39 @@ class TestOnPolicyServerArgs(unittest.TestCase):
             ]
         )
         self.assertEqual(fsdp_result["rl_on_policy_target"], "fsdp")
+        self.assertIsNone(fsdp_result["true_on_policy_contract"])
         self.assertTrue(fsdp_result["enable_deterministic_inference"])
+
+    def test_cli_accepts_explicit_true_on_policy_contract(self):
+        result = _run_server_args_script(
+            [
+                "--model-path",
+                "dummy",
+                "--attention-backend",
+                "triton",
+                "--rl-on-policy-target",
+                "fsdp_tp",
+                "--true-on-policy-contract",
+                QWEN3_DENSE_TRUE_ON_POLICY_V1,
+            ]
+        )
+
+        self.assertEqual(result["rl_on_policy_target"], "fsdp_tp")
+        self.assertEqual(result["true_on_policy_contract"], QWEN3_DENSE_TRUE_ON_POLICY_V1)
+        self.assertTrue(result["enable_deterministic_inference"])
+
+    def test_cli_rejects_contract_without_on_policy_target(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            _run_server_args_script(
+                [
+                    "--model-path",
+                    "dummy",
+                    "--attention-backend",
+                    "triton",
+                    "--true-on-policy-contract",
+                    QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                ]
+            )
 
     def test_fsdp_tp_disables_flashinfer_allreduce_fusion(self):
         result = _run_server_args_script(
@@ -265,6 +301,32 @@ class TestOnPolicyHelpers(unittest.TestCase):
                 row_linear_enable_inv=True,
             )
         )
+
+    def test_contract_resolver_preserves_legacy_target_behavior(self):
+        policy = resolve_true_on_policy_runtime_policy(
+            SimpleNamespace(
+                rl_on_policy_target="fsdp_tp",
+                true_on_policy_contract=None,
+            )
+        )
+
+        self.assertEqual(policy.contract_name, QWEN3_DENSE_TRUE_ON_POLICY_V1)
+        self.assertTrue(policy.enabled)
+        self.assertTrue(policy.tp_invariant_row_linear)
+        self.assertTrue(policy.deterministic_tree_all_reduce)
+
+    def test_contract_resolver_accepts_explicit_qwen3_dense_contract(self):
+        server_args = SimpleNamespace(
+            rl_on_policy_target="fsdp",
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+        )
+        policy = resolve_true_on_policy_runtime_policy(
+            server_args
+        )
+
+        self.assertTrue(policy.enabled)
+        self.assertTrue(policy.force_bfloat16_dense_tensor_math)
+        self.assertFalse(policy.tp_invariant_row_linear)
         self.assertFalse(
             should_use_tp_invariant_row_linear(
                 96,
@@ -279,6 +341,15 @@ class TestOnPolicyHelpers(unittest.TestCase):
                 row_linear_enable_inv=True,
             )
         )
+
+    def test_contract_resolver_rejects_contract_without_target(self):
+        with self.assertRaisesRegex(ValueError, "requires --rl-on-policy-target"):
+            resolve_true_on_policy_runtime_policy(
+                SimpleNamespace(
+                    rl_on_policy_target=None,
+                    true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                )
+            )
 
     def test_reduce_scatter_and_fusion_are_disabled_for_any_on_policy_target(self):
         self.assertTrue(

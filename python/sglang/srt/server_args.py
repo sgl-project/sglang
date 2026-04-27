@@ -32,6 +32,7 @@ from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.true_on_policy import (
     should_disable_flashinfer_allreduce_fusion,
+    validate_true_on_policy_contract,
 )
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -674,6 +675,7 @@ class ServerArgs:
     enable_deterministic_inference: bool = False
     enable_prefill_only_deterministic_inference: bool = False
     rl_on_policy_target: Optional[str] = None
+    true_on_policy_contract: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
     gc_threshold: Optional[List[int]] = None
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
@@ -3462,6 +3464,8 @@ class ServerArgs:
             raise ValueError("--swa-full-tokens-ratio should be in range (0, 1.0].")
 
     def _handle_deterministic_inference(self):
+        validate_true_on_policy_contract(self)
+
         if self.enable_prefill_only_deterministic_inference:
             self.enable_deterministic_inference = True
 
@@ -5719,6 +5723,16 @@ class ServerArgs:
             default=ServerArgs.rl_on_policy_target,
             choices=RL_ON_POLICY_TARGET_CHOICES,
             help="The training system that SGLang needs to match for true on-policy.",
+        )
+        parser.add_argument(
+            "--true-on-policy-contract",
+            type=str,
+            default=ServerArgs.true_on_policy_contract,
+            help=(
+                "Internal true-on-policy parity contract selected by the launcher. "
+                "Normal users should prefer --rl-on-policy-target or the Miles "
+                "true_on_policy switch."
+            ),
         )
         parser.add_argument(
             "--enable-attn-tp-input-scattered",
