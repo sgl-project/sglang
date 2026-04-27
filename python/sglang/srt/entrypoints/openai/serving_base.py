@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import orjson
@@ -239,6 +240,46 @@ class OpenAIServingBase(ABC):
             code=status_code,
         )
         return json.dumps({"error": error.model_dump()})
+
+    def maybe_convert_pre_stream_bad_request(
+        self, first_chunk: Any
+    ) -> Optional[ORJSONResponse]:
+        """Convert a pre-stream SSE bad-request chunk into an HTTP 400 response.
+
+        Streaming OpenAI handlers kick-start their generators before returning a
+        StreamingResponse so deterministic validation failures can still surface
+        as request-level HTTP errors. Some validation paths in stream mode yield
+        an SSE error chunk as the first item instead of raising ValueError.
+        Detect that first-chunk bad-request case and convert it back into the
+        same flat HTTP 400 error payload used by non-streaming requests.
+        """
+        if isinstance(first_chunk, bytes):
+            first_chunk = first_chunk.decode()
+        if not isinstance(first_chunk, str) or not first_chunk.startswith("data: "):
+            return None
+
+        payload = first_chunk[len("data: ") :].strip()
+        if payload == "[DONE]":
+            return None
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+
+        error = data.get("error")
+        if not isinstance(error, dict):
+            return None
+
+        if error.get("code") != HTTPStatus.BAD_REQUEST.value:
+            return None
+
+        return self.create_error_response(
+            message=error.get("message", "Bad request"),
+            err_type="BadRequest",
+            status_code=HTTPStatus.BAD_REQUEST.value,
+            param=error.get("param"),
+        )
 
     def extract_custom_labels(self, raw_request):
         if (

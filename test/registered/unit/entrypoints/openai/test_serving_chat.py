@@ -18,6 +18,7 @@ from typing import Optional
 from unittest.mock import Mock, patch
 
 from fastapi import Request
+from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
@@ -774,6 +775,85 @@ class ServingChatTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_handle_streaming_request_returns_http_400_for_pre_stream_bad_request(self):
+        err_msg = "Requested token count exceeds the model's maximum context length."
+
+        async def _mock_pre_stream_bad_request(*args, **kwargs):
+            error = self.chat.create_streaming_error_response(
+                err_msg,
+                HTTPStatus.BAD_REQUEST.name,
+                HTTPStatus.BAD_REQUEST.value,
+            )
+            yield f"data: {error}\n\n"
+            yield "data: [DONE]\n\n"
+
+        self.chat._generate_chat_stream = Mock(
+            return_value=_mock_pre_stream_bad_request()
+        )
+
+        loop = get_or_create_event_loop()
+        response = loop.run_until_complete(
+            self.chat._handle_streaming_request(
+                Mock(spec=GenerateReqInput), self.stream_req, self.fastapi_request
+            )
+        )
+
+        self.assertIsInstance(response, ORJSONResponse)
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST.value)
+        body = json.loads(response.body)
+        self.assertEqual(body["message"], err_msg)
+        self.assertEqual(body["code"], HTTPStatus.BAD_REQUEST.value)
+        self.assertEqual(body["type"], "BadRequest")
+        self.tm.create_abort_task.assert_not_called()
+
+    def test_handle_streaming_request_keeps_sse_for_post_start_abort(self):
+        err_msg = "Backend failed after streaming started"
+
+        async def _mock_post_start_abort(*args, **kwargs):
+            yield (
+                'data: {"choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}\n\n'
+            )
+            error = self.chat.create_streaming_error_response(
+                err_msg,
+                HTTPStatus.INTERNAL_SERVER_ERROR.name,
+                HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            )
+            yield f"data: {error}\n\n"
+            yield "data: [DONE]\n\n"
+
+        self.chat._generate_chat_stream = Mock(return_value=_mock_post_start_abort())
+        adapted_request = Mock(spec=GenerateReqInput)
+
+        loop = get_or_create_event_loop()
+        response = loop.run_until_complete(
+            self.chat._handle_streaming_request(
+                adapted_request, self.stream_req, self.fastapi_request
+            )
+        )
+
+        self.assertIsInstance(response, StreamingResponse)
+        self.assertEqual(response.status_code, HTTPStatus.OK.value)
+        self.tm.create_abort_task.assert_called_once_with(adapted_request)
+
+        async def collect_chunks():
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+            return chunks
+
+        chunks = loop.run_until_complete(collect_chunks())
+        self.assertEqual(
+            chunks[1],
+            "data: "
+            + self.chat.create_streaming_error_response(
+                err_msg,
+                HTTPStatus.INTERNAL_SERVER_ERROR.name,
+                HTTPStatus.INTERNAL_SERVER_ERROR.value,
+            )
+            + "\n\n",
+        )
+        self.assertEqual(chunks[-1], "data: [DONE]\n\n")
 
     # ------------- incremental streaming output tests -------------
     def test_incremental_streaming_output_delta(self):

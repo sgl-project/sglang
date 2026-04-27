@@ -721,6 +721,8 @@ class OpenAIServingChat(OpenAIServingBase):
             first_chunk = await generator.__anext__()
         except ValueError as e:
             return self.create_error_response(str(e))
+        if error_response := self.maybe_convert_pre_stream_bad_request(first_chunk):
+            return error_response
 
         async def prepend_first_chunk():
             yield first_chunk

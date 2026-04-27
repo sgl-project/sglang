@@ -15,6 +15,7 @@ from typing import Optional
 from unittest.mock import AsyncMock, Mock
 
 from fastapi import Request
+from fastapi.responses import ORJSONResponse
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
@@ -255,6 +256,44 @@ class ServingCompletionTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk, and possibly a role chunk
         self.assertGreaterEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_handle_streaming_request_returns_http_400_for_pre_stream_bad_request(self):
+        err_msg = "Requested token count exceeds the model's maximum context length."
+
+        async def _mock_pre_stream_bad_request(*args, **kwargs):
+            error = self.sc.create_streaming_error_response(
+                err_msg,
+                HTTPStatus.BAD_REQUEST.name,
+                HTTPStatus.BAD_REQUEST.value,
+            )
+            yield f"data: {error}\n\n"
+            yield "data: [DONE]\n\n"
+
+        self.sc._generate_completion_stream = Mock(
+            return_value=_mock_pre_stream_bad_request()
+        )
+
+        req = CompletionRequest(
+            model="x",
+            prompt="Hello world",
+            max_tokens=100,
+            stream=True,
+        )
+
+        loop = get_or_create_event_loop()
+        response = loop.run_until_complete(
+            self.sc._handle_streaming_request(
+                Mock(), req, self.fastapi_request
+            )
+        )
+
+        self.assertIsInstance(response, ORJSONResponse)
+        self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST.value)
+        body = json.loads(response.body)
+        self.assertEqual(body["message"], err_msg)
+        self.assertEqual(body["code"], HTTPStatus.BAD_REQUEST.value)
+        self.assertEqual(body["type"], "BadRequest")
+        self.sc.tokenizer_manager.create_abort_task.assert_not_called()
 
 
 if __name__ == "__main__":
