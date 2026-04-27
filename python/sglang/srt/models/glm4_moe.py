@@ -320,11 +320,11 @@ class Glm4MoeAttention(nn.Module):
                 self.q_size,
                 self.kv_size,
                 self.head_dim,
-                eps=self.q_norm.variance_epsilon,
-                q_weight=self.q_norm.weight,
-                k_weight=self.k_norm.weight,
-                q_bias=getattr(self.q_norm, "bias", None),
-                k_bias=getattr(self.k_norm, "bias", None),
+                eps=self.q_norm.variance_epsilon if self.use_qk_norm else None,
+                q_weight=self.q_norm.weight if self.use_qk_norm else None,
+                k_weight=self.k_norm.weight if self.use_qk_norm else None,
+                q_bias=getattr(self.q_norm, "bias", None) if self.use_qk_norm else None,
+                k_bias=getattr(self.k_norm, "bias", None) if self.use_qk_norm else None,
             )
 
         inner_state = q, k, v, forward_batch
