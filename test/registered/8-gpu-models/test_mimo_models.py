@@ -5,7 +5,7 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.spec_decoding_kit import SpecDecodingMixin
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
-register_cuda_ci(est_time=283, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=330, suite="stage-c-test-8-gpu-h200")
 
 
 class TestMiMoV2Flash(GSM8KMixin, SpecDecodingMixin, DefaultServerBase):

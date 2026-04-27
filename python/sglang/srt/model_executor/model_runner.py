@@ -363,6 +363,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None
+
+        self.msprobe_debugger = None
+        if server_args.msprobe_dump_config is not None:
+            self.init_msprobe()
+
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
         self.dflash_use_aux_hidden_state = False
@@ -513,6 +518,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_path=model_path,
             model_revision=model_revision,
             is_draft_model=is_draft_model,
+        )
+
+    def init_msprobe(self):
+        # Init the msprobe
+        try:
+            from msprobe.pytorch import PrecisionDebugger, seed_all
+        except ImportError:
+            logger.warning(
+                "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "
+                "see https://gitcode.com/Ascend/msprobe for details."
+            )
+            return
+        seed_all(mode=True)
+        self.msprobe_debugger = PrecisionDebugger(
+            config_path=self.server_args.msprobe_dump_config
         )
 
     def init_mindspore_runner(self):
@@ -2918,6 +2938,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
+        if self.msprobe_debugger is not None:
+            rank_id = (
+                self.gpu_id if self.dp_size is not None and self.dp_size > 1 else None
+            )
+            self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
+
         step_span_ctx = (
             torch.profiler.record_function(_build_step_span_name(forward_batch))
             if torch.autograd._profiler_enabled()
@@ -2973,6 +2999,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if dumper.may_enable:
             dumper.step()
+
+        if self.msprobe_debugger is not None:
+            self.msprobe_debugger.stop()
+            self.msprobe_debugger.step()
 
         return output
 
