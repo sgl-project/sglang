@@ -19,6 +19,14 @@ Dispatch approach (following TRT-LLM reference):
   - Kernel naturally skips experts with zero weights (no token-expert pairs)
   - No weight subsetting or expert ID remapping at runtime
   - Stable tensor shapes → CUDA graph compatible
+
+Attention INT4 swap (optional):
+  When ``heter_config["attention_num_bits"] == 4``, ``apply_heter_precision``
+  also replaces every layer's ``self_attn.qkv_proj`` and ``self_attn.o_proj``
+  with INT4 GPTQ-Marlin linears loaded from the same checkpoint as the INT4
+  MoE group. Attention is fixed-precision (no per-batch dispatch / policy);
+  the swap reuses the standard ``GPTQMarlinLinearMethod`` path used by
+  ``--quantization gptq_marlin``.
 """
 
 from __future__ import annotations
@@ -88,6 +96,27 @@ def _parse_heter_config(config_path: str) -> Dict[str, Any]:
             cfg["_bf16_only_by_layer"] = json.load(f)
     else:
         cfg["_bf16_only_by_layer"] = {}
+
+    # Optional INT4 attention swap: replaces every layer's qkv_proj+o_proj
+    # with GPTQ-Marlin INT4 linears loaded from the INT4 group's checkpoint.
+    # Default 16 = no swap (back-compat). Only {16, 4} supported.
+    attn_bits = cfg.get("attention_num_bits", 16)
+    if not isinstance(attn_bits, int) or attn_bits not in (16, 4):
+        raise ValueError(
+            f"attention_num_bits must be 16 or 4, got {attn_bits!r}"
+        )
+    if attn_bits == 4:
+        int4_groups_with_ckpt = [
+            g for g in groups
+            if g.get("num_bits", 16) == 4 and g.get("checkpoint")
+        ]
+        if not int4_groups_with_ckpt:
+            raise ValueError(
+                "attention_num_bits=4 requires an INT4 group with a "
+                "'checkpoint' path in groups[] (the same checkpoint is "
+                "reused for attention)."
+            )
+    cfg["attention_num_bits"] = attn_bits
     return cfg
 
 
@@ -813,6 +842,206 @@ class HeterFusedMoE(nn.Module):
         return output
 
 
+def _build_gptq_marlin_config_from_ckpt(ckpt_path: str):
+    """Read the GPTQ quantize config from a checkpoint dir, return GPTQMarlinConfig.
+
+    Tries ``<ckpt>/quantize_config.json`` first, then falls back to the
+    ``quantization_config`` field inside ``<ckpt>/config.json`` (Qwen GPTQ
+    checkpoints use the latter).
+    """
+    from sglang.srt.layers.quantization.gptq import GPTQMarlinConfig
+
+    qcfg = None
+    qc_path = os.path.join(ckpt_path, "quantize_config.json")
+    if os.path.isfile(qc_path):
+        with open(qc_path) as f:
+            qcfg = json.load(f)
+    else:
+        cfg_path = os.path.join(ckpt_path, "config.json")
+        if os.path.isfile(cfg_path):
+            with open(cfg_path) as f:
+                qcfg = json.load(f).get("quantization_config")
+    if qcfg is None:
+        raise ValueError(
+            f"GPTQ checkpoint {ckpt_path}: cannot find quantize_config.json "
+            "nor config.json[quantization_config]; required to build "
+            "GPTQMarlinConfig for INT4 attention swap."
+        )
+    return GPTQMarlinConfig.from_config(qcfg)
+
+
+def _swap_attention_to_int4(
+    model: nn.Module,
+    gptq_checkpoint_path: str,
+    device: torch.device,
+) -> None:
+    """Swap every layer's self_attn.{qkv_proj, o_proj} with INT4 GPTQ-Marlin.
+
+    Reuses the production GPTQMarlinLinearMethod path:
+      1. Build GPTQMarlinConfig from the GPTQ checkpoint's quantize config.
+      2. For each transformer layer: construct a fresh INT4 QKVParallelLinear
+         and RowParallelLinear matching the existing module's geometry
+         (hidden_size, head counts, bias, dtype, TP rank/size).
+      3. Stream q/k/v/o tensors from the checkpoint via the standard
+         weight_loader_v2 (which fuses q/k/v along the output dim and applies
+         TP sharding).
+      4. process_weights_after_loading repacks GPTQ → Marlin in-place.
+      5. Swap into the layer; free the old BF16 modules with explicit gc to
+         keep peak VRAM flat (matches the per-layer MoE swap pattern).
+    """
+    from safetensors import safe_open
+
+    from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+
+    gptq_config = _build_gptq_marlin_config_from_ckpt(gptq_checkpoint_path)
+
+    layers_module = None
+    if hasattr(model, "model") and hasattr(model.model, "layers"):
+        layers_module = model.model.layers
+    elif hasattr(model, "layers"):
+        layers_module = model.layers
+    if layers_module is None:
+        raise ValueError("Cannot find model layers for INT4 attention swap")
+
+    # Discover safetensors files (single-file or sharded directory)
+    if os.path.isfile(gptq_checkpoint_path) and gptq_checkpoint_path.endswith(
+        ".safetensors"
+    ):
+        st_files = [gptq_checkpoint_path]
+    else:
+        st_files = sorted(
+            os.path.join(gptq_checkpoint_path, f)
+            for f in os.listdir(gptq_checkpoint_path)
+            if f.endswith(".safetensors")
+        )
+    if not st_files:
+        raise ValueError(
+            f"No .safetensors files under {gptq_checkpoint_path} for INT4 attention swap"
+        )
+
+    import gc
+
+    attrs = ("qweight", "scales", "qzeros", "g_idx")
+    num_swapped = 0
+    for layer_id, layer in enumerate(layers_module):
+        attn = getattr(layer, "self_attn", None)
+        if attn is None:
+            # Non-attention layer (uncommon for transformer stacks); skip cleanly.
+            continue
+        old_qkv = getattr(attn, "qkv_proj", None)
+        old_o = getattr(attn, "o_proj", None)
+        if old_qkv is None or old_o is None:
+            continue
+        if not isinstance(old_qkv, QKVParallelLinear):
+            raise TypeError(
+                f"Layer {layer_id} self_attn.qkv_proj is "
+                f"{type(old_qkv).__name__}, expected QKVParallelLinear. "
+                "INT4 attention swap only supports vanilla QKVParallelLinear."
+            )
+        if not isinstance(old_o, RowParallelLinear):
+            raise TypeError(
+                f"Layer {layer_id} self_attn.o_proj is "
+                f"{type(old_o).__name__}, expected RowParallelLinear."
+            )
+
+        # Construct fresh INT4 modules on-device matching the existing geometry.
+        # `with torch.device(device):` ensures empty param storage lands on GPU
+        # (constructors here don't take a device argument).
+        prefix_qkv = f"model.layers.{layer_id}.self_attn.qkv_proj"
+        prefix_o = f"model.layers.{layer_id}.self_attn.o_proj"
+        with torch.device(device):
+            new_qkv = QKVParallelLinear(
+                hidden_size=old_qkv.hidden_size,
+                head_size=old_qkv.head_size,
+                total_num_heads=old_qkv.total_num_heads,
+                total_num_kv_heads=old_qkv.total_num_kv_heads,
+                bias=old_qkv.bias is not None,
+                params_dtype=old_qkv.params_dtype,
+                quant_config=gptq_config,
+                prefix=prefix_qkv,
+                tp_rank=old_qkv.tp_rank,
+                tp_size=old_qkv.tp_size,
+            )
+            new_o = RowParallelLinear(
+                input_size=old_o.input_size,
+                output_size=old_o.output_size,
+                bias=old_o.bias is not None,
+                input_is_parallel=getattr(old_o, "input_is_parallel", True),
+                params_dtype=old_o.params_dtype,
+                reduce_results=old_o.reduce_results,
+                quant_config=gptq_config,
+                prefix=prefix_o,
+                tp_rank=old_o.tp_rank,
+                tp_size=old_o.tp_size,
+            )
+
+        # Stream tensors. q/k/v share new_qkv, o is its own module.
+        proj_to_target = {
+            "q_proj": ("q", new_qkv),
+            "k_proj": ("k", new_qkv),
+            "v_proj": ("v", new_qkv),
+            "o_proj": (None, new_o),
+        }
+        loaded: Dict[str, set] = {p: set() for p in proj_to_target}
+        attn_prefix = f"model.layers.{layer_id}.self_attn."
+
+        for st_file in st_files:
+            with safe_open(st_file, framework="pt", device=str(device)) as f:
+                for key in f.keys():
+                    if not key.startswith(attn_prefix):
+                        continue
+                    suffix = key[len(attn_prefix):]
+                    parts = suffix.split(".")
+                    if len(parts) != 2:
+                        continue
+                    proj, attr = parts
+                    if proj not in proj_to_target or attr not in attrs:
+                        continue
+                    shard_id, mod = proj_to_target[proj]
+                    tensor = f.get_tensor(key)
+                    param = getattr(mod, attr)
+                    if shard_id is None:
+                        mod.weight_loader_v2(param, tensor)
+                    else:
+                        mod.weight_loader_v2(param, tensor, shard_id)
+                    loaded[proj].add(attr)
+
+        # Loud failure if any tensor is missing — partial loads silently
+        # corrupt outputs.
+        for proj, got in loaded.items():
+            missing = set(attrs) - got
+            if missing:
+                raise ValueError(
+                    f"Layer {layer_id} self_attn.{proj}: missing tensors "
+                    f"{sorted(missing)} in {gptq_checkpoint_path}"
+                )
+
+        # Repack GPTQ → Marlin (creates workspace, permutes scales, etc.)
+        new_qkv.quant_method.process_weights_after_loading(new_qkv)
+        new_o.quant_method.process_weights_after_loading(new_o)
+
+        # Swap and drop the old BF16 modules so their VRAM is freed before
+        # the next layer (mirrors the MoE per-layer free pattern).
+        attn.qkv_proj = new_qkv
+        attn.o_proj = new_o
+        del old_qkv, old_o
+        gc.collect()
+        torch.cuda.empty_cache()
+        num_swapped += 1
+
+        if layer_id % 10 == 0:
+            logger.info(
+                f"Swapped layer {layer_id} self_attn.qkv_proj+o_proj → INT4"
+            )
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info(
+        f"Swapped attention to INT4 in {num_swapped} layers "
+        f"(checkpoint: {gptq_checkpoint_path})"
+    )
+
+
 def apply_heter_precision(
     model: nn.Module,
     config_path: str,
@@ -824,6 +1053,8 @@ def apply_heter_precision(
     2. For each MoE layer, create HeterFusedMoE from the loaded BF16 FusedMoE
     3. Load INT4 expert weights from secondary checkpoint
     4. Repack GPTQ → Marlin
+    5. (Optional) If ``attention_num_bits == 4``, swap every layer's
+       qkv_proj+o_proj with INT4 GPTQ-Marlin linears (same checkpoint).
     """
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
@@ -908,3 +1139,6 @@ def apply_heter_precision(
         f"Applied heterogeneous precision to {num_swapped} MoE layers. "
         f"Groups: {[g['name'] for g in heter_config['groups']]}"
     )
+
+    if heter_config.get("attention_num_bits", 16) == 4:
+        _swap_attention_to_int4(model, int4_checkpoint, device)
