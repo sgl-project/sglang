@@ -35,7 +35,7 @@ if _is_hip:
         gemm_a4w4 = None
 
 # The gemm_a4w4 ASM kernel has degraded precision when the output
-# dimension (N) is smaller than its minimum tile size.  
+# dimension (N) is smaller than its minimum tile size. 
 # Layers with output_size falls below this threshold will stay unquantized
 _MXFP4_MIN_OUTPUT_DIM = 256
 
