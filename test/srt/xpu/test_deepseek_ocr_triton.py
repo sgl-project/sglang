@@ -45,6 +45,7 @@ class TestDeepSeekOCRTriton(TestDeepSeekOCR):
             ],
         )
 
+
 # Prevent pytest from collecting the imported base test class here.
 del TestDeepSeekOCR
 

@@ -15,8 +15,6 @@ from sglang.test.test_utils import (
 )
 
 
-
-
 def intel_xpu_benchmark(
     extra_args=None, min_throughput=None, mem_fraction_static="0.4"
 ):
