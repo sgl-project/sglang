@@ -63,7 +63,7 @@ This repo now contains:
 
 Validated documentation and CI coverage currently center on these ModelOpt diffusion transformer override families:
 
-- FP8: FLUX.1-dev, FLUX.2-dev, Wan2.2, Qwen Image, Qwen Image Edit
+- FP8: FLUX.1-dev, FLUX.2-dev, Wan2.2, HunyuanVideo
 - NVFP4: FLUX.1-dev, FLUX.2-dev, Wan2.2
 
 Treat a new family, a new precision, or a new checkpoint layout as unsupported until it has a documented matrix row and a matching validation story.
@@ -173,32 +173,27 @@ For `FLUX.1-dev`, the validated fallback set currently keeps these modules in BF
 
 Use `--model-type flux1` to force that profile, or rely on `--model-type auto` when the export config identifies `FluxTransformer2DModel`.
 
-Qwen Image and Qwen Image Edit share `QwenImageTransformer2DModel`, so one
-ModelOpt FP8 fallback preset covers both. The validated Qwen Image fallback set
-keeps these modules in BF16:
+HunyuanVideo uses `HunyuanVideoTransformer3DModel`, so the validated
+HunyuanVideo FP8 fallback preset keeps these modules in BF16:
 
-- `img_in`
-- `txt_in`
-- `time_text_embed.timestep_embedder.linear_1`
-- `time_text_embed.timestep_embedder.linear_2`
+- `context_embedder.*`
+- `x_embedder.proj`
+- `time_text_embed.(timestep_embedder|guidance_embedder|text_embedder).linear_[12]`
 - `norm_out.linear`
 - `proj_out`
-- `transformer_blocks.*.img_mlp.net.2`
-- `transformer_blocks.*.img_mod`
-- `transformer_blocks.*.txt_mod`
+- `transformer_blocks.*.norm1.linear`
+- `transformer_blocks.*.norm1_context.linear`
+- `single_transformer_blocks.*.norm.linear`
 
-Use `--model-type qwen-image` to force that profile, or rely on
+Use `--model-type hunyuan-video` to force that profile, or rely on
 `--model-type auto` when the export config identifies
-`QwenImageTransformer2DModel`.
+`HunyuanVideoTransformer3DModel`.
 
-Qwen modulation weights can appear in safetensors as `.img_mod.1.weight` and
-`.txt_mod.1.weight`. Canonicalize those module names to `.img_mod` and
-`.txt_mod` before fallback matching.
-
-For Qwen Image FP8, explicit BF16 fallback tensors must be written before
-honoring ModelOpt ignored weights. Otherwise converter stats can report a
-fallback while the output checkpoint still retains the source FP8 tensor, which
-causes severe image-quality regressions.
+HunyuanVideo ModelOpt exports use diffusers module names that differ from
+SGLang runtime names for fused QKV and fused QKV+MLP layers. Keep the
+diffusers-to-runtime mapping in `build_modelopt_fp8_transformer.py` in sync
+with `runtime/models/dits/hunyuanvideo.py` before trusting converted scale
+tensors.
 
 For FLUX.1-dev NVFP4 model families that need a mixed BF16+NVFP4 checkpoint, build the merged transformer explicitly:
 

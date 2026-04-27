@@ -76,15 +76,6 @@ DEFAULT_LTX2_KEEP_BF16_PATTERNS = [
     r"^transformer_blocks\.(0|43|44|45|46|47)\.(attn1|attn2|audio_attn1|audio_attn2|audio_to_video_attn|video_to_audio_attn)\.to_out\.0$",
     r"^transformer_blocks\.(0|43|44|45|46|47)\.(ff|audio_ff)\.proj_(in|out)$",
 ]
-DEFAULT_QWEN_IMAGE_KEEP_BF16_PATTERNS = [
-    r"^img_in$",
-    r"^txt_in$",
-    r"^time_text_embed\.timestep_embedder\.linear_[12]$",
-    r"^norm_out\.linear$",
-    r"^proj_out$",
-    r"^transformer_blocks\.\d+\.img_mlp\.net\.2$",
-    r"^transformer_blocks\.\d+\.(img_mod|txt_mod)$",
-]
 DEFAULT_HUNYUANVIDEO_KEEP_BF16_PATTERNS = [
     r"^context_embedder\.",
     r"^x_embedder\.proj$",
@@ -324,7 +315,6 @@ def _module_name_variants(
         canonicalized.append(
             re.sub(r"(\.audio_ff|\.ff)\.net\.2$", r"\1.proj_out", variant)
         )
-        canonicalized.append(re.sub(r"(\.(img_mod|txt_mod))\.1$", r"\1", variant))
     variants.extend(canonicalized)
     if runtime_name_mapper is not None:
         runtime_variants: list[str] = []
@@ -419,8 +409,6 @@ def get_default_keep_bf16_patterns(
         return list(DEFAULT_FLUX1_KEEP_BF16_PATTERNS)
     if model_type == "flux2":
         return list(DEFAULT_FLUX2_KEEP_BF16_PATTERNS)
-    if model_type == "qwen-image":
-        return list(DEFAULT_QWEN_IMAGE_KEEP_BF16_PATTERNS)
     if model_type == "hunyuan-video":
         return list(DEFAULT_HUNYUANVIDEO_KEEP_BF16_PATTERNS)
     if model_type == "none":
@@ -429,8 +417,6 @@ def get_default_keep_bf16_patterns(
         return list(DEFAULT_FLUX1_KEEP_BF16_PATTERNS)
     if class_name == "Flux2Transformer2DModel":
         return list(DEFAULT_FLUX2_KEEP_BF16_PATTERNS)
-    if class_name == "QwenImageTransformer2DModel":
-        return list(DEFAULT_QWEN_IMAGE_KEEP_BF16_PATTERNS)
     if class_name == "HunyuanVideoTransformer3DModel":
         return list(DEFAULT_HUNYUANVIDEO_KEEP_BF16_PATTERNS)
     return []
@@ -828,7 +814,6 @@ def _parse_args() -> argparse.Namespace:
             "flux1",
             "flux2",
             "ltx2",
-            "qwen-image",
             "hunyuan-video",
             "none",
         ],
@@ -836,7 +821,7 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Optional model-family BF16 fallback profile. 'none' uses the generic "
             "conversion path. 'auto' enables the validated FLUX.1 / FLUX.2 / LTX-2 / "
-            "Qwen Image / HunyuanVideo fallback set when the export config matches "
+            "HunyuanVideo fallback set when the export config matches "
             "those transformer classes."
         ),
     )
