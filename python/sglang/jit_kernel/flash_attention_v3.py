@@ -15,6 +15,17 @@ SGL_FA3_KERNEL_REVISION = "v1"
 DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
+def _call_fa3_kernel(kernel, *args, out=None):
+    if out is None:
+        return kernel(*args)
+    try:
+        return kernel(*args, out=out)
+    except TypeError as exc:
+        if "unexpected keyword argument 'out'" not in str(exc):
+            raise
+        return kernel(*args)
+
+
 @cache_once
 def _load_fa3_kernels():
     # By default, we use the implementation from sgl-kernel,
@@ -129,7 +140,8 @@ def flash_attn_with_kvcache(
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
 
-    return _load_fa3_kernels()["flash_attn_with_kvcache"](
+    return _call_fa3_kernel(
+        _load_fa3_kernels()["flash_attn_with_kvcache"],
         q,
         k_cache,
         v_cache,
@@ -199,7 +211,8 @@ def flash_attn_varlen_func(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
         )
 
-    return _load_fa3_kernels()["flash_attn_varlen_func"](
+    return _call_fa3_kernel(
+        _load_fa3_kernels()["flash_attn_varlen_func"],
         q,
         k,
         v,

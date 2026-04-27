@@ -1005,7 +1005,20 @@ class LoRAMemoryPool:
                         :lora_rank,
                     ]
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
-                elif target_module == "lm_head" and "lm_head" in name:
+                elif (
+                    target_module == "lm_head"
+                    and "lm_head" in name
+                    and (
+                        "lora_embedding_A" in name
+                        or "lora_A" in name
+                        or "lora_embedding_B" in name
+                        or "lora_B" in name
+                    )
+                ):
+                    # Only assert for genuine LoRA A/B deltas. Non-LoRA adapter
+                    # entries (e.g. `base_layer.weight` emitted by PEFT for
+                    # tied-embedding lm_head) fall through and are handled by
+                    # the base weight loader, mirroring embed_tokens behavior.
                     # Non-last PP stages do not own lm_head, so adapters can
                     # legitimately contain lm_head LoRA weights with no local
                     # module to load them into, otherwise we should have been able to load this weight.
