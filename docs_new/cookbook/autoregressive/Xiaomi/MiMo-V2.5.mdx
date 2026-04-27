@@ -1,0 +1,92 @@
+---
+title: MiMo-V2.5
+metatags:
+    description: "Deploy XiaomiMiMo/MiMo-V2.5 with SGLang - 310B total parameters, 15B activated parameters, native multimodal inputs, MTP, and long-context serving."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[XiaomiMiMo/MiMo-V2.5](https://huggingface.co/XiaomiMiMo/MiMo-V2.5) is a native omnimodal Mixture-of-Experts model from XiaomiMiMo with strong agentic capabilities, improved multimodal perception, and efficient long-context inference.
+
+**Model summary:**
+
+- **Architecture**: Sparse MoE with 310B total parameters and 15B activated parameters.
+- **Context length**: Up to 1M tokens.
+- **Modalities**: Text, image, video, and audio.
+- **Vision encoder**: 729M-parameter ViT with 28 layers.
+- **Audio encoder**: 261M-parameter Audio Transformer with 24 layers.
+- **MTP**: 329M-parameter, 3-layer Multi-Token Prediction module.
+
+## 2. SGLang Installation
+
+Refer to the [official SGLang installation guide](/docs/get-started/install). Use a recent SGLang build that includes MiMo-V2.5 support.
+
+## 3. Model Deployment
+
+The following command mirrors the launch configuration from the MiMo-V2.5 SGLang support PR. It targets an NVIDIA CUDA deployment with DP attention, DeepEP, FA3 attention, FP8 quantization, and multimodal encoder data parallelism.
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path XiaomiMiMo/MiMo-V2.5 \
+  --served-model-name mimo-v2.5 \
+  --log-level-http warning \
+  --enable-cache-report \
+  --pp-size 1 \
+  --dp-size 2 \
+  --tp-size 8 \
+  --enable-dp-attention \
+  --moe-a2a-backend deepep \
+  --deepep-mode auto \
+  --decode-log-interval 1 \
+  --page-size 1 \
+  --host 0.0.0.0 \
+  --port 9001 \
+  --trust-remote-code \
+  --watchdog-timeout 1000000 \
+  --mem-fraction-static 0.65 \
+  --chunked-prefill-size 16384 \
+  --reasoning-parser qwen3 \
+  --tool-call-parser mimo \
+  --context-length 262144 \
+  --collect-tokens-histogram \
+  --enable-metrics \
+  --load-balance-method round_robin \
+  --allow-auto-truncate \
+  --enable-metrics-for-all-schedulers \
+  --quantization fp8 \
+  --skip-server-warmup \
+  --moe-dense-tp-size 1 \
+  --enable-dp-lm-head \
+  --disable-tokenizer-batch-decode \
+  --mm-enable-dp-encoder \
+  --attention-backend fa3 \
+  --mm-attention-backend fa3
+```
+
+### Configuration tips
+
+- **Platform**: This recipe is for NVIDIA CUDA deployments using FA3 for both text and multimodal attention.
+- **Parallelism**: The example uses `pp=1`, `dp=2`, and `tp=8` with DP attention enabled.
+- **Multimodal encoder DP**: `--mm-enable-dp-encoder` enables data parallelism for multimodal encoders.
+- **Context length**: The launch command uses `--context-length 262144` for memory headroom. Increase toward the model's maximum context only after validating memory usage on your hardware.
+- **Tool calling**: Use `--tool-call-parser mimo` for MiMo tool-call formatting.
+
+## 4. Model Invocation
+
+Once the server is running, send a text request to the served model name:
+
+```bash Command
+curl http://localhost:9001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mimo-v2.5",
+    "messages": [
+      {"role": "user", "content": "Summarize the main differences between dense and MoE language models."}
+    ],
+    "max_tokens": 512,
+    "temperature": 0.7
+  }'
+```
+
+For multimodal request formats, use the OpenAI-compatible message content schema described in [Basic API Usage](/docs/basic_usage/send_request), then target the same `mimo-v2.5` served model.
