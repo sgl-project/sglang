@@ -100,9 +100,7 @@ class ExpertLocationMetadata:
         num_logical_experts = model_config_for_expert_location.num_logical_experts
 
         physical_to_logical_map = (
-            torch.arange(0, num_physical_experts, dtype=torch.int32).repeat(
-                num_layers, 1
-            )
+            torch.arange(0, num_physical_experts).repeat(num_layers, 1)
             % num_logical_experts
         )
 
@@ -121,11 +119,7 @@ class ExpertLocationMetadata:
         moe_ep_rank: int = None,
     ):
         if not isinstance(physical_to_logical_map, torch.Tensor):
-            physical_to_logical_map = torch.tensor(
-                physical_to_logical_map, dtype=torch.int32
-            )
-        else:
-            physical_to_logical_map = physical_to_logical_map.to(torch.int32)
+            physical_to_logical_map = torch.tensor(physical_to_logical_map)
         physical_to_logical_map = physical_to_logical_map.to(server_args.device)
 
         common = ExpertLocationMetadata._init_common(server_args, model_config)
@@ -234,7 +228,7 @@ class ExpertLocationMetadata:
 
         logical_to_all_physical_map_num_valid = torch.count_nonzero(
             logical_to_all_physical_map != -1, dim=-1
-        ).to(torch.int32)
+        )
 
         return ExpertLocationMetadata(
             physical_to_logical_map=physical_to_logical_map,
@@ -381,9 +375,7 @@ def _compute_logical_to_all_physical_map(
     )
 
     return torch.tensor(
-        logical_to_all_physical_map,
-        dtype=torch.int32,
-        device=physical_to_logical_map.device,
+        logical_to_all_physical_map, device=physical_to_logical_map.device
     )
 
 
