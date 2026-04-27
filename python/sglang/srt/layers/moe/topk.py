@@ -538,13 +538,24 @@ def fused_topk(
                 renormalize,
             )
     elif scoring_func == "sigmoid":
-        topk_sigmoid(
-            topk_weights,
-            topk_ids,
-            gating_output,
-            renormalize,
-            correction_bias,
-        )
+        if _use_aiter and correction_bias is not None:
+            aiter_biased_grouped_topk(
+                gating_output,
+                correction_bias.to(dtype=gating_output.dtype),
+                topk_weights,
+                topk_ids,
+                num_expert_group=1,
+                topk_group=1,
+                need_renorm=renormalize,
+            )
+        else:
+            topk_sigmoid(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                renormalize,
+                correction_bias,
+            )
     else:
         raise ValueError(f"Invalid scoring function: {scoring_func}")
 
@@ -902,6 +913,30 @@ def biased_grouped_topk_gpu(
                 renormalize=renormalize,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
+        elif (
+            _is_cuda
+            and num_expert_group == 1
+            and topk_group == 1
+            and num_fused_shared_experts == 0
+            and num_experts <= 512
+            and topk <= 8
+        ):
+            from sglang.jit_kernel.grouped_topk import grouped_topk as jit_grouped_topk
+
+            scaling = (
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            )
+            if not apply_routed_scaling_factor_on_output:
+                scaling = 1.0
+            return jit_grouped_topk(
+                gating_output.to(dtype=torch.float32),
+                correction_bias.to(dtype=torch.float32),
+                num_expert_group,
+                topk_group,
+                topk,
+                renormalize,
+                scaling,
             )
         else:
             return biased_grouped_topk_impl(

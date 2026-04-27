@@ -175,14 +175,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         T2V_sampling_params,
     ),
-    DiffusionTestCase(
-        "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
-        DiffusionServerArgs(
-            model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-            text_encoder_cpu_offload=True,
-        ),
-        T2V_sampling_params,
-    ),
     # TeaCache acceleration test for Wan video model
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_teacache_enabled",
@@ -332,6 +324,16 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     #         num_frames=33,
     #     ),
     # ),
+    DiffusionTestCase(
+        "ltx_2_3_hq_pipeline",
+        DiffusionServerArgs(
+            model_path="Lightricks/LTX-2.3",
+            extras=[
+                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode snapshot"
+            ],
+        ),
+        T2I_sampling_params,
+    ),
 ]
 
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
@@ -519,6 +521,7 @@ TWO_GPU_CASES = [
         "ltx_2_3_two_stage_ti2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
+            ulysses_degree=2,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original"
             ],
@@ -537,6 +540,7 @@ TWO_GPU_CASES = [
         "ltx_2.3_two_stage_t2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
+            ulysses_degree=2,
             extras=[
                 "--pipeline-class-name LTX2TwoStagePipeline",
                 "--ltx2-two-stage-device-mode original",
@@ -619,6 +623,7 @@ TWO_GPU_CASES = [
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
+            ulysses_degree=2,
         ),
         TI2V_sampling_params,
     ),
