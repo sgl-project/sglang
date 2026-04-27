@@ -1,46 +1,83 @@
 ---
-title: MiMo-V2.5
+title: MiMo-V2.5 and MiMo-V2.5-Pro
+sidebarTitle: MiMo-V2.5
 metatags:
-    description: "Deploy XiaomiMiMo/MiMo-V2.5 with SGLang - 310B total parameters, 15B activated parameters, native multimodal inputs, MTP, and long-context serving."
+    description: "Deploy XiaomiMiMo/MiMo-V2.5 and MiMo-V2.5-Pro with SGLang - multimodal and text-only MiMo-V2.5 recipes with long-context serving."
 tag: NEW
 ---
 
 ## 1. Model Introduction
 
-[XiaomiMiMo/MiMo-V2.5](https://huggingface.co/XiaomiMiMo/MiMo-V2.5) is a native omnimodal Mixture-of-Experts model from XiaomiMiMo with strong agentic capabilities, improved multimodal perception, and efficient long-context inference.
+The MiMo-V2.5 family from XiaomiMiMo includes the native multimodal [XiaomiMiMo/MiMo-V2.5](https://huggingface.co/XiaomiMiMo/MiMo-V2.5) checkpoint and the larger text-only [XiaomiMiMo/MiMo-V2.5-Pro](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro) checkpoint. Both use Mixture-of-Experts (MoE) architecture, hybrid attention, long-context serving, and Multi-Token Prediction (MTP).
 
-**Model summary:**
+<Note>
+MiMo-V2.5-Pro is text-only in the current SGLang support path. Multimodal support for the Pro variant is planned for a future release.
+</Note>
 
-- **Architecture**: Sparse MoE with 310B total parameters and 15B activated parameters.
-- **Context length**: Up to 1M tokens.
-- **Modalities**: Text, image, video, and audio.
-- **Vision encoder**: 729M-parameter ViT with 28 layers.
-- **Audio encoder**: 261M-parameter Audio Transformer with 24 layers.
-- **MTP**: 329M-parameter, 3-layer Multi-Token Prediction module.
+**Available variants:**
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Variant</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Scale</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Modalities</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Context</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/XiaomiMiMo/MiMo-V2.5">XiaomiMiMo/MiMo-V2.5</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>310B total / 15B active</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Text, image, video, audio</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Up to 1M tokens</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro">XiaomiMiMo/MiMo-V2.5-Pro</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>1.02T total / 42B active</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Text only now</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Up to 1M tokens</td>
+    </tr>
+  </tbody>
+</table>
+
+**Key features:**
+
+- **Sparse MoE scale**: Choose the 310B multimodal checkpoint or the 1.02T Pro checkpoint based on workload and cluster capacity.
+- **Long context**: Both variants support long-context serving up to 1M tokens.
+- **Hybrid attention**: Uses the MiMo-V2 hybrid attention architecture for long-context efficiency.
+- **MTP acceleration**: Supports 3-layer MTP through SGLang's EAGLE speculative decoding path.
+- **Reasoning and tool use**: Use the MiMo tool-call parser; the Pro recipe uses the `mimo` reasoning parser.
 
 ## 2. SGLang Installation
 
-Refer to the [official SGLang installation guide](/docs/get-started/install). Use a recent SGLang build that includes MiMo-V2.5 support.
+Refer to the [official SGLang installation guide](/docs/get-started/install). Use a recent SGLang build that includes MiMo-V2.5 and MiMo-V2.5-Pro support.
 
 ## 3. Model Deployment
 
-Use the configuration selector below to generate the deployment command. The generator mirrors the MiMo-V2.5 launch configuration from the SGLang support PR and emits `sglang serve` syntax for current SGLang CLI usage.
+Use the configuration selector below to generate the deployment command. The generator mirrors the MiMo-V2.5 launch configurations from the SGLang support PRs and emits `sglang serve` syntax for current SGLang CLI usage.
+
+For MiMo-V2.5-Pro multi-node deployments, set these distributed placeholders before launch:
+
+- `LWS_LEADER_IP`: rendezvous host IP.
+- `LWS_WORKER_INDEX`: node rank.
+- `LWS_GROUP_SIZE`: total number of nodes.
 
 import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deployment.jsx'
 
-<MiMoV25Deployment defaultModel="standard" />
+<MiMoV25Deployment />
 
 ### Configuration tips
 
-- **Platform**: This recipe is for NVIDIA CUDA deployments using FA3 for both text and multimodal attention.
-- **Parallelism**: The example uses `pp=1`, `dp=2`, and `tp=8` with DP attention enabled.
-- **Multimodal encoder DP**: `--mm-enable-dp-encoder` enables data parallelism for multimodal encoders.
-- **Context length**: The launch command uses `--context-length 262144` for memory headroom. Increase toward the model's maximum context only after validating memory usage on your hardware.
-- **Tool calling**: Use `--tool-call-parser mimo` for MiMo tool-call formatting.
+- **Platform**: These recipes target NVIDIA CUDA deployments using FA3 attention and DeepEP.
+- **MiMo-V2.5**: The generator emits a multimodal recipe with `pp=1`, `dp=2`, `tp=8`, `--mm-enable-dp-encoder`, `--attention-backend fa3`, and `--mm-attention-backend fa3`.
+- **MiMo-V2.5-Pro**: The generator emits a text-only multi-node recipe with `pp=1`, `dp=2`, `ep=16`, `tp=16`, EAGLE speculative decoding, and `--context-length 1048576`.
+- **Context length**: Reduce `--context-length` if you need more memory headroom for your workload.
+- **DeepEP dispatch buffer**: For the Pro recipe, tune `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` together with `--max-running-requests` and `--speculative-num-draft-tokens` for high-concurrency serving.
 
 ## 4. Model Invocation
 
-Once the server is running, send a text request to the served model name:
+Once the server is running, send a chat request to the OpenAI-compatible endpoint. Use `mimo-v2.5` for the standard variant and `XiaomiMiMo/MiMo-V2.5-Pro` for the Pro variant unless you override `--served-model-name`.
 
 ```bash Command
 curl http://localhost:9001/v1/chat/completions \
@@ -55,4 +92,4 @@ curl http://localhost:9001/v1/chat/completions \
   }'
 ```
 
-For multimodal request formats, use the OpenAI-compatible message content schema described in [Basic API Usage](/docs/basic_usage/send_request), then target the same `mimo-v2.5` served model.
+For multimodal request formats, use the OpenAI-compatible message content schema described in [Basic API Usage](/docs/basic_usage/send_request).

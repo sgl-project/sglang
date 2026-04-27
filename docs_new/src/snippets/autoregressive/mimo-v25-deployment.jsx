@@ -1,28 +1,46 @@
-export const MiMoV25Deployment = ({ defaultModel = 'standard' }) => {
+export const MiMoV25Deployment = () => {
   const options = {
-    model: {
-      name: 'model',
+    modelVariant: {
+      name: 'modelVariant',
       title: 'Model Variant',
       items: [
-        { id: 'standard', label: 'MiMo-V2.5', default: defaultModel === 'standard' },
-        { id: 'pro', label: 'MiMo-V2.5-Pro', default: defaultModel === 'pro' }
+        { id: 'v25', label: 'MiMo-V2.5', default: true },
+        { id: 'v25-pro', label: 'MiMo-V2.5-Pro', default: false }
       ]
     },
-    platform: {
-      name: 'platform',
-      title: 'Platform',
+    hardware: {
+      name: 'hardware',
+      title: 'Hardware Platform',
       items: [
         { id: 'nvidia', label: 'NVIDIA CUDA', default: true }
       ]
     }
   };
 
+  const modelConfigs = {
+    v25: {
+      modelPath: 'XiaomiMiMo/MiMo-V2.5',
+      servedModelName: 'mimo-v2.5'
+    },
+    'v25-pro': {
+      modelPath: 'XiaomiMiMo/MiMo-V2.5-Pro'
+    }
+  };
+
+  const resolveItems = (option, values) => {
+    if (typeof option.getDynamicItems === 'function') {
+      return option.getDynamicItems(values);
+    }
+    return option.items;
+  };
+
   const getInitialState = () => {
     const initialState = {};
-    Object.entries(options).forEach(([key, option]) => {
-      const defaultItem = option.items.find(item => item.default && !item.disabled) || option.items.find(item => !item.disabled) || option.items[0];
+    for (const [key, option] of Object.entries(options)) {
+      const items = resolveItems(option, initialState);
+      const defaultItem = items.find(item => item.default && !item.disabled) || items.find(item => !item.disabled) || items[0];
       initialState[key] = defaultItem.id;
-    });
+    }
     return initialState;
   };
 
@@ -48,9 +66,10 @@ export const MiMoV25Deployment = ({ defaultModel = 'standard' }) => {
   };
 
   const generateStandardCommand = () => {
+    const config = modelConfigs.v25;
     let cmd = 'sglang serve \\\n';
-    cmd += '  --model-path XiaomiMiMo/MiMo-V2.5 \\\n';
-    cmd += '  --served-model-name mimo-v2.5 \\\n';
+    cmd += `  --model-path ${config.modelPath} \\\n`;
+    cmd += `  --served-model-name ${config.servedModelName} \\\n`;
     cmd += '  --log-level-http warning \\\n';
     cmd += '  --enable-cache-report \\\n';
     cmd += '  --pp-size 1 \\\n';
@@ -87,10 +106,11 @@ export const MiMoV25Deployment = ({ defaultModel = 'standard' }) => {
   };
 
   const generateProCommand = () => {
+    const config = modelConfigs['v25-pro'];
     let cmd = 'SGLANG_ENABLE_SPEC_V2=1 \\\n';
     cmd += 'SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256 \\\n';
     cmd += 'sglang serve \\\n';
-    cmd += '  --model-path XiaomiMiMo/MiMo-V2.5-Pro \\\n';
+    cmd += `  --model-path ${config.modelPath} \\\n`;
     cmd += '  --trust-remote-code \\\n';
     cmd += '  --pp-size 1 \\\n';
     cmd += '  --dp-size 2 \\\n';
@@ -126,7 +146,12 @@ export const MiMoV25Deployment = ({ defaultModel = 'standard' }) => {
     return cmd;
   };
 
-  const generateCommand = () => values.model === 'pro' ? generateProCommand() : generateStandardCommand();
+  const generateCommand = () => {
+    if (values.modelVariant === 'v25-pro') {
+      return generateProCommand();
+    }
+    return generateStandardCommand();
+  };
 
   const containerStyle = { maxWidth: '900px', margin: '0 auto', display: 'flex', flexDirection: 'column', gap: '4px' };
   const cardStyle = { padding: '8px 12px', border: `1px solid ${isDark ? '#374151' : '#e5e7eb'}`, borderLeft: `3px solid ${isDark ? '#E85D4D' : '#D45D44'}`, borderRadius: '4px', display: 'flex', alignItems: 'center', gap: '12px', background: isDark ? '#1f2937' : '#fff' };
@@ -139,23 +164,38 @@ export const MiMoV25Deployment = ({ defaultModel = 'standard' }) => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {Object.entries(options).map(([key, option]) => (
-        <div key={key} style={cardStyle}>
-          <div style={titleStyle}>{option.title}</div>
-          <div style={itemsStyle}>
-            {option.items.map(item => {
-              const isChecked = values[option.name] === item.id;
-              const isDisabled = !!item.disabled;
-              return (
-                <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}>
-                  <input type="radio" name={option.name} value={item.id} checked={isChecked} disabled={isDisabled} onChange={() => !isDisabled && handleRadioChange(option.name, item.id)} style={{ display: 'none' }} />
-                  {item.label}
-                </label>
-              );
-            })}
+      {Object.entries(options).map(([key, option]) => {
+        const items = resolveItems(option, values);
+        return (
+          <div key={key} style={cardStyle}>
+            <div style={titleStyle}>{option.title}</div>
+            <div style={itemsStyle}>
+              {items.map(item => {
+                const isChecked = values[option.name] === item.id;
+                const isDisabled = !!item.disabled;
+                return (
+                  <label
+                    key={item.id}
+                    style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? disabledStyle : {}) }}
+                    title={item.disabledReason || ''}
+                  >
+                    <input
+                      type="radio"
+                      name={option.name}
+                      value={item.id}
+                      checked={isChecked}
+                      disabled={isDisabled}
+                      onChange={() => !isDisabled && handleRadioChange(option.name, item.id)}
+                      style={{ display: 'none' }}
+                    />
+                    {item.label}
+                  </label>
+                );
+              })}
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
       <div style={cardStyle}>
         <div style={titleStyle}>Run this Command:</div>
         <pre style={commandDisplayStyle}>{generateCommand()}</pre>
