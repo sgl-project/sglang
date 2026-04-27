@@ -46,6 +46,12 @@ if is_cuda():
 elif is_hip():
     from sgl_kernel import verify_tree_greedy
 
+    # Sampling kernels (top_k_renorm_prob, top_p_renorm_prob,
+    # tree_speculative_sampling_target_only) are NOT compiled in the ROCm
+    # build of sgl-kernel.  Only greedy verification is available on AMD.
+    # To enable sampling verification on AMD, these kernels must first be
+    # added to sgl-kernel/setup_rocm.py and common_extension_rocm.cc.
+
 
 @dataclass
 class NgramVerifyInput(SpecInput):
@@ -427,13 +433,29 @@ class NgramVerifyInput(SpecInput):
                 logits=logits_output.next_token_logits, vocab_mask=vocab_mask
             )
 
-        # Sample tokens. Force greedy sampling on AMD
+        # Sample tokens.
+        # On AMD/HIP the sampling kernels (tree_speculative_sampling_target_only,
+        # top_k_renorm_prob, top_p_renorm_prob) are not compiled in sgl-kernel
+        # for ROCm yet, so we always use greedy verification on AMD.
+        # The --enable-speculative-sampling flag is reserved for future
+        # use once those kernels are added to setup_rocm.py / common_extension_rocm.cc.
         is_all_greedy = (
             sampling_info.is_all_greedy or envs.SGLANG_NGRAM_FORCE_GREEDY_VERIFY.get()
         )
+        if is_hip() and not is_all_greedy:
+            if get_global_server_args().enable_speculative_sampling:
+                logger.warning(
+                    "--enable-speculative-sampling is set, but the sampling "
+                    "verification kernels (tree_speculative_sampling_target_only, "
+                    "top_k_renorm_prob, top_p_renorm_prob) are not compiled in "
+                    "sgl-kernel for ROCm. Falling back to greedy verification. "
+                    "To enable sampling, add these kernels to sgl-kernel/setup_rocm.py "
+                    "and sgl-kernel/csrc/common_extension_rocm.cc."
+                )
+            is_all_greedy = True
         if (not is_all_greedy) and (not TREE_SPEC_KERNEL_AVAILABLE):
             logger.warning(
-                "Tree speculative sampling kernel unavailable (likely AMD/HIP build). "
+                "Tree speculative sampling kernel unavailable. "
                 "Falling back to greedy verification."
             )
 

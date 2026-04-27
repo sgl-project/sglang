@@ -106,6 +106,7 @@ sglang-kernel = { index = "sglang-kernel-cu130" }
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 runai = ["runai-model-streamer[s3,gcs,azure]>=0.15.7"]
+suffix-decoding = ["arctic-inference==0.1.1"]
 diffusion = [
   "PyYAML==6.0.1",
   "cloudpickle==3.1.2",

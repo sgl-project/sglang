@@ -26,6 +26,7 @@ sources = [
     "csrc/moe/moe_topk_softmax_kernels.cu",
     "csrc/moe/moe_topk_sigmoid_kernels.cu",
     "csrc/speculative/eagle_utils.cu",
+    "csrc/speculative/ngram_utils.cu",
 ]
 
 libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
