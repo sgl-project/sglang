@@ -42,7 +42,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
-    MiMoV2FlashForCausalLM,
+    MiMoV2ForCausalLM,
     MiMoV2MLP,
 )
 from sglang.srt.server_args import get_global_server_args
@@ -233,7 +233,7 @@ class MiMoV2ModelNextN(nn.Module):
         return hidden_states, hidden_states_before_norm
 
 
-class MiMoV2MTP(MiMoV2FlashForCausalLM):
+class MiMoV2MTP(MiMoV2ForCausalLM):
 
     def __init__(
         self,

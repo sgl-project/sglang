@@ -338,8 +338,8 @@ class ModelConfig:
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
         if is_draft_model and self.hf_config.architectures[0] in (
+            "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",
-            "MiMoV2ProForCausalLM",
         ):
             self.hf_config.architectures[0] = "MiMoV2MTP"
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
@@ -397,8 +397,8 @@ class ModelConfig:
         self.has_attention_sinks = self._detect_attention_sinks()
 
         self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
+            "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",
-            "MiMoV2ProForCausalLM",
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
@@ -421,7 +421,7 @@ class ModelConfig:
             a in archs
             for a in (
                 "MiMoV2FlashForCausalLM",
-                "MiMoV2ProForCausalLM",
+                "MiMoV2ForCausalLM",
                 "MiMoV2MTP",
             )
         ):
@@ -1520,9 +1520,9 @@ def is_hybrid_swa_model(model_architectures: List[str]):
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
         "GptOssForCausalLM",
+        "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
         "MiMoV2MTP",
-        "MiMoV2ProForCausalLM",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
         "Gemma4ForCausalLM",
@@ -1553,7 +1553,10 @@ def get_hybrid_layer_ids(
         ]
     elif any(
         x in model_architectures
-        for x in ("MiMoV2FlashForCausalLM", "MiMoV2ProForCausalLM")
+        for x in (
+            "MiMoV2ForCausalLM",
+            "MiMoV2FlashForCausalLM",
+        )
     ):
         hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
         swa_attention_layer_ids = [

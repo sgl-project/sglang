@@ -947,7 +947,7 @@ class MiMoV2Model(nn.Module):
                 )
 
 
-class MiMoV2FlashForCausalLM(nn.Module):
+class MiMoV2ForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -1187,9 +1187,9 @@ class MiMoV2FlashForCausalLM(nn.Module):
         )
 
 
-# Pro uses the same architecture; subclass so registry sees a distinct __name__
-class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
+# Keep the old Flash architecture name loadable while new configs use MiMoV2ForCausalLM.
+class MiMoV2FlashForCausalLM(MiMoV2ForCausalLM):
     pass
 
 
-EntryClass = [MiMoV2FlashForCausalLM, MiMoV2ProForCausalLM]
+EntryClass = [MiMoV2ForCausalLM, MiMoV2FlashForCausalLM]

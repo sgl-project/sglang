@@ -1949,7 +1949,11 @@ class ServerArgs:
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
         elif any(
-            x in model_arch for x in ("MiMoV2FlashForCausalLM", "MiMoV2ProForCausalLM")
+            x in model_arch
+            for x in (
+                "MiMoV2ForCausalLM",
+                "MiMoV2FlashForCausalLM",
+            )
         ):
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True
@@ -7320,8 +7324,8 @@ def auto_choose_speculative_params(self: ServerArgs):
         "BailingMoeV2_5ForCausalLM",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
+        "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
-        "MiMoV2ProForCausalLM",
     ]:
         return (3, 1, 4)
     elif arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
