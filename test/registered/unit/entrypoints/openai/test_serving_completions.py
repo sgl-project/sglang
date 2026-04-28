@@ -295,7 +295,7 @@ class ServingCompletionTestCase(unittest.TestCase):
         body = json.loads(response.body)
         self.assertEqual(body["message"], err_msg)
         self.assertEqual(body["code"], HTTPStatus.BAD_REQUEST.value)
-        self.assertEqual(body["type"], "BadRequest")
+        self.assertEqual(body["type"], HTTPStatus.BAD_REQUEST.name)
         self.sc.tokenizer_manager.create_abort_task.assert_not_called()
         self.assertTrue(generator_closed)
 

@@ -809,7 +809,7 @@ class ServingChatTestCase(unittest.TestCase):
         body = json.loads(response.body)
         self.assertEqual(body["message"], err_msg)
         self.assertEqual(body["code"], HTTPStatus.BAD_REQUEST.value)
-        self.assertEqual(body["type"], "BadRequest")
+        self.assertEqual(body["type"], HTTPStatus.BAD_REQUEST.name)
         self.tm.create_abort_task.assert_not_called()
         self.assertTrue(generator_closed)
 
@@ -836,6 +836,7 @@ class ServingChatTestCase(unittest.TestCase):
         self.assertEqual(response.status_code, HTTPStatus.BAD_REQUEST.value)
         body = json.loads(response.body)
         self.assertEqual(body["message"], err_msg)
+        self.assertEqual(body["type"], "BadRequestError")
         self.assertEqual(body["param"], "max_tokens")
         self.assertIsNone(
             self.chat.maybe_convert_pre_stream_bad_request("data: []\n\n")

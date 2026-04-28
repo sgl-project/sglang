@@ -295,10 +295,13 @@ class OpenAIServingBase(ABC):
         param = error.get("param")
         if not isinstance(param, str):
             param = None
+        err_type = error.get("type")
+        if not isinstance(err_type, str) or not err_type:
+            err_type = "BadRequest"
 
         return self.create_error_response(
             message=message,
-            err_type="BadRequest",
+            err_type=err_type,
             status_code=status_code,
             param=param,
         )
