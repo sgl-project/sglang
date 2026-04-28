@@ -226,6 +226,24 @@ class SWAComponent(TreeComponent):
         else:
             new_parent.component_data[self.component_type].value = None
 
+        child_swa_host_value = child.component_data[self.component_type].host_value
+        if child_swa_host_value is not None:
+            split_len = len(new_parent.key)
+            new_parent.component_data[self.component_type].host_value = (
+                child_swa_host_value[:split_len].clone()
+            )
+            child.component_data[self.component_type].host_value = child_swa_host_value[
+                split_len:
+            ].clone()
+            host_lru = self.cache.host_lru_lists[self.component_type]
+            if new_parent.component_data[self.component_type].value is None:
+                host_lru.insert_mru(new_parent)
+            if (
+                child.component_data[self.component_type].value is None
+                and not host_lru.in_list(child)
+            ):
+                host_lru.insert_mru(child)
+
         # parent inherits the swa_uuid from child for swa lock ref
         new_parent.component_data[self.component_type].metadata["uuid"] = (
             child.component_data[self.component_type].metadata.get("uuid")
