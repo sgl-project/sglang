@@ -230,22 +230,22 @@ export const MiMoV25Deployment = () => {
     // ---------------- sgl-jax (TPU) branch ----------------
     if (jax) {
       // Recipe sources:
-      //   v7x: tp=ep=32, omits --attention-backend, mem-frac 0.95, swa ratio 0.25
-      //   v6e: tp=ep=64, --attention-backend fa,    mem-frac 0.92, swa ratio 0.15
+      //   v7x: tp=ep=32, dp=4, omits --attention-backend, mem-frac 0.95, swa 0.25
+      //   v6e: tp=ep=64, dp=8, --attention-backend fa,    mem-frac 0.92, swa 0.15
       const isV7x = hardware === "tpu-v7x";
       const useEp = expertParallelism === "enabled";
       const useDpAttn = dpAttention === "enabled";
+      const dpSize = isV7x ? 4 : 8;
       const flags = [];
       flags.push(`  --model-path ${slug}`);
       flags.push("  --trust-remote-code");
       flags.push(`  --tp-size ${tp}`);
       if (useEp) flags.push(`  --ep-size ${tp}`);
-      if (useDpAttn) flags.push(`  --dp-size ${tp}`, "  --enable-dp-attention");
+      if (useDpAttn) flags.push(`  --dp-size ${dpSize}`, "  --enable-dp-attention");
       flags.push("  --moe-backend fused");
       if (!isV7x) flags.push("  --attention-backend fa");
       flags.push("  --host 0.0.0.0");
-      flags.push("  --port 30271");
-      flags.push("  --disable-radix-cache");
+      flags.push("  --port 30000");
       flags.push("  --page-size 256");
       flags.push("  --context-length 262144");
       if (isV7x) {
@@ -267,7 +267,7 @@ export const MiMoV25Deployment = () => {
       if (toolcall === "enabled") flags.push("  --tool-call-parser mimo");
       flags.push(`  --nnodes ${nnodes}`);
       flags.push("  --node-rank <node-rank>");
-      flags.push("  --dist-init-addr <node0-ip>:5000");
+      flags.push("  --dist-init-addr <node0-ip>:20000");
       const cmd = `JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache python -m sgl_jax.launch_server \\\n${flags.join(" \\\n")}`;
       return prependMultiNodeNote(cmd, nnodes);
     }
