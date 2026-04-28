@@ -371,7 +371,6 @@ class DeepEPWaterfillBalancer:
         )
         self.static_rank_load: Optional[Tensor] = None
         self._counts_buf: Optional[Tensor] = None
-        self._eplb_map_data_ptr = None
 
     def update_static_weights(self):
         """Update static weights from EPLB metadata if layout changes."""
@@ -382,14 +381,12 @@ class DeepEPWaterfillBalancer:
         metadata = get_global_expert_location_metadata()
         if metadata is None or metadata.rank_load is None:
             return
-        cur_ptr = metadata.physical_to_logical_map.data_ptr()
-        if self._eplb_map_data_ptr == cur_ptr and self.static_rank_load is not None:
+        if self.static_rank_load is not None:
             return
         if self.layer_id < metadata.rank_load.shape[0]:
             layer_load = metadata.rank_load[self.layer_id]
             if layer_load.sum() > 0:
-                self.static_rank_load = layer_load.to(dtype=torch.float64)
-                self._eplb_map_data_ptr = cur_ptr
+                self.static_rank_load = layer_load
 
     def count_local_routed(self, topk_ids: Tensor) -> Tensor:
         """Count routed tokens per rank via Triton kernel (uses original expert IDs)."""

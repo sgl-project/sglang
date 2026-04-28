@@ -180,7 +180,7 @@ class ExpertLocationMetadata:
             )
         )
 
-        return ExpertLocationMetadata._init_raw(
+        metadata = ExpertLocationMetadata._init_raw(
             server_args=server_args,
             ep_size=common["ep_size"],
             physical_to_logical_map=physical_to_logical_map.to(server_args.device),
@@ -188,6 +188,13 @@ class ExpertLocationMetadata:
                 server_args.device
             ),
         )
+        if metadata is not None and server_args.enable_deepep_waterfill:
+            metadata.rank_load = _compute_rank_load(
+                logical_count,
+                metadata.physical_to_logical_map,
+                common["ep_size"],
+            )
+        return metadata
 
     @staticmethod
     def _init_common(server_args: ServerArgs, model_config: ModelConfig):
@@ -264,6 +271,9 @@ class ExpertLocationMetadata:
         ]:
             assert getattr(self, field) == getattr(other, field)
 
+        if self.rank_load is None and other.rank_load is not None:
+            self.rank_load = torch.zeros_like(other.rank_load)
+
         for field in [
             "physical_to_logical_map",
             "physical_to_logical_map_cpu",
@@ -271,6 +281,7 @@ class ExpertLocationMetadata:
             "logical_to_all_physical_map_cpu",
             "logical_to_all_physical_map_num_valid",
             "logical_to_rank_dispatch_physical_map",
+            "rank_load",
         ]:
             other_field = getattr(other, field)
             self_field = getattr(self, field)
@@ -593,12 +604,6 @@ def compute_initial_expert_location_metadata(
         metadata = ExpertLocationMetadata.init_by_eplb(
             server_args, model_config, logical_count=data_dict["logical_count"]
         )
-        if metadata is not None and server_args.enable_deepep_waterfill:
-            metadata.rank_load = _compute_rank_load(
-                data_dict["logical_count"],
-                metadata.physical_to_logical_map,
-                server_args.ep_size,
-            )
         return metadata
     else:
         raise NotImplementedError(
