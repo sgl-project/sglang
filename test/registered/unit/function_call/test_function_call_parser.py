@@ -1,6 +1,8 @@
 import json
 import unittest
 
+import xgrammar as xgr
+
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
@@ -1165,6 +1167,30 @@ class TestKimiK2Detector(unittest.TestCase):
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"')
 
+    # ==================== Structural tag (xgrammar builtin) ====================
+    # Kimi K2 uses the new builtin structural tag path, not the legacy one.
+
+    def test_supports_structural_tag(self):
+        self.assertFalse(self.detector.supports_structural_tag())
+
+    def test_supports_model_structural_tag(self):
+        self.assertTrue(self.detector.supports_model_structural_tag())
+
+    def test_get_model_structural_tag(self):
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=True
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=False
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
 
 class TestDeepSeekV3Detector(unittest.TestCase):
     def setUp(self):
@@ -1632,6 +1658,30 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         params = json.loads(tool_calls_by_index[0]["parameters"])
         self.assertEqual(params, {})
 
+    # ==================== Structural tag (xgrammar builtin) ====================
+    # DeepSeek V3.2 uses the new builtin structural tag path, not the legacy one.
+
+    def test_supports_structural_tag(self):
+        self.assertFalse(self.detector.supports_structural_tag())
+
+    def test_supports_model_structural_tag(self):
+        self.assertTrue(self.detector.supports_model_structural_tag())
+
+    def test_get_model_structural_tag(self):
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=True
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=False
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
 
 class TestQwen3CoderDetector(unittest.TestCase):
     """Test suite for Qwen3CoderDetector."""
@@ -1984,6 +2034,30 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertTrue(self.detector.has_tool_call("text <tool_call> more"))
         self.assertFalse(self.detector.has_tool_call("plain text only"))
         self.assertFalse(self.detector.has_tool_call(""))
+
+    # ==================== Structural tag (xgrammar builtin) ====================
+    # Qwen3 Coder uses the new builtin structural tag path, not the legacy one.
+
+    def test_supports_structural_tag(self):
+        self.assertFalse(self.detector.supports_structural_tag())
+
+    def test_supports_model_structural_tag(self):
+        self.assertTrue(self.detector.supports_model_structural_tag())
+
+    def test_get_model_structural_tag(self):
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=True
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=False
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
 
 
 class TestGlm4MoeDetector(unittest.TestCase):
@@ -3279,7 +3353,7 @@ class TestLfm2Detector(unittest.TestCase):
         """Test that LFM2 does not support structural tags (Pythonic format)."""
         # LFM2 uses Pythonic format which is not JSON-compatible,
         # so structural_tag constrained generation cannot be used
-        self.assertFalse(self.detector.supports_structural_tag())
+        self.assertFalse(self.detector.supports_legacy_structural_tag())
 
     def test_structure_info(self):
         """Test structure info for constrained generation."""
