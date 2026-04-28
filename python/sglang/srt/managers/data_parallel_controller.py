@@ -66,6 +66,8 @@ from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
+SCHEDULER_PIDS_ARG = "scheduler_pids"
+
 
 class LoadBalanceMethod(Enum):
     """Load balance method."""
@@ -359,7 +361,33 @@ class DataParallelController:
             logger.debug("Worker port broadcast completed")
             return worker_ports
         finally:
-            rep_socket.close()
+            if self.server_args.elastic_ep_backend is None:
+                rep_socket.close()
+            else:
+                threading.Thread(
+                    target=self._reply_ports_as_server,
+                    args=(rep_socket, worker_ports),
+                    daemon=True,
+                ).start()
+
+    def _reply_ports_as_server(self, rep_socket: zmq.Socket, worker_ports: List[int]):
+        """
+        Runs as a background thread to broadcast worker ports for recovered EP ranks
+        """
+        while True:
+            # Wait for client handshake
+            try:
+                client_rank = rep_socket.recv().decode()
+            except Exception:
+                logger.exception(
+                    "Failed to recv/decode handshake in reply thread; continue"
+                )
+                continue
+            logger.debug(f"Received handshake from node {client_rank}")
+
+            # Send worker ports to client
+            rep_socket.send_pyobj(worker_ports)
+            logger.debug(f"Sent worker ports to node {client_rank}")
 
     def _receive_ports_as_client(self, endpoint: str, node_rank: int) -> List[int]:
         """Receive worker ports from the server node."""
@@ -617,11 +645,15 @@ def run_data_parallel_controller_process(
         controller = DataParallelController(
             server_args, port_args, run_scheduler_process_func
         )
+        scheduler_pids = [
+            proc.pid for proc in controller.scheduler_procs if proc is not None
+        ]
         pipe_writer.send(
             {
                 "status": "ready",
                 "max_total_num_tokens": controller.max_total_num_tokens,
                 "max_req_input_len": controller.max_req_input_len,
+                SCHEDULER_PIDS_ARG: scheduler_pids,
             }
         )
         if server_args.node_rank == 0:

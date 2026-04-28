@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
 )
@@ -41,6 +42,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
+_is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -48,7 +50,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
 
-if _is_cuda or _is_xpu:
+if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
             from flashinfer.norm import layernorm
@@ -108,6 +110,7 @@ logger = logging.getLogger(__name__)
 
 if _is_npu:
     import torch_npu
+    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
 
 def _forward_with_allreduce_fusion(
@@ -321,6 +324,29 @@ class RMSNorm(MultiPlatformOp):
             return out, residual_out
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
+        return out
+
+    def forward_musa(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not get_global_server_args().disable_piecewise_cuda_graph:
+            return self.forward_native(x, residual, post_residual_addition)
+
+        if not x.is_contiguous():
+            x = x.contiguous()
+
+        if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            return x, residual
+
+        out = nn.functional.rms_norm(
+            x, (self.hidden_size,), self.weight.data, self.variance_epsilon
+        )
         return out
 
     def forward_native(
@@ -647,11 +673,13 @@ class GemmaRMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            x = x + residual
-            residual = x
+            norm_out, residual = add_gemma_rms_norm(
+                x, self.weight, residual, self.variance_epsilon
+            )
+            return norm_out, residual
 
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
-        return x if residual is None else (x, residual)
+        return x
 
     def forward_xpu(
         self,
