@@ -93,6 +93,11 @@ class TestUGDiffusionPipeline(unittest.TestCase):
         self.assertEqual(counters["srt_last_request_id"], session.anchor_request_id)
         self.assertEqual(counters["srt_last_origin_input_len"], 8)
         self.assertEqual(counters["srt_mm_offsets"], [(1, 3), (6, 8)])
+        self.assertEqual(counters["srt_executed_request_count"], 2)
+        self.assertEqual(
+            counters["srt_last_executed_request_id"], session.anchor_request_id
+        )
+        self.assertEqual(counters["srt_last_executed_state"], "append_image")
         self.assertEqual(counters["state"], "u_decode")
 
         bridge.release_contexts(result.extra["ug_contexts"])

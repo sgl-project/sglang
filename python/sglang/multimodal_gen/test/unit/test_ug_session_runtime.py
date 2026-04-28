@@ -25,6 +25,31 @@ class FakeTreeCache:
         self.released_sessions.append(session_id)
 
 
+class RecordingSRTRequestExecutor:
+    def __init__(self):
+        self.events = []
+
+    def execute_ug_request(self, *, record, req, state):
+        self.events.append(
+            {
+                "session_id": record.session_id,
+                "state": state.value,
+                "rid": req.rid,
+                "origin_input_ids": list(req.origin_input_ids),
+                "mm_offsets": (
+                    [
+                        offset
+                        for item in getattr(req.multimodal_inputs, "mm_items", [])
+                        for offset in getattr(item, "offsets", [])
+                    ]
+                    if req.multimodal_inputs is not None
+                    else []
+                ),
+                "finished_reason": req.finished_reason,
+            }
+        )
+
+
 class TestUGSessionRuntime(unittest.TestCase):
     def test_handle_does_not_expose_kv_allocator_details(self):
         names = {field.name for field in fields(UGSessionHandle)}
@@ -139,6 +164,44 @@ class TestUGSessionRuntime(unittest.TestCase):
         post_image = runtime.decode_next_segment(handle)
         self.assertEqual(post_image.type, "text")
         self.assertEqual(post_image.text, "generated_text_after_image")
+
+    def test_srt_request_executor_receives_materialized_prefill_and_append_reqs(self):
+        executor = RecordingSRTRequestExecutor()
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+        )
+
+        handle = runtime.prefill_interleaved(
+            [
+                UGInterleavedMessage(type="image", content=object()),
+                UGInterleavedMessage(type="text", content="hello"),
+            ],
+            session_id="srt-executor-session",
+        )
+        runtime.decode_next_segment(handle)
+        handle = runtime.append_generated_image(handle, image=object())
+
+        self.assertEqual(
+            [event["state"] for event in executor.events],
+            ["u_prefill", "append_image"],
+        )
+        self.assertEqual(
+            [event["rid"] for event in executor.events],
+            ["srt-executor-session:u1", "srt-executor-session:u2"],
+        )
+        self.assertEqual(executor.events[0]["mm_offsets"], [(1, 3)])
+        self.assertEqual(executor.events[1]["mm_offsets"], [(1, 3), (4, 6)])
+        self.assertIsNone(executor.events[0]["finished_reason"])
+        self.assertIsNone(executor.events[1]["finished_reason"])
+
+        debug = runtime.get_debug_counters(handle)
+        self.assertEqual(debug["srt_executed_request_count"], 2)
+        self.assertEqual(
+            debug["srt_last_executed_request_id"], handle.anchor_request_id
+        )
+        self.assertEqual(debug["srt_last_executed_state"], "append_image")
 
     def test_close_session_releases_srt_multimodal_features(self):
         tree_cache = FakeTreeCache()

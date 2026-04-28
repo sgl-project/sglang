@@ -27,10 +27,20 @@ class _UGRuntimeTreeCache:
         self.released_sessions.append(session_id)
 
 
+class _UGSRTRequestBoundaryExecutor:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str, int]] = []
+
+    def execute_ug_request(self, *, record, req, state) -> None:
+        del record
+        self.events.append((state.value, req.rid, len(req.origin_input_ids)))
+
+
 def _build_srt_owned_ug_runtime(model_runner=None) -> UGSessionRuntime:
     return UGSessionRuntime(
         model_runner=model_runner or FakeUGModelRunner(),
         session_controller=SessionController(_UGRuntimeTreeCache()),
+        srt_request_executor=_UGSRTRequestBoundaryExecutor(),
     )
 
 

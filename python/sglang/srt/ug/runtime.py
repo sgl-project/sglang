@@ -109,6 +109,9 @@ class UGSessionRecord:
     srt_last_origin_input_ids: list[int] = field(default_factory=list)
     srt_mm_offsets: list[tuple[int, int]] = field(default_factory=list)
     srt_mm_inputs: _UGSessionMMInputs | None = None
+    srt_executed_request_count: int = 0
+    srt_last_executed_request_id: str | None = None
+    srt_last_executed_state: str | None = None
     closed: bool = False
 
     def handle(self) -> UGSessionHandle:
@@ -144,6 +147,18 @@ class UGModelRunnerProtocol(Protocol):
     ) -> Any | None: ...
 
     def close_session(self, *, session_id: str) -> None: ...
+
+
+class UGSRTRequestExecutorProtocol(Protocol):
+    """Executes a UG SRT request after SessionController has materialized it."""
+
+    def execute_ug_request(
+        self,
+        *,
+        record: UGSessionRecord,
+        req: Any,
+        state: UGSegmentState,
+    ) -> None: ...
 
 
 class FakeUGModelRunner:
@@ -208,12 +223,14 @@ class UGSessionRuntime:
         *,
         model_runner: UGModelRunnerProtocol | None = None,
         session_controller: Any | None = None,
+        srt_request_executor: UGSRTRequestExecutorProtocol | None = None,
         capacity_of_str_len: int = 4096,
         tokenizer: Any | None = None,
         vocab_size: int = 32000,
     ) -> None:
         self.model_runner = model_runner or FakeUGModelRunner()
         self.session_controller = session_controller
+        self.srt_request_executor = srt_request_executor
         self.capacity_of_str_len = capacity_of_str_len
         self.tokenizer = tokenizer or _UGSimpleTokenizer()
         self.vocab_size = vocab_size
@@ -401,6 +418,9 @@ class UGSessionRuntime:
             "srt_last_origin_input_len": record.srt_last_origin_input_len,
             "srt_last_origin_input_ids": record.srt_last_origin_input_ids,
             "srt_mm_offsets": record.srt_mm_offsets,
+            "srt_executed_request_count": record.srt_executed_request_count,
+            "srt_last_executed_request_id": record.srt_last_executed_request_id,
+            "srt_last_executed_state": record.srt_last_executed_state,
             "srt_mm_features_released": self._srt_mm_features_released(record),
         }
 
@@ -484,6 +504,16 @@ class UGSessionRuntime:
         if mm_inputs is not None:
             SessionController.adjust_mm_offsets(recv_req, req, mm_inputs)
             req.extend_image_inputs(mm_inputs)
+
+        if self.srt_request_executor is not None:
+            self.srt_request_executor.execute_ug_request(
+                record=record,
+                req=req,
+                state=record.state,
+            )
+            record.srt_executed_request_count += 1
+            record.srt_last_executed_request_id = request_id
+            record.srt_last_executed_state = record.state.value
 
         req.finished_reason = FINISH_LENGTH(0)
         record.srt_request_count += 1
