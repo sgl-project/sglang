@@ -871,6 +871,10 @@ class Scheduler(
             self.server_args.disaggregation_transfer_backend
         )
 
+        # Default to the target model_config so the MetadataBuffers branches
+        # below can always access it; overridden by the draft model_config
+        # when this node runs a spec module.
+        model_config = self.model_config
         if self.draft_worker is None or self.spec_algorithm.is_ngram():
             draft_token_to_kv_pool = None
         elif self.spec_algorithm.supports_spec_v2() and self.enable_overlap:
