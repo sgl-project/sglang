@@ -49,7 +49,9 @@ Note: To view the traces through perfetto-ui, please:
         hourly_cost_per_gpu = 2  # $2/hour for one H100
         hourly_cost = hourly_cost_per_gpu * 1  # Assuming tp_size = 1 for simplicity
         input_util = 0.7
-        accept_length = round(self.acc_length, 2) if self.acc_length > 0 else "n/a"
+        num_accepted_drafts = (
+            round(self.acc_length, 2) if self.acc_length > 0 else "n/a"
+        )
         itl = 1 / (self.output_throughput / self.batch_size) * 1000
         input_cost = 1e6 / (self.input_throughput * input_util) / 3600 * hourly_cost
         output_cost = 1e6 / self.output_throughput / 3600 * hourly_cost
@@ -85,7 +87,7 @@ Note: To view the traces through perfetto-ui, please:
             profile_link = " | ".join(trace_files_relay_links)
 
         # Build the row
-        return f"| {self.batch_size} | {self.input_len} | {self.latency:.2f} | {self.input_throughput:.2f} | {self.output_throughput:.2f} | {accept_length} | {itl:.2f} | {input_cost:.2f} | {output_cost:.2f} | {profile_link} |\n"
+        return f"| {self.batch_size} | {self.input_len} | {self.latency:.2f} | {self.input_throughput:.2f} | {self.output_throughput:.2f} | {num_accepted_drafts} | {itl:.2f} | {input_cost:.2f} | {output_cost:.2f} | {profile_link} |\n"
 
 
 def generate_markdown_report(

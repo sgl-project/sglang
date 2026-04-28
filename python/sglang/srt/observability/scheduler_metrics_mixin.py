@@ -846,7 +846,7 @@ class SchedulerMetricsMixin:
         if include_all or "spec" in include:
             if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
                 speculative = SpeculativeMetrics(
-                    accept_length=(
+                    num_accepted_drafts=(
                         self.spec_total_num_accepted_tokens
                         / self.spec_total_num_forward_ct
                     ),

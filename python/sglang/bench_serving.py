@@ -957,7 +957,7 @@ def calculate_metrics(
     dur_s: float,
     tokenizer: PreTrainedTokenizerBase,
     backend: str,
-    accept_length: Optional[float] = None,
+    num_accepted_drafts: Optional[float] = None,
     plot_throughput: bool = False,
 ) -> Tuple[BenchmarkMetrics, List[int]]:
     output_lens: List[int] = []
@@ -973,8 +973,8 @@ def calculate_metrics(
     retokenized_itls: List[float] = []
 
     use_retokenized_itl = (
-        accept_length is not None
-        and accept_length > 0
+        num_accepted_drafts is not None
+        and num_accepted_drafts > 0
         and backend in ("sglang-oai", "sglang-oai-chat")
     )
 
@@ -1413,15 +1413,15 @@ async def benchmark(
                 "internal_states" in server_info_json
                 and server_info_json["internal_states"]
             ):
-                accept_length = server_info_json["internal_states"][0].get(
+                num_accepted_drafts = server_info_json["internal_states"][0].get(
                     "avg_spec_accept_length", None
                 )
             else:
-                accept_length = None
+                num_accepted_drafts = None
         else:
-            accept_length = None
+            num_accepted_drafts = None
     else:
-        accept_length = None
+        num_accepted_drafts = None
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
@@ -1431,7 +1431,7 @@ async def benchmark(
         dur_s=benchmark_duration,
         tokenizer=tokenizer,
         backend=backend,
-        accept_length=accept_length,
+        num_accepted_drafts=num_accepted_drafts,
         plot_throughput=args.plot_throughput,
     )
 
@@ -1501,8 +1501,8 @@ async def benchmark(
             )
         )
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
-    if accept_length:
-        print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    if num_accepted_drafts:
+        print("{:<40} {:<10.2f}".format("Accept length:", num_accepted_drafts))
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
@@ -1591,7 +1591,7 @@ async def benchmark(
             "p95_itl_ms": metrics.p95_itl_ms,
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
-            "accept_length": accept_length,
+            "num_accepted_drafts": num_accepted_drafts,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }

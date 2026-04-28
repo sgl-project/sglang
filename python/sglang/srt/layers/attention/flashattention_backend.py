@@ -2144,10 +2144,10 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            # accept_length is drafts-only; extend QO length per req is +1 (bonus token).
-            extend_lens = spec_info.accept_length[:bs] + 1
-            if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
+            # num_accepted_drafts is drafts-only; extend QO length per req is +1 (bonus token).
+            extend_lens = spec_info.num_accepted_drafts[:bs] + 1
+            if spec_info.num_accepted_drafts_cpu:
+                metadata.max_seq_len_q = max(spec_info.num_accepted_drafts_cpu) + 1
             else:
                 metadata.max_seq_len_q = 1
 

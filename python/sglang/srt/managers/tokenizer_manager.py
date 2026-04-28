@@ -2093,7 +2093,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if all_drafts > 0:
                 # accept_rate: accepted_drafts / total_proposed_drafts (strict count, no bonus).
                 meta_info["spec_accept_rate"] = accepted_drafts / all_drafts
-                # accept_length: accepted_drafts / verify_ct (includes bonus token).
+                # num_accepted_drafts: accepted_drafts / verify_ct (includes bonus token).
                 meta_info["spec_accept_length"] = (
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
                 )

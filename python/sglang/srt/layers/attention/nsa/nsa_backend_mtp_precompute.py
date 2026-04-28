@@ -262,7 +262,7 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
 
         # Extend seqlens from spec_info
-        extend_seq_lens = spec_info.accept_length[:bs]
+        extend_seq_lens = spec_info.num_accepted_drafts[:bs]
         extend_seq_lens_cpu = extend_seq_lens.tolist()
 
         # Page indices (repeated per accept length)
