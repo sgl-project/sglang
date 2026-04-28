@@ -1,7 +1,14 @@
 # Adapted from KIVI (https://github.com/jy-yuan/KIVI), quant/new_pack.py
 from __future__ import annotations
 
+import math
+
 import torch
+
+
+def _safe_scale(mx: torch.Tensor, mn: torch.Tensor, max_int: int) -> torch.Tensor:
+    scale = (mx - mn) / max_int
+    return torch.where(scale == 0, torch.ones_like(scale), scale)
 
 
 def pack_tensor(data: torch.Tensor, bits: int, pack_dim: int) -> torch.Tensor:
@@ -66,7 +73,7 @@ def quant_and_pack_kcache(
     data = k.view(bsz, nheads, num_groups, group_size, -1)
     mn = torch.min(data, dim=-2, keepdim=True)[0]
     mx = torch.max(data, dim=-2, keepdim=True)[0]
-    scale = (mx - mn) / max_int
+    scale = _safe_scale(mx, mn, max_int)
     data = data - mn
     data.div_(scale)
     data = data.clamp_(0, max_int).round_().to(torch.int32).view_as(k)
@@ -89,7 +96,7 @@ def quant_and_pack_vcache(
     data = v.view(v.shape[:-1] + (num_groups, group_size))
     mn = torch.min(data, dim=-1, keepdim=True)[0]
     mx = torch.max(data, dim=-1, keepdim=True)[0]
-    scale = (mx - mn) / max_int
+    scale = _safe_scale(mx, mn, max_int)
     data = data - mn
     data.div_(scale)
     data = data.clamp_(0, max_int).round_().to(torch.int32).view_as(v)
@@ -137,8 +144,9 @@ def kivi_roundtrip_kv_chunk(
     v_bits: int,
     k_group_size: int,
     v_group_size: int,
+    residual_length: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize+dequantize a KV chunk with KIVI kernels.
+    """Quantize+dequantize a single-request KV chunk with KIVI-style residuals.
 
     Args:
         cache_k/cache_v: [T, H, D]
@@ -148,16 +156,22 @@ def kivi_roundtrip_kv_chunk(
 
     feat_per_int_k = 32 // k_bits
     t, h, d = cache_k.shape
+    if residual_length < 0:
+        raise ValueError(
+            f"residual_length must be non-negative, got {residual_length}."
+        )
 
-    # K cache packs along token axis. Pad T to satisfy packing constraints.
-    pad_t = (feat_per_int_k - (t % feat_per_int_k)) % feat_per_int_k
-    if pad_t:
-        pad_k = torch.zeros((pad_t, h, d), dtype=cache_k.dtype, device=cache_k.device)
-        pad_v = torch.zeros((pad_t, h, d), dtype=cache_v.dtype, device=cache_v.device)
-        k_in = torch.cat([cache_k, pad_k], dim=0)
-        v_in = torch.cat([cache_v, pad_v], dim=0)
-    else:
-        k_in, v_in = cache_k, cache_v
+    # KIVI keeps recent/residual tokens in full precision. Do not pad incomplete
+    # groups with zeros: padding changes min/max and can quantize unrelated tokens
+    # together in serving batches.
+    quant_len = max(0, t - residual_length)
+    align = math.lcm(k_group_size, feat_per_int_k)
+    quant_len = (quant_len // align) * align
+    if quant_len == 0:
+        return cache_k, cache_v
+
+    k_in = cache_k[:quant_len]
+    v_in = cache_v[:quant_len]
 
     k_4d = k_in.permute(1, 0, 2).unsqueeze(0).contiguous()  # [1, H, T, D]
     v_4d = v_in.permute(1, 0, 2).unsqueeze(0).contiguous()  # [1, H, T, D]
@@ -167,6 +181,8 @@ def kivi_roundtrip_kv_chunk(
     k_dq = unpack_and_dequant_kcache(k_code, k_scale, k_mn, k_group_size, k_bits)
     v_dq = unpack_and_dequant_vcache(v_code, v_scale, v_mn, v_group_size, v_bits)
 
-    k_out = k_dq.squeeze(0).permute(1, 0, 2).contiguous()[:t]
-    v_out = v_dq.squeeze(0).permute(1, 0, 2).contiguous()[:t]
+    k_out = cache_k.clone()
+    v_out = cache_v.clone()
+    k_out[:quant_len] = k_dq.squeeze(0).permute(1, 0, 2).contiguous()
+    v_out[:quant_len] = v_dq.squeeze(0).permute(1, 0, 2).contiguous()
     return k_out.to(cache_k.dtype), v_out.to(cache_v.dtype)

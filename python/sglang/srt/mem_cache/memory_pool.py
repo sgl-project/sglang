@@ -1004,6 +1004,27 @@ class MHATokenToKVPool(KVCache):
     ):
         from sglang.srt.layers.quantization.kivi_utils import kivi_roundtrip_kv_chunk
 
+        k_group_size = getattr(layer, "kivi_k_group_size", 32)
+        allow_flattened_groups = os.getenv(
+            "SGLANG_KIVI_ALLOW_FLATTENED_GROUPS", ""
+        ).lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if k_group_size > 1 and not allow_flattened_groups:
+            if not getattr(self, "_kivi_flattened_group_warning_logged", False):
+                logger.warning(
+                    "Skipping KIVI roundtrip for k_group_size=%s because the current "
+                    "KV write path is flattened across requests. Set "
+                    "SGLANG_KIVI_ALLOW_FLATTENED_GROUPS=1 only for single-request "
+                    "experiments.",
+                    k_group_size,
+                )
+                self._kivi_flattened_group_warning_logged = True
+            return cache_k, cache_v
+
         v_group_size = getattr(layer, "kivi_v_group_size", 32)
         if cache_v.shape[-1] % v_group_size != 0:
             v_group_size = 1
@@ -1012,8 +1033,9 @@ class MHATokenToKVPool(KVCache):
             cache_v,
             k_bits=getattr(layer, "kivi_k_bits", 2),
             v_bits=getattr(layer, "kivi_v_bits", 2),
-            k_group_size=getattr(layer, "kivi_k_group_size", 1),
+            k_group_size=k_group_size,
             v_group_size=v_group_size,
+            residual_length=getattr(layer, "kivi_residual_length", 128),
         )
 
     def kivi_roundtrip_on_indices(

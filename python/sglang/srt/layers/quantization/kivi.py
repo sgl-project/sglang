@@ -20,14 +20,16 @@ class KIVIConfig(QuantizationConfig):
         self,
         k_bits: int = 2,
         v_bits: int = 2,
-        k_group_size: int = 1,
+        k_group_size: int = 32,
         v_group_size: int = 32,
+        residual_length: int = 128,
     ) -> None:
         super().__init__()
         self.k_bits = k_bits
         self.v_bits = v_bits
         self.k_group_size = k_group_size
         self.v_group_size = v_group_size
+        self.residual_length = residual_length
 
     @classmethod
     def get_name(cls) -> str:
@@ -51,8 +53,9 @@ class KIVIConfig(QuantizationConfig):
         return cls(
             k_bits=config.get("k_bits", 2),
             v_bits=config.get("v_bits", 2),
-            k_group_size=config.get("k_group_size", 1),
+            k_group_size=config.get("k_group_size", 32),
             v_group_size=config.get("v_group_size", 32),
+            residual_length=config.get("residual_length", 128),
         )
 
     def get_quant_method(
@@ -82,3 +85,4 @@ class KIVIKVCacheMethod(BaseKVCacheMethod):
         layer.kivi_v_bits = self.quant_config.v_bits
         layer.kivi_k_group_size = self.quant_config.k_group_size
         layer.kivi_v_group_size = self.quant_config.v_group_size
+        layer.kivi_residual_length = self.quant_config.residual_length
