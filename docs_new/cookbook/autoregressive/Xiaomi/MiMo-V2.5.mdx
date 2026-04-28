@@ -1,0 +1,626 @@
+---
+title: MiMo-V2.5
+metatags:
+    description: "Deploy XiaomiMiMo MiMo-V2.5-Pro (1.02T MoE, text) and MiMo-V2.5 (310B MoE, multimodal) with SGLang — EAGLE speculative decoding, hybrid attention, and 1M-token context."
+tag: NEW
+---
+
+## 1. Model Introduction
+
+[MiMo-V2.5-Pro](https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro) and [MiMo-V2.5](https://huggingface.co/XiaomiMiMo/MiMo-V2.5) are next-generation Mixture-of-Experts models from the XiaomiMiMo Team.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25%"}} />
+    <col style={{width: "15%"}} />
+    <col style={{width: "15%"}} />
+    <col style={{width: "45%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Variant</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Total params</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.02)"}}>Active (MoE)</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, backgroundColor: "rgba(255,255,255,0.05)"}}>Modalities</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/XiaomiMiMo/MiMo-V2.5-Pro">MiMo-V2.5-Pro</a></strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>1.02T</strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>42B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Text (multimodal planned)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/XiaomiMiMo/MiMo-V2.5">MiMo-V2.5</a></strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>310B</strong></td>
+      <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>15B</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Text, Image, Video, Audio</td>
+    </tr>
+  </tbody>
+</table>
+
+**Key Features:**
+
+- **Hybrid Attention Architecture**: Interleaves Sliding Window Attention (SWA) and Global Attention (GA) for reduced KV cache while preserving long-context capability.
+- **Multi-Token Prediction (MTP)**: 3-layer MTP module accelerates decoding (329M params on V2.5; V2.5-Pro supports EAGLE speculative decoding on top of MTP).
+- **1M-Token Context**: Both variants support up to 1 million token context windows.
+- **Agentic Capabilities**: Post-training with large-scale agentic RL achieves strong performance on coding, reasoning, and tool-use benchmarks.
+- **MiMo-V2.5 Multimodal** (V2.5 only): Native omnimodal architecture with a 729M-param ViT Vision Encoder (28 layers: 24 SWA + 4 Full) and a 261M-param Audio Transformer (24 layers: 12 SWA + 12 Full); supports image, video, and audio understanding via standard OpenAI-compatible multimodal API.
+
+**License:** Apache 2.0
+
+## 2. SGLang Installation
+
+Refer to the [official SGLang installation guide](../../../docs/get-started/install).
+
+**Docker Images by Variant × Hardware:**
+
+| Variant | Hardware | Docker Image |
+| --- | --- | --- |
+| **MiMo-V2.5 (310B)** | H100 / H200 (Hopper, CUDA 12.9) | `lmsysorg/sglang:dev-mimo-v2.5` |
+| **MiMo-V2.5 (310B)** | B200 / GB300 (Blackwell, CUDA 13.0) | `lmsysorg/sglang:dev-cu13-mimo-v2.5` |
+| **MiMo-V2.5-Pro (1.02T)** | H100 / H200 (Hopper, CUDA 12.9) | `lmsysorg/sglang:dev-mimo-v2.5-pro` |
+| **MiMo-V2.5-Pro (1.02T)** | B200 / GB300 (Blackwell, CUDA 13.0) | `lmsysorg/sglang:dev-cu13-mimo-v2.5-pro` |
+
+> Pull the image matching your GPU's CUDA driver. `lmsysorg/sglang:latest` will not load either checkpoint.
+
+## 3. Model Deployment
+
+### 3.1 Basic Configuration
+
+Use the selector below to generate the deployment command for your variant and hardware.
+
+import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deployment.jsx'
+
+<MiMoV25Deployment />
+
+### 3.2 Configuration Tips
+
+**MiMo-V2.5-Pro (1.02T):**
+- **B200**: single node, TP=8 (verified). Uses `--attention-backend fa4` + `--moe-runner-backend flashinfer_trtllm` + `--mem-fraction-static 0.8`. Set `--swa-full-tokens-ratio 0.1` to keep KV-cache footprint within 192 GB HBM.
+- **GB300**: 2 nodes, TP=8 (verified). Same Blackwell stack as B200; multi-node interconnect requires `NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1`. Default SWA ratio is fine.
+- **H100/H200**: 2 nodes × 8 GPUs (TP=16, not yet verified). Uses the Hopper stack (`fa3` + DeepEP + EAGLE multi-layer); fits with `--mem-fraction-static 0.7` and `--swa-full-tokens-ratio 0.3`. DeepEP dispatch tuning: `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256` avoids memory spikes during prefill.
+- EAGLE speculative decoding (3 steps, topk=1) typically yields a 2–3× decode speedup. Requires `SGLANG_ENABLE_SPEC_V2=1`; on Hopper also pass `--enable-multi-layer-eagle`.
+
+**MiMo-V2.5 (310B):**
+- The checkpoint has a TP=4-interleaved fused `qkv_proj`; attention-TP per DP group **must** be 4. So DP-attention is always required (`--dp = TP / 4`), and total GPUs must be a multiple of 4. A bare `--tp 8` without `--dp 2` will fail to load with `MiMoV2Omni fused qkv_proj checkpoint is TP=4-interleaved; got tp_size=8`.
+- Single-node deployments: H100/H200 8× GPUs (`--tp 8 --dp 2`), B200 4× GPUs (`--tp 4`, dp=1, no DP-attn flag needed), GB300 4× GPUs (`--tp 4`, single NVL4 node). FP8 quantization.
+- `--enable-dp-lm-head` and `--mm-enable-dp-encoder` are required whenever `--enable-dp-attention` is on, to keep LM head and encoder sharding consistent.
+- **Multimodal**: Supports image, video, and audio understanding; see Section 4.3 for invocation examples.
+
+**DeepEP (optional toggle, Hopper-only):**
+- DeepEP replaces the default MoE all-to-all dispatch with a fused [DeepEP](https://github.com/deepseek-ai/DeepEP) backend; it lowers expert dispatch latency and memory traffic, so it pays off under **high concurrency / throughput-bound workloads** on H100/H200. Under concurrency=1 / latency-bound workloads the gain is negligible — leave it off.
+- Enabling adds `--moe-a2a-backend deepep` + `--moe-dense-tp-size 1` (and `--ep <tp>` for Pro) plus `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256` env to cap the dispatch buffer. Requires `pip install deep_ep` (not part of the default sglang install).
+- On Blackwell (B200, GB300) the verified MoE backend is `flashinfer_trtllm`; the DeepEP toggle is a no-op there.
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+See [Basic API Usage](../../../docs/basic_usage/send_request).
+
+### 4.2 Reasoning Output
+
+Both variants support hybrid thinking mode. Thinking content is separated via the reasoning parser.
+
+**Thinking Mode (default):**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+response = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-V2.5",
+    messages=[
+        {"role": "user", "content": "Which is larger, 9.11 or 9.9? Think carefully."}
+    ]
+)
+
+print("====== Reasoning ======")
+print(response.choices[0].message.reasoning_content)
+print("====== Answer ======")
+print(response.choices[0].message.content)
+```
+
+**Output Example (MiMo-V2.5):**
+
+```text
+====== Reasoning ======
+Comparing 9.11 and 9.9.
+
+The integer parts are both 9. Now compare the decimal parts: 0.11 vs 0.9.
+
+0.9 = 0.90, which is greater than 0.11.
+
+So 9.9 > 9.11.
+====== Answer ======
+**9.9 is larger than 9.11.**
+
+Here's the reasoning: When comparing decimals, line them up to the same number of decimal places:
+
+- 9.11
+- 9.90
+
+Both have a **9** in the ones place, but in the tenths place, **9 > 1**, so 9.90 > 0.11.
+
+**9.9 > 9.11**
+```
+
+**Thinking Off (instant mode):**
+
+```python Example
+response = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-V2.5",
+    messages=[
+        {"role": "user", "content": "Which is larger, 9.11 or 9.9? Think carefully."}
+    ],
+    extra_body={"chat_template_kwargs": {"thinking": False}}
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output Example (MiMo-V2.5):**
+
+```text
+## Comparing 9.11 and 9.9
+
+**9.9 is larger.**
+
+The key is to compare them place by place. It helps to write them with the same number of decimal places:
+
+- **9.11** → 9.11
+- **9.9** → 9.90
+
+Both have **9** in the ones place, but in the tenths place: **9** (in 9.90) is greater than **1** (in 9.11).
+
+So **9.90 > 9.11**.
+```
+
+### 4.3 Multimodal Invocation (V2.5 only)
+
+**Image Understanding:**
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+response = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-V2.5",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "image_url", "image_url": {"url": "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/images/man_ironing_on_back_of_suv.png"}},
+            {"type": "text", "text": "Describe this image in detail."}
+        ]
+    }]
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text
+Based on the image provided, here is a detailed description:
+
+The image captures a whimsical or surreal scene set on a busy city street, likely in New York City given the iconic yellow cabs. In the center foreground, a man is sitting on a folding chair, casually crossing his legs. He is wearing a bright yellow hoodie with a graphic on the front and blue jeans. He is intently focused on ironing a white dress shirt that rests on an ironing board set up directly on the asphalt.
+
+Behind him, a yellow SUV taxi cab is stopped or moving slowly, angled slightly away from the camera. To his left, another yellow taxi sedan is captured in motion blur, indicating it is driving past him. The background features tall city buildings with glass windows and storefronts. There are banners hanging from streetlights, and some greenery is visible in the distance. The overall impression is one of incongruity—performing a domestic chore like ironing in the middle of a chaotic urban environment.
+```
+
+**Video Understanding:**
+
+```python Example
+response = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-V2.5",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "video_url", "video_url": {"url": "https://videos.pexels.com/video-files/4114797/4114797-uhd_3840_2160_25fps.mp4"}},
+            {"type": "text", "text": "Summarize what happens in this video."}
+        ]
+    }]
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text
+A person wearing blue protective gloves is shown operating a microscope in a close-up shot. The individual is adjusting a knob on the side of the microscope, which moves the stage holding a glass slide, likely focusing the lens on the specimen.
+```
+
+> Video decoding requires `decord` (`pip install decord`); SGLang's MiMo-V2.5 multimodal processor uses `decord.VideoReader` for frame extraction.
+
+**Audio Understanding:**
+
+```python Example
+response = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-V2.5",
+    messages=[{
+        "role": "user",
+        "content": [
+            {"type": "audio_url", "audio_url": {"url": "https://raw.githubusercontent.com/sgl-project/sgl-test-files/refs/heads/main/audios/Trump_WEF_2018_10s.mp3"}},
+            {"type": "text", "text": "Transcribe and summarize this audio."}
+        ]
+    }]
+)
+
+print(response.choices[0].message.content)
+```
+
+**Output Example:**
+
+```text
+**Transcript:**
+"Thank you Klaus very much. It's a privilege to be here at this forum where leaders in business, science, art, diplomacy and world affairs have gathered for..."
+
+**Summary:**
+The speaker thanks Klaus for the introduction and expresses their honor at attending a forum. They highlight that the event has brought together high-level leaders from various sectors, including business, science, art, and diplomacy.
+```
+
+### 4.4 Tool Calling
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:30000/v1",
+    api_key="EMPTY"
+)
+
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string", "description": "City name"},
+                    "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
+                },
+                "required": ["location"]
+            }
+        }
+    }
+]
+
+response = client.chat.completions.create(
+    model="XiaomiMiMo/MiMo-V2.5",
+    messages=[{"role": "user", "content": "What's the weather in Beijing?"}],
+    tools=tools
+)
+
+msg = response.choices[0].message
+if msg.reasoning_content:
+    print("=== Reasoning ===")
+    print(msg.reasoning_content)
+if msg.tool_calls:
+    print("=== Tool Calls ===")
+    for tc in msg.tool_calls:
+        print(f"  Function: {tc.function.name}")
+        print(f"  Arguments: {tc.function.arguments}")
+```
+
+**Output Example (MiMo-V2.5):**
+
+```text
+=== Reasoning ===
+The user wants to know the weather in Beijing. I have a function available called "get_weather" that can retrieve current weather for a location. Let me call that function with Beijing as the location.
+=== Tool Calls ===
+  Function: get_weather
+  Arguments: {"location": "Beijing"}
+```
+
+## 5. Benchmark
+
+Accuracy numbers come from `sglang.test.run_eval` (GSM8K standard 5-shot, MMMU validation split). Speed numbers come from `sglang.bench_serving` against the [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) dataset; each request is configured with 1024 input tokens and 1024 output tokens to represent a typical medium-length conversation.
+
+### 5.1 Accuracy Benchmark
+
+#### 5.1.1 GSM8K
+
+Standard 5-shot, `temperature=0`, `max_tokens=4096`, model defaults to thinking-on (responses contain `<think>...</think>` and the eval extracts the trailing number via regex). Server launch: see [Section 3](#3-model-deployment).
+
+**Benchmark Command:**
+
+```shell Command
+python3 -m sglang.test.run_eval \
+  --base-url http://127.0.0.1:30000 \
+  --model XiaomiMiMo/MiMo-V2.5 \
+  --eval-name gsm8k \
+  --num-examples 200 \
+  --num-threads 8 \
+  --max-tokens 4096 \
+  --temperature 0.0
+```
+
+> `run_eval.py` automatically appends `/v1` to `--base-url`; pass the bare `host:port` URL (without trailing `/v1`), otherwise requests resolve to `/v1/v1/chat/completions` and 404.
+
+- **Test Results:**
+  - MiMo-V2.5-Pro (FP8)
+    ```
+    Pending update
+    ```
+  - MiMo-V2.5 (FP8, 8× H200)
+    ```
+    Score:             0.980  (196 / 200)
+    Latency:           477.52 s
+    Output throughput: 88.9 tok/s
+    ```
+
+#### 5.1.2 MMMU (V2.5 only)
+
+`MMMU/MMMU` validation split (multi-discipline multimodal), `concurrency=16`, default sampling.
+
+- **Benchmark Command:**
+
+```shell Command
+python3 benchmark/mmmu/bench_sglang.py \
+  --port 30000 \
+  --model XiaomiMiMo/MiMo-V2.5 \
+  --concurrency 16
+```
+
+- **Test Results:**
+  - MiMo-V2.5 (FP8)
+    ```
+    Pending update
+    ```
+
+### 5.2 Speed Benchmark — MiMo-V2.5-Pro
+
+**Test Environment:**
+
+- Hardware: NVIDIA B200 GPU (8×)
+- Model: `XiaomiMiMo/MiMo-V2.5-Pro` (FP8)
+- Tensor Parallelism: 8
+- Recipe: Balanced (DP-attn + DeepEP + EAGLE MTP)
+- sglang version: Pending update
+
+#### 5.2.1 Latency-Sensitive Benchmark
+
+- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model XiaomiMiMo/MiMo-V2.5-Pro \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+- **Test Results:**
+
+```text Output
+Pending update — replace with real bench_serving output after the latency run.
+```
+
+#### 5.2.2 Throughput-Sensitive Benchmark
+
+- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model XiaomiMiMo/MiMo-V2.5-Pro \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100
+```
+
+- **Test Results:**
+
+```text Output
+Pending update — replace with real bench_serving output after the throughput run.
+```
+
+### 5.3 Speed Benchmark — MiMo-V2.5
+
+**Test Environment:**
+
+- Hardware: NVIDIA H200 GPU (8×)
+- Model: `XiaomiMiMo/MiMo-V2.5` (FP8)
+- Tensor Parallelism: 8 (DP-attention with `--dp-size 2`)
+- Recipe: Balanced (DP-attn)
+- sglang version: 1.1.2.dev9066
+
+#### 5.3.1 Latency-Sensitive Benchmark
+
+- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model XiaomiMiMo/MiMo-V2.5 \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  26.41
+Total input tokens:                      1997
+Total input text tokens:                 1997
+Total generated tokens:                  2798
+Total generated tokens (retokenized):    2669
+Request throughput (req/s):              0.38
+Input token throughput (tok/s):          75.60
+Output token throughput (tok/s):         105.93
+Peak output token throughput (tok/s):    110.00
+Peak concurrent requests:                3
+Total token throughput (tok/s):          181.53
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   2639.75
+Median E2E Latency (ms):                 2928.14
+P90 E2E Latency (ms):                    4107.62
+P99 E2E Latency (ms):                    4830.83
+---------------Time to First Token----------------
+Mean TTFT (ms):                          73.94
+Median TTFT (ms):                        74.09
+P99 TTFT (ms):                           79.90
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          9.19
+Median TPOT (ms):                        9.21
+P99 TPOT (ms):                           9.24
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           9.20
+Median ITL (ms):                         9.21
+P95 ITL (ms):                            9.31
+P99 ITL (ms):                            9.43
+Max ITL (ms):                            16.43
+==================================================
+```
+
+#### 5.3.2 Throughput-Sensitive Benchmark
+
+- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model XiaomiMiMo/MiMo-V2.5 \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 1000 \
+  --max-concurrency 100
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Traffic request rate:                    inf
+Max request concurrency:                 100
+Successful requests:                     1000
+Benchmark duration (s):                  87.23
+Total input tokens:                      302118
+Total input text tokens:                 302118
+Total generated tokens:                  195775
+Total generated tokens (retokenized):    190470
+Request throughput (req/s):              11.46
+Input token throughput (tok/s):          3463.61
+Output token throughput (tok/s):         2244.45
+Peak output token throughput (tok/s):    4274.00
+Peak concurrent requests:                122
+Total token throughput (tok/s):          5708.05
+Concurrency:                             87.80
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   7658.29
+Median E2E Latency (ms):                 5195.82
+P90 E2E Latency (ms):                    18382.07
+P99 E2E Latency (ms):                    32849.04
+---------------Time to First Token----------------
+Mean TTFT (ms):                          188.32
+Median TTFT (ms):                        138.69
+P99 TTFT (ms):                           746.89
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          40.13
+Median TPOT (ms):                        40.68
+P99 TPOT (ms):                           80.38
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           38.42
+Median ITL (ms):                         21.63
+P95 ITL (ms):                            82.64
+P99 ITL (ms):                            119.66
+Max ITL (ms):                            726.36
+==================================================
+```
+
+#### 5.3.3 Multimodal (Image) Benchmark
+
+- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
+- Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model XiaomiMiMo/MiMo-V2.5 \
+  --dataset-name image \
+  --image-count 2 \
+  --image-resolution 720p \
+  --random-input-len 128 \
+  --random-output-len 1024 \
+  --num-prompts 10 \
+  --max-concurrency 1
+```
+
+- **Test Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang-oai-chat
+Traffic request rate:                    inf
+Max request concurrency:                 1
+Successful requests:                     10
+Benchmark duration (s):                  41.89
+Total input tokens:                      18514
+Total input text tokens:                 874
+Total input vision tokens:               17640
+Total generated tokens:                  4220
+Total generated tokens (retokenized):    1478
+Request throughput (req/s):              0.24
+Input token throughput (tok/s):          442.01
+Output token throughput (tok/s):         100.75
+Peak output token throughput (tok/s):    107.00
+Peak concurrent requests:                2
+Total token throughput (tok/s):          542.76
+Concurrency:                             1.00
+----------------End-to-End Latency----------------
+Mean E2E Latency (ms):                   4186.79
+Median E2E Latency (ms):                 3366.20
+P90 E2E Latency (ms):                    7545.54
+P99 E2E Latency (ms):                    9180.85
+---------------Time to First Token----------------
+Mean TTFT (ms):                          1284.90
+Median TTFT (ms):                        622.81
+P99 TTFT (ms):                           5030.79
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          7.36
+Median TPOT (ms):                        8.45
+P99 TPOT (ms):                           10.94
+---------------Inter-Token Latency----------------
+Mean ITL (ms):                           9.54
+Median ITL (ms):                         9.45
+P95 ITL (ms):                            9.58
+P99 ITL (ms):                            11.12
+Max ITL (ms):                            37.67
+==================================================
+```
