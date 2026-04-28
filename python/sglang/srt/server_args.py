@@ -4958,12 +4958,15 @@ class ServerArgs:
             action="store_true",
             help="Return number of cached tokens in usage.prompt_tokens_details for each openai request.",
         )
+        reasoning_parser_choices = list(ReasoningParser.DetectorMap.keys())
         parser.add_argument(
             "--reasoning-parser",
             type=str,
-            choices=list(ReasoningParser.DetectorMap.keys()),
+            choices=["auto"] + reasoning_parser_choices,
             default=ServerArgs.reasoning_parser,
-            help=f"Specify the parser for reasoning models, supported parsers are: {list(ReasoningParser.DetectorMap.keys())}.",
+            help=f"Specify the parser for reasoning models. "
+            f"Use 'auto' to detect from chat template. "
+            f"Options include: {reasoning_parser_choices}.",
         )
         parser.add_argument(
             "--strip-thinking-cache",
@@ -4976,9 +4979,11 @@ class ServerArgs:
         parser.add_argument(
             "--tool-call-parser",
             type=str,
-            choices=tool_call_parser_choices,
+            choices=["auto"] + tool_call_parser_choices,
             default=ServerArgs.tool_call_parser,
-            help=f"Specify the parser for handling tool-call interactions. Options include: {tool_call_parser_choices}.",
+            help=f"Specify the parser for handling tool-call interactions. "
+            f"Use 'auto' to detect from chat template. "
+            f"Options include: {tool_call_parser_choices}.",
         )
         parser.add_argument(
             "--tool-server",
