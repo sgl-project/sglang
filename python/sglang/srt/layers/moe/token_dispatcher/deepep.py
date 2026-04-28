@@ -622,7 +622,7 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
             use_nvfp4 = True
         elif (
             not get_moe_runner_backend().is_flashinfer_cutedsl()
-            and not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+            and (not _is_npu or not envs.SGLANG_DEEPEP_BF16_DISPATCH.get())
         ):
             # flashinfer_cutedsl expects BF16 dispatch when NVFP4 dispatch is
             # off; its kernel quantizes to NVFP4 internally.
