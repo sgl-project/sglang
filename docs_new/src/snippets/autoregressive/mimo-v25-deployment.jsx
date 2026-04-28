@@ -248,19 +248,17 @@ export const MiMoV25Deployment = () => {
       flags.push("  --port 30000");
       flags.push("  --page-size 256");
       flags.push("  --context-length 262144");
+      flags.push("  --chunked-prefill-size 4096");
+      flags.push("  --max-running-requests 512");
       if (isV7x) {
-        flags.push("  --chunked-prefill-size 4096");
         flags.push("  --dtype bfloat16");
         flags.push("  --mem-fraction-static 0.95");
         flags.push("  --swa-full-tokens-ratio 0.25");
         flags.push("  --log-level info");
-        flags.push("  --max-running-requests 512");
       } else {
         flags.push("  --max-seq-len 4096");
-        flags.push("  --chunked-prefill-size 4096");
         flags.push("  --max-prefill-tokens 16384");
         flags.push("  --mem-fraction-static 0.92");
-        flags.push("  --max-running-requests 512");
         flags.push("  --swa-full-tokens-ratio 0.15");
       }
       if (reasoningParser === "enabled") flags.push("  --reasoning-parser mimo");

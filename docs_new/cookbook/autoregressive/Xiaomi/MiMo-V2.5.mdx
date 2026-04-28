@@ -65,6 +65,8 @@ Refer to the [official SGLang installation guide](../../../docs/get-started/inst
 
 > Pull the image matching your GPU's CUDA driver. `lmsysorg/sglang:latest` will not load either checkpoint.
 
+**TPU (sgl-jax):** MiMo-V2.5-Pro can also be served on TPU via the JAX-based [sgl-jax](https://github.com/sgl-project/sglang-jax) runtime. The container image and `pip install` steps are listed in [§3.3 TPU Deployment](#33-tpu-deployment-mimo-v25-pro-sgl-jax).
+
 ## 3. Model Deployment
 
 ### 3.1 Basic Configuration
@@ -98,10 +100,12 @@ import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deploym
 
 MiMo-V2.5-Pro can also be served on TPU via [sgl-jax](https://github.com/sgl-project/sglang-jax). The runtime is a separate JAX-based stack (`sgl_jax.launch_server`); pick **TPU v7x** or **TPU v6e** in the panel above to generate the launch command. Verified topologies:
 
-| TPU Type | Topology | Chips/Node | Nodes | Total Chips |
-| --- | --- | --- | --- | --- |
-| **v7x** | 2×2×4 | 4 | 4 | 16 |
-| **v6e** | 4×4×4 | 4 | 16 | 64 |
+| TPU Type | Topology | Chips/Node | Nodes | Total Chips | JAX Devices/Chip | Total JAX Devices (= `--tp-size`) |
+| --- | --- | --- | --- | --- | --- | --- |
+| **v7x** | 2×2×4 | 4 | 4 | 16 | 2 | 32 |
+| **v6e** | 4×4×4 | 4 | 16 | 64 | 1 | 64 |
+
+> v7x exposes **2 logical JAX devices per chip**, so `--tp-size = 16 chips × 2 = 32`. v6e exposes 1 device per chip, so `--tp-size = 64`. Always set `--tp-size` to the total JAX device count across all nodes, not the chip count.
 
 All nodes must sit in the same TPU slice and reach each other on the JAX init port (`20000`) and the TPU process port (`8471`).
 
