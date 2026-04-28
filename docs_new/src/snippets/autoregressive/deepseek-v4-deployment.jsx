@@ -482,6 +482,38 @@ export const DeepSeekV4Deployment = () => {
         cmd;
     }
     const withMultinode = multinode ? prependMultiNodeNote(cmd, nnodes) : cmd;
+
+    // H200 Pro low-latency: show BOTH a single-node (TP=8 marlin) variant
+    // and the existing multi-node (TP=16 DP-attn + DeepEP) variant.
+    if (hardware === "h200" && isBig && recipe === "low-latency") {
+      const singleFlags = [
+        "  --trust-remote-code",
+        "  --model-path deepseek-ai/DeepSeek-V4-Pro",
+        "  --tp 8",
+        "  --moe-runner-backend marlin",
+        "  --speculative-algo EAGLE",
+        "  --speculative-num-steps 3",
+        "  --speculative-eagle-topk 1",
+        "  --speculative-num-draft-tokens 4",
+        "  --chunked-prefill-size 4096",
+        "  --disable-flashinfer-autotune",
+        "  --mem-fraction-static 0.88",
+      ];
+      if (toolcall === "enabled") singleFlags.push("  --tool-call-parser deepseekv4");
+      if (reasoningParser === "enabled") singleFlags.push("  --reasoning-parser deepseek-v4");
+      singleFlags.push("  --host 0.0.0.0");
+      singleFlags.push("  --port 30000");
+      const singleNodeCmd = `sglang serve \\\n${singleFlags.join(" \\\n")}`;
+      const combined =
+        `# --- Single-Node (TP=8, Marlin) ---\n${singleNodeCmd}\n\n` +
+        `# --- Multi-Node (2 nodes, TP=16, DP-Attn + DeepEP) ---\n${withMultinode}`;
+      const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+      if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
+      return VERIFIED_RECIPES.has(verifyKey)
+        ? combined
+        : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(combined)}`;
+    }
+
     const verifyKey = `${hardware}|${modelSize}|${recipe}`;
     if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
     return VERIFIED_RECIPES.has(verifyKey)
