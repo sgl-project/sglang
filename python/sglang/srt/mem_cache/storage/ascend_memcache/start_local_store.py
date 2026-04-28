@@ -122,6 +122,32 @@ def launch_local_store(config_path: str, block: bool = True) -> int:
     if unknown:
         logger.warning("Ignoring unknown LocalConfig keys: %s", unknown)
 
+    for attr in [
+        "meta_service_url",
+        "config_store_url",
+        "log_level",
+        "world_size",
+        "protocol",
+        "hcom_url",
+        "dram_size",
+        "hbm_size",
+        "max_dram_size",
+        "max_hbm_size",
+    ]:
+        if attr in config_data and hasattr(local_cfg, attr):
+            setattr(local_cfg, attr, config_data[attr])
+
+    if hasattr(local_cfg, "protocol"):
+        local_cfg.protocol = config_data.get("protocol", "host_tcp")
+
+    logger.info(
+        "Resolved LocalConfig: protocol=%s, config_store_url=%s, dram_size=%s, hbm_size=%s",
+        getattr(local_cfg, "protocol", None),
+        getattr(local_cfg, "config_store_url", None),
+        getattr(local_cfg, "dram_size", None),
+        getattr(local_cfg, "hbm_size", None),
+    )
+
     device_id = int(config_data.get("device_id", 0))
     init_bm = bool(config_data.get("init_bm", True))
     conf_file_path = config_data.get("conf_file_path")
