@@ -878,7 +878,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.max_kv_len,
                 )
         elif forward_batch.forward_mode.is_draft_extend():
-            # EAGLE V1: DRAFT_EXTEND mode - uses spec_info.num_accepted_drafts
+            # EAGLE V1: DRAFT_EXTEND mode - uses spec_info.num_accepted_tokens
             if self.use_mla:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
@@ -1957,7 +1957,7 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
             )
         elif forward_mode.is_draft_extend():
-            # EAGLE V1: Uses spec_info.num_accepted_drafts
+            # EAGLE V1: Uses spec_info.num_accepted_tokens
             num_tokens_per_bs = self.speculative_num_steps + 1
             seq_lens = seq_lens[:bs]
             # num_accepted_drafts is drafts-only; extend QO length per req is +1 (bonus token).
