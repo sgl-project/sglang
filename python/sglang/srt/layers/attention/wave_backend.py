@@ -292,6 +292,9 @@ class WaveAttnBackend(AttentionBackend):
                 )
             )
             mask_indptr = None
+            # TODO(FIXME): This will trigger an invalid Eagle tree when using
+            # `max(spec_info.num_accepted_tokens_cpu)`.
+            # It might have been forgotten to update somewhere.
             max_extend_len = torch.max(spec_info.num_accepted_tokens).item()
             num_kv_splits = None
             attn_logits = None
