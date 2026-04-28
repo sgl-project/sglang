@@ -351,3 +351,9 @@ class DeepSeekV32Detector(BaseFormatDetector):
             end="</｜DSML｜invoke>",
             trigger="<｜DSML｜invoke",
         )
+
+    def supports_model_structural_tag(self) -> bool:
+        return True
+
+    def get_model_structural_tag_id(self) -> str:
+        return "deepseek_v3_2"

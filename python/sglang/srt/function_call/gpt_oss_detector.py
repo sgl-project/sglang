@@ -239,3 +239,9 @@ class GptOssDetector(BaseFormatDetector):
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError("structure_info not used with HarmonyParser")
+
+    def supports_model_structural_tag(self) -> bool:
+        return True
+
+    def get_model_structural_tag_id(self) -> str:
+        return "gpt_oss"
