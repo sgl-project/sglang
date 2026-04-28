@@ -94,26 +94,26 @@ uv pip install -e "python[all]"
 
 2. Create a SkyPilot configuration file:
 
-<details>
-<summary>SkyPilot YAML: <code>sglang-jax.sky.yaml</code></summary>
+    <details>
+    <summary>SkyPilot YAML: <code>sglang-jax.sky.yaml</code></summary>
 
-```yaml
-# sglang-jax.sky.yaml
-resources:
-   accelerators: tpu-v6e-4
-   accelerator_args:
-      tpu_vm: True
-      runtime_version: v2-alpha-tpuv6e
+    ```yaml
+    # sglang-jax.sky.yaml
+    resources:
+    accelerators: tpu-v6e-4
+    accelerator_args:
+        tpu_vm: True
+        runtime_version: v2-alpha-tpuv6e
 
-run: |
-  git clone https://github.com/sgl-project/sglang-jax.git
-  cd sglang-jax
-  uv venv --python 3.12
-  source .venv/bin/activate
-  uv pip install -e "python[all]"
-```
+    run: |
+    git clone https://github.com/sgl-project/sglang-jax.git
+    cd sglang-jax
+    uv venv --python 3.12
+    source .venv/bin/activate
+    uv pip install -e "python[all]"
+    ```
 
-</details>
+    </details>
 
 3. Launch your TPU cluster:
 
@@ -201,7 +201,6 @@ python3 -u -m sgl_jax.launch_server \
 ```
 
 **NOTE:** Speculative decoding is currently supported for Qwen3 and LLaMA model families. See the [Speculative Decoding documentation](https://github.com/sgl-project/sglang-jax/blob/main/docs/features/speculative_decoding.md) for detailed configuration guidance.
-
 
 ### Multi-Node Distributed Serving
 
@@ -307,11 +306,13 @@ See the [Benchmark and Profiling Guide](https://github.com/sgl-project/sglang-ja
 ### Memory Optimization
 
 **Reduce memory usage:**
+
 - Lower `--mem-fraction-static` (from 0.8 → 0.5 → 0.3)
 - Decrease `--max-prefill-tokens` (from 16384 → 8192 → 4096)
 - Reduce `--max-running-requests`
 
 **Handle OOM errors:**
+
 - Start with conservative memory settings (`--mem-fraction-static=0.5`)
 - Gradually increase until you find the optimal balance
 - Increase `--page-size` for better memory locality (1 → 16 → 64 → 128)
@@ -339,9 +340,11 @@ To minimize time-to-first-token (TTFT) and inter-token latency:
 ### TPU-Specific Optimizations
 
 1. **JIT Compilation Cache:**
+
    ```bash
    export JAX_COMPILATION_CACHE_DIR=/tmp/jit_cache
    ```
+
    Always set this environment variable to cache compiled kernels and accelerate server startup.
 
 2. **Data Type Optimization:**
@@ -424,6 +427,7 @@ python -c "from sgl_jax import check_env; check_env.check_env()"
 ```
 
 This command checks:
+
 - Installed package versions
 - TPU device availability and specifications
 - System resources and configuration

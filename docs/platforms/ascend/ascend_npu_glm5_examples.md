@@ -10,8 +10,7 @@ The GLM (General Language Model) series is an open-source bilingual large langua
 
 - `GLM-5.0`(BF16 version): [Download model weight](https://www.modelscope.cn/models/ZhipuAI/GLM-5).
 - `GLM-5.0-w4a8`(Quantized version without mtp): [Download model weight](https://modelers.cn/models/Eco-Tech/GLM-5-w4a8).
-- You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantify the model naively.
-
+- You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize the model naively.
 
 ### Installation
 
@@ -54,7 +53,9 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:${TAG}
 ```
 
 ### Best Practices
+
 Note: Using this image for **best practices**, you need to update transformers to version 5.3.0
+
 ``` shell
 # reinstall transformers
 

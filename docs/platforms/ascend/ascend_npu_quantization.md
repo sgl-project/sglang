@@ -5,6 +5,7 @@ To load already quantized models, simply load the model weights and config. Agai
 SGLang support **mix-bits** quantization (independently defines and loads each layer depending on the type of quantification specified in the `quant_model_description'.json`). [Advanced mix-bits for MoE](https://github.com/sgl-project/sglang/pull/17361) in progress, will add independent quantization determination for the w13 (up-gate) and w2 (down) layers.
 
 [ModelSlim on Ascend support](https://github.com/sgl-project/sglang/pull/14504)
+
 | Quantization scheme                                       | Layer type               |               A2 Supported               |               A3 Supported               |               A5 Supported                 |             Diffusion models               |
 |-----------------------------------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|:------------------------------------------:|:------------------------------------------:|
 | W4A4 dynamic                                              | Linear                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>**  | **<span style="color: green;">√</span>**   |
@@ -17,6 +18,7 @@ SGLang support **mix-bits** quantization (independently defines and loads each l
 | [MXFP8](https://github.com/sgl-project/sglang/pull/20922) | MoE                      | **<span style="color: red;">x</span>**   | **<span style="color: red;">x</span>**   | **<span style="color: blue;">WIP</span>**  | **<span style="color: red;">x</span>**     |
 
 [AWQ on Ascend support](https://github.com/sgl-project/sglang/pull/10158):
+
 | Quantization scheme            | Layer type               |               A2 Supported               |               A3 Supported               |               A5 Supported                 |
 |--------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|:------------------------------------------:|
 | W4A16                          | Linear                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>**  |
@@ -24,6 +26,7 @@ SGLang support **mix-bits** quantization (independently defines and loads each l
 | W4A16                          | MoE                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>**  |
 
 GPTQ on Ascend support
+
 | Quantization scheme                                                        | Layer type               |               A2 Supported               |               A3 Supported               |               A5 Supported                |
 |----------------------------------------------------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|:-----------------------------------------:|
 | [W4A16](https://github.com/sgl-project/sglang/pull/15203)                  | Linear                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
@@ -32,6 +35,7 @@ GPTQ on Ascend support
 | [W8A16 MOE](https://github.com/sgl-project/sglang/pull/16364)              | MoE                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
 
 [Auto-round on Ascend support](https://github.com/sgl-project/sglang/pull/16699)
+
 | Quantization scheme            | Layer type               |               A2 Supported               |               A3 Supported               |               A5 Supported                |
 |--------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|:-----------------------------------------:|
 | W4A16                          | Linear                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
@@ -40,6 +44,7 @@ GPTQ on Ascend support
 | W8A16                          | MoE                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
 
 Compressed-tensors (LLM Compressor) on Ascend support:
+
 | Quantization scheme                                                                           | Layer type               |               A2 Supported               |               A3 Supported               |               A5 Supported                |
 |-----------------------------------------------------------------------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|:-----------------------------------------:|
 | [W8A8 dynamic](https://github.com/sgl-project/sglang/pull/14504)                              | Linear                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
@@ -48,6 +53,7 @@ Compressed-tensors (LLM Compressor) on Ascend support:
 | [W8A8 dynamic](https://github.com/sgl-project/sglang/pull/14504)                              | MoE                      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |
 
 [GGUF on Ascend support](https://github.com/sgl-project/sglang/pull/17883)
+
 | Quantization scheme                                       | Layer type               |               A2 Supported               |               A3 Supported               |               A5 Supported                |
 |-----------------------------------------------------------|--------------------------|:----------------------------------------:|:----------------------------------------:|:-----------------------------------------:|
 | [GGUF (all types)](https://github.com/sgl-project/sglang/pull/17883) | Linear                   | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** | **<span style="color: yellow;">TBD</span>** |

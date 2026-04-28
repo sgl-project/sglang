@@ -1,4 +1,4 @@
-# Support Models on Ascend NPU
+# Supported Models on Ascend NPU
 
 This section describes the models supported on the Ascend NPU, including Large Language Models, Multimodal Language
 Models, Embedding Models, Reward Models and Rerank Models. Mainstream DeepSeek/Qwen/GLM series are included.
@@ -68,8 +68,8 @@ You are welcome to enable various models based on your business requirements.
 | deepseek-ai/deepseek-vl2                      | DeepSeek-VL2              | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | deepseek-ai/Janus-Pro-1B                      | Janus-Pro (1B, 7B)        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | deepseek-ai/Janus-Pro-7B                      | Janus-Pro (1B, 7B)        | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| openbmb/MiniCPM-V-2_6                         | MiniCPM-V / MiniCPM-o     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
-| openbmb/MiniCPM-o-2_6                         | MiniCPM-V / MiniCPM-o     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| openbmb/MiniCPM-V-2_6                         | MiniCPM-V / MiniCPM-O    | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
+| openbmb/MiniCPM-o-2_6                         | MiniCPM-V / MiniCPM-O     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | google/gemma-3-4b-it                          | Gemma 3 (Multimodal)      | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | mistralai/Mistral-Small-3.1-24B-Instruct-2503 | Mistral-Small-3.1-24B     | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |
 | microsoft/Phi-4-multimodal-instruct           | Phi-4-multimodal-instruct | **<span style="color: green;">√</span>** | **<span style="color: green;">√</span>** |

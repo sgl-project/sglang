@@ -1,8 +1,8 @@
-## Qwen3 examples
+# Qwen3 examples
 
-### Running Qwen3
+## Running Qwen3
 
-#### Running Qwen3-32B on 1 x Atlas 800I A3.
+### Running Qwen3-32B on 1 x Atlas 800I A3
 
 Model weights could be found [here](https://huggingface.co/Qwen/Qwen3-32B)
 
@@ -22,7 +22,7 @@ python -m sglang.launch_server \
    --mem-fraction-static 0.8
 ```
 
-#### Running Qwen3-32B on 1 x Atlas 800I A3 with Qwen3-32B-Eagle3.
+### Running Qwen3-32B on 1 x Atlas 800I A3 with Qwen3-32B-Eagle3
 
 Model weights could be found [here](https://huggingface.co/Qwen/Qwen3-32B)
 
@@ -50,7 +50,7 @@ python -m sglang.launch_server \
    --speculative-num-draft-tokens 2
 ```
 
-#### Running Qwen3-30B-A3B MOE on 1 x Atlas 800I A3.
+### Running Qwen3-30B-A3B MOE on 1 x Atlas 800I A3
 
 Model weights could be found [here](https://huggingface.co/Qwen/Qwen3-30B-A3B)
 
@@ -72,7 +72,7 @@ python -m sglang.launch_server \
    --mem-fraction-static 0.8
 ```
 
-#### Running Qwen3-235B-A22B-Instruct-2507 MOE on 1 x Atlas 800I A3.
+### Running Qwen3-235B-A22B-Instruct-2507 MOE on 1 x Atlas 800I A3
 
 Model weights could be found [here](https://huggingface.co/Qwen/Qwen3-235B-A22B-Instruct-2507)
 
@@ -185,7 +185,7 @@ python3 -m sglang_router.launch_router \
    --prometheus-port 29010
 ```
 
-#### Running Qwen3-VL-8B-Instruct on 1 x Atlas 800I A3.
+### Running Qwen3-VL-8B-Instruct on 1 x Atlas 800I A3
 
 Model weights could be found [here](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct)
 

@@ -27,7 +27,6 @@ cd sgl-mindspore
 pip install -e .
 ```
 
-
 ## Run Model
 
 Current SGLang-MindSpore supports Qwen3 and DeepSeek V3/R1 models. This doc uses Qwen3-8B as an example.
@@ -100,7 +99,7 @@ python3 -m sglang.launch_server \
 
 ## Troubleshooting
 
-#### Debug Mode
+### Debug Mode
 
 Enable sglang debug logging by log-level argument.
 
@@ -146,6 +145,7 @@ export PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION=python  # to avoid protobuf binary
 ```
 
 ## Support
+
 For MindSpore-specific issues:
 
 - Refer to the [MindSpore documentation](https://www.mindspore.cn/)

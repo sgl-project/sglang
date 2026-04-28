@@ -39,16 +39,20 @@ SGLang uses Python's built-in [unittest](https://docs.python.org/3/library/unitt
 For detailed instructions on running tests and integrating them into CI, refer to [test/README.md](https://github.com/sgl-project/sglang/tree/main/test/README.md).
 
 If you need to use model which is not in `python/sglang/test/ascend/test_ascend_utils.py` list. Follow these steps:
+
 1. Register account and upload your model to [modelscope](https://modelscope.cn/models).
 2. Make sure your model is pre-cached on the CI server and is on the way "/data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}".
-If this is not the case, use following command on CI server:
-  ```bash
-  modelscope download
-  --model {your_model_repo}/{your_model}
-  --local_dir /data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}
-  ```
-  > Note: If you don’t have access to CI server, please ask maintainers (zl19940307@163.com) to download your model.
-4. Add model to ```python/sglang/test/ascend/test_ascend_utils.py``` (use docker ```"/root/.cache/modelscope/hub/models/{your_model_repo}/{your_model}"``` path).
+  If this is not the case, use following command on CI server:
+
+    ```bash
+    modelscope download
+    --model {your_model_repo}/{your_model}
+    --local_dir /data/ascend-ci-share-pkking-sglang/modelscope/hub/models/{your_model_repo}/{your_model}
+    ```
+
+    > Note: If you don’t have access to CI server, please ask maintainers (zl19940307@163.com) to download your model.
+
+3. Add model to ```python/sglang/test/ascend/test_ascend_utils.py``` (use docker ```"/root/.cache/modelscope/hub/models/{your_model_repo}/{your_model}"``` path).
 
 ## Write documentations
 
@@ -56,9 +60,10 @@ We recommend new contributors start from writing documentation, which helps you 
 For more details, please refer to [docs/README.md](https://github.com/sgl-project/sglang/tree/main/docs/README.md).
 
 ## Test the accuracy
+
 If your code changes the model output, please run the accuracy tests. A quick sanity check is the few-shot GSM8K.
 
-```
+```bash
 # Launch a server
 python3 -m sglang.launch_server --model Qwen/Qwen2-7B-Instruct
 
@@ -72,13 +77,16 @@ Also, do not rely on the "Latency/Output throughput" from this script, as it is 
 
 GSM8K is too easy for state-of-the-art models nowadays. Please try your own more challenging accuracy tests.
 You can find additional accuracy eval examples in:
+
 - [test_eval_accuracy_large.py](https://github.com/sgl-project/sglang/blob/main/test/registered/eval/test_eval_accuracy_large.py)
 - [test_gpt_oss_1gpu.py](https://github.com/sgl-project/sglang/blob/main/test/registered/core/test_gpt_oss_1gpu.py)
 
 ## Benchmark the speed
+
 Refer to [Benchmark and Profiling](../../developer_guide/benchmark_and_profiling.md).
 
 ## Requesting a review for merge
+
 You can follow the pull request merge process described in [MAINTAINER.md](https://github.com/sgl-project/sglang/blob/main/.github/MAINTAINER.md).
 You will need to work with the Merge Oncall, Codeowner, and other reviewers to get their approvals.
 Then your PR can be merged.
@@ -95,13 +103,13 @@ For CI to run on a pull request, it must have the "run-ci" label. Authorized use
 - `/tag-and-rerun-ci`: A single command that performs both `/tag-run-ci-label` and `/rerun-failed-ci`.
 - `/rerun-stage <stage-name>`: Reruns a specific test stage without waiting for its dependencies. This is useful when you want to quickly validate a fix for a specific test failure instead of waiting ~30 minutes for preceding stages to complete.
 
-If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here’s a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
+If you have permission, the [Slash Command Handler](https://github.com/sgl-project/sglang/actions/workflows/slash-command-handler.yml) will run your command and react with a 👍 to your comment. It may take up to a few minutes for the reaction to appear. Here's a usage [example](https://github.com/sgl-project/sglang/pull/14253#issuecomment-3599509302).
 
 To avoid spamming a PR with too many `/rerun-failed-ci` comments, you can also trigger the command by editing an existing comment and adding any suffix (e.g., `/rerun-failed-ci try again`).
 
 Example of rerunning a single test stage: `/rerun-stage unit-test-backend-4-gpu`.
 
-If you don’t have permission, please ask maintainers to trigger CI for you.
+If you don't have permission, please ask maintainers to trigger CI for you.
 
 ### CI rate limits
 
@@ -121,6 +129,7 @@ cool-down-minutes:
 Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob/main/.github/CI_PERMISSIONS.json) may have a per-user cooldown interval. In practice, we use the minimum of the workflow’s default window and the user-specific interval.
 
 ## Code style guidance
+
 - Avoid code duplication. If the same code snippet (more than five lines) appears multiple times, extract it into a shared function.
 - Minimize device synchronization. Reduce expensive CPU-GPU synchronization operations, such as `tensor.item()` or `tensor.cpu()`, whenever possible. Use vectorized code.
 - Prioritize extreme efficiency. SGLang is a runtime, and most of your code runs on the critical path for every request. Optimize all minor overheads as much as possible, especially in the model forward code.
@@ -137,6 +146,7 @@ Users listed in [CI_PERMISSIONS.json](https://github.com/sgl-project/sglang/blob
   - If you write multiple if/else blocks for new features, ensure the common path (e.g., NVIDIA hardware or the existing code path) is the first branch.
 
 ## How to update sgl-kernel
+
 Since sglang and sgl-kernel are separate Python packages, our current GitHub CI infrastructure does not support updating a kernel and using it immediately within the same pull request (PR).
 To add a new kernel or modify an existing one in the `sgl-kernel/` source tree, you must use multiple PRs.
 

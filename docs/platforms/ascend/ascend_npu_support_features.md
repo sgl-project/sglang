@@ -463,7 +463,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Other Params
 
-The following parameters are not supported because the third-party components that depend on are not compatible with the
+The following parameters are not supported because the third-party components they depend on are not compatible with the
 NPU, like Ktransformer, checkpoint-engine etc.
 
 | Argument                                                          | Defaults  | Options                   |

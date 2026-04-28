@@ -29,7 +29,7 @@ As the plugin interfaces mature and stabilize, in-tree hardware backends can be 
 
 The platform hierarchy uses a DeviceMixin pattern to share device operations between SRT (LLM inference) and Multimodal subsystems:
 
-```
+```text
 DeviceMixin (shared device identity + operations)
 ├── SRTPlatform(DeviceMixin)           # + graph runner, KV pool, …
 │   └── MySRTPlatform(SRTPlatform, MyDeviceMixin)   # OOT plugin
@@ -38,6 +38,7 @@ DeviceMixin (shared device identity + operations)
 ```
 
 Key design points:
+
 - **DeviceMixin** provides platform identity queries (`is_cuda()`, `is_npu()`, etc.) and device operations (`set_device()`, `get_device_name()`, etc.)
 - **SRTPlatform** adds SRT-specific factory methods, capability flags, and lifecycle hooks
 - OOT plugins implement a **device mixin** (vendor-specific operations) and compose it with **SRTPlatform** via multiple inheritance
@@ -50,7 +51,7 @@ Key design points:
 
 `current_platform` is a **lazy singleton** in `sglang.srt.platforms`. On first access it resolves the active platform through the following priority chain:
 
-```
+```text
 entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadata only)
   │
   ├─ SGLANG_PLATFORM set (front-loading filter):
@@ -77,7 +78,7 @@ entry_points("sglang.srt.platforms")  → Enumerate ALL plugins by name (metadat
 
 > **Note**: `load_plugins()` is idempotent (guarded by `_plugins_loaded` flag). In spawn'd subprocesses the flag resets, so plugins are correctly re-loaded.
 
-```
+```text
 load_plugins()
   ├── _get_excluded_dists()                       → compute dists to skip (via SGLANG_PLATFORM)
   ├── load_plugins_by_group("sglang.srt.plugins",     → discover entry_points, filter by SGLANG_PLUGINS
@@ -99,7 +100,7 @@ A hardware platform plugin registers an `SRTPlatform` subclass that tells SGLang
 
 **1. Create a minimal package:**
 
-```
+```text
 my_platform_plugin/
 ├── pyproject.toml
 └── my_platform_plugin/
@@ -271,7 +272,7 @@ General function plugins inject behavior into sglang **without requiring a custo
 
 **1. Create a minimal package:**
 
-```
+```text
 my_general_plugin/
 ├── pyproject.toml
 └── my_general_plugin/

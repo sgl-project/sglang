@@ -10,15 +10,15 @@ This document provides a list of commonly used environment variables and aims to
 | `SGLANG_NPU_USE_MLAPO`                           | Adopts the `MLAPO` fusion operator in attention <br/> preprocessing stage of the MLA model.                                                                 | `false`       |
 | `SGLANG_USE_FIA_NZ`                              | Reshapes KV Cache for FIA NZ format.<br/> `SGLANG_USE_FIA_NZ` must be enabled with `SGLANG_NPU_USE_MLAPO`                                                   | `false`       |
 | `SGLANG_NPU_USE_MULTI_STREAM`                    | Enable dual-stream computation of shared experts <br/> and routing experts in DeepSeek models.<br/> Enable dual-stream computation in DeepSeek NSA Indexer. | `false`       |
-| `SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT`           | Disable cast model weight tensor to a specific NPU <br/> ACL format.                                                                                        | `false`       |
+| `SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT`           | Disable casting model weight tensor to a specific NPU <br/> ACL format.                                                                                        | `false`       |
 | `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK` | The maximum number of dispatched tokens on each rank.                                                                                                       | `128`         |
 
 ## Used in DeepEP Ascend
 
 | Environment Variable                      | Description                                                                                                            | Default Value |
 |-------------------------------------------|------------------------------------------------------------------------------------------------------------------------|---------------|
-| `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS` | Enable ant-moving function in dispatch stage. Indicates <br/> the number of tokens transmitted per round on each rank. | `8192`        |
-| `DEEPEP_NORMAL_LONG_SEQ_ROUND`            | Enable ant-moving function in dispatch stage. Indicates <br/> the number of rounds transmitted on each rank.           | `1`           |
+| `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS` | Enable anti-moving function in dispatch stage. Indicates <br/> the number of tokens transmitted per round on each rank. | `8192`        |
+| `DEEPEP_NORMAL_LONG_SEQ_ROUND`            | Enable anti-moving function in dispatch stage. Indicates <br/> the number of rounds transmitted on each rank.           | `1`           |
 | `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ`   | Enable ant-moving function in combine stage. <br/> The value `0` means disabled.                                       | `0`           |
 | `MOE_ENABLE_TOPK_NEG_ONE`                 | Needs to be enabled when the expert ID to be processed by <br/> DEEPEP contains -1.                                    | `0`           |
 | `DEEP_NORMAL_MODE_USE_INT8_QUANT`         | Quantizes x to int8 and returns (tensor, scales) in dispatch operator.                                                 | `0`           |
@@ -27,7 +27,7 @@ This document provides a list of commonly used environment variables and aims to
 
 | Environment Variable     | Description                                                                                                                                                                                                                                                                | Default Value |
 |--------------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|---------------|
-| `TASK_QUEUE_ENABLE`      | Used to control the optimization level of the dispatch queue<br/> about the task_queue operator. [Detail](https://www.hiascend.com/document/detail/zh/Pytorch/730/comref/Envvariables/docs/zh/environment_variable_reference/TASK_QUEUE_ENABLE.md)                         | `1`           |
+| `TASK_QUEUE_ENABLE`      | Used to control the optimization level of the dispatch queue<br/> for the task_queue operator. [Detail](https://www.hiascend.com/document/detail/zh/Pytorch/730/comref/Envvariables/docs/zh/environment_variable_reference/TASK_QUEUE_ENABLE.md)                         | `1`           |
 | `INF_NAN_MODE_ENABLE`    | Controls whether the chip uses saturation mode or INF_NAN mode. [Detail](https://www.hiascend.com/document/detail/zh/CANNCommunityEdition/800alpha001/apiref/envref/envref_07_0056.html)                                                                                   | `1`           |
 | `STREAMS_PER_DEVICE`     | Configures the maximum number of streams for the stream pool. [Detail](https://www.hiascend.com/document/detail/zh/Pytorch/720/comref/Envvariables/Envir_041.html)                                                                                                         | `32`          |
 | `PYTORCH_NPU_ALLOC_CONF` | Controls the behavior of the cache allocator. <br/>This variable changes memory usage and may cause performance fluctuations. [Detail](https://www.hiascend.com/document/detail/zh/Pytorch/700/comref/Envvariables/Envir_012.html)                                         |               |
