@@ -580,7 +580,9 @@ class EagleDraftWorker(BaseDraftWorker):
             )
 
         if forward_batch.spec_info.accept_length is None:
-            forward_batch.spec_info.accept_length = batch_result.accept_lens
+            # `batch_result.accept_lens` includes the bonus token; spec_info.accept_length
+            # is drafts-only by convention, so strip the bonus.
+            forward_batch.spec_info.accept_length = batch_result.accept_lens - 1
 
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (

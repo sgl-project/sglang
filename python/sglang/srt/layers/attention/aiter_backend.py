@@ -946,7 +946,8 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 )
                 kv_indices = kv_indices.to(torch.int64)
-                draft_max_extend_len = torch.max(spec_info.accept_length).item()
+                # accept_length is drafts-only; extend QO length per req is +1 (bonus token).
+                draft_max_extend_len = torch.max(spec_info.accept_length).item() + 1
 
                 self.forward_metadata = ForwardMetadata(
                     kv_indptr,
@@ -1959,9 +1960,10 @@ class AiterAttnBackend(AttentionBackend):
             # EAGLE V1: Uses spec_info.accept_length
             num_tokens_per_bs = self.speculative_num_steps + 1
             seq_lens = seq_lens[:bs]
-            accept_lens = spec_info.accept_length[:bs]
+            # accept_length is drafts-only; extend QO length per req is +1 (bonus token).
+            extend_lens = spec_info.accept_length[:bs] + 1
             qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+            qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices

@@ -439,11 +439,12 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             ):
                 buffers.hidden_states[:num_tokens].copy_(ret.hidden_states[:num_tokens])
 
+            # accept_length is drafts-only; the last accepted draft sits at index
+            # `accept_length` within the (current_token + drafts) slot range.
             select_index = (
                 torch.arange(bs, device=self.model_runner.device)
                 * (self.speculative_num_draft_tokens + self.step)
                 + buffers.accept_length[:bs]
-                - 1
                 + self.step
             )
 
@@ -452,9 +453,11 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
 
             if self.next_cuda_graph_runner is not None:
                 next_buffers = self.next_cuda_graph_runner.buffers
+                # rejected drafts = proposed drafts - accepted drafts.
+                # speculative_num_draft_tokens includes the current-token slot, so -1.
                 padding_lens = (
-                    self.speculative_num_draft_tokens - buffers.accept_length[:bs]
-                )
+                    self.speculative_num_draft_tokens - 1
+                ) - buffers.accept_length[:bs]
                 assign_new_state_triton(
                     ret.topk_index,
                     buffers.input_ids,
@@ -704,8 +707,10 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self.cuda_graph_buffers["out_cache_loc"].zero_()
         self.cuda_graph_buffers["swa_out_cache_loc"].zero_()
         self.cuda_graph_buffers["positions"].zero_()
+        # `batch_result.accept_lens` is drafts + bonus; the buffer keeps the
+        # drafts-only convention that matches `spec_info.accept_length`.
         self.cuda_graph_buffers["accept_length"][: forward_batch.batch_size].copy_(
-            batch_result.accept_lens
+            batch_result.accept_lens - 1
         )
 
     def get_runner(self, step):

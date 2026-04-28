@@ -736,14 +736,16 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         batch.return_hidden_states = False
 
         self.capture_hidden_mode = CaptureHiddenMode.LAST
-        self.accept_length.add_(1)
+        # `self.accept_length` stays drafts-only; tree extend's qo length is
+        # accepted_drafts + 1 trailing/bonus token per req (out-of-place add).
+        extend_lens = self.accept_length + 1
         self.positions = torch.empty_like(batch.input_ids, dtype=torch.long)
-        self.verified_id = torch.empty_like(self.accept_length, dtype=torch.int32)
+        self.verified_id = torch.empty_like(extend_lens, dtype=torch.int32)
 
         create_extend_after_decode_spec_info[(len(batch.seq_lens),)](
             batch.input_ids,
             batch.seq_lens,
-            self.accept_length,
+            extend_lens,
             self.positions,
             self.verified_id,
             next_power_of_2(max(speculative_num_steps + 1, len(batch.seq_lens))),
@@ -759,7 +761,8 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
         device = req_pool_indices.device
         bs = self.accept_length.numel()
         qo_indptr = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
-        qo_indptr[1:] = torch.cumsum(self.accept_length, dim=0)
+        # Each req contributes accepted_drafts + 1 trailing/bonus token to the qo.
+        qo_indptr[1:] = torch.cumsum(self.accept_length + 1, dim=0)
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=device)
         cum_kv_seq_len[1:] = torch.cumsum(paged_kernel_lens, dim=0)
 

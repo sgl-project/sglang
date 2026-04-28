@@ -453,9 +453,10 @@ class EagleVerifyInputV2Mixin:
                 spec_steps=self.spec_steps,
             )
 
-        # Include the bonus token
-        accept_length.add_(1)
-        return predict, accept_length, accept_index
+        # `accept_length` stays drafts-only inside this function; the returned
+        # tensor includes the trailing/bonus token via out-of-place +1 so the
+        # name no longer flips semantics mid-function (naming doc C2).
+        return predict, accept_length + 1, accept_index
 
 
 @triton.jit
