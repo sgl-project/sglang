@@ -46,7 +46,7 @@ export const Ling261TDeployment = ({ urlStatePrefix = 'ling-26-1t' }) => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
-  
+
   useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   // Detect dark mode

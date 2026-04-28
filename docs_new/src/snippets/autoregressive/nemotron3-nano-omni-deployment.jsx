@@ -120,8 +120,8 @@ export const Nemotron3NanoOmniDeployment = ({ urlStatePrefix = 'nemotron3-nano-o
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
-  
-  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix }); 
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

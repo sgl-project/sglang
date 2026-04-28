@@ -54,7 +54,7 @@ export const Ling26FlashDeployment = ({ urlStatePrefix = 'ling-26-flash' }) => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
-  
+
   useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   // Detect dark mode
