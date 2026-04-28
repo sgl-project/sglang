@@ -36,6 +36,7 @@ from sglang.srt.ug.runtime import (
 from sglang.srt.ug.srt_executor import (
     UGSRTRequestBoundaryExecutor,
     UGSRTSchedulerExecutor,
+    UGSRTSchedulerExecutorError,
 )
 
 __all__ = [
@@ -65,6 +66,7 @@ __all__ = [
     "UGSessionRuntime",
     "UGSRTRequestBoundaryExecutor",
     "UGSRTSchedulerExecutor",
+    "UGSRTSchedulerExecutorError",
     "UGVelocityRequest",
     "UGVelocityResponse",
     "create_bagel_ug_model_adapter",

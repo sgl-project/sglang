@@ -49,6 +49,7 @@ flowchart LR
 - `UGSessionRuntime` 新增可插拔 SRT request executor 边界；`SessionController.create_req(...)` 产出的真实 SRT `Req` 会在标记 `FINISH_LENGTH(0)` 前交给 executor。真权重脚本输出 `executor_events=[('u_prefill', '<session>:u1', 8), ('append_image', '<session>:u2', 10)]`、`srt_executed_request_count=2`、`srt_last_executed_state='append_image'`。这不是完整 scheduler/model-runner forward，但已经把 U prefill/append 的 materialized SRT Req 推到了可替换的执行边界。
 - `python/sglang/srt/ug/srt_executor.py` 新增最小 SRT scheduler handoff：`UGSRTSchedulerExecutor` 复用注入 scheduler 的 `session_controller`，对 materialized UG `Req` 调 `init_req_max_new_tokens(...)` 和 `_add_request_to_queue(...)`。单测证明 scheduler 在入队瞬间拿到的 `Req.finished_reason is None`，完成动作必须由 scheduler 侧发生，UG runtime 不会把 queued request 自己标成 finished。这个点明确了下一步真正接 scheduler 时需要“enqueue + run/complete + continue UG 状态机”的同步边界。
 - 改动后真权重 U-G-U smoke 仍通过：`CUDA_VISIBLE_DEVICES=0`、`/data/models/BAGEL-7B-MoT`、`num_inference_steps=4` 输出 `output_shape=(1, 32, 32, 3)`、`latents_shape=(4, 64)`、`trajectory_latents_shape=(3, 4, 64)`，默认 executor 为 `UGSRTRequestBoundaryExecutor`，事件为 `u_prefill -> append_image`，关闭 session 后 `srt_mm_features_released=True`。
+- `UGSRTSchedulerExecutor` 现在从 handoff-only 前进到同步小闭环：入队后复用 SRT scheduler 的 `get_next_batch_to_run -> run_batch -> process_batch_result`，等待 prefill-only `Req` 真实 finished，再做一次 idle cleanup 清掉 `last_batch`，然后才允许 UG runtime 继续创建下一段 session request。新增 fake scheduler 单测验证 `u1/u2` 都是在入队时未完成、各自经过一次 `run_batch/process_batch_result` 后完成，`sync_step_count=2`，pending queue 和 `last_batch` 都被清空。
 - `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake official model 验证 `_forward_flow` 只调用一次、CFG interval 规则一致、timestep 会扩展到 latent batch。
 - `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake official inferencer 验证 U-G-U 闭环：同一 session prefill 一次、denoise 多步复用 prepared context、BAGEL decode latents 到 image、append image 后继续 U decode，并且追加新 U 输入后能进入下一轮 G marker。
 - `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake loader symbols 验证真 loader 的官方构造形状和单卡 device-map pinning，不需要真实 7B 权重。
@@ -57,5 +58,5 @@ flowchart LR
 ## 仍未解决
 
 - 真权重已证明同 session 的 `U -> G 多步 -> append image -> U text` 控制流，也已让 U prefill / append image 进入 SRT `SessionController` 的 request 生命周期和一个可替换的 SRT request executor 边界；但 U forward 本身还没有由真实 SRT scheduler/model runner 执行。
-- 只把 `Req` enqueue 到真实 scheduler 不足以支撑同步的 U-G-U pipeline：如果 `u1` 未完成就创建 `u2`，`SessionController` 会拒绝“追加到未完成请求”。下一步必须在 SRT-owned 入口里让 scheduler 跑完 prefill-only request，再驱动 UG 状态机进入 G denoise/append。
+- 只把 `Req` enqueue 到真实 scheduler 不足以支撑同步的 U-G-U pipeline：如果 `u1` 未完成就创建 `u2`，`SessionController` 会拒绝“追加到未完成请求”。这个风险已在 fake scheduler 单测里固定；当前同步 executor 只允许 idle scheduler，真正多请求 batching 需要后续单独设计。
 - CFG/text/image 三份上下文现在仍在 BAGEL adapter 内用官方 `NaiveCache` 表达；还没有落到 SRT paged KV allocator 的真实 page/slot 生命周期。

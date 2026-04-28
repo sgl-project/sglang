@@ -139,15 +139,19 @@ class TestUGDiffusionPipeline(unittest.TestCase):
         session = result.extra["ug_contexts"].full.session
         self.assertIs(bridge.runtime.session_controller, scheduler.session_controller)
         self.assertEqual(
-            [req.rid for req in scheduler.waiting_queue],
+            [req.rid for req in scheduler.enqueued_requests],
             [f"{session.session_id}:u1", f"{session.session_id}:u2"],
         )
         self.assertEqual(
             scheduler.finished_reason_at_enqueue,
             [None, None],
         )
-        self.assertTrue(all(req.finished() for req in scheduler.waiting_queue))
+        self.assertTrue(all(req.finished() for req in scheduler.enqueued_requests))
         self.assertEqual(scheduler.init_req_max_new_tokens_calls, 2)
+        self.assertEqual(scheduler.run_batch_calls, 2)
+        self.assertEqual(scheduler.process_batch_result_calls, 2)
+        self.assertEqual(scheduler.pending_queue, [])
+        self.assertIsNone(scheduler.last_batch)
         self.assertEqual(
             bridge.runtime.srt_request_executor.events,
             [
@@ -155,6 +159,7 @@ class TestUGDiffusionPipeline(unittest.TestCase):
                 ("append_image", f"{session.session_id}:u2", 5),
             ],
         )
+        self.assertEqual(bridge.runtime.srt_request_executor.sync_step_count, 2)
         counters = bridge.runtime.get_debug_counters(session)
         self.assertEqual(counters["srt_executed_request_count"], 2)
         self.assertEqual(counters["srt_last_executed_state"], "append_image")
@@ -311,9 +316,15 @@ class FakeTreeCache:
 class RecordingSRTScheduler:
     def __init__(self):
         self.session_controller = SessionController(FakeTreeCache())
-        self.waiting_queue = []
+        self.enqueued_requests = []
+        self.pending_queue = []
         self.finished_reason_at_enqueue = []
         self.init_req_max_new_tokens_calls = 0
+        self.run_batch_calls = 0
+        self.process_batch_result_calls = 0
+        self.idle_calls = 0
+        self.cur_batch = None
+        self.last_batch = None
 
     def init_req_max_new_tokens(self, req):
         self.init_req_max_new_tokens_calls += 1
@@ -321,8 +332,51 @@ class RecordingSRTScheduler:
 
     def _add_request_to_queue(self, req):
         self.finished_reason_at_enqueue.append(req.finished_reason)
-        self.waiting_queue.append(req)
-        req.check_finished(new_accepted_len=0)
+        self.enqueued_requests.append(req)
+        self.pending_queue.append(req)
+
+    def is_fully_idle(self):
+        return not self.pending_queue and self.last_batch is None
+
+    def get_next_batch_to_run(self):
+        if self.last_batch is not None:
+            self.last_batch = None
+            return None
+        if not self.pending_queue:
+            return None
+        return RecordingSRTBatch(self.pending_queue.pop(0))
+
+    def run_batch(self, batch):
+        self.run_batch_calls += 1
+        self.assert_unfinished_batch(batch)
+        return RecordingSRTBatchResult()
+
+    def process_batch_result(self, batch, result):
+        del result
+        self.process_batch_result_calls += 1
+        for req in batch.reqs:
+            req.check_finished(new_accepted_len=0)
+
+    def on_idle(self):
+        self.idle_calls += 1
+
+    @staticmethod
+    def assert_unfinished_batch(batch):
+        for req in batch.reqs:
+            if req.finished():
+                raise AssertionError(f"Request {req.rid} finished before run_batch")
+
+
+class RecordingSRTBatch:
+    def __init__(self, req):
+        self.reqs = [req]
+
+    def __bool__(self):
+        return True
+
+
+class RecordingSRTBatchResult:
+    pass
 
 
 if __name__ == "__main__":
