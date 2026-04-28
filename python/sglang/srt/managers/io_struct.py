@@ -1915,7 +1915,7 @@ class MemoryMetrics:
 class SpeculativeMetrics:
     """Speculative decoding metrics."""
 
-    num_accepted_drafts: float = field(
+    accept_length: float = field(
         metadata={
             "metric": (
                 "gauge",
