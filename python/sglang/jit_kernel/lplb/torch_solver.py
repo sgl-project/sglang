@@ -11,6 +11,7 @@ get the fused kernel automatically without code changes.
 """
 
 import logging
+from typing import Optional
 
 import torch
 
@@ -24,6 +25,18 @@ _FUSED_SOLVE_IPM = None  # type: ignore[assignment]
 _FUSED_WARMUP = None  # type: ignore[assignment]
 _FUSED_ASSERT_FITS = None  # type: ignore[assignment]
 _FUSED_REJECTED_SHAPES: set = set()  # (nc, nv) shapes that don't fit / failed
+
+_REQUIRE_FUSED_CACHED: Optional[bool] = None
+
+
+def _require_fused() -> bool:
+    """Whether --lplb-require-fused is set; read once and cached at first call."""
+    global _REQUIRE_FUSED_CACHED
+    if _REQUIRE_FUSED_CACHED is None:
+        from sglang.srt.server_args import get_global_server_args
+
+        _REQUIRE_FUSED_CACHED = bool(get_global_server_args().lplb_require_fused)
+    return _REQUIRE_FUSED_CACHED
 
 
 def _init_fused_backend() -> None:
@@ -132,11 +145,38 @@ def solve_ipm(
         try:
             return _FUSED_SOLVE_IPM(A, b, c, num_iters=num_iters)
         except Exception as e:  # pragma: no cover
+            if _require_fused():
+                raise RuntimeError(
+                    f"--lplb-require-fused is set but the fused solver raised "
+                    f"at runtime for (NC={nc}, NV={nv}): {e!r}."
+                ) from e
             logger.warning(
                 f"LPLB fused solver: runtime failure for (NC={nc}, NV={nv}): {e}. "
                 "Falling back to torch IPM for this shape."
             )
             _FUSED_REJECTED_SHAPES.add((nc, nv))
+
+    if _require_fused():
+        if not _FUSED_AVAILABLE:
+            reason = (
+                "fused backend unavailable (no CUDA, GPU SM < 9.0, or "
+                "nvmath-python[cu12-dx] / numba-cuda not importable)"
+            )
+        elif not A.is_cuda:
+            reason = f"input A is on {A.device}, not CUDA"
+        elif A.dtype != torch.float32:
+            reason = f"input A dtype is {A.dtype}, not torch.float32"
+        elif (nc, nv) in _FUSED_REJECTED_SHAPES:
+            reason = (
+                f"shape (NC={nc}, NV={nv}) was rejected earlier "
+                "(exceeded shmem budget or failed at runtime)"
+            )
+        else:
+            reason = "dispatch predicate fell through unexpectedly"
+        raise RuntimeError(
+            f"--lplb-require-fused is set but the fused solver was skipped: "
+            f"{reason}. (NC={nc}, NV={nv})."
+        )
 
     return _solve_ipm_torch(A, b, c, num_iters=num_iters)
 
