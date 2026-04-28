@@ -216,7 +216,7 @@ class EagleDraftInputV2Mixin:
         extend_num_tokens = len(batch.seq_lens) * num_draft_tokens
 
         batch.spec_info = self
-        batch.input_ids = predict
+        batch.input_ids = predict.long()
         batch.seq_lens = batch.seq_lens + num_draft_tokens
         batch.seq_lens_cpu = batch.seq_lens_cpu + num_draft_tokens
         batch.seq_lens_sum += extend_num_tokens
