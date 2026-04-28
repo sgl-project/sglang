@@ -68,7 +68,6 @@ def _build_mamba2_cache_params(config):
     )
 
 
-
 class NemotronHConfig(PretrainedConfig):
     r"""
     This is the configuration class to store the configuration of a
