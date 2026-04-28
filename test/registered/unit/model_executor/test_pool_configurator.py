@@ -80,6 +80,7 @@ def _make_model_runner(
     sa = SimpleNamespace()
     sa.swa_full_tokens_ratio = swa_full_tokens_ratio
     sa.page_size = page_size
+    sa.int8_kv_cache = False
     mr.server_args = sa
 
     spec = MagicMock()
@@ -254,6 +255,37 @@ class TestHybridSWAConfigurator(unittest.TestCase):
             config.swa_max_total_num_tokens,
             int(config.full_max_total_num_tokens * 0.5),
         )
+
+
+class TestInt8KVConfigurator(unittest.TestCase):
+    """INT8 KV cache uses INT8 storage plus scale/zp metadata for sizing."""
+
+    def test_int8_cell_size_used_for_capacity(self):
+        mr = _make_model_runner(
+            num_kv_heads=4,
+            head_dim=64,
+            v_head_dim=80,
+            num_layers=32,
+        )
+        mr.server_args.int8_kv_cache = True
+        available = 10_000_000
+
+        with mock_cpu_env():
+            from sglang.srt.mem_cache.memory_pool_int8kv import INT8MHATokenToKVPool
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+            config = cfg.calculate_pool_sizes(available, mr.server_args.page_size)
+            expected_cell = INT8MHATokenToKVPool.get_bytes_per_token(
+                4,
+                64,
+                32,
+                v_head_dim=80,
+            )
+
+        self.assertEqual(config.max_total_num_tokens, available // expected_cell)
 
 
 class TestAllSWAConfigurator(unittest.TestCase):

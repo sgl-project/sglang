@@ -27,6 +27,7 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
 )
+from sglang.srt.mem_cache.memory_pool_int8kv import INT8MHATokenToKVPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.utils.common import (
     get_available_gpu_memory,
@@ -52,7 +53,6 @@ _is_hip = is_hip()
 
 
 class ModelRunnerKVCacheMixin:
-
     def _profile_available_bytes(self: ModelRunner, pre_model_load_memory: int) -> int:
         post_model_load_memory = get_available_gpu_memory(
             self.device,
@@ -165,9 +165,9 @@ class ModelRunnerKVCacheMixin:
         # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
         # Note: rope dimension is stored in original dtype (bf16), not quantized to fp8
         if kv_cache_dtype == torch.float8_e4m3fn:
-            assert (
-                kv_lora_rank % quant_block_size == 0
-            ), f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+            assert kv_lora_rank % quant_block_size == 0, (
+                f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+            )
 
             return (
                 kv_lora_rank
@@ -191,9 +191,29 @@ class ModelRunnerKVCacheMixin:
 
         return MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO + additional_ratio
 
+    def _validate_int8_kv_cache_config(self: ModelRunner):
+        if not getattr(self.server_args, "int8_kv_cache", False):
+            return
+
+        if self.use_mla_backend:
+            raise ValueError("INT8 KV cache currently supports MHA only.")
+        if self.server_args.enable_double_sparsity:
+            raise ValueError(
+                "INT8 KV cache is incompatible with --enable-double-sparsity."
+            )
+        if self.mambaish_config is not None:
+            raise ValueError(
+                "INT8 KV cache phase-1 is not implemented for hybrid linear/GDN models."
+            )
+        if self.is_hybrid_swa:
+            raise ValueError(
+                "INT8 KV cache phase-1 does not support hybrid SWA memory pools."
+            )
+
     def _init_pools(self: ModelRunner):
         """Initialize the memory pools."""
         max_num_reqs = self.max_running_requests
+        use_int8_kv_cache = getattr(self.server_args, "int8_kv_cache", False)
 
         # Initialize req_to_token_pool
         if self.req_to_token_pool is None:
@@ -527,7 +547,29 @@ class ModelRunnerKVCacheMixin:
                     **extra_args,
                 )
             else:
-                if is_float4_e2m1fn_x2(self.kv_cache_dtype):
+                if use_int8_kv_cache:
+                    self.token_to_kv_pool = INT8MHATokenToKVPool(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        head_num=self.model_config.get_num_kv_heads(
+                            get_attention_tp_size()
+                        ),
+                        head_dim=self.model_config.head_dim,
+                        v_head_dim=getattr(
+                            self.model_config, "v_head_dim", self.model_config.head_dim
+                        ),
+                        layer_num=self.num_effective_layers,
+                        device=self.device,
+                        enable_memory_saver=self.server_args.enable_memory_saver,
+                        start_layer=self.start_layer,
+                        end_layer=self.end_layer,
+                        enable_alt_stream=not self.server_args.enable_pdmux,
+                        enable_kv_cache_copy=(
+                            self.server_args.speculative_algorithm is not None
+                        ),
+                    )
+                elif is_float4_e2m1fn_x2(self.kv_cache_dtype):
                     self.token_to_kv_pool = MHATokenToKVPoolFP4(
                         self.max_total_num_tokens,
                         page_size=self.page_size,
@@ -567,6 +609,32 @@ class ModelRunnerKVCacheMixin:
                             self.server_args.speculative_algorithm is not None
                         ),
                     )
+
+        if use_int8_kv_cache:
+            base_cell = INT8MHATokenToKVPool.get_baseline_bytes_per_token(
+                self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                self.model_config.head_dim,
+                self.num_effective_layers,
+                self.kv_cache_dtype,
+                v_head_dim=getattr(
+                    self.model_config, "v_head_dim", self.model_config.head_dim
+                ),
+            )
+            int8_cell = INT8MHATokenToKVPool.get_bytes_per_token(
+                self.model_config.get_num_kv_heads(get_attention_tp_size()),
+                self.model_config.head_dim,
+                self.num_effective_layers,
+                v_head_dim=getattr(
+                    self.model_config, "v_head_dim", self.model_config.head_dim
+                ),
+            )
+            logger.info(
+                "[INT8 KV] cell_size: baseline=%d B, int8=%d B, compression=%.2fx, max_total_tokens=%d",
+                base_cell,
+                int8_cell,
+                base_cell / int8_cell,
+                self.max_total_num_tokens,
+            )
 
         # Initialize token_to_kv_pool_allocator
         need_sort = self.server_args.disaggregation_mode in ("decode", "prefill")
@@ -730,6 +798,7 @@ class ModelRunnerKVCacheMixin:
         self: ModelRunner, pre_model_load_memory: int
     ) -> MemoryPoolConfig:
         """Profile GPU memory and resolve all pool parameters into a config."""
+        self._validate_int8_kv_cache_config()
         from sglang.srt.model_executor.pool_configurator import (
             create_memory_pool_configurator,
         )
@@ -755,9 +824,9 @@ class ModelRunnerKVCacheMixin:
 
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
-            assert (
-                self.memory_pool_config is not None
-            ), "Draft worker requires memory_pool_config"
+            assert self.memory_pool_config is not None, (
+                "Draft worker requires memory_pool_config"
+            )
         else:
             self.memory_pool_config = self._resolve_memory_pool_config(
                 pre_model_load_memory

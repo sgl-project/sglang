@@ -22,6 +22,7 @@ import torch
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.mem_cache.memory_pool_int8kv import INT8MHATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
 
 
@@ -149,14 +150,26 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
                 cell_size += indexer_size_per_token * num_layers * element_size
         else:
-            cell_size = (
-                model_config.get_num_kv_heads(tp_size)
-                * (model_config.head_dim + model_config.v_head_dim)
-                * num_layers
-                * kv_size
-            )
+            if getattr(mr.server_args, "int8_kv_cache", False):
+                cell_size = INT8MHATokenToKVPool.get_bytes_per_token(
+                    model_config.get_num_kv_heads(tp_size),
+                    model_config.head_dim,
+                    num_layers,
+                    v_head_dim=getattr(
+                        model_config, "v_head_dim", model_config.head_dim
+                    ),
+                )
+            else:
+                cell_size = (
+                    model_config.get_num_kv_heads(tp_size)
+                    * (model_config.head_dim + model_config.v_head_dim)
+                    * num_layers
+                    * kv_size
+                )
 
-            if is_float4_e2m1fn_x2(kv_cache_dtype):
+            if not getattr(
+                mr.server_args, "int8_kv_cache", False
+            ) and is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
                 scale_block_size = 16
                 n = model_config.get_num_kv_heads(tp_size)
@@ -196,9 +209,9 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
 
         self._full_layers_num = len(model_config.full_attention_layer_ids)
         self._swa_layers_num = len(model_config.swa_attention_layer_ids)
-        assert (
-            self._swa_layers_num > 0
-        ), "Hybrid SWA model must have at least one SWA layer"
+        assert self._swa_layers_num > 0, (
+            "Hybrid SWA model must have at least one SWA layer"
+        )
 
         self._swa_full_tokens_ratio = mr.server_args.swa_full_tokens_ratio
 
