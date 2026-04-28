@@ -29,6 +29,35 @@ logger = logging.getLogger(__name__)
 _global_lplb_solvers: dict[int, "LPLBSolver"] = {}
 
 
+# LP dispatch requires every EP rank to call solver.solve() on every forward
+# pass (including empty-topk ranks under DP-attention) — the all-reduce inside
+# would otherwise hang. Only the DeepSeek-v2 family and its subclasses route
+# empty-rank paths through solver.solve(); other MoE families would deadlock.
+_LPLB_SUPPORTED_MODEL_ARCHS: frozenset[str] = frozenset(
+    {
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        "MistralLarge3ForCausalLM",
+        "MistralLarge3ForCausalLMEagle",
+        "Glm4MoeLiteForCausalLM",
+        "GlmMoeDsaForCausalLM",
+    }
+)
+
+
+def assert_lplb_supported_model(architecture: str) -> None:
+    if architecture not in _LPLB_SUPPORTED_MODEL_ARCHS:
+        supported = ", ".join(sorted(_LPLB_SUPPORTED_MODEL_ARCHS))
+        raise NotImplementedError(
+            f"{architecture} does not support --ep-dispatch-algorithm lp. "
+            f"Validated targets: {supported}. Other MoE families have "
+            "empty-token early returns that don't participate in the EP "
+            "all-reduce inside LPLBSolver.solve(), which would deadlock "
+            "under DP-attention."
+        )
+
+
 def get_global_lplb_solver(layer_id: int) -> Optional["LPLBSolver"]:
     return _global_lplb_solvers.get(layer_id)
 
@@ -78,6 +107,14 @@ class LPLBSolver:
         self.num_logical = log2phy.shape[0]
         self.max_copies = log2phy.shape[1]
         self.num_phy = phy2log.shape[0]
+        # B1/B2 GPU-assignment matrices below assume each rank owns a
+        # contiguous block of num_phy // num_gpus physical experts.
+        if self.num_phy % num_gpus != 0:
+            raise ValueError(
+                f"LPLBSolver requires num_phy ({self.num_phy}) to be divisible "
+                f"by num_gpus ({num_gpus}); per-rank-contiguous ownership is "
+                "currently the only supported allocation."
+            )
         num_phy_per_gpu = self.num_phy // num_gpus
 
         # Count copies per logical expert
