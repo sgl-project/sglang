@@ -1367,6 +1367,7 @@ class Scheduler(
         abort if over SGLANG_ELASTIC_EP_MAX_RETRACTION), rebalance experts,
         mark snapshot handled."""
         self.result_queue.clear()
+        ElasticEPStateManager.instance().clear_pending_snapshots()
         torch.cuda.synchronize()
 
         if self.running_batch is not None and not self.running_batch.is_empty():

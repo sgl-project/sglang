@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -14,33 +14,46 @@ class ElasticEPState:
     active_ranks: Optional[torch.Tensor]
     active_ranks_cpu: Optional[torch.Tensor]
     last_handled_active_ranks_cpu: Optional[torch.Tensor]
-    staging_active_ranks_cpu: Optional[torch.Tensor]
+    staging_active_ranks_cpu_slots: Optional[tuple[torch.Tensor, torch.Tensor]]
+    next_staging_slot: int = 0
+    pending_staging_slots: list[int] = field(default_factory=list)
 
     def submit_active_snapshot(self) -> None:
         """Enqueue an async copy of active_ranks into the pinned staging
         buffer. No explicit event is recorded; the scheduler relies on
         copy_done.synchronize() (same forward_stream, recorded strictly
         later) to act as the barrier before reading the staging buffer."""
-        if self.active_ranks is None or self.staging_active_ranks_cpu is None:
+        if self.active_ranks is None or self.staging_active_ranks_cpu_slots is None:
             return
 
+        slot = self.next_staging_slot
+        self.next_staging_slot ^= 1
+        staging_active_ranks_cpu = self.staging_active_ranks_cpu_slots[slot]
+        self.pending_staging_slots.append(slot)
+        assert len(self.pending_staging_slots) <= 2
+
         if self.active_ranks.device.type == "cuda":
-            self.staging_active_ranks_cpu.copy_(self.active_ranks, non_blocking=True)
+            staging_active_ranks_cpu.copy_(self.active_ranks, non_blocking=True)
         else:
             # CPU backend: fully synchronous, no stream involved.
-            self.staging_active_ranks_cpu.copy_(self.active_ranks)
+            staging_active_ranks_cpu.copy_(self.active_ranks)
 
     def is_stale_snapshot(self) -> bool:
-        """Publish the most recently submitted staging snapshot into
+        """Publish the oldest unconsumed staging snapshot into
         active_ranks_cpu (so downstream readers like EPLB rebalance see
         the current state), then return True iff a new fault has appeared
         since the last mark_snapshot_handled. Caller must have already
         synchronized the stream the submit was enqueued on (e.g. via
         copy_done.synchronize) so staging_active_ranks_cpu is known to
         hold the latest snapshot."""
-        if self.staging_active_ranks_cpu is None:
+        if (
+            not self.pending_staging_slots
+            or self.staging_active_ranks_cpu_slots is None
+        ):
             return False
-        self.active_ranks_cpu.copy_(self.staging_active_ranks_cpu)
+        slot = self.pending_staging_slots.pop(0)
+        snapshot = self.staging_active_ranks_cpu_slots[slot]
+        self.active_ranks_cpu.copy_(snapshot)
         return not torch.equal(
             self.active_ranks_cpu, self.last_handled_active_ranks_cpu
         )
@@ -48,10 +61,11 @@ class ElasticEPState:
     def mark_snapshot_handled(self) -> None:
         """Snap last_handled to the current staging value so subsequent
         is_stale_snapshot() calls only flag *new* faults."""
-        if self.staging_active_ranks_cpu is not None:
-            self.last_handled_active_ranks_cpu.copy_(self.staging_active_ranks_cpu)
-        elif self.active_ranks_cpu is not None:
+        if self.active_ranks_cpu is not None:
             self.last_handled_active_ranks_cpu.copy_(self.active_ranks_cpu)
+
+    def clear_pending_snapshots(self) -> None:
+        self.pending_staging_slots.clear()
 
 
 class ElasticEPStateManager:
@@ -88,15 +102,19 @@ class ElasticEPStateManager:
         # Initialize staging to the healthy initial state so is_stale_snapshot()
         # before the first submit returns False (no false positive on startup).
         if active.device.type == "cuda":
-            staging_active_ranks_cpu = active_cpu.clone().pin_memory()
+            staging_active_ranks_cpu_slots = (
+                active_cpu.clone().pin_memory(),
+                active_cpu.clone().pin_memory(),
+            )
         else:
-            staging_active_ranks_cpu = active_cpu.clone()
+            staging_active_ranks_cpu_slots = (active_cpu.clone(), active_cpu.clone())
 
         return ElasticEPState(
             active_ranks=active,
             active_ranks_cpu=active_cpu.clone(),
             last_handled_active_ranks_cpu=active_cpu,
-            staging_active_ranks_cpu=staging_active_ranks_cpu,
+            staging_active_ranks_cpu_slots=staging_active_ranks_cpu_slots,
+            pending_staging_slots=[],
         )
 
     @classmethod
