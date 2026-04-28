@@ -430,6 +430,29 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         assert len(models) == 1
         assert isinstance(getattr(models[0], "max_model_len", None), int)
 
+        response = requests.get(self.base_url + "/models")
+        self.assertTrue(response.ok, response.text)
+        models_data = response.json()
+        self.assertEqual(models_data["object"], "list")
+        self.assertEqual(len(models_data["data"]), 1)
+
+    def test_model_list_codex_shape(self):
+        response = requests.get(
+            self.base_url + "/models", params={"client_version": "0.124.0"}
+        )
+        self.assertTrue(response.ok, response.text)
+        models_data = response.json()
+        self.assertIn("models", models_data)
+        self.assertNotIn("data", models_data)
+        self.assertGreaterEqual(len(models_data["models"]), 1)
+
+        base_model = models_data["models"][0]
+        self.assertEqual(base_model["slug"], self.model)
+        self.assertEqual(base_model["display_name"], self.model)
+        self.assertIn("base_instructions", base_model)
+        self.assertIn("truncation_policy", base_model)
+        self.assertIn("context_window", base_model)
+
     def test_retrieve_model(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
@@ -437,6 +460,12 @@ The SmartHome Mini is a compact smart home assistant available in black or white
         retrieved_model = client.models.retrieve(self.model)
         self.assertEqual(retrieved_model.id, self.model)
         self.assertEqual(retrieved_model.root, self.model)
+
+        raw_response = requests.get(self.base_url + f"/models/{self.model}")
+        self.assertTrue(raw_response.ok, raw_response.text)
+        raw_model = raw_response.json()
+        self.assertEqual(raw_model["object"], "model")
+        self.assertEqual(raw_model["id"], self.model)
 
         # Test retrieving a non-existent model
         with self.assertRaises(openai.NotFoundError):
