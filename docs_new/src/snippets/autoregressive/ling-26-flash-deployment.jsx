@@ -1,5 +1,5 @@
 import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
-export const Ling26FlashDeployment = () => {
+export const Ling26FlashDeployment = ({ urlStatePrefix = 'ling-26-flash' }) => {
   // Config options
   const options = {
     hardware: {

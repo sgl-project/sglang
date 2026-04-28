@@ -1,5 +1,5 @@
 import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
-export const Ling261TDeployment = () => {
+export const Ling261TDeployment = ({ urlStatePrefix = 'ling-26-1t' }) => {
   // Config options
   const options = {
     hardware: {

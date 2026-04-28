@@ -39,8 +39,6 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
 
 Ling-2.6-flash is a 104B/7.4B-active MoE that runs comfortably on a single 4-GPU node. Use the selector below to generate the launch command for your hardware.
 
-import { Ling26FlashDeployment } from '/src/snippets/autoregressive/ling-26-flash-deployment.jsx'
-
 <Ling26FlashDeployment urlStatePrefix="ling-26-flash"/>
 
 #### Configuration Tips
@@ -55,8 +53,6 @@ import { Ling26FlashDeployment } from '/src/snippets/autoregressive/ling-26-flas
 ### 3.2 Ling-2.6-1T
 
 Ling-2.6-1T ships in **FP8 (E4M3)**, so unlike Ling-2.5-1T it fits a **single GB300 node with `--tp 4`**. On smaller GPUs (H200/B200), a 2-node deployment with `--pp-size 2` is required.
-
-import { Ling261TDeployment } from '/src/snippets/autoregressive/ling-26-1t-deployment.jsx'
 
 <Ling261TDeployment urlStatePrefix="ling-26-1t"/>
 
