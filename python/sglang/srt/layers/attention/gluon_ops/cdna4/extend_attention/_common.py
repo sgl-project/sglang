@@ -66,23 +66,23 @@ import inspect
 import torch
 import triton
 import triton.language as tl
-
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
-from triton.experimental.gluon.language.amd import AMDMFMALayout, warp_pipeline_stage
-from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async
-from triton.experimental.gluon.language.amd.cdna4 import (
-    buffer_load as cdna4_buffer_load,
-    buffer_store as cdna4_buffer_store,
-)
-from triton.experimental.gluon.language.amd.cdna4 import mfma as mfma_cdna4
 from triton.experimental.gluon.language._layouts import (
     DistributedLinearLayout,
     DotOperandLayout,
     PaddedSharedLayout,
 )
+from triton.experimental.gluon.language.amd import AMDMFMALayout, warp_pipeline_stage
+from triton.experimental.gluon.language.amd.cdna4 import async_copy as cdna4_async
+from triton.experimental.gluon.language.amd.cdna4 import (
+    buffer_load as cdna4_buffer_load,
+)
+from triton.experimental.gluon.language.amd.cdna4 import (
+    buffer_store as cdna4_buffer_store,
+)
+from triton.experimental.gluon.language.amd.cdna4 import mfma as mfma_cdna4
 from triton.language.core import _aggregate as aggregate
-
 
 # ===---------------------------------------------------------------------===#
 # Module-level constants
@@ -148,7 +148,9 @@ def nan_propagating_max(x, axis):
 @gluon.jit
 def do_mma(a, b, c):
     if b.dtype == tl.float8e4b8 or b.dtype == tl.float8e4nv:
-        a_fp8 = tl.cast(a, tl.float8e4nv, bitcast=(a.dtype != tl.bfloat16 and a.dtype != tl.float16))
+        a_fp8 = tl.cast(
+            a, tl.float8e4nv, bitcast=(a.dtype != tl.bfloat16 and a.dtype != tl.float16)
+        )
         b_fp8 = tl.cast(b, tl.float8e4nv, bitcast=True)
         return mfma_cdna4(a_fp8, b_fp8, c)
     return mfma_cdna4(a.to(tl.bfloat16), b.to(tl.bfloat16), c)
@@ -163,9 +165,7 @@ def _buffer_load_to_shared_cast_safe(dst_smem, src_base, offsets, mask, other):
                 dst_smem, src_base, offsets, mask=mask, other=other
             )
         else:
-            cdna4_async.buffer_load_to_shared(
-                dst_smem, src_base, offsets
-            )
+            cdna4_async.buffer_load_to_shared(dst_smem, src_base, offsets)
     else:
         if mask is not None:
             reg = cdna4_buffer_load(src_base, offsets, mask=mask, other=other)
@@ -237,7 +237,9 @@ def remap_xcd_attention(
     xcd = pid % NUM_XCDS
     local_pid = pid // NUM_XCDS
     tall_pid = xcd * pids_per_xcd + local_pid
-    short_pid = tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+    short_pid = (
+        tall_xcds * pids_per_xcd + (xcd - tall_xcds) * (pids_per_xcd - 1) + local_pid
+    )
     return tl.where(xcd < tall_xcds, tall_pid, short_pid)
 
 
@@ -329,7 +331,7 @@ class ExtendAttentionLayouts:
 
     # ==== Policy ====
     IS_FP8: gl.constexpr
-    PFX_SMEM_TY: gl.constexpr          # element type for prefix smem allocation
+    PFX_SMEM_TY: gl.constexpr  # element type for prefix smem allocation
     ASYNC_PAD_K: gl.constexpr
     ASYNC_PAD_V: gl.constexpr
 
@@ -355,7 +357,9 @@ class ExtendAttentionLayouts:
         self.mma_m_layout = gl.constexpr(mma_m_ly)
 
         if IS_FP8:
-            fp8_q, fp8_kt, fp8_p, fp8_v = ExtendAttentionLayouts.make_fp8_dot_layouts(mma, 16, 8)
+            fp8_q, fp8_kt, fp8_p, fp8_v = ExtendAttentionLayouts.make_fp8_dot_layouts(
+                mma, 16, 8
+            )
             self.pfx_q_dot_layout = gl.constexpr(fp8_q)
             self.pfx_kt_dot_layout = gl.constexpr(fp8_kt)
             self.pfx_p_dot_layout = gl.constexpr(fp8_p)
@@ -535,43 +539,67 @@ class ExtendAttentionLayouts:
     def _kt_dll_bases_4w(BLOCK_D, BLOCK_N):
         """4-warp K^T (reg_bases, lane_bases, warp_bases)."""
         if BLOCK_D >= 512:
-            reg = [[1,0],[2,0],[4,0],[0,4],[0,8],[0,16],[0,32]] if BLOCK_N >= 64 \
-               else [[1,0],[2,0],[4,0],[0,4],[0,8],[0,16]]
-            lane = [[8,0],[16,0],[32,0],[64,0],[128,0],[256,0]]
+            reg = (
+                [[1, 0], [2, 0], [4, 0], [0, 4], [0, 8], [0, 16], [0, 32]]
+                if BLOCK_N >= 64
+                else [[1, 0], [2, 0], [4, 0], [0, 4], [0, 8], [0, 16]]
+            )
+            lane = [[8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0]]
         elif BLOCK_D >= 256:
-            reg  = [[1,0],[2,0],[4,0],[0,4],[0,8]]
-            lane = [[8,0],[16,0],[32,0],[64,0],[128,0],[0,16]]
+            reg = [[1, 0], [2, 0], [4, 0], [0, 4], [0, 8]]
+            lane = [[8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [0, 16]]
         else:
-            reg = [[1,0],[2,0],[4,0],[0,4],[0,8],[0,64]] if BLOCK_N >= 128 \
-               else [[1,0],[2,0],[4,0],[0,4],[0,8]]
-            lane = [[8,0],[16,0],[32,0],[64,0],[0,16],[0,32]]
-        return reg, lane, [[0,1],[0,2]]
+            reg = (
+                [[1, 0], [2, 0], [4, 0], [0, 4], [0, 8], [0, 64]]
+                if BLOCK_N >= 128
+                else [[1, 0], [2, 0], [4, 0], [0, 4], [0, 8]]
+            )
+            lane = [[8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32]]
+        return reg, lane, [[0, 1], [0, 2]]
 
     @gluon.constexpr_function
     def _kt_dll_bases_8w(BLOCK_D, BLOCK_N):
         """8-warp K^T (reg_bases, lane_bases, warp_bases)."""
         if BLOCK_D >= 512:
-            lane = [[8,0],[16,0],[32,0],[64,0],[128,0],[256,0]]
+            lane = [[8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [256, 0]]
             if BLOCK_N >= 64:
-                return ([[1,0],[2,0],[4,0],[0,4],[0,8],[0,16]], lane,
-                        [[0,1],[0,2],[0,32]])
-            return ([[1,0],[2,0],[4,0],[0,8],[0,16]], lane,
-                    [[0,1],[0,2],[0,4]])
+                return (
+                    [[1, 0], [2, 0], [4, 0], [0, 4], [0, 8], [0, 16]],
+                    lane,
+                    [[0, 1], [0, 2], [0, 32]],
+                )
+            return (
+                [[1, 0], [2, 0], [4, 0], [0, 8], [0, 16]],
+                lane,
+                [[0, 1], [0, 2], [0, 4]],
+            )
         if BLOCK_D >= 256:
-            return ([[1,0],[2,0],[4,0],[0,8]],
-                    [[8,0],[16,0],[32,0],[64,0],[128,0],[0,16]],
-                    [[0,1],[0,2],[0,4]])
+            return (
+                [[1, 0], [2, 0], [4, 0], [0, 8]],
+                [[8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [0, 16]],
+                [[0, 1], [0, 2], [0, 4]],
+            )
         if BLOCK_D >= 128:
-            reg = [[1,0],[2,0],[4,0],[0,8],[0,64]] if BLOCK_N >= 128 \
-               else [[1,0],[2,0],[4,0],[0,8]]
-            return (reg,
-                    [[8,0],[16,0],[32,0],[64,0],[0,16],[0,32]],
-                    [[0,1],[0,2],[0,4]])
-        reg = [[1,0],[2,0],[4,0],[0,64]] if BLOCK_N >= 128 \
-           else [[1,0],[2,0],[4,0]]
-        return (reg,
-                [[8,0],[16,0],[32,0],[0,16],[0,32],[0,1]],
-                [[0,2],[0,4],[0,8]])
+            reg = (
+                [[1, 0], [2, 0], [4, 0], [0, 8], [0, 64]]
+                if BLOCK_N >= 128
+                else [[1, 0], [2, 0], [4, 0], [0, 8]]
+            )
+            return (
+                reg,
+                [[8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32]],
+                [[0, 1], [0, 2], [0, 4]],
+            )
+        reg = (
+            [[1, 0], [2, 0], [4, 0], [0, 64]]
+            if BLOCK_N >= 128
+            else [[1, 0], [2, 0], [4, 0]]
+        )
+        return (
+            reg,
+            [[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 1]],
+            [[0, 2], [0, 4], [0, 8]],
+        )
 
     @gluon.constexpr_function
     def _kt_dll_bases(num_warps, BLOCK_D, BLOCK_N):
@@ -598,10 +626,15 @@ class ExtendAttentionLayouts:
     @gluon.constexpr_function
     def make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N):
         """Async DMA DistributedLinearLayout for a [BLOCK_DMODEL, BLOCK_N] K^T tile."""
-        reg, lane, warp = ExtendAttentionLayouts._kt_dll_bases(num_warps, BLOCK_DMODEL, BLOCK_N)
+        reg, lane, warp = ExtendAttentionLayouts._kt_dll_bases(
+            num_warps, BLOCK_DMODEL, BLOCK_N
+        )
         return DistributedLinearLayout(
-            reg_bases=reg, lane_bases=lane, warp_bases=warp,
-            block_bases=[], shape=[BLOCK_DMODEL, BLOCK_N],
+            reg_bases=reg,
+            lane_bases=lane,
+            warp_bases=warp,
+            block_bases=[],
+            shape=[BLOCK_DMODEL, BLOCK_N],
         )
 
     @gluon.constexpr_function
@@ -611,12 +644,15 @@ class ExtendAttentionLayouts:
         Pure transpose of the K^T layout: every basis [a, b] is mirrored to
         [b, a] and the tile shape is [N, Dv] instead of [Dv, N].
         """
-        reg, lane, warp = ExtendAttentionLayouts._kt_dll_bases(num_warps, BLOCK_DV, BLOCK_N)
+        reg, lane, warp = ExtendAttentionLayouts._kt_dll_bases(
+            num_warps, BLOCK_DV, BLOCK_N
+        )
         return DistributedLinearLayout(
             reg_bases=ExtendAttentionLayouts._transpose_bases(reg),
             lane_bases=ExtendAttentionLayouts._transpose_bases(lane),
             warp_bases=ExtendAttentionLayouts._transpose_bases(warp),
-            block_bases=[], shape=[BLOCK_N, BLOCK_DV],
+            block_bases=[],
+            shape=[BLOCK_N, BLOCK_DV],
         )
 
     # ==== FP8 extend exceptions: BF16 V layout inside the FP8 kernel ==========
@@ -630,39 +666,59 @@ class ExtendAttentionLayouts:
     def _fp8_bf16_v_dll_bases_4w(BLOCK_DV, BLOCK_N):
         """4-warp FP8-kernel BF16-V (reg, lane, warp), with special-case overrides."""
         if BLOCK_DV >= 256:
-            reg = ([[0,1],[0,2],[0,4],[4,0],[8,0],[32,0],[64,0]] if BLOCK_N >= 128
-                   else [[0,1],[0,2],[0,4],[4,0],[8,0]])
-            return (reg,
-                    [[0,8],[0,16],[0,32],[0,64],[0,128],[16,0]],
-                    [[1,0],[2,0]])
+            reg = (
+                [[0, 1], [0, 2], [0, 4], [4, 0], [8, 0], [32, 0], [64, 0]]
+                if BLOCK_N >= 128
+                else [[0, 1], [0, 2], [0, 4], [4, 0], [8, 0]]
+            )
+            return (
+                reg,
+                [[0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [16, 0]],
+                [[1, 0], [2, 0]],
+            )
         if BLOCK_N >= 128:
-            return ([[0,1],[0,2],[0,4],[4,0],[8,0],[64,0]],
-                    [[0,8],[0,16],[0,32],[0,64],[16,0],[32,0]],
-                    [[1,0],[2,0]])
-        return ([[0,1],[0,2],[0,4],[0,8],[8,0]],
-                [[0,16],[0,32],[0,64],[1,0],[2,0],[4,0]],
-                [[16,0],[32,0]])
+            return (
+                [[0, 1], [0, 2], [0, 4], [4, 0], [8, 0], [64, 0]],
+                [[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]],
+                [[1, 0], [2, 0]],
+            )
+        return (
+            [[0, 1], [0, 2], [0, 4], [0, 8], [8, 0]],
+            [[0, 16], [0, 32], [0, 64], [1, 0], [2, 0], [4, 0]],
+            [[16, 0], [32, 0]],
+        )
 
     @gluon.constexpr_function
     def _fp8_bf16_v_dll_bases_8w(BLOCK_DV, BLOCK_N):
         """8-warp FP8-kernel BF16-V (reg, lane, warp), with special-case overrides."""
         if BLOCK_DV >= 256:
-            return ([[0,1],[0,2],[0,4],[8,0]],
-                    [[0,8],[0,16],[0,32],[0,64],[0,128],[16,0]],
-                    [[1,0],[2,0],[4,0]])
+            return (
+                [[0, 1], [0, 2], [0, 4], [8, 0]],
+                [[0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [16, 0]],
+                [[1, 0], [2, 0], [4, 0]],
+            )
         if BLOCK_DV >= 128:
             if BLOCK_N >= 128:
-                return ([[0,1],[0,2],[0,4],[8,0],[64,0]],
-                        [[0,8],[0,16],[0,32],[0,64],[16,0],[32,0]],
-                        [[1,0],[2,0],[4,0]])
-            return ([[0,1],[0,2],[0,4],[0,8]],
-                    [[0,16],[0,32],[0,64],[1,0],[2,0],[4,0]],
-                    [[8,0],[16,0],[32,0]])
-        reg = [[0,1],[0,2],[0,4],[64,0]] if BLOCK_N >= 128 \
-           else [[0,1],[0,2],[0,4]]
-        return (reg,
-                [[0,8],[0,16],[0,32],[16,0],[32,0],[1,0]],
-                [[2,0],[4,0],[8,0]])
+                return (
+                    [[0, 1], [0, 2], [0, 4], [8, 0], [64, 0]],
+                    [[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]],
+                    [[1, 0], [2, 0], [4, 0]],
+                )
+            return (
+                [[0, 1], [0, 2], [0, 4], [0, 8]],
+                [[0, 16], [0, 32], [0, 64], [1, 0], [2, 0], [4, 0]],
+                [[8, 0], [16, 0], [32, 0]],
+            )
+        reg = (
+            [[0, 1], [0, 2], [0, 4], [64, 0]]
+            if BLOCK_N >= 128
+            else [[0, 1], [0, 2], [0, 4]]
+        )
+        return (
+            reg,
+            [[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [1, 0]],
+            [[2, 0], [4, 0], [8, 0]],
+        )
 
     @gluon.constexpr_function
     def make_fp8_bf16_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N):
@@ -697,12 +753,19 @@ class ExtendAttentionLayouts:
         - 8w Dv<256  N<128:  same shuffled pattern, 3-warp stride
         """
         if num_warps < 8:
-            reg, lane, warp = ExtendAttentionLayouts._fp8_bf16_v_dll_bases_4w(BLOCK_DV, BLOCK_N)
+            reg, lane, warp = ExtendAttentionLayouts._fp8_bf16_v_dll_bases_4w(
+                BLOCK_DV, BLOCK_N
+            )
         else:
-            reg, lane, warp = ExtendAttentionLayouts._fp8_bf16_v_dll_bases_8w(BLOCK_DV, BLOCK_N)
+            reg, lane, warp = ExtendAttentionLayouts._fp8_bf16_v_dll_bases_8w(
+                BLOCK_DV, BLOCK_N
+            )
         return DistributedLinearLayout(
-            reg_bases=reg, lane_bases=lane, warp_bases=warp,
-            block_bases=[], shape=[BLOCK_N, BLOCK_DV],
+            reg_bases=reg,
+            lane_bases=lane,
+            warp_bases=warp,
+            block_bases=[],
+            shape=[BLOCK_N, BLOCK_DV],
         )
 
     # ==== FP8 prefix async-DMA tile factories =================================
@@ -735,35 +798,38 @@ class ExtendAttentionLayouts:
             return ExtendAttentionLayouts.make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
         if is_4w:
             if BLOCK_DMODEL >= 256:
-                reg  = [[1,0],[2,0],[4,0],[0,4],[0,8]]
-                lane = [[8,0],[16,0],[32,0],[64,0],[128,0],[0,16]]
-                warp = [[0,1],[0,2]]
+                reg = [[1, 0], [2, 0], [4, 0], [0, 4], [0, 8]]
+                lane = [[8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [0, 16]]
+                warp = [[0, 1], [0, 2]]
             else:  # D=128
                 if BLOCK_N >= 128:
-                    reg  = [[1,0],[2,0],[4,0],[8,0],[0,4],[0,8]]
-                    lane = [[16,0],[32,0],[64,0],[0,16],[0,32],[0,64]]
-                    warp = [[0,1],[0,2]]
+                    reg = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 4], [0, 8]]
+                    lane = [[16, 0], [32, 0], [64, 0], [0, 16], [0, 32], [0, 64]]
+                    warp = [[0, 1], [0, 2]]
                 else:
-                    reg  = [[1,0],[2,0],[4,0],[8,0],[0,8]]
-                    lane = [[16,0],[32,0],[64,0],[0,1],[0,2],[0,4]]
-                    warp = [[0,16],[0,32]]
+                    reg = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 8]]
+                    lane = [[16, 0], [32, 0], [64, 0], [0, 1], [0, 2], [0, 4]]
+                    warp = [[0, 16], [0, 32]]
         else:  # 8-warp
             if BLOCK_DMODEL >= 256:
-                reg  = [[1,0],[2,0],[4,0],[0,8]]
-                lane = [[8,0],[16,0],[32,0],[64,0],[128,0],[0,16]]
-                warp = [[0,1],[0,2],[0,4]]
+                reg = [[1, 0], [2, 0], [4, 0], [0, 8]]
+                lane = [[8, 0], [16, 0], [32, 0], [64, 0], [128, 0], [0, 16]]
+                warp = [[0, 1], [0, 2], [0, 4]]
             else:  # D=128
                 if BLOCK_N >= 128:
-                    reg  = [[1,0],[2,0],[4,0],[8,0],[0,8]]
-                    lane = [[16,0],[32,0],[64,0],[0,16],[0,32],[0,64]]
-                    warp = [[0,1],[0,2],[0,4]]
+                    reg = [[1, 0], [2, 0], [4, 0], [8, 0], [0, 8]]
+                    lane = [[16, 0], [32, 0], [64, 0], [0, 16], [0, 32], [0, 64]]
+                    warp = [[0, 1], [0, 2], [0, 4]]
                 else:
-                    reg  = [[1,0],[2,0],[4,0],[8,0]]
-                    lane = [[16,0],[32,0],[64,0],[0,1],[0,2],[0,4]]
-                    warp = [[0,8],[0,16],[0,32]]
+                    reg = [[1, 0], [2, 0], [4, 0], [8, 0]]
+                    lane = [[16, 0], [32, 0], [64, 0], [0, 1], [0, 2], [0, 4]]
+                    warp = [[0, 8], [0, 16], [0, 32]]
         return DistributedLinearLayout(
-            reg_bases=reg, lane_bases=lane, warp_bases=warp,
-            block_bases=[], shape=[BLOCK_DMODEL, BLOCK_N],
+            reg_bases=reg,
+            lane_bases=lane,
+            warp_bases=warp,
+            block_bases=[],
+            shape=[BLOCK_DMODEL, BLOCK_N],
         )
 
     @gluon.constexpr_function
@@ -781,48 +847,53 @@ class ExtendAttentionLayouts:
         if is_4w:
             if BLOCK_DV >= 256:
                 if BLOCK_N >= 128:
-                    reg  = [[0,1],[0,2],[0,4],[0,8],[4,0],[8,0],[64,0]]
-                    lane = [[0,16],[0,32],[0,64],[0,128],[16,0],[32,0]]
+                    reg = [[0, 1], [0, 2], [0, 4], [0, 8], [4, 0], [8, 0], [64, 0]]
+                    lane = [[0, 16], [0, 32], [0, 64], [0, 128], [16, 0], [32, 0]]
                 else:
-                    reg  = [[0,1],[0,2],[0,4],[4,0],[8,0]]
-                    lane = [[0,8],[0,16],[0,32],[0,64],[0,128],[16,0]]
-                warp = [[1,0],[2,0]]
+                    reg = [[0, 1], [0, 2], [0, 4], [4, 0], [8, 0]]
+                    lane = [[0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [16, 0]]
+                warp = [[1, 0], [2, 0]]
             else:  # Dv<256
                 if BLOCK_N >= 128:
-                    reg  = [[0,1],[0,2],[0,4],[0,8],[4,0],[8,0]]
-                    lane = [[0,16],[0,32],[0,64],[16,0],[32,0],[64,0]]
-                    warp = [[1,0],[2,0]]
+                    reg = [[0, 1], [0, 2], [0, 4], [0, 8], [4, 0], [8, 0]]
+                    lane = [[0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [64, 0]]
+                    warp = [[1, 0], [2, 0]]
                 else:
-                    reg  = [[0,1],[0,2],[0,4],[0,8],[8,0]]
-                    lane = [[0,16],[0,32],[0,64],[1,0],[2,0],[4,0]]
-                    warp = [[16,0],[32,0]]
+                    reg = [[0, 1], [0, 2], [0, 4], [0, 8], [8, 0]]
+                    lane = [[0, 16], [0, 32], [0, 64], [1, 0], [2, 0], [4, 0]]
+                    warp = [[16, 0], [32, 0]]
         else:  # 8-warp
             if BLOCK_DMODEL >= 256:
                 if BLOCK_DV >= 256:
-                    reg  = [[0,1],[0,2],[0,4],[8,0]]
-                    lane = [[0,8],[0,16],[0,32],[0,64],[0,128],[16,0]]
+                    reg = [[0, 1], [0, 2], [0, 4], [8, 0]]
+                    lane = [[0, 8], [0, 16], [0, 32], [0, 64], [0, 128], [16, 0]]
                 else:
-                    reg  = [[0,1],[0,2],[0,4],[8,0]]
-                    lane = [[0,8],[0,16],[0,32],[0,64],[16,0],[32,0]]
-                warp = [[1,0],[2,0],[4,0]]
+                    reg = [[0, 1], [0, 2], [0, 4], [8, 0]]
+                    lane = [[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]]
+                warp = [[1, 0], [2, 0], [4, 0]]
             else:  # D=128  (Dv=128 implied at every callsite)
                 if BLOCK_N >= 128:
-                    reg  = [[0,1],[0,2],[0,4],[0,8],[8,0]]
-                    lane = [[0,16],[0,32],[0,64],[16,0],[32,0],[64,0]]
-                    warp = [[1,0],[2,0],[4,0]]
+                    reg = [[0, 1], [0, 2], [0, 4], [0, 8], [8, 0]]
+                    lane = [[0, 16], [0, 32], [0, 64], [16, 0], [32, 0], [64, 0]]
+                    warp = [[1, 0], [2, 0], [4, 0]]
                 else:
-                    reg  = [[0,1],[0,2],[0,4],[0,8]]
-                    lane = [[0,16],[0,32],[0,64],[1,0],[2,0],[4,0]]
-                    warp = [[8,0],[16,0],[32,0]]
+                    reg = [[0, 1], [0, 2], [0, 4], [0, 8]]
+                    lane = [[0, 16], [0, 32], [0, 64], [1, 0], [2, 0], [4, 0]]
+                    warp = [[8, 0], [16, 0], [32, 0]]
         return DistributedLinearLayout(
-            reg_bases=reg, lane_bases=lane, warp_bases=warp,
-            block_bases=[], shape=[BLOCK_N, BLOCK_DV],
+            reg_bases=reg,
+            lane_bases=lane,
+            warp_bases=warp,
+            block_bases=[],
+            shape=[BLOCK_N, BLOCK_DV],
         )
 
     @gluon.constexpr_function
     def make_fp8_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N):
         """FP8 prefix V offset bases -- same ladder as BF16 extend V (alias)."""
-        return ExtendAttentionLayouts.make_fp8_bf16_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N)
+        return ExtendAttentionLayouts.make_fp8_bf16_v_offset_bases(
+            num_warps, BLOCK_DV, BLOCK_N
+        )
 
     @gluon.constexpr_function
     def make_fp8_extend_v_dll(num_warps, BLOCK_DV, BLOCK_N):
@@ -840,42 +911,52 @@ class ExtendAttentionLayouts:
         ``make_kt_offset_bases``.
         """
         if BLOCK_DMODEL >= 256:
-            return ExtendAttentionLayouts.make_offset_bases(128, [16,32], [1,2,4,8], 0)
-        return ExtendAttentionLayouts.make_offset_bases(64, [16,32], [1,2,4,8], 0)
+            return ExtendAttentionLayouts.make_offset_bases(
+                128, [16, 32], [1, 2, 4, 8], 0
+            )
+        return ExtendAttentionLayouts.make_offset_bases(64, [16, 32], [1, 2, 4, 8], 0)
 
     @gluon.constexpr_function
     def make_ext_kt_dll(num_warps, BLOCK_DMODEL, EXT_BLOCK_N):
         """BF16 extend K^T DLL for ``EXT_BLOCK_N != BLOCK_N`` (rare)."""
         if BLOCK_DMODEL >= 256:
-            reg = [[1,0],[2,0],[4,0],[128,0],[0,4],[0,8]]
+            reg = [[1, 0], [2, 0], [4, 0], [128, 0], [0, 4], [0, 8]]
         else:
-            reg = [[1,0],[2,0],[4,0],[0,4],[0,8]]
-        lane = [[8,0],[16,0],[32,0],[64,0],[0,16],[0,32]]
-        warp = [[0,1],[0,2]]
+            reg = [[1, 0], [2, 0], [4, 0], [0, 4], [0, 8]]
+        lane = [[8, 0], [16, 0], [32, 0], [64, 0], [0, 16], [0, 32]]
+        warp = [[0, 1], [0, 2]]
         return DistributedLinearLayout(
-            reg_bases=reg, lane_bases=lane, warp_bases=warp,
-            block_bases=[], shape=[BLOCK_DMODEL, EXT_BLOCK_N],
+            reg_bases=reg,
+            lane_bases=lane,
+            warp_bases=warp,
+            block_bases=[],
+            shape=[BLOCK_DMODEL, EXT_BLOCK_N],
         )
 
     @gluon.constexpr_function
     def make_ext_v_offset_bases(num_warps, BLOCK_DV, EXT_BLOCK_N):
         """BF16 extend V offset bases for ``EXT_BLOCK_N != BLOCK_N`` (rare)."""
         if BLOCK_DV >= 256:
-            return ExtendAttentionLayouts.make_offset_bases(128, [16,32], [1,2,4,8], 1)
-        return ExtendAttentionLayouts.make_offset_bases(64, [16,32], [1,2,4,8], 1)
+            return ExtendAttentionLayouts.make_offset_bases(
+                128, [16, 32], [1, 2, 4, 8], 1
+            )
+        return ExtendAttentionLayouts.make_offset_bases(64, [16, 32], [1, 2, 4, 8], 1)
 
     @gluon.constexpr_function
     def make_ext_v_dll(num_warps, BLOCK_DV, EXT_BLOCK_N):
         """BF16 extend V DLL for ``EXT_BLOCK_N != BLOCK_N`` (rare)."""
         if BLOCK_DV >= 256:
-            reg = [[0,1],[0,2],[0,4],[0,128],[4,0],[8,0]]
+            reg = [[0, 1], [0, 2], [0, 4], [0, 128], [4, 0], [8, 0]]
         else:
-            reg = [[0,1],[0,2],[0,4],[4,0],[8,0]]
-        lane = [[0,8],[0,16],[0,32],[0,64],[16,0],[32,0]]
-        warp = [[1,0],[2,0]]
+            reg = [[0, 1], [0, 2], [0, 4], [4, 0], [8, 0]]
+        lane = [[0, 8], [0, 16], [0, 32], [0, 64], [16, 0], [32, 0]]
+        warp = [[1, 0], [2, 0]]
         return DistributedLinearLayout(
-            reg_bases=reg, lane_bases=lane, warp_bases=warp,
-            block_bases=[], shape=[EXT_BLOCK_N, BLOCK_DV],
+            reg_bases=reg,
+            lane_bases=lane,
+            warp_bases=warp,
+            block_bases=[],
+            shape=[EXT_BLOCK_N, BLOCK_DV],
         )
 
     # ==== Prefix smem policy and IS_FP8-aware prefix async factories ==========
@@ -884,21 +965,27 @@ class ExtendAttentionLayouts:
     def prefix_v_offset_bases(layouts, num_warps, BLOCK_DV, BLOCK_N):
         """V offset bases for an async prefix tile (FP8-packed layout when IS_FP8)."""
         if layouts.IS_FP8:
-            return ExtendAttentionLayouts.make_fp8_v_offset_bases(num_warps, BLOCK_DV, BLOCK_N)
+            return ExtendAttentionLayouts.make_fp8_v_offset_bases(
+                num_warps, BLOCK_DV, BLOCK_N
+            )
         return ExtendAttentionLayouts.make_v_offset_bases(BLOCK_DV, BLOCK_N)
 
     @gluon.constexpr_function
     def prefix_kt_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_N):
         """Prefix K^T async DMA DLL (FP8-native partition when IS_FP8)."""
         if layouts.IS_FP8:
-            return ExtendAttentionLayouts.make_fp8_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
+            return ExtendAttentionLayouts.make_fp8_kt_dll(
+                num_warps, BLOCK_DMODEL, BLOCK_N
+            )
         return ExtendAttentionLayouts.make_kt_dll(num_warps, BLOCK_DMODEL, BLOCK_N)
 
     @gluon.constexpr_function
     def prefix_v_dll(layouts, num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N):
         """Prefix V async DMA DLL (FP8-native partition when IS_FP8)."""
         if layouts.IS_FP8:
-            return ExtendAttentionLayouts.make_fp8_v_dll(num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N)
+            return ExtendAttentionLayouts.make_fp8_v_dll(
+                num_warps, BLOCK_DMODEL, BLOCK_DV, BLOCK_N
+            )
         return ExtendAttentionLayouts.make_v_dll(num_warps, BLOCK_DV, BLOCK_N)
 
     @gluon.constexpr_function
@@ -908,7 +995,9 @@ class ExtendAttentionLayouts:
             pad_pairs = [[1024, layouts.ASYNC_PAD_K.value], [2048, 32]]
         else:
             pad_pairs = [[512, layouts.ASYNC_PAD_K.value]]
-        return ExtendAttentionLayouts.make_padded_smem([BLOCK_DMODEL, BLOCK_N], offset_bases, pad_pairs)
+        return ExtendAttentionLayouts.make_padded_smem(
+            [BLOCK_DMODEL, BLOCK_N], offset_bases, pad_pairs
+        )
 
     @gluon.constexpr_function
     def prefix_v_smem_layout(layouts, BLOCK_N, BLOCK_DV, offset_bases):
@@ -917,7 +1006,9 @@ class ExtendAttentionLayouts:
             pad_pairs = [[1024, layouts.ASYNC_PAD_V.value], [2048, 32]]
         else:
             pad_pairs = [[512, layouts.ASYNC_PAD_V.value]]
-        return ExtendAttentionLayouts.make_padded_smem([BLOCK_N, BLOCK_DV], offset_bases, pad_pairs)
+        return ExtendAttentionLayouts.make_padded_smem(
+            [BLOCK_N, BLOCK_DV], offset_bases, pad_pairs
+        )
 
 
 # ===---------------------------------------------------------------------===#
@@ -1189,7 +1280,7 @@ class AsyncKVLoader:
     smem: gl.shared_memory_descriptor
     gbl_base: gl.tensor
     kv_indices: gl.tensor | gl.constexpr  # gl.constexpr(0) when IS_PREFIX=False
-    kv_start: gl.tensor | gl.constexpr    # gl.constexpr(0) when IS_PREFIX=False
+    kv_start: gl.tensor | gl.constexpr  # gl.constexpr(0) when IS_PREFIX=False
     stride_n: gl.tensor | gl.constexpr
     IS_PREFIX: gl.constexpr
     IS_K: gl.constexpr
@@ -1227,54 +1318,116 @@ class AsyncKVLoader:
 
     @gluon.jit
     def for_prefix_k(
-        kt_smem, K_Buffer, cur_kv_head, kv_indices, kv_start, stride_buf_kbs, stride_buf_kh,
-        BLOCK_N: gl.constexpr, BLOCK_DMODEL: gl.constexpr, kt_async_layout: gl.constexpr,
+        kt_smem,
+        K_Buffer,
+        cur_kv_head,
+        kv_indices,
+        kv_start,
+        stride_buf_kbs,
+        stride_buf_kh,
+        BLOCK_N: gl.constexpr,
+        BLOCK_DMODEL: gl.constexpr,
+        kt_async_layout: gl.constexpr,
     ):
         """Build a loader for the prefix-K gather tap (multi-slot)."""
         k_prefix_base = K_Buffer + cur_kv_head * stride_buf_kh
         return AsyncKVLoader(
-            kt_smem, k_prefix_base, kv_indices, kv_start, stride_buf_kbs,
-            IS_PREFIX=True, IS_K=True,
-            BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_DMODEL, async_layout=kt_async_layout,
+            kt_smem,
+            k_prefix_base,
+            kv_indices,
+            kv_start,
+            stride_buf_kbs,
+            IS_PREFIX=True,
+            IS_K=True,
+            BLOCK_N=BLOCK_N,
+            BLOCK_D=BLOCK_DMODEL,
+            async_layout=kt_async_layout,
         )
 
     @gluon.jit
     def for_prefix_v(
-        v_smem, V_Buffer, cur_kv_head, kv_indices, kv_start, stride_buf_vbs, stride_buf_vh,
-        BLOCK_N: gl.constexpr, BLOCK_DV: gl.constexpr, v_async_layout: gl.constexpr,
+        v_smem,
+        V_Buffer,
+        cur_kv_head,
+        kv_indices,
+        kv_start,
+        stride_buf_vbs,
+        stride_buf_vh,
+        BLOCK_N: gl.constexpr,
+        BLOCK_DV: gl.constexpr,
+        v_async_layout: gl.constexpr,
     ):
         """Build a loader for the prefix-V gather tap (multi-slot)."""
         v_prefix_base = V_Buffer + cur_kv_head * stride_buf_vh
         return AsyncKVLoader(
-            v_smem, v_prefix_base, kv_indices, kv_start, stride_buf_vbs,
-            IS_PREFIX=True, IS_K=False,
-            BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_DV, async_layout=v_async_layout,
+            v_smem,
+            v_prefix_base,
+            kv_indices,
+            kv_start,
+            stride_buf_vbs,
+            IS_PREFIX=True,
+            IS_K=False,
+            BLOCK_N=BLOCK_N,
+            BLOCK_D=BLOCK_DV,
+            async_layout=v_async_layout,
         )
 
     @gluon.jit
     def for_extend_k(
-        kt_smem, K_Extend, cur_seq_q_start_idx, cur_kv_head, stride_kbs, stride_kh,
-        BLOCK_N: gl.constexpr, BLOCK_DMODEL: gl.constexpr, kt_async_layout: gl.constexpr,
+        kt_smem,
+        K_Extend,
+        cur_seq_q_start_idx,
+        cur_kv_head,
+        stride_kbs,
+        stride_kh,
+        BLOCK_N: gl.constexpr,
+        BLOCK_DMODEL: gl.constexpr,
+        kt_async_layout: gl.constexpr,
     ):
         """Build a loader for the extend-K row-major tap (multi-slot)."""
-        k_extend_base = K_Extend + cur_seq_q_start_idx * stride_kbs + cur_kv_head * stride_kh
+        k_extend_base = (
+            K_Extend + cur_seq_q_start_idx * stride_kbs + cur_kv_head * stride_kh
+        )
         return AsyncKVLoader(
-            kt_smem, k_extend_base, 0, 0, stride_kbs,
-            IS_PREFIX=False, IS_K=True,
-            BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_DMODEL, async_layout=kt_async_layout,
+            kt_smem,
+            k_extend_base,
+            0,
+            0,
+            stride_kbs,
+            IS_PREFIX=False,
+            IS_K=True,
+            BLOCK_N=BLOCK_N,
+            BLOCK_D=BLOCK_DMODEL,
+            async_layout=kt_async_layout,
         )
 
     @gluon.jit
     def for_extend_v(
-        v_smem, V_Extend, cur_seq_q_start_idx, cur_kv_head, stride_vbs, stride_vh,
-        BLOCK_N: gl.constexpr, BLOCK_DV: gl.constexpr, v_async_layout: gl.constexpr,
+        v_smem,
+        V_Extend,
+        cur_seq_q_start_idx,
+        cur_kv_head,
+        stride_vbs,
+        stride_vh,
+        BLOCK_N: gl.constexpr,
+        BLOCK_DV: gl.constexpr,
+        v_async_layout: gl.constexpr,
     ):
         """Build a loader for the extend-V row-major tap (multi-slot)."""
-        v_extend_base = V_Extend + cur_seq_q_start_idx * stride_vbs + cur_kv_head * stride_vh
+        v_extend_base = (
+            V_Extend + cur_seq_q_start_idx * stride_vbs + cur_kv_head * stride_vh
+        )
         return AsyncKVLoader(
-            v_smem, v_extend_base, 0, 0, stride_vbs,
-            IS_PREFIX=False, IS_K=False,
-            BLOCK_N=BLOCK_N, BLOCK_D=BLOCK_DV, async_layout=v_async_layout,
+            v_smem,
+            v_extend_base,
+            0,
+            0,
+            stride_vbs,
+            IS_PREFIX=False,
+            IS_K=False,
+            BLOCK_N=BLOCK_N,
+            BLOCK_D=BLOCK_DV,
+            async_layout=v_async_layout,
         )
 
     @gluon.jit
@@ -1291,53 +1444,85 @@ class AsyncKVLoader:
         slot_smem = self.smem.index(slot)
         if self.IS_K:
             offs_d = gl.arange(
-                0, self.BLOCK_D,
+                0,
+                self.BLOCK_D,
                 layout=gl.SliceLayout(dim=1, parent=self.async_layout),
             )
             offs_n = gl.arange(
-                0, self.BLOCK_N,
+                0,
+                self.BLOCK_N,
                 layout=gl.SliceLayout(dim=0, parent=self.async_layout),
             )
             if self.IS_PREFIX:
                 n_idx = start_n + offs_n
                 mask_n = n_idx < seq_len
                 kv_locs = gl.load(
-                    self.kv_indices + self.kv_start + n_idx, mask=mask_n, other=0,
+                    self.kv_indices + self.kv_start + n_idx,
+                    mask=mask_n,
+                    other=0,
                 ).to(tl.int32)
-                kt_offsets = (offs_d[:, None] + kv_locs[None, :] * self.stride_n).to(tl.int32)
+                kt_offsets = (offs_d[:, None] + kv_locs[None, :] * self.stride_n).to(
+                    tl.int32
+                )
                 _buffer_load_to_shared_cast_safe(
-                    slot_smem, self.gbl_base, kt_offsets, mask=mask_n[None, :], other=0.0,
+                    slot_smem,
+                    self.gbl_base,
+                    kt_offsets,
+                    mask=mask_n[None, :],
+                    other=0.0,
                 )
             else:
-                kt_offsets = (offs_d[:, None] + (start_n + offs_n[None, :]) * self.stride_n).to(tl.int32)
+                kt_offsets = (
+                    offs_d[:, None] + (start_n + offs_n[None, :]) * self.stride_n
+                ).to(tl.int32)
                 kt_mask = (start_n + offs_n[None, :]) < seq_len
                 _buffer_load_to_shared_cast_safe(
-                    slot_smem, self.gbl_base, kt_offsets, mask=kt_mask, other=0.0,
+                    slot_smem,
+                    self.gbl_base,
+                    kt_offsets,
+                    mask=kt_mask,
+                    other=0.0,
                 )
         else:
             offs_n = gl.arange(
-                0, self.BLOCK_N,
+                0,
+                self.BLOCK_N,
                 layout=gl.SliceLayout(dim=1, parent=self.async_layout),
             )
             offs_d = gl.arange(
-                0, self.BLOCK_D,
+                0,
+                self.BLOCK_D,
                 layout=gl.SliceLayout(dim=0, parent=self.async_layout),
             )
             if self.IS_PREFIX:
                 n_idx = start_n + offs_n
                 mask_n = n_idx < seq_len
                 kv_locs = gl.load(
-                    self.kv_indices + self.kv_start + n_idx, mask=mask_n, other=0,
+                    self.kv_indices + self.kv_start + n_idx,
+                    mask=mask_n,
+                    other=0,
                 ).to(tl.int32)
-                v_offsets = (kv_locs[:, None] * self.stride_n + offs_d[None, :]).to(tl.int32)
+                v_offsets = (kv_locs[:, None] * self.stride_n + offs_d[None, :]).to(
+                    tl.int32
+                )
                 _buffer_load_to_shared_cast_safe(
-                    slot_smem, self.gbl_base, v_offsets, mask=mask_n[:, None], other=0.0,
+                    slot_smem,
+                    self.gbl_base,
+                    v_offsets,
+                    mask=mask_n[:, None],
+                    other=0.0,
                 )
             else:
-                v_offsets = ((start_n + offs_n[:, None]) * self.stride_n + offs_d[None, :]).to(tl.int32)
+                v_offsets = (
+                    (start_n + offs_n[:, None]) * self.stride_n + offs_d[None, :]
+                ).to(tl.int32)
                 v_mask = (start_n + offs_n[:, None]) < seq_len
                 _buffer_load_to_shared_cast_safe(
-                    slot_smem, self.gbl_base, v_offsets, mask=v_mask, other=0.0,
+                    slot_smem,
+                    self.gbl_base,
+                    v_offsets,
+                    mask=v_mask,
+                    other=0.0,
                 )
 
     @gluon.jit
@@ -1353,22 +1538,42 @@ class AsyncKVLoader:
         tl.static_assert(not self.IS_PREFIX, "issue_nomask is extend-only")
         slot_smem = self.smem.index(slot)
         if self.IS_K:
-            offs_d_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=self.async_layout)
-            offs_n_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=self.async_layout)
+            offs_d_layout: gl.constexpr = gl.SliceLayout(
+                dim=1, parent=self.async_layout
+            )
+            offs_n_layout: gl.constexpr = gl.SliceLayout(
+                dim=0, parent=self.async_layout
+            )
             offs_d = gl.arange(0, self.BLOCK_D, layout=offs_d_layout)
             offs_n = gl.arange(0, self.BLOCK_N, layout=offs_n_layout)
-            kt_offsets = (offs_d[:, None] + (start_n + offs_n[None, :]) * self.stride_n).to(tl.int32)
+            kt_offsets = (
+                offs_d[:, None] + (start_n + offs_n[None, :]) * self.stride_n
+            ).to(tl.int32)
             _buffer_load_to_shared_cast_safe(
-                slot_smem, self.gbl_base, kt_offsets, mask=None, other=0.0,
+                slot_smem,
+                self.gbl_base,
+                kt_offsets,
+                mask=None,
+                other=0.0,
             )
         else:
-            offs_n_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=self.async_layout)
-            offs_d_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=self.async_layout)
+            offs_n_layout: gl.constexpr = gl.SliceLayout(
+                dim=1, parent=self.async_layout
+            )
+            offs_d_layout: gl.constexpr = gl.SliceLayout(
+                dim=0, parent=self.async_layout
+            )
             offs_n = gl.arange(0, self.BLOCK_N, layout=offs_n_layout)
             offs_d = gl.arange(0, self.BLOCK_D, layout=offs_d_layout)
-            v_offsets = ((start_n + offs_n[:, None]) * self.stride_n + offs_d[None, :]).to(tl.int32)
+            v_offsets = (
+                (start_n + offs_n[:, None]) * self.stride_n + offs_d[None, :]
+            ).to(tl.int32)
             _buffer_load_to_shared_cast_safe(
-                slot_smem, self.gbl_base, v_offsets, mask=None, other=0.0,
+                slot_smem,
+                self.gbl_base,
+                v_offsets,
+                mask=None,
+                other=0.0,
             )
 
     @gluon.jit
@@ -1397,18 +1602,34 @@ class AsyncKVLoader:
         else:
             mask = mask_n_or_scalar[None, :] if self.IS_K else mask_n_or_scalar[:, None]
         if self.IS_K:
-            offs_d_layout: gl.constexpr = gl.SliceLayout(dim=1, parent=self.async_layout)
+            offs_d_layout: gl.constexpr = gl.SliceLayout(
+                dim=1, parent=self.async_layout
+            )
             offs_d = gl.arange(0, self.BLOCK_D, layout=offs_d_layout)
-            kt_offsets = (offs_d[:, None] + kv_locs[None, :] * self.stride_n).to(tl.int32)
+            kt_offsets = (offs_d[:, None] + kv_locs[None, :] * self.stride_n).to(
+                tl.int32
+            )
             _buffer_load_to_shared_cast_safe(
-                slot_smem, self.gbl_base, kt_offsets, mask=mask, other=0.0,
+                slot_smem,
+                self.gbl_base,
+                kt_offsets,
+                mask=mask,
+                other=0.0,
             )
         else:
-            offs_d_layout: gl.constexpr = gl.SliceLayout(dim=0, parent=self.async_layout)
+            offs_d_layout: gl.constexpr = gl.SliceLayout(
+                dim=0, parent=self.async_layout
+            )
             offs_d = gl.arange(0, self.BLOCK_D, layout=offs_d_layout)
-            v_offsets = (kv_locs[:, None] * self.stride_n + offs_d[None, :]).to(tl.int32)
+            v_offsets = (kv_locs[:, None] * self.stride_n + offs_d[None, :]).to(
+                tl.int32
+            )
             _buffer_load_to_shared_cast_safe(
-                slot_smem, self.gbl_base, v_offsets, mask=mask, other=0.0,
+                slot_smem,
+                self.gbl_base,
+                v_offsets,
+                mask=mask,
+                other=0.0,
             )
 
 
@@ -1638,33 +1859,79 @@ class ExtendAttnProgram:
     @gluon.jit
     def initialize(
         cfg,
-        Q_Extend, K_Extend, V_Extend, O_Extend, K_Buffer, V_Buffer,
-        qo_indptr, kv_indptr, kv_indices,
-        Mask, MaskIndptr, WindowKvOffsets, Sinks,
-        stride_qbs, stride_qh,
-        stride_kbs, stride_kh,
-        stride_vbs, stride_vh,
-        stride_obs, stride_oh,
-        stride_buf_kbs, stride_buf_kh,
-        stride_buf_vbs, stride_buf_vh,
-        sm_scale, kv_group_num, v_scale,
-        num_heads, total_valid_tiles, total_programs,
-        partial_out, partial_lse, tile_done, actual_batch_size,
+        Q_Extend,
+        K_Extend,
+        V_Extend,
+        O_Extend,
+        K_Buffer,
+        V_Buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        Mask,
+        MaskIndptr,
+        WindowKvOffsets,
+        Sinks,
+        stride_qbs,
+        stride_qh,
+        stride_kbs,
+        stride_kh,
+        stride_vbs,
+        stride_vh,
+        stride_obs,
+        stride_oh,
+        stride_buf_kbs,
+        stride_buf_kh,
+        stride_buf_vbs,
+        stride_buf_vh,
+        sm_scale,
+        kv_group_num,
+        v_scale,
+        num_heads,
+        total_valid_tiles,
+        total_programs,
+        partial_out,
+        partial_lse,
+        tile_done,
+        actual_batch_size,
     ):
         return ExtendAttnProgram(
             cfg,
-            Q_Extend, K_Extend, V_Extend, O_Extend, K_Buffer, V_Buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            Mask, MaskIndptr, WindowKvOffsets, Sinks,
-            stride_qbs, stride_qh,
-            stride_kbs, stride_kh,
-            stride_vbs, stride_vh,
-            stride_obs, stride_oh,
-            stride_buf_kbs, stride_buf_kh,
-            stride_buf_vbs, stride_buf_vh,
-            sm_scale, kv_group_num, v_scale,
-            num_heads, total_valid_tiles, total_programs,
-            partial_out, partial_lse, tile_done, actual_batch_size,
+            Q_Extend,
+            K_Extend,
+            V_Extend,
+            O_Extend,
+            K_Buffer,
+            V_Buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            Mask,
+            MaskIndptr,
+            WindowKvOffsets,
+            Sinks,
+            stride_qbs,
+            stride_qh,
+            stride_kbs,
+            stride_kh,
+            stride_vbs,
+            stride_vh,
+            stride_obs,
+            stride_oh,
+            stride_buf_kbs,
+            stride_buf_kh,
+            stride_buf_vbs,
+            stride_buf_vh,
+            sm_scale,
+            kv_group_num,
+            v_scale,
+            num_heads,
+            total_valid_tiles,
+            total_programs,
+            partial_out,
+            partial_lse,
+            tile_done,
+            actual_batch_size,
         )
 
     # --------------------------------------------------------------------- #
@@ -1684,8 +1951,12 @@ class ExtendAttnProgram:
         cur_head = gl.program_id(1)
         cur_block_m = gl.program_id(2)
         if cfg.XCD_REMAP:
-            seq_head_domain = (cur_seq - cur_seq + self.actual_batch_size) * self.num_heads
-            tile_idx = cur_seq + self.actual_batch_size * (cur_head + self.num_heads * cur_block_m)
+            seq_head_domain = (
+                cur_seq - cur_seq + self.actual_batch_size
+            ) * self.num_heads
+            tile_idx = cur_seq + self.actual_batch_size * (
+                cur_head + self.num_heads * cur_block_m
+            )
             if cfg.XCD_MODE == 2:
                 tile_idx = remap_xcd_attention(
                     tile_idx,
@@ -1706,20 +1977,29 @@ class ExtendAttnProgram:
         cur_kv_head = cur_head // self.kv_group_num
 
         cur_seq_q_start_idx = gl.load(self.qo_indptr + cur_seq)
-        seq_len_extend = (gl.load(self.qo_indptr + cur_seq + 1) - cur_seq_q_start_idx).to(tl.int32)
+        seq_len_extend = (
+            gl.load(self.qo_indptr + cur_seq + 1) - cur_seq_q_start_idx
+        ).to(tl.int32)
         is_valid_tile = cur_block_m * cfg.BLOCK_M < seq_len_extend
         seq_len_extend = tl.where(is_valid_tile, seq_len_extend, 0)
         cur_seq_kv_start_idx = gl.load(self.kv_indptr + cur_seq)
-        seq_len_prefix_raw = (gl.load(self.kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx).to(tl.int32)
+        seq_len_prefix_raw = (
+            gl.load(self.kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
+        ).to(tl.int32)
         seq_len_prefix = tl.where(is_valid_tile, seq_len_prefix_raw, 0)
 
         return (
-            cur_seq, cur_head, cur_block_m, cur_kv_head,
-            cur_seq_q_start_idx, seq_len_extend,
-            cur_seq_kv_start_idx, seq_len_prefix,
+            cur_seq,
+            cur_head,
+            cur_block_m,
+            cur_kv_head,
+            cur_seq_q_start_idx,
+            seq_len_extend,
+            cur_seq_kv_start_idx,
+            seq_len_prefix,
             is_valid_tile,
-            0,   # output_tile (unused for data-centric)
-            0,   # k_split_id (unused for data-centric)
+            0,  # output_tile (unused for data-centric)
+            0,  # k_split_id (unused for data-centric)
         )
 
     @gluon.jit
@@ -1778,7 +2058,9 @@ class ExtendAttnProgram:
             _s_start = gl.load(self.qo_indptr + cur_seq)
             _s_end = gl.load(self.qo_indptr + cur_seq + 1)
             s_ext = (_s_end - _s_start).to(tl.int32)
-            s_tiles = tl.maximum((s_ext + cfg.BLOCK_M - 1) // cfg.BLOCK_M, 0) * self.num_heads
+            s_tiles = (
+                tl.maximum((s_ext + cfg.BLOCK_M - 1) // cfg.BLOCK_M, 0) * self.num_heads
+            )
             next_cum = cum_tiles + s_tiles
             if next_cum > output_tile:
                 found = 1
@@ -1789,7 +2071,9 @@ class ExtendAttnProgram:
         cur_seq = tl.minimum(cur_seq, self.actual_batch_size - 1)
 
         local_tile = output_tile - cum_tiles
-        seq_ext_len = (gl.load(self.qo_indptr + cur_seq + 1) - gl.load(self.qo_indptr + cur_seq)).to(tl.int32)
+        seq_ext_len = (
+            gl.load(self.qo_indptr + cur_seq + 1) - gl.load(self.qo_indptr + cur_seq)
+        ).to(tl.int32)
         tiles_per_head = tl.maximum((seq_ext_len + cfg.BLOCK_M - 1) // cfg.BLOCK_M, 1)
         cur_head = local_tile // tiles_per_head
         cur_block_m = local_tile % tiles_per_head
@@ -1798,15 +2082,23 @@ class ExtendAttnProgram:
         cur_seq_q_start_idx = gl.load(self.qo_indptr + cur_seq)
         seq_len_extend = tl.where(is_valid_tile, seq_ext_len, 0)
         cur_seq_kv_start_idx = gl.load(self.kv_indptr + cur_seq)
-        seq_len_prefix_raw = (gl.load(self.kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx).to(tl.int32)
+        seq_len_prefix_raw = (
+            gl.load(self.kv_indptr + cur_seq + 1) - cur_seq_kv_start_idx
+        ).to(tl.int32)
         seq_len_prefix = tl.where(is_valid_tile, seq_len_prefix_raw, 0)
 
         return (
-            cur_seq, cur_head, cur_block_m, cur_kv_head,
-            cur_seq_q_start_idx, seq_len_extend,
-            cur_seq_kv_start_idx, seq_len_prefix,
+            cur_seq,
+            cur_head,
+            cur_block_m,
+            cur_kv_head,
+            cur_seq_q_start_idx,
+            seq_len_extend,
+            cur_seq_kv_start_idx,
+            seq_len_prefix,
             is_valid_tile,
-            output_tile, k_split_id,
+            output_tile,
+            k_split_id,
         )
 
     # --------------------------------------------------------------------- #
@@ -1837,7 +2129,9 @@ class ExtendAttnProgram:
         return mask_base_idx, mask_row_stride, mask_kv_col_offset
 
     @gluon.jit
-    def _load_q(self, cur_seq_q_start_idx, cur_head, cur_block_m, seq_len_extend, offs_m, offs_d):
+    def _load_q(
+        self, cur_seq_q_start_idx, cur_head, cur_block_m, seq_len_extend, offs_m, offs_d
+    ):
         """Q load shared by serial and pipelined kernels.
 
         ``q_dot`` and the optional FP8 ``pfx_q`` are layout-converted here
@@ -1846,7 +2140,8 @@ class ExtendAttnProgram:
         cfg: gl.constexpr = self.cfg
         q_ptrs = (
             self.Q_Extend
-            + (cur_seq_q_start_idx + cur_block_m * cfg.BLOCK_M + offs_m[:, None]) * self.stride_qbs
+            + (cur_seq_q_start_idx + cur_block_m * cfg.BLOCK_M + offs_m[:, None])
+            * self.stride_qbs
             + cur_head * self.stride_qh
             + offs_d[None, :]
         )
@@ -1863,9 +2158,18 @@ class ExtendAttnProgram:
     def _init_softmax(self):
         """m_i (-inf), l_i (1.0), acc (zeros) in the MMA layouts."""
         cfg: gl.constexpr = self.cfg
-        m_i = gl.full([cfg.BLOCK_M], float("-inf"), dtype=gl.float32, layout=cfg.layouts.mma_m_layout)
-        l_i = gl.full([cfg.BLOCK_M], 1.0, dtype=gl.float32, layout=cfg.layouts.mma_m_layout)
-        acc = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_DV], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+        m_i = gl.full(
+            [cfg.BLOCK_M],
+            float("-inf"),
+            dtype=gl.float32,
+            layout=cfg.layouts.mma_m_layout,
+        )
+        l_i = gl.full(
+            [cfg.BLOCK_M], 1.0, dtype=gl.float32, layout=cfg.layouts.mma_m_layout
+        )
+        acc = gl.zeros(
+            [cfg.BLOCK_M, cfg.BLOCK_DV], dtype=gl.float32, layout=cfg.layouts.mma_layout
+        )
         return m_i, l_i, acc
 
     @gluon.jit
@@ -1882,16 +2186,26 @@ class ExtendAttnProgram:
             xai_temperature_reg = gl.where(
                 q_abs_pos > cfg.XAI_TEMPERATURE_LEN,
                 tl.log2(q_abs_pos.to(gl.float32)) * inv_log2_len,
-                gl.full([cfg.BLOCK_M], 1.0, dtype=gl.float32, layout=cfg.layouts.mma_offs_m_row),
+                gl.full(
+                    [cfg.BLOCK_M],
+                    1.0,
+                    dtype=gl.float32,
+                    layout=cfg.layouts.mma_offs_m_row,
+                ),
             )
         else:
             xai_temperature_reg = gl.full(
-                [cfg.BLOCK_M], 1.0, dtype=gl.float32, layout=cfg.layouts.mma_offs_m_row,
+                [cfg.BLOCK_M],
+                1.0,
+                dtype=gl.float32,
+                layout=cfg.layouts.mma_offs_m_row,
             )
         return q_abs_pos, xai_temperature_reg
 
     @gluon.jit
-    def _compute_swa_skip(self, cur_seq_kv_start_idx, seq_len_prefix, cur_block_m, q_abs_pos):
+    def _compute_swa_skip(
+        self, cur_seq_kv_start_idx, seq_len_prefix, cur_block_m, q_abs_pos
+    ):
         """SWA prefix skip: jump past prefix tiles entirely outside the window.
 
         For the M-tile, min q_abs_pos = seq_len_prefix + cur_block_m * BLOCK_M.
@@ -1911,7 +2225,9 @@ class ExtendAttnProgram:
         return pfx_kv_start, pfx_seq_len, pfx_q_abs_pos
 
     @gluon.jit
-    def _apply_splitk_prefix_partition(self, pfx_kv_start, pfx_seq_len, pfx_q_abs_pos, k_split_id, seq_len_extend):
+    def _apply_splitk_prefix_partition(
+        self, pfx_kv_start, pfx_seq_len, pfx_q_abs_pos, k_split_id, seq_len_extend
+    ):
         """Select this CTA's prefix slice for WCA split-K.
 
         ``SPLIT_K > 1`` partitions prefix KV blocks across WCA CTAs. All
@@ -1926,7 +2242,9 @@ class ExtendAttnProgram:
             my_block_end = tl.minimum((k_split_id + 1) * blocks_per_split, n_pfx_blocks)
             split_start_offset = my_block_start * cfg.BLOCK_N
             pfx_kv_start = pfx_kv_start + split_start_offset
-            pfx_seq_len = tl.minimum(my_block_end * cfg.BLOCK_N, pfx_seq_len) - split_start_offset
+            pfx_seq_len = (
+                tl.minimum(my_block_end * cfg.BLOCK_N, pfx_seq_len) - split_start_offset
+            )
             pfx_seq_len = tl.maximum(pfx_seq_len, 0)
             pfx_q_abs_pos = pfx_q_abs_pos - split_start_offset
             if k_split_id < cfg.SPLIT_K - 1:
@@ -1953,7 +2271,9 @@ class ExtendAttnProgram:
         if cfg.BLOCK_DMODEL >= 256 or cfg.USE_CUSTOM_MASK:
             # One combined dispatch covers the whole range with per-step masking.
             n_full_blocks = 0
-        elif cfg.SLIDING_WINDOW_SIZE > 0 and (cfg.IS_FP8 or effective_end > cfg.SLIDING_WINDOW_SIZE):
+        elif cfg.SLIDING_WINDOW_SIZE > 0 and (
+            cfg.IS_FP8 or effective_end > cfg.SLIDING_WINDOW_SIZE
+        ):
             # Mixed SWA coverage: fall back to masked dispatch for all blocks.
             n_full_blocks = 0
         else:
@@ -1966,7 +2286,9 @@ class ExtendAttnProgram:
             n_full_blocks = n_extend_blocks - masked_blocks
 
         if cfg.SLIDING_WINDOW_SIZE > 0 and cfg.IS_CAUSAL:
-            swa_first_useful = tl.maximum(cur_block_m * cfg.BLOCK_M - cfg.SLIDING_WINDOW_SIZE, 0)
+            swa_first_useful = tl.maximum(
+                cur_block_m * cfg.BLOCK_M - cfg.SLIDING_WINDOW_SIZE, 0
+            )
             swa_skip_n_blocks = swa_first_useful // EXT_N
         else:
             swa_skip_n_blocks = 0
@@ -1977,15 +2299,20 @@ class ExtendAttnProgram:
     # Online softmax: scale + optional mask + exp2 + stream-update of
     # (acc, l_i, m_i). The prefix variant and the fused extend variant
     # both take ``qk`` as the input tensor; the extend split variants
-    # let the caller overlap the VALU work with V DMA.
+    # let the caller overlap vector ALU work with V DMA.
     # --------------------------------------------------------------------- #
 
     @gluon.jit
     def compute_softmax_prefix(
         self,
-        acc, l_i, m_i, qk,
-        start_n, seq_len_prefix,
-        qk_scale, xai_temperature_reg,
+        acc,
+        l_i,
+        m_i,
+        qk,
+        start_n,
+        seq_len_prefix,
+        qk_scale,
+        xai_temperature_reg,
         q_abs_pos,
         BLOCK_N: gl.constexpr,
         ENABLE_PREFIX_UNMASKED: gl.constexpr,
@@ -2012,13 +2339,11 @@ class ExtendAttnProgram:
         bound_offs = start_n + gl.arange(0, BLOCK_N, layout=cfg.layouts.mma_offs_n_col)
         is_partial_tail = (start_n + BLOCK_N) > seq_len_prefix
         if cfg.SLIDING_WINDOW_SIZE > 0:
-            swa_safe = (tl.max(q_abs_pos) <= start_n + cfg.SLIDING_WINDOW_SIZE)
+            swa_safe = tl.max(q_abs_pos) <= start_n + cfg.SLIDING_WINDOW_SIZE
         else:
             swa_safe = True
         use_unmasked_path = (
-            ENABLE_PREFIX_UNMASKED
-            and swa_safe
-            and (not is_partial_tail)
+            ENABLE_PREFIX_UNMASKED and swa_safe and (not is_partial_tail)
         )
 
         if use_unmasked_path:
@@ -2026,7 +2351,9 @@ class ExtendAttnProgram:
             m_new = gl.maximum(m_i, m_ij, propagate_nan=tl.PropagateNan.ALL)
             p = gl.exp2(qk_scaled - m_new[:, None])
         else:
-            bound_mask = (q_abs_pos[:, None] >= 0) & (bound_offs[None, :] < seq_len_prefix)
+            bound_mask = (q_abs_pos[:, None] >= 0) & (
+                bound_offs[None, :] < seq_len_prefix
+            )
             if cfg.SLIDING_WINDOW_SIZE > 0:
                 bound_mask = bound_mask & (
                     q_abs_pos[:, None] <= bound_offs[None, :] + cfg.SLIDING_WINDOW_SIZE
@@ -2035,8 +2362,10 @@ class ExtendAttnProgram:
                 bound_mask,
                 qk_scaled,
                 gl.full(
-                    [cfg.BLOCK_M, BLOCK_N], float("-inf"),
-                    dtype=gl.float32, layout=cfg.layouts.mma_layout,
+                    [cfg.BLOCK_M, BLOCK_N],
+                    float("-inf"),
+                    dtype=gl.float32,
+                    layout=cfg.layouts.mma_layout,
                 ),
             )
 
@@ -2063,10 +2392,16 @@ class ExtendAttnProgram:
     @gluon.jit
     def softmax_part0(
         self,
-        m_i, qk,
-        start_n, cur_block_m, seq_len_extend,
-        qk_scale, xai_temperature_reg,
-        mask_base_idx, mask_row_stride, mask_kv_col_offset,
+        m_i,
+        qk,
+        start_n,
+        cur_block_m,
+        seq_len_extend,
+        qk_scale,
+        xai_temperature_reg,
+        mask_base_idx,
+        mask_row_stride,
+        mask_kv_col_offset,
         BLOCK_N: gl.constexpr,
         MASK_STEPS: gl.constexpr,
     ):
@@ -2088,8 +2423,12 @@ class ExtendAttnProgram:
         if cfg.XAI_TEMPERATURE_LEN > 0:
             qk_scaled = qk_scaled * xai_temperature_reg[:, None]
         if MASK_STEPS:
-            bound_offs = start_n + gl.arange(0, BLOCK_N, layout=cfg.layouts.mma_offs_n_col)
-            q_offs = cur_block_m * cfg.BLOCK_M + gl.arange(0, cfg.BLOCK_M, layout=cfg.layouts.mma_offs_m_row)
+            bound_offs = start_n + gl.arange(
+                0, BLOCK_N, layout=cfg.layouts.mma_offs_n_col
+            )
+            q_offs = cur_block_m * cfg.BLOCK_M + gl.arange(
+                0, cfg.BLOCK_M, layout=cfg.layouts.mma_offs_m_row
+            )
             valid_mask = q_offs[:, None] < seq_len_extend
             valid_mask = valid_mask & (bound_offs[None, :] < seq_len_extend)
             if cfg.USE_CUSTOM_MASK:
@@ -2113,8 +2452,10 @@ class ExtendAttnProgram:
                 valid_mask,
                 qk_scaled,
                 gl.full(
-                    [cfg.BLOCK_M, BLOCK_N], float("-inf"),
-                    dtype=gl.float32, layout=cfg.layouts.mma_layout,
+                    [cfg.BLOCK_M, BLOCK_N],
+                    float("-inf"),
+                    dtype=gl.float32,
+                    layout=cfg.layouts.mma_layout,
                 ),
             )
 
@@ -2154,10 +2495,18 @@ class ExtendAttnProgram:
     @gluon.jit
     def compute_softmax_extend(
         self,
-        acc, l_i, m_i, qk,
-        start_n, cur_block_m, seq_len_extend,
-        qk_scale, xai_temperature_reg,
-        mask_base_idx, mask_row_stride, mask_kv_col_offset,
+        acc,
+        l_i,
+        m_i,
+        qk,
+        start_n,
+        cur_block_m,
+        seq_len_extend,
+        qk_scale,
+        xai_temperature_reg,
+        mask_base_idx,
+        mask_row_stride,
+        mask_kv_col_offset,
         BLOCK_N: gl.constexpr,
         MASK_STEPS: gl.constexpr,
     ):
@@ -2167,11 +2516,18 @@ class ExtendAttnProgram:
         the split form for warp-pipelined overlap between QK MMA and V DMA.
         """
         p, alpha, m_new = self.softmax_part0(
-            m_i, qk,
-            start_n, cur_block_m, seq_len_extend,
-            qk_scale, xai_temperature_reg,
-            mask_base_idx, mask_row_stride, mask_kv_col_offset,
-            BLOCK_N, MASK_STEPS,
+            m_i,
+            qk,
+            start_n,
+            cur_block_m,
+            seq_len_extend,
+            qk_scale,
+            xai_temperature_reg,
+            mask_base_idx,
+            mask_row_stride,
+            mask_kv_col_offset,
+            BLOCK_N,
+            MASK_STEPS,
         )
         acc, l_i, m_i = self.softmax_part1(acc, l_i, p, alpha, m_new)
         return acc, l_i, m_i, p
@@ -2188,10 +2544,17 @@ class ExtendAttnProgram:
     @gluon.jit
     def attn_fwd_inner_prefix_unpipelined(
         self,
-        acc, l_i, m_i, q_dot,
-        kv_start, cur_kv_head, seq_len_prefix,
+        acc,
+        l_i,
+        m_i,
+        q_dot,
+        kv_start,
+        cur_kv_head,
+        seq_len_prefix,
         bank,
-        qk_scale, xai_temperature_reg, q_abs_pos,
+        qk_scale,
+        xai_temperature_reg,
+        q_abs_pos,
         block_start=0,
     ):
         """Serial prefix inner: one-slot synchronous-ish DMA loop.
@@ -2205,14 +2568,28 @@ class ExtendAttnProgram:
         n_prefix_blocks = (seq_len_prefix + cfg.BLOCK_N - 1) // cfg.BLOCK_N
 
         kt_loader = AsyncKVLoader.for_prefix_k(
-            bank.kt_smem, self.K_Buffer, cur_kv_head, self.kv_indices,
-            kv_start, self.stride_buf_kbs, self.stride_buf_kh,
-            cfg.BLOCK_N, cfg.BLOCK_DMODEL, bank.kt_async_layout,
+            bank.kt_smem,
+            self.K_Buffer,
+            cur_kv_head,
+            self.kv_indices,
+            kv_start,
+            self.stride_buf_kbs,
+            self.stride_buf_kh,
+            cfg.BLOCK_N,
+            cfg.BLOCK_DMODEL,
+            bank.kt_async_layout,
         )
         v_loader = AsyncKVLoader.for_prefix_v(
-            bank.v_smem, self.V_Buffer, cur_kv_head, self.kv_indices,
-            kv_start, self.stride_buf_vbs, self.stride_buf_vh,
-            cfg.BLOCK_N, cfg.BLOCK_DV, bank.v_async_layout,
+            bank.v_smem,
+            self.V_Buffer,
+            cur_kv_head,
+            self.kv_indices,
+            kv_start,
+            self.stride_buf_vbs,
+            self.stride_buf_vh,
+            cfg.BLOCK_N,
+            cfg.BLOCK_DV,
+            bank.v_async_layout,
         )
 
         for block_n in tl.range(block_start, n_prefix_blocks):
@@ -2225,22 +2602,35 @@ class ExtendAttnProgram:
             # QK MMA runs, then drain it before the P*V MMA below.
             cdna4_async.wait_group(1)
             kt_dot = cdna4_async.load_shared_relaxed(
-                bank.kt_smem.index(0), cfg.layouts.pfx_kt_dot_layout,
+                bank.kt_smem.index(0),
+                cfg.layouts.pfx_kt_dot_layout,
             )
 
-            qk = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+            qk = gl.zeros(
+                [cfg.BLOCK_M, cfg.BLOCK_N],
+                dtype=gl.float32,
+                layout=cfg.layouts.mma_layout,
+            )
             qk = do_mma(q_dot, kt_dot, qk)
 
             acc, l_i, m_i, p = self.compute_softmax_prefix(
-                acc, l_i, m_i, qk,
-                start_n, seq_len_prefix,
-                qk_scale, xai_temperature_reg, q_abs_pos,
-                cfg.BLOCK_N, cfg.ENABLE_PREFIX_UNMASKED,
+                acc,
+                l_i,
+                m_i,
+                qk,
+                start_n,
+                seq_len_prefix,
+                qk_scale,
+                xai_temperature_reg,
+                q_abs_pos,
+                cfg.BLOCK_N,
+                cfg.ENABLE_PREFIX_UNMASKED,
             )
 
             cdna4_async.wait_group(0)
             v_dot = cdna4_async.load_shared_relaxed(
-                bank.v_smem.index(0), cfg.layouts.pfx_v_dot_layout,
+                bank.v_smem.index(0),
+                cfg.layouts.pfx_v_dot_layout,
             )
             p_cast = p.to(v_dot.dtype)
             p_dot = gl.convert_layout(p_cast, cfg.layouts.pfx_p_dot_layout)
@@ -2260,12 +2650,22 @@ class ExtendAttnProgram:
     @gluon.jit
     def _attn_fwd_inner_extend_unpipelined_block_span(
         self,
-        acc, l_i, m_i, q_dot,
-        cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-        block_start, block_end,
+        acc,
+        l_i,
+        m_i,
+        q_dot,
+        cur_seq_q_start_idx,
+        cur_kv_head,
+        cur_block_m,
+        seq_len_extend,
+        block_start,
+        block_end,
         bank,
-        qk_scale, xai_temperature_reg,
-        mask_base_idx, mask_row_stride, mask_kv_col_offset,
+        qk_scale,
+        xai_temperature_reg,
+        mask_base_idx,
+        mask_row_stride,
+        mask_kv_col_offset,
         EXT_N: gl.constexpr,
         MASK_STEPS: gl.constexpr,
         SKIP_BOUNDS_CHECK: gl.constexpr = False,
@@ -2283,14 +2683,26 @@ class ExtendAttnProgram:
         cfg: gl.constexpr = self.cfg
 
         kt_loader = AsyncKVLoader.for_extend_k(
-            bank.kt_smem, self.K_Extend, cur_seq_q_start_idx, cur_kv_head,
-            self.stride_kbs, self.stride_kh,
-            EXT_N, cfg.BLOCK_DMODEL, bank.kt_async_layout,
+            bank.kt_smem,
+            self.K_Extend,
+            cur_seq_q_start_idx,
+            cur_kv_head,
+            self.stride_kbs,
+            self.stride_kh,
+            EXT_N,
+            cfg.BLOCK_DMODEL,
+            bank.kt_async_layout,
         )
         v_loader = AsyncKVLoader.for_extend_v(
-            bank.v_smem, self.V_Extend, cur_seq_q_start_idx, cur_kv_head,
-            self.stride_vbs, self.stride_vh,
-            EXT_N, cfg.BLOCK_DV, bank.v_async_layout,
+            bank.v_smem,
+            self.V_Extend,
+            cur_seq_q_start_idx,
+            cur_kv_head,
+            self.stride_vbs,
+            self.stride_vh,
+            EXT_N,
+            cfg.BLOCK_DV,
+            bank.v_async_layout,
         )
 
         cdna4_async.wait_group(0)
@@ -2316,22 +2728,35 @@ class ExtendAttnProgram:
             start_n = (block_start + local_idx) * EXT_N
 
             kt_dot = cdna4_async.load_shared_relaxed(
-                bank.kt_smem.index(buf_idx), cfg.layouts.kt_dot_layout,
+                bank.kt_smem.index(buf_idx),
+                cfg.layouts.kt_dot_layout,
             )
 
-            qk = gl.zeros([cfg.BLOCK_M, EXT_N], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+            qk = gl.zeros(
+                [cfg.BLOCK_M, EXT_N], dtype=gl.float32, layout=cfg.layouts.mma_layout
+            )
             qk = do_mma(q_dot, kt_dot, qk)
 
             acc, l_i, m_i, p = self.compute_softmax_extend(
-                acc, l_i, m_i, qk,
-                start_n, cur_block_m, seq_len_extend,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
-                EXT_N, MASK_STEPS,
+                acc,
+                l_i,
+                m_i,
+                qk,
+                start_n,
+                cur_block_m,
+                seq_len_extend,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
+                EXT_N,
+                MASK_STEPS,
             )
 
             v_dot = cdna4_async.load_shared_relaxed(
-                bank.v_smem.index(buf_idx), cfg.layouts.v_dot_layout,
+                bank.v_smem.index(buf_idx),
+                cfg.layouts.v_dot_layout,
             )
             p_cast = p.to(v_dot.dtype)
             p_dot = gl.convert_layout(p_cast, cfg.layouts.p_dot_layout)
@@ -2354,8 +2779,15 @@ class ExtendAttnProgram:
 
     @gluon.jit
     def _normalize_and_store(
-        self, cur_seq_q_start_idx, cur_head, cur_block_m, seq_len_extend,
-        acc, l_i, offs_m, offs_dv,
+        self,
+        cur_seq_q_start_idx,
+        cur_head,
+        cur_block_m,
+        seq_len_extend,
+        acc,
+        l_i,
+        offs_m,
+        offs_dv,
     ):
         """Data-centric path (no split-K): normalize + v_scale + buffer_store output."""
         cfg: gl.constexpr = self.cfg
@@ -2363,20 +2795,35 @@ class ExtendAttnProgram:
         acc = acc * l_recip[:, None]
         acc = acc * self.v_scale
 
-        o_base = self.O_Extend + cur_seq_q_start_idx * self.stride_obs + cur_head * self.stride_oh
-        o_offsets = ((cur_block_m * cfg.BLOCK_M + offs_m[:, None]) * self.stride_obs + offs_dv[None, :]).to(tl.int32)
+        o_base = (
+            self.O_Extend
+            + cur_seq_q_start_idx * self.stride_obs
+            + cur_head * self.stride_oh
+        )
+        o_offsets = (
+            (cur_block_m * cfg.BLOCK_M + offs_m[:, None]) * self.stride_obs
+            + offs_dv[None, :]
+        ).to(tl.int32)
         o_mask = (cur_block_m * cfg.BLOCK_M + offs_m[:, None]) < seq_len_extend
-        out = gl.convert_layout(acc, cfg.layouts.blocked_layout).to(self.O_Extend.dtype.element_ty)
+        out = gl.convert_layout(acc, cfg.layouts.blocked_layout).to(
+            self.O_Extend.dtype.element_ty
+        )
         cdna4_buffer_store(out, o_base, o_offsets, mask=o_mask)
 
     @gluon.jit
     def _splitk_partial_store_and_reduce(
         self,
-        output_tile, k_split_id,
-        cur_seq_q_start_idx, cur_head, cur_block_m,
+        output_tile,
+        k_split_id,
+        cur_seq_q_start_idx,
+        cur_head,
+        cur_block_m,
         orig_seq_len_extend,
-        acc, l_i, m_i,
-        offs_m, offs_dv,
+        acc,
+        l_i,
+        m_i,
+        offs_m,
+        offs_dv,
     ):
         """Split-K partial store + atomic-counter-gated final reduce.
 
@@ -2410,37 +2857,57 @@ class ExtendAttnProgram:
             r_base_0 = output_tile * cfg.SPLIT_K
             r_lse = gl.load(
                 self.partial_lse + r_base_0 * cfg.BLOCK_M + offs_m,
-                mask=r_m_mask, other=float("-inf"),
+                mask=r_m_mask,
+                other=float("-inf"),
             )
             r_acc = gl.load(
-                self.partial_out + r_base_0 * cfg.BLOCK_M * cfg.BLOCK_DV
-                + offs_m[:, None] * cfg.BLOCK_DV + offs_dv[None, :],
-                mask=r_m_mask[:, None], other=0.0,
+                self.partial_out
+                + r_base_0 * cfg.BLOCK_M * cfg.BLOCK_DV
+                + offs_m[:, None] * cfg.BLOCK_DV
+                + offs_dv[None, :],
+                mask=r_m_mask[:, None],
+                other=0.0,
             )
             for _sk in tl.static_range(1, cfg.SPLIT_K):
                 r_base_k = r_base_0 + _sk
                 lse_k = gl.load(
                     self.partial_lse + r_base_k * cfg.BLOCK_M + offs_m,
-                    mask=r_m_mask, other=float("-inf"),
+                    mask=r_m_mask,
+                    other=float("-inf"),
                 )
                 acc_k = gl.load(
-                    self.partial_out + r_base_k * cfg.BLOCK_M * cfg.BLOCK_DV
-                    + offs_m[:, None] * cfg.BLOCK_DV + offs_dv[None, :],
-                    mask=r_m_mask[:, None], other=0.0,
+                    self.partial_out
+                    + r_base_k * cfg.BLOCK_M * cfg.BLOCK_DV
+                    + offs_m[:, None] * cfg.BLOCK_DV
+                    + offs_dv[None, :],
+                    mask=r_m_mask[:, None],
+                    other=0.0,
                 )
                 max_lse = gl.maximum(r_lse, lse_k)
                 w_old = gl.exp2(r_lse - max_lse)
                 w_new = gl.exp2(lse_k - max_lse)
                 denom = w_old + w_new
-                r_acc = (r_acc * w_old[:, None] + acc_k * w_new[:, None]) / denom[:, None]
+                r_acc = (r_acc * w_old[:, None] + acc_k * w_new[:, None]) / denom[
+                    :, None
+                ]
                 r_lse = max_lse + tl.log2(denom)
 
             r_acc = r_acc * self.v_scale
-            r_o_base = self.O_Extend + cur_seq_q_start_idx * self.stride_obs + cur_head * self.stride_oh
-            r_o_offsets = ((cur_block_m * cfg.BLOCK_M + offs_m[:, None]) * self.stride_obs + offs_dv[None, :]).to(tl.int32)
+            r_o_base = (
+                self.O_Extend
+                + cur_seq_q_start_idx * self.stride_obs
+                + cur_head * self.stride_oh
+            )
+            r_o_offsets = (
+                (cur_block_m * cfg.BLOCK_M + offs_m[:, None]) * self.stride_obs
+                + offs_dv[None, :]
+            ).to(tl.int32)
             r_o_mask = r_m_mask[:, None]
-            out_r = gl.convert_layout(r_acc, cfg.layouts.blocked_layout).to(self.O_Extend.dtype.element_ty)
+            out_r = gl.convert_layout(r_acc, cfg.layouts.blocked_layout).to(
+                self.O_Extend.dtype.element_ty
+            )
             cdna4_buffer_store(out_r, r_o_base, r_o_offsets, mask=r_o_mask)
+
 
 # ===---------------------------------------------------------------------===#
 # Schedule-specific program wrappers
@@ -2466,64 +2933,111 @@ class ExtendAttnSerialProgram:
         """
         cfg: gl.constexpr = self.cfg
         tl.static_assert(cfg.NUM_STAGES == 1, "serial program requires NUM_STAGES=1")
-        tl.static_assert(cfg.num_warps == 2 or cfg.num_warps == 4,
-                         "serial program serves NW in {2, 4}; NW>=8 routes to 8w pingpong")
         tl.static_assert(
-            cfg.BLOCK_DMODEL == 64 or cfg.BLOCK_DMODEL == 128 or cfg.BLOCK_DMODEL == 256,
+            cfg.num_warps == 2 or cfg.num_warps == 4,
+            "serial program serves NW in {2, 4}; NW>=8 routes to 8w pingpong",
+        )
+        tl.static_assert(
+            cfg.BLOCK_DMODEL == 64
+            or cfg.BLOCK_DMODEL == 128
+            or cfg.BLOCK_DMODEL == 256,
             "BLOCK_DMODEL must be in {64, 128, 256}",
         )
-        tl.static_assert(not cfg.IS_FP8 or cfg.BLOCK_DMODEL != 256,
-                         "FP8 D=256 unsupported (MFMA_F8 gfx950 codegen failure)")
+        tl.static_assert(
+            not cfg.IS_FP8 or cfg.BLOCK_DMODEL != 256,
+            "FP8 D=256 unsupported (MFMA_F8 gfx950 codegen failure)",
+        )
 
         qk_scale = self.sm_scale * LOG2E
 
         # Tile coords (data-centric only for serial).
-        (cur_seq, cur_head, cur_block_m, cur_kv_head,
-         cur_seq_q_start_idx, seq_len_extend,
-         cur_seq_kv_start_idx, seq_len_prefix,
-         is_valid_tile, _, _) = self._schedule_data_centric()
+        (
+            cur_seq,
+            cur_head,
+            cur_block_m,
+            cur_kv_head,
+            cur_seq_q_start_idx,
+            seq_len_extend,
+            cur_seq_kv_start_idx,
+            seq_len_prefix,
+            is_valid_tile,
+            _,
+            _,
+        ) = self._schedule_data_centric()
 
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=cfg.layouts.offs_m_layout)
         offs_d = gl.arange(0, cfg.BLOCK_DMODEL, layout=cfg.layouts.offs_d_layout)
         offs_dv = gl.arange(0, cfg.BLOCK_DV, layout=cfg.layouts.offs_d_layout)
 
-        kt_blocked_layout: gl.constexpr = ExtendAttentionLayouts.make_serial_kt_blocked(cfg.num_warps)
+        kt_blocked_layout: gl.constexpr = ExtendAttentionLayouts.make_serial_kt_blocked(
+            cfg.num_warps
+        )
         kt_prefix_smem = gl.allocate_shared_memory(
-            cfg.layouts.PFX_SMEM_TY, [cfg.BLOCK_DMODEL, cfg.BLOCK_N], layout=SERIAL_KT_SMEM,
+            cfg.layouts.PFX_SMEM_TY,
+            [cfg.BLOCK_DMODEL, cfg.BLOCK_N],
+            layout=SERIAL_KT_SMEM,
         )
         v_prefix_smem = gl.allocate_shared_memory(
-            cfg.layouts.PFX_SMEM_TY, [cfg.BLOCK_N, cfg.BLOCK_DV], layout=SERIAL_V_SMEM,
+            cfg.layouts.PFX_SMEM_TY,
+            [cfg.BLOCK_N, cfg.BLOCK_DV],
+            layout=SERIAL_V_SMEM,
         )
         if cfg.IS_FP8:
             kt_extend_smem = gl.allocate_shared_memory(
-                self.Q_Extend.dtype.element_ty, [cfg.BLOCK_DMODEL, cfg.BLOCK_N], layout=SERIAL_KT_SMEM,
+                self.Q_Extend.dtype.element_ty,
+                [cfg.BLOCK_DMODEL, cfg.BLOCK_N],
+                layout=SERIAL_KT_SMEM,
             )
             v_extend_smem = gl.allocate_shared_memory(
-                self.Q_Extend.dtype.element_ty, [cfg.BLOCK_N, cfg.BLOCK_DV], layout=SERIAL_V_SMEM,
+                self.Q_Extend.dtype.element_ty,
+                [cfg.BLOCK_N, cfg.BLOCK_DV],
+                layout=SERIAL_V_SMEM,
             )
         else:
             kt_extend_smem = kt_prefix_smem
             v_extend_smem = v_prefix_smem
 
-        kt_offs_d = gl.arange(0, cfg.BLOCK_DMODEL, layout=gl.SliceLayout(dim=1, parent=kt_blocked_layout))
-        kt_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(dim=0, parent=kt_blocked_layout))
-        v_offs_n = gl.arange(0, cfg.BLOCK_N, layout=gl.SliceLayout(dim=1, parent=cfg.layouts.blocked_layout))
-        v_offs_d = gl.arange(0, cfg.BLOCK_DV, layout=gl.SliceLayout(dim=0, parent=cfg.layouts.blocked_layout))
+        kt_offs_d = gl.arange(
+            0, cfg.BLOCK_DMODEL, layout=gl.SliceLayout(dim=1, parent=kt_blocked_layout)
+        )
+        kt_offs_n = gl.arange(
+            0, cfg.BLOCK_N, layout=gl.SliceLayout(dim=0, parent=kt_blocked_layout)
+        )
+        v_offs_n = gl.arange(
+            0,
+            cfg.BLOCK_N,
+            layout=gl.SliceLayout(dim=1, parent=cfg.layouts.blocked_layout),
+        )
+        v_offs_d = gl.arange(
+            0,
+            cfg.BLOCK_DV,
+            layout=gl.SliceLayout(dim=0, parent=cfg.layouts.blocked_layout),
+        )
 
-        mask_base_idx, mask_row_stride, mask_kv_col_offset = (
-            self._compute_mask_state(cur_seq, seq_len_extend, seq_len_prefix)
+        mask_base_idx, mask_row_stride, mask_kv_col_offset = self._compute_mask_state(
+            cur_seq, seq_len_extend, seq_len_prefix
         )
 
         q_dot, pfx_q = self._load_q(
-            cur_seq_q_start_idx, cur_head, cur_block_m, seq_len_extend, offs_m, offs_d,
+            cur_seq_q_start_idx,
+            cur_head,
+            cur_block_m,
+            seq_len_extend,
+            offs_m,
+            offs_d,
         )
 
         m_i, l_i, acc = self._init_softmax()
-        q_abs_pos, xai_temperature_reg = self._compute_q_abs_pos_and_xai(seq_len_prefix, cur_block_m)
+        q_abs_pos, xai_temperature_reg = self._compute_q_abs_pos_and_xai(
+            seq_len_prefix, cur_block_m
+        )
 
         # Serial kernel uses the same SWA prefix-skip as pipelined kernels.
         pfx_kv_start, pfx_seq_len, pfx_q_abs_pos = self._compute_swa_skip(
-            cur_seq_kv_start_idx, seq_len_prefix, cur_block_m, q_abs_pos,
+            cur_seq_kv_start_idx,
+            seq_len_prefix,
+            cur_block_m,
+            q_abs_pos,
         )
 
         # Prefix loop: serial, synchronous gather.
@@ -2537,31 +3051,59 @@ class ExtendAttnSerialProgram:
             n_idx_k = start_n + kt_offs_n
             mask_n_k = n_idx_k < pfx_seq_len
             kv_locs_k = cdna4_buffer_load(
-                kv_indices_base, n_idx_k.to(tl.int32), mask=mask_n_k, other=0,
+                kv_indices_base,
+                n_idx_k.to(tl.int32),
+                mask=mask_n_k,
+                other=0,
             ).to(tl.int32)
-            kt_offsets = (kt_offs_d[:, None] + kv_locs_k[None, :] * self.stride_buf_kbs).to(tl.int32)
+            kt_offsets = (
+                kt_offs_d[:, None] + kv_locs_k[None, :] * self.stride_buf_kbs
+            ).to(tl.int32)
             kt_global = cdna4_buffer_load(
-                k_prefix_base, kt_offsets, mask=mask_n_k[None, :], other=0.0,
+                k_prefix_base,
+                kt_offsets,
+                mask=mask_n_k[None, :],
+                other=0.0,
             )
             kt_prefix_smem.store(kt_global)
             kt_dot = kt_prefix_smem.load(cfg.layouts.pfx_kt_dot_layout)
 
-            qk = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+            qk = gl.zeros(
+                [cfg.BLOCK_M, cfg.BLOCK_N],
+                dtype=gl.float32,
+                layout=cfg.layouts.mma_layout,
+            )
             qk = do_mma(pfx_q, kt_dot, qk)
             acc, l_i, m_i, p = self.compute_softmax_prefix(
-                acc, l_i, m_i, qk, start_n, pfx_seq_len,
-                qk_scale, xai_temperature_reg, pfx_q_abs_pos,
-                cfg.BLOCK_N, ENABLE_PREFIX_UNMASKED=cfg.IS_CAUSAL,
+                acc,
+                l_i,
+                m_i,
+                qk,
+                start_n,
+                pfx_seq_len,
+                qk_scale,
+                xai_temperature_reg,
+                pfx_q_abs_pos,
+                cfg.BLOCK_N,
+                ENABLE_PREFIX_UNMASKED=cfg.IS_CAUSAL,
             )
 
             n_idx_v = start_n + v_offs_n
             mask_n_v = n_idx_v < pfx_seq_len
             kv_locs_v = cdna4_buffer_load(
-                kv_indices_base, n_idx_v.to(tl.int32), mask=mask_n_v, other=0,
+                kv_indices_base,
+                n_idx_v.to(tl.int32),
+                mask=mask_n_v,
+                other=0,
             ).to(tl.int32)
-            v_offsets = (kv_locs_v[:, None] * self.stride_buf_vbs + v_offs_d[None, :]).to(tl.int32)
+            v_offsets = (
+                kv_locs_v[:, None] * self.stride_buf_vbs + v_offs_d[None, :]
+            ).to(tl.int32)
             v_global = cdna4_buffer_load(
-                v_prefix_base, v_offsets, mask=mask_n_v[:, None], other=0.0,
+                v_prefix_base,
+                v_offsets,
+                mask=mask_n_v[:, None],
+                other=0.0,
             )
             v_prefix_smem.store(v_global)
             v_dot = v_prefix_smem.load(cfg.layouts.pfx_v_dot_layout)
@@ -2575,8 +3117,16 @@ class ExtendAttnSerialProgram:
             if not cfg.IS_CAUSAL
             else tl.minimum(seq_len_extend, (cur_block_m + 1) * cfg.BLOCK_M)
         )
-        k_extend_base = self.K_Extend + cur_seq_q_start_idx * self.stride_kbs + cur_kv_head * self.stride_kh
-        v_extend_base = self.V_Extend + cur_seq_q_start_idx * self.stride_vbs + cur_kv_head * self.stride_vh
+        k_extend_base = (
+            self.K_Extend
+            + cur_seq_q_start_idx * self.stride_kbs
+            + cur_kv_head * self.stride_kh
+        )
+        v_extend_base = (
+            self.V_Extend
+            + cur_seq_q_start_idx * self.stride_vbs
+            + cur_kv_head * self.stride_vh
+        )
         n_extend_blocks = (cur_block_m_end + cfg.BLOCK_N - 1) // cfg.BLOCK_N
         for block_n in tl.range(0, n_extend_blocks):
             start_n = block_n * cfg.BLOCK_N
@@ -2584,24 +3134,44 @@ class ExtendAttnSerialProgram:
             kt_idx = start_n + kt_offs_n[None, :]
             kt_offsets = (kt_offs_d[:, None] + kt_idx * self.stride_kbs).to(tl.int32)
             kt_global = cdna4_buffer_load(
-                k_extend_base, kt_offsets, mask=kt_idx < cur_block_m_end, other=0.0,
+                k_extend_base,
+                kt_offsets,
+                mask=kt_idx < cur_block_m_end,
+                other=0.0,
             )
             kt_extend_smem.store(kt_global)
             kt_dot = kt_extend_smem.load(cfg.layouts.kt_dot_layout)
 
-            qk = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+            qk = gl.zeros(
+                [cfg.BLOCK_M, cfg.BLOCK_N],
+                dtype=gl.float32,
+                layout=cfg.layouts.mma_layout,
+            )
             qk = do_mma(q_dot, kt_dot, qk)
             acc, l_i, m_i, p = self.compute_softmax_extend(
-                acc, l_i, m_i, qk, start_n, cur_block_m, seq_len_extend,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
-                cfg.BLOCK_N, MASK_STEPS=True,
+                acc,
+                l_i,
+                m_i,
+                qk,
+                start_n,
+                cur_block_m,
+                seq_len_extend,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
+                cfg.BLOCK_N,
+                MASK_STEPS=True,
             )
 
             v_idx = start_n + v_offs_n[:, None]
             v_offsets = (v_idx * self.stride_vbs + v_offs_d[None, :]).to(tl.int32)
             v_global = cdna4_buffer_load(
-                v_extend_base, v_offsets, mask=v_idx < cur_block_m_end, other=0.0,
+                v_extend_base,
+                v_offsets,
+                mask=v_idx < cur_block_m_end,
+                other=0.0,
             )
             v_extend_smem.store(v_global)
             v_dot = v_extend_smem.load(cfg.layouts.v_dot_layout)
@@ -2611,8 +3181,14 @@ class ExtendAttnSerialProgram:
 
         l_i = self._apply_sinks(cur_head, l_i, m_i)
         self._normalize_and_store(
-            cur_seq_q_start_idx, cur_head, cur_block_m, seq_len_extend,
-            acc, l_i, offs_m, offs_dv,
+            cur_seq_q_start_idx,
+            cur_head,
+            cur_block_m,
+            seq_len_extend,
+            acc,
+            l_i,
+            offs_m,
+            offs_dv,
         )
 
 
@@ -2632,10 +3208,17 @@ class ExtendAttnSwPipeline4WProgram:
     @gluon.jit
     def attn_fwd_inner_prefix_sw_pipeline_4w(
         self,
-        acc, l_i, m_i, q_dot,
-        kv_start, cur_kv_head, seq_len_prefix,
+        acc,
+        l_i,
+        m_i,
+        q_dot,
+        kv_start,
+        cur_kv_head,
+        seq_len_prefix,
         bank,
-        qk_scale, xai_temperature_reg, q_abs_pos,
+        qk_scale,
+        xai_temperature_reg,
+        q_abs_pos,
     ):
         """4-warp sw-pipeline prefix: manually-scheduled async DMA loop.
 
@@ -2666,14 +3249,28 @@ class ExtendAttnSwPipeline4WProgram:
         WAIT_V: gl.constexpr = STREAMS * cfg.NUM_STAGES - STREAMS
 
         kt_loader = AsyncKVLoader.for_prefix_k(
-            bank.kt_smem, self.K_Buffer, cur_kv_head, self.kv_indices,
-            kv_start, self.stride_buf_kbs, self.stride_buf_kh,
-            cfg.BLOCK_N, cfg.BLOCK_DMODEL, kt_async_layout,
+            bank.kt_smem,
+            self.K_Buffer,
+            cur_kv_head,
+            self.kv_indices,
+            kv_start,
+            self.stride_buf_kbs,
+            self.stride_buf_kh,
+            cfg.BLOCK_N,
+            cfg.BLOCK_DMODEL,
+            kt_async_layout,
         )
         v_loader = AsyncKVLoader.for_prefix_v(
-            bank.v_smem, self.V_Buffer, cur_kv_head, self.kv_indices,
-            kv_start, self.stride_buf_vbs, self.stride_buf_vh,
-            cfg.BLOCK_N, cfg.BLOCK_DV, v_async_layout,
+            bank.v_smem,
+            self.V_Buffer,
+            cur_kv_head,
+            self.kv_indices,
+            kv_start,
+            self.stride_buf_vbs,
+            self.stride_buf_vh,
+            cfg.BLOCK_N,
+            cfg.BLOCK_DV,
+            v_async_layout,
         )
 
         for stage in gl.static_range(cfg.NUM_STAGES):
@@ -2682,12 +3279,18 @@ class ExtendAttnSwPipeline4WProgram:
             n_idx_k = pf_init_n + kt_offs_n
             mask_n_k = n_idx_k < seq_len_prefix
             kv_locs_k = cdna4_buffer_load(
-                kv_indices_base, n_idx_k.to(tl.int32), mask=mask_n_k, other=0,
+                kv_indices_base,
+                n_idx_k.to(tl.int32),
+                mask=mask_n_k,
+                other=0,
             ).to(tl.int32)
             n_idx_v = pf_init_n + v_offs_n
             mask_n_v = n_idx_v < seq_len_prefix
             kv_locs_v = cdna4_buffer_load(
-                kv_indices_base, n_idx_v.to(tl.int32), mask=mask_n_v, other=0,
+                kv_indices_base,
+                n_idx_v.to(tl.int32),
+                mask=mask_n_v,
+                other=0,
             ).to(tl.int32)
             kt_loader.issue_from_locs(kv_locs_k, mask_n_k, slot=stage)
             v_loader.issue_from_locs(kv_locs_v, mask_n_v, slot=stage)
@@ -2697,17 +3300,24 @@ class ExtendAttnSwPipeline4WProgram:
         n_idx_k_pf = pf_start_n + kt_offs_n
         mask_k_pf = n_idx_k_pf < seq_len_prefix
         kv_locs_k_pf = cdna4_buffer_load(
-            kv_indices_base, n_idx_k_pf.to(tl.int32), mask=mask_k_pf, other=0,
+            kv_indices_base,
+            n_idx_k_pf.to(tl.int32),
+            mask=mask_k_pf,
+            other=0,
         ).to(tl.int32)
         n_idx_v_pf = pf_start_n + v_offs_n
         mask_v_pf = n_idx_v_pf < seq_len_prefix
         kv_locs_v_pf = cdna4_buffer_load(
-            kv_indices_base, n_idx_v_pf.to(tl.int32), mask=mask_v_pf, other=0,
+            kv_indices_base,
+            n_idx_v_pf.to(tl.int32),
+            mask=mask_v_pf,
+            other=0,
         ).to(tl.int32)
 
         cdna4_async.wait_group(WAIT_K)
         kt_dot = cdna4_async.load_shared_relaxed(
-            bank.kt_smem.index(0), cfg.layouts.pfx_kt_dot_layout,
+            bank.kt_smem.index(0),
+            cfg.layouts.pfx_kt_dot_layout,
         )
 
         main_loop_end = n_prefix_blocks - cfg.NUM_STAGES
@@ -2719,20 +3329,31 @@ class ExtendAttnSwPipeline4WProgram:
             n_idx_k_nf = nf_start_n + kt_offs_n
             mask_k_nf = n_idx_k_nf < seq_len_prefix
             kv_locs_k_nf = cdna4_buffer_load(
-                kv_indices_base, n_idx_k_nf.to(tl.int32), mask=mask_k_nf, other=0,
+                kv_indices_base,
+                n_idx_k_nf.to(tl.int32),
+                mask=mask_k_nf,
+                other=0,
             ).to(tl.int32)
             n_idx_v_nf = nf_start_n + v_offs_n
             mask_v_nf = n_idx_v_nf < seq_len_prefix
             kv_locs_v_nf = cdna4_buffer_load(
-                kv_indices_base, n_idx_v_nf.to(tl.int32), mask=mask_v_nf, other=0,
+                kv_indices_base,
+                n_idx_v_nf.to(tl.int32),
+                mask=mask_v_nf,
+                other=0,
             ).to(tl.int32)
 
-            qk = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+            qk = gl.zeros(
+                [cfg.BLOCK_M, cfg.BLOCK_N],
+                dtype=gl.float32,
+                layout=cfg.layouts.mma_layout,
+            )
             qk = do_mma(q_dot, kt_dot, qk)
 
             cdna4_async.wait_group(WAIT_V)
             v_dot = cdna4_async.load_shared_relaxed(
-                bank.v_smem.index(stage_idx), cfg.layouts.pfx_v_dot_layout,
+                bank.v_smem.index(stage_idx),
+                cfg.layouts.pfx_v_dot_layout,
             )
 
             # NOTE: issue K_future AFTER v_dot read; writing back into
@@ -2741,10 +3362,17 @@ class ExtendAttnSwPipeline4WProgram:
             kt_loader.issue_from_locs(kv_locs_k_pf, mask_k_pf, slot=stage_idx)
 
             acc, l_i, m_i, p = self.compute_softmax_prefix(
-                acc, l_i, m_i, qk,
-                start_n, seq_len_prefix,
-                qk_scale, xai_temperature_reg, q_abs_pos,
-                cfg.BLOCK_N, cfg.ENABLE_PREFIX_UNMASKED,
+                acc,
+                l_i,
+                m_i,
+                qk,
+                start_n,
+                seq_len_prefix,
+                qk_scale,
+                xai_temperature_reg,
+                q_abs_pos,
+                cfg.BLOCK_N,
+                cfg.ENABLE_PREFIX_UNMASKED,
             )
 
             p_cast = p.to(v_dot.dtype)
@@ -2754,7 +3382,8 @@ class ExtendAttnSwPipeline4WProgram:
             next_stage_idx = ((block_n + 1) % cfg.NUM_STAGES).to(tl.int32)
             cdna4_async.wait_group(WAIT_K)
             kt_dot = cdna4_async.load_shared_relaxed(
-                bank.kt_smem.index(next_stage_idx), cfg.layouts.pfx_kt_dot_layout,
+                bank.kt_smem.index(next_stage_idx),
+                cfg.layouts.pfx_kt_dot_layout,
             )
 
             # V_future must be issued after the p*V MMA has consumed
@@ -2772,21 +3401,34 @@ class ExtendAttnSwPipeline4WProgram:
             start_n = (main_loop_end + tail_i) * cfg.BLOCK_N
 
             kt_dot_tail = cdna4_async.load_shared_relaxed(
-                bank.kt_smem.index(stage_idx), cfg.layouts.pfx_kt_dot_layout,
+                bank.kt_smem.index(stage_idx),
+                cfg.layouts.pfx_kt_dot_layout,
             )
-            qk = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+            qk = gl.zeros(
+                [cfg.BLOCK_M, cfg.BLOCK_N],
+                dtype=gl.float32,
+                layout=cfg.layouts.mma_layout,
+            )
             qk = do_mma(q_dot, kt_dot_tail, qk)
 
             acc, l_i, m_i, p = self.compute_softmax_prefix(
-                acc, l_i, m_i, qk,
-                start_n, seq_len_prefix,
-                qk_scale, xai_temperature_reg, q_abs_pos,
-                cfg.BLOCK_N, cfg.ENABLE_PREFIX_UNMASKED,
+                acc,
+                l_i,
+                m_i,
+                qk,
+                start_n,
+                seq_len_prefix,
+                qk_scale,
+                xai_temperature_reg,
+                q_abs_pos,
+                cfg.BLOCK_N,
+                cfg.ENABLE_PREFIX_UNMASKED,
             )
 
             cdna4_async.wait_group(STREAMS * (cfg.NUM_STAGES - tail_i) - STREAMS)
             v_dot_tail = cdna4_async.load_shared_relaxed(
-                bank.v_smem.index(stage_idx), cfg.layouts.pfx_v_dot_layout,
+                bank.v_smem.index(stage_idx),
+                cfg.layouts.pfx_v_dot_layout,
             )
             p_cast = p.to(v_dot_tail.dtype)
             p_dot_tail = gl.convert_layout(p_cast, cfg.layouts.pfx_p_dot_layout)
@@ -2797,10 +3439,17 @@ class ExtendAttnSwPipeline4WProgram:
         # sw-pipeline drain so smem slot 0 is free to reuse.
         if seq_len_prefix > aligned_prefix_len:
             acc, l_i, m_i = self.attn_fwd_inner_prefix_unpipelined(
-                acc, l_i, m_i, q_dot,
-                kv_start, cur_kv_head, seq_len_prefix,
+                acc,
+                l_i,
+                m_i,
+                q_dot,
+                kv_start,
+                cur_kv_head,
+                seq_len_prefix,
                 bank,
-                qk_scale, xai_temperature_reg, q_abs_pos,
+                qk_scale,
+                xai_temperature_reg,
+                q_abs_pos,
                 block_start=n_prefix_blocks,
             )
 
@@ -2809,12 +3458,22 @@ class ExtendAttnSwPipeline4WProgram:
     @gluon.jit
     def _attn_fwd_inner_extend_sw_pipeline_4w_block_span(
         self,
-        acc, l_i, m_i, q_dot,
-        cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-        block_start, block_end,
+        acc,
+        l_i,
+        m_i,
+        q_dot,
+        cur_seq_q_start_idx,
+        cur_kv_head,
+        cur_block_m,
+        seq_len_extend,
+        block_start,
+        block_end,
         bank,
-        qk_scale, xai_temperature_reg,
-        mask_base_idx, mask_row_stride, mask_kv_col_offset,
+        qk_scale,
+        xai_temperature_reg,
+        mask_base_idx,
+        mask_row_stride,
+        mask_kv_col_offset,
         EXT_N: gl.constexpr,
         EXT_NS: gl.constexpr,
         MASK_STEPS: gl.constexpr,
@@ -2830,14 +3489,26 @@ class ExtendAttnSwPipeline4WProgram:
         STREAMS: gl.constexpr = 2
 
         kt_loader = AsyncKVLoader.for_extend_k(
-            bank.kt_smem, self.K_Extend, cur_seq_q_start_idx, cur_kv_head,
-            self.stride_kbs, self.stride_kh,
-            EXT_N, cfg.BLOCK_DMODEL, bank.kt_async_layout,
+            bank.kt_smem,
+            self.K_Extend,
+            cur_seq_q_start_idx,
+            cur_kv_head,
+            self.stride_kbs,
+            self.stride_kh,
+            EXT_N,
+            cfg.BLOCK_DMODEL,
+            bank.kt_async_layout,
         )
         v_loader = AsyncKVLoader.for_extend_v(
-            bank.v_smem, self.V_Extend, cur_seq_q_start_idx, cur_kv_head,
-            self.stride_vbs, self.stride_vh,
-            EXT_N, cfg.BLOCK_DV, bank.v_async_layout,
+            bank.v_smem,
+            self.V_Extend,
+            cur_seq_q_start_idx,
+            cur_kv_head,
+            self.stride_vbs,
+            self.stride_vh,
+            EXT_N,
+            cfg.BLOCK_DV,
+            bank.v_async_layout,
         )
 
         cdna4_async.wait_group(0)
@@ -2857,7 +3528,8 @@ class ExtendAttnSwPipeline4WProgram:
         WAIT_V: gl.constexpr = STREAMS * EXT_NS - 2
         cdna4_async.wait_group(WAIT_K)
         kt_dot = cdna4_async.load_shared_relaxed(
-            bank.kt_smem.index(0), cfg.layouts.kt_dot_layout,
+            bank.kt_smem.index(0),
+            cfg.layouts.kt_dot_layout,
         )
 
         main_loop_end = block_end - EXT_NS
@@ -2866,12 +3538,15 @@ class ExtendAttnSwPipeline4WProgram:
             start_n = (block_n * EXT_N).to(tl.int32)
             future_start_n = ((block_n + EXT_NS) * EXT_N).to(tl.int32)
 
-            qk = gl.zeros([cfg.BLOCK_M, EXT_N], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+            qk = gl.zeros(
+                [cfg.BLOCK_M, EXT_N], dtype=gl.float32, layout=cfg.layouts.mma_layout
+            )
             qk = do_mma(q_dot, kt_dot, qk)
 
             cdna4_async.wait_group(WAIT_V)
             v_dot = cdna4_async.load_shared_relaxed(
-                bank.v_smem.index(stage_idx), cfg.layouts.v_dot_layout,
+                bank.v_smem.index(stage_idx),
+                cfg.layouts.v_dot_layout,
             )
             if SKIP_BOUNDS_CHECK:
                 kt_loader.issue_nomask(future_start_n, seq_len_extend, slot=stage_idx)
@@ -2879,11 +3554,20 @@ class ExtendAttnSwPipeline4WProgram:
                 kt_loader.issue(future_start_n, seq_len_extend, slot=stage_idx)
 
             acc, l_i, m_i, p = self.compute_softmax_extend(
-                acc, l_i, m_i, qk,
-                start_n, cur_block_m, seq_len_extend,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
-                EXT_N, MASK_STEPS,
+                acc,
+                l_i,
+                m_i,
+                qk,
+                start_n,
+                cur_block_m,
+                seq_len_extend,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
+                EXT_N,
+                MASK_STEPS,
             )
             p_cast = p.to(v_dot.dtype)
             p_dot_reg = gl.convert_layout(p_cast, cfg.layouts.p_dot_layout)
@@ -2892,7 +3576,8 @@ class ExtendAttnSwPipeline4WProgram:
             cdna4_async.wait_group(WAIT_V)
             next_stage_idx = ((block_n + 1 - block_start) % EXT_NS).to(tl.int32)
             kt_dot = cdna4_async.load_shared_relaxed(
-                bank.kt_smem.index(next_stage_idx), cfg.layouts.kt_dot_layout,
+                bank.kt_smem.index(next_stage_idx),
+                cfg.layouts.kt_dot_layout,
             )
             if SKIP_BOUNDS_CHECK:
                 v_loader.issue_nomask(future_start_n, seq_len_extend, slot=stage_idx)
@@ -2905,22 +3590,33 @@ class ExtendAttnSwPipeline4WProgram:
             start_n = (main_loop_end + tail_i) * EXT_N
 
             kt_dot_tail = cdna4_async.load_shared_relaxed(
-                bank.kt_smem.index(stage_idx), cfg.layouts.kt_dot_layout,
+                bank.kt_smem.index(stage_idx),
+                cfg.layouts.kt_dot_layout,
             )
-            qk = gl.zeros([cfg.BLOCK_M, EXT_N], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+            qk = gl.zeros(
+                [cfg.BLOCK_M, EXT_N], dtype=gl.float32, layout=cfg.layouts.mma_layout
+            )
             qk = do_mma(q_dot, kt_dot_tail, qk)
 
             p, alpha, m_new = self.softmax_part0(
-                m_i, qk,
-                start_n, cur_block_m, seq_len_extend,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
-                EXT_N, MASK_STEPS,
+                m_i,
+                qk,
+                start_n,
+                cur_block_m,
+                seq_len_extend,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
+                EXT_N,
+                MASK_STEPS,
             )
 
             cdna4_async.wait_group(STREAMS * (EXT_NS - tail_i) - 2)
             v_dot_tail = cdna4_async.load_shared_relaxed(
-                bank.v_smem.index(stage_idx), cfg.layouts.v_dot_layout,
+                bank.v_smem.index(stage_idx),
+                cfg.layouts.v_dot_layout,
             )
             acc, l_i, m_i = self.softmax_part1(acc, l_i, p, alpha, m_new)
             p_cast = p.to(v_dot_tail.dtype)
@@ -2932,12 +3628,23 @@ class ExtendAttnSwPipeline4WProgram:
     @gluon.jit
     def attn_fwd_inner_extend_sw_pipeline_4w(
         self,
-        acc, l_i, m_i, q_dot,
-        cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-        bulk_end, tail_start, tail_end,
+        acc,
+        l_i,
+        m_i,
+        q_dot,
+        cur_seq_q_start_idx,
+        cur_kv_head,
+        cur_block_m,
+        seq_len_extend,
+        bulk_end,
+        tail_start,
+        tail_end,
         bank,
-        qk_scale, xai_temperature_reg,
-        mask_base_idx, mask_row_stride, mask_kv_col_offset,
+        qk_scale,
+        xai_temperature_reg,
+        mask_base_idx,
+        mask_row_stride,
+        mask_kv_col_offset,
         EXT_N: gl.constexpr,
         EXT_NS: gl.constexpr,
     ):
@@ -2966,62 +3673,111 @@ class ExtendAttnSwPipeline4WProgram:
         """
         if bulk_end >= EXT_NS:
             acc, l_i, m_i = self._attn_fwd_inner_extend_sw_pipeline_4w_block_span(
-                acc, l_i, m_i, q_dot,
-                cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-                0, bulk_end,
+                acc,
+                l_i,
+                m_i,
+                q_dot,
+                cur_seq_q_start_idx,
+                cur_kv_head,
+                cur_block_m,
+                seq_len_extend,
+                0,
+                bulk_end,
                 bank,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
-                EXT_N, EXT_NS,
-                MASK_STEPS=False, SKIP_BOUNDS_CHECK=True,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
+                EXT_N,
+                EXT_NS,
+                MASK_STEPS=False,
+                SKIP_BOUNDS_CHECK=True,
             )
         elif bulk_end > 0:
             acc, l_i, m_i = self._attn_fwd_inner_extend_unpipelined_block_span(
-                acc, l_i, m_i, q_dot,
-                cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-                0, bulk_end,
+                acc,
+                l_i,
+                m_i,
+                q_dot,
+                cur_seq_q_start_idx,
+                cur_kv_head,
+                cur_block_m,
+                seq_len_extend,
+                0,
+                bulk_end,
                 bank,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
                 EXT_N,
-                MASK_STEPS=False, SKIP_BOUNDS_CHECK=True,
+                MASK_STEPS=False,
+                SKIP_BOUNDS_CHECK=True,
             )
         remaining_blocks = tail_end - tail_start
         if remaining_blocks >= EXT_NS:
             acc, l_i, m_i = self._attn_fwd_inner_extend_sw_pipeline_4w_block_span(
-                acc, l_i, m_i, q_dot,
-                cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-                tail_start, tail_end,
+                acc,
+                l_i,
+                m_i,
+                q_dot,
+                cur_seq_q_start_idx,
+                cur_kv_head,
+                cur_block_m,
+                seq_len_extend,
+                tail_start,
+                tail_end,
                 bank,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
-                EXT_N, EXT_NS,
-                MASK_STEPS=True, SKIP_BOUNDS_CHECK=False,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
+                EXT_N,
+                EXT_NS,
+                MASK_STEPS=True,
+                SKIP_BOUNDS_CHECK=False,
             )
         elif remaining_blocks > 0:
             acc, l_i, m_i = self._attn_fwd_inner_extend_unpipelined_block_span(
-                acc, l_i, m_i, q_dot,
-                cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-                tail_start, tail_end,
+                acc,
+                l_i,
+                m_i,
+                q_dot,
+                cur_seq_q_start_idx,
+                cur_kv_head,
+                cur_block_m,
+                seq_len_extend,
+                tail_start,
+                tail_end,
                 bank,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
                 EXT_N,
-                MASK_STEPS=True, SKIP_BOUNDS_CHECK=False,
+                MASK_STEPS=True,
+                SKIP_BOUNDS_CHECK=False,
             )
         return acc, l_i, m_i
-
 
     @gluon.jit
     def run(self):
         """Body of ``gluon_extend_attn_fwd_4w`` (NS>=2, D>=128, NW<8)."""
         cfg: gl.constexpr = self.cfg
-        tl.static_assert(cfg.NUM_STAGES >= 2,
-                         "4w sw-pipeline program requires NUM_STAGES>=2")
-        tl.static_assert(cfg.BLOCK_DMODEL >= 128,
-                         "4w sw-pipeline program requires BLOCK_DMODEL>=128")
-        tl.static_assert(cfg.num_warps < 8,
-                         "4w sw-pipeline program requires num_warps<8; NW>=8 routes to 8w pingpong")
+        tl.static_assert(
+            cfg.NUM_STAGES >= 2, "4w sw-pipeline program requires NUM_STAGES>=2"
+        )
+        tl.static_assert(
+            cfg.BLOCK_DMODEL >= 128, "4w sw-pipeline program requires BLOCK_DMODEL>=128"
+        )
+        tl.static_assert(
+            cfg.num_warps < 8,
+            "4w sw-pipeline program requires num_warps<8; NW>=8 routes to 8w pingpong",
+        )
         if cfg.IS_FP8:
             tl.static_assert(
                 cfg.BLOCK_DMODEL != 256,
@@ -3047,39 +3803,77 @@ class ExtendAttnSwPipeline4WProgram:
         while tile_idx < (self.total_valid_tiles if cfg.IS_WCA else 1):
             # Tile coords.
             if cfg.IS_WCA:
-                (cur_seq, cur_head, cur_block_m, cur_kv_head,
-                 cur_seq_q_start_idx, seq_len_extend,
-                 cur_seq_kv_start_idx, seq_len_prefix,
-                 is_valid_tile, output_tile, k_split_id) = self._schedule_wca(tile_idx)
+                (
+                    cur_seq,
+                    cur_head,
+                    cur_block_m,
+                    cur_kv_head,
+                    cur_seq_q_start_idx,
+                    seq_len_extend,
+                    cur_seq_kv_start_idx,
+                    seq_len_prefix,
+                    is_valid_tile,
+                    output_tile,
+                    k_split_id,
+                ) = self._schedule_wca(tile_idx)
             else:
-                (cur_seq, cur_head, cur_block_m, cur_kv_head,
-                 cur_seq_q_start_idx, seq_len_extend,
-                 cur_seq_kv_start_idx, seq_len_prefix,
-                 is_valid_tile, output_tile, k_split_id) = self._schedule_data_centric()
+                (
+                    cur_seq,
+                    cur_head,
+                    cur_block_m,
+                    cur_kv_head,
+                    cur_seq_q_start_idx,
+                    seq_len_extend,
+                    cur_seq_kv_start_idx,
+                    seq_len_prefix,
+                    is_valid_tile,
+                    output_tile,
+                    k_split_id,
+                ) = self._schedule_data_centric()
 
             mask_base_idx, mask_row_stride, mask_kv_col_offset = (
                 self._compute_mask_state(cur_seq, seq_len_extend, seq_len_prefix)
             )
 
             q_dot, pfx_q = self._load_q(
-                cur_seq_q_start_idx, cur_head, cur_block_m, seq_len_extend, offs_m, offs_d,
+                cur_seq_q_start_idx,
+                cur_head,
+                cur_block_m,
+                seq_len_extend,
+                offs_m,
+                offs_d,
             )
             m_i, l_i, acc = self._init_softmax()
-            q_abs_pos, xai_temperature_reg = self._compute_q_abs_pos_and_xai(seq_len_prefix, cur_block_m)
+            q_abs_pos, xai_temperature_reg = self._compute_q_abs_pos_and_xai(
+                seq_len_prefix, cur_block_m
+            )
 
             pfx_kv_start, pfx_seq_len, pfx_q_abs_pos = self._compute_swa_skip(
-                cur_seq_kv_start_idx, seq_len_prefix, cur_block_m, q_abs_pos,
+                cur_seq_kv_start_idx,
+                seq_len_prefix,
+                cur_block_m,
+                q_abs_pos,
             )
             orig_seq_len_extend = seq_len_extend
             pfx_kv_start, pfx_seq_len, pfx_q_abs_pos, seq_len_extend = (
                 self._apply_splitk_prefix_partition(
-                    pfx_kv_start, pfx_seq_len, pfx_q_abs_pos, k_split_id, seq_len_extend,
+                    pfx_kv_start,
+                    pfx_seq_len,
+                    pfx_q_abs_pos,
+                    k_split_id,
+                    seq_len_extend,
                 )
             )
 
             # FP8 EXT_N / EXT_NS override (4w only; BF16 reuses BLOCK_N / NUM_STAGES).
-            _EXT_N: gl.constexpr = cfg.EXT_BLOCK_N if (cfg.IS_FP8 and cfg.EXT_BLOCK_N > 0) else cfg.BLOCK_N
-            _EXT_NS: gl.constexpr = cfg.EXT_NUM_STAGES if (cfg.IS_FP8 and cfg.EXT_NUM_STAGES > 0) else cfg.NUM_STAGES
+            _EXT_N: gl.constexpr = (
+                cfg.EXT_BLOCK_N if (cfg.IS_FP8 and cfg.EXT_BLOCK_N > 0) else cfg.BLOCK_N
+            )
+            _EXT_NS: gl.constexpr = (
+                cfg.EXT_NUM_STAGES
+                if (cfg.IS_FP8 and cfg.EXT_NUM_STAGES > 0)
+                else cfg.NUM_STAGES
+            )
 
             effective_end, n_extend_blocks, n_full_blocks, swa_skip_n_blocks = (
                 self._compute_extend_bounds(seq_len_extend, cur_block_m, _EXT_N)
@@ -3087,12 +3881,24 @@ class ExtendAttnSwPipeline4WProgram:
 
             # Dot layouts live on cfg.layouts; build the async tile layouts and
             # prefix smem policy directly from the same facade.
-            kt_offset_bases: gl.constexpr = ExtendAttentionLayouts.make_kt_offset_bases(cfg.BLOCK_DMODEL, cfg.BLOCK_N)
-            v_offset_bases: gl.constexpr = ExtendAttentionLayouts.prefix_v_offset_bases(cfg.layouts, cfg.num_warps, cfg.BLOCK_DV, cfg.BLOCK_N)
-            kt_async_layout: gl.constexpr = ExtendAttentionLayouts.prefix_kt_dll(cfg.layouts, cfg.num_warps, cfg.BLOCK_DMODEL, cfg.BLOCK_N)
-            v_async_layout: gl.constexpr = ExtendAttentionLayouts.prefix_v_dll(cfg.layouts, cfg.num_warps, cfg.BLOCK_DMODEL, cfg.BLOCK_DV, cfg.BLOCK_N)
-            kt_smem_layout: gl.constexpr = ExtendAttentionLayouts.prefix_kt_smem_layout(cfg.layouts, cfg.BLOCK_DMODEL, cfg.BLOCK_N, kt_offset_bases)
-            v_smem_layout: gl.constexpr = ExtendAttentionLayouts.prefix_v_smem_layout(cfg.layouts, cfg.BLOCK_N, cfg.BLOCK_DV, v_offset_bases)
+            kt_offset_bases: gl.constexpr = ExtendAttentionLayouts.make_kt_offset_bases(
+                cfg.BLOCK_DMODEL, cfg.BLOCK_N
+            )
+            v_offset_bases: gl.constexpr = ExtendAttentionLayouts.prefix_v_offset_bases(
+                cfg.layouts, cfg.num_warps, cfg.BLOCK_DV, cfg.BLOCK_N
+            )
+            kt_async_layout: gl.constexpr = ExtendAttentionLayouts.prefix_kt_dll(
+                cfg.layouts, cfg.num_warps, cfg.BLOCK_DMODEL, cfg.BLOCK_N
+            )
+            v_async_layout: gl.constexpr = ExtendAttentionLayouts.prefix_v_dll(
+                cfg.layouts, cfg.num_warps, cfg.BLOCK_DMODEL, cfg.BLOCK_DV, cfg.BLOCK_N
+            )
+            kt_smem_layout: gl.constexpr = ExtendAttentionLayouts.prefix_kt_smem_layout(
+                cfg.layouts, cfg.BLOCK_DMODEL, cfg.BLOCK_N, kt_offset_bases
+            )
+            v_smem_layout: gl.constexpr = ExtendAttentionLayouts.prefix_v_smem_layout(
+                cfg.layouts, cfg.BLOCK_N, cfg.BLOCK_DV, v_offset_bases
+            )
 
             if cfg.IS_FP8:
                 # FP8 prefix is native FP8, but extend K/V are BF16; these
@@ -3101,18 +3907,50 @@ class ExtendAttnSwPipeline4WProgram:
                 if _EXT_N == cfg.BLOCK_N:
                     ext_kt_offset_bases: gl.constexpr = kt_offset_bases
                     ext_v_offset_bases: gl.constexpr = v_offset_bases
-                    ext_kt_async_layout: gl.constexpr = ExtendAttentionLayouts.make_kt_dll(cfg.num_warps, cfg.BLOCK_DMODEL, cfg.BLOCK_N)
-                    ext_v_async_layout: gl.constexpr = ExtendAttentionLayouts.make_fp8_extend_v_dll(cfg.num_warps, cfg.BLOCK_DV, cfg.BLOCK_N)
+                    ext_kt_async_layout: gl.constexpr = (
+                        ExtendAttentionLayouts.make_kt_dll(
+                            cfg.num_warps, cfg.BLOCK_DMODEL, cfg.BLOCK_N
+                        )
+                    )
+                    ext_v_async_layout: gl.constexpr = (
+                        ExtendAttentionLayouts.make_fp8_extend_v_dll(
+                            cfg.num_warps, cfg.BLOCK_DV, cfg.BLOCK_N
+                        )
+                    )
                 else:
-                    ext_kt_offset_bases: gl.constexpr = ExtendAttentionLayouts.make_ext_kt_offset_bases(cfg.num_warps, cfg.BLOCK_DMODEL, _EXT_N)
-                    ext_kt_async_layout: gl.constexpr = ExtendAttentionLayouts.make_ext_kt_dll(cfg.num_warps, cfg.BLOCK_DMODEL, _EXT_N)
-                    ext_v_offset_bases: gl.constexpr = ExtendAttentionLayouts.make_ext_v_offset_bases(cfg.num_warps, cfg.BLOCK_DV, _EXT_N)
-                    ext_v_async_layout: gl.constexpr = ExtendAttentionLayouts.make_ext_v_dll(cfg.num_warps, cfg.BLOCK_DV, _EXT_N)
-                ext_kt_smem_layout: gl.constexpr = ExtendAttentionLayouts.make_padded_smem(
-                    [cfg.BLOCK_DMODEL, _EXT_N], ext_kt_offset_bases, [[512, 16]],
+                    ext_kt_offset_bases: gl.constexpr = (
+                        ExtendAttentionLayouts.make_ext_kt_offset_bases(
+                            cfg.num_warps, cfg.BLOCK_DMODEL, _EXT_N
+                        )
+                    )
+                    ext_kt_async_layout: gl.constexpr = (
+                        ExtendAttentionLayouts.make_ext_kt_dll(
+                            cfg.num_warps, cfg.BLOCK_DMODEL, _EXT_N
+                        )
+                    )
+                    ext_v_offset_bases: gl.constexpr = (
+                        ExtendAttentionLayouts.make_ext_v_offset_bases(
+                            cfg.num_warps, cfg.BLOCK_DV, _EXT_N
+                        )
+                    )
+                    ext_v_async_layout: gl.constexpr = (
+                        ExtendAttentionLayouts.make_ext_v_dll(
+                            cfg.num_warps, cfg.BLOCK_DV, _EXT_N
+                        )
+                    )
+                ext_kt_smem_layout: gl.constexpr = (
+                    ExtendAttentionLayouts.make_padded_smem(
+                        [cfg.BLOCK_DMODEL, _EXT_N],
+                        ext_kt_offset_bases,
+                        [[512, 16]],
+                    )
                 )
-                ext_v_smem_layout: gl.constexpr = ExtendAttentionLayouts.make_padded_smem(
-                    [_EXT_N, cfg.BLOCK_DV], ext_v_offset_bases, [[512, 16]],
+                ext_v_smem_layout: gl.constexpr = (
+                    ExtendAttentionLayouts.make_padded_smem(
+                        [_EXT_N, cfg.BLOCK_DV],
+                        ext_v_offset_bases,
+                        [[512, 16]],
+                    )
                 )
             else:
                 ext_kt_async_layout: gl.constexpr = kt_async_layout
@@ -3123,8 +3961,11 @@ class ExtendAttnSwPipeline4WProgram:
             # Allocate the K/V staging bank and carry the async layouts with
             # it so prefix and extend helpers share the same descriptor bundle.
             bank = KVSmemBank.initialize(
-                cfg, kt_smem_layout, v_smem_layout,
-                kt_async_layout, v_async_layout,
+                cfg,
+                kt_smem_layout,
+                v_smem_layout,
+                kt_async_layout,
+                v_async_layout,
                 zero_fill=(cfg.IS_FP8 or is_valid_tile),
             )
 
@@ -3136,20 +3977,36 @@ class ExtendAttnSwPipeline4WProgram:
                 n_extend_est = (seq_len_extend + cfg.BLOCK_N - 1) // cfg.BLOCK_N
                 use_pipe_prefix = n_full_prefix >= cfg.NUM_STAGES
                 if cfg.LOGIT_CAP > 0:
-                    use_pipe_prefix = use_pipe_prefix and (n_extend_est < cfg.NUM_STAGES)
+                    use_pipe_prefix = use_pipe_prefix and (
+                        n_extend_est < cfg.NUM_STAGES
+                    )
                 if use_pipe_prefix:
                     acc, l_i, m_i = self.attn_fwd_inner_prefix_sw_pipeline_4w(
-                        acc, l_i, m_i, pfx_q,
-                        pfx_kv_start, cur_kv_head, pfx_seq_len,
+                        acc,
+                        l_i,
+                        m_i,
+                        pfx_q,
+                        pfx_kv_start,
+                        cur_kv_head,
+                        pfx_seq_len,
                         bank,
-                        qk_scale, xai_temperature_reg, pfx_q_abs_pos,
+                        qk_scale,
+                        xai_temperature_reg,
+                        pfx_q_abs_pos,
                     )
                 else:
                     acc, l_i, m_i = self.attn_fwd_inner_prefix_unpipelined(
-                        acc, l_i, m_i, pfx_q,
-                        pfx_kv_start, cur_kv_head, pfx_seq_len,
+                        acc,
+                        l_i,
+                        m_i,
+                        pfx_q,
+                        pfx_kv_start,
+                        cur_kv_head,
+                        pfx_seq_len,
                         bank,
-                        qk_scale, xai_temperature_reg, pfx_q_abs_pos,
+                        qk_scale,
+                        xai_temperature_reg,
+                        pfx_q_abs_pos,
                     )
 
             cdna4_async.wait_group(0)
@@ -3157,38 +4014,66 @@ class ExtendAttnSwPipeline4WProgram:
             # FP8 smem transition (BF16 skips).
             if cfg.IS_FP8:
                 bank = bank.transition_to_extend(
-                    cfg, self.Q_Extend.dtype.element_ty,
-                    ext_kt_smem_layout, ext_v_smem_layout,
-                    ext_kt_async_layout, ext_v_async_layout,
-                    _EXT_N, _EXT_NS,
+                    cfg,
+                    self.Q_Extend.dtype.element_ty,
+                    ext_kt_smem_layout,
+                    ext_v_smem_layout,
+                    ext_kt_async_layout,
+                    ext_v_async_layout,
+                    _EXT_N,
+                    _EXT_NS,
                 )
 
             # Extend hot-loop (fused unmasked-bulk + masked-tail 4w sw-pipeline).
             masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
             acc, l_i, m_i = self.attn_fwd_inner_extend_sw_pipeline_4w(
-                acc, l_i, m_i, q_dot,
-                cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-                n_full_blocks, masked_start, n_extend_blocks,
+                acc,
+                l_i,
+                m_i,
+                q_dot,
+                cur_seq_q_start_idx,
+                cur_kv_head,
+                cur_block_m,
+                seq_len_extend,
+                n_full_blocks,
+                masked_start,
+                n_extend_blocks,
                 bank,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
-                _EXT_N, _EXT_NS,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
+                _EXT_N,
+                _EXT_NS,
             )
 
             l_i = self._apply_sinks(cur_head, l_i, m_i)
 
             if cfg.IS_WCA and cfg.SPLIT_K > 1:
                 self._splitk_partial_store_and_reduce(
-                    output_tile, k_split_id,
-                    cur_seq_q_start_idx, cur_head, cur_block_m,
+                    output_tile,
+                    k_split_id,
+                    cur_seq_q_start_idx,
+                    cur_head,
+                    cur_block_m,
                     orig_seq_len_extend,
-                    acc, l_i, m_i,
-                    offs_m, offs_dv,
+                    acc,
+                    l_i,
+                    m_i,
+                    offs_m,
+                    offs_dv,
                 )
             else:
                 self._normalize_and_store(
-                    cur_seq_q_start_idx, cur_head, cur_block_m, seq_len_extend,
-                    acc, l_i, offs_m, offs_dv,
+                    cur_seq_q_start_idx,
+                    cur_head,
+                    cur_block_m,
+                    seq_len_extend,
+                    acc,
+                    l_i,
+                    offs_m,
+                    offs_dv,
                 )
 
             if cfg.IS_WCA:
@@ -3213,10 +4098,17 @@ class ExtendAttnPingpong8WProgram:
     @gluon.jit
     def attn_fwd_inner_prefix_pingpong_8w(
         self,
-        acc, l_i, m_i, q_dot,
-        kv_start, cur_kv_head, seq_len_prefix,
+        acc,
+        l_i,
+        m_i,
+        q_dot,
+        kv_start,
+        cur_kv_head,
+        seq_len_prefix,
         bank,
-        qk_scale, xai_temperature_reg, q_abs_pos,
+        qk_scale,
+        xai_temperature_reg,
+        q_abs_pos,
         SCALAR_MASK: gl.constexpr = False,
     ):
         """8-warp pingpong prefix: warp_pipeline_stage-scheduled async DMA loop.
@@ -3255,14 +4147,28 @@ class ExtendAttnPingpong8WProgram:
         v_offs_n_pf = gl.arange(0, cfg.BLOCK_N, layout=v_offs_n_layout)
 
         kt_loader = AsyncKVLoader.for_prefix_k(
-            bank.kt_smem, self.K_Buffer, cur_kv_head, self.kv_indices,
-            kv_start, self.stride_buf_kbs, self.stride_buf_kh,
-            cfg.BLOCK_N, cfg.BLOCK_DMODEL, kt_async_layout,
+            bank.kt_smem,
+            self.K_Buffer,
+            cur_kv_head,
+            self.kv_indices,
+            kv_start,
+            self.stride_buf_kbs,
+            self.stride_buf_kh,
+            cfg.BLOCK_N,
+            cfg.BLOCK_DMODEL,
+            kt_async_layout,
         )
         v_loader = AsyncKVLoader.for_prefix_v(
-            bank.v_smem, self.V_Buffer, cur_kv_head, self.kv_indices,
-            kv_start, self.stride_buf_vbs, self.stride_buf_vh,
-            cfg.BLOCK_N, cfg.BLOCK_DV, v_async_layout,
+            bank.v_smem,
+            self.V_Buffer,
+            cur_kv_head,
+            self.kv_indices,
+            kv_start,
+            self.stride_buf_vbs,
+            self.stride_buf_vh,
+            cfg.BLOCK_N,
+            cfg.BLOCK_DV,
+            v_async_layout,
         )
 
         for stage in gl.static_range(cfg.NUM_STAGES):
@@ -3274,12 +4180,16 @@ class ExtendAttnPingpong8WProgram:
         n_idx_kt_pf = pf_start_n + kt_offs_n_pf
         mask_n_kt_pf = n_idx_kt_pf < seq_len_prefix
         kv_locs_kt_pf = gl.load(
-            self.kv_indices + kv_start + n_idx_kt_pf, mask=mask_n_kt_pf, other=0,
+            self.kv_indices + kv_start + n_idx_kt_pf,
+            mask=mask_n_kt_pf,
+            other=0,
         ).to(tl.int32)
         n_idx_v_pf = pf_start_n + v_offs_n_pf
         mask_n_v_pf = n_idx_v_pf < seq_len_prefix
         kv_locs_v_pf = gl.load(
-            self.kv_indices + kv_start + n_idx_v_pf, mask=mask_n_v_pf, other=0,
+            self.kv_indices + kv_start + n_idx_v_pf,
+            mask=mask_n_v_pf,
+            other=0,
         ).to(tl.int32)
 
         # Each logical tile issues K then V. The wait counts leave just
@@ -3296,7 +4206,8 @@ class ExtendAttnPingpong8WProgram:
 
         cdna4_async.wait_group(WAIT_K)
         kt_dot = cdna4_async.load_shared_relaxed(
-            bank.kt_smem.index(0), cfg.layouts.pfx_kt_dot_layout,
+            bank.kt_smem.index(0),
+            cfg.layouts.pfx_kt_dot_layout,
         )
 
         main_loop_end = n_prefix_blocks - cfg.NUM_STAGES
@@ -3305,46 +4216,70 @@ class ExtendAttnPingpong8WProgram:
             with warp_pipeline_stage("compute0", priority=0):
                 stage_idx = (block_n % cfg.NUM_STAGES).to(tl.int32)
                 start_n = (block_n * cfg.BLOCK_N).to(tl.int32)
-                qk = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+                qk = gl.zeros(
+                    [cfg.BLOCK_M, cfg.BLOCK_N],
+                    dtype=gl.float32,
+                    layout=cfg.layouts.mma_layout,
+                )
                 qk = do_mma(q_dot, kt_dot, qk)
 
             cdna4_async.wait_group(WAIT_V)
 
             with warp_pipeline_stage("memory0", priority=1):
                 v_dot = cdna4_async.load_shared_relaxed(
-                    bank.v_smem.index(stage_idx), cfg.layouts.pfx_v_dot_layout,
+                    bank.v_smem.index(stage_idx),
+                    cfg.layouts.pfx_v_dot_layout,
                 )
                 if SCALAR_MASK:
                     kt_loader.issue_from_locs(
-                        kv_locs_kt_pf, dma_mask, slot=stage_idx, IS_SCALAR_MASK=True,
+                        kv_locs_kt_pf,
+                        dma_mask,
+                        slot=stage_idx,
+                        IS_SCALAR_MASK=True,
                     )
                 else:
                     kt_loader.issue_from_locs(
-                        kv_locs_kt_pf, mask_n_kt_pf, slot=stage_idx,
+                        kv_locs_kt_pf,
+                        mask_n_kt_pf,
+                        slot=stage_idx,
                     )
 
             with warp_pipeline_stage("compute1", priority=0):
                 acc, l_i, m_i, p = self.compute_softmax_prefix(
-                    acc, l_i, m_i, qk,
-                    start_n, seq_len_prefix,
-                    qk_scale, xai_temperature_reg, q_abs_pos,
-                    cfg.BLOCK_N, cfg.ENABLE_PREFIX_UNMASKED,
+                    acc,
+                    l_i,
+                    m_i,
+                    qk,
+                    start_n,
+                    seq_len_prefix,
+                    qk_scale,
+                    xai_temperature_reg,
+                    q_abs_pos,
+                    cfg.BLOCK_N,
+                    cfg.ENABLE_PREFIX_UNMASKED,
                 )
 
             with warp_pipeline_stage("memory1", priority=1):
                 if SCALAR_MASK:
                     v_loader.issue_from_locs(
-                        kv_locs_v_pf, dma_mask, slot=stage_idx, IS_SCALAR_MASK=True,
+                        kv_locs_v_pf,
+                        dma_mask,
+                        slot=stage_idx,
+                        IS_SCALAR_MASK=True,
                     )
                 else:
                     v_loader.issue_from_locs(
-                        kv_locs_v_pf, mask_n_v_pf, slot=stage_idx,
+                        kv_locs_v_pf,
+                        mask_n_v_pf,
+                        slot=stage_idx,
                     )
                 nf_start_n = ((block_n + cfg.NUM_STAGES + 1) * cfg.BLOCK_N).to(tl.int32)
                 n_idx_kt_nf = nf_start_n + kt_offs_n_pf
                 mask_n_kt_pf = n_idx_kt_nf < seq_len_prefix
                 kv_locs_kt_pf = gl.load(
-                    self.kv_indices + kv_start + n_idx_kt_nf, mask=mask_n_kt_pf, other=0,
+                    self.kv_indices + kv_start + n_idx_kt_nf,
+                    mask=mask_n_kt_pf,
+                    other=0,
                 ).to(tl.int32)
 
             with warp_pipeline_stage("compute2", priority=0):
@@ -3357,12 +4292,15 @@ class ExtendAttnPingpong8WProgram:
             with warp_pipeline_stage("memory2", priority=1):
                 next_stage_idx = ((block_n + 1) % cfg.NUM_STAGES).to(tl.int32)
                 kt_dot = cdna4_async.load_shared_relaxed(
-                    bank.kt_smem.index(next_stage_idx), cfg.layouts.pfx_kt_dot_layout,
+                    bank.kt_smem.index(next_stage_idx),
+                    cfg.layouts.pfx_kt_dot_layout,
                 )
                 n_idx_v_nf = nf_start_n + v_offs_n_pf
                 mask_n_v_pf = n_idx_v_nf < seq_len_prefix
                 kv_locs_v_pf = gl.load(
-                    self.kv_indices + kv_start + n_idx_v_nf, mask=mask_n_v_pf, other=0,
+                    self.kv_indices + kv_start + n_idx_v_nf,
+                    mask=mask_n_v_pf,
+                    other=0,
                 ).to(tl.int32)
 
         for tail_i in gl.static_range(cfg.NUM_STAGES):
@@ -3371,21 +4309,34 @@ class ExtendAttnPingpong8WProgram:
             start_n = (main_loop_end + tail_i) * cfg.BLOCK_N
 
             kt_dot_tail = cdna4_async.load_shared_relaxed(
-                bank.kt_smem.index(stage_idx), cfg.layouts.pfx_kt_dot_layout,
+                bank.kt_smem.index(stage_idx),
+                cfg.layouts.pfx_kt_dot_layout,
             )
-            qk = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_N], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+            qk = gl.zeros(
+                [cfg.BLOCK_M, cfg.BLOCK_N],
+                dtype=gl.float32,
+                layout=cfg.layouts.mma_layout,
+            )
             qk = do_mma(q_dot, kt_dot_tail, qk)
 
             acc, l_i, m_i, p = self.compute_softmax_prefix(
-                acc, l_i, m_i, qk,
-                start_n, seq_len_prefix,
-                qk_scale, xai_temperature_reg, q_abs_pos,
-                cfg.BLOCK_N, cfg.ENABLE_PREFIX_UNMASKED,
+                acc,
+                l_i,
+                m_i,
+                qk,
+                start_n,
+                seq_len_prefix,
+                qk_scale,
+                xai_temperature_reg,
+                q_abs_pos,
+                cfg.BLOCK_N,
+                cfg.ENABLE_PREFIX_UNMASKED,
             )
 
             cdna4_async.wait_group(STREAMS * (cfg.NUM_STAGES - tail_i) - STREAMS)
             v_dot_tail = cdna4_async.load_shared_relaxed(
-                bank.v_smem.index(stage_idx), cfg.layouts.pfx_v_dot_layout,
+                bank.v_smem.index(stage_idx),
+                cfg.layouts.pfx_v_dot_layout,
             )
             p_cast = p.to(v_dot_tail.dtype)
             p_dot_tail = gl.convert_layout(p_cast, cfg.layouts.pfx_p_dot_layout)
@@ -3399,10 +4350,17 @@ class ExtendAttnPingpong8WProgram:
         # aligned there).
         if seq_len_prefix > aligned_prefix_len:
             acc, l_i, m_i = self.attn_fwd_inner_prefix_unpipelined(
-                acc, l_i, m_i, q_dot,
-                kv_start, cur_kv_head, seq_len_prefix,
+                acc,
+                l_i,
+                m_i,
+                q_dot,
+                kv_start,
+                cur_kv_head,
+                seq_len_prefix,
                 bank,
-                qk_scale, xai_temperature_reg, q_abs_pos,
+                qk_scale,
+                xai_temperature_reg,
+                q_abs_pos,
                 block_start=n_prefix_blocks,
             )
 
@@ -3411,12 +4369,22 @@ class ExtendAttnPingpong8WProgram:
     @gluon.jit
     def _attn_fwd_inner_extend_pingpong_8w_block_span(
         self,
-        acc, l_i, m_i, q_dot,
-        cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-        block_start, block_end,
+        acc,
+        l_i,
+        m_i,
+        q_dot,
+        cur_seq_q_start_idx,
+        cur_kv_head,
+        cur_block_m,
+        seq_len_extend,
+        block_start,
+        block_end,
         bank,
-        qk_scale, xai_temperature_reg,
-        mask_base_idx, mask_row_stride, mask_kv_col_offset,
+        qk_scale,
+        xai_temperature_reg,
+        mask_base_idx,
+        mask_row_stride,
+        mask_kv_col_offset,
         EXT_N: gl.constexpr,
         EXT_NS: gl.constexpr,
         MASK_STEPS: gl.constexpr,
@@ -3444,14 +4412,26 @@ class ExtendAttnPingpong8WProgram:
         )
 
         kt_loader = AsyncKVLoader.for_extend_k(
-            bank.kt_smem, self.K_Extend, cur_seq_q_start_idx, cur_kv_head,
-            self.stride_kbs, self.stride_kh,
-            EXT_N, cfg.BLOCK_DMODEL, bank.kt_async_layout,
+            bank.kt_smem,
+            self.K_Extend,
+            cur_seq_q_start_idx,
+            cur_kv_head,
+            self.stride_kbs,
+            self.stride_kh,
+            EXT_N,
+            cfg.BLOCK_DMODEL,
+            bank.kt_async_layout,
         )
         v_loader = AsyncKVLoader.for_extend_v(
-            bank.v_smem, self.V_Extend, cur_seq_q_start_idx, cur_kv_head,
-            self.stride_vbs, self.stride_vh,
-            EXT_N, cfg.BLOCK_DV, bank.v_async_layout,
+            bank.v_smem,
+            self.V_Extend,
+            cur_seq_q_start_idx,
+            cur_kv_head,
+            self.stride_vbs,
+            self.stride_vh,
+            EXT_N,
+            cfg.BLOCK_DV,
+            bank.v_async_layout,
         )
 
         cdna4_async.wait_group(0)
@@ -3471,7 +4451,8 @@ class ExtendAttnPingpong8WProgram:
         WAIT_LOOP: gl.constexpr = STREAMS * EXT_NS - STREAMS
         cdna4_async.wait_group(WAIT_INIT)
         kt_dot = cdna4_async.load_shared_relaxed(
-            bank.kt_smem.index(0), cfg.layouts.kt_dot_layout,
+            bank.kt_smem.index(0),
+            cfg.layouts.kt_dot_layout,
         )
 
         main_loop_end = block_end - EXT_NS
@@ -3481,24 +4462,38 @@ class ExtendAttnPingpong8WProgram:
                 stage_idx = ((block_n - block_start) % EXT_NS).to(tl.int32)
                 start_n = (block_n * EXT_N).to(tl.int32)
                 future_start_n = ((block_n + EXT_NS) * EXT_N).to(tl.int32)
-                qk = gl.zeros([cfg.BLOCK_M, EXT_N], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+                qk = gl.zeros(
+                    [cfg.BLOCK_M, EXT_N],
+                    dtype=gl.float32,
+                    layout=cfg.layouts.mma_layout,
+                )
                 qk = do_mma(q_dot, kt_dot, qk)
                 p, alpha, m_new = self.softmax_part0(
-                    m_i, qk,
-                    start_n, cur_block_m, seq_len_extend,
-                    qk_scale, xai_temperature_reg,
-                    mask_base_idx, mask_row_stride, mask_kv_col_offset,
-                    EXT_N, MASK_STEPS,
+                    m_i,
+                    qk,
+                    start_n,
+                    cur_block_m,
+                    seq_len_extend,
+                    qk_scale,
+                    xai_temperature_reg,
+                    mask_base_idx,
+                    mask_row_stride,
+                    mask_kv_col_offset,
+                    EXT_N,
+                    MASK_STEPS,
                 )
 
             cdna4_async.wait_group(WAIT_LOOP)
 
             with warp_pipeline_stage("mem1", priority=1):
                 v_dot = cdna4_async.load_shared_relaxed(
-                    bank.v_smem.index(stage_idx), cfg.layouts.v_dot_layout,
+                    bank.v_smem.index(stage_idx),
+                    cfg.layouts.v_dot_layout,
                 )
                 if SKIP_BOUNDS_CHECK:
-                    kt_loader.issue_nomask(future_start_n, seq_len_extend, slot=stage_idx)
+                    kt_loader.issue_nomask(
+                        future_start_n, seq_len_extend, slot=stage_idx
+                    )
                 else:
                     kt_loader.issue(future_start_n, seq_len_extend, slot=stage_idx)
 
@@ -3515,10 +4510,13 @@ class ExtendAttnPingpong8WProgram:
             with warp_pipeline_stage("mem2", priority=1):
                 next_stage_idx = ((block_n + 1 - block_start) % EXT_NS).to(tl.int32)
                 kt_dot = cdna4_async.load_shared_relaxed(
-                    bank.kt_smem.index(next_stage_idx), cfg.layouts.kt_dot_layout,
+                    bank.kt_smem.index(next_stage_idx),
+                    cfg.layouts.kt_dot_layout,
                 )
                 if SKIP_BOUNDS_CHECK:
-                    v_loader.issue_nomask(future_start_n, seq_len_extend, slot=stage_idx)
+                    v_loader.issue_nomask(
+                        future_start_n, seq_len_extend, slot=stage_idx
+                    )
                 else:
                     v_loader.issue(future_start_n, seq_len_extend, slot=stage_idx)
 
@@ -3528,22 +4526,33 @@ class ExtendAttnPingpong8WProgram:
             start_n = (main_loop_end + tail_i) * EXT_N
 
             kt_dot_tail = cdna4_async.load_shared_relaxed(
-                bank.kt_smem.index(stage_idx), cfg.layouts.kt_dot_layout,
+                bank.kt_smem.index(stage_idx),
+                cfg.layouts.kt_dot_layout,
             )
-            qk = gl.zeros([cfg.BLOCK_M, EXT_N], dtype=gl.float32, layout=cfg.layouts.mma_layout)
+            qk = gl.zeros(
+                [cfg.BLOCK_M, EXT_N], dtype=gl.float32, layout=cfg.layouts.mma_layout
+            )
             qk = do_mma(q_dot, kt_dot_tail, qk)
 
             p, alpha, m_new = self.softmax_part0(
-                m_i, qk,
-                start_n, cur_block_m, seq_len_extend,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
-                EXT_N, MASK_STEPS,
+                m_i,
+                qk,
+                start_n,
+                cur_block_m,
+                seq_len_extend,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
+                EXT_N,
+                MASK_STEPS,
             )
 
             cdna4_async.wait_group(STREAMS * (EXT_NS - tail_i) - STREAMS)
             v_dot_tail = cdna4_async.load_shared_relaxed(
-                bank.v_smem.index(stage_idx), cfg.layouts.v_dot_layout,
+                bank.v_smem.index(stage_idx),
+                cfg.layouts.v_dot_layout,
             )
             acc, l_i, m_i = self.softmax_part1(acc, l_i, p, alpha, m_new)
             p_cast = p.to(v_dot_tail.dtype)
@@ -3555,12 +4564,23 @@ class ExtendAttnPingpong8WProgram:
     @gluon.jit
     def attn_fwd_inner_extend_pingpong_8w(
         self,
-        acc, l_i, m_i, q_dot,
-        cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-        bulk_end, tail_start, tail_end,
+        acc,
+        l_i,
+        m_i,
+        q_dot,
+        cur_seq_q_start_idx,
+        cur_kv_head,
+        cur_block_m,
+        seq_len_extend,
+        bulk_end,
+        tail_start,
+        tail_end,
         bank,
-        qk_scale, xai_temperature_reg,
-        mask_base_idx, mask_row_stride, mask_kv_col_offset,
+        qk_scale,
+        xai_temperature_reg,
+        mask_base_idx,
+        mask_row_stride,
+        mask_kv_col_offset,
         EXT_N: gl.constexpr,
         EXT_NS: gl.constexpr,
     ):
@@ -3579,60 +4599,107 @@ class ExtendAttnPingpong8WProgram:
         """
         if bulk_end >= EXT_NS:
             acc, l_i, m_i = self._attn_fwd_inner_extend_pingpong_8w_block_span(
-                acc, l_i, m_i, q_dot,
-                cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-                0, bulk_end,
+                acc,
+                l_i,
+                m_i,
+                q_dot,
+                cur_seq_q_start_idx,
+                cur_kv_head,
+                cur_block_m,
+                seq_len_extend,
+                0,
+                bulk_end,
                 bank,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
-                EXT_N, EXT_NS,
-                MASK_STEPS=False, SKIP_BOUNDS_CHECK=True,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
+                EXT_N,
+                EXT_NS,
+                MASK_STEPS=False,
+                SKIP_BOUNDS_CHECK=True,
             )
         elif bulk_end > 0:
             acc, l_i, m_i = self._attn_fwd_inner_extend_unpipelined_block_span(
-                acc, l_i, m_i, q_dot,
-                cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-                0, bulk_end,
+                acc,
+                l_i,
+                m_i,
+                q_dot,
+                cur_seq_q_start_idx,
+                cur_kv_head,
+                cur_block_m,
+                seq_len_extend,
+                0,
+                bulk_end,
                 bank,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
                 EXT_N,
-                MASK_STEPS=False, SKIP_BOUNDS_CHECK=True,
+                MASK_STEPS=False,
+                SKIP_BOUNDS_CHECK=True,
             )
         remaining_blocks = tail_end - tail_start
         if remaining_blocks >= EXT_NS:
             acc, l_i, m_i = self._attn_fwd_inner_extend_pingpong_8w_block_span(
-                acc, l_i, m_i, q_dot,
-                cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-                tail_start, tail_end,
+                acc,
+                l_i,
+                m_i,
+                q_dot,
+                cur_seq_q_start_idx,
+                cur_kv_head,
+                cur_block_m,
+                seq_len_extend,
+                tail_start,
+                tail_end,
                 bank,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
-                EXT_N, EXT_NS,
-                MASK_STEPS=True, SKIP_BOUNDS_CHECK=False,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
+                EXT_N,
+                EXT_NS,
+                MASK_STEPS=True,
+                SKIP_BOUNDS_CHECK=False,
             )
         elif remaining_blocks > 0:
             acc, l_i, m_i = self._attn_fwd_inner_extend_unpipelined_block_span(
-                acc, l_i, m_i, q_dot,
-                cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-                tail_start, tail_end,
+                acc,
+                l_i,
+                m_i,
+                q_dot,
+                cur_seq_q_start_idx,
+                cur_kv_head,
+                cur_block_m,
+                seq_len_extend,
+                tail_start,
+                tail_end,
                 bank,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
                 EXT_N,
-                MASK_STEPS=True, SKIP_BOUNDS_CHECK=False,
+                MASK_STEPS=True,
+                SKIP_BOUNDS_CHECK=False,
             )
         return acc, l_i, m_i
-
 
     @gluon.jit
     def run(self):
         """Body of ``gluon_extend_attn_fwd_8w`` (NS>=2, NW>=8)."""
         cfg: gl.constexpr = self.cfg
-        tl.static_assert(cfg.num_warps >= 8,
-                         "8w pingpong program requires num_warps>=8")
-        tl.static_assert(cfg.NUM_STAGES >= 2,
-                         "8w pingpong program requires NUM_STAGES>=2")
+        tl.static_assert(
+            cfg.num_warps >= 8, "8w pingpong program requires num_warps>=8"
+        )
+        tl.static_assert(
+            cfg.NUM_STAGES >= 2, "8w pingpong program requires NUM_STAGES>=2"
+        )
         if cfg.IS_FP8:
             tl.static_assert(
                 cfg.BLOCK_DMODEL != 256,
@@ -3659,32 +4726,64 @@ class ExtendAttnPingpong8WProgram:
         # stride loop are still active when SPLIT_K == 1.
         while tile_idx < (self.total_valid_tiles if cfg.IS_WCA else 1):
             if cfg.IS_WCA:
-                (cur_seq, cur_head, cur_block_m, cur_kv_head,
-                 cur_seq_q_start_idx, seq_len_extend,
-                 cur_seq_kv_start_idx, seq_len_prefix,
-                 is_valid_tile, output_tile, k_split_id) = self._schedule_wca(tile_idx)
+                (
+                    cur_seq,
+                    cur_head,
+                    cur_block_m,
+                    cur_kv_head,
+                    cur_seq_q_start_idx,
+                    seq_len_extend,
+                    cur_seq_kv_start_idx,
+                    seq_len_prefix,
+                    is_valid_tile,
+                    output_tile,
+                    k_split_id,
+                ) = self._schedule_wca(tile_idx)
             else:
-                (cur_seq, cur_head, cur_block_m, cur_kv_head,
-                 cur_seq_q_start_idx, seq_len_extend,
-                 cur_seq_kv_start_idx, seq_len_prefix,
-                 is_valid_tile, output_tile, k_split_id) = self._schedule_data_centric()
+                (
+                    cur_seq,
+                    cur_head,
+                    cur_block_m,
+                    cur_kv_head,
+                    cur_seq_q_start_idx,
+                    seq_len_extend,
+                    cur_seq_kv_start_idx,
+                    seq_len_prefix,
+                    is_valid_tile,
+                    output_tile,
+                    k_split_id,
+                ) = self._schedule_data_centric()
 
             mask_base_idx, mask_row_stride, mask_kv_col_offset = (
                 self._compute_mask_state(cur_seq, seq_len_extend, seq_len_prefix)
             )
             q_dot, pfx_q = self._load_q(
-                cur_seq_q_start_idx, cur_head, cur_block_m, seq_len_extend, offs_m, offs_d,
+                cur_seq_q_start_idx,
+                cur_head,
+                cur_block_m,
+                seq_len_extend,
+                offs_m,
+                offs_d,
             )
             m_i, l_i, acc = self._init_softmax()
-            q_abs_pos, xai_temperature_reg = self._compute_q_abs_pos_and_xai(seq_len_prefix, cur_block_m)
+            q_abs_pos, xai_temperature_reg = self._compute_q_abs_pos_and_xai(
+                seq_len_prefix, cur_block_m
+            )
 
             pfx_kv_start, pfx_seq_len, pfx_q_abs_pos = self._compute_swa_skip(
-                cur_seq_kv_start_idx, seq_len_prefix, cur_block_m, q_abs_pos,
+                cur_seq_kv_start_idx,
+                seq_len_prefix,
+                cur_block_m,
+                q_abs_pos,
             )
             orig_seq_len_extend = seq_len_extend
             pfx_kv_start, pfx_seq_len, pfx_q_abs_pos, seq_len_extend = (
                 self._apply_splitk_prefix_partition(
-                    pfx_kv_start, pfx_seq_len, pfx_q_abs_pos, k_split_id, seq_len_extend,
+                    pfx_kv_start,
+                    pfx_seq_len,
+                    pfx_q_abs_pos,
+                    k_split_id,
+                    seq_len_extend,
                 )
             )
 
@@ -3698,23 +4797,49 @@ class ExtendAttnPingpong8WProgram:
 
             # Dot layouts live on cfg.layouts; build the async tile layouts and
             # prefix smem policy directly from the same facade.
-            kt_offset_bases: gl.constexpr = ExtendAttentionLayouts.make_kt_offset_bases(cfg.BLOCK_DMODEL, cfg.BLOCK_N)
-            v_offset_bases: gl.constexpr = ExtendAttentionLayouts.prefix_v_offset_bases(cfg.layouts, cfg.num_warps, cfg.BLOCK_DV, cfg.BLOCK_N)
-            kt_async_layout: gl.constexpr = ExtendAttentionLayouts.prefix_kt_dll(cfg.layouts, cfg.num_warps, cfg.BLOCK_DMODEL, cfg.BLOCK_N)
-            v_async_layout: gl.constexpr = ExtendAttentionLayouts.prefix_v_dll(cfg.layouts, cfg.num_warps, cfg.BLOCK_DMODEL, cfg.BLOCK_DV, cfg.BLOCK_N)
-            kt_smem_layout: gl.constexpr = ExtendAttentionLayouts.prefix_kt_smem_layout(cfg.layouts, cfg.BLOCK_DMODEL, cfg.BLOCK_N, kt_offset_bases)
-            v_smem_layout: gl.constexpr = ExtendAttentionLayouts.prefix_v_smem_layout(cfg.layouts, cfg.BLOCK_N, cfg.BLOCK_DV, v_offset_bases)
+            kt_offset_bases: gl.constexpr = ExtendAttentionLayouts.make_kt_offset_bases(
+                cfg.BLOCK_DMODEL, cfg.BLOCK_N
+            )
+            v_offset_bases: gl.constexpr = ExtendAttentionLayouts.prefix_v_offset_bases(
+                cfg.layouts, cfg.num_warps, cfg.BLOCK_DV, cfg.BLOCK_N
+            )
+            kt_async_layout: gl.constexpr = ExtendAttentionLayouts.prefix_kt_dll(
+                cfg.layouts, cfg.num_warps, cfg.BLOCK_DMODEL, cfg.BLOCK_N
+            )
+            v_async_layout: gl.constexpr = ExtendAttentionLayouts.prefix_v_dll(
+                cfg.layouts, cfg.num_warps, cfg.BLOCK_DMODEL, cfg.BLOCK_DV, cfg.BLOCK_N
+            )
+            kt_smem_layout: gl.constexpr = ExtendAttentionLayouts.prefix_kt_smem_layout(
+                cfg.layouts, cfg.BLOCK_DMODEL, cfg.BLOCK_N, kt_offset_bases
+            )
+            v_smem_layout: gl.constexpr = ExtendAttentionLayouts.prefix_v_smem_layout(
+                cfg.layouts, cfg.BLOCK_N, cfg.BLOCK_DV, v_offset_bases
+            )
 
             if cfg.IS_FP8:
                 # FP8 prefix is native FP8, but extend K/V are BF16; select the
                 # BF16-extend V exception in the same layout namespace.
-                ext_kt_async_layout: gl.constexpr = ExtendAttentionLayouts.make_kt_dll(cfg.num_warps, cfg.BLOCK_DMODEL, cfg.BLOCK_N)
-                ext_v_async_layout: gl.constexpr = ExtendAttentionLayouts.make_fp8_extend_v_dll(cfg.num_warps, cfg.BLOCK_DV, cfg.BLOCK_N)
-                ext_kt_smem_layout: gl.constexpr = ExtendAttentionLayouts.make_padded_smem(
-                    [cfg.BLOCK_DMODEL, cfg.BLOCK_N], kt_offset_bases, [[512, 16]],
+                ext_kt_async_layout: gl.constexpr = ExtendAttentionLayouts.make_kt_dll(
+                    cfg.num_warps, cfg.BLOCK_DMODEL, cfg.BLOCK_N
                 )
-                ext_v_smem_layout: gl.constexpr = ExtendAttentionLayouts.make_padded_smem(
-                    [cfg.BLOCK_N, cfg.BLOCK_DV], v_offset_bases, [[512, 16]],
+                ext_v_async_layout: gl.constexpr = (
+                    ExtendAttentionLayouts.make_fp8_extend_v_dll(
+                        cfg.num_warps, cfg.BLOCK_DV, cfg.BLOCK_N
+                    )
+                )
+                ext_kt_smem_layout: gl.constexpr = (
+                    ExtendAttentionLayouts.make_padded_smem(
+                        [cfg.BLOCK_DMODEL, cfg.BLOCK_N],
+                        kt_offset_bases,
+                        [[512, 16]],
+                    )
+                )
+                ext_v_smem_layout: gl.constexpr = (
+                    ExtendAttentionLayouts.make_padded_smem(
+                        [cfg.BLOCK_N, cfg.BLOCK_DV],
+                        v_offset_bases,
+                        [[512, 16]],
+                    )
                 )
             else:
                 ext_kt_async_layout: gl.constexpr = kt_async_layout
@@ -3723,8 +4848,11 @@ class ExtendAttnPingpong8WProgram:
                 ext_v_smem_layout: gl.constexpr = v_smem_layout
 
             bank = KVSmemBank.initialize(
-                cfg, kt_smem_layout, v_smem_layout,
-                kt_async_layout, v_async_layout,
+                cfg,
+                kt_smem_layout,
+                v_smem_layout,
+                kt_async_layout,
+                v_async_layout,
                 zero_fill=(cfg.IS_FP8 or is_valid_tile),
             )
 
@@ -3735,54 +4863,96 @@ class ExtendAttnPingpong8WProgram:
             _use_scalar_mask: gl.constexpr = cfg.IS_WCA
             if n_full_prefix >= cfg.NUM_STAGES:
                 acc, l_i, m_i = self.attn_fwd_inner_prefix_pingpong_8w(
-                    acc, l_i, m_i, pfx_q,
-                    pfx_kv_start, cur_kv_head, pfx_seq_len,
+                    acc,
+                    l_i,
+                    m_i,
+                    pfx_q,
+                    pfx_kv_start,
+                    cur_kv_head,
+                    pfx_seq_len,
                     bank,
-                    qk_scale, xai_temperature_reg, pfx_q_abs_pos,
+                    qk_scale,
+                    xai_temperature_reg,
+                    pfx_q_abs_pos,
                     _use_scalar_mask,
                 )
             elif pfx_seq_len > 0:
                 acc, l_i, m_i = self.attn_fwd_inner_prefix_unpipelined(
-                    acc, l_i, m_i, pfx_q,
-                    pfx_kv_start, cur_kv_head, pfx_seq_len,
+                    acc,
+                    l_i,
+                    m_i,
+                    pfx_q,
+                    pfx_kv_start,
+                    cur_kv_head,
+                    pfx_seq_len,
                     bank,
-                    qk_scale, xai_temperature_reg, pfx_q_abs_pos,
+                    qk_scale,
+                    xai_temperature_reg,
+                    pfx_q_abs_pos,
                 )
 
             if cfg.IS_FP8:
                 bank = bank.transition_to_extend(
-                    cfg, self.Q_Extend.dtype.element_ty,
-                    ext_kt_smem_layout, ext_v_smem_layout,
-                    ext_kt_async_layout, ext_v_async_layout,
-                    _EXT_N, _EXT_NS,
+                    cfg,
+                    self.Q_Extend.dtype.element_ty,
+                    ext_kt_smem_layout,
+                    ext_v_smem_layout,
+                    ext_kt_async_layout,
+                    ext_v_async_layout,
+                    _EXT_N,
+                    _EXT_NS,
                 )
 
             # Extend hot-loop (fused unmasked-bulk + masked-tail 8w pingpong).
             masked_start = tl.maximum(n_full_blocks, swa_skip_n_blocks)
             acc, l_i, m_i = self.attn_fwd_inner_extend_pingpong_8w(
-                acc, l_i, m_i, q_dot,
-                cur_seq_q_start_idx, cur_kv_head, cur_block_m, seq_len_extend,
-                n_full_blocks, masked_start, n_extend_blocks,
+                acc,
+                l_i,
+                m_i,
+                q_dot,
+                cur_seq_q_start_idx,
+                cur_kv_head,
+                cur_block_m,
+                seq_len_extend,
+                n_full_blocks,
+                masked_start,
+                n_extend_blocks,
                 bank,
-                qk_scale, xai_temperature_reg,
-                mask_base_idx, mask_row_stride, mask_kv_col_offset,
-                _EXT_N, _EXT_NS,
+                qk_scale,
+                xai_temperature_reg,
+                mask_base_idx,
+                mask_row_stride,
+                mask_kv_col_offset,
+                _EXT_N,
+                _EXT_NS,
             )
 
             l_i = self._apply_sinks(cur_head, l_i, m_i)
 
             if cfg.IS_WCA and cfg.SPLIT_K > 1:
                 self._splitk_partial_store_and_reduce(
-                    output_tile, k_split_id,
-                    cur_seq_q_start_idx, cur_head, cur_block_m,
+                    output_tile,
+                    k_split_id,
+                    cur_seq_q_start_idx,
+                    cur_head,
+                    cur_block_m,
                     orig_seq_len_extend,
-                    acc, l_i, m_i,
-                    offs_m, offs_dv,
+                    acc,
+                    l_i,
+                    m_i,
+                    offs_m,
+                    offs_dv,
                 )
             else:
                 self._normalize_and_store(
-                    cur_seq_q_start_idx, cur_head, cur_block_m, seq_len_extend,
-                    acc, l_i, offs_m, offs_dv,
+                    cur_seq_q_start_idx,
+                    cur_head,
+                    cur_block_m,
+                    seq_len_extend,
+                    acc,
+                    l_i,
+                    offs_m,
+                    offs_dv,
                 )
 
             if cfg.IS_WCA:

@@ -40,16 +40,15 @@ import torch
 import triton
 
 from ._common import (
-    gluon,
-    gl,
     ExtendAttentionLayouts,
     ExtendAttnConfig,
+    ExtendAttnPingpong8WProgram,
     ExtendAttnProgram,
     ExtendAttnSerialProgram,
     ExtendAttnSwPipeline4WProgram,
-    ExtendAttnPingpong8WProgram,
+    gl,
+    gluon,
 )
-
 
 # ===---------------------------------------------------------------------===#
 # Serial kernel (NS=1, NW in {2, 4})
@@ -115,24 +114,35 @@ def gluon_extend_attn_serial_fwd(
     BLOCK_DV: gl.constexpr = BLOCK_DMODEL
 
     layouts: gl.constexpr = ExtendAttentionLayouts(
-        IS_FP8, num_warps, Q_Extend.dtype.element_ty, K_Buffer.dtype.element_ty,
+        IS_FP8,
+        num_warps,
+        Q_Extend.dtype.element_ty,
+        K_Buffer.dtype.element_ty,
     )
     cfg: gl.constexpr = ExtendAttnConfig(
         layouts=layouts,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_DV=BLOCK_DV,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DV=BLOCK_DV,
         NUM_STAGES=1,
-        EXT_BLOCK_N=0, EXT_NUM_STAGES=0,
+        EXT_BLOCK_N=0,
+        EXT_NUM_STAGES=0,
         num_warps=num_warps,
-        IS_CAUSAL=IS_CAUSAL, USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        IS_CAUSAL=IS_CAUSAL,
+        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         ENABLE_PREFIX_UNMASKED=False,
         LOGIT_CAP=LOGIT_CAP,
         XAI_TEMPERATURE_LEN=XAI_TEMPERATURE_LEN,
         SLIDING_WINDOW_SIZE=SLIDING_WINDOW_SIZE,
         HAS_WINDOW_OFFSETS=HAS_WINDOW_OFFSETS,
-        IS_FP8=IS_FP8, HAS_SINK=Sinks_present,
-        IS_WCA=False, SPLIT_K=1,
-        XCD_REMAP=XCD_REMAP, NUM_XCDS=NUM_XCDS, XCD_CHUNK=XCD_CHUNK,
+        IS_FP8=IS_FP8,
+        HAS_SINK=Sinks_present,
+        IS_WCA=False,
+        SPLIT_K=1,
+        XCD_REMAP=XCD_REMAP,
+        NUM_XCDS=NUM_XCDS,
+        XCD_CHUNK=XCD_CHUNK,
         XCD_MODE=XCD_MODE,
     )
     # Optional tensor slots use constexpr placeholders when the feature is off.
@@ -144,17 +154,41 @@ def gluon_extend_attn_serial_fwd(
 
     state = ExtendAttnProgram.initialize(
         cfg,
-        Q_Extend, K_Extend, V_Extend, O_Extend, K_Buffer, V_Buffer,
-        qo_indptr, kv_indptr, kv_indices,
-        Mask, MaskIndptr, WindowKvOffsets, Sinks_arg,
-        stride_qbs, stride_qh,
-        stride_kbs, stride_kh,
-        stride_vbs, stride_vh,
-        stride_obs, stride_oh,
-        stride_buf_kbs, stride_buf_kh,
-        stride_buf_vbs, stride_buf_vh,
-        sm_scale, kv_group_num, v_scale,
-        0, 0, 0, 0, 0, 0, 0,  # WCA / split-K workspace (unused on the serial kernel)
+        Q_Extend,
+        K_Extend,
+        V_Extend,
+        O_Extend,
+        K_Buffer,
+        V_Buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        Mask,
+        MaskIndptr,
+        WindowKvOffsets,
+        Sinks_arg,
+        stride_qbs,
+        stride_qh,
+        stride_kbs,
+        stride_kh,
+        stride_vbs,
+        stride_vh,
+        stride_obs,
+        stride_oh,
+        stride_buf_kbs,
+        stride_buf_kh,
+        stride_buf_vbs,
+        stride_buf_vh,
+        sm_scale,
+        kv_group_num,
+        v_scale,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,  # WCA / split-K workspace (unused on the serial kernel)
     )
     pgm = ExtendAttnSerialProgram(state)
     pgm.run()
@@ -240,24 +274,35 @@ def gluon_extend_attn_fwd_4w(
     BLOCK_DV: gl.constexpr = BLOCK_DMODEL
 
     layouts: gl.constexpr = ExtendAttentionLayouts(
-        IS_FP8, num_warps, Q_Extend.dtype.element_ty, K_Buffer.dtype.element_ty,
+        IS_FP8,
+        num_warps,
+        Q_Extend.dtype.element_ty,
+        K_Buffer.dtype.element_ty,
     )
     cfg: gl.constexpr = ExtendAttnConfig(
         layouts=layouts,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_DV=BLOCK_DV,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DV=BLOCK_DV,
         NUM_STAGES=NUM_STAGES,
-        EXT_BLOCK_N=EXT_BLOCK_N, EXT_NUM_STAGES=EXT_NUM_STAGES,
+        EXT_BLOCK_N=EXT_BLOCK_N,
+        EXT_NUM_STAGES=EXT_NUM_STAGES,
         num_warps=num_warps,
-        IS_CAUSAL=IS_CAUSAL, USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        IS_CAUSAL=IS_CAUSAL,
+        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         ENABLE_PREFIX_UNMASKED=ENABLE_PREFIX_UNMASKED,
         LOGIT_CAP=LOGIT_CAP,
         XAI_TEMPERATURE_LEN=XAI_TEMPERATURE_LEN,
         SLIDING_WINDOW_SIZE=SLIDING_WINDOW_SIZE,
         HAS_WINDOW_OFFSETS=HAS_WINDOW_OFFSETS,
-        IS_FP8=IS_FP8, HAS_SINK=HAS_SINK,
-        IS_WCA=IS_WCA, SPLIT_K=SPLIT_K,
-        XCD_REMAP=XCD_REMAP, NUM_XCDS=NUM_XCDS, XCD_CHUNK=XCD_CHUNK,
+        IS_FP8=IS_FP8,
+        HAS_SINK=HAS_SINK,
+        IS_WCA=IS_WCA,
+        SPLIT_K=SPLIT_K,
+        XCD_REMAP=XCD_REMAP,
+        NUM_XCDS=NUM_XCDS,
+        XCD_CHUNK=XCD_CHUNK,
         XCD_MODE=XCD_MODE,
     )
     # Optional tensor slots use constexpr placeholders when the feature is off.
@@ -268,18 +313,41 @@ def gluon_extend_attn_fwd_4w(
 
     state = ExtendAttnProgram.initialize(
         cfg,
-        Q_Extend, K_Extend, V_Extend, O_Extend, K_Buffer, V_Buffer,
-        qo_indptr, kv_indptr, kv_indices,
-        Mask, MaskIndptr, WindowKvOffsets, Sinks_arg,
-        stride_qbs, stride_qh,
-        stride_kbs, stride_kh,
-        stride_vbs, stride_vh,
-        stride_obs, stride_oh,
-        stride_buf_kbs, stride_buf_kh,
-        stride_buf_vbs, stride_buf_vh,
-        sm_scale, kv_group_num, v_scale,
-        num_heads, total_valid_tiles, total_programs,
-        partial_out, partial_lse, tile_done, actual_batch_size,
+        Q_Extend,
+        K_Extend,
+        V_Extend,
+        O_Extend,
+        K_Buffer,
+        V_Buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        Mask,
+        MaskIndptr,
+        WindowKvOffsets,
+        Sinks_arg,
+        stride_qbs,
+        stride_qh,
+        stride_kbs,
+        stride_kh,
+        stride_vbs,
+        stride_vh,
+        stride_obs,
+        stride_oh,
+        stride_buf_kbs,
+        stride_buf_kh,
+        stride_buf_vbs,
+        stride_buf_vh,
+        sm_scale,
+        kv_group_num,
+        v_scale,
+        num_heads,
+        total_valid_tiles,
+        total_programs,
+        partial_out,
+        partial_lse,
+        tile_done,
+        actual_batch_size,
     )
     pgm = ExtendAttnSwPipeline4WProgram(state)
     pgm.run()
@@ -358,24 +426,35 @@ def gluon_extend_attn_fwd_8w(
     BLOCK_DV: gl.constexpr = BLOCK_DMODEL
 
     layouts: gl.constexpr = ExtendAttentionLayouts(
-        IS_FP8, num_warps, Q_Extend.dtype.element_ty, K_Buffer.dtype.element_ty,
+        IS_FP8,
+        num_warps,
+        Q_Extend.dtype.element_ty,
+        K_Buffer.dtype.element_ty,
     )
     cfg: gl.constexpr = ExtendAttnConfig(
         layouts=layouts,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_DV=BLOCK_DV,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        BLOCK_DV=BLOCK_DV,
         NUM_STAGES=NUM_STAGES,
-        EXT_BLOCK_N=EXT_BLOCK_N, EXT_NUM_STAGES=EXT_NUM_STAGES,
+        EXT_BLOCK_N=EXT_BLOCK_N,
+        EXT_NUM_STAGES=EXT_NUM_STAGES,
         num_warps=num_warps,
-        IS_CAUSAL=IS_CAUSAL, USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        IS_CAUSAL=IS_CAUSAL,
+        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
         ENABLE_PREFIX_UNMASKED=ENABLE_PREFIX_UNMASKED,
         LOGIT_CAP=LOGIT_CAP,
         XAI_TEMPERATURE_LEN=XAI_TEMPERATURE_LEN,
         SLIDING_WINDOW_SIZE=SLIDING_WINDOW_SIZE,
         HAS_WINDOW_OFFSETS=HAS_WINDOW_OFFSETS,
-        IS_FP8=IS_FP8, HAS_SINK=HAS_SINK,
-        IS_WCA=IS_WCA, SPLIT_K=SPLIT_K,
-        XCD_REMAP=XCD_REMAP, NUM_XCDS=NUM_XCDS, XCD_CHUNK=XCD_CHUNK,
+        IS_FP8=IS_FP8,
+        HAS_SINK=HAS_SINK,
+        IS_WCA=IS_WCA,
+        SPLIT_K=SPLIT_K,
+        XCD_REMAP=XCD_REMAP,
+        NUM_XCDS=NUM_XCDS,
+        XCD_CHUNK=XCD_CHUNK,
         XCD_MODE=XCD_MODE,
     )
     if HAS_SINK:
@@ -385,22 +464,44 @@ def gluon_extend_attn_fwd_8w(
 
     state = ExtendAttnProgram.initialize(
         cfg,
-        Q_Extend, K_Extend, V_Extend, O_Extend, K_Buffer, V_Buffer,
-        qo_indptr, kv_indptr, kv_indices,
-        Mask, MaskIndptr, WindowKvOffsets, Sinks_arg,
-        stride_qbs, stride_qh,
-        stride_kbs, stride_kh,
-        stride_vbs, stride_vh,
-        stride_obs, stride_oh,
-        stride_buf_kbs, stride_buf_kh,
-        stride_buf_vbs, stride_buf_vh,
-        sm_scale, kv_group_num, v_scale,
-        num_heads, total_valid_tiles, total_programs,
-        partial_out, partial_lse, tile_done, actual_batch_size,
+        Q_Extend,
+        K_Extend,
+        V_Extend,
+        O_Extend,
+        K_Buffer,
+        V_Buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        Mask,
+        MaskIndptr,
+        WindowKvOffsets,
+        Sinks_arg,
+        stride_qbs,
+        stride_qh,
+        stride_kbs,
+        stride_kh,
+        stride_vbs,
+        stride_vh,
+        stride_obs,
+        stride_oh,
+        stride_buf_kbs,
+        stride_buf_kh,
+        stride_buf_vbs,
+        stride_buf_vh,
+        sm_scale,
+        kv_group_num,
+        v_scale,
+        num_heads,
+        total_valid_tiles,
+        total_programs,
+        partial_out,
+        partial_lse,
+        tile_done,
+        actual_batch_size,
     )
     pgm = ExtendAttnPingpong8WProgram(state)
     pgm.run()
-
 
 
 # ===-----------------------------------------------------------------------===#
@@ -449,11 +550,7 @@ def _select_data_centric_xcd_mode(
         return XcdRemapMode.OFF
 
     data_blocks = int(total_valid_tiles) // max(1, int(batch_size) * int(head_num))
-    if (
-        int(batch_size) >= 16
-        and data_blocks == 8
-        and int(sliding_window_size) <= 0
-    ):
+    if int(batch_size) >= 16 and data_blocks == 8 and int(sliding_window_size) <= 0:
         return XcdRemapMode.ATTENTION
     return XcdRemapMode.CHUNKED
 
@@ -523,7 +620,10 @@ def _select_xcd_remap_config(
         if mode == XcdRemapMode.OFF:
             return _disabled_xcd_remap_config()
         return XcdRemapConfig(
-            True, _NUM_XCDS, _select_xcd_chunk(total_valid_tiles), mode,
+            True,
+            _NUM_XCDS,
+            _select_xcd_chunk(total_valid_tiles),
+            mode,
         )
 
     mode = _select_wca_xcd_mode(
@@ -539,7 +639,10 @@ def _select_xcd_remap_config(
     if mode == XcdRemapMode.OFF:
         return _disabled_xcd_remap_config()
     return XcdRemapConfig(
-        True, _NUM_XCDS, _select_xcd_chunk(total_valid_tiles), mode,
+        True,
+        _NUM_XCDS,
+        _select_xcd_chunk(total_valid_tiles),
+        mode,
     )
 
 
@@ -578,6 +681,7 @@ def _should_route_serial_data_centric_bf16(
             return True
     return False
 
+
 # Tiny manual cache for a pure shape transform. ``Lq`` only takes a few
 # production values, but this helper is on every dispatch path.
 _QK_SPLIT_CACHE = {}
@@ -605,7 +709,7 @@ def _get_num_CUs(device):
     global _single_device_num_CUs
     if _single_device_num_CUs is not None:
         return _single_device_num_CUs
-    idx = device.index if hasattr(device, 'index') and device.index is not None else 0
+    idx = device.index if hasattr(device, "index") and device.index is not None else 0
     cached = _cached_num_CUs.get(idx)
     if cached is None:
         cached = torch.cuda.get_device_properties(device).multi_processor_count
@@ -680,9 +784,11 @@ _splitk_ws_lse = None
 _splitk_ws_done = None
 
 
-def _ensure_splitk_workspace(total_splits, total_output_tiles, BLOCK_M, BLOCK_DV, device):
+def _ensure_splitk_workspace(
+    total_splits, total_output_tiles, BLOCK_M, BLOCK_DV, device
+):
     """Return (partial_out, partial_lse, tile_done) workspace tensors,
-    re-using cached allocations when possible.
+    reusing cached allocations when possible.
 
     ``partial_out`` / ``partial_lse`` intentionally skip per-call
     zero-init: each split-K CTA writes to its own slot with ``po_mask ==
@@ -705,7 +811,9 @@ def _ensure_splitk_workspace(total_splits, total_output_tiles, BLOCK_M, BLOCK_DV
         pl = _splitk_ws_lse[:total_splits, :BLOCK_M]
     else:
         cap = max(total_splits, 2048)
-        _splitk_ws_out = torch.empty(cap, BLOCK_M, BLOCK_DV, dtype=torch.float32, device=device)
+        _splitk_ws_out = torch.empty(
+            cap, BLOCK_M, BLOCK_DV, dtype=torch.float32, device=device
+        )
         _splitk_ws_lse = torch.empty(cap, BLOCK_M, dtype=torch.float32, device=device)
         po = _splitk_ws_out[:total_splits]
         pl = _splitk_ws_lse[:total_splits]
@@ -724,7 +832,11 @@ def _ensure_splitk_workspace(total_splits, total_output_tiles, BLOCK_M, BLOCK_DV
 
 
 def _prepare_wca_masks(
-    q_extend, batch_size, custom_mask, mask_indptr, window_kv_offsets,
+    q_extend,
+    batch_size,
+    custom_mask,
+    mask_indptr,
+    window_kv_offsets,
 ):
     """Normalize optional mask args without placeholder allocations."""
     use_custom_mask = custom_mask is not None
@@ -734,7 +846,13 @@ def _prepare_wca_masks(
         mask_indptr = 0
     if not has_window_offsets:
         window_kv_offsets = 0
-    return custom_mask, mask_indptr, window_kv_offsets, use_custom_mask, has_window_offsets
+    return (
+        custom_mask,
+        mask_indptr,
+        window_kv_offsets,
+        use_custom_mask,
+        has_window_offsets,
+    )
 
 
 _FINALIZE_SKIP = (True,)
@@ -820,7 +938,7 @@ def _finalize_wca_grid(
     SPLIT_K,
 ):
     """Shared WCA-grid finalization: compute the tight tile count,
-    decide split-K, allocate (or re-use) the workspace.
+    decide split-K, allocate (or reuse) the workspace.
 
     Returns a positional tuple::
         (skip, total_valid_tiles, total_programs,
@@ -850,7 +968,11 @@ def _finalize_wca_grid(
     if grid_cfg.split_k > 1:
         total_splits = grid_cfg.total_valid_tiles
         partial_out, partial_lse, tile_done = _ensure_splitk_workspace(
-            total_splits, grid_cfg.total_output_tiles, BLOCK_M, BLOCK_DV, device,
+            total_splits,
+            grid_cfg.total_output_tiles,
+            BLOCK_M,
+            BLOCK_DV,
+            device,
         )
     else:
         partial_out = partial_lse = tile_done = 0
@@ -865,6 +987,7 @@ def _finalize_wca_grid(
         grid_cfg.grid,
     )
 
+
 # ===-----------------------------------------------------------------------===#
 # Data-centric path heuristic configs
 # ===-----------------------------------------------------------------------===#
@@ -873,11 +996,11 @@ def _finalize_wca_grid(
 class PrefixBucket(IntEnum):
     """Average prefix length bucket used by sync-free route heuristics."""
 
-    NONE = 0       # no prefix / prefill from scratch
-    TINY = 1       # avg < 512
-    MODERATE = 2   # avg < 2048
-    LARGE = 3      # avg < 8192
-    HUGE = 4       # avg >= 8192
+    NONE = 0  # no prefix / prefill from scratch
+    TINY = 1  # avg < 512
+    MODERATE = 2  # avg < 2048
+    LARGE = 3  # avg < 8192
+    HUGE = 4  # avg >= 8192
 
 
 class HeuristicConfig(NamedTuple):
@@ -1012,11 +1135,18 @@ def _select_d256_heuristic_config(
 
 
 def _select_d64_bf16_data_centric_config(
-    batch_size, max_len_extend, pfx_bucket, head_num,
+    batch_size,
+    max_len_extend,
+    pfx_bucket,
+    head_num,
 ):
     """Pick the normal D=64 BF16 data-centric config before refinements."""
     total_ext = batch_size * max_len_extend
-    if batch_size >= 8 and max_len_extend <= 128 and pfx_bucket >= PrefixBucket.MODERATE:
+    if (
+        batch_size >= 8
+        and max_len_extend <= 128
+        and pfx_bucket >= PrefixBucket.MODERATE
+    ):
         return HeuristicConfig(128, 128, 4, 4).with_default_extend()
     if batch_size >= 16 and max_len_extend <= 32:
         return HeuristicConfig(64, 64, 4, 4).with_default_extend()
@@ -1044,7 +1174,10 @@ def _select_d64_bf16_data_centric_config(
 
 
 def _select_d128_bf16_data_centric_config(
-    batch_size, max_len_extend, pfx_bucket, head_num,
+    batch_size,
+    max_len_extend,
+    pfx_bucket,
+    head_num,
 ):
     """Pick the normal D=128 BF16 data-centric config before refinements."""
     total_ext = batch_size * max_len_extend
@@ -1084,15 +1217,25 @@ def _select_bf16_data_centric_base_config(
     """Single BF16 data-centric base selector for fast and full paths."""
     if Lq == 256:
         return _select_d256_heuristic_config(
-            batch_size, max_len_extend, min_len_extend,
-            total_prefix_len, total_extend_len, prefix_bucket,
+            batch_size,
+            max_len_extend,
+            min_len_extend,
+            total_prefix_len,
+            total_extend_len,
+            prefix_bucket,
         )
     if Lq == 64:
         return _select_d64_bf16_data_centric_config(
-            batch_size, max_len_extend, prefix_bucket, head_num,
+            batch_size,
+            max_len_extend,
+            prefix_bucket,
+            head_num,
         )
     return _select_d128_bf16_data_centric_config(
-        batch_size, max_len_extend, prefix_bucket, head_num,
+        batch_size,
+        max_len_extend,
+        prefix_bucket,
+        head_num,
     )
 
 
@@ -1126,15 +1269,25 @@ def _apply_data_centric_policy_refinements(
             cfg = HeuristicConfig(128, 128, 8, 2, 16, 16, 128, 2)
             if batch_size == 1 and max_len_extend <= 256:
                 cfg = cfg._replace(block_m=64)
-            elif batch_size >= 32 and max_len_extend <= 8 and prefix_bucket <= PrefixBucket.MODERATE:
+            elif (
+                batch_size >= 32
+                and max_len_extend <= 8
+                and prefix_bucket <= PrefixBucket.MODERATE
+            ):
                 # Spec-verify / draft-extend continuous batches: BM=64 NW=4
                 # avoids pad-heavy Q tiles.
                 cfg = cfg._replace(block_m=64, num_warps=4)
             elif batch_size >= 16 and max_len_extend <= 64:
                 # Decode-continuation: max_ext < BM leaves Q tiles mostly
                 # padding at BM=128. Drop to the serial kernel.
-                cfg = cfg._replace(block_m=64, num_warps=4, num_stages=1, ext_num_stages=1)
-            elif batch_size >= 8 and max_len_extend <= 64 and prefix_bucket >= PrefixBucket.LARGE:
+                cfg = cfg._replace(
+                    block_m=64, num_warps=4, num_stages=1, ext_num_stages=1
+                )
+            elif (
+                batch_size >= 8
+                and max_len_extend <= 64
+                and prefix_bucket >= PrefixBucket.LARGE
+            ):
                 # Long prefix at moderate batch: keep NS=2 to pipeline the
                 # prefix phase, but above B=15 the DMA cost outpaces per-tile
                 # work so go fully serial.
@@ -1251,7 +1404,12 @@ def _select_data_centric_heuristic_config(
 
 @functools.lru_cache(maxsize=2048)
 def _get_data_centric_heuristic_config(
-    Lq, batch_size, max_len_extend, pfx_bucket, is_fp8, sliding_window_size=-1,
+    Lq,
+    batch_size,
+    max_len_extend,
+    pfx_bucket,
+    is_fp8,
+    sliding_window_size=-1,
     head_num=None,
 ):
     """Cached sync-free data-centric heuristic config.
@@ -1275,6 +1433,7 @@ def _get_data_centric_heuristic_config(
         total_prefix_len=None,
         total_extend_len=batch_size * max_len_extend,
     )
+
 
 @functools.lru_cache(maxsize=2048)
 def _get_exact_data_centric_heuristic_config(
@@ -1389,7 +1548,10 @@ def _launch_attention_grid(
     sm_scale_local = (sm_scale if sm_scale is not None else Lq**-0.5) * k_scale
     kv_group_num = head_num // k_extend.shape[1]
     use_serial_kernel = _is_serial_schedule(
-        num_stages, num_warps, block_dmodel, kv_is_fp8,
+        num_stages,
+        num_warps,
+        block_dmodel,
+        kv_is_fp8,
     )
     xcd_config = _select_xcd_remap_config(
         is_wca=is_wca,
@@ -1414,19 +1576,33 @@ def _launch_attention_grid(
     if use_serial_kernel:
         serial_extra = {"IS_FP8": True} if kv_is_fp8 else {}
         gluon_extend_attn_serial_fwd[grid](
-            q_extend, k_extend, v_extend, o_extend,
-            k_buffer, v_buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            mask, mask_indptr, window_kv_offsets,
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            mask,
+            mask_indptr,
+            window_kv_offsets,
             sinks,
             sm_scale_local,
             kv_group_num,
-            q_s0, q_s1,
-            k_s0, k_s1,
-            v_s0, v_s1,
-            o_s0, o_s1,
-            kb_s0, kb_s1,
-            vb_s0, vb_s1,
+            q_s0,
+            q_s1,
+            k_s0,
+            k_s1,
+            v_s0,
+            v_s1,
+            o_s0,
+            o_s1,
+            kb_s0,
+            kb_s1,
+            vb_s0,
+            vb_s1,
             IS_CAUSAL=is_causal,
             USE_CUSTOM_MASK=use_custom_mask,
             BLOCK_M=block_m,
@@ -1446,26 +1622,46 @@ def _launch_attention_grid(
         )
         return
 
-    schedule_kernel = gluon_extend_attn_fwd_8w if num_warps >= 8 else gluon_extend_attn_fwd_4w
+    schedule_kernel = (
+        gluon_extend_attn_fwd_8w if num_warps >= 8 else gluon_extend_attn_fwd_4w
+    )
     kernel_extra = {}
     if kv_is_fp8:
         kernel_extra["IS_FP8"] = True
-        kernel_extra["EXT_BLOCK_N"] = ext_block_n if ext_block_n is not None else block_n
-        kernel_extra["EXT_NUM_STAGES"] = ext_num_stages if ext_num_stages is not None else num_stages
+        kernel_extra["EXT_BLOCK_N"] = (
+            ext_block_n if ext_block_n is not None else block_n
+        )
+        kernel_extra["EXT_NUM_STAGES"] = (
+            ext_num_stages if ext_num_stages is not None else num_stages
+        )
 
     schedule_kernel[grid](
-        q_extend, k_extend, v_extend, o_extend,
-        k_buffer, v_buffer,
-        qo_indptr, kv_indptr, kv_indices,
-        mask, mask_indptr, window_kv_offsets,
+        q_extend,
+        k_extend,
+        v_extend,
+        o_extend,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        mask,
+        mask_indptr,
+        window_kv_offsets,
         sm_scale_local,
         kv_group_num,
-        q_s0, q_s1,
-        k_s0, k_s1,
-        v_s0, v_s1,
-        o_s0, o_s1,
-        kb_s0, kb_s1,
-        vb_s0, vb_s1,
+        q_s0,
+        q_s1,
+        k_s0,
+        k_s1,
+        v_s0,
+        v_s1,
+        o_s0,
+        o_s1,
+        kb_s0,
+        kb_s1,
+        vb_s0,
+        vb_s1,
         IS_CAUSAL=is_causal,
         USE_CUSTOM_MASK=use_custom_mask,
         ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
@@ -1522,8 +1718,14 @@ def _select_wca_heuristic_config(
         block_n = 128 if Lq == 128 else (32 if block_dmodel >= 256 else 64)
         if split_k > 1:
             return HeuristicConfig(
-                128, block_n, 8, _FP8_DEFAULT_NS,
-                16, 16, _FP8_DEFAULT_EXT_BN, _FP8_DEFAULT_EXT_NS,
+                128,
+                block_n,
+                8,
+                _FP8_DEFAULT_NS,
+                16,
+                16,
+                _FP8_DEFAULT_EXT_BN,
+                _FP8_DEFAULT_EXT_NS,
             )
         if block_dmodel >= 256:
             block_m, num_warps = 64, 4
@@ -1536,8 +1738,14 @@ def _select_wca_heuristic_config(
         else:
             block_m, num_warps = 128, 8
         return HeuristicConfig(
-            block_m, block_n, num_warps, _FP8_DEFAULT_NS,
-            16, 16, _FP8_DEFAULT_EXT_BN, _FP8_DEFAULT_EXT_NS,
+            block_m,
+            block_n,
+            num_warps,
+            _FP8_DEFAULT_NS,
+            16,
+            16,
+            _FP8_DEFAULT_EXT_BN,
+            _FP8_DEFAULT_EXT_NS,
         )
 
     block_n = 32 if block_dmodel >= 256 else 64
@@ -1549,14 +1757,11 @@ def _select_wca_heuristic_config(
         and 32 <= max_len_extend <= 512
     )
     lq128_ext_dominated = Lq == 128 and total_pfx_est < 4 * total_extend_rows
-    use_small_tile = (
-        not pfx_dominated_big_b
-        and (
-            max_len_extend <= 128
-            or (max_len_extend <= 256 and het_ratio >= 2.0)
-            or (min_len_extend < 64 and max_len_extend <= 512 and batch_size <= 4)
-            or lq128_ext_dominated
-        )
+    use_small_tile = not pfx_dominated_big_b and (
+        max_len_extend <= 128
+        or (max_len_extend <= 256 and het_ratio >= 2.0)
+        or (min_len_extend < 64 and max_len_extend <= 512 and batch_size <= 4)
+        or lq128_ext_dominated
     )
 
     if block_dmodel >= 256:
@@ -1579,7 +1784,9 @@ def _select_wca_heuristic_config(
     if block_m == 128 and num_warps == 8 and num_stages == 2:
         num_stages = 3
 
-    return HeuristicConfig(block_m, block_n, num_warps, num_stages).with_default_extend()
+    return HeuristicConfig(
+        block_m, block_n, num_warps, num_stages
+    ).with_default_extend()
 
 
 def _heuristic_config_cache_key(cfg: HeuristicConfig | None):
@@ -1632,13 +1839,30 @@ def _get_wca_heuristic_config(
 
 
 def _launch_wca(
-    q_extend, k_extend, v_extend, o_extend,
-    k_buffer, v_buffer,
-    qo_indptr, kv_indptr, kv_indices,
-    custom_mask, is_causal, mask_indptr, max_len_extend,
-    k_scale, v_scale, sm_scale, logit_cap,
-    sliding_window_size, sinks, window_kv_offsets, xai_temperature_len,
-    kv_is_fp8, total_prefix_len, min_len_extend,
+    q_extend,
+    k_extend,
+    v_extend,
+    o_extend,
+    k_buffer,
+    v_buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    custom_mask,
+    is_causal,
+    mask_indptr,
+    max_len_extend,
+    k_scale,
+    v_scale,
+    sm_scale,
+    logit_cap,
+    sliding_window_size,
+    sinks,
+    window_kv_offsets,
+    xai_temperature_len,
+    kv_is_fp8,
+    total_prefix_len,
+    min_len_extend,
     *,
     split_k=1,
     forced_config=None,
@@ -1667,8 +1891,14 @@ def _launch_wca(
         int(total_prefix_len) if total_prefix_len is not None else kv_indices.numel()
     )
 
-    mask, mask_indptr, window_kv_offsets, use_custom_mask, has_window_offsets = _prepare_wca_masks(
-        q_extend, batch_size, custom_mask, mask_indptr, window_kv_offsets,
+    mask, mask_indptr, window_kv_offsets, use_custom_mask, has_window_offsets = (
+        _prepare_wca_masks(
+            q_extend,
+            batch_size,
+            custom_mask,
+            mask_indptr,
+            window_kv_offsets,
+        )
     )
     cfg = _get_wca_heuristic_config(
         Lq,
@@ -1708,10 +1938,18 @@ def _launch_wca(
     ) = grid_state
 
     _launch_attention_grid(
-        q_extend, k_extend, v_extend, o_extend,
-        k_buffer, v_buffer,
-        qo_indptr, kv_indptr, kv_indices,
-        mask, mask_indptr, window_kv_offsets,
+        q_extend,
+        k_extend,
+        v_extend,
+        o_extend,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        mask,
+        mask_indptr,
+        window_kv_offsets,
         use_custom_mask=use_custom_mask,
         is_causal=is_causal,
         max_len_extend=max_len_extend,
@@ -1750,21 +1988,42 @@ def _launch_wca(
 
 
 def _launch_splitk(
-    q_extend, k_extend, v_extend, o_extend,
-    k_buffer, v_buffer,
-    qo_indptr, kv_indptr, kv_indices,
-    custom_mask, mask_indptr, window_kv_offsets,
-    sm_scale, k_scale, v_scale, logit_cap,
-    Lq, is_causal, max_len_extend, min_len_extend,
-    sinks, xai_temperature_len, sliding_window_size,
-    BLOCK_M, BLOCK_N, num_warps, NUM_STAGES,
+    q_extend,
+    k_extend,
+    v_extend,
+    o_extend,
+    k_buffer,
+    v_buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    custom_mask,
+    mask_indptr,
+    window_kv_offsets,
+    sm_scale,
+    k_scale,
+    v_scale,
+    logit_cap,
+    Lq,
+    is_causal,
+    max_len_extend,
+    min_len_extend,
+    sinks,
+    xai_temperature_len,
+    sliding_window_size,
+    BLOCK_M,
+    BLOCK_N,
+    num_warps,
+    NUM_STAGES,
     total_prefix_len=None,
     kv_is_fp8=False,
 ):
     """Route through WCA, adding split-K only when it improves CU fill."""
     head_num = q_extend.shape[1]
     batch_size = qo_indptr.shape[0] - 1
-    total_output_tiles = batch_size * head_num * ((max_len_extend + BLOCK_M - 1) // BLOCK_M)
+    total_output_tiles = (
+        batch_size * head_num * ((max_len_extend + BLOCK_M - 1) // BLOCK_M)
+    )
     if total_output_tiles == 0:
         return
 
@@ -1775,13 +2034,30 @@ def _launch_splitk(
     avg_kv_len = total_prefix_len_policy // max(1, batch_size)
     if not (total_output_tiles < num_CUs and avg_kv_len >= 4 * BLOCK_N):
         _launch_wca(
-            q_extend, k_extend, v_extend, o_extend,
-            k_buffer, v_buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            custom_mask, is_causal, mask_indptr, max_len_extend,
-            k_scale, v_scale, sm_scale, logit_cap,
-            sliding_window_size, sinks, window_kv_offsets, xai_temperature_len,
-            kv_is_fp8, total_prefix_len_policy, min_len_extend,
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            custom_mask,
+            is_causal,
+            mask_indptr,
+            max_len_extend,
+            k_scale,
+            v_scale,
+            sm_scale,
+            logit_cap,
+            sliding_window_size,
+            sinks,
+            window_kv_offsets,
+            xai_temperature_len,
+            kv_is_fp8,
+            total_prefix_len_policy,
+            min_len_extend,
         )
         return
 
@@ -1801,16 +2077,35 @@ def _launch_splitk(
     elif block_dmodel < 256:
         forced = HeuristicConfig(128, BLOCK_N, 8, 4).with_default_extend()
     else:
-        forced = HeuristicConfig(BLOCK_M, BLOCK_N, num_warps, NUM_STAGES).with_default_extend()
+        forced = HeuristicConfig(
+            BLOCK_M, BLOCK_N, num_warps, NUM_STAGES
+        ).with_default_extend()
 
     _launch_wca(
-        q_extend, k_extend, v_extend, o_extend,
-        k_buffer, v_buffer,
-        qo_indptr, kv_indptr, kv_indices,
-        custom_mask, is_causal, mask_indptr, max_len_extend,
-        k_scale, v_scale, sm_scale, logit_cap,
-        sliding_window_size, sinks, window_kv_offsets, xai_temperature_len,
-        kv_is_fp8, total_prefix_len_policy, min_len_extend,
+        q_extend,
+        k_extend,
+        v_extend,
+        o_extend,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        custom_mask,
+        is_causal,
+        mask_indptr,
+        max_len_extend,
+        k_scale,
+        v_scale,
+        sm_scale,
+        logit_cap,
+        sliding_window_size,
+        sinks,
+        window_kv_offsets,
+        xai_temperature_len,
+        kv_is_fp8,
+        total_prefix_len_policy,
+        min_len_extend,
         split_k=split_k,
         forced_config=forced,
         enable_prefix_unmasked=is_causal,
@@ -1881,10 +2176,18 @@ def _launch_data_centric_grid(
     )
     data_total_programs = grid[0] * grid[1] * grid[2] if data_xcd_candidate else 0
     _launch_attention_grid(
-        q_extend, k_extend, v_extend, o_extend,
-        k_buffer, v_buffer,
-        qo_indptr, kv_indptr, kv_indices,
-        mask, mask_indptr, window_kv_offsets,
+        q_extend,
+        k_extend,
+        v_extend,
+        o_extend,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        mask,
+        mask_indptr,
+        window_kv_offsets,
         use_custom_mask=use_custom_mask,
         is_causal=is_causal,
         max_len_extend=max_len_extend,
@@ -1995,29 +2298,40 @@ def gluon_extend_attention_fwd(
     # WCA and split-K stay separate because they allocate workspace and launch a
     # 1D work-centric grid rather than the 3D data-centric grid.
     _total_pfx_est_pre = (
-        total_prefix_len if total_prefix_len is not None
-        else kv_indices.numel()
+        total_prefix_len if total_prefix_len is not None else kv_indices.numel()
     )
 
     # BF16 serial-kernel preflight: cheap (Lq, B, ext, pfx) gate before
     # the heavier _is_ragged setup. The serial kernel itself handles
     # SWA and custom masks (see ``gluon_extend_attn_serial_fwd`` in
     # this file); FP8 KV is excluded here.
-    if (
-        not _kv_is_fp8
-        and _should_route_serial_data_centric_bf16(
-            Lq, batch_size, max_len_extend, _total_pfx_est_pre
-        )
+    if not _kv_is_fp8 and _should_route_serial_data_centric_bf16(
+        Lq, batch_size, max_len_extend, _total_pfx_est_pre
     ):
         _BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
         _launch_data_centric_grid(
-            q_extend, k_extend, v_extend, o_extend,
-            k_buffer, v_buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            is_causal, max_len_extend,
-            k_scale, v_scale, sm_scale, logit_cap,
-            sliding_window_size, sinks, xai_temperature_len,
-            Lq, head_num, batch_size, _kv_is_fp8,
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            is_causal,
+            max_len_extend,
+            k_scale,
+            v_scale,
+            sm_scale,
+            logit_cap,
+            sliding_window_size,
+            sinks,
+            xai_temperature_len,
+            Lq,
+            head_num,
+            batch_size,
+            _kv_is_fp8,
             BLOCK_M=64,
             BLOCK_N=64,
             BLOCK_DMODEL=_BLOCK_DMODEL,
@@ -2035,7 +2349,7 @@ def gluon_extend_attention_fwd(
     # Sync-free uniform detection: q_extend.shape[0] == sum(ext_i),
     # so if it equals B * max_ext every seq has length max_ext.
     _total_extend_rows = _q_shape[0]
-    _uniform_by_shape = (_total_extend_rows == batch_size * max_len_extend)
+    _uniform_by_shape = _total_extend_rows == batch_size * max_len_extend
 
     # WCA (and split-K, which shares the same kernel body) does
     # not support SWA + sinks. The combination produces NaN on prefix-
@@ -2046,8 +2360,9 @@ def gluon_extend_attention_fwd(
     _has_sw_sinks = sliding_window_size > 0 and sinks is not None
     _can_use_fastpath = custom_mask is None
     _can_route_wca = _can_use_fastpath and not _has_sw_sinks
-    _is_uniform = (batch_size <= 1 or min_len_extend == max_len_extend
-                   or _uniform_by_shape)
+    _is_uniform = (
+        batch_size <= 1 or min_len_extend == max_len_extend or _uniform_by_shape
+    )
     _is_ragged_ext = _can_route_wca and not _is_uniform and batch_size >= 2
     # Small-ext + big-prefix-skew (e.g. spec-decode): looks uniform but
     # the longest-prefix CTA dominates, so WCA reclaims these.
@@ -2061,13 +2376,12 @@ def gluon_extend_attention_fwd(
         # than WCA on these buckets. The _need_wca gate below
         # still sends long-prefix B<=4 back to WCA when useful.
         and not (_kv_is_fp8 and Lq == 128 and max_len_extend <= 64)
+        and not (_kv_is_fp8 and Lq == 128 and batch_size <= 4 and max_len_extend >= 128)
         and not (
-            _kv_is_fp8 and Lq == 128
-            and batch_size <= 4 and max_len_extend >= 128
-        )
-        and not (
-            _kv_is_fp8 and Lq == 64
-            and batch_size >= 8 and max_len_extend <= 64
+            _kv_is_fp8
+            and Lq == 64
+            and batch_size >= 8
+            and max_len_extend <= 64
             and _total_pfx_est_pre >= batch_size * 8192
         )
     )
@@ -2090,10 +2404,7 @@ def gluon_extend_attention_fwd(
     # D=256 WCA hits LDS pressure issues; both fall through to data-centric.
     # D=128 B<=4 never satisfies the WCA clauses below, so skip.
     _skip_wca_check = (
-        Lq == 128
-        and not _kv_is_fp8
-        and not _is_ragged_pfx
-        and batch_size <= 4
+        Lq == 128 and not _kv_is_fp8 and not _is_ragged_pfx and batch_size <= 4
     )
     if _is_ragged and Lq == 128 and not _skip_wca_check:
         _total_ext = _total_extend_rows
@@ -2114,14 +2425,30 @@ def gluon_extend_attention_fwd(
             )
         if _use_wca:
             _launch_wca(
-                q_extend, k_extend, v_extend, o_extend,
-                k_buffer, v_buffer,
-                qo_indptr, kv_indptr, kv_indices,
-                custom_mask, is_causal, mask_indptr, max_len_extend,
-                k_scale, v_scale, sm_scale, logit_cap,
-                sliding_window_size, sinks, window_kv_offsets,
+                q_extend,
+                k_extend,
+                v_extend,
+                o_extend,
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                custom_mask,
+                is_causal,
+                mask_indptr,
+                max_len_extend,
+                k_scale,
+                v_scale,
+                sm_scale,
+                logit_cap,
+                sliding_window_size,
+                sinks,
+                window_kv_offsets,
                 xai_temperature_len,
-                _kv_is_fp8, _total_pfx_est_pre, min_len_extend,
+                _kv_is_fp8,
+                _total_pfx_est_pre,
+                min_len_extend,
             )
             return
 
@@ -2131,13 +2458,28 @@ def gluon_extend_attention_fwd(
         # D=64 BF16 tiny-prefix small-extend: NS=1 serial data-centric kernel.
         if _is_d64_tiny_prefix_small_ext:
             _launch_data_centric_grid(
-                q_extend, k_extend, v_extend, o_extend,
-                k_buffer, v_buffer,
-                qo_indptr, kv_indptr, kv_indices,
-                is_causal, max_len_extend,
-                k_scale, v_scale, sm_scale, logit_cap,
-                sliding_window_size, sinks, xai_temperature_len,
-                Lq, head_num, batch_size, _kv_is_fp8,
+                q_extend,
+                k_extend,
+                v_extend,
+                o_extend,
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                is_causal,
+                max_len_extend,
+                k_scale,
+                v_scale,
+                sm_scale,
+                logit_cap,
+                sliding_window_size,
+                sinks,
+                xai_temperature_len,
+                Lq,
+                head_num,
+                batch_size,
+                _kv_is_fp8,
                 BLOCK_M=64,
                 BLOCK_N=64,
                 BLOCK_DMODEL=_BLOCK_DMODEL,
@@ -2162,14 +2504,10 @@ def gluon_extend_attention_fwd(
             _total_pfx = total_prefix_len if total_prefix_len is not None else 0
             _avg_pfx = _total_pfx // max(1, batch_size)
             if _kv_is_fp8:
-                _need_wca = (
-                    _total_tiles_est < _num_CUs
-                    and (
-                        (_avg_pfx >= 4096 and max_len_extend <= 64)
-                        or (_avg_pfx >= 4096 and max_len_extend <= 128
-                            and batch_size >= 5)
-                        or (_avg_pfx >= 16384 and max_len_extend <= 256)
-                    )
+                _need_wca = _total_tiles_est < _num_CUs and (
+                    (_avg_pfx >= 4096 and max_len_extend <= 64)
+                    or (_avg_pfx >= 4096 and max_len_extend <= 128 and batch_size >= 5)
+                    or (_avg_pfx >= 16384 and max_len_extend <= 256)
                 )
             else:
                 _need_wca = (
@@ -2179,14 +2517,30 @@ def gluon_extend_attention_fwd(
                 )
             if _need_wca and _can_route_wca:
                 _launch_wca(
-                    q_extend, k_extend, v_extend, o_extend,
-                    k_buffer, v_buffer,
-                    qo_indptr, kv_indptr, kv_indices,
-                    custom_mask, is_causal, mask_indptr, max_len_extend,
-                    k_scale, v_scale, sm_scale, logit_cap,
-                    sliding_window_size, sinks, window_kv_offsets,
+                    q_extend,
+                    k_extend,
+                    v_extend,
+                    o_extend,
+                    k_buffer,
+                    v_buffer,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    custom_mask,
+                    is_causal,
+                    mask_indptr,
+                    max_len_extend,
+                    k_scale,
+                    v_scale,
+                    sm_scale,
+                    logit_cap,
+                    sliding_window_size,
+                    sinks,
+                    window_kv_offsets,
                     xai_temperature_len,
-                    _kv_is_fp8, _total_pfx_est_pre, min_len_extend,
+                    _kv_is_fp8,
+                    _total_pfx_est_pre,
+                    min_len_extend,
                 )
                 return
 
@@ -2204,31 +2558,66 @@ def gluon_extend_attention_fwd(
             )
             if _need_wca_256 and _can_route_wca:
                 _launch_wca(
-                    q_extend, k_extend, v_extend, o_extend,
-                    k_buffer, v_buffer,
-                    qo_indptr, kv_indptr, kv_indices,
-                    custom_mask, is_causal, mask_indptr, max_len_extend,
-                    k_scale, v_scale, sm_scale, logit_cap,
-                    sliding_window_size, sinks, window_kv_offsets,
+                    q_extend,
+                    k_extend,
+                    v_extend,
+                    o_extend,
+                    k_buffer,
+                    v_buffer,
+                    qo_indptr,
+                    kv_indptr,
+                    kv_indices,
+                    custom_mask,
+                    is_causal,
+                    mask_indptr,
+                    max_len_extend,
+                    k_scale,
+                    v_scale,
+                    sm_scale,
+                    logit_cap,
+                    sliding_window_size,
+                    sinks,
+                    window_kv_offsets,
                     xai_temperature_len,
-                    _kv_is_fp8, _total_pfx_est_pre, min_len_extend,
+                    _kv_is_fp8,
+                    _total_pfx_est_pre,
+                    min_len_extend,
                 )
                 return
 
         _cfg = _get_data_centric_heuristic_config(
-            Lq, batch_size, max_len_extend, _prefix_bucket_fastpath, _kv_is_fp8,
+            Lq,
+            batch_size,
+            max_len_extend,
+            _prefix_bucket_fastpath,
+            _kv_is_fp8,
             sliding_window_size=sliding_window_size,
             head_num=head_num,
         )
 
         _launch_data_centric_grid(
-            q_extend, k_extend, v_extend, o_extend,
-            k_buffer, v_buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            is_causal, max_len_extend,
-            k_scale, v_scale, sm_scale, logit_cap,
-            sliding_window_size, sinks, xai_temperature_len,
-            Lq, head_num, batch_size, _kv_is_fp8,
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            is_causal,
+            max_len_extend,
+            k_scale,
+            v_scale,
+            sm_scale,
+            logit_cap,
+            sliding_window_size,
+            sinks,
+            xai_temperature_len,
+            Lq,
+            head_num,
+            batch_size,
+            _kv_is_fp8,
             BLOCK_M=_cfg.block_m,
             BLOCK_N=_cfg.block_n,
             BLOCK_DMODEL=_BLOCK_DMODEL,
@@ -2268,13 +2657,28 @@ def gluon_extend_attention_fwd(
             True,
         )
         _launch_data_centric_grid(
-            q_extend, k_extend, v_extend, o_extend,
-            k_buffer, v_buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            is_causal, max_len_extend,
-            k_scale, v_scale, sm_scale, logit_cap,
-            sliding_window_size, sinks, xai_temperature_len,
-            Lq, head_num, batch_size, _kv_is_fp8,
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            is_causal,
+            max_len_extend,
+            k_scale,
+            v_scale,
+            sm_scale,
+            logit_cap,
+            sliding_window_size,
+            sinks,
+            xai_temperature_len,
+            Lq,
+            head_num,
+            batch_size,
+            _kv_is_fp8,
             BLOCK_M=_cfg.block_m,
             BLOCK_N=_cfg.block_n,
             BLOCK_DMODEL=BLOCK_DMODEL,
@@ -2300,10 +2704,7 @@ def gluon_extend_attention_fwd(
     # Split-K delegates to the WCA body, so SWA+sinks shapes
     # intentionally skip it and fall through to the data-centric path below.
     _use_splitk = (
-        (Lq > 64)
-        and (Lq <= 128)
-        and (custom_mask is None)
-        and not _has_sw_sinks
+        (Lq > 64) and (Lq <= 128) and (custom_mask is None) and not _has_sw_sinks
     )
 
     if _use_splitk:
@@ -2311,14 +2712,29 @@ def gluon_extend_attention_fwd(
         if min_len_extend is None:
             min_len_extend = max_len_extend
         _launch_splitk(
-            q_extend, k_extend, v_extend, o_extend,
-            k_buffer, v_buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            custom_mask, mask_indptr,
+            q_extend,
+            k_extend,
+            v_extend,
+            o_extend,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            custom_mask,
+            mask_indptr,
             window_kv_offsets,
-            sm_scale, k_scale, v_scale, logit_cap,
-            Lq, is_causal, max_len_extend, min_len_extend,
-            sinks, xai_temperature_len, sliding_window_size,
+            sm_scale,
+            k_scale,
+            v_scale,
+            logit_cap,
+            Lq,
+            is_causal,
+            max_len_extend,
+            min_len_extend,
+            sinks,
+            xai_temperature_len,
+            sliding_window_size,
             BLOCK_M=64,
             BLOCK_N=_BN,
             num_warps=4,
@@ -2353,13 +2769,28 @@ def gluon_extend_attention_fwd(
     )
 
     _launch_data_centric_grid(
-        q_extend, k_extend, v_extend, o_extend,
-        k_buffer, v_buffer,
-        qo_indptr, kv_indptr, kv_indices,
-        is_causal, max_len_extend,
-        k_scale, v_scale, sm_scale, logit_cap,
-        sliding_window_size, sinks, xai_temperature_len,
-        Lq, head_num, batch_size, _kv_is_fp8,
+        q_extend,
+        k_extend,
+        v_extend,
+        o_extend,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        is_causal,
+        max_len_extend,
+        k_scale,
+        v_scale,
+        sm_scale,
+        logit_cap,
+        sliding_window_size,
+        sinks,
+        xai_temperature_len,
+        Lq,
+        head_num,
+        batch_size,
+        _kv_is_fp8,
         BLOCK_M=_cfg.block_m,
         BLOCK_N=_cfg.block_n,
         BLOCK_DMODEL=BLOCK_DMODEL,

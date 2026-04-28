@@ -49,9 +49,10 @@ def _gluon_supports(
     is_causal: bool,
 ) -> bool:
     """Fast guard for unsupported Gluon shapes."""
-    return _gluon_unsupported_reason(
-        q_extend, v_extend, k_buffer, custom_mask, is_causal
-    ) is None
+    return (
+        _gluon_unsupported_reason(q_extend, v_extend, k_buffer, custom_mask, is_causal)
+        is None
+    )
 
 
 def _gluon_unsupported_reason(
@@ -85,22 +86,50 @@ def make_extend_attention_fwd(triton_fallback: Callable) -> Callable:
     gluon_fn = _GLUON_FN
 
     def _fwd(
-        q_extend, k_extend, v_extend, o_extend,
-        k_buffer, v_buffer,
-        qo_indptr, kv_indptr, kv_indices,
-        custom_mask, is_causal, mask_indptr, max_len_extend,
-        k_scale=1.0, v_scale=1.0, sm_scale=None,
-        logit_cap=0.0, skip_prefix_custom_mask=True,
-        sliding_window_size=-1, sinks=None,
-        window_kv_offsets=None, xai_temperature_len=-1,
-        total_prefix_len=None, total_extend_len=None, min_len_extend=None,
+        q_extend,
+        k_extend,
+        v_extend,
+        o_extend,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        custom_mask,
+        is_causal,
+        mask_indptr,
+        max_len_extend,
+        k_scale=1.0,
+        v_scale=1.0,
+        sm_scale=None,
+        logit_cap=0.0,
+        skip_prefix_custom_mask=True,
+        sliding_window_size=-1,
+        sinks=None,
+        window_kv_offsets=None,
+        xai_temperature_len=-1,
+        total_prefix_len=None,
+        total_extend_len=None,
+        min_len_extend=None,
     ):
         def _fallback():
             return triton_fallback(
-                q_extend, k_extend, v_extend, o_extend,
-                k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices,
-                custom_mask, is_causal, mask_indptr, max_len_extend,
-                k_scale, v_scale, sm_scale,
+                q_extend,
+                k_extend,
+                v_extend,
+                o_extend,
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                custom_mask,
+                is_causal,
+                mask_indptr,
+                max_len_extend,
+                k_scale,
+                v_scale,
+                sm_scale,
                 logit_cap=logit_cap,
                 skip_prefix_custom_mask=skip_prefix_custom_mask,
                 sliding_window_size=sliding_window_size,
@@ -117,9 +146,19 @@ def make_extend_attention_fwd(triton_fallback: Callable) -> Callable:
 
         try:
             return gluon_fn(
-                q_extend, k_extend, v_extend, o_extend,
-                k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices,
-                custom_mask, is_causal, mask_indptr, max_len_extend,
+                q_extend,
+                k_extend,
+                v_extend,
+                o_extend,
+                k_buffer,
+                v_buffer,
+                qo_indptr,
+                kv_indptr,
+                kv_indices,
+                custom_mask,
+                is_causal,
+                mask_indptr,
+                max_len_extend,
                 k_scale=k_scale,
                 v_scale=v_scale,
                 sm_scale=sm_scale,

@@ -87,9 +87,7 @@ class TritonAttnBackend(AttentionBackend):
         # Optional gfx950 Gluon extend attention.
         self._gluon_extend_enabled = False
         _extend_fwd = extend_attention_fwd
-        _mla_model = (
-            model_runner.model_config.attention_arch == AttentionArch.MLA
-        )
+        _mla_model = model_runner.model_config.attention_arch == AttentionArch.MLA
         if (
             model_runner.server_args.enable_gluon_extend_attention
             and is_gfx95_supported()
@@ -98,6 +96,7 @@ class TritonAttnBackend(AttentionBackend):
             from sglang.srt.layers.attention.gluon_extend_attention import (
                 make_extend_attention_fwd,
             )
+
             _gluon_fwd = make_extend_attention_fwd(extend_attention_fwd)
             if _gluon_fwd is not extend_attention_fwd:
                 self._gluon_extend_enabled = True
