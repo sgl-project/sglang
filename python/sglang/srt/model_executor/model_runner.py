@@ -744,13 +744,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     f"moe_intermediate_size {moe_intermediate_size} must be divisible by moe_tp_size ({moe_tp_size}) which is tp_size ({self.tp_size}) divided by moe_ep_size ({self.moe_ep_size})."
                 )
 
-            if (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0:
-                raise ValueError(
-                    f"For quantized MoE models, please make sure ({moe_intermediate_size=} / {moe_tp_size=}) % {weight_block_size_n=} == 0 "
-                    f"where moe_tp_size is equal to tp_size ({self.tp_size}) divided by ep_size ({self.moe_ep_size}). "
-                    f"You can fix this by setting arguments `--tp` and `--ep` correctly."
-                )
-
     def init_torch_distributed(self):
         logger.info("Init torch distributed begin.")
 
