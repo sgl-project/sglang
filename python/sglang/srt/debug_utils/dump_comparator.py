@@ -7,6 +7,7 @@ full ``comparator/`` package: ``python -m sglang.srt.debug_utils.comparator``.
 
 import argparse
 import functools
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -190,6 +191,10 @@ def _compute_and_print_diff(
 ):
     raw_abs_diff = (x_target - x_baseline).abs()
 
+    if raw_abs_diff.numel() == 0:
+        print(prefix_text + "⚠️ Empty tensor, skipping diff computation")
+        return dict(max_abs_diff=0.0)
+
     max_abs_diff = raw_abs_diff.max().item()
     mean_abs_diff = raw_abs_diff.mean().item()
     rel_diff = _calc_rel_diff(x_target, x_baseline)
@@ -264,6 +269,41 @@ def _load_object(path):
 
 def _comparison_preprocessor(x_baseline, x_target, name):
     """Customization endpoint. Can insert arbitrary adhoc postprocessing logic here."""
+    if bool(int(os.environ.get("SGLANG_HACK_TRUNCATE_DIM0", "0"))):
+        if (
+            x_baseline.dim() >= 1
+            and x_target.dim() >= 1
+            and x_baseline.shape[0] != x_target.shape[0]
+            and x_baseline.shape[1:] == x_target.shape[1:]
+        ):
+            n = min(x_baseline.shape[0], x_target.shape[0])
+            print(
+                f"[HACK] Truncating dim0: {x_baseline.shape[0]} vs {x_target.shape[0]} -> {n}"
+            )
+            x_baseline = x_baseline[:n]
+            x_target = x_target[:n]
+
+    # CP round-robin stride-select: baseline has FULL tokens [N],
+    # target has LOCAL tokens [N/cp_size] from round-robin stride.
+    # Stride-select baseline[cp_rank::cp_size] to align with target.
+    # Usage: SGLANG_HACK_CP_ROUND_ROBIN_STRIDE="0:4" (rank:size)
+    cp_stride_spec = os.environ.get("SGLANG_HACK_CP_ROUND_ROBIN_STRIDE", "")
+    if cp_stride_spec:
+        cp_rank, cp_size = (int(x) for x in cp_stride_spec.split(":"))
+        if (
+            x_baseline.dim() >= 1
+            and x_target.dim() >= 1
+            and x_baseline.shape[1:] == x_target.shape[1:]
+            and x_baseline.shape[0] != x_target.shape[0]
+            and x_baseline.shape[0] == x_target.shape[0] * cp_size
+        ):
+            print(
+                f"[HACK] CP round-robin stride-select: "
+                f"baseline[{cp_rank}::{cp_size}] "
+                f"({x_baseline.shape[0]} -> {x_target.shape[0]})"
+            )
+            x_baseline = x_baseline[cp_rank::cp_size]
+
     return x_baseline, x_target
 
 

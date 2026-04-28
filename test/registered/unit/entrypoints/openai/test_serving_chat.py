@@ -45,7 +45,7 @@ class _MockTokenizerManager:
             reasoning_parser=None,
             stream_response_default_include_usage=False,
         )
-        # Mock hf_config for _use_dpsk_v32_encoding check
+        # Mock hf_config for _resolve_chat_encoding_spec check
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["LlamaForCausalLM"]
         self.model_config.hf_config = mock_hf_config
@@ -674,29 +674,29 @@ class ServingChatTestCase(unittest.TestCase):
         """Test DeepSeek V3.2 encoding path detection and application."""
         from sglang.srt.managers.template_manager import TemplateManager
 
-        # Only mock the fields that _use_dpsk_v32_encoding() actually reads:
-        # tokenizer.chat_template and hf_config.architectures
+        # Only mock the fields that _resolve_chat_encoding_spec() actually reads:
+        # tokenizer.chat_template, hf_config.architectures, and tool_call_parser
         tm = _MockTokenizerManager()
 
         mock_hf_config = Mock()
         mock_hf_config.architectures = ["DeepseekV32ForCausalLM"]
         tm.model_config.hf_config = mock_hf_config
 
-        # Case 1: No chat template + DeepSeek V3.2 arch -> should use dpsk encoding
+        # Case 1: No chat template + DeepSeek V3.2 arch -> should use dsv32 encoding
         tm.tokenizer.chat_template = None
         serving_chat = OpenAIServingChat(tm, TemplateManager())
-        self.assertTrue(serving_chat.use_dpsk_v32_encoding)
+        self.assertEqual(serving_chat.chat_encoding_spec, "dsv32")
 
         # Case 2: Chat template exists -> should NOT use dpsk encoding
         tm.tokenizer.chat_template = "some template"
         serving_chat = OpenAIServingChat(tm, TemplateManager())
-        self.assertFalse(serving_chat.use_dpsk_v32_encoding)
+        self.assertIsNone(serving_chat.chat_encoding_spec)
 
         # Case 3: Not DeepSeek V3.2 architecture -> should NOT use dpsk encoding
         tm.tokenizer.chat_template = None
         mock_hf_config.architectures = ["LlamaForCausalLM"]
         serving_chat = OpenAIServingChat(tm, TemplateManager())
-        self.assertFalse(serving_chat.use_dpsk_v32_encoding)
+        self.assertIsNone(serving_chat.chat_encoding_spec)
 
     def test_streaming_abort_yields_error(self):
         """Test that an abort finish reason during streaming correctly yields an error and stops."""

@@ -198,7 +198,11 @@ class RMSNorm(MultiPlatformOp):
         self.variance_size_override = (
             None if var_hidden_size == hidden_size else var_hidden_size
         )
-        if _use_aiter:
+        # if _use_aiter:
+        #     self._forward_method = self.forward_aiter
+        if get_bool_env_var("SGLANG_USE_NATIVE_LAYERNORM"):
+            self._forward_method = self.forward_native
+        elif _use_aiter:
             self._forward_method = self.forward_aiter
 
     def forward_cuda(
@@ -284,11 +288,28 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if _is_hip:
+            ### amd dsk
+            # Handle empty tensor case
+            if x.shape[0] == 0:
+                if residual is not None:
+                    return x, residual
+                return x
+
+        #     # DEBUG: skip rms_norm，return tensor
+        #     if residual is not None:
+        #         # return same shape 的 tensor
+        #         # output = torch.empty_like(x)
+        #         output = torch.zeros_like(x)
+        #         # residual_out = torch.empty_like(x)
+        #         residual_out = torch.zeros_like(x)
+        #         return output, residual_out
+        #     # return torch.empty_like(x)
+        #     return torch.zeros_like(x)
+        # else:
         if residual is not None:
             residual_out = torch.empty_like(x)
             output = torch.empty_like(x)
-            if post_residual_addition is not None:
-                residual = residual + post_residual_addition
             fused_add_rms_norm(
                 output,
                 x,

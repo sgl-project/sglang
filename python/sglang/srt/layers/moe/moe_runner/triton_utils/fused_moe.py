@@ -11,6 +11,10 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
+from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+    deepseek_v4_moe_code_path_checker,
+)
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.server_args import get_global_server_args
@@ -28,6 +32,7 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
+    act_and_mul_triton,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
     support_tensor_descriptor,
@@ -111,6 +116,7 @@ def inplace_fused_experts(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
     filter_expert: bool = True,
 ) -> None:
     fused_experts_impl(
@@ -141,6 +147,7 @@ def inplace_fused_experts(
         routed_scaling_factor,
         gemm1_alpha,
         gemm1_limit,
+        swiglu_limit,
         filter_expert,
     )
 
@@ -173,6 +180,7 @@ def outplace_fused_experts(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
     filter_expert: bool = True,
 ) -> torch.Tensor:
     return fused_experts_impl(
@@ -203,6 +211,7 @@ def outplace_fused_experts(
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
+        swiglu_limit=swiglu_limit,
         filter_expert=filter_expert,
     )
 
@@ -261,6 +270,7 @@ def fused_experts(
             moe_runner_config.routed_scaling_factor,
             moe_runner_config.gemm1_alpha,
             moe_runner_config.gemm1_clamp_limit,
+            moe_runner_config.swiglu_limit,
             filter_expert,
         )
         return hidden_states
@@ -292,6 +302,7 @@ def fused_experts(
             routed_scaling_factor=moe_runner_config.routed_scaling_factor,
             gemm1_alpha=moe_runner_config.gemm1_alpha,
             gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+            swiglu_limit=moe_runner_config.swiglu_limit,
             filter_expert=filter_expert,
         )
 
@@ -423,6 +434,7 @@ def _fused_moe_kernel_sequence(
     routed_scaling_factor: Optional[float],
     gemm1_alpha: Optional[float],
     gemm1_limit: Optional[float],
+    swiglu_limit: Optional[float],
     filter_expert: bool,
     hooks: Optional[Any] = None,
 ) -> torch.Tensor:
@@ -529,6 +541,24 @@ def _fused_moe_kernel_sequence(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
         elif _is_cuda or _is_hip or _is_xpu:
+            is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
+            assert is_2604b == (swiglu_limit is not None), (
+                f"swiglu_limit must be non-None iff submode=2604B "
+                f"(got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, "
+                f"swiglu_limit={swiglu_limit!r})"
+            )
+            swiglu_limit_for_triton: Optional[float] = None
+            if is_2604b:
+                if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+                    swiglu_limit_for_triton = swiglu_limit
+                else:
+                    half = N // 2
+                    intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
+                    intermediate_cache1[:, half:].clamp_(
+                        min=-swiglu_limit, max=swiglu_limit
+                    )
+                    deepseek_v4_moe_code_path_checker.observed += 1
+
             if filter_expert and _is_cuda:
                 # HIP/XPU fall through to the unfiltered path: the down kernel
                 # zeros filtered rows without reading their input.
@@ -537,6 +567,17 @@ def _fused_moe_kernel_sequence(
                     intermediate_cache2,
                     expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
                     expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
+                )
+            elif filter_expert and _is_hip:
+                act_and_mul_triton(
+                    intermediate_cache1.view(-1, N),
+                    intermediate_cache2,
+                    config,
+                    topk_ids,
+                    expert_ids,
+                    down_moe_use_tma,
+                    activation,
+                    swiglu_limit=swiglu_limit_for_triton,
                 )
             else:
                 silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
@@ -680,7 +721,8 @@ def _fused_moe_kernel_sequence(
                     routed_scaling_factor,
                 )
     elif _is_hip:
-        if _use_aiter:
+        _force_triton = envs.SGLANG_FORCE_TRITON_MOE_FP8.get()
+        if _use_aiter and not _force_triton:
             moe_sum(
                 intermediate_cache3.view(*intermediate_cache3.shape),
                 out_hidden_states,
@@ -752,6 +794,7 @@ def fused_experts_impl(
     routed_scaling_factor: Optional[float] = None,
     gemm1_alpha: Optional[float] = None,
     gemm1_limit: Optional[float] = None,
+    swiglu_limit: Optional[float] = None,
     filter_expert: bool = True,
 ):
     padded_size = padding_size
@@ -825,6 +868,7 @@ def fused_experts_impl(
         routed_scaling_factor=routed_scaling_factor,
         gemm1_alpha=gemm1_alpha,
         gemm1_limit=gemm1_limit,
+        swiglu_limit=swiglu_limit,
         filter_expert=filter_expert,
         hooks=None,
     )

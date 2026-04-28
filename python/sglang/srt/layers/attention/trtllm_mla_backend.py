@@ -14,6 +14,9 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
+from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
+
+fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
@@ -199,7 +202,7 @@ def unpad_draft_extend_output_kernel(
 
 
 def _quantize_fp8_qkv(q, k, v, layer):
-    q = q.to(torch.float8_e4m3fn)
+    q = q.to(fp8_dtype)
 
     k_scale = getattr(layer, "k_scale_float", None)
     if k_scale is None:
@@ -211,7 +214,7 @@ def _quantize_fp8_qkv(q, k, v, layer):
         )
         k = k_2d.reshape(k.shape)
     else:
-        k = k.to(torch.float8_e4m3fn)
+        k = k.to(fp8_dtype)
 
     v_scale = getattr(layer, "v_scale_float", None)
     if v_scale is None:
@@ -223,7 +226,7 @@ def _quantize_fp8_qkv(q, k, v, layer):
         )
         v = v_2d.reshape(v.shape)
     else:
-        v = v.to(torch.float8_e4m3fn)
+        v = v.to(fp8_dtype)
 
     return q, k, v, k_scale, v_scale
 
@@ -675,6 +678,48 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     def init_mha_chunk_metadata(self, forward_batch: ForwardBatch):
         super().init_mha_chunk_metadata(forward_batch, disable_flashinfer_ragged=True)
 
+    def quantize_and_rope_for_fp8(
+        self,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_rope: torch.Tensor,
+        forward_batch: ForwardBatch,
+        cos_sin_cache: torch.Tensor,
+        is_neox: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        attn_dtype = fp8_dtype
+        q_len, num_heads = q_rope.shape[0], q_rope.shape[1]
+
+        q_out = q_rope.new_empty(
+            q_len,
+            num_heads,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            dtype=attn_dtype,
+        )
+
+        k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)
+        k_nope_out = k_nope.new_empty(k_nope.shape, dtype=attn_dtype)
+
+        flashinfer.rope.mla_rope_quantize_fp8(
+            q_rope=q_rope,
+            k_rope=k_rope,
+            q_nope=q_nope,
+            k_nope=k_nope,
+            cos_sin_cache=cos_sin_cache,
+            pos_ids=forward_batch.positions,
+            is_neox=is_neox,
+            quantize_dtype=attn_dtype,
+            q_rope_out=q_out[..., self.kv_lora_rank :],
+            k_rope_out=k_rope_out,
+            q_nope_out=q_out[..., : self.kv_lora_rank],
+            k_nope_out=k_nope_out,
+            quant_scale_q=1.0,
+            quant_scale_kv=1.0,
+        )
+
+        return q_out, k_nope_out, k_rope_out
+
     def pad_draft_extend_query(
         self,
         q: torch.Tensor,
@@ -771,7 +816,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MLA kernel."""
         merge_query = q_rope is not None
-        if self.data_type == torch.float8_e4m3fn:
+        if self.data_type == fp8_dtype:
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
             assert all(
@@ -910,7 +955,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # TODO refactor to avoid code duplication
         merge_query = q_rope is not None
         if (
-            self.data_type == torch.float8_e4m3fn
+            self.data_type == fp8_dtype
         ) and forward_batch.forward_mode.is_target_verify():
             # For FP8 path, we quantize the query and rope parts and merge them into a single tensor
             # Note: rope application in deepseek_v2.py:forward_absorb_prepare is skipped for FP8 decode path of this trtllm_mla backend
@@ -1088,7 +1133,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         v = v.view(-1, layer.tp_k_head_num, layer.v_head_dim)
 
         q_scale = k_scale = v_scale = 1.0
-        if self.data_type == torch.float8_e4m3fn:
+        if self.data_type == fp8_dtype:
             q, k, v, k_scale, v_scale = _quantize_fp8_qkv(q, k, v, layer)
 
         common_trtllm_args = {

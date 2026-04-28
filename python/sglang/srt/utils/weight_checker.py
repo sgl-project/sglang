@@ -104,11 +104,15 @@ def _random_like(t: torch.Tensor):
     shape = t.shape
     dtype = t.dtype
 
-    if dtype.is_floating_point:
+    # FP8 types (float8_e4m3fn, etc.) have is_floating_point=False but are logically floats
+    if dtype.is_floating_point or "float" in str(dtype):
         return torch.rand(shape, device=device, dtype=torch.float32).to(dtype)
 
     if dtype == torch.bool:
         return torch.rand(shape, device=device) > 0.5
+
+    if dtype.is_complex:
+        return torch.randn(shape, device=device, dtype=dtype)
 
     info = torch.iinfo(dtype)
     return torch.randint(
@@ -121,7 +125,18 @@ def _postprocess_tensors(
 ) -> Iterable[Tuple[str, bool, torch.Tensor]]:
     from sglang.srt.debug_utils.dumper import get_tensor_info
 
-    skip_compare_names = []
+    # skip because megatron don't use k_scale/v_scale
+    skip_compare_names = [
+        name
+        for name in raw
+        if any(pattern in name for pattern in ["attn_mqa.k_scale", "attn_mqa.v_scale"])
+    ]
+    # rope parameters should not be updated from megatron
+    skip_compare_names += [
+        name
+        for name in raw
+        if any(pattern in name for pattern in ["freqs_cis", "cos_sin_cache"])
+    ]
 
     # dequant fp8
     quant_names = [
@@ -130,19 +145,27 @@ def _postprocess_tensors(
         # Match: `something.weight`, `something.experts.w2_weight`
         if name.endswith("weight") and name.replace("weight", "weight_scale_inv") in raw
     ]
+    quant_scale_names = [
+        name.replace("weight", "weight_scale_inv") for name in quant_names
+    ]
     skip_compare_names += quant_names
+    skip_compare_names += quant_scale_names
     for name in quant_names:
         w_q = raw[name]
         w_s = raw[name.replace("weight", "weight_scale_inv")]
 
         try:
-            # TODO this is only needed for Blackwell
-            w_s_inverse_transformed = inverse_transform_scale_ue8m0(
-                w_s, mn=w_q.shape[-2]
-            )
+            # ue8m0 format has int32 dtype
+            # triton format has float32 dtype
+            if w_s.dtype == torch.int32:
+                # TODO this is only needed for Blackwell
+                w_s_for_dequant = inverse_transform_scale_ue8m0(w_s, mn=w_q.shape[-2])
+            else:
+                w_s_for_dequant = w_s
+
             w_dequant = block_quant_dequant(
                 w_q,
-                w_s_inverse_transformed,
+                w_s_for_dequant,
                 # TODO do not hardcode
                 block_size=[128, 128],
                 dtype=torch.bfloat16,

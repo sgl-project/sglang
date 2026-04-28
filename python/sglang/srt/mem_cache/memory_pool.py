@@ -145,7 +145,10 @@ class ReqToTokenPool:
             self.req_to_token = torch.zeros(
                 (size, max_context_len), dtype=torch.int32, device=device
             )
-        self.free_slots = list(range(size))
+
+        # Skip index 0 because SWA cache and KV State don't have padding
+        self.free_slots = list(range(1, size))
+        self.num_reserved_slots = 1
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -185,7 +188,9 @@ class ReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(self.size))
+        # temporarily skip index 0 because SWA cache and KV State don't have padding
+        # self.free_slots = list(range(self.size))
+        self.free_slots = list(range(1, self.size))
 
 
 class MambaPool:

@@ -793,8 +793,6 @@ class PrefillAdder:
         # Reserve page_size for page-alignment overhead. The paged allocator
         # may consume up to one extra page per request (see alloc_extend), and
         # _update_prefill_budget already accounts for this in the deduction.
-        # Without this, admission is more optimistic than the actual budget
-        # deduction, allowing over-admission when the pool is nearly full.
         max_new = min(
             max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
             CLIP_MAX_NEW_TOKENS,
@@ -885,6 +883,13 @@ class PrefillAdder:
                         trunc_len = truncation_align_size * (
                             trunc_len // truncation_align_size
                         )
+
+                now_input_len = trunc_len + len(req.prefix_indices)
+                now_input_len = now_input_len // self.page_size * self.page_size
+                trunc_len = now_input_len - len(req.prefix_indices)
+
+                if trunc_len <= 0:
+                    return AddReqResult.OTHER
 
                 # Chunked prefill
                 req.set_extend_input_len(trunc_len)

@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -789,8 +790,12 @@ class SWARadixCache(BasePrefixCache):
         match_len_since_tombstone = float("inf")
         best_value_len = 0
         best_last_node = node
+        enable_compact = envs.SGLANG_OPT_SWA_RADIX_CACHE_COMPACT.get()
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
+
+            if enable_compact:
+                self._compact_single_child_chain(child)
 
             if child.swa_tombstone:
                 # update best_value_len and best_last_node if needed
@@ -870,6 +875,37 @@ class SWARadixCache(BasePrefixCache):
             last_device_node=last_node,
             last_host_node=last_node,
         )
+
+    def _compact_single_child_chain(self, node: TreeNode) -> None:
+        """Path compression: merge consecutive single-child internal nodes
+        with the same tombstone and lock ref state into one node.
+        Leaf nodes are never absorbed because req.last_node may point to them."""
+        while len(node.children) == 1:
+            child = next(iter(node.children.values()))
+            # Never absorb a leaf since req.last_node may reference it
+            if len(child.children) == 0:
+                break
+            if (
+                child.swa_tombstone != node.swa_tombstone
+                or child.full_lock_ref != node.full_lock_ref
+                or child.swa_lock_ref != node.swa_lock_ref
+            ):
+                break
+
+            node.key = RadixKey(
+                node.key.token_ids + child.key.token_ids, node.key.extra_key
+            )
+            node.value = torch.cat([node.value, child.value])
+            node.children = child.children
+            for grandchild in node.children.values():
+                grandchild.parent = node
+
+            if child.swa_uuid is not None:
+                node.swa_uuid = child.swa_uuid
+
+            self.full_lru_list.remove_node(child)
+            if not child.swa_tombstone:
+                self.swa_lru_list.remove_node(child)
 
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
@@ -992,6 +1028,7 @@ class SWARadixCache(BasePrefixCache):
                 child_key = key.child_key(self.page_size)
 
         if len(key):
+
             # Layout: |--- total_prefix_length ---|--- len(key) ---|
             #         ^                           ^                ^
             #         0              total_prefix_length     total_length
@@ -1005,9 +1042,6 @@ class SWARadixCache(BasePrefixCache):
             # 3. swa_evicted_seqlen == total_length:
             #    All remaining tokens are evicted. Free value and return without
             #    creating a node (leaf nodes must not be tombstone).
-            #    Note: the -page_size fix in _evict_swa prevents this case from
-            #    occurring in normal operation. This check is a defensive guard
-            #    against unexpected eviction states from other code paths.
             if swa_evicted_seqlen == total_prefix_length + len(key):
                 self.token_to_kv_pool_allocator.free(value)
                 return total_prefix_length
@@ -1026,6 +1060,7 @@ class SWARadixCache(BasePrefixCache):
                 key = key[swa_tombstone_len:]
                 value = value[swa_tombstone_len:]
 
+            # Insert non-tombstone nodes after the swa evicted seqlen
             self._add_new_node(node, key, value, swa_tombstone=False)
         return total_prefix_length
 

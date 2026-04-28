@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -13,6 +13,9 @@ from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 
 _is_npu = is_npu()
 
@@ -238,29 +241,37 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: str,
-        kvcache: SWAKVPool,
+        kvcache: Union[SWAKVPool, "DeepSeekV4TokenToKVPool"],
         need_sort: bool,
     ):
-        assert isinstance(kvcache, SWAKVPool)
+        from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        assert isinstance(kvcache, (SWAKVPool, DeepSeekV4TokenToKVPool))
         self._size_full = size
         self._size_swa = size_swa
         self.dtype = dtype
         self.device = device
         self.page_size = page_size
 
+        # FIXME: kv cache should not be passed to allocator
+        full_kv_pool = getattr(kvcache, "full_kv_pool", None)
+        swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
+
         if page_size == 1:
             self.full_attn_allocator = TokenToKVPoolAllocator(
                 size,
                 dtype,
                 device,
-                kvcache.full_kv_pool,
+                full_kv_pool,
                 need_sort,
             )
             self.swa_attn_allocator = TokenToKVPoolAllocator(
                 size_swa,
                 dtype,
                 device,
-                kvcache.swa_kv_pool,
+                swa_kv_pool,
                 need_sort,
             )
         else:
@@ -273,7 +284,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 page_size,
                 dtype,
                 device,
-                kvcache.full_kv_pool,
+                full_kv_pool,
                 need_sort,
             )
             self.swa_attn_allocator = PagedTokenToKVPoolAllocatorClass(
@@ -281,7 +292,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 page_size,
                 dtype,
                 device,
-                kvcache.swa_kv_pool,
+                swa_kv_pool,
                 need_sort,
             )
         # Note: append one more item of value -1 in the end so -1 maps to -1.
@@ -305,6 +316,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
 
         self.clear()
+        # FIXME: the mapping should be maintained by the allocator?
         self._kvcache = kvcache
         self._kvcache.register_mapping(self.full_to_swa_index_mapping)
 
@@ -460,6 +472,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
     def free_swa(self, free_index: torch.Tensor):
+        # print(f"[FREE-SWA-{get_tp_group().rank}] {free_index=}", flush=True)
         swa_indices = self.full_to_swa_index_mapping[free_index]
         swa_indices = swa_indices[swa_indices > 0]
         self.swa_attn_allocator.free(swa_indices)

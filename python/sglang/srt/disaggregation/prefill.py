@@ -173,6 +173,24 @@ class PrefillBootstrapQueue:
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
 
+        from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
+        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
+            from sglang.srt.environ import envs
+
+            assert (
+                envs.SGLANG_OPT_DPSK_V4_RADIX.get()
+            ), "V4 PD disaggregation requires radix mode (SGLANG_OPT_DPSK_V4_RADIX=1)"
+            assert self.pp_size == 1, (
+                "V4 PD disaggregation requires PP=1 "
+                "(get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized flat list)"
+            )
+            assert (
+                self.decode_tp_size == self.scheduler.tp_size
+            ), "V4 PD disaggregation requires same TP size on prefill and decode"
+
         if hasattr(self.token_to_kv_pool, "get_state_buf_infos"):
             state_data_ptrs, state_data_lens, state_item_lens = (
                 self.token_to_kv_pool.get_state_buf_infos()
@@ -181,7 +199,7 @@ class PrefillBootstrapQueue:
             kv_args.state_data_lens = state_data_lens
             kv_args.state_item_lens = state_item_lens
 
-            if isinstance(self.token_to_kv_pool, SWAKVPool):
+            if isinstance(self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool)):
                 kv_args.state_type = "swa"
             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 kv_args.state_type = "mamba"
@@ -757,6 +775,10 @@ class SchedulerDisaggregationPrefillMixin:
         """
         Send a prefilled chunk to the decode server
         """
+        from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+            DeepSeekV4TokenToKVPool,
+        )
+
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         end_idx = (
@@ -791,8 +813,11 @@ class SchedulerDisaggregationPrefillMixin:
                     .cpu()
                     .numpy()
                 ]
-            elif isinstance(self.token_to_kv_pool_allocator.get_kvcache(), SWAKVPool):
-                # SWA hybrid model: send last window KV indices
+            elif isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(),
+                (SWAKVPool, DeepSeekV4TokenToKVPool),
+            ):
+                # SWA / V4 hybrid model: send last window KV indices
                 seq_len = len(req.fill_ids)
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)

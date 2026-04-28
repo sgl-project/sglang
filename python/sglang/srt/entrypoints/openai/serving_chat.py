@@ -15,7 +15,7 @@ from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.entrypoints.openai.encoding_dsv32 import encode_messages
+from sglang.srt.entrypoints.openai import encoding_dsv4, encoding_dsv32
 from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
@@ -45,6 +45,7 @@ from sglang.srt.entrypoints.openai.utils import (
     should_include_usage,
     to_openai_style_logprobs,
 )
+from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
@@ -218,7 +219,9 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tokenizer_manager.model_config.hf_config.model_type == "gemma4"
         )
 
-        self.use_dpsk_v32_encoding = self._use_dpsk_v32_encoding()
+        # Which Python-based chat encoder (if any) bypasses apply_chat_template.
+        # Values: "dsv32", "dsv4", or None.
+        self.chat_encoding_spec = self._resolve_chat_encoding_spec()
 
     def _handle_last_assistant_message(
         self,
@@ -276,14 +279,25 @@ class OpenAIServingChat(OpenAIServingBase):
             encoded = encoded[1:]
         return prompt_ids + encoded
 
-    def _use_dpsk_v32_encoding(self) -> bool:
+    def _resolve_chat_encoding_spec(self) -> Optional[str]:
+        if self.tool_call_parser == "deepseekv4":
+            return "dsv4"
+        if self.tool_call_parser == "deepseekv32":
+            return "dsv32"
+
+        architectures = self.tokenizer_manager.model_config.hf_config.architectures
+        arch = architectures[0] if architectures else ""
+
+        if "DeepseekV4" in arch:
+            return "dsv4"
+
         has_chat_template = (
             self.tokenizer_manager.tokenizer is not None
             and self.tokenizer_manager.tokenizer.chat_template is not None
         )
-        architectures = self.tokenizer_manager.model_config.hf_config.architectures
-        is_dpsk_v32 = "DeepseekV3" in architectures[0] if architectures else False
-        return not has_chat_template and is_dpsk_v32
+        if "DeepseekV3" in arch and not has_chat_template:
+            return "dsv32"
+        return None
 
     def _request_id_prefix(self) -> str:
         return "chatcmpl-"
@@ -493,14 +507,14 @@ class OpenAIServingChat(OpenAIServingBase):
 
         template_content_format = self.template_manager.jinja_template_content_format
 
-        if self.use_dpsk_v32_encoding:
-            thinking_mode = (
-                "thinking"
-                if (request.chat_template_kwargs or {}).get("thinking")
-                else "chat"
+        if self.chat_encoding_spec is not None:
+            # Per-request wins; env is fallback so existing
+            # `export SGLANG_ENABLE_THINKING=1` workflow keeps working here.
+            thinking_requested = (request.chat_template_kwargs or {}).get(
+                "thinking", envs.SGLANG_ENABLE_THINKING.get()
             )
-            messages = request.messages
-            messages = [msg.model_dump() for msg in messages]
+            thinking_mode = "thinking" if thinking_requested else "chat"
+            messages = [msg.model_dump() for msg in request.messages]
 
             for msg in messages:
                 if msg.get("content") is None:
@@ -526,7 +540,28 @@ class OpenAIServingChat(OpenAIServingBase):
                 messages.insert(0, {"role": "system", "content": ""})
             if request.tools:
                 messages[0]["tools"] = [tool.model_dump() for tool in request.tools]
-            real_input = encode_messages(messages, thinking_mode=thinking_mode)
+
+            if self.chat_encoding_spec == "dsv4":
+                # V4 encoder only accepts "max" / "high" / None.
+                # OpenAI protocol defaults to "medium" which V4 rejects; drop it.
+                # Fallback: if request didn't set it, try env SGLANG_REASONING_EFFORT.
+                effort_source = request.reasoning_effort
+                if effort_source is None:
+                    env_val = envs.SGLANG_REASONING_EFFORT.get()
+                    if env_val:
+                        effort_source = env_val
+                v4_reasoning_effort = (
+                    effort_source if effort_source in ("max", "high") else None
+                )
+                real_input = encoding_dsv4.encode_messages(
+                    messages,
+                    thinking_mode=thinking_mode,
+                    reasoning_effort=v4_reasoning_effort,
+                )
+            else:
+                real_input = encoding_dsv32.encode_messages(
+                    messages, thinking_mode=thinking_mode
+                )
             prompt_ids = self.tokenizer_manager.tokenizer.encode(real_input)
 
             # Append assistant prefix if continue_final_message is enabled
@@ -586,11 +621,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 extra_template_kwargs.update(request.chat_template_kwargs)
 
             try:
+                chat_template_kwargs = request.chat_template_kwargs or {}
+                if envs.SGLANG_ENABLE_THINKING.get():
+                    chat_template_kwargs["thinking"] = True
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
                     openai_compatible_messages,
                     tokenize=True,
                     add_generation_prompt=True,
                     tools=tools,
+                    reasoning_effort=request.reasoning_effort,
                     return_dict=False,
                     **extra_template_kwargs,
                 )
@@ -608,6 +647,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tokenize=True,
                         add_generation_prompt=True,
                         tools=tools,
+                        reasoning_effort=request.reasoning_effort,
                         return_dict=False,
                         **extra_template_kwargs,
                     )
@@ -1376,8 +1416,7 @@ class OpenAIServingChat(OpenAIServingBase):
         if not self.reasoning_parser:
             return False
 
-        if self.reasoning_parser == "deepseek-v3":
-            # Models that require explicit enable thinking (thinking=True)
+        if self.reasoning_parser in ["deepseek-v3", "deepseek-v4"]:
             return (
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("thinking") is True

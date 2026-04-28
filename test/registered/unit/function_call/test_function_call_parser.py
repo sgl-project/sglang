@@ -5,6 +5,7 @@ from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.gemma4_detector import (
     Gemma4Detector,
@@ -1625,6 +1626,283 @@ class TestDeepSeekV32Detector(unittest.TestCase):
                         ] += call.parameters
 
         # Should still parse correctly even with whitespace-only content
+        self.assertEqual(
+            len(tool_calls_by_index), 1, "Should have exactly one tool call"
+        )
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_date")
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params, {})
+
+
+class TestDeepSeekV4Detector(unittest.TestCase):
+    """DeepSeek V4 DSML tool-call tests.
+
+    Mirrors TestDeepSeekV32Detector but targets the V4 outer block name
+    ``<｜DSML｜tool_calls>`` instead of ``<｜DSML｜function_calls>``. The V4
+    reference encoder only emits XML-parameter form, so the V32 JSON-body
+    tests have no V4 analogue and are intentionally omitted.
+    """
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Searches for information related to query and displays topn results.",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "The search query string",
+                            },
+                            "topn": {
+                                "type": "integer",
+                                "description": "Number of top results to display",
+                                "default": 10,
+                            },
+                            "source": {
+                                "type": "string",
+                                "description": "Source to search within",
+                                "enum": ["web", "news"],
+                                "default": "web",
+                            },
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_favorite_tourist_spot",
+                    description="Return the favorite tourist spot for a given city.",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = DeepSeekV4Detector()
+        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+
+        # V3.2 tokenizer works for the chunk-split streaming test: it already
+        # has the DSML special tokens and decodes the test strings losslessly.
+        self.tokenizer = get_tokenizer("deepseek-ai/DeepSeek-V3.2")
+        self.interval = 1
+
+    def test_detect_and_parse_xml_format(self):
+        """Test parsing standard XML format (DSML)"""
+        text = """I'll help you with information about San Francisco and get its favorite tourist spot for you.\n\n
+        <｜DSML｜tool_calls>\n
+            <｜DSML｜invoke name="get_favorite_tourist_spot">\n
+                <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>\n
+            </｜DSML｜invoke>\n
+            <｜DSML｜invoke name="search">
+                <｜DSML｜parameter name="query" string="true">WebNav benchmark</｜DSML｜parameter>
+                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
+                <｜DSML｜parameter name="source" string="true">web</｜DSML｜parameter>
+            </｜DSML｜invoke>
+        </｜DSML｜tool_calls>
+        """
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertIn("I'll help you with information", result.normal_text)
+        self.assertEqual(len(result.calls), 2)
+
+        call1 = result.calls[0]
+        self.assertEqual(call1.name, "get_favorite_tourist_spot")
+        params1 = json.loads(call1.parameters)
+        self.assertEqual(params1["city"], "San Francisco")
+
+        call2 = result.calls[1]
+        self.assertEqual(call2.name, "search")
+        params2 = json.loads(call2.parameters)
+        self.assertEqual(params2["query"], "WebNav benchmark")
+        self.assertEqual(params2["topn"], 10)
+        self.assertEqual(params2["source"], "web")
+
+    def test_streaming_xml_format(self):
+        """Test streaming parsing of XML format"""
+        text = """<｜DSML｜tool_calls>
+            <｜DSML｜invoke name="get_favorite_tourist_spot">
+                <｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>
+                <｜DSML｜parameter name="another_city" string="true">London</｜DSML｜parameter>
+                <｜DSML｜parameter name="topn" string="false">10</｜DSML｜parameter>
+                <｜DSML｜parameter name="obj" string="false">{"name": "John", "age": 30}</｜DSML｜parameter>
+            </｜DSML｜invoke>
+        </｜DSML｜tool_calls>"""
+
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        self.assertEqual(len(tool_calls_by_index), 1)
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_favorite_tourist_spot")
+        params = json.loads(tool_calls_by_index[0]["parameters"])
+        self.assertEqual(params["city"], "San Francisco")
+        self.assertEqual(params["another_city"], "London")
+        self.assertEqual(params["topn"], 10)
+        self.assertEqual(params["obj"]["name"], "John")
+        self.assertEqual(params["obj"]["age"], 30)
+
+    def test_detect_and_parse_no_parameters(self):
+        """Test parsing function calls with no parameters (non-streaming)"""
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+        text = """Let me get the current date for you.
+
+<｜DSML｜tool_calls>
+<｜DSML｜invoke name="get_date">
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"""
+
+        result = self.detector.detect_and_parse(text, tools_with_no_param)
+
+        self.assertIn("Let me get the current date", result.normal_text)
+        self.assertEqual(len(result.calls), 1)
+
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_date")
+        params = json.loads(call.parameters)
+        self.assertEqual(params, {})
+
+    def test_streaming_no_parameters(self):
+        """Test streaming parsing of function calls with no parameters."""
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+        text = """<｜DSML｜tool_calls>
+<｜DSML｜invoke name="get_date">
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"""
+
+        self.detector = DeepSeekV4Detector()
+
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, tools_with_no_param)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
+        self.assertEqual(
+            len(tool_calls_by_index), 1, "Should have exactly one tool call"
+        )
+        self.assertEqual(tool_calls_by_index[0]["name"], "get_date")
+
+        params_str = tool_calls_by_index[0]["parameters"].strip()
+        params = json.loads(params_str)
+        self.assertEqual(params, {})
+
+    def test_streaming_no_parameters_with_whitespace(self):
+        """Test streaming parsing when invoke content has only whitespace (newlines)."""
+        tools_with_no_param = self.tools + [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_date",
+                    description="Get the current date.",
+                    parameters={"type": "object", "properties": {}},
+                ),
+            ),
+        ]
+
+        text = """<｜DSML｜tool_calls>
+<｜DSML｜invoke name="get_date">
+
+</｜DSML｜invoke>
+</｜DSML｜tool_calls>"""
+
+        self.detector = DeepSeekV4Detector()
+
+        input_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunk_ids = [
+            input_ids[i : i + self.interval]
+            for i in range(0, len(input_ids), self.interval)
+        ]
+        chunks = [self.tokenizer.decode(chunk_id) for chunk_id in chunk_ids]
+
+        tool_calls_by_index = {}
+
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, tools_with_no_param)
+            for call in result.calls:
+                if call.tool_index is not None:
+                    if call.tool_index not in tool_calls_by_index:
+                        tool_calls_by_index[call.tool_index] = {
+                            "name": "",
+                            "parameters": "",
+                        }
+
+                    if call.name:
+                        tool_calls_by_index[call.tool_index]["name"] = call.name
+                    if call.parameters:
+                        tool_calls_by_index[call.tool_index][
+                            "parameters"
+                        ] += call.parameters
+
         self.assertEqual(
             len(tool_calls_by_index), 1, "Should have exactly one tool call"
         )

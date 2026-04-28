@@ -104,7 +104,9 @@ def import_model_classes(package_name: str, strict: bool = False):
             except Exception as e:
                 if strict:
                     raise
-                logger.warning(f"Ignore import error when loading {name}: {e}")
+                logger.warning(
+                    f"In import_model_classes: Ignore import error when loading {name}: {e}"
+                )
                 continue
             if hasattr(module, "EntryClass"):
                 entry = module.EntryClass

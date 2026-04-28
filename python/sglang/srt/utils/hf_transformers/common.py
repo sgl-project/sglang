@@ -26,6 +26,7 @@ from sglang.srt.configs import (
     BailingHybridConfig,
     ChatGLMConfig,
     DbrxConfig,
+    DeepSeekV4Config,
     DeepseekVL2Config,
     DotsOCRConfig,
     DotsVLMConfig,
@@ -72,6 +73,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         BailingHybridConfig,
         ChatGLMConfig,
         DbrxConfig,
+        DeepSeekV4Config,
         ExaoneConfig,
         DeepseekVL2Config,
         MultiModalityConfig,
@@ -304,8 +306,10 @@ def _override_v_head_dim_if_zero(config: PretrainedConfig, patch: int = 128) -> 
         )
 
 
-def _load_deepseek_v32_model(
+def _load_deepseek_temp_model(
     model_path: str,
+    model_type: str,
+    architecture: str,
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
     **kwargs,
@@ -320,18 +324,50 @@ def _load_deepseek_v32_model(
     with open(config_file, "r") as f:
         config_json = json.load(f)
 
-    config_json["architectures"] = ["DeepseekV3ForCausalLM"]
+    config_json["architectures"] = [architecture]
     config_json["model_type"] = "deepseek_v3"
 
     tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
     os.makedirs(tmp_path, exist_ok=True)
 
-    unique_path = os.path.join(tmp_path, f"deepseek_v32_{os.getpid()}")
+    unique_path = os.path.join(tmp_path, f"{model_type}_{os.getpid()}")
     with open(unique_path, "w") as f:
         json.dump(config_json, f)
 
     return AutoConfig.from_pretrained(
         unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
+    )
+
+
+def _load_deepseek_v32_model(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    return _load_deepseek_temp_model(
+        model_path,
+        model_type="deepseek_v32",
+        architecture="DeepseekV3ForCausalLM",
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        **kwargs,
+    )
+
+
+def _load_deepseek_v4_model(
+    model_path: str,
+    trust_remote_code: bool = False,
+    revision: Optional[str] = None,
+    **kwargs,
+):
+    return _load_deepseek_temp_model(
+        model_path,
+        model_type="deepseek_v4",
+        architecture="DeepseekV4ForCausalLM",
+        trust_remote_code=trust_remote_code,
+        revision=revision,
+        **kwargs,
     )
 
 

@@ -708,7 +708,7 @@ class EAGLEWorker(TpModelWorker):
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
-            hidden_size=self.model_config.hidden_size,
+            hidden_size=self.model_config.spec_hidden_size,
             dtype=self.model_config.dtype,
             topk=self.topk,
             capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -1109,12 +1109,12 @@ class EAGLEWorker(TpModelWorker):
         if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
-            hidden_size = (
-                self.model_config.hidden_size * 3
-                if self.speculative_algorithm.is_eagle3()
+            hidden_size = self.model_config.spec_hidden_size
+            if (
+                self.speculative_algorithm.is_eagle3()
                 and self.eagle_use_aux_hidden_state
-                else self.model_config.hidden_size
-            )
+            ):
+                hidden_size = self.model_config.hidden_size * 3
             batch.spec_info = EagleDraftInput.create_idle_input(
                 device=self.device,
                 hidden_size=hidden_size,
@@ -1162,6 +1162,7 @@ class EAGLEWorker(TpModelWorker):
             forward_batch.spec_info.hidden_states = logits_output.hidden_states
         else:
             forward_batch.can_run_dp_cuda_graph = False
+            # print(f"forward_draft_extend_after_decode.spec_info: {forward_batch.spec_info.accept_length}")
             if not forward_batch.forward_mode.is_idle():
                 attn_backend = (
                     self.draft_extend_attn_backend

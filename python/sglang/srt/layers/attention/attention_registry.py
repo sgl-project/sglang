@@ -5,6 +5,7 @@ from sglang.srt.configs.linear_attn_model_registry import (
     get_linear_attn_config,
     import_backend_class,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_device_capability, is_musa
 
 _is_musa = is_musa()
@@ -90,6 +91,22 @@ def create_nsa_backend(runner):
     from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 
     return NativeSparseAttnBackend(runner)
+
+
+@register_attention_backend("compressed")
+def create_compressed_backend(runner):
+    if envs.SGLANG_OPT_DPSK_V4_RADIX.get():
+        from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
+            DeepseekV4BackendRadix,
+        )
+
+        logger.info("Using DeepseekV4BackendRadix for compressed attention backend.")
+        return DeepseekV4BackendRadix(runner)
+    else:
+        from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4Backend
+
+        logger.info("Using DeepseekV4Backend for compressed attention backend.")
+        return DeepseekV4Backend(runner)
 
 
 @register_attention_backend("triton")

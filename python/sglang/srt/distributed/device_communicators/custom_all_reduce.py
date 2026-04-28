@@ -184,6 +184,9 @@ class CustomAllreduce:
         try:
             self._IS_CAPTURING = True
             yield
+        except Exception as e:
+            print(e, flush=True)
+            raise e
         finally:
             self._IS_CAPTURING = False
             if not self.disabled:

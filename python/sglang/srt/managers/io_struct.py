@@ -176,6 +176,8 @@ class GenerateReqInput(BaseReq):
     return_hidden_states: Union[List[bool], bool] = False
     # Whether to return captured routed experts
     return_routed_experts: bool = False
+    # Whether to return captured indexer topk (layers with indexer)
+    return_indexer_topk: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
 
@@ -652,6 +654,7 @@ class GenerateReqInput(BaseReq):
                 else self.return_hidden_states
             ),
             return_routed_experts=self.return_routed_experts,
+            return_indexer_topk=self.return_indexer_topk,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,
@@ -729,6 +732,9 @@ class TokenizedGenerateReqInput(BaseReq):
     return_routed_experts: bool = False
     # The start location in the prompt for returning routed experts.
     routed_experts_start_len: int = 0
+
+    # Whether to return captured indexer topk (layers with indexer)
+    return_indexer_topk: bool = False
 
     # The input embeds
     input_embeds: Optional[Union[List[List[List[float]]], List[List[float]]]] = None
@@ -1104,6 +1110,9 @@ class BatchTokenIDOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
     routed_experts: List[Optional[torch.Tensor]]
 
+    # The indexer topk for each output token (layers with indexer)
+    indexer_topk: List[torch.Tensor]
+
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
     # val is the length of padded tokens after expansion.
@@ -1165,6 +1174,9 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # The routed experts for each token, including both input and output tokens
     # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
     routed_experts: List[Optional[torch.Tensor]]
+
+    # The indexer topk for each output token (layers with indexer)
+    indexer_topk: List[List[int]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.

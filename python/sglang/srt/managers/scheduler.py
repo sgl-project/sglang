@@ -887,6 +887,22 @@ class Scheduler(
             else:
                 self.tree_cache = RadixCache(params)
 
+        if self.enable_hisparse:
+            # FIXME, hardcode some hisparse config here for now
+            self.hisparse_coordinator = HiSparseCoordinator(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                top_k=512,
+                device_buffer_size=1024,
+                device=self.device,
+                tp_group=(
+                    self.attn_tp_cpu_group
+                    if self.server_args.enable_dp_attention
+                    else self.tp_cpu_group
+                ),
+            )
+            self.tp_worker.register_hisparse_coordinator(self.hisparse_coordinator)
+
         if (
             server_args.enable_streaming_session
             and not self.tree_cache.supports_streaming_session()
@@ -1868,6 +1884,7 @@ class Scheduler(
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
+                return_indexer_topk=recv_req.return_indexer_topk,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -2305,6 +2322,47 @@ class Scheduler(
         # todo hisparse, maybe other info to contain for the new batch
         return batch
 
+    def create_hisparse_ready_batch(self, reqs: List[Req]) -> ScheduleBatch:
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+            chunked_req=None,
+            dllm_config=self.dllm_config,
+        )
+        batch.forward_mode = ForwardMode.DECODE
+        batch.device = self.device
+
+        seq_lens = [len(r.origin_input_ids) for r in reqs]
+
+        batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        batch.seq_lens = batch.seq_lens_cpu.to(self.device, non_blocking=True)
+        batch.orig_seq_lens = torch.tensor(
+            seq_lens, dtype=torch.int32, device=self.device
+        )
+        batch.seq_lens_sum = sum(seq_lens)
+
+        batch.req_pool_indices = torch.tensor(
+            [r.req_pool_idx for r in reqs],
+            dtype=torch.int32,
+            device=self.device,
+        )
+
+        batch.multimodal_inputs = [r.multimodal_inputs for r in reqs]
+        if batch.return_logprob:
+            batch.top_logprobs_nums = [r.top_logprobs_num for r in reqs]
+            batch.token_ids_logprobs = [r.token_ids_logprob for r in reqs]
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch, self.model_config.vocab_size
+        )
+
+        batch.hisparse_coordinator = self.hisparse_coordinator
+        return batch
+
     def get_next_batch_to_run(self) -> Optional[ScheduleBatch]:
         self._abort_on_waiting_timeout()
         self._abort_on_running_timeout()
@@ -2325,7 +2383,6 @@ class Scheduler(
             chunked_req_to_exclude.add(self.chunked_req)
             self.stash_chunked_request(self.chunked_req)
 
-        # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
         if self.enable_hisparse:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
@@ -2335,7 +2392,6 @@ class Scheduler(
                 else:
                     self.running_batch.merge_batch(new_batch)
                 self.running_batch.hisparse_coordinator = self.hisparse_coordinator
-            # Reset batch_is_full so the scheduler can schedule more prefills.
             self.running_batch.batch_is_full = False
 
         if (
@@ -2344,14 +2400,11 @@ class Scheduler(
             and self.last_batch.forward_mode.is_extend()
         ):
             if self.last_batch.chunked_req is not None:
-                # In the context pipeline parallelism, after the last chunk, the current microbatch still track outdated chunked_req.
-                # We need to discard it.
                 chunked_req_to_exclude.add(self.last_batch.chunked_req)
 
             if self.dllm_config is not None and self.last_batch.reqs:
                 chunked_req_to_exclude.update(self.last_batch.reqs)
 
-            # Filter batch
             last_bs = self.last_batch.batch_size()
             self.last_batch.filter_batch(
                 chunked_req_to_exclude=list(chunked_req_to_exclude)
@@ -2359,19 +2412,12 @@ class Scheduler(
             if self.last_batch.batch_size() < last_bs:
                 self.running_batch.batch_is_full = False
 
-            # Merge the new batch into the running batch.
             if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
                 else:
-                    # Merge running_batch with prefill batch
                     self.running_batch.merge_batch(self.last_batch)
 
-        # For prefill-only batch, filter out finished requests since they
-        # won't go through the decode step. This keeps running_batch accurate
-        # for load reporting (num_running_reqs via /v1/loads).
-        # Runs outside the last_batch block so stale requests are cleaned
-        # even when no new batches arrive (e.g. traffic stops).
         if self.running_batch.is_prefill_only:
             self.running_batch.filter_batch()
             if self.running_batch.is_empty():
@@ -2418,8 +2464,7 @@ class Scheduler(
 
     def get_num_allocatable_reqs(self, running_bs):
         res = get_global_server_args().pp_max_micro_batch_size - running_bs
-        if self.pp_size > 1:
-            res = min(res, self.req_to_token_pool.available_size())
+        res = min(res, self.req_to_token_pool.available_size())
         return res
 
     def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
@@ -2697,6 +2742,7 @@ class Scheduler(
         if (kv_full_retract_flag := not batch.check_decode_mem()) or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
+            # todo hisparse: retract for hisparse if no sufficient memory as well, this includes no sufficient device or host memory left for C4
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio
             mamba_pool = getattr(self.tree_cache.req_to_token_pool, "mamba_pool", None)

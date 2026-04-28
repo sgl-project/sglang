@@ -44,6 +44,7 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import (
@@ -1186,12 +1187,32 @@ def select_experts(
         )
     elif custom_routing_function is None:
         assert not apply_routed_scaling_factor_on_output, "Not implemented"
-        if (
+        if scoring_func == "sqrtsoftplus":
+            if envs.SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK.get():
+                from sglang.srt.layers.moe.deepseek_v4_topk import (
+                    biased_topk_jit_kernel_impl as biased_topk_impl,
+                )
+            else:
+                from sglang.srt.layers.moe.deepseek_v4_topk import biased_topk_impl
+
+            topk_weights, topk_ids = biased_topk_impl(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                correction_bias=correction_bias,
+                topk=num_routed_topk if _use_aiter else top_k,
+                renormalize=renormalize,
+                scoring_func=scoring_func,
+                num_fused_shared_experts=num_fused_shared_experts,
+                routed_scaling_factor=routed_scaling_factor,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
+        elif (
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
             and scoring_func == "softmax"
             and correction_bias is None
         ):
-            # flashinfer_trtllm_routed uses raw-logits topk
             topk_weights, topk_ids = fused_topk_softmax_torch_raw_logits(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -1199,13 +1220,14 @@ def select_experts(
                 renormalize=renormalize,
             )
         else:
-            # Qwen3MOE uses fused_topk
             topk_weights, topk_ids = fused_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
                 topk=num_routed_topk if _use_aiter else top_k,
                 renormalize=renormalize,
                 correction_bias=correction_bias,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=expert_location_dispatch_info,
                 scoring_func=scoring_func,
             )
     else:

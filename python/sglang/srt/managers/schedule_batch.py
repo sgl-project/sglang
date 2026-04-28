@@ -595,6 +595,7 @@ class Req(ReqDllmMixin):
         require_reasoning: bool = False,
         return_hidden_states: bool = False,
         return_routed_experts: bool = False,
+        return_indexer_topk: bool = False,
         eos_token_ids: Optional[Set[int]] = None,
         bootstrap_host: Optional[str] = None,
         bootstrap_port: Optional[int] = None,
@@ -814,6 +815,12 @@ class Req(ReqDllmMixin):
         self.routed_experts: Optional[torch.Tensor] = (
             None  # cpu tensor: shape (seqlen, topk)
         )
+
+        # capture indexer topk (layers with indexer)
+        self.return_indexer_topk = return_indexer_topk
+        self.indexer_topk: Optional[torch.Tensor] = (
+            None  # cpu tensor: shape (seqlen, num_indexer_layers, index_topk)
+        )
         # Customized info
         self.customized_info: Optional[Dict[str, List[Any]]] = None
 
@@ -900,6 +907,10 @@ class Req(ReqDllmMixin):
 
         # For hisparse
         self.hisparse_staging = False
+
+        # For hisparse
+        self.staging = False
+        self.batch = None
 
     @property
     def seqlen(self) -> int:
@@ -1230,6 +1241,7 @@ class Req(ReqDllmMixin):
 
         self.prefix_indices = torch.empty((0,), dtype=torch.int64)
         self.routed_experts = None
+        self.indexer_topk = None
         self.last_node = None
         self.swa_uuid_for_lock = None
         self.extend_input_len = 0
@@ -1254,11 +1266,6 @@ class Req(ReqDllmMixin):
         self.extend_batch_idx = 0
         self.decode_batch_idx = 0
 
-        # When using input_embeds, we cannot easily mix the original input embeddings
-        # with the newly generated output token IDs during re-prefill of retracted request.
-        # output_ids will have no use, but will lead to wrong size cache indexes.
-        # Therefore, we discard the generated output_ids and restart prefill and generation
-        # to ensure shape consistency in KV cache.
         if self.input_embeds is not None:
             self.output_ids = []
 
@@ -1469,6 +1476,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Whether to return captured experts
     return_routed_experts: bool = False
 
+    # Whether to return captured indexer topk (layers with indexer)
+    return_indexer_topk: bool = False
+
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
 
@@ -1484,6 +1494,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     prefill_stats: Optional[PrefillStats] = None
+
+    # HiSparse
+    hisparse_coordinator: Optional[HiSparseCoordinator] = None
 
     # HiSparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
@@ -1507,7 +1520,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             is_hybrid_swa = True
 
-        return cls(
+        batch = cls(
             reqs=reqs,
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
@@ -1522,10 +1535,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=spec_algorithm,
             return_hidden_states=any(req.return_hidden_states for req in reqs),
             return_routed_experts=any(req.return_routed_experts for req in reqs),
+            return_indexer_topk=any(req.return_indexer_topk for req in reqs),
             is_prefill_only=all(req.is_prefill_only for req in reqs),
             chunked_req=chunked_req,
             dllm_config=dllm_config,
         )
+        # FIXME: hack for staging batch
+        for r in reqs:
+            r.batch = batch
+        return batch
 
     def batch_size(self):
         return len(self.reqs)
@@ -2268,6 +2286,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return
 
         if self.sampling_info.penalizer_orchestrator.is_required:
+            # todo hisparse, potential compatibility issue
             if self.enable_overlap:
                 # TODO: this can be slow, optimize this.
                 delayed_output_ids = torch.tensor(
@@ -2299,7 +2318,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
         # Allocate memory
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
+        if self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.map_last_loc_to_buffer(
+                self.out_cache_loc, self.seq_lens, self.req_pool_indices
+            )
 
+        # todo hisparse: be careful about meta data modification
         # Update req-level memory management fields
         for req in self.reqs:
             req.decode_batch_idx += 1
@@ -2662,7 +2686,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # radix tree insert boundary (page_floor(seq_len)). This keeps at least one
         # page of non-evicted SWA KV for the tree to store as a non-tombstone node,
         # preserving cache reuse in multi-turn scenarios.
-        # See also: _insert_helper case 3 in swa_radix_cache.py (defensive counterpart).
         new_swa_evicted_seqlen = max(
             req.swa_evicted_seqlen,
             pre_len - sliding_window_size - self.tree_cache.page_size,

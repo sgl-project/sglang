@@ -2,6 +2,7 @@ from sglang.srt.configs.afmoe import AfmoeConfig
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
 from sglang.srt.configs.chatglm import ChatGLMConfig
 from sglang.srt.configs.dbrx import DbrxConfig
+from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.configs.deepseekvl2 import DeepseekVL2Config
 from sglang.srt.configs.dots_ocr import DotsOCRConfig
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
@@ -38,6 +39,7 @@ __all__ = [
     "ExaoneConfig",
     "ChatGLMConfig",
     "DbrxConfig",
+    "DeepSeekV4Config",
     "DeepseekVL2Config",
     "LongcatFlashConfig",
     "MultiModalityConfig",

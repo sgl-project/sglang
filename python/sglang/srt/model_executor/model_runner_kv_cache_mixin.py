@@ -5,7 +5,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import (
+    get_nsa_index_head_dim,
+    is_deepseek_compressed,
+    is_deepseek_nsa,
+)
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -282,11 +286,40 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_v4_model = is_deepseek_compressed(self.model_config.hf_config)
 
         # Check out-of-tree platform (plugin system) first
         from sglang.srt.platforms import current_platform
 
-        if current_platform.is_out_of_tree() and not self.mambaish_config:
+        if is_v4_model:
+            from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+                DeepSeekV4TokenToKVPool,
+            )
+
+            dsv4_sizes = self.dsv4_pool_sizes
+            self.token_to_kv_pool = DeepSeekV4TokenToKVPool(
+                max_num_reqs=self.max_running_requests,
+                swa_size=dsv4_sizes.swa_max_total_num_tokens,
+                c4_size=dsv4_sizes.c4_max_total_num_tokens,
+                c128_size=dsv4_sizes.c128_max_total_num_tokens,
+                c4_state_pool_size=dsv4_sizes.c4_state_pool_size,
+                c128_state_pool_size=dsv4_sizes.c128_state_pool_size,
+                page_size=self.page_size,
+                swa_page_size=self.model_config.window_size,
+                dtype=self.kv_cache_dtype,
+                state_dtype=torch.float32,
+                qk_nope_head_dim=self.model_config.qk_nope_head_dim,
+                qk_rope_head_dim=self.model_config.qk_rope_head_dim,
+                indexer_head_dim=self.model_config.index_head_dim,
+                layer_num=self.num_effective_layers,
+                device=self.device,
+                enable_memory_saver=self.server_args.enable_memory_saver,
+                compression_ratios=self.model_config.compress_ratios,
+                start_layer=self.start_layer,
+                end_layer=self.end_layer,
+                enable_hisparse=self.enable_hisparse,
+            )
+        elif current_platform.is_out_of_tree() and not self.mambaish_config:
             if self.use_mla_backend and is_nsa_model:
                 PoolCls = current_platform.get_nsa_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
@@ -753,15 +786,58 @@ class ModelRunnerKVCacheMixin:
         config.mem_fraction_static = self.server_args.mem_fraction_static
         return config
 
+    def _resolve_dsv4_memory_pool_config(
+        self: ModelRunner, pre_model_load_memory: int
+    ) -> MemoryPoolConfig:
+        """Profile GPU memory and resolve DSv4 compressed attention pool config."""
+        from sglang.srt.model_executor.memory_profiler import DSv4MemoryCalculator
+        from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
+
+        available_bytes = self._profile_available_bytes(pre_model_load_memory)
+        page_size = self.server_args.page_size
+
+        calculator = DSv4MemoryCalculator(
+            model_config=self.model_config,
+            page_size=page_size,
+            swa_ratio=self.server_args.swa_full_tokens_ratio,
+            is_speculative=not self.spec_algorithm.is_none(),
+        )
+
+        dsv4_pool_sizes = calculator.calculate_pool_sizes(available_bytes)
+
+        constrained = self._apply_token_constraints(
+            dsv4_pool_sizes.full_max_total_num_tokens
+        )
+        if constrained != dsv4_pool_sizes.full_max_total_num_tokens:
+            dsv4_pool_sizes = calculator.get_pool_sizes_by_configuration(constrained)
+
+        self.dsv4_pool_sizes = dsv4_pool_sizes
+
+        config = MemoryPoolConfig(
+            max_total_num_tokens=dsv4_pool_sizes.full_max_total_num_tokens,
+            full_max_total_num_tokens=dsv4_pool_sizes.full_max_total_num_tokens,
+            swa_max_total_num_tokens=dsv4_pool_sizes.swa_max_total_num_tokens,
+        )
+        config.max_running_requests = self._resolve_max_num_reqs(
+            config.max_total_num_tokens
+        )
+        config.mem_fraction_static = self.server_args.mem_fraction_static
+        return config
+
     def init_memory_pool(self: ModelRunner, pre_model_load_memory: int):
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             assert (
                 self.memory_pool_config is not None
             ), "Draft worker requires memory_pool_config"
         else:
-            self.memory_pool_config = self._resolve_memory_pool_config(
-                pre_model_load_memory
-            )
+            if self.model_config.is_swa_with_compressed_attention:
+                self.memory_pool_config = self._resolve_dsv4_memory_pool_config(
+                    pre_model_load_memory
+                )
+            else:
+                self.memory_pool_config = self._resolve_memory_pool_config(
+                    pre_model_load_memory
+                )
 
         self._apply_memory_pool_config(self.memory_pool_config)
 

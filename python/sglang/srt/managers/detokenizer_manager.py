@@ -21,6 +21,7 @@ from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
+import pybase64
 import setproctitle
 import zmq
 
@@ -319,6 +320,33 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         return output_strs
 
+    def _extract_topk_base64(self, data_list) -> List[List[int]]:
+        if data_list is None:
+            return None
+        return [
+            (
+                pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
+                if item is not None
+                else []
+            )
+            for item in data_list
+        ]
+
+    def _extract_routed_experts(
+        self, recv_obj: BatchTokenIDOutput
+    ) -> list[str | None] | None:
+        routed_experts = None
+        if recv_obj.routed_experts is not None:
+            routed_experts = [
+                (
+                    pybase64.b64encode(routed_experts.numpy().tobytes()).decode("utf-8")
+                    if routed_experts is not None
+                    else None
+                )
+                for routed_experts in recv_obj.routed_experts
+            ]
+        return routed_experts
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
         output_strs = (
@@ -326,6 +354,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
+        routed_experts = self._extract_topk_base64(recv_obj.routed_experts)
+        indexer_topk = self._extract_topk_base64(recv_obj.indexer_topk)
+
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
@@ -354,7 +385,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
-            routed_experts=recv_obj.routed_experts,
+            indexer_topk=indexer_topk,
+            routed_experts=routed_experts,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

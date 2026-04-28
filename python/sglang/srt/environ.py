@@ -398,6 +398,7 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_SCALE_CONVERT_AT_INIT = EnvBool(True)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
 
     # DeepSeek MHA Optimization
@@ -548,12 +549,72 @@ class Envs:
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
+    # Chat Template
+    SGLANG_ENABLE_THINKING = EnvBool(False)
+    # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
+    # Accepts "", "max", "high" (empty string means unset). Other values filtered to None.
+    SGLANG_REASONING_EFFORT = EnvStr("")
+
+    # DeepSeek V4
+    SGLANG_DSV4_MODE = EnvStr("2604")
+    SGLANG_DSV4_2604_SUBMODE = EnvStr("2604B")
+    SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)  # Set False when using FP4-to-FP8 converted checkpoint with 2604 config
+    SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
+    SGLANG_OPT_USE_FUSED_COMPRESS = EnvBool(True)
+    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")
+    SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
+    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
+
+
+    SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
+    SGLANG_OPT_USE_TILELANG_SWA_PREPARE = EnvBool(True)
+    SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
+
+    SGLANG_OPT_DEBUG_PAGED_COMPRESS = EnvBool(False)
+    SGLANG_OPT_USE_FUSED_PAGED_COMPRESS = EnvBool(True)
+    SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(True)
+    SGLANG_OPT_V4_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+    SGLANG_OPT_TRITON_PREPARE_COMPRESS = EnvBool(True)
+    SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
+    SGLANG_OPT_USE_OVERLAP_STORE_CACHE = EnvBool(True)
+    SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
+    SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
+    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
+    SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
+    SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(True)
+    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
+    SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(False)
+    SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE = EnvInt(-1)
+    SGLANG_DSV4_FIX_ATTN_PADDING = EnvBool(False)
+
+    # Advanced CUDA Graph Capture to reduce the prepare overhead
+    SGLANG_ADVANCED_CUDA_GRAPH_CAPTURE = EnvBool(False)
+
+    SGLANG_OPT_USE_TRITON_CA_METADATA = EnvBool(True)
+
+    # dsv4 radix
+    SGLANG_OPT_DPSK_V4_RADIX = EnvBool(True)
+    # ds temp, for backward compatibility
+    SGLANG_OPT_USE_OLD_COMPRESSOR = EnvBool(False)
+
+    # for AMD support
+    SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
+    SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
     SGLANG_DEBUG_SYMM_MEM = EnvBool(False)
 
     # Aiter
     SGLANG_USE_AITER_FP8_PER_TOKEN = EnvBool(False)
+    # on HIP, force FP8 MoE off the aiter fused_moe path and onto the
+    # Triton runner. Skips aiter's weight shuffle during load AND bypasses the aiter
+    # dispatch at apply time, while leaving SGLANG_USE_AITER behavior intact for all
+    # other code paths (topk, non-MoE FP8, etc.).
+    SGLANG_FORCE_TRITON_MOE_FP8 = EnvBool(False)
     # fmt: on
 
     # EPD

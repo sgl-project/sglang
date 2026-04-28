@@ -267,7 +267,9 @@ def _try_load_model_cls(
     try:
         return model.load_model_cls()
     except Exception:
-        logger.exception("Ignore import error when loading '%s'", model_arch)
+        logger.exception(
+            "In _try_load_model_cls: Ignore import error when loading '%s'", model_arch
+        )
         return None
 
 

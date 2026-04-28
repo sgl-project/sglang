@@ -78,8 +78,15 @@ def is_deepseek_nsa(config) -> bool:
     )
 
 
+def is_deepseek_compressed(config: PretrainedConfig) -> bool:
+    return config.architectures is not None and (
+        config.architectures[0] == "DeepseekV4ForCausalLM"
+        or config.architectures[0] == "DeepseekV4ForCausalLMNextN"
+    )
+
+
 def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+    assert is_deepseek_nsa(config) or is_deepseek_compressed(config)
     return config.index_head_dim
 
 
@@ -317,6 +324,14 @@ class ModelConfig:
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "DeepseekV4ForCausalLM"
+        ):
+            self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
+            # TODO: Tmp hardcode to 1 since num_nextn_predict_layers is not in config.json
+            self.hf_config.num_nextn_predict_layers = 1
+
         if is_draft_model and self.hf_config.architectures[0] in [
             "Glm4MoeForCausalLM",
             "Glm4MoeLiteForCausalLM",
@@ -385,8 +400,22 @@ class ModelConfig:
             is_hybrid_swa_model(self.hf_config.architectures)
             and not self.disable_hybrid_swa_memory
         )
+        self.is_swa_with_compressed_attention = False
+        self.has_attention_sinks = False
 
-        if self.is_hybrid_swa:
+        if not self.is_hybrid_swa:
+            return
+
+        logger.info(f"Hybrid swa model: {self.hf_config.architectures=}")
+
+        # FIXME: distinguish Compressed Attention SWA from Mimo's SWA compress
+        self.is_swa_with_compressed_attention = any(
+            arch in ["DeepseekV4ForCausalLM", "DeepseekV4ForCausalLMNextN"]
+            for arch in self.hf_config.architectures
+        )
+
+        if self.is_hybrid_swa and not self.is_swa_with_compressed_attention:
+            # NOTE: hybrid swa with compressed attention does not need to get layer ids
             self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                 get_hybrid_layer_ids(
                     self.hf_config.architectures,
@@ -529,6 +558,31 @@ class ModelConfig:
                     self.scaling = compute_mla_mscale_scaling(
                         rope_scaling, self.scaling
                     )
+        elif (
+            "DeepseekV4ForCausalLM" in self.hf_config.architectures
+            or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
+        ):
+            self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
+            if envs.SGLANG_DSV4_MODE.get() == "2604":
+                self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
+                self.window_size = self.hf_config.sliding_window
+            else:
+                self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
+                self.window_size = self.hf_config.window_size
+            self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
+            if envs.SGLANG_DSV4_MODE.get() == "2604":
+                self.v_head_dim = self.head_dim
+            self.index_head_dim = self.hf_config.index_head_dim
+            self.compress_ratios = self.hf_config.compress_ratios
+            self.attention_arch = AttentionArch.MHA
+            self.scaling = 1 / math.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim)
+            if self.hf_config.rope_scaling:
+                mscale_all_dim = self.hf_config.rope_scaling.get(
+                    "mscale_all_dim", False
+                )
+                scaling_factor = self.hf_config.rope_scaling["factor"]
+                mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+                self.scaling = self.scaling * mscale * mscale
         elif "MiniCPM3ForCausalLM" in self.hf_config.architectures:
             self.head_dim = 128
             self.attention_arch = AttentionArch.MLA
@@ -633,6 +687,14 @@ class ModelConfig:
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
         self.hidden_size = self.hf_text_config.hidden_size
+        hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
+        self.spec_hidden_size = (
+            self.hidden_size * hc_mult
+            if hc_mult > 1
+            and envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
+            and envs.SGLANG_DSV4_MODE.get() == "2604"
+            else self.hidden_size
+        )
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers
         self.num_attention_layers = self.num_hidden_layers
         if "LongcatFlashForCausalLM" in self.hf_config.architectures:
@@ -941,10 +1003,11 @@ class ModelConfig:
             return "fp8"  # Default fallback
 
     def _get_sliding_window_size(self) -> Optional[int]:
-        sliding_window_size = getattr(self.hf_text_config, "sliding_window_size", None)
-        if sliding_window_size is None:
-            sliding_window_size = getattr(self.hf_text_config, "sliding_window", None)
-        return sliding_window_size
+        key_list = ["sliding_window_size", "sliding_window", "window_size"]
+        for key in key_list:
+            if hasattr(self.hf_text_config, key):
+                return getattr(self.hf_text_config, key)
+        return None
 
     def _validate_quantize_and_serve_config(self):
         """Validate quantize_and_serve configuration."""
@@ -1519,6 +1582,8 @@ def is_hybrid_swa_model(model_architectures: List[str]):
 
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
+        "DeepseekV4ForCausalLM",
+        "DeepseekV4ForCausalLMNextN",
         "GptOssForCausalLM",
         "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
