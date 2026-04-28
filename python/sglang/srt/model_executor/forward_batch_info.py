@@ -760,9 +760,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mm_input = batch.multimodal_inputs[batch_idx]
             if self.forward_mode.is_decode():
                 # 3 * N
-                if (
-                    mm_input is None
-                    or is_true_on_policy_enabled(get_global_server_args())
+                if mm_input is None or is_true_on_policy_enabled(
+                    get_global_server_args()
                 ):
                     mrope_positions_list[batch_idx] = torch.full(
                         (3, 1),
@@ -779,9 +778,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     batch.extend_seq_lens[batch_idx],
                     batch.extend_prefix_lens[batch_idx],
                 )
-                if (
-                    mm_input is None
-                    or is_true_on_policy_enabled(get_global_server_args())
+                if mm_input is None or is_true_on_policy_enabled(
+                    get_global_server_args()
                 ):
                     # text only
                     mrope_positions = torch.tensor(

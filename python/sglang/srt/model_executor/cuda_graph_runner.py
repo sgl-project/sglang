@@ -53,9 +53,6 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
-from sglang.srt.true_on_policy import (
-    patch_prefill_only_deterministic_inference_for_cuda_graph,
-)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
@@ -69,6 +66,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.multiplex.pdmux_context import get_current_stream_idx, get_stream_groups
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.true_on_policy import (
+    patch_prefill_only_deterministic_inference_for_cuda_graph,
+)
 from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,

@@ -28,10 +28,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     is_allocation_symmetric,
 )
-from sglang.srt.true_on_policy import (
-    should_use_tp_invariant_row_linear,
-    should_use_tp_invariant_tree_all_reduce,
-)
 from sglang.srt.layers.parameter import (
     BasevLLMParameter,
     BlockQuantScaleParameter,
@@ -42,6 +38,10 @@ from sglang.srt.layers.parameter import (
     _ColumnvLLMParameter,
 )
 from sglang.srt.layers.utils import pad_or_narrow_weight
+from sglang.srt.true_on_policy import (
+    should_use_tp_invariant_row_linear,
+    should_use_tp_invariant_tree_all_reduce,
+)
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu, set_weight_attrs
 
 if TYPE_CHECKING:

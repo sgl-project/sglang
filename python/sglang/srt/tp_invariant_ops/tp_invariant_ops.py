@@ -1,5 +1,6 @@
 import contextlib
 import math
+import os
 import sys
 from typing import Any, Callable, Dict
 
@@ -7,7 +8,6 @@ import torch
 import torch.distributed as dist
 import triton
 import triton.language as tl
-import os
 
 # Triton's constexpr tree unrolling causes deep AST recursion in the JIT
 # compiler.  The two-level tree (v2) bounds compilation depth to
@@ -15,6 +15,7 @@ import os
 # need headroom for the per-level AST visitor overhead.
 if sys.getrecursionlimit() < 16384:
     sys.setrecursionlimit(16384)
+
 
 def _matmul_launch_metadata(
     grid: Callable[..., Any], kernel: Any, args: Dict[str, Any]
@@ -351,7 +352,10 @@ def matmul_kernel_tp_persistent_optim(
                             carry_over = (2 == count_value_added).to(tl.int1)
                             if count_value_added > 1:
                                 tmp_acc_mask = S_mask == (level - 5)
-                                acc = tl.sum(S * tmp_acc_mask, axis=0, dtype=ACC_DTYPE) + acc
+                                acc = (
+                                    tl.sum(S * tmp_acc_mask, axis=0, dtype=ACC_DTYPE)
+                                    + acc
+                                )
                             count = tl.where(
                                 idx_mask, count_value_added * (1 - carry_over), count
                             )
@@ -568,11 +572,14 @@ def tree_all_reduce_sum(x: torch.Tensor, device_group=None) -> torch.Tensor:
 
     return result[0]
 
+
 def tree_all_reduce_sum_optim(x: torch.Tensor, device_group=None) -> torch.Tensor:
     if not x.is_cuda:
         raise ValueError("x must be a CUDA tensor.")
     if not x.is_contiguous():
-        raise ValueError("x must be contiguous. Call x = x.contiguous() OUTSIDE graph capture.")
+        raise ValueError(
+            "x must be contiguous. Call x = x.contiguous() OUTSIDE graph capture."
+        )
 
     world_size = dist.get_world_size(device_group)
     if world_size & (world_size - 1) != 0:
@@ -585,7 +592,9 @@ def tree_all_reduce_sum_optim(x: torch.Tensor, device_group=None) -> torch.Tenso
     key = (id(device_group), x.device.index, tuple(x.shape), x.dtype, world_size)
     st = tree_all_reduce_sum._cache.get(key)
     if st is None:
-        gather = torch.empty((world_size,) + tuple(x.shape), device=x.device, dtype=x.dtype)
+        gather = torch.empty(
+            (world_size,) + tuple(x.shape), device=x.device, dtype=x.dtype
+        )
         out = torch.empty_like(x)
         st = tree_all_reduce_sum._cache[key] = (gather, out)
 
@@ -665,7 +674,9 @@ def set_tp_invariant_mode(enabled=True):
         _tp_inv_MODE = old_state
 
 
-def scatter_input_by_local_expert(topk: torch.Tensor, input: torch.Tensor, E: int) -> torch.Tensor:
+def scatter_input_by_local_expert(
+    topk: torch.Tensor, input: torch.Tensor, E: int
+) -> torch.Tensor:
     """
     Args:
         topk: [M, topk], long, -1 means remote expert
@@ -675,44 +686,55 @@ def scatter_input_by_local_expert(topk: torch.Tensor, input: torch.Tensor, E: in
         output: [M, E, hidden_size]
     """
     M, _, hidden_size = input.shape
-    
+
     # Mask out remote experts in output
     valid = (topk != -1).unsqueeze(-1)  # [M, topk, 1]
     output_masked = input * valid.to(input.dtype)  # [M, topk, hidden_size]
-    
+
     # Replace -1 with 0 for safe indexing (value doesn't matter because output is zero)
     topk_index = topk.clamp(min=0)  # turns -1 into 0, leaves others unchanged
-    
+
     # Expand index to match output
-    index = topk_index.unsqueeze(-1).expand(-1, -1, hidden_size)  # [M, topk, hidden_size]
-    
+    index = topk_index.unsqueeze(-1).expand(
+        -1, -1, hidden_size
+    )  # [M, topk, hidden_size]
+
     # Initialize result
     output = torch.zeros(M, E, hidden_size, device=input.device, dtype=input.dtype)
-    
+
     # Scatter add
     output.scatter_add_(1, index, output_masked)
-    
+
     return output
+
 
 @triton.jit
 def _load_expert_tile(
-    input_ptr, input_base, input_stride_1,
-    topk_ids_base, topk_ids_stride_1,
-    zero_ptrs, offs_dim,
-    mask, mask_token,
-    e: tl.constexpr, TOPK: tl.constexpr, BLOCK_M: tl.constexpr,
+    input_ptr,
+    input_base,
+    input_stride_1,
+    topk_ids_base,
+    topk_ids_stride_1,
+    zero_ptrs,
+    offs_dim,
+    mask,
+    mask_token,
+    e: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
 ):
     """Load tile for expert e: search topk_ids for slot, redirect to zero_buf if remote."""
     found_slot = tl.full([BLOCK_M], -1, dtype=tl.int32)
     for k in range(TOPK):
         kid = tl.load(
             topk_ids_base + k * topk_ids_stride_1,
-            mask=mask_token, other=-1,
+            mask=mask_token,
+            other=-1,
         ).to(tl.int32)
         match = (kid == e) & (found_slot == -1)
         found_slot = tl.where(match, k, found_slot)
 
-    is_valid = (found_slot != -1)
+    is_valid = found_slot != -1
     slot_safe = tl.maximum(found_slot, 0)
     input_ptrs = input_base + slot_safe[:, None] * input_stride_1 + offs_dim[None, :]
     load_ptrs = tl.where(is_valid[:, None], input_ptrs, zero_ptrs)
@@ -721,12 +743,19 @@ def _load_expert_tile(
 
 @triton.jit
 def _tree_reduce_pair(
-    input_ptr, input_base, input_stride_1,
-    topk_ids_base, topk_ids_stride_1,
-    zero_ptrs, offs_dim,
-    mask, mask_token,
-    start: tl.constexpr, size: tl.constexpr,
-    TOPK: tl.constexpr, BLOCK_M: tl.constexpr,
+    input_ptr,
+    input_base,
+    input_stride_1,
+    topk_ids_base,
+    topk_ids_stride_1,
+    zero_ptrs,
+    offs_dim,
+    mask,
+    mask_token,
+    start: tl.constexpr,
+    size: tl.constexpr,
+    TOPK: tl.constexpr,
+    BLOCK_M: tl.constexpr,
 ):
     """
     Recursively compute binary-tree sum over experts [start, start+size).
@@ -745,27 +774,50 @@ def _tree_reduce_pair(
     """
     if size == 1:
         return _load_expert_tile(
-            input_ptr, input_base, input_stride_1,
-            topk_ids_base, topk_ids_stride_1,
-            zero_ptrs, offs_dim,
-            mask, mask_token,
-            start, TOPK, BLOCK_M,
+            input_ptr,
+            input_base,
+            input_stride_1,
+            topk_ids_base,
+            topk_ids_stride_1,
+            zero_ptrs,
+            offs_dim,
+            mask,
+            mask_token,
+            start,
+            TOPK,
+            BLOCK_M,
         )
     else:
         half: tl.constexpr = size // 2
         left = _tree_reduce_pair(
-            input_ptr, input_base, input_stride_1,
-            topk_ids_base, topk_ids_stride_1,
-            zero_ptrs, offs_dim,
-            mask, mask_token,
-            start, half, TOPK, BLOCK_M,
+            input_ptr,
+            input_base,
+            input_stride_1,
+            topk_ids_base,
+            topk_ids_stride_1,
+            zero_ptrs,
+            offs_dim,
+            mask,
+            mask_token,
+            start,
+            half,
+            TOPK,
+            BLOCK_M,
         )
         right = _tree_reduce_pair(
-            input_ptr, input_base, input_stride_1,
-            topk_ids_base, topk_ids_stride_1,
-            zero_ptrs, offs_dim,
-            mask, mask_token,
-            start + half, half, TOPK, BLOCK_M,
+            input_ptr,
+            input_base,
+            input_stride_1,
+            topk_ids_base,
+            topk_ids_stride_1,
+            zero_ptrs,
+            offs_dim,
+            mask,
+            mask_token,
+            start + half,
+            half,
+            TOPK,
+            BLOCK_M,
         )
         return left + right
 
@@ -831,11 +883,19 @@ def _fused_tree_reduce_kernel(
 
     # Binary tree reduce over all E experts, entirely in registers.
     result = _tree_reduce_pair(
-        input_ptr, input_base, input_stride_1,
-        topk_ids_base, topk_ids_stride_1,
-        zero_ptrs, offs_dim,
-        mask, mask_token,
-        0, E, TOPK, BLOCK_M,
+        input_ptr,
+        input_base,
+        input_stride_1,
+        topk_ids_base,
+        topk_ids_stride_1,
+        zero_ptrs,
+        offs_dim,
+        mask,
+        mask_token,
+        0,
+        E,
+        TOPK,
+        BLOCK_M,
     )
 
     result *= routed_scaling_factor
@@ -850,8 +910,8 @@ _zero_buf_cache: torch.Tensor | None = None
 
 
 def moe_sum_tree_reduce_v1(
-    input: torch.Tensor,          # [M, topk, hidden_dim]
-    output: torch.Tensor,         # [M, hidden_dim]
+    input: torch.Tensor,  # [M, topk, hidden_dim]
+    output: torch.Tensor,  # [M, hidden_dim]
     curr_topk_ids: torch.Tensor,  # [M, topk], -1 means remote
     routed_scaling_factor: float,
     E: int,
@@ -888,9 +948,15 @@ def moe_sum_tree_reduce_v1(
 
     # Zero buffer: [hidden_dim], allocated once, reused forever
     global _zero_buf_cache
-    if _zero_buf_cache is None or _zero_buf_cache.device != input.device or \
-       _zero_buf_cache.dtype != input.dtype or _zero_buf_cache.numel() < hidden_dim:
-        _zero_buf_cache = torch.zeros(hidden_dim, device=input.device, dtype=input.dtype)
+    if (
+        _zero_buf_cache is None
+        or _zero_buf_cache.device != input.device
+        or _zero_buf_cache.dtype != input.dtype
+        or _zero_buf_cache.numel() < hidden_dim
+    ):
+        _zero_buf_cache = torch.zeros(
+            hidden_dim, device=input.device, dtype=input.dtype
+        )
     zero_buf = _zero_buf_cache
 
     BLOCK_M = 1
@@ -904,9 +970,11 @@ def moe_sum_tree_reduce_v1(
 
     _fused_tree_reduce_kernel[grid](
         input,
-        input.stride(0), input.stride(1),
+        input.stride(0),
+        input.stride(1),
         curr_topk_ids,
-        curr_topk_ids.stride(0), curr_topk_ids.stride(1),
+        curr_topk_ids.stride(0),
+        curr_topk_ids.stride(1),
         zero_buf,
         output,
         output.stride(0),
@@ -923,6 +991,7 @@ def moe_sum_tree_reduce_v1(
 
 
 import math
+
 import torch
 import triton
 import triton.language as tl
@@ -930,14 +999,22 @@ import triton.language as tl
 
 @triton.jit
 def _moe_sum_tree_reduce_k8_fused_kernel_opt2d(
-    x_ptr, ids_ptr, out_ptr,
-    sx_m: tl.constexpr, sx_k: tl.constexpr, sx_h: tl.constexpr,     # x: [M,8,H]
-    sid_m: tl.constexpr, sid_k: tl.constexpr,                       # ids: [M,8]
-    so_m: tl.constexpr, so_h: tl.constexpr,                         # out: [M,H]
-    M, H,                                                           # runtime OK
-    E_LEVEL,                                                        # runtime int (log2(E))
-    routed_scaling_factor,                                          # runtime scalar
-    BLOCK_M: tl.constexpr, BLOCK_H: tl.constexpr,
+    x_ptr,
+    ids_ptr,
+    out_ptr,
+    sx_m: tl.constexpr,
+    sx_k: tl.constexpr,
+    sx_h: tl.constexpr,  # x: [M,8,H]
+    sid_m: tl.constexpr,
+    sid_k: tl.constexpr,  # ids: [M,8]
+    so_m: tl.constexpr,
+    so_h: tl.constexpr,  # out: [M,H]
+    M,
+    H,  # runtime OK
+    E_LEVEL,  # runtime int (log2(E))
+    routed_scaling_factor,  # runtime scalar
+    BLOCK_M: tl.constexpr,
+    BLOCK_H: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -976,20 +1053,36 @@ def _moe_sum_tree_reduce_k8_fused_kernel_opt2d(
     m6 = mask_mh & (ids6 != -1)[:, None]
     m7 = mask_mh & (ids7 != -1)[:, None]
 
-    v0 = tl.load(x_ptr + m[:, None] * sx_m + 0 * sx_k + h[None, :] * sx_h, mask=m0, other=0.0)
-    v1 = tl.load(x_ptr + m[:, None] * sx_m + 1 * sx_k + h[None, :] * sx_h, mask=m1, other=0.0)
-    v2 = tl.load(x_ptr + m[:, None] * sx_m + 2 * sx_k + h[None, :] * sx_h, mask=m2, other=0.0)
-    v3 = tl.load(x_ptr + m[:, None] * sx_m + 3 * sx_k + h[None, :] * sx_h, mask=m3, other=0.0)
-    v4 = tl.load(x_ptr + m[:, None] * sx_m + 4 * sx_k + h[None, :] * sx_h, mask=m4, other=0.0)
-    v5 = tl.load(x_ptr + m[:, None] * sx_m + 5 * sx_k + h[None, :] * sx_h, mask=m5, other=0.0)
-    v6 = tl.load(x_ptr + m[:, None] * sx_m + 6 * sx_k + h[None, :] * sx_h, mask=m6, other=0.0)
-    v7 = tl.load(x_ptr + m[:, None] * sx_m + 7 * sx_k + h[None, :] * sx_h, mask=m7, other=0.0)
+    v0 = tl.load(
+        x_ptr + m[:, None] * sx_m + 0 * sx_k + h[None, :] * sx_h, mask=m0, other=0.0
+    )
+    v1 = tl.load(
+        x_ptr + m[:, None] * sx_m + 1 * sx_k + h[None, :] * sx_h, mask=m1, other=0.0
+    )
+    v2 = tl.load(
+        x_ptr + m[:, None] * sx_m + 2 * sx_k + h[None, :] * sx_h, mask=m2, other=0.0
+    )
+    v3 = tl.load(
+        x_ptr + m[:, None] * sx_m + 3 * sx_k + h[None, :] * sx_h, mask=m3, other=0.0
+    )
+    v4 = tl.load(
+        x_ptr + m[:, None] * sx_m + 4 * sx_k + h[None, :] * sx_h, mask=m4, other=0.0
+    )
+    v5 = tl.load(
+        x_ptr + m[:, None] * sx_m + 5 * sx_k + h[None, :] * sx_h, mask=m5, other=0.0
+    )
+    v6 = tl.load(
+        x_ptr + m[:, None] * sx_m + 6 * sx_k + h[None, :] * sx_h, mask=m6, other=0.0
+    )
+    v7 = tl.load(
+        x_ptr + m[:, None] * sx_m + 7 * sx_k + h[None, :] * sx_h, mask=m7, other=0.0
+    )
 
     x_dtype = x_ptr.dtype.element_ty
 
     # ---- deterministic dense-tree-equivalent reduce (same order concept as baseline) ----
     # Remote entries have already been masked to 0.0 at load time (m0..m7).
-    
+
     for bit in tl.range(0, E_LEVEL):
         bitmask = 1 << bit
 
@@ -1211,8 +1304,8 @@ def _moe_sum_tree_reduce_k8_fused_kernel_opt2d(
 
 
 def _moe_sum_tree_reduce_k8_fast_path(
-    input: torch.Tensor,          # [M, 8, H]
-    output: torch.Tensor,         # [M, H]
+    input: torch.Tensor,  # [M, 8, H]
+    output: torch.Tensor,  # [M, H]
     curr_topk_ids: torch.Tensor,  # [M, 8], -1 means remote
     routed_scaling_factor: float,
     E: int,
@@ -1243,14 +1336,22 @@ def _moe_sum_tree_reduce_k8_fast_path(
 
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(H, BLOCK_H))
     _moe_sum_tree_reduce_k8_fused_kernel_opt2d[grid](
-        input, curr_topk_ids, output,
-        input.stride(0), input.stride(1), input.stride(2),
-        curr_topk_ids.stride(0), curr_topk_ids.stride(1),
-        output.stride(0), output.stride(1),
-        M, H,
+        input,
+        curr_topk_ids,
+        output,
+        input.stride(0),
+        input.stride(1),
+        input.stride(2),
+        curr_topk_ids.stride(0),
+        curr_topk_ids.stride(1),
+        output.stride(0),
+        output.stride(1),
+        M,
+        H,
         E_LEVEL,
         routed_scaling_factor,
-        BLOCK_M=BLOCK_M, BLOCK_H=BLOCK_H,
+        BLOCK_M=BLOCK_M,
+        BLOCK_H=BLOCK_H,
         num_warps=num_warps,
     )
     return output
@@ -1258,15 +1359,23 @@ def _moe_sum_tree_reduce_k8_fast_path(
 
 @triton.jit
 def _moe_sum_tree_reduce_topk16_sparse_kernel(
-    x_ptr, ids_ptr, out_ptr,
-    sx_m, sx_k, sx_h,          # x: [M, K, H]
-    sid_m, sid_k,              # ids: [M, K]
-    so_m, so_h,                # out: [M, H]
-    M, K, H,                   # runtime
-    E_LEVEL,                   # log2(E)
+    x_ptr,
+    ids_ptr,
+    out_ptr,
+    sx_m,
+    sx_k,
+    sx_h,  # x: [M, K, H]
+    sid_m,
+    sid_k,  # ids: [M, K]
+    so_m,
+    so_h,  # out: [M, H]
+    M,
+    K,
+    H,  # runtime
+    E_LEVEL,  # log2(E)
     routed_scaling_factor,
     BLOCK_H: tl.constexpr,
-    MAX_TOPK: tl.constexpr,    # fixed compile-time capacity, e.g. 16
+    MAX_TOPK: tl.constexpr,  # fixed compile-time capacity, e.g. 16
 ):
     # One program handles one token + one hidden tile.
     pid_m = tl.program_id(0)
@@ -1282,9 +1391,9 @@ def _moe_sum_tree_reduce_topk16_sparse_kernel(
     slot = tl.arange(0, MAX_TOPK)
     in_k = slot < K
 
-    ids = tl.load(ids_ptr + m * sid_m + slot * sid_k, mask=(mask_m & in_k), other=-1).to(
-        tl.int32
-    )
+    ids = tl.load(
+        ids_ptr + m * sid_m + slot * sid_k, mask=(mask_m & in_k), other=-1
+    ).to(tl.int32)
     valid = (ids != -1) & in_k & mask_m
 
     vals = tl.zeros((MAX_TOPK, BLOCK_H), dtype=tl.float32)
@@ -1326,12 +1435,14 @@ def _moe_sum_tree_reduce_topk16_sparse_kernel(
         acc += tl.where(ids[s] == 0, vals[s, :], 0.0)
 
     acc *= routed_scaling_factor
-    tl.store(out_ptr + m * so_m + h * so_h, acc.to(out_ptr.dtype.element_ty), mask=mask_mh)
+    tl.store(
+        out_ptr + m * so_m + h * so_h, acc.to(out_ptr.dtype.element_ty), mask=mask_mh
+    )
 
 
 def moe_sum_tree_reduce_v1_topk_sparse16(
-    input: torch.Tensor,          # [M, K, H]
-    output: torch.Tensor,         # [M, H]
+    input: torch.Tensor,  # [M, K, H]
+    output: torch.Tensor,  # [M, H]
     curr_topk_ids: torch.Tensor,  # [M, K], -1 means remote
     routed_scaling_factor: float,
     E: int,
@@ -1380,8 +1491,8 @@ def moe_sum_tree_reduce_v1_topk_sparse16(
 
 
 def moe_sum_tree_reduce_v0(
-    input: torch.Tensor,          # [M, 8, H]
-    output: torch.Tensor,         # [M, H]
+    input: torch.Tensor,  # [M, 8, H]
+    output: torch.Tensor,  # [M, H]
     curr_topk_ids: torch.Tensor,  # [M, 8], -1 means remote
     routed_scaling_factor: float,
     E: int,
@@ -1395,16 +1506,24 @@ def moe_sum_tree_reduce_v0(
         E=E,
     )
 
+
 @triton.jit
 def _moe_tree_reduce_sparse_k8_kernel(
-    x_ptr, ids_ptr, out_ptr,
-    sx_m: tl.constexpr, sx_k: tl.constexpr, sx_h: tl.constexpr,
-    sid_m: tl.constexpr, sid_k: tl.constexpr,
-    so_m: tl.constexpr, so_h: tl.constexpr,
-    M, H,
+    x_ptr,
+    ids_ptr,
+    out_ptr,
+    sx_m: tl.constexpr,
+    sx_k: tl.constexpr,
+    sx_h: tl.constexpr,
+    sid_m: tl.constexpr,
+    sid_k: tl.constexpr,
+    so_m: tl.constexpr,
+    so_h: tl.constexpr,
+    M,
+    H,
     routed_scaling_factor,
-    LOGE,                        # runtime: tl.range does not unroll
-    CAST_MODE: tl.constexpr,     # 0: per-level bf16 round, 1: no intermediate cast
+    LOGE,  # runtime: tl.range does not unroll
+    CAST_MODE: tl.constexpr,  # 0: per-level bf16 round, 1: no intermediate cast
     BLOCK_M: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
@@ -1436,22 +1555,46 @@ def _moe_tree_reduce_sparse_k8_kernel(
     ids7 = tl.load(ids_ptr + m * sid_m + 7 * sid_k, mask=mask_m, other=-1).to(tl.int32)
 
     # ---- vals: load -> fp32 ----
-    f0 = tl.load(x_ptr + m[:, None] * sx_m + 0 * sx_k + h[None, :] * sx_h,
-                 mask=mask_mh & (ids0 != -1)[:, None], other=0.0).to(tl.float32)
-    f1 = tl.load(x_ptr + m[:, None] * sx_m + 1 * sx_k + h[None, :] * sx_h,
-                 mask=mask_mh & (ids1 != -1)[:, None], other=0.0).to(tl.float32)
-    f2 = tl.load(x_ptr + m[:, None] * sx_m + 2 * sx_k + h[None, :] * sx_h,
-                 mask=mask_mh & (ids2 != -1)[:, None], other=0.0).to(tl.float32)
-    f3 = tl.load(x_ptr + m[:, None] * sx_m + 3 * sx_k + h[None, :] * sx_h,
-                 mask=mask_mh & (ids3 != -1)[:, None], other=0.0).to(tl.float32)
-    f4 = tl.load(x_ptr + m[:, None] * sx_m + 4 * sx_k + h[None, :] * sx_h,
-                 mask=mask_mh & (ids4 != -1)[:, None], other=0.0).to(tl.float32)
-    f5 = tl.load(x_ptr + m[:, None] * sx_m + 5 * sx_k + h[None, :] * sx_h,
-                 mask=mask_mh & (ids5 != -1)[:, None], other=0.0).to(tl.float32)
-    f6 = tl.load(x_ptr + m[:, None] * sx_m + 6 * sx_k + h[None, :] * sx_h,
-                 mask=mask_mh & (ids6 != -1)[:, None], other=0.0).to(tl.float32)
-    f7 = tl.load(x_ptr + m[:, None] * sx_m + 7 * sx_k + h[None, :] * sx_h,
-                 mask=mask_mh & (ids7 != -1)[:, None], other=0.0).to(tl.float32)
+    f0 = tl.load(
+        x_ptr + m[:, None] * sx_m + 0 * sx_k + h[None, :] * sx_h,
+        mask=mask_mh & (ids0 != -1)[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    f1 = tl.load(
+        x_ptr + m[:, None] * sx_m + 1 * sx_k + h[None, :] * sx_h,
+        mask=mask_mh & (ids1 != -1)[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    f2 = tl.load(
+        x_ptr + m[:, None] * sx_m + 2 * sx_k + h[None, :] * sx_h,
+        mask=mask_mh & (ids2 != -1)[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    f3 = tl.load(
+        x_ptr + m[:, None] * sx_m + 3 * sx_k + h[None, :] * sx_h,
+        mask=mask_mh & (ids3 != -1)[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    f4 = tl.load(
+        x_ptr + m[:, None] * sx_m + 4 * sx_k + h[None, :] * sx_h,
+        mask=mask_mh & (ids4 != -1)[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    f5 = tl.load(
+        x_ptr + m[:, None] * sx_m + 5 * sx_k + h[None, :] * sx_h,
+        mask=mask_mh & (ids5 != -1)[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    f6 = tl.load(
+        x_ptr + m[:, None] * sx_m + 6 * sx_k + h[None, :] * sx_h,
+        mask=mask_mh & (ids6 != -1)[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    f7 = tl.load(
+        x_ptr + m[:, None] * sx_m + 7 * sx_k + h[None, :] * sx_h,
+        mask=mask_mh & (ids7 != -1)[:, None],
+        other=0.0,
+    ).to(tl.float32)
 
     # ---- main: runtime loop ----
     for bit in tl.range(0, LOGE):
@@ -1463,8 +1606,13 @@ def _moe_tree_reduce_sparse_k8_kernel(
         # ---------------- s0 ----------------
         c0 = (a0 != -1) & ((a0 & bitmask) != 0)
         t0 = tl.where(c0, a0 ^ bitmask, NEG2)
-        m01 = (a1 == t0); m02 = (a2 == t0); m03 = (a3 == t0); m04 = (a4 == t0)
-        m05 = (a5 == t0); m06 = (a6 == t0); m07 = (a7 == t0)
+        m01 = a1 == t0
+        m02 = a2 == t0
+        m03 = a3 == t0
+        m04 = a4 == t0
+        m05 = a5 == t0
+        m06 = a6 == t0
+        m07 = a7 == t0
         hit0 = m01 | m02 | m03 | m04 | m05 | m06 | m07
         src = f0
         f1 = tl.where(m01[:, None], f1 + src, f1)
@@ -1480,8 +1628,13 @@ def _moe_tree_reduce_sparse_k8_kernel(
         # ---------------- s1 ----------------
         c1 = (a1 != -1) & ((a1 & bitmask) != 0)
         t1 = tl.where(c1, a1 ^ bitmask, NEG2)
-        m10 = (a0 == t1); m12 = (a2 == t1); m13 = (a3 == t1); m14 = (a4 == t1)
-        m15 = (a5 == t1); m16 = (a6 == t1); m17 = (a7 == t1)
+        m10 = a0 == t1
+        m12 = a2 == t1
+        m13 = a3 == t1
+        m14 = a4 == t1
+        m15 = a5 == t1
+        m16 = a6 == t1
+        m17 = a7 == t1
         hit1 = m10 | m12 | m13 | m14 | m15 | m16 | m17
         src = f1
         f0 = tl.where(m10[:, None], f0 + src, f0)
@@ -1497,8 +1650,13 @@ def _moe_tree_reduce_sparse_k8_kernel(
         # ---------------- s2 ----------------
         c2 = (a2 != -1) & ((a2 & bitmask) != 0)
         t2 = tl.where(c2, a2 ^ bitmask, NEG2)
-        m20 = (a0 == t2); m21 = (a1 == t2); m23 = (a3 == t2); m24 = (a4 == t2)
-        m25 = (a5 == t2); m26 = (a6 == t2); m27 = (a7 == t2)
+        m20 = a0 == t2
+        m21 = a1 == t2
+        m23 = a3 == t2
+        m24 = a4 == t2
+        m25 = a5 == t2
+        m26 = a6 == t2
+        m27 = a7 == t2
         hit2 = m20 | m21 | m23 | m24 | m25 | m26 | m27
         src = f2
         f0 = tl.where(m20[:, None], f0 + src, f0)
@@ -1514,8 +1672,13 @@ def _moe_tree_reduce_sparse_k8_kernel(
         # ---------------- s3 ----------------
         c3 = (a3 != -1) & ((a3 & bitmask) != 0)
         t3 = tl.where(c3, a3 ^ bitmask, NEG2)
-        m30 = (a0 == t3); m31 = (a1 == t3); m32 = (a2 == t3); m34 = (a4 == t3)
-        m35 = (a5 == t3); m36 = (a6 == t3); m37 = (a7 == t3)
+        m30 = a0 == t3
+        m31 = a1 == t3
+        m32 = a2 == t3
+        m34 = a4 == t3
+        m35 = a5 == t3
+        m36 = a6 == t3
+        m37 = a7 == t3
         hit3 = m30 | m31 | m32 | m34 | m35 | m36 | m37
         src = f3
         f0 = tl.where(m30[:, None], f0 + src, f0)
@@ -1531,8 +1694,13 @@ def _moe_tree_reduce_sparse_k8_kernel(
         # ---------------- s4 ----------------
         c4 = (a4 != -1) & ((a4 & bitmask) != 0)
         t4 = tl.where(c4, a4 ^ bitmask, NEG2)
-        m40 = (a0 == t4); m41 = (a1 == t4); m42 = (a2 == t4); m43 = (a3 == t4)
-        m45 = (a5 == t4); m46 = (a6 == t4); m47 = (a7 == t4)
+        m40 = a0 == t4
+        m41 = a1 == t4
+        m42 = a2 == t4
+        m43 = a3 == t4
+        m45 = a5 == t4
+        m46 = a6 == t4
+        m47 = a7 == t4
         hit4 = m40 | m41 | m42 | m43 | m45 | m46 | m47
         src = f4
         f0 = tl.where(m40[:, None], f0 + src, f0)
@@ -1548,8 +1716,13 @@ def _moe_tree_reduce_sparse_k8_kernel(
         # ---------------- s5 ----------------
         c5 = (a5 != -1) & ((a5 & bitmask) != 0)
         t5 = tl.where(c5, a5 ^ bitmask, NEG2)
-        m50 = (a0 == t5); m51 = (a1 == t5); m52 = (a2 == t5); m53 = (a3 == t5); m54 = (a4 == t5)
-        m56 = (a6 == t5); m57 = (a7 == t5)
+        m50 = a0 == t5
+        m51 = a1 == t5
+        m52 = a2 == t5
+        m53 = a3 == t5
+        m54 = a4 == t5
+        m56 = a6 == t5
+        m57 = a7 == t5
         hit5 = m50 | m51 | m52 | m53 | m54 | m56 | m57
         src = f5
         f0 = tl.where(m50[:, None], f0 + src, f0)
@@ -1565,8 +1738,13 @@ def _moe_tree_reduce_sparse_k8_kernel(
         # ---------------- s6 ----------------
         c6 = (a6 != -1) & ((a6 & bitmask) != 0)
         t6 = tl.where(c6, a6 ^ bitmask, NEG2)
-        m60 = (a0 == t6); m61 = (a1 == t6); m62 = (a2 == t6); m63 = (a3 == t6); m64 = (a4 == t6); m65 = (a5 == t6)
-        m67 = (a7 == t6)
+        m60 = a0 == t6
+        m61 = a1 == t6
+        m62 = a2 == t6
+        m63 = a3 == t6
+        m64 = a4 == t6
+        m65 = a5 == t6
+        m67 = a7 == t6
         hit6 = m60 | m61 | m62 | m63 | m64 | m65 | m67
         src = f6
         f0 = tl.where(m60[:, None], f0 + src, f0)
@@ -1582,7 +1760,13 @@ def _moe_tree_reduce_sparse_k8_kernel(
         # ---------------- s7 ----------------
         c7 = (a7 != -1) & ((a7 & bitmask) != 0)
         t7 = tl.where(c7, a7 ^ bitmask, NEG2)
-        m70 = (a0 == t7); m71 = (a1 == t7); m72 = (a2 == t7); m73 = (a3 == t7); m74 = (a4 == t7); m75 = (a5 == t7); m76 = (a6 == t7)
+        m70 = a0 == t7
+        m71 = a1 == t7
+        m72 = a2 == t7
+        m73 = a3 == t7
+        m74 = a4 == t7
+        m75 = a5 == t7
+        m76 = a6 == t7
         hit7 = m70 | m71 | m72 | m73 | m74 | m75 | m76
         src = f7
         f0 = tl.where(m70[:, None], f0 + src, f0)
@@ -1623,15 +1807,20 @@ def _moe_tree_reduce_sparse_k8_kernel(
     out_ptrs = out_ptr + m[:, None] * so_m + h[None, :] * so_h
     tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=mask_mh)
 
+
 def _launch_sparse_tree_k8_k10(
-    input: torch.Tensor,          # [M, K, H], bf16 contiguous
-    output: torch.Tensor,         # [M, H], bf16 contiguous
+    input: torch.Tensor,  # [M, K, H], bf16 contiguous
+    output: torch.Tensor,  # [M, H], bf16 contiguous
     curr_topk_ids: torch.Tensor,  # [M, K], int32/int64 contiguous, -1 remote
     routed_scaling_factor: float,
     E: int,
-    cast_mode: int = 1,           # <-- you asked for "last cast" version, so default = 1
+    cast_mode: int = 1,  # <-- you asked for "last cast" version, so default = 1
 ):
-    assert input.is_contiguous() and output.is_contiguous() and curr_topk_ids.is_contiguous()
+    assert (
+        input.is_contiguous()
+        and output.is_contiguous()
+        and curr_topk_ids.is_contiguous()
+    )
     M, K, H = input.shape
     assert output.shape == (M, H)
     assert K in (8, 10)
@@ -1646,15 +1835,24 @@ def _launch_sparse_tree_k8_k10(
 
     # NOTE: for strict CUDA Graph safety, avoid dtype conversion here.
     # Please ensure curr_topk_ids is int32 upstream.
-    assert curr_topk_ids.dtype == torch.int32, "make ids int32 upstream for CUDA Graph stability"
+    assert (
+        curr_topk_ids.dtype == torch.int32
+    ), "make ids int32 upstream for CUDA Graph stability"
 
     if K == 8:
         _moe_tree_reduce_sparse_k8_kernel[grid](
-            input, curr_topk_ids, output,
-            input.stride(0), input.stride(1), input.stride(2),
-            curr_topk_ids.stride(0), curr_topk_ids.stride(1),
-            output.stride(0), output.stride(1),
-            M, H,
+            input,
+            curr_topk_ids,
+            output,
+            input.stride(0),
+            input.stride(1),
+            input.stride(2),
+            curr_topk_ids.stride(0),
+            curr_topk_ids.stride(1),
+            output.stride(0),
+            output.stride(1),
+            M,
+            H,
             routed_scaling_factor,
             LOGE=LOGE,
             CAST_MODE=cast_mode,
@@ -1662,6 +1860,8 @@ def _launch_sparse_tree_k8_k10(
             BLOCK_H=BLOCK_H,
             num_warps=num_warps,
         )
+
+
 def moe_sum_tree_reduce_v2(
     input: torch.Tensor,
     output: torch.Tensor,
@@ -1671,7 +1871,11 @@ def moe_sum_tree_reduce_v2(
     *,
     cast_mode: int = 0,  # default to "last cast" as requested
 ):
-    assert input.is_contiguous() and output.is_contiguous() and curr_topk_ids.is_contiguous()
+    assert (
+        input.is_contiguous()
+        and output.is_contiguous()
+        and curr_topk_ids.is_contiguous()
+    )
     M, K, H = input.shape
     if M == 0:
         return output
@@ -1723,8 +1927,9 @@ def moe_sum_tree_reduce(
         E=E,
     )
 
+
 # if os.getenv("MOE_SUM_OPTIM", "0") == "1":
-#     moe_sum_tree_reduce = moe_sum_tree_reduce_optim    
+#     moe_sum_tree_reduce = moe_sum_tree_reduce_optim
 #     print("using optimized moe_sum_tree_reduce_optim")
 # else:
 #     print("using original moe_sum_tree_reduce_original")

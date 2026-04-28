@@ -1,13 +1,5 @@
 """True-on-policy runtime contract helpers."""
 
-from .contracts import (
-    QWEN3_DENSE_TRUE_ON_POLICY_V1,
-    SGLangTrueOnPolicyContract,
-    SGLangTrueOnPolicyRuntimePolicy,
-    get_true_on_policy_contract,
-    resolve_true_on_policy_runtime_policy,
-    validate_true_on_policy_contract,
-)
 from .config import (
     ROW_LINEAR_INV_BLOCK_K,
     get_on_policy_rms_norm_kwargs,
@@ -23,6 +15,14 @@ from .config import (
     should_force_bfloat16_lm_head,
     should_use_tp_invariant_row_linear,
     should_use_tp_invariant_tree_all_reduce,
+)
+from .contracts import (
+    QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    SGLangTrueOnPolicyContract,
+    SGLangTrueOnPolicyRuntimePolicy,
+    get_true_on_policy_contract,
+    resolve_true_on_policy_runtime_policy,
+    validate_true_on_policy_contract,
 )
 
 __all__ = [

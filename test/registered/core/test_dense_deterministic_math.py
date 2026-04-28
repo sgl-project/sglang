@@ -15,13 +15,11 @@ from sglang.srt.true_on_policy import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-
 register_cpu_ci(est_time=12, suite="stage-a-test-cpu")
 
 
 def _run_dense_math_script(script_body: str) -> dict[str, object]:
-    stubbed_imports = textwrap.dedent(
-        """
+    stubbed_imports = textwrap.dedent("""
         import importlib.machinery
         import json
         import sys
@@ -111,8 +109,7 @@ def _run_dense_math_script(script_body: str) -> dict[str, object]:
             },
         )
         sys.modules.setdefault("gguf", gguf_mod)
-        """
-    )
+        """)
 
     env = dict(os.environ)
     pythonpath = env.get("PYTHONPATH")
@@ -181,9 +178,7 @@ class TestDenseOnPolicyHelpers(unittest.TestCase):
 
 class TestDenseOnPolicyContracts(unittest.TestCase):
     def test_qwen3_style_rms_norm_keeps_fp32_weight_output_and_residual(self):
-        result = _run_dense_math_script(
-            textwrap.dedent(
-                """
+        result = _run_dense_math_script(textwrap.dedent("""
                 import json
                 from types import SimpleNamespace
 
@@ -220,18 +215,14 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                         }
                     )
                 )
-                """
-            )
-        )
+                """))
 
         self.assertEqual(result["weight_dtype"], "torch.float32")
         self.assertEqual(result["out_dtype"], "torch.float32")
         self.assertEqual(result["residual_dtype"], "torch.float32")
 
     def test_rms_norm_can_self_configure_from_true_on_policy_role_hints(self):
-        result = _run_dense_math_script(
-            textwrap.dedent(
-                """
+        result = _run_dense_math_script(textwrap.dedent("""
                 import json
 
                 import torch
@@ -265,9 +256,7 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                         }
                     )
                 )
-                """
-            )
-        )
+                """))
 
         self.assertEqual(result["weight_dtype"], "torch.float32")
         self.assertTrue(result["cast_x_before_out_mul"])
@@ -275,9 +264,7 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
         self.assertEqual(result["override_orig_dtype"], "torch.float32")
 
     def test_on_policy_lm_head_forces_bfloat16_matmul_inputs(self):
-        result = _run_dense_math_script(
-            textwrap.dedent(
-                """
+        result = _run_dense_math_script(textwrap.dedent("""
                 import json
                 from types import SimpleNamespace
                 from unittest.mock import patch
@@ -340,9 +327,7 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                         }
                     )
                 )
-                """
-            )
-        )
+                """))
 
         self.assertEqual(result["a_dtype"], "torch.bfloat16")
         self.assertEqual(result["b_dtype"], "torch.bfloat16")

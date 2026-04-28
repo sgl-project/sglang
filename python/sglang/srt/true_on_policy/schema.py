@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal
 
-
 TrueOnPolicyContractName = Literal["qwen3_dense_true_on_policy_v1"]
 ModelFamily = Literal["qwen3_dense", "qwen3_moe", "qwen3_next"]
 KernelContract = Literal["qwen3_dense_sglang_math"]
@@ -32,4 +31,3 @@ QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA = TrueOnPolicyContractSchema(
     fsdp_attention_implementation="flash_attention_3",
     disable_megatron_sequence_parallel=True,
 )
-

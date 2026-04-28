@@ -1,9 +1,7 @@
 import json
 import os
 import subprocess
-import sys
 import textwrap
-import types
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,8 +10,8 @@ import torch
 
 from sglang.srt.true_on_policy import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
-    get_true_on_policy_contract,
     get_rl_on_policy_target,
+    get_true_on_policy_contract,
     is_tp_invariant_target,
     is_true_on_policy_enabled,
     patch_prefill_only_deterministic_inference_for_cuda_graph,
@@ -196,7 +194,9 @@ class TestOnPolicyServerArgs(unittest.TestCase):
         )
 
         self.assertIsNone(result["rl_on_policy_target"])
-        self.assertEqual(result["true_on_policy_contract"], QWEN3_DENSE_TRUE_ON_POLICY_V1)
+        self.assertEqual(
+            result["true_on_policy_contract"], QWEN3_DENSE_TRUE_ON_POLICY_V1
+        )
         self.assertTrue(result["enable_deterministic_inference"])
 
     def test_contract_tp_rollout_disables_flashinfer_allreduce_fusion(self):
@@ -372,7 +372,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
         )
         self.assertFalse(
             should_disable_reduce_scatter_for_on_policy(
-                SimpleNamespace(rl_on_policy_target=None, true_on_policy_contract=None, tp_size=1)
+                SimpleNamespace(
+                    rl_on_policy_target=None, true_on_policy_contract=None, tp_size=1
+                )
             )
         )
 
@@ -405,7 +407,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
             )
 
     def test_attention_handoff_tree_reduce_uses_attention_tp_group(self):
-        from sglang.srt.layers.communicator import CommunicateWithAllReduceAndLayerNormFn
+        from sglang.srt.layers.communicator import (
+            CommunicateWithAllReduceAndLayerNormFn,
+        )
 
         hidden_states = torch.ones(2, 4)
         residual = torch.full((2, 4), 3.0)
@@ -437,7 +441,9 @@ class TestOnPolicyHelpers(unittest.TestCase):
             ) as attn_tree_reduce,
             patch(
                 "sglang.srt.layers.communicator.tensor_model_parallel_tree_all_reduce",
-                side_effect=AssertionError("generic TP tree reduce must not handle attention output"),
+                side_effect=AssertionError(
+                    "generic TP tree reduce must not handle attention output"
+                ),
             ),
         ):
             output, output_residual = (
@@ -522,9 +528,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
             )
             self.assertTrue(server_args.disable_custom_all_reduce)
             self.assertEqual(attn_backend.num_splits, 1)
-            self.assertEqual(
-                os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"], "1"
-            )
+            self.assertEqual(os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"], "1")
             self.assertEqual(os.environ["SGLANG_DISABLE_CUSTOM_ALL_REDUCE"], "1")
             self.assertEqual(os.environ["NCCL_ALGO"], "allreduce:tree")
 
@@ -572,30 +576,28 @@ class TestOnPolicyHelpers(unittest.TestCase):
 
     def test_flashinfer_allreduce_fusion_helpers(self):
         self.assertTrue(
-            should_disable_flashinfer_allreduce_fusion(
-                self._contract_args(tp_size=2)
-            )
+            should_disable_flashinfer_allreduce_fusion(self._contract_args(tp_size=2))
+        )
+        self.assertFalse(
+            should_disable_flashinfer_allreduce_fusion(self._contract_args(tp_size=1))
         )
         self.assertFalse(
             should_disable_flashinfer_allreduce_fusion(
-                self._contract_args(tp_size=1)
-            )
-        )
-        self.assertFalse(
-            should_disable_flashinfer_allreduce_fusion(
-                SimpleNamespace(rl_on_policy_target=None, true_on_policy_contract=None, tp_size=1)
+                SimpleNamespace(
+                    rl_on_policy_target=None, true_on_policy_contract=None, tp_size=1
+                )
             )
         )
 
     def test_fused_qk_norm_mrope_helper_follows_true_on_policy_contract(self):
         self.assertTrue(
-            should_disable_fused_qk_norm_mrope(
-                self._contract_args(tp_size=1)
-            )
+            should_disable_fused_qk_norm_mrope(self._contract_args(tp_size=1))
         )
         self.assertFalse(
             should_disable_fused_qk_norm_mrope(
-                SimpleNamespace(rl_on_policy_target=None, true_on_policy_contract=None, tp_size=1)
+                SimpleNamespace(
+                    rl_on_policy_target=None, true_on_policy_contract=None, tp_size=1
+                )
             )
         )
 
@@ -613,25 +615,25 @@ class TestOnPolicyHelpers(unittest.TestCase):
         )
 
     def test_is_true_on_policy_enabled_for_both_targets(self):
-        self.assertTrue(
-            is_true_on_policy_enabled(self._contract_args(tp_size=1))
-        )
-        self.assertTrue(
-            is_true_on_policy_enabled(self._contract_args(tp_size=2))
-        )
+        self.assertTrue(is_true_on_policy_enabled(self._contract_args(tp_size=1)))
+        self.assertTrue(is_true_on_policy_enabled(self._contract_args(tp_size=2)))
         self.assertFalse(
-            is_true_on_policy_enabled(SimpleNamespace(rl_on_policy_target=None, true_on_policy_contract=None, tp_size=1))
+            is_true_on_policy_enabled(
+                SimpleNamespace(
+                    rl_on_policy_target=None, true_on_policy_contract=None, tp_size=1
+                )
+            )
         )
 
     def test_is_tp_invariant_target_only_fsdp_tp(self):
-        self.assertTrue(
-            is_tp_invariant_target(self._contract_args(tp_size=2))
-        )
+        self.assertTrue(is_tp_invariant_target(self._contract_args(tp_size=2)))
+        self.assertFalse(is_tp_invariant_target(self._contract_args(tp_size=1)))
         self.assertFalse(
-            is_tp_invariant_target(self._contract_args(tp_size=1))
-        )
-        self.assertFalse(
-            is_tp_invariant_target(SimpleNamespace(rl_on_policy_target=None, true_on_policy_contract=None, tp_size=1))
+            is_tp_invariant_target(
+                SimpleNamespace(
+                    rl_on_policy_target=None, true_on_policy_contract=None, tp_size=1
+                )
+            )
         )
 
     def test_cuda_graph_patch_noop_when_disabled(self):
@@ -669,8 +671,8 @@ class TestOnPolicyHelpers(unittest.TestCase):
         self.assertTrue(hasattr(tp_invariant_ops, "matmul_tp_inv"))
 
     def test_legacy_on_policy_utils_import_matches_true_on_policy_namespace(self):
-        from sglang.srt.layers import on_policy_utils as legacy
         from sglang.srt import true_on_policy
+        from sglang.srt.layers import on_policy_utils as legacy
 
         self.assertIs(
             legacy.should_use_tp_invariant_row_linear,

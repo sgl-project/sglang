@@ -25,12 +25,12 @@ from sglang.srt.batch_invariant_ops import (
     rms_norm_batch_invariant,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.true_on_policy import (
     get_on_policy_rms_norm_kwargs,
     is_true_on_policy_enabled,
 )
-from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,

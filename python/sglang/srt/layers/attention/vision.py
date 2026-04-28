@@ -989,10 +989,7 @@ class VisionAttention(nn.Module):
         if x.dim() == 2:
             x = x.unsqueeze(0)
         assert x.dim() == 3, x.shape
-        if (
-            is_true_on_policy_enabled()
-            and position_embeddings is not None
-        ):
+        if is_true_on_policy_enabled() and position_embeddings is not None:
             assert isinstance(position_embeddings, tuple), (
                 "expected position_embeddings to be a tuple of two tensors,\n"
                 f"but got {type(position_embeddings)}, change if needed"
