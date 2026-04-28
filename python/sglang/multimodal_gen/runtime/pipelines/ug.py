@@ -17,6 +17,10 @@ from sglang.srt.ug.adapter import UGModelRunnerAdapter
 from sglang.srt.ug.bagel import create_bagel_ug_model_adapter
 from sglang.srt.ug.denoiser import SRTBackedUGDenoiserBridge, UGDenoiserBridge
 from sglang.srt.ug.runtime import FakeUGModelRunner, UGSessionRuntime
+from sglang.srt.ug.srt_executor import (
+    UGSRTRequestBoundaryExecutor,
+    UGSRTSchedulerExecutor,
+)
 
 
 class _UGRuntimeTreeCache:
@@ -27,31 +31,39 @@ class _UGRuntimeTreeCache:
         self.released_sessions.append(session_id)
 
 
-class _UGSRTRequestBoundaryExecutor:
-    def __init__(self) -> None:
-        self.events: list[tuple[str, str, int]] = []
-
-    def execute_ug_request(self, *, record, req, state) -> None:
-        del record
-        self.events.append((state.value, req.rid, len(req.origin_input_ids)))
-
-
-def _build_srt_owned_ug_runtime(model_runner=None) -> UGSessionRuntime:
+def _build_srt_owned_ug_runtime(
+    model_runner=None, *, scheduler=None
+) -> UGSessionRuntime:
+    srt_request_executor = (
+        UGSRTSchedulerExecutor(scheduler)
+        if scheduler is not None
+        else UGSRTRequestBoundaryExecutor()
+    )
+    session_controller = (
+        srt_request_executor.session_controller
+        if scheduler is not None
+        else SessionController(_UGRuntimeTreeCache())
+    )
     return UGSessionRuntime(
         model_runner=model_runner or FakeUGModelRunner(),
-        session_controller=SessionController(_UGRuntimeTreeCache()),
-        srt_request_executor=_UGSRTRequestBoundaryExecutor(),
+        session_controller=session_controller,
+        srt_request_executor=srt_request_executor,
     )
 
 
-def _load_ug_bridge(model_path: str) -> UGDenoiserBridge:
+def _load_ug_bridge(model_path: str, *, scheduler=None) -> UGDenoiserBridge:
     model_path_lower = model_path.lower()
     if "fake-ug" in model_path_lower:
-        return SRTBackedUGDenoiserBridge(_build_srt_owned_ug_runtime())
+        return SRTBackedUGDenoiserBridge(
+            _build_srt_owned_ug_runtime(scheduler=scheduler)
+        )
     if "bagel" in model_path_lower:
         adapter = create_bagel_ug_model_adapter(model_path)
         return SRTBackedUGDenoiserBridge(
-            _build_srt_owned_ug_runtime(UGModelRunnerAdapter(adapter))
+            _build_srt_owned_ug_runtime(
+                UGModelRunnerAdapter(adapter),
+                scheduler=scheduler,
+            )
         )
     raise ValueError(f"Unsupported UG model path: {model_path}")
 
@@ -67,7 +79,12 @@ class UGPipeline(ComposedPipelineBase):
     ) -> dict[str, Any]:
         if loaded_modules and "ug_bridge" in loaded_modules:
             return loaded_modules
-        return {"ug_bridge": _load_ug_bridge(self.model_path)}
+        return {
+            "ug_bridge": _load_ug_bridge(
+                self.model_path,
+                scheduler=getattr(server_args, "ug_srt_scheduler", None),
+            )
+        }
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         bridge = self.get_module("ug_bridge")

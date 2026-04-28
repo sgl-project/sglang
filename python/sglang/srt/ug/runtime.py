@@ -515,7 +515,8 @@ class UGSessionRuntime:
             record.srt_last_executed_request_id = request_id
             record.srt_last_executed_state = record.state.value
 
-        req.finished_reason = FINISH_LENGTH(0)
+        if getattr(self.srt_request_executor, "finish_request_after_execute", True):
+            req.finished_reason = FINISH_LENGTH(0)
         record.srt_request_count += 1
         record.srt_last_request_id = request_id
         record.srt_last_origin_input_len = len(req.origin_input_ids)

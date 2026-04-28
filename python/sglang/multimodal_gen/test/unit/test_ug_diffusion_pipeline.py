@@ -15,6 +15,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
     SyncExecutor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle
 from sglang.srt.ug.runtime import UGDecodeResult, UGLatentPrepareResult
 
@@ -108,6 +109,55 @@ class TestUGDiffusionPipeline(unittest.TestCase):
             bridge.runtime.session_controller.tree_cache.released_sessions,
             [session.session_id],
         )
+
+    def test_fake_pipeline_can_use_injected_srt_scheduler_executor(self):
+        server_args = _make_server_args()
+        scheduler = RecordingSRTScheduler()
+        server_args.ug_srt_scheduler = scheduler
+        with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
+            pipeline = UGPipeline(
+                "sglang-internal/fake-ug",
+                server_args,
+                executor=SyncExecutor(server_args),
+            )
+
+        result = pipeline.forward(
+            Req(
+                sampling_params=UGSamplingParams(
+                    prompt="scheduler executor",
+                    width=32,
+                    height=32,
+                    seed=123,
+                    num_inference_steps=2,
+                    suppress_logs=True,
+                )
+            ),
+            server_args,
+        )
+
+        bridge = pipeline.get_module("ug_bridge")
+        session = result.extra["ug_contexts"].full.session
+        self.assertIs(bridge.runtime.session_controller, scheduler.session_controller)
+        self.assertEqual(
+            [req.rid for req in scheduler.waiting_queue],
+            [f"{session.session_id}:u1", f"{session.session_id}:u2"],
+        )
+        self.assertEqual(
+            scheduler.finished_reason_at_enqueue,
+            [None, None],
+        )
+        self.assertTrue(all(req.finished() for req in scheduler.waiting_queue))
+        self.assertEqual(scheduler.init_req_max_new_tokens_calls, 2)
+        self.assertEqual(
+            bridge.runtime.srt_request_executor.events,
+            [
+                ("u_prefill", f"{session.session_id}:u1", 3),
+                ("append_image", f"{session.session_id}:u2", 5),
+            ],
+        )
+        counters = bridge.runtime.get_debug_counters(session)
+        self.assertEqual(counters["srt_executed_request_count"], 2)
+        self.assertEqual(counters["srt_last_executed_state"], "append_image")
 
     def test_runtime_guard_rejects_cfg_parallel(self):
         server_args = _make_server_args()
@@ -248,6 +298,31 @@ class RecordingUGBridge:
     def decode_next_segment(self, *, contexts):
         del contexts
         return UGDecodeResult(type="text", text="after_image")
+
+
+class FakeTreeCache:
+    def __init__(self):
+        self.released_sessions = []
+
+    def release_session(self, session_id):
+        self.released_sessions.append(session_id)
+
+
+class RecordingSRTScheduler:
+    def __init__(self):
+        self.session_controller = SessionController(FakeTreeCache())
+        self.waiting_queue = []
+        self.finished_reason_at_enqueue = []
+        self.init_req_max_new_tokens_calls = 0
+
+    def init_req_max_new_tokens(self, req):
+        self.init_req_max_new_tokens_calls += 1
+        req.ug_init_req_max_new_tokens_seen = True
+
+    def _add_request_to_queue(self, req):
+        self.finished_reason_at_enqueue.append(req.finished_reason)
+        self.waiting_queue.append(req)
+        req.check_finished(new_accepted_len=0)
 
 
 if __name__ == "__main__":

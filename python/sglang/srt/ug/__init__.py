@@ -33,6 +33,10 @@ from sglang.srt.ug.runtime import (
     UGVelocityRequest,
     UGVelocityResponse,
 )
+from sglang.srt.ug.srt_executor import (
+    UGSRTRequestBoundaryExecutor,
+    UGSRTSchedulerExecutor,
+)
 
 __all__ = [
     "FakeUGDenoiserBridge",
@@ -59,6 +63,8 @@ __all__ = [
     "UGSegmentState",
     "UGSessionHandle",
     "UGSessionRuntime",
+    "UGSRTRequestBoundaryExecutor",
+    "UGSRTSchedulerExecutor",
     "UGVelocityRequest",
     "UGVelocityResponse",
     "create_bagel_ug_model_adapter",
