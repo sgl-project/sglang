@@ -291,6 +291,16 @@ class ModelRunnerKVCacheMixin:
             page_size % 128 == 0
         ), "page_size must be multiple of 128 for compressed attention"
 
+        # Online c128 keeps a single in-progress (max, sum, kv) state per index
+        # and assumes a strict forward-only schedule. Speculative decode (MTP)
+        # would need rollback / replay of that state across draft and verify,
+        # which the online path doesn't support yet.
+        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            assert (
+                self.spec_algorithm.is_none()
+            ), "SGLANG_OPT_USE_ONLINE_COMPRESS does not support speculative decode (MTP) yet"
+            logger.info("DSv4 compressed attention: online c128 enabled (ring_size=1)")
+
         if not self.spec_algorithm.is_none() and self.is_draft_worker:
             config = getattr(self.server_args, "_draft_pool_config", None)
             assert (

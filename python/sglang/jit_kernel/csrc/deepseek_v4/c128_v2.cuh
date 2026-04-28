@@ -70,10 +70,16 @@ struct Compress128PrefillParams {
   /** \brief Shape: `[batch_size, ]`*/
   const int32_t* __restrict__ load_indices;
   /** \brief The following part is plan info. */
+
   const Plan128* __restrict__ compress_plan;
   const Plan128* __restrict__ write_plan;
+
   uint32_t num_compress;
   uint32_t num_write;
+
+  uint32_t num_q_tokens;
+  uint32_t batch_size;
+  uint32_t num_indices;
 };
 
 struct Compress128SharedBuffer {
@@ -307,7 +313,8 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
 
   const auto& [
     _kv_score_buffer, _kv_score_input, _kv_compressed_output, _score_bias, // kv score
-    indices, load_indices, compress_plan, write_plan, num_compress, num_write // prefill plan
+    indices, load_indices, compress_plan, write_plan, num_compress, num_write, // prefill plan
+    _num_q_tokens, _batch_size, _num_indices
   ] = params;
   const uint32_t warp_id = threadIdx.x / kWarpThreads;
   const uint32_t lane_id = threadIdx.x % kWarpThreads;
@@ -347,7 +354,13 @@ C128_KERNEL void flash_c128_prefill(const __grid_constant__ Compress128PrefillPa
   if (ragged_id == 0xFFFFFFFF) [[unlikely]]
     return;
 
+  if (ragged_id >= _num_q_tokens) [[unlikely]] return;
+  if (global_bid >= _batch_size) [[unlikely]] return;
+
   const int32_t index = indices_ptr[global_bid];
+
+  if (index < 0 || static_cast<uint32_t>(index) >= _num_indices) [[unlikely]] return;
+
   // kv score
   const auto kv_score_buffer = static_cast<InFloat*>(_kv_score_buffer);
   const auto kv_buf = kv_score_buffer + index * (kElementSize * 128) + split_offset;
@@ -447,10 +460,11 @@ struct FlashCompress128Kernel {
     auto N = SymbolicSize{"num_q_tokens"};
     auto X = SymbolicSize{"compress_tokens"};
     auto Y = SymbolicSize{"write_tokens"};
+    auto K = SymbolicSize{"num_indices"};
     auto device_ = SymbolicDevice{};
     device_.set_options<kDLCUDA>();
 
-    TensorMatcher({-1, 128, kHeadDim * 2})  // kv score
+    TensorMatcher({K, 128, kHeadDim * 2})  // kv score
         .with_dtype<InFloat>()
         .with_device(device_)
         .verify(kv_score_buffer);
@@ -491,6 +505,7 @@ struct FlashCompress128Kernel {
     const auto num_q_tokens = static_cast<uint32_t>(N.unwrap());
     const auto num_c = static_cast<uint32_t>(X.unwrap());
     const auto num_w = static_cast<uint32_t>(Y.unwrap());
+    const auto num_indices = static_cast<uint32_t>(K.unwrap());
     const auto params = Compress128PrefillParams{
         .kv_score_buffer = kv_score_buffer.data_ptr(),
         .kv_score_input = kv_score_input.data_ptr(),
@@ -502,6 +517,9 @@ struct FlashCompress128Kernel {
         .write_plan = static_cast<const Plan128*>(write_plan.data_ptr()),
         .num_compress = num_c,
         .num_write = num_w,
+        .num_q_tokens = num_q_tokens,
+        .batch_size = batch_size,
+        .num_indices = num_indices,
     };
     RuntimeCheck(num_q_tokens >= batch_size, "num_q_tokens must be >= batch_size");
     RuntimeCheck(num_q_tokens >= std::max(num_c, num_w), "invalid prefill plan");

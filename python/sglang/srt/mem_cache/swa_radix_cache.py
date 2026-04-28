@@ -514,7 +514,12 @@ class SWARadixCache(BasePrefixCache):
 
         # Remove req slot release the cache lock
         self.req_to_token_pool.free(req.req_pool_idx)
-        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+        self.dec_lock_ref(
+            req.last_node,
+            req.swa_uuid_for_lock,
+            skip_swa=req.swa_prefix_lock_released,
+        )
+        req.swa_prefix_lock_released = False
 
     def cache_unfinished_req(self, req: Req, chunked=False) -> None:
         """Cache request when it is unfinished."""
@@ -588,7 +593,12 @@ class SWARadixCache(BasePrefixCache):
 
         req.cache_protected_len = len(new_indices)
 
-        self.dec_lock_ref(req.last_node, req.swa_uuid_for_lock)
+        self.dec_lock_ref(
+            req.last_node,
+            req.swa_uuid_for_lock,
+            skip_swa=req.swa_prefix_lock_released,
+        )
+        req.swa_prefix_lock_released = False
         swa_uuid_for_lock = self.inc_lock_ref(new_last_node)
 
         # `req.prefix_indices` will be used in `PrefillAdder::add_chunked_req` later
@@ -636,12 +646,15 @@ class SWARadixCache(BasePrefixCache):
                 # 1. free node kv indices, evict full and swa tokens
                 self.token_to_kv_pool_allocator.free(x.value)
                 full_num_evicted += len(x.value)
-                swa_num_evicted += len(x.value)
+                # Tombstoned leaves had their SWA freed earlier in `dec_swa_lock_only`
+                if not x.swa_tombstone:
+                    swa_num_evicted += len(x.value)
 
                 # 2. get the next leaf, update the lru lists
                 x_next = self.full_lru_list.get_prev_leaf_no_lock(x)
                 self.full_lru_list.remove_node(x)
-                self.swa_lru_list.remove_node(x)
+                if not x.swa_tombstone:
+                    self.swa_lru_list.remove_node(x)
 
                 # 3. delete the leaf node
                 self._delete_leaf(x)
@@ -678,6 +691,18 @@ class SWARadixCache(BasePrefixCache):
 
                     # 3. tombstone the node
                     self._tombstone_internal_node(x)
+                elif x.full_lock_ref > 0:
+                    # Leaf still holds a full-side lock (can happen when the
+                    # SWA leaf-lock early-release optimization revived a
+                    # tombstoned leaf. Treat it like an internal tombstone.
+                    self.token_to_kv_pool_allocator.free_swa(x.value)
+                    swa_num_evicted += len(x.value)
+
+                    x_next = self.swa_lru_list.get_prev_no_lock(x)
+                    self.swa_lru_list.remove_node(x)
+
+                    self.swa_evictable_size_ -= len(x.value)
+                    x.swa_tombstone = True
                 else:
                     assert (
                         x.full_lock_ref == 0
@@ -746,17 +771,25 @@ class SWARadixCache(BasePrefixCache):
             node = node.parent
         return swa_uuid_for_lock
 
-    def dec_lock_ref(self, node: TreeNode, swa_uuid_for_lock: Optional[int] = None):
+    def dec_lock_ref(
+        self,
+        node: TreeNode,
+        swa_uuid_for_lock: Optional[int] = None,
+        skip_swa: bool = False,
+    ):
         """
         Decrement the lock reference count for the node.
         It unlocks the full_lock_ref for nodes between the [last node, root), exclusive.
         It unlocks the swa_lock_ref for nodes between the [last node, swa_uuid_for_lock], inclusive.
         If swa_uuid_for_lock is None, it unlocks to the root, exclusive.
+
+        If skip_swa is True, only the full_lock_ref is decremented; the SWA lock is
+        assumed to have been released already (e.g. via `dec_swa_lock_only`).
         """
         if self.disable:
             return
 
-        dec_lock_swa = True
+        dec_lock_swa = not skip_swa
         while node != self.root_node:
             assert (
                 node.full_lock_ref > 0
@@ -781,6 +814,61 @@ class SWARadixCache(BasePrefixCache):
                 if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
                     dec_lock_swa = False
 
+            node = node.parent
+
+    def dec_swa_lock_only(
+        self, node: TreeNode, swa_uuid_for_lock: Optional[int] = None
+    ):
+        """
+        Decrement only the swa_lock_ref (and swa_protected_size_) along the chain
+        [node, swa_uuid_for_lock], inclusive. The full_lock_ref is left untouched
+        so the caller's full-cache protection is preserved.
+
+        Used to early-release the SWA portion of a request's tree lock once the
+        request's decode position has advanced past the sliding window, so the
+        protected window can be reclaimed.
+
+        For internal nodes, the standard protected -> evictable transition is
+        applied (node stays in swa_lru_list and may be evicted by SWA LRU later).
+        For leaf nodes, since `swa_lru_list` cannot contain a leaf with
+        `full_lock_ref > 0` (SWA-eviction would also delete the still-referenced
+        leaf), we instead free the SWA pool slots immediately and mark the leaf
+        as `swa_tombstone=True`. The full kv stays alive until the full-side
+        lock drops; future prefix-matches stop before this tombstoned leaf.
+
+        Caller must ensure this is invoked at most once per (node, swa_uuid_for_lock)
+        pair (track via e.g. `Req.swa_prefix_lock_released`). When the request
+        finally releases its full lock via `dec_lock_ref`, pass `skip_swa=True`
+        to avoid touching SWA state again.
+        """
+        if self.disable:
+            return
+
+        while node != self.root_node:
+            assert (
+                not node.swa_tombstone
+            ), f"dec_swa_lock_only on swa_tombstone node, {node.id=}"
+            assert (
+                node.swa_lock_ref > 0
+            ), f"dec_swa_lock_only on node with {node.swa_lock_ref=}, {node.id=}"
+
+            if node.swa_lock_ref == 1:
+                self.swa_protected_size_ -= len(node.value)
+                if len(node.children) == 0:
+                    # Leaf: free SWA pool slots and tombstone, and remove from
+                    # swa_lru_list so SWA-eviction won't pick this tombstoned
+                    # leaf (which still holds full_lock_ref > 0). The full kv
+                    # stays alive until the request releases its full lock.
+                    self.token_to_kv_pool_allocator.free_swa(node.value)
+                    self.swa_lru_list.remove_node(node)
+                    node.swa_tombstone = True
+                else:
+                    # Internal: standard protected -> evictable.
+                    self.swa_evictable_size_ += len(node.value)
+            node.swa_lock_ref -= 1
+
+            if swa_uuid_for_lock and node.swa_uuid == swa_uuid_for_lock:
+                break
             node = node.parent
 
     def sanity_check(self):
@@ -1168,15 +1256,15 @@ class SWARadixCache(BasePrefixCache):
         return node, full_num_evicted
 
     def _delete_leaf(self, node: TreeNode) -> None:
-        assert (
-            not node.swa_tombstone
-        ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         key = self.get_child_key_fn(node.key)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
         self.full_evictable_size_ -= len(node.key)
-        self.swa_evictable_size_ -= len(node.key)
+        # Tombstoned leaves were never (re-)added to swa_lru_list and were
+        # already removed from swa_evictable_size_ when they were tombstoned.
+        if not node.swa_tombstone:
+            self.swa_evictable_size_ -= len(node.key)
 
     def _tombstone_internal_node(self, node: TreeNode) -> None:
         assert len(node.children) != 0, f"Cannot tombstone a leaf node, {node.id=}"

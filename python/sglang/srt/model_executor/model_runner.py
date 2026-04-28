@@ -580,17 +580,23 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if self.enable_hisparse:
                 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 
+                _hisparse_top_k = getattr(
+                    self.model_config.hf_text_config, "index_topk", 512
+                )
                 self.hisparse_coordinator = HiSparseCoordinator(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    top_k=512,
-                    device_buffer_size=1024,
+                    top_k=_hisparse_top_k,
+                    device_buffer_size=_hisparse_top_k * 2,
                     device=self.device,
                     tp_group=(
                         self.attention_tp_group.cpu_group
                         if self.server_args.enable_dp_attention
                         else self.tp_group.cpu_group
                     ),
+                )
+                self.hisparse_coordinator.set_decode_producer_stream(
+                    self.forward_stream
                 )
             self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:

@@ -43,3 +43,6 @@ RUN cd /tmp && rm -rf flash-mla && \
     pip install --no-build-isolation .
 # fast_hadamard_transform — sgl_kernel 0.3.21 lacks hadamard_transform on B300
 RUN pip install --no-build-isolation git+https://github.com/Dao-AILab/fast-hadamard-transform.git
+
+# Install mooncake
+RUN pip install mooncake-transfer-engine-cuda13

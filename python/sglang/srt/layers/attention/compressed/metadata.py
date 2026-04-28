@@ -212,7 +212,12 @@ class PagedCoreMetadata(CoreMetadata):
             raise ValueError(f"invalid {compress_ratio=}")
 
     def __post_init__(self):
-        assert self.c4_sparse_topk == 512
+        # c4_sparse_topk is set from model_config.index_topk per-model
+        # (small model: 512, large model: 1024).
+        assert self.c4_sparse_topk in (512, 1024), (
+            f"unexpected c4_sparse_topk={self.c4_sparse_topk}; "
+            "supported: 512 (small) or 1024 (large)"
+        )
         self.c4_sparse_topk_lengths = torch.clamp(
             self.c4_topk_lengths_clamp1, max=self.c4_sparse_topk
         )

@@ -4,7 +4,6 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
@@ -14,6 +13,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.utils.common import get_num_new_pages
 
 logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
@@ -365,12 +365,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
     ):
         assert self.page_size > 1
-        num_tokens = extend_num_tokens + len(seq_lens) * self.page_size
-        msg = f"[ALLOC-EXTEND-{get_tp_group().rank}] {num_tokens=}, {extend_num_tokens=}, {len(seq_lens)=}, {self.page_size=}"
-        msg += f", {self.full_attn_allocator.available_size()=}, {self.swa_attn_allocator.available_size()=}"
-        if num_tokens > self.full_attn_allocator.available_size():
+
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
+        )
+        if num_new_pages > self.full_attn_allocator.available_size() // self.page_size:
             return None
-        if num_tokens > self.swa_attn_allocator.available_size():
+        if num_new_pages > self.swa_attn_allocator.available_size() // self.page_size:
             return None
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)
