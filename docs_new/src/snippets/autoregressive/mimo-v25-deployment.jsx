@@ -15,7 +15,7 @@ export const MiMoV25Deployment = () => {
   //     GB300 → tp=4, dp=1, single-node, FP8
   //
   //   Optional toggles:
-  //     EAGLE MTP — Pro only. Adds --speculative-* flags + SGLANG_ENABLE_SPEC_V2=1.
+  //     EAGLE MTP — adds --speculative-* flags + SGLANG_ENABLE_SPEC_V2=1.
   //     DeepEP    — Hopper only (Blackwell uses flashinfer_trtllm). Adds
   //                 --moe-a2a-backend deepep + --moe-dense-tp-size 1
   //                 (and --ep on Pro) + SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256.
@@ -44,7 +44,7 @@ export const MiMoV25Deployment = () => {
       name: "eagleMtp",
       title: "EAGLE MTP",
       items: [
-        { id: "enabled",  label: "Enabled",  default: true,  subtitle: "Pro only" },
+        { id: "enabled",  label: "Enabled",  default: true,  subtitle: "EAGLE" },
         { id: "disabled", label: "Disabled", default: false },
       ],
     },
@@ -68,8 +68,8 @@ export const MiMoV25Deployment = () => {
       name: "deepep",
       title: "DeepEP",
       items: [
-        { id: "disabled", label: "Disabled", default: true,  subtitle: "default" },
         { id: "enabled",  label: "Enabled",  default: false, subtitle: "needs deep_ep" },
+        { id: "disabled", label: "Disabled", default: true,  subtitle: "default" },
       ],
     },
     reasoningParser: {
@@ -126,8 +126,6 @@ export const MiMoV25Deployment = () => {
     const blackwell = spec ? spec.blackwell : false;
     const c = {};
     if (!isPro) {
-      // V2.5 has no MTP module, so EAGLE MTP is genuinely unavailable.
-      c.eagleMtp = { force: "disabled", reason: "EAGLE MTP applies to V2.5-Pro only." };
       // V2.5 checkpoint is TP=4-interleaved; tp/dp must equal 4. With dp>1 we
       // must use DP-attention; with dp=1 it must be off (single attention group).
       if (spec && spec.dp > 1) {
@@ -209,9 +207,9 @@ export const MiMoV25Deployment = () => {
     const spec = HW_VARIANT_SPEC[specKey];
     const { slug, tp, multinode, nnodes, blackwell } = spec;
     const isPro = modelVariant === "pro";
-    // Toggles. EAGLE MTP / EP / DeepEP / DP-attn are gated by hardware + variant
+    // Toggles. EP / DeepEP / DP-attn are gated by hardware + variant
     // through computeConstraints; here we just read the (already-snapped) value.
-    const useMtp = isPro && eagleMtp === "enabled";
+    const useMtp = eagleMtp === "enabled";
     const useDeepep = !blackwell && deepep === "enabled";
     const useEp = isPro && !blackwell && expertParallelism === "enabled";
     const useDpAttn = dpAttention === "enabled";
@@ -278,7 +276,7 @@ export const MiMoV25Deployment = () => {
     }
 
     if (useMtp) {
-      flags.push("  --speculative-algo EAGLE");
+      flags.push("  --speculative-algorithm EAGLE");
       flags.push("  --speculative-num-steps 3");
       flags.push("  --speculative-eagle-topk 1");
       flags.push("  --speculative-num-draft-tokens 4");
