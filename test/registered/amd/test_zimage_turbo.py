@@ -148,3 +148,9 @@ class TestZImageTurboAMD(DiffusionServerBase):
             )
 
         _save_image_and_write_summary(case.id, prompt, content, clip_score)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

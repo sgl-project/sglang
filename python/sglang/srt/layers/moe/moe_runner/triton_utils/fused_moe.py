@@ -20,6 +20,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_xpu,
     use_intel_xpu_backend,
 )
@@ -27,7 +28,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
-    act_and_mul_triton,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
     support_tensor_descriptor,
@@ -44,10 +44,13 @@ _is_cpu = is_cpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_xpu = is_xpu()
 _use_sgl_xpu = use_intel_xpu_backend()
+_is_musa = is_musa()
 
 
 if _is_cuda:
-    from sgl_kernel import gelu_and_mul, moe_sum_reduce, silu_and_mul
+    from sgl_kernel import moe_sum_reduce
+
+    from sglang.jit_kernel.activation import gelu_and_mul, silu_and_mul
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
@@ -62,6 +65,10 @@ elif _is_hip:
     # because the code uses moe_sum_reduce_triton as fallback (line 619)
 elif _is_xpu:
     from sgl_kernel import moe_sum_reduce, silu_and_mul
+elif _is_musa:
+    from sgl_kernel import moe_sum_reduce
+
+    _silu_and_mul_musa = torch.nn.SwishGLU()
 
 # Try to import vllm_ops for non-CUDA/HIP/XPU platforms
 _has_vllm_ops = False
@@ -522,18 +529,19 @@ def _fused_moe_kernel_sequence(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
         elif _is_cuda or _is_hip or _is_xpu:
-            if not filter_expert:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                act_and_mul_triton(
+            if filter_expert and _is_cuda:
+                # HIP/XPU fall through to the unfiltered path: the down kernel
+                # zeros filtered rows without reading their input.
+                silu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
-                    config,
-                    topk_ids,
-                    expert_ids,
-                    down_moe_use_tma,
-                    activation,
+                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
+                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
+            else:
+                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+        elif _is_musa:
+            intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
         else:
             if _has_vllm_ops:
                 vllm_ops.silu_and_mul(
@@ -548,18 +556,15 @@ def _fused_moe_kernel_sequence(
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
         if _is_cuda or _is_hip:
-            if not filter_expert:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                act_and_mul_triton(
+            if filter_expert and _is_cuda:
+                gelu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
-                    config,
-                    topk_ids,
-                    expert_ids,
-                    down_moe_use_tma,
-                    activation,
+                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
+                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
+            else:
+                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         else:
             if _has_vllm_ops:
                 vllm_ops.gelu_and_mul(
@@ -618,7 +623,7 @@ def _fused_moe_kernel_sequence(
         sorted_token_ids,
         expert_ids,
         num_tokens_post_padded,
-        not apply_router_weight_on_input,
+        not apply_router_weight_on_input and not no_combine,
         1,
         down_config or config,
         compute_type=compute_type,
@@ -647,7 +652,7 @@ def _fused_moe_kernel_sequence(
 
     if no_combine:
         pass
-    elif _is_cuda:
+    elif _is_cuda or _is_musa:
         if use_fused_moe_sum_all_reduce:
             if routed_scaling_factor != 1.0:
                 assert out_slice is not None
