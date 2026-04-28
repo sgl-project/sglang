@@ -227,6 +227,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
                 else ActivationType.Gelu
             ),
             doweight_stage1=False,
-            expert_mask=layer.expert_mask_gpu,
+            expert_mask=layer.dispatcher.expert_mask_gpu,
         )
         return StandardCombineInput(hidden_states=output)
