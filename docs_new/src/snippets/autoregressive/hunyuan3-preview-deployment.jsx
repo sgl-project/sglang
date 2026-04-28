@@ -1,4 +1,5 @@
-export const Hunyuan3PreviewDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Hunyuan3PreviewDeployment = ({ urlStatePrefix = "hunyuan3-preview" }) => {
   // Hunyuan 3 Preview (~276B total / ~20B active MoE) — BF16 only.
   // ~552GB weights; 80GB-class GPUs (A100/H100) cannot fit single-node.
   //   H200 (141GB): tp=8
@@ -66,6 +67,8 @@ export const Hunyuan3PreviewDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

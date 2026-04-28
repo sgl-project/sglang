@@ -1,4 +1,5 @@
-export const KimiK2Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const KimiK2Deployment = ({ urlStatePrefix = "kimi-k2" }) => {
   const modelFamily = 'moonshotai';
 
   const options = {
@@ -131,6 +132,8 @@ export const KimiK2Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

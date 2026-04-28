@@ -5,6 +5,10 @@ metatags:
 tag: NEW
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.jsx';
+
 ## 1. Model Introduction
 
 **Available Models:**
@@ -26,9 +30,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, and capabilities. SGLang supports serving GLM-5.1 on NVIDIA H100, H200, B200, GB300, and AMD MI300X/MI325X/MI355X GPUs.
 
-import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.jsx'
-
-<GLM51Deployment />
+<GLM51Deployment urlStatePrefix="glm-51" />
 
 ### 3.2 Configuration Tips
 

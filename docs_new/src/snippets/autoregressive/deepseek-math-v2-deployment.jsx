@@ -1,4 +1,5 @@
-export const DeepSeekMathV2Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const DeepSeekMathV2Deployment = ({ urlStatePrefix = "deepseek-math-v2" }) => {
   const modelFamily = 'deepseek-ai';
 
   const options = {
@@ -117,6 +118,8 @@ export const DeepSeekMathV2Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

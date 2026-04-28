@@ -1,4 +1,5 @@
-export const LLaDA21Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const LLaDA21Deployment = ({ urlStatePrefix = "llada-21" }) => {
   const modelFamily = 'inclusionAI';
 
   const options = {
@@ -96,6 +97,8 @@ export const LLaDA21Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

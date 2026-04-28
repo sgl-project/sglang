@@ -4,6 +4,8 @@ metatags:
     description: "Deploy DeepSeek-OCR-2 with SGLang - high-accuracy text extraction from images and documents for OCR tasks."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { DeepSeekOCR2Deployment } from '/src/snippets/autoregressive/deepseek-ocr-v2-deployment.jsx';
 
 ## 1. Model Introduction
@@ -38,7 +40,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, and deployment strategy. SGLang supports serving DeepSeek-OCR-2 on NVIDIA H200 and B200, and AMD MI300X, MI355X, and MI325X GPUs.
 
-<DeepSeekOCR2Deployment />
+<DeepSeekOCR2Deployment urlStatePrefix="deepseek-ocr-v2" />
 
 **Note**: DeepSeek-OCR-2 has ~3.58B parameters and easily fits on a single modern GPU. For low-latency serving, no model parallelism is needed. For high-throughput requirements, consider using data parallelism with the SGLang Model Gateway — see [DP, DPA and SGLang DP Router](../../../docs/advanced_features/sgl_model_gateway) for more details.
 

@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Ernie4.5 with SGLang - community contribution guide for Baidu's Ernie 4.5 model deployment."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Ernie45Deployment } from '/src/snippets/autoregressive/ernie-45-deployment.jsx';
 
 ## 1. Model Introduction
@@ -31,7 +33,7 @@ This section provides a progressive guide from quick deployment to performance o
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities.
 
-<Ernie45Deployment />
+<Ernie45Deployment urlStatePrefix="ernie-45" />
 
 ## 4. API Usage
 For basic API usage and request examples, please refer to:

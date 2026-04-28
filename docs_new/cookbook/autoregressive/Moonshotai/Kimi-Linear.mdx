@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Kimi-Linear with SGLang - community contribution guide for Moonshot AI's Kimi-Linear model deployment."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { KimiLinearDeployment } from '/src/snippets/autoregressive/kimi-linear-deployment.jsx';
 
 ## AMD GPU Support
@@ -34,7 +36,7 @@ This section provides a progressive guide from quick deployment to performance o
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities.
 
-<KimiLinearDeployment />
+<KimiLinearDeployment urlStatePrefix="kimi-linear" />
 
 ## 4. Model Invocation
 

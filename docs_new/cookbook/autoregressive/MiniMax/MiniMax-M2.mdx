@@ -4,6 +4,8 @@ metatags:
     description: "Deploy MiniMax-M2 with SGLang - community contribution guide for MiniMax M2 model deployment."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { MiniMaxM2Deployment } from '/src/snippets/autoregressive/minimax-m2-deployment.jsx';
 
 ## 1. Model Introduction
@@ -67,7 +69,7 @@ This section provides a progressive guide from quick deployment to performance o
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities.
 
-<MiniMaxM2Deployment />
+<MiniMaxM2Deployment urlStatePrefix="minimax-m2" />
 
 ## 4. Model Invocation
 

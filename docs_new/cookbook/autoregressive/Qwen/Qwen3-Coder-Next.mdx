@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Qwen3-Coder-Next code-focused models with SGLang on AMD MI300X - available in 3B to 80B sizes with enhanced code understanding."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Qwen3CoderNextDeployment } from '/src/snippets/autoregressive/qwen3-coder-next-deployment.jsx';
 
 ## 1. Model Introduction
@@ -36,7 +38,7 @@ This section provides a progressive guide from quick deployment to performance o
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and deployment options.
 
-<Qwen3CoderNextDeployment />
+<Qwen3CoderNextDeployment urlStatePrefix="qwen3-coder-next" />
 
 ### 3.2 Configuration Tips
 

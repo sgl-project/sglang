@@ -1,4 +1,5 @@
-export const Qwen3CoderNextDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Qwen3CoderNextDeployment = ({ urlStatePrefix = "qwen3-coder-next" }) => {
   const options = {
     hardware: {
       name: 'hardware',
@@ -128,6 +129,8 @@ export const Qwen3CoderNextDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

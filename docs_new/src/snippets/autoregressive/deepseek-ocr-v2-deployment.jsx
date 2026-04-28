@@ -1,4 +1,5 @@
-export const DeepSeekOCR2Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const DeepSeekOCR2Deployment = ({ urlStatePrefix = "deepseek-ocr-v2" }) => {
   const options = {
     hardware: {
       name: 'hardware',
@@ -100,6 +101,8 @@ export const DeepSeekOCR2Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

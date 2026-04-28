@@ -1,3 +1,4 @@
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
 export const Ling26FlashDeployment = () => {
   // Config options
   const options = {
@@ -53,6 +54,8 @@ export const Ling26FlashDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+  
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   // Detect dark mode
   useEffect(() => {

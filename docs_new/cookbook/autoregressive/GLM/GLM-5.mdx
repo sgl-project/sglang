@@ -4,6 +4,10 @@ metatags:
     description: "Deploy GLM-5 with SGLang on NVIDIA H100/H200/B200 and AMD MI300X/MI325X/MI355X — state-of-the-art reasoning, enhanced coding, and robust tool calling capabilities."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { GLM5Deployment } from '/src/snippets/autoregressive/glm-5-deployment.jsx';
+
 ## 1. Model Introduction
 
 [GLM-5](https://huggingface.co/zai-org/GLM-5) is the most powerful language model in the GLM series developed by Zhipu AI, targeting complex systems engineering and long-horizon agentic tasks. Scaling from GLM-4.5's 355B parameters (32B active) to 744B parameters (40B active), GLM-5 integrates DeepSeek Sparse Attention (DSA) to largely reduce deployment cost while preserving long-context capacity.
@@ -37,9 +41,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, and capabilities. SGLang supports serving GLM-5 on NVIDIA H100, H200, B200, and AMD MI300X/MI325X/MI355X GPUs.
 
-import { GLM5Deployment } from '/src/snippets/autoregressive/glm-5-deployment.jsx'
-
-<GLM5Deployment />
+<GLM5Deployment urlStatePrefix="glm-5" />
 
 ### 3.2 Configuration Tips
 

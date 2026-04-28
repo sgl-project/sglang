@@ -1,4 +1,5 @@
-export const Ring251TDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Ring251TDeployment = ({ urlStatePrefix = "ring-25-1t" }) => {
   // Config mirrors sgl-cookbook src/components/autoregressive/Ring25ConfigGenerator/index.js.
   //
   // GPU requirements:
@@ -61,6 +62,8 @@ export const Ring251TDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

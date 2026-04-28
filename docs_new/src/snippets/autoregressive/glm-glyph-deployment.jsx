@@ -1,4 +1,5 @@
-export const GLMGlyphDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const GLMGlyphDeployment = ({ urlStatePrefix = "glm-glyph" }) => {
   const modelFamily = 'zai-org';
 
   const options = {
@@ -130,6 +131,8 @@ export const GLMGlyphDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

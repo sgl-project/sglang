@@ -1,4 +1,5 @@
-export const Qwen35Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Qwen35Deployment = ({ urlStatePrefix = "qwen35" }) => {
   // Qwen3.5 Configuration Generator
   //
   // MoE models (Gated Delta Networks + sparse MoE, hybrid architecture):
@@ -230,6 +231,8 @@ export const Qwen35Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

@@ -1,4 +1,5 @@
-export const DeepSeekV32Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const DeepSeekV32Deployment = ({ urlStatePrefix = "deepseek-v32" }) => {
   // Config mirrors sgl-cookbook src/components/autoregressive/DeepSeekConfigGenerator/index.js.
   //
   // Model variants:
@@ -86,6 +87,8 @@ export const DeepSeekV32Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

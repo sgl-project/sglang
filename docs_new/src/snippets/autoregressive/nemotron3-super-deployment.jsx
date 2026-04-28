@@ -1,4 +1,5 @@
-export const Nemotron3SuperDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Nemotron3SuperDeployment = ({ urlStatePrefix = "nemotron3-super" }) => {
   const MODEL_PATHS = {
     bf16: 'nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16',
     fp8: 'nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-FP8',
@@ -139,6 +140,8 @@ export const Nemotron3SuperDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

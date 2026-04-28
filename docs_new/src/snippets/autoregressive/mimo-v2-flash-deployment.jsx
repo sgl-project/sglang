@@ -1,4 +1,5 @@
-export const MiMoV2FlashDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const MiMoV2FlashDeployment = ({ urlStatePrefix = "mimo-v2-flash" }) => {
   // Config mirrors sgl-cookbook src/components/autoregressive/MiMoConfigGenerator/index.js.
   const options = {
     hardware: {
@@ -55,6 +56,8 @@ export const MiMoV2FlashDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   // Detect dark mode
   useEffect(() => {

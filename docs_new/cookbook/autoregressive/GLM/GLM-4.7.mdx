@@ -4,6 +4,10 @@ metatags:
     description: "Deploy GLM-4.7 with SGLang on AMD GPUs - state-of-the-art reasoning, enhanced coding, and robust tool calling capabilities."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { GLM47Deployment } from '/src/snippets/autoregressive/glm-47-deployment.jsx';
+
 ## 1. Model Introduction
 
 [GLM-4.7](https://huggingface.co/zai-org/GLM-4.7) is the latest and most powerful language model in the GLM series developed by Zhipu AI, featuring state-of-the-art capabilities in reasoning, function calling, and multi-modal understanding.
@@ -48,9 +52,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, deployment strategy, and thinking capabilities.
 
-import { GLM47Deployment } from "/src/snippets/autoregressive/glm-47-deployment.jsx";
-
-<GLM47Deployment />
+<GLM47Deployment urlStatePrefix="glm-47" />
 
 ### 3.2 Configuration Tips
 

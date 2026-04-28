@@ -1,4 +1,5 @@
-export const DeepSeekV3Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const DeepSeekV3Deployment = ({ urlStatePrefix = "deepseek-v3" }) => {
   // Config options
   const options = {
     hardware: {
@@ -66,6 +67,8 @@ export const DeepSeekV3Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   // Detect dark mode - prioritize page theme over system preference
   useEffect(() => {

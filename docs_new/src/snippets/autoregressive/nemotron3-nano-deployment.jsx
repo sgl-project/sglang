@@ -1,4 +1,5 @@
-export const Nemotron3NanoDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Nemotron3NanoDeployment = ({ urlStatePrefix = "nemotron3-nano" }) => {
   const modelFamily = 'nvidia';
 
   const options = {
@@ -129,6 +130,8 @@ export const Nemotron3NanoDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

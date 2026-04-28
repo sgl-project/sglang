@@ -1,4 +1,5 @@
-export const Step35Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Step35Deployment = ({ urlStatePrefix = "step-35" }) => {
   const options = {
     hardware: {
       name: 'hardware',
@@ -151,6 +152,8 @@ export const Step35Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

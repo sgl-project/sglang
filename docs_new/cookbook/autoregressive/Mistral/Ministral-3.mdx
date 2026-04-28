@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Mistral 3 with SGLang - deployment configurations and usage patterns for Mistral's latest model."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Ministral3Deployment } from '/src/snippets/autoregressive/ministral-3-deployment.jsx';
 
 ## 1. Model Introduction
@@ -33,7 +35,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities.
 
-<Ministral3Deployment />
+<Ministral3Deployment urlStatePrefix="ministral-3" />
 
 ### 3.2 Configuration Tips
 **Context length vs memory**: Ministral-3 advertises a long context window; if you are memory-constrained, start by lowering --context-length (for example 32768) and increase once things are stable.

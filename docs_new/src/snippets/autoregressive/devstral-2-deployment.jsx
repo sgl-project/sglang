@@ -1,4 +1,5 @@
-export const Devstral2Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Devstral2Deployment = ({ urlStatePrefix = "devstral-2" }) => {
   // Config options based on Devstral2ConfigGenerator
   const options = {
     hardware: {
@@ -68,6 +69,8 @@ export const Devstral2Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   // Detect dark mode
   useEffect(() => {

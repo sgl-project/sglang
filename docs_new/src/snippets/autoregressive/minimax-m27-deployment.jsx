@@ -1,4 +1,5 @@
-export const MiniMaxM27Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const MiniMaxM27Deployment = ({ urlStatePrefix = "minimax-m27" }) => {
   // Config options. `getDynamicItems(values)` is evaluated at render time so that
   // e.g. the 2-GPU option is only enabled on AMD or GB300 hardware.
   const options = {
@@ -70,6 +71,8 @@ export const MiniMaxM27Deployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

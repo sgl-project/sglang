@@ -1,4 +1,5 @@
-export const DeepSeekR1AdvancedDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const DeepSeekR1AdvancedDeployment = ({ urlStatePrefix = "deepseek-r1-advanced" }) => {
 const lookupData = {
   "model": "deepseek-r1",
   "version": "v0.5.6",
@@ -571,6 +572,8 @@ const resolveItems = (option, values) =>
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

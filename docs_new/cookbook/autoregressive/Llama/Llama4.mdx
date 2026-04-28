@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Llama 4 Scout and Maverick with SGLang - Meta's latest generation open-source LLMs with industry-leading performance."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Llama4ScoutDeployment } from '/src/snippets/autoregressive/llama4-scout-deployment.jsx';
 import { Llama4MaverickDeployment } from '/src/snippets/autoregressive/llama4-maverick-deployment.jsx';
 
@@ -37,9 +39,9 @@ This section provides a progressive guide from quick deployment to performance o
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities.
 
-<Llama4ScoutDeployment />
+<Llama4ScoutDeployment urlStatePrefix="llama4-scout" />
 
-<Llama4MaverickDeployment />
+<Llama4MaverickDeployment urlStatePrefix="llama4-maverick" />
 
 ## 4. Model Invocation
 

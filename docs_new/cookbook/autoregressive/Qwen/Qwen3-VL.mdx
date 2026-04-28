@@ -4,6 +4,10 @@ metatags:
     description: "Deploy Qwen3-VL vision-language models with SGLang - open model for text, 262K context, enhanced visual reasoning and agent capabilities."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+
+import { Qwen3VLDeployment } from '/src/snippets/autoregressive/qwen3-vl-deployment.jsx';
 
 ## 1. Model Introduction
 
@@ -36,9 +40,7 @@ The Qwen3-VL series offers models in various sizes and architectures, optimized 
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size, quantization method, and thinking capabilities.
 
-import { Qwen3VLDeployment } from "/src/snippets/autoregressive/qwen3-vl-deployment.jsx";
-
-<Qwen3VLDeployment />
+<Qwen3VLDeployment urlStatePrefix="qwen3-vl" />
 
 ### 3.2 Configuration Tips
 

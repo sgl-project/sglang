@@ -4,6 +4,10 @@ metatags:
     description: "Deploy GLM-4.6 with SGLang - 200K context window, superior coding, advanced reasoning, and enhanced agentic capabilities."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+import { GLM46Deployment } from '/src/snippets/autoregressive/glm-46-deployment.jsx';
+
 ## 1. Model Introduction
 
 [GLM-4.6](https://huggingface.co/zai-org/GLM-4.6) is a powerful language model developed by Zhipu AI, featuring advanced capabilities in reasoning, function calling, and multi-modal understanding.
@@ -32,9 +36,7 @@ This section provides deployment configurations optimized for different hardware
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, deployment strategy, and thinking capabilities.
 
-import { GLM46Deployment } from "/src/snippets/autoregressive/glm-46-deployment.jsx";
-
-<GLM46Deployment />
+<GLM46Deployment urlStatePrefix="glm-46" />
 
 ### 3.2 Configuration Tips
 

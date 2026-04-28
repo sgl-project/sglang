@@ -1,4 +1,5 @@
-export const Qwen25VLDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Qwen25VLDeployment = ({ urlStatePrefix = "qwen25-vl" }) => {
   const options = {
     hardware: {
       name: 'hardware',
@@ -122,6 +123,8 @@ export const Qwen25VLDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

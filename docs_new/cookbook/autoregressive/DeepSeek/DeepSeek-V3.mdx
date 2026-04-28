@@ -4,6 +4,10 @@ metatags:
     description: "Deploy DeepSeek-V3 MoE model with SGLang - efficient architecture with strong reasoning, coding, and tool-augmented capabilities."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
+
+import { DeepSeekV3Deployment } from '/src/snippets/autoregressive/deepseek-v3-deployment.jsx';
 
 ## 1. Model Introduction
 
@@ -30,9 +34,7 @@ This section provides a progressive guide from quick deployment to performance o
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities.
 
-import { DeepSeekV3Deployment } from "/src/snippets/autoregressive/deepseek-v3-deployment.jsx";
-
-<DeepSeekV3Deployment />
+<DeepSeekV3Deployment urlStatePrefix="deepseek-v3" />
 
 ### 3.2 Configuration Tips
 For more detailed configuration tips, please refer to [DeepSeek-V3 Usage](../../../docs/basic_usage/deepseek_v3).

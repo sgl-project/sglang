@@ -3,6 +3,10 @@ title: Llama-3.3-70B
 metatags:
     description: "Deploy Llama-3.3-70B-Instruct with SGLang on AMD GPUs - 128K context, enhanced reasoning, tool calling, and multilingual support."
 ---
+
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+import { Llama33Deployment } from '/src/snippets/autoregressive/llama33-70b-deployment.jsx';
+
 ## 1. Model Introduction
 
 [Llama-3.3-70B-Instruct](https://huggingface.co/meta-llama/Llama-3.3-70B-Instruct) is Meta's latest 70 billion parameter instruction-tuned language model, featuring improved performance and efficiency over Llama 3.1. With a 128K token context window and enhanced capabilities across reasoning, coding, and multilingual tasks, Llama 3.3 delivers state-of-the-art results while maintaining accessibility for production deployment.
@@ -32,9 +36,7 @@ This section provides deployment configurations optimized for AMD GPUs (MI300X, 
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your AMD GPU setup.
 
-import { Llama33Deployment } from "/src/snippets/autoregressive/llama33-70b-deployment.jsx";
-
-<Llama33Deployment />
+<Llama33Deployment urlStatePrefix="llama33-70b" />
 
 ### 3.2 Configuration Tips
 
