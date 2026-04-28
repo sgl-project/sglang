@@ -431,7 +431,7 @@ def fused_topk_cpu(
         renormalize=renormalize,
     )
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    topk_ids = _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
 
@@ -486,7 +486,7 @@ def fused_topk(
         raise ValueError(f"Invalid scoring function: {scoring_func}")
 
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    topk_ids = _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
 
@@ -555,7 +555,7 @@ def grouped_topk_gpu(
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    topk_ids = _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
 
@@ -625,7 +625,7 @@ def kimi_k2_biased_topk_impl(
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    topk_ids = _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
 
@@ -701,7 +701,7 @@ def biased_grouped_topk_impl(
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    topk_ids = _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
 
@@ -712,14 +712,16 @@ def is_power_of_two(n):
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
-) -> None:
+) -> torch.Tensor:
     if num_token_non_padded is None:
-        return
+        return topk_ids
     if envs.SGLANG_OPT_USE_FAST_MASK_EP.get():
+        topk_ids = topk_ids.to(torch.int32)
         mask_topk_ids(topk_ids, num_token_non_padded)
     else:
         indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
         topk_ids[indices >= num_token_non_padded, :] = -1
+    return topk_ids
 
 
 def _maybe_override_topk_ids_random(
@@ -737,7 +739,7 @@ def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    topk_ids = _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_ids
 
 

@@ -80,9 +80,9 @@ def topk_ids_logical_to_physical(
         return topk_ids
 
     if info.ep_dispatch_algorithm == "static":
-        return _topk_ids_logical_to_physical_static(topk_ids, info).to(torch.int32)
+        return _topk_ids_logical_to_physical_static(topk_ids, info)
     if info.ep_dispatch_algorithm in ["dynamic", "fake"]:
-        return _topk_ids_logical_to_physical_dynamic(topk_ids, info).to(torch.int32)
+        return _topk_ids_logical_to_physical_dynamic(topk_ids, info)
     raise NotImplementedError(f"Unknown algorithm {info.ep_dispatch_algorithm}")
 
 

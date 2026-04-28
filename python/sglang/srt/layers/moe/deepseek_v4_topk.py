@@ -148,7 +148,7 @@ class HashTopK(nn.Module):
 
         topk_ids = _maybe_override_topk_ids_random(topk_ids, self.num_experts)
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-        _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+        topk_ids = _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
         topk_output = StandardTopKOutput(
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
@@ -213,7 +213,7 @@ def biased_topk_impl(
 
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    topk_ids = _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
 
 
@@ -246,5 +246,5 @@ def biased_topk_jit_kernel_impl(
     )
     topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
     topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
-    _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
+    topk_ids = _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
     return topk_weights, topk_ids
