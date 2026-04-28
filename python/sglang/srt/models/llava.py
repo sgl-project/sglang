@@ -495,6 +495,9 @@ class LlavaBaseForCausalLM(nn.Module):
             "model.mm_projector.0": "multi_modal_projector.linear_1",
             "model.mm_projector.2": "multi_modal_projector.linear_2",
             "model.vision_tower.vision_tower": "vision_tower",
+            # transformers 5.6.0 flattened CLIPVisionModel/SiglipVisionModel,
+            # dropping the `vision_model` intermediate wrapper.
+            "vision_tower.vision_model.": "vision_tower.",
             # Update the vision tower weights if we find them in the checkpoint (it may be finetuned).
             "model.image_newline": "language_model.model.image_newline",
         }

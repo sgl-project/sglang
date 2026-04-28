@@ -475,6 +475,7 @@ class TpModelWorker(BaseTpWorker):
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                routed_experts_output=out.routed_experts_output,
             )
 
             if is_verify:
