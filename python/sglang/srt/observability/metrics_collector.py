@@ -101,6 +101,13 @@ class SchedulerStats:
     # Speculative decoding
     spec_accept_length: float = 0.0
     spec_accept_rate: float = 0.0
+    adaptive_spec_enabled: int = 0
+    adaptive_spec_current_steps: int = 0
+    adaptive_spec_previous_steps: int = 0
+    adaptive_spec_num_tier_switches: int = 0
+    adaptive_spec_ema_accept_length: float = 0.0
+    adaptive_spec_last_batch_accept_length: float = 0.0
+    adaptive_spec_wasted_draft_ratio: float = 0.0
 
     # Retract
     num_retracted_reqs: int = 0
@@ -177,7 +184,6 @@ class DPCooperationInfo:
 
 
 class SchedulerMetricsCollector:
-
     def __init__(
         self,
         labels: Dict[str, str],
@@ -311,6 +317,48 @@ class SchedulerMetricsCollector:
         self.spec_accept_rate = Gauge(
             name="sglang:spec_accept_rate",
             documentation="Speculative acceptance rate (`accepted drafts / proposed drafts` in batch).",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.adaptive_spec_enabled = Gauge(
+            name="sglang:adaptive_spec_enabled",
+            documentation="Whether adaptive speculative decoding is active for this scheduler.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.adaptive_spec_current_steps = Gauge(
+            name="sglang:adaptive_spec_current_steps",
+            documentation="The active speculative_num_steps tier selected by adaptive speculative decoding.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.adaptive_spec_previous_steps = Gauge(
+            name="sglang:adaptive_spec_previous_steps",
+            documentation="The previous speculative_num_steps tier before the last adaptive switch.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.adaptive_spec_num_tier_switches = Gauge(
+            name="sglang:adaptive_spec_num_tier_switches",
+            documentation="The number of adaptive speculative decoding tier switches since startup.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.adaptive_spec_ema_accept_length = Gauge(
+            name="sglang:adaptive_spec_ema_accept_length",
+            documentation="The EMA accept length used by the adaptive speculative decoding policy.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.adaptive_spec_last_batch_accept_length = Gauge(
+            name="sglang:adaptive_spec_last_batch_accept_length",
+            documentation="The last observed batch average accept length for adaptive speculative decoding.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.adaptive_spec_wasted_draft_ratio = Gauge(
+            name="sglang:adaptive_spec_wasted_draft_ratio",
+            documentation="The last observed ratio of proposed draft tokens not accepted by adaptive speculative decoding.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -1043,6 +1091,29 @@ class SchedulerMetricsCollector:
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
         self._log_gauge(self.spec_accept_rate, stats.spec_accept_rate)
+        self._log_gauge(self.adaptive_spec_enabled, stats.adaptive_spec_enabled)
+        self._log_gauge(
+            self.adaptive_spec_current_steps, stats.adaptive_spec_current_steps
+        )
+        self._log_gauge(
+            self.adaptive_spec_previous_steps, stats.adaptive_spec_previous_steps
+        )
+        self._log_gauge(
+            self.adaptive_spec_num_tier_switches,
+            stats.adaptive_spec_num_tier_switches,
+        )
+        self._log_gauge(
+            self.adaptive_spec_ema_accept_length,
+            stats.adaptive_spec_ema_accept_length,
+        )
+        self._log_gauge(
+            self.adaptive_spec_last_batch_accept_length,
+            stats.adaptive_spec_last_batch_accept_length,
+        )
+        self._log_gauge(
+            self.adaptive_spec_wasted_draft_ratio,
+            stats.adaptive_spec_wasted_draft_ratio,
+        )
 
         # PD disaggregation
         self._log_gauge_queue_count(

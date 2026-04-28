@@ -1926,6 +1926,45 @@ class SpeculativeMetrics:
     accept_rate: float = field(
         metadata={"metric": ("gauge", "Speculative acceptance rate")}
     )
+    adaptive_enabled: int = field(
+        default=0,
+        metadata={
+            "metric": ("gauge", "Whether adaptive speculative decoding is active")
+        },
+    )
+    adaptive_current_steps: int = field(
+        default=0,
+        metadata={"metric": ("gauge", "Current adaptive speculative decoding tier")},
+    )
+    adaptive_previous_steps: int = field(
+        default=0,
+        metadata={"metric": ("gauge", "Previous adaptive speculative decoding tier")},
+    )
+    adaptive_num_tier_switches: int = field(
+        default=0,
+        metadata={"metric": ("gauge", "Adaptive speculative decoding tier switches")},
+    )
+    adaptive_ema_accept_length: float = field(
+        default=0.0,
+        metadata={
+            "metric": ("gauge", "Adaptive speculative decoding EMA accept length")
+        },
+    )
+    adaptive_last_batch_accept_length: float = field(
+        default=0.0,
+        metadata={
+            "metric": (
+                "gauge",
+                "Adaptive speculative decoding last batch accept length",
+            )
+        },
+    )
+    adaptive_wasted_draft_ratio: float = field(
+        default=0.0,
+        metadata={
+            "metric": ("gauge", "Adaptive speculative decoding wasted draft ratio")
+        },
+    )
 
 
 @dataclass
