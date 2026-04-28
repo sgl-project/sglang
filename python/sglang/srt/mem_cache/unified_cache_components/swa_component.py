@@ -58,6 +58,15 @@ class SWAComponent(TreeComponent):
             full_indices
         )
 
+    def _restore_device_value(self, node: UnifiedTreeNode, value: torch.Tensor) -> None:
+        ct = self.component_type
+        node.component_data[ct].value = value
+        host_lru = self.cache.host_lru_lists[ct]
+        if host_lru.in_list(node):
+            host_lru.remove_node(node)
+        self.cache.lru_lists[ct].insert_mru(node)
+        self.cache.component_evictable_size_[ct] += len(value)
+
     def create_match_validator(self) -> Callable[[UnifiedTreeNode], bool]:
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
@@ -107,9 +116,7 @@ class SWAComponent(TreeComponent):
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
-            node.component_data[self.component_type].value = swa_value
-            self.cache.lru_lists[self.component_type].insert_mru(node)
-            self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+            self._restore_device_value(node, swa_value)
             return 0
         elif swa_evicted_seqlen < total_prefix_len + prefix_len:
             # Branch 2: value_slice[start_idx:] is within SWA window — partial recover
@@ -124,9 +131,7 @@ class SWAComponent(TreeComponent):
             swa_value = self._translate_full_to_swa(
                 node.component_data[BASE_COMPONENT_TYPE].value
             )
-            node.component_data[self.component_type].value = swa_value
-            self.cache.lru_lists[self.component_type].insert_mru(node)
-            self.cache.component_evictable_size_[self.component_type] += len(swa_value)
+            self._restore_device_value(node, swa_value)
             return start_idx
         else:
             # Branch 3: entire value_slice is outside SWA window — not consumed
@@ -168,12 +173,7 @@ class SWAComponent(TreeComponent):
             swa_value = self._translate_full_to_swa(full_value)
         else:
             return
-        node.component_data[ct].value = swa_value
-        host_lru = self.cache.host_lru_lists[ct]
-        if host_lru.in_list(node):
-            host_lru.remove_node(node)
-        self.cache.lru_lists[ct].insert_mru(node)
-        self.cache.component_evictable_size_[ct] += len(swa_value)
+        self._restore_device_value(node, swa_value)
 
     def commit_insert_component_data(
         self,
@@ -465,17 +465,14 @@ class SWAComponent(TreeComponent):
                 return
             xfer = transfers[0]
             device_indices = xfer.device_indices
-            host_lru = self.cache.host_lru_lists[ct]
             offset = 0
             for n in xfer.nodes_to_load or []:
                 cd_n = n.component_data[ct]
                 n_tokens = len(cd_n.host_value)
-                cd_n.value = device_indices[offset : offset + n_tokens].clone()
+                self._restore_device_value(
+                    n, device_indices[offset : offset + n_tokens].clone()
+                )
                 offset += n_tokens
-                if host_lru.in_list(n):
-                    host_lru.remove_node(n)
-                self.cache.lru_lists[ct].insert_mru(n)
-                self.cache.component_evictable_size_[ct] += n_tokens
             assert offset == xfer.swa_suffix_tokens
             return
 
