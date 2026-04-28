@@ -108,6 +108,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                tokenizer_backend=server_args.tokenizer_backend,
             )
 
     def init_running_status(self, server_args: ServerArgs):

@@ -1,0 +1,542 @@
+---
+title: Nemotron 3 Nano Omni
+metatags:
+    description: "Deploy NVIDIA Nemotron 3 Nano Omni multimodal MoE model with SGLang - text, image, video, and audio inputs with reasoning and tool calling."
+tag:
+    NEW
+---
+
+import { Nemotron3NanoOmniDeployment } from '/src/snippets/autoregressive/nemotron3-nano-omni-deployment.jsx';
+
+## 1. Model Introduction
+
+`NVIDIA Nemotron 3 Nano Omni` is a 30B-parameter hybrid MoE multimodal model that activates only 3B parameters per forward pass, combining vision and audio encoders into a unified architecture. Part of the Nemotron 3 family, it is designed to power multimodal sub-agents that perceive and reason across vision, audio, and language in a single inference loop — eliminating the fragmented stacks of separate models for each modality.
+
+Architecture and key features:
+
+- **Hybrid Transformer-Mamba Architecture (MoE):** Combines Mixture of Experts with a hybrid Transformer-Mamba architecture for efficient routing and sequence modeling.
+- **30B total / 3B active parameters:** Delivers strong multimodal accuracy at a fraction of the cost of dense models.
+- **1M token context window:** Sustains coherent agent state across extended multimodal workflows — screen history, document content, and audio context remain in view without re-ingestion.
+- **Unified vision and audio encoders:** One model replaces fragmented multimodal stacks; vision and audio perception happen in the same forward pass.
+- **3D Convolution (Conv3D):** Efficient temporal-spatial processing for video inputs.
+- **Efficient Video Sampling (EVS):** Enables longer video processing at the same compute budget via temporal-aware perception and adaptive frame sampling.
+- **FP8 and NVFP4 quantization:** FP8 supports deployment from workstation (RTX 6000, DGX Spark) to cloud (H100, H200, B200, A100, L40S); NVFP4 requires Blackwell hardware.
+- **9x higher throughput** than other open omni models at the same interactivity level.
+- **~20% higher multimodal intelligence** compared to the best open alternative.
+- **Post-trained with multi-environment reinforcement learning** via NVIDIA NeMo RL and NeMo Gym across text, image, audio, and video environments, improving instruction following and convergence to correct multimodal answers.
+
+**Modalities:** Input: text, image, video, audio — Output: text
+
+**Supported GPUs:** NVIDIA B200, H100, H200, A100, L40S, DGX Spark, RTX 6000
+
+Available model variants on HuggingFace:
+- [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning)
+- [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-BF16`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-BF16)
+- [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-FP8`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-FP8)
+- [`nvidia/Nemotron-3-Nano-Omni-30B-A3B-NVFP4`](https://huggingface.co/nvidia/Nemotron-3-Nano-Omni-30B-A3B-NVFP4)
+
+**Agentic workloads this model enables:**
+- **Computer Use Agent:** Perception loop for agents navigating GUIs — reads screens, understands UI state over time, validates outcomes. Collapses vision and reasoning into a single loop.
+- **Document Intelligence:** Interprets documents, charts, tables, screenshots, and mixed media inputs for enterprise analysis and compliance workflows.
+- **Audio & Video Understanding Agents:** Maintains continuous audio-video context for customer service, research, and monitoring workflows, tying what was said, shown, and documented into a single reasoning stream.
+
+## 2. SGLang Installation
+
+Install SGLang via pip or from source:
+
+```shell Command
+# Install via pip
+pip install sglang
+
+# Or install from source
+uv pip install 'git+https://github.com/sgl-project/sglang.git#subdirectory=python'
+
+# Or use Docker
+docker pull lmsysorg/sglang:nightly
+```
+
+For the full Docker setup and other installation methods, refer to the [official SGLang installation guide](../../../docs/get-started/installation).
+
+## 3. Model Deployment
+
+This section provides a progressive guide from quick deployment to performance tuning.
+
+### 3.1 Basic Configuration
+
+**Interactive Command Generator**: select hardware, model variant, and common knobs to generate a launch command.
+
+<Nemotron3NanoOmniDeployment />
+
+### 3.2 Configuration Tips
+
+- **Attention backend:**
+
+    **H100/H200:** Use flash attention 3 backend by default.
+    **B200:** Use flashinfer backend by default.
+
+- **TP support:**
+
+    To set tensor parallelism, use `--tp <1|2|4|8>`. A 4×H100 setup is recommended for the BF16/Reasoning variant.
+
+- **FP8 KV cache:**
+
+    To enable FP8 KV cache, append `--kv-cache-dtype fp8_e4m3`. FP8 KV cache trades a small amount of accuracy for memory; omit the flag if you observe accuracy regressions on your workload.
+
+- **Reasoning parser:**
+
+    Append `--reasoning-parser deepseek-r1` to enable structured reasoning traces (`reasoning_content` field in the response).
+
+- **Tool calling:**
+
+    Append `--tool-call-parser qwen3_coder` to enable tool calling support.
+
+## 4. Model Invocation
+
+The command below launches the server for a 4×H100 setup with reasoning and tool calling enabled. See [Section 4.8](#48-fp8-and-nvfp4-deployment) for FP8 and NVFP4 variants.
+
+```shell Command
+sglang serve \
+  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --tp 4 \
+  --trust-remote-code \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser deepseek-r1
+```
+
+### 4.1 Basic Usage (Text)
+
+SGLang provides an OpenAI-compatible endpoint. Example with the OpenAI Python client:
+
+```python Example
+from openai import OpenAI
+
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+resp = client.chat.completions.create(
+    model=SERVED_MODEL_NAME,
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant."},
+        {"role": "user", "content": "Give me 3 bullet points about SGLang."},
+    ],
+    temperature=0.6,
+    max_tokens=512,
+)
+print(resp.choices[0].message.reasoning_content, resp.choices[0].message.content)
+```
+
+Output:
+```text Output
+Reasoning: SGLang is a serving framework I know from my training data. Let me recall the key features...
+
+Content:
+- **Radix Attention** — SGLang reuses KV cache across requests sharing a common prefix, dramatically reducing memory and compute for multi-turn and few-shot workloads.
+- **OpenAI-compatible API** — Drop-in replacement for the OpenAI Python client; no application code changes required to serve a locally-hosted model.
+- **High-throughput serving** — Continuous batching, chunked prefill, and optimized CUDA kernels deliver state-of-the-art throughput on NVIDIA GPUs across A100, H100, and B200.
+```
+
+Streaming chat completion:
+
+```python Example
+from openai import OpenAI
+
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+stream = client.chat.completions.create(
+    model=SERVED_MODEL_NAME,
+    messages=[
+        {"role": "system", "content": "You are a helpful AI assistant."},
+        {"role": "user", "content": "What are the first 5 prime numbers?"},
+    ],
+    temperature=0.6,
+    max_tokens=512,
+    stream=True,
+)
+for chunk in stream:
+    delta = chunk.choices[0].delta
+    if delta and delta.content:
+        print(delta.content, end="", flush=True)
+```
+
+### 4.2 Image Understanding
+
+Pass image inputs using the OpenAI vision format. Supports both URLs and base64-encoded images:
+
+```python Example
+from openai import OpenAI
+
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+# From URL
+resp = client.chat.completions.create(
+    model=SERVED_MODEL_NAME,
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://upload.wikimedia.org/wikipedia/commons/thumb/3/3a/Cat03.jpg/1200px-Cat03.jpg"},
+                },
+                {"type": "text", "text": "Describe this image in detail."},
+            ],
+        }
+    ],
+    temperature=0.6,
+    max_tokens=512,
+)
+print(resp.choices[0].message.reasoning_content)
+print(resp.choices[0].message.content)
+```
+
+For local images, encode as base64:
+
+```python Example
+import base64
+from openai import OpenAI
+
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+with open("screenshot.png", "rb") as f:
+    image_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+resp = client.chat.completions.create(
+    model=SERVED_MODEL_NAME,
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                },
+                {"type": "text", "text": "What UI elements are visible on this screen? What action would you take next?"},
+            ],
+        }
+    ],
+    temperature=0.6,
+    max_tokens=512,
+)
+print(resp.choices[0].message.content)
+```
+
+### 4.3 Video Understanding
+
+Nemotron 3 Nano Omni uses Conv3D layers and Efficient Video Sampling (EVS) for temporal-spatial video reasoning, processing longer videos at the same compute budget:
+
+```python Example
+import base64
+from openai import OpenAI
+
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+with open("video.mp4", "rb") as f:
+    video_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+resp = client.chat.completions.create(
+    model=SERVED_MODEL_NAME,
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": {"url": f"data:video/mp4;base64,{video_b64}"},
+                },
+                {"type": "text", "text": "Summarize what happens in this video step by step."},
+            ],
+        }
+    ],
+    temperature=0.6,
+    max_tokens=1024,
+)
+print(resp.choices[0].message.reasoning_content)
+print(resp.choices[0].message.content)
+```
+
+### 4.4 Audio Understanding
+
+Pass audio inputs as base64-encoded WAV or MP3 data:
+
+```python Example
+import base64
+from openai import OpenAI
+
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+with open("audio.wav", "rb") as f:
+    audio_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+resp = client.chat.completions.create(
+    model=SERVED_MODEL_NAME,
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_audio",
+                    "input_audio": {"data": audio_b64, "format": "wav"},
+                },
+                {"type": "text", "text": "Transcribe and summarize what was said in this audio."},
+            ],
+        }
+    ],
+    temperature=0.6,
+    max_tokens=512,
+)
+print(resp.choices[0].message.content)
+```
+
+### 4.5 Mixed Multimodal Input
+
+Combine modalities in a single request. For example, an image alongside an audio question about it:
+
+```python Example
+import base64
+from openai import OpenAI
+
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+with open("chart.png", "rb") as f:
+    image_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+resp = client.chat.completions.create(
+    model=SERVED_MODEL_NAME,
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                },
+                {"type": "text", "text": "Analyze this chart. What are the key trends and what conclusion does the data support?"},
+            ],
+        }
+    ],
+    temperature=0.6,
+    max_tokens=1024,
+)
+print(resp.choices[0].message.reasoning_content)
+print(resp.choices[0].message.content)
+```
+
+### 4.6 Reasoning
+
+The model supports two modes — Reasoning ON (default) vs OFF. Toggle per-request by setting `enable_thinking` to `False`:
+
+```python Example
+from openai import OpenAI
+
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+# Reasoning ON (default)
+print("Reasoning on")
+resp = client.chat.completions.create(
+    model=SERVED_MODEL_NAME,
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is the derivative of x^3 sin(x)?"},
+    ],
+    temperature=0.6,
+    max_tokens=1024,
+)
+print(f"Reasoning:\n{resp.choices[0].message.reasoning_content[:300]}...\nContent:\n{resp.choices[0].message.content}")
+print("\n")
+
+# Reasoning OFF
+print("Reasoning off")
+resp = client.chat.completions.create(
+    model=SERVED_MODEL_NAME,
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is 15% of 200?"},
+    ],
+    temperature=0.6,
+    max_tokens=256,
+    extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+)
+print(f"Content:\n{resp.choices[0].message.content}")
+```
+
+Output:
+```text Output
+Reasoning on
+Reasoning:
+The user wants the derivative of x^3 sin(x). I'll apply the product rule: d/dx[u·v] = u'v + uv'. Here u = x^3, v = sin(x). So u' = 3x^2, v' = cos(x). The result is 3x^2·sin(x) + x^3·cos(x)...
+Content:
+Using the product rule: d/dx[x³ sin(x)] = 3x² sin(x) + x³ cos(x)
+
+
+Reasoning off
+Content:
+15% of 200 is **30**.
+```
+
+### 4.7 Tool Calling
+
+Call functions using the OpenAI Tools schema. The server must be launched with `--tool-call-parser qwen3_coder`:
+
+```python Example
+from openai import OpenAI
+
+SERVED_MODEL_NAME = "nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning"
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the current weather for a location",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {
+                        "type": "string",
+                        "description": "City and state, e.g. San Francisco, CA",
+                    },
+                    "unit": {
+                        "type": "string",
+                        "enum": ["celsius", "fahrenheit"],
+                    },
+                },
+                "required": ["location"],
+            },
+        },
+    }
+]
+
+completion = client.chat.completions.create(
+    model=SERVED_MODEL_NAME,
+    messages=[
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": "What is the weather like in Santa Clara, CA?"},
+    ],
+    tools=TOOLS,
+    temperature=0.6,
+    top_p=0.95,
+    max_tokens=512,
+    stream=False,
+)
+print(completion.choices[0].message.reasoning_content)
+print(completion.choices[0].message.tool_calls)
+```
+
+Output:
+```text Output
+The user is asking about weather in Santa Clara, CA. I have a get_weather function that takes a location and optional unit. I should call it with location="Santa Clara, CA".
+
+[ChatCompletionMessageFunctionToolCall(id='call_abc123', function=Function(arguments='{"location": "Santa Clara, CA", "unit": "fahrenheit"}', name='get_weather'), type='function', index=0)]
+```
+
+### 4.8 FP8 and NVFP4 Deployment
+
+**FP8 variant** (recommended for throughput-critical serving on H100/H200/B200):
+
+```shell Command
+sglang serve \
+  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-FP8 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --tp 4 \
+  --trust-remote-code \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser deepseek-r1
+```
+
+**NVFP4 variant** (maximum efficiency on Blackwell B200):
+
+```shell Command
+sglang serve \
+  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-NVFP4 \
+  --host 0.0.0.0 \
+  --port 30000 \
+  --tp 2 \
+  --trust-remote-code \
+  --tool-call-parser qwen3_coder \
+  --reasoning-parser deepseek-r1
+```
+
+---
+
+## 5. Benchmark
+
+### 5.1 Efficiency Benchmark
+
+Nemotron 3 Nano Omni achieves **9x higher throughput** than other open omni models at the same interactivity level, delivering lower cost and better scalability without sacrificing responsiveness. It also achieves **~20% higher multimodal intelligence** compared to the best open alternative across image, video, and audio reasoning tasks.
+
+### 5.2 Speed Benchmark
+
+**Test Environment:**
+- Hardware: H100 (4×)
+- Model: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning
+- Tensor Parallelism: 4
+- SGLang Version: main branch
+
+Model Deployment Command:
+
+```shell Command
+sglang serve \
+  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning \
+  --trust-remote-code \
+  --tp 4 \
+  --max-running-requests 1024 \
+  --host 0.0.0.0 \
+  --port 30000
+```
+
+Benchmark Command:
+
+```shell Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 30000 \
+  --model nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning \
+  --dataset-name random \
+  --random-input-len 1024 \
+  --random-output-len 1024 \
+  --num-prompts 4096 \
+  --max-concurrency 256
+```
+
+### 5.3 Accuracy Benchmark
+
+#### 5.3.1 GSM8K Benchmark
+
+**Environment**
+- Hardware: H100 (4×)
+- Model: nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning
+- Tensor Parallelism: 4
+- SGLang Version: main branch
+
+**Launch Model**
+```shell Command
+sglang serve \
+  --model-path nvidia/Nemotron-3-Nano-Omni-30B-A3B-Reasoning \
+  --trust-remote-code \
+  --tp 4 \
+  --reasoning-parser deepseek-r1
+```
+
+**Run Benchmark**
+```shell Command
+python3 benchmark/gsm8k/bench_sglang.py --port 30000
+```
+
+#### 5.3.2 MMLU Benchmark
+
+**Run Benchmark**
+```shell Command
+python3 benchmark/mmlu/bench_sglang.py --port 30000
+```

@@ -21,6 +21,7 @@ import torch
 import triton
 import triton.language as tl
 from torch import nn
+from triton.language.extra import libdevice
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -274,9 +275,7 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
-        self.multi_item_delimiter = (
-            get_global_server_args().multi_item_scoring_delimiter
-        )
+        self.enable_mis = get_global_server_args().enable_mis
 
         # enable chunked logprobs processing
         self.enable_logprobs_chunk = envs.SGLANG_ENABLE_LOGITS_PROCESSER_CHUNK.get()
@@ -292,17 +291,20 @@ class LogitsProcessor(nn.Module):
         aux_hidden_states: Optional[torch.Tensor] = None,
         hidden_states_before_norm: Optional[torch.Tensor] = None,
     ) -> LogitsProcessorOutput:
+        # Extract MIS indices before ForwardBatch → LogitsMetadata conversion
+        multi_item_delimiter_indices = None
         if isinstance(logits_metadata, ForwardBatch):
+            multi_item_delimiter_indices = logits_metadata.multi_item_delimiter_indices
             logits_metadata = LogitsMetadata.from_forward_batch(logits_metadata)
 
-        # Multi-item scoring only for prefill-only requests.
-        if self.multi_item_delimiter is not None and logits_metadata.is_prefill_only:
+        # Multi-item scoring only for prefill-only requests with pre-computed indices.
+        if multi_item_delimiter_indices is not None and logits_metadata.is_prefill_only:
             return self.compute_logprobs_for_multi_item_scoring(
                 input_ids,
                 hidden_states,
                 lm_head,
                 logits_metadata,
-                self.multi_item_delimiter,
+                multi_item_delimiter_indices,
             )
 
         # Diffusion LLM only.
@@ -347,6 +349,9 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                # FIXME: These fields are not logits-related but are passed through here as a
+                # workaround since ForwardBatch is local to forward_batch_generation().
+                # They should be moved to GenerationBatchResult to keep this class clean.
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
 
@@ -1006,39 +1011,41 @@ class LogitsProcessor(nn.Module):
         hidden_states,
         lm_head: VocabParallelEmbedding,
         logits_metadata: Union[LogitsMetadata, ForwardBatch],
-        delimiter_token: int,
+        multi_item_delimiter_indices: List[torch.Tensor],
     ):
         """
-        Compute logprobs for multi-item scoring using delimiter-based token extraction.
-
-        This method is designed for scenarios where you want to score multiple items/candidates
-        against a single query by combining them into one sequence separated by delimiters.
+        Compute logprobs for multi-item scoring using pre-computed delimiter indices.
 
         Sequence format: Query<delimiter>Item1<delimiter>Item2<delimiter>...
         Scoring positions: Extracts logprobs at positions before each <delimiter>
 
         Args:
-            input_ids (torch.Tensor): Input token IDs containing query and items separated by delimiters.
-                Shape: [total_sequence_length] for single request or [batch_total_length] for batch.
-            hidden_states (torch.Tensor): Hidden states from the model.
-                Shape: [sequence_length, hidden_dim].
-            lm_head (VocabParallelEmbedding): Language model head for computing logits.
-            logits_metadata (Union[LogitsMetadata, ForwardBatch]): Metadata containing batch info
-                and token ID specifications for logprob extraction.
-            delimiter_token (int): Token ID used as delimiter between query and items.
-
-        Returns:
-            LogitsProcessorOutput: Contains:
-                - next_token_logits: None (not needed for scoring-only requests)
-                - input_token_logprobs: Logprobs of delimiter tokens at scoring positions
-                - input_top_logprobs_val: Top-k logprobs at delimiter positions (if requested)
-                - input_top_logprobs_idx: Top-k token indices at delimiter positions (if requested)
-                - input_token_ids_logprobs_val: Logprobs for user-requested token IDs (if any)
-                - input_token_ids_logprobs_idx: Indices for user-requested token IDs (if any)
+            input_ids: Input token IDs. Shape: [total_sequence_length].
+            hidden_states: Hidden states from the model. Shape: [sequence_length, hidden_dim].
+            lm_head: Language model head for computing logits.
+            logits_metadata: Metadata containing batch info and logprob specs.
+            multi_item_delimiter_indices: Pre-computed delimiter positions per request (CPU tensors).
         """
-        multi_item_indices = (input_ids == delimiter_token).nonzero(as_tuple=True)[
-            0
-        ] - 1
+        # Compute positions just before each delimiter.
+        # Build offset-adjusted indices on CPU, then do a single CPU→GPU transfer.
+        device = input_ids.device
+        all_tensors = []
+        if logits_metadata.extend_seq_lens_cpu is not None:
+            offset = 0
+            for req_seq_len, indices_tensor in zip(
+                logits_metadata.extend_seq_lens_cpu, multi_item_delimiter_indices
+            ):
+                if len(indices_tensor) > 0:
+                    # Note: if the first delimiter is at position 0 (empty query),
+                    # indices - 1 wraps to -1. This is harmless — the first
+                    # delimiter entry is always discarded by
+                    # _process_multi_item_scoring_results.
+                    all_tensors.append(indices_tensor + (offset - 1))
+                offset += req_seq_len
+        else:
+            all_tensors.append(multi_item_delimiter_indices[0] - 1)
+        multi_item_indices = torch.cat(all_tensors).to(device, non_blocking=True)
+
         # Extract hidden states at delimiter positions for multi-item scoring
         sliced_hidden = hidden_states[multi_item_indices]
 
@@ -1052,27 +1059,13 @@ class LogitsProcessor(nn.Module):
         input_top_logprobs_idx = None
 
         # Recalculate extend_logprob_pruned_lens_cpu to match delimiter counts per request
-        # Original contains sequence lengths, but we need delimiter counts for sliced_logprobs
         if (
             logits_metadata.token_ids_logprobs
             or logits_metadata.extend_return_top_logprob
         ):
-            logits_metadata.extend_logprob_pruned_lens_cpu = []
-
-            if logits_metadata.extend_seq_lens_cpu is not None:
-                # Multi-request batch: count delimiters per request
-                input_pt = 0
-                for req_seq_len in logits_metadata.extend_seq_lens_cpu:
-                    req_input_ids = input_ids[input_pt : input_pt + req_seq_len]
-                    delimiter_count = (req_input_ids == delimiter_token).sum().item()
-                    logits_metadata.extend_logprob_pruned_lens_cpu.append(
-                        delimiter_count
-                    )
-                    input_pt += req_seq_len
-            else:
-                # Single request case: one request gets all delimiters
-                total_delimiters = (input_ids == delimiter_token).sum().item()
-                logits_metadata.extend_logprob_pruned_lens_cpu = [total_delimiters]
+            logits_metadata.extend_logprob_pruned_lens_cpu = [
+                len(t) for t in multi_item_delimiter_indices
+            ]
 
         # Get the logprobs of specified token ids
         if logits_metadata.extend_token_ids_logprob:
@@ -1090,11 +1083,17 @@ class LogitsProcessor(nn.Module):
                 input_top_logprobs_idx,
             ) = get_top_logprobs_prefill(sliced_logprobs, logits_metadata)
 
-        # For input_token_logprobs, use delimiter token logprobs
-        input_token_logprobs = sliced_logprobs[:, delimiter_token]
+        # MIS scores come from input_token_ids_logprobs_val (label-token logprobs),
+        # not from per-position input_token_logprobs. However, the shared logprob
+        # pipeline (add_input_logprob_return_values) asserts input_token_logprobs is
+        # non-None, converts it to a tuple, slices it, and validates its length —
+        # all before score_request() ever sees the result. We can't set it to None
+        # without changing those shared asserts, so we fill with zeros to satisfy
+        # the pipeline. score_request() ignores this field entirely.
+        input_token_logprobs = torch.zeros(multi_item_indices.shape[0], device=device)
 
         return LogitsProcessorOutput(
-            next_token_logits=None,  # Multi-item scoring doesn't need next token logits
+            next_token_logits=None,
             input_token_logprobs=input_token_logprobs,
             input_top_logprobs_val=input_top_logprobs_val,
             input_top_logprobs_idx=input_top_logprobs_idx,
@@ -1111,39 +1110,49 @@ class LogitsProcessor(nn.Module):
 def fused_softcap_kernel(
     full_logits_ptr,
     softcapping_value,
-    n_elements,
+    ncols,
+    row_stride,
     BLOCK_SIZE: tl.constexpr,
 ):
+    row = tl.program_id(1).to(tl.int64)
     pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+    mask = offsets < ncols
 
     # Load values
-    x = tl.load(full_logits_ptr + offsets, mask=mask)
+    row_ptr = full_logits_ptr + row * row_stride
+    x = tl.load(row_ptr + offsets, mask=mask)
 
     # Perform operations in-place
     x = x / softcapping_value
-
-    # Manual tanh implementation using exp
-    exp2x = tl.exp(2 * x)
-    x = (exp2x - 1) / (exp2x + 1)
-
+    x = libdevice.tanh(x)
     x = x * softcapping_value
 
     # Store result
-    tl.store(full_logits_ptr + offsets, x, mask=mask)
+    tl.store(row_ptr + offsets, x, mask=mask)
 
 
 def fused_softcap(full_logits, final_logit_softcapping):
-    n_elements = full_logits.numel()
+    if full_logits.is_contiguous():
+        nrows, ncols = 1, full_logits.numel()
+        row_stride = ncols
+    else:
+        assert full_logits.ndim == 2, "non-contiguous softcap requires 2D tensor"
+        assert (
+            full_logits.stride(1) == 1
+        ), "non-contiguous softcap requires contiguous columns"
+        nrows, ncols = full_logits.shape
+        row_stride = full_logits.stride(0)
+
     BLOCK_SIZE = 1024
-    grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE, 1, 1)
+    grid = ((ncols + BLOCK_SIZE - 1) // BLOCK_SIZE, nrows)
 
     fused_softcap_kernel[grid](
         full_logits_ptr=full_logits,
         softcapping_value=final_logit_softcapping,
-        n_elements=n_elements,
+        ncols=ncols,
+        row_stride=row_stride,
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return full_logits
