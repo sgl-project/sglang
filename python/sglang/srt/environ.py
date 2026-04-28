@@ -398,6 +398,7 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+    SGLANG_OPT_DEEPGEMM_SCALE_CONVERT_AT_INIT = EnvBool(True)
     SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
 
     # DeepSeek MHA Optimization

@@ -84,6 +84,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cpu,
     is_cuda,
+    is_gfx95_supported,
     is_hip,
     is_musa,
     is_npu,
@@ -111,11 +112,30 @@ _is_cpu = is_cpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
+_is_shuffle_moe_mxfp4 = is_gfx95_supported()
+
+
+def _use_aiter_moe() -> bool:
+    # with SGLANG_FORCE_TRITON_MOE_FP8=1, FP8 MoE skips
+    # aiter (no weight shuffle, no aiter dispatch) while the rest of the aiter paths
+    # keep running. Must be checked at call time because the flag is a runtime toggle.
+    return _use_aiter and not envs.SGLANG_FORCE_TRITON_MOE_FP8.get()
+
+
+def _require_fp4_dtype():
+    fp4_dtype = getattr(torch, "float4_e2m1fn_x2", None)
+    if fp4_dtype is None:
+        raise RuntimeError(
+            "DeepSeek-V4 FP4 experts require torch.float4_e2m1fn_x2 support."
+        )
+    return fp4_dtype
+
 
 if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+    from aiter.utility.fp4_utils import e8m0_shuffle
 
 if _use_aiter:
     from sglang.srt.layers.quantization.fp8_utils import (
@@ -801,6 +821,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
         self.with_bias = False
+        self.is_fp4_expert = (
+            envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
+        )
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -877,7 +900,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         )
 
         # WEIGHTS
-        if _is_hip and _use_hip_int4:
+        if self.is_fp4_expert:
+            # FP4 E2M1 packed as uint8: 2 FP4 values per byte, K dim halved
+            w13_weight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // 2,
+                    dtype=torch.int8,
+                ),
+                requires_grad=False,
+            )
+            w2_weight = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // 2,
+                    dtype=torch.int8,
+                ),
+                requires_grad=False,
+            )
+        elif _is_hip and _use_hip_int4:
             # INT4 MoE weight - INT32 packed
             w13_weight = torch.nn.Parameter(
                 torch.empty(
@@ -949,7 +992,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             set_weight_attrs(w2_weight_bias, extra_weight_attrs)
 
         # WEIGHT_SCALES
-        if self.block_quant:
+        if self.is_fp4_expert:
+            fp4_block_k = 32
+            fp4_scale_dtype = (
+                torch.float8_e8m0fnu if _use_aiter_moe() else torch.float32
+            )
+            w13_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // fp4_block_k,
+                    dtype=fp4_scale_dtype,
+                ),
+                requires_grad=False,
+            )
+            w2_weight_scale = torch.nn.Parameter(
+                torch.ones(
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // fp4_block_k,
+                    dtype=fp4_scale_dtype,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+            layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        elif self.block_quant:
             scale_dtype = torch.uint8 if self.use_mxfp8 else torch.float32
             scale_init = torch.zeros if scale_dtype == torch.uint8 else torch.ones
             w13_weight_scale = torch.nn.Parameter(
@@ -1054,6 +1122,31 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        # AMD FP4 experts: use aiter's native MXFP4 MoE path
+        if _use_aiter_moe() and self.is_fp4_expert:
+            fp4_weight_dtype = _require_fp4_dtype()
+            for scale_name in ("w13_weight_scale_inv", "w2_weight_scale_inv"):
+                scale = getattr(layer, scale_name)
+                num_experts, num_rows, _ = scale.shape
+                scale.data = e8m0_shuffle(scale.view(num_experts * num_rows, -1)).view(
+                    num_experts, num_rows, -1
+                )
+
+            layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
+            layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
+
+            is_shuffled = _is_shuffle_moe_mxfp4
+            if is_shuffled:
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight.contiguous(), (16, 16)
+                )
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight.contiguous(), (16, 16)
+                )
+            layer.w13_weight.is_shuffled = is_shuffled
+            layer.w2_weight.is_shuffled = is_shuffled
+            return
+
         # If ROCm, normalize the weights and scales to e4m3fnuz
         if _is_fp8_fnuz:
             # activation_scheme: dynamic
@@ -1078,8 +1171,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w2_weight_scale, requires_grad=False
             )
             layer.w2_input_scale = None
-
-        if _use_aiter:
+            if _use_aiter_moe():
+                layer.w13_weight.data = shuffle_weight(
+                    layer.w13_weight.contiguous(), (16, 16)
+                )
+                layer.w2_weight.data = shuffle_weight(
+                    layer.w2_weight.contiguous(), (16, 16)
+                )
+        elif _use_aiter_moe():
             # Pre-shuffle weights
             t = shuffle_weight(layer.w13_weight, (16, 16))
             layer.w13_weight.copy_(t)
@@ -1098,6 +1197,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         else:
             # For fp8 moe run with deepgemm, the expert weights and scales need be requantized to ue8m0
+            from sglang.srt.layers import deep_gemm_wrapper
             from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE
             from sglang.srt.model_loader.utils import (
                 should_deepgemm_weight_requant_ue8m0,
@@ -1106,8 +1206,43 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # Check if MoE will actually use DeepGEMM runner
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
 
+            if self.is_fp4_expert:
+                fp4_weight_dtype = (
+                    _require_fp4_dtype() if _use_aiter_moe() else torch.uint8
+                )
+                layer.w13_weight.data = layer.w13_weight.data.view(fp4_weight_dtype)
+                layer.w2_weight.data = layer.w2_weight.data.view(fp4_weight_dtype)
+
+                if (
+                    envs.SGLANG_OPT_DEEPGEMM_SCALE_CONVERT_AT_INIT.get()
+                    and envs.SGLANG_DSV4_MODE.get() == "2604"
+                    and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                    and will_use_deepgemm
+                ):
+                    from deep_gemm import transform_sf_into_required_layout
+
+                    for scale_param, weight_param in [
+                        (layer.w13_weight_scale_inv, layer.w13_weight),
+                        (layer.w2_weight_scale_inv, layer.w2_weight),
+                    ]:
+                        num_experts, n, _ = scale_param.data.shape
+                        k = weight_param.shape[2] * 2
+                        scale_param.data = transform_sf_into_required_layout(
+                            scale_param.data,
+                            mn=n,
+                            k=k,
+                            recipe=None,
+                            recipe_ab=(1, 32),
+                            num_groups=num_experts,
+                            is_sfa=False,
+                            disable_ue8m0_cast=False,
+                        )
+                    layer.w13_weight_scale_inv.format_ue8m0 = True
+                    layer.w2_weight_scale_inv.format_ue8m0 = True
+
             if (
-                should_deepgemm_weight_requant_ue8m0(
+                not self.is_fp4_expert
+                and should_deepgemm_weight_requant_ue8m0(
                     weight_block_size=getattr(
                         self.quant_config, "weight_block_size", None
                     ),
@@ -1484,7 +1619,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
     def process_weights_hip_scale_padding(self, layer: Module):
         padding_size = get_moe_padding_size(_use_aiter)
-        if _use_aiter:
+        if _use_aiter_moe():
             layer.w13_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w13_weight.data, (16, 16)),
                 requires_grad=False,
@@ -1809,18 +1944,37 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 ),
             )
 
-        if _use_aiter:
+        if _use_aiter_moe():
             assert not no_combine, f"{no_combine=} is not supported."
+            topk_weights = topk_weights.to(torch.float32)
+            if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
+                from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+                    deepseek_v4_moe_code_path_checker,
+                )
+
+                deepseek_v4_moe_code_path_checker.observed += 1
             if self.block_quant:
+                quant_type = (
+                    QuantType.per_1x32 if self.is_fp4_expert else QuantType.per_128x128
+                )
+                w13_weight = layer.w13_weight
+                w2_weight = layer.w2_weight
+                if self.is_fp4_expert:
+                    fp4_weight_dtype = _require_fp4_dtype()
+                    w13_weight = w13_weight.view(fp4_weight_dtype)
+                    w2_weight = w2_weight.view(fp4_weight_dtype)
+                    if getattr(layer.w13_weight, "is_shuffled", False):
+                        w13_weight.is_shuffled = True
+                        w2_weight.is_shuffled = True
                 return fused_moe(
                     x,
-                    layer.w13_weight,
-                    layer.w2_weight,
+                    w13_weight,
+                    w2_weight,
                     topk_weights,
                     topk_ids,
                     w1_scale=layer.w13_weight_scale_inv,
                     w2_scale=layer.w2_weight_scale_inv,
-                    quant_type=QuantType.per_128x128,
+                    quant_type=quant_type,
                     activation=(
                         ActivationType.Silu
                         if activation == "silu"
@@ -1845,6 +1999,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     ),
                     expert_mask=layer.dispatcher.expert_mask_gpu,
                 )
+
         return None
 
 

@@ -2749,9 +2749,9 @@ EntryClass = [DeepseekV4ForCausalLM]
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequant fp8 block-quantized wo_a weight: bf16 = fp8_weight * e8m0_scale.
 
-    Specifically for wo_a in 2604 checkpoint:
-      weight: [8192, 4096] fp8_e4m3fn   (64*128 x 32*128)
-      scale:  [64, 32]     fp8_e8m0fnu  (per 128x128 block)
+    The weight and scale use 128x128 block quantization:
+      weight: [N, K] fp8_e4m3fn   (N and K must be divisible by 128)
+      scale:  [N//128, K//128]    fp8_e8m0fnu  (per 128x128 block)
     """
     from einops import rearrange
 
@@ -2761,8 +2761,14 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     assert (
         scale.dtype == torch.float8_e8m0fnu
     ), f"expected fp8_e8m0fnu, got {scale.dtype}"
-    assert weight.shape == (8192, 4096), f"unexpected weight shape {weight.shape}"
-    assert scale.shape == (64, 32), f"unexpected scale shape {scale.shape}"
+    N, K = weight.shape
+    assert (
+        N % 128 == 0 and K % 128 == 0
+    ), f"weight dims must be divisible by 128, got {weight.shape}"
+    assert scale.shape == (
+        N // 128,
+        K // 128,
+    ), f"scale shape {scale.shape} doesn't match weight shape {weight.shape}"
 
     weight_f32 = rearrange(
         weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=128, bk=128
@@ -2771,7 +2777,6 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
     )
 
-    assert result.shape == (8192, 4096)
     return result.to(torch.bfloat16)
 
 
@@ -2780,24 +2785,28 @@ def _dequant_fp8_wo_a(
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     """Dequant fp8 wo_a weights inline: pair (wo_a.scale, wo_a.weight) -> bf16 wo_a.weight.
 
-    2601 checkpoint:
-      layers.0.attn.wo_a.weight  torch.bfloat16  [8192, 4096]  64.00MB  min=-0.375 max=0.3125
-
-    2604 checkpoint:
-      layers.0.attn.wo_a.scale  torch.float8_e8m0fnu  [64, 32]  0.00MB
-      layers.0.attn.wo_a.weight  torch.float8_e4m3fn  [8192, 4096]  32.00MB
+    Streaming version: buffers only wo_a.scale tensors (tiny) until the
+    corresponding wo_a.weight arrives.  All other weights pass through
+    immediately so we never materialise the full checkpoint in memory.
     """
-    weights_dict = dict(weights)
+    pending_scales: dict[str, torch.Tensor] = {}
 
-    for name in list(weights_dict.keys()):
-        if name not in weights_dict:
+    for name, tensor in weights:
+        if name.endswith(".wo_a.scale"):
+            pending_scales[name] = tensor
             continue
-        if not name.endswith(".wo_a.weight"):
-            continue
-        scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
-        assert scale_name in weights_dict
-        weight = weights_dict.pop(name)
-        scale = weights_dict.pop(scale_name)
-        yield name, _dequant_fp8(weight, scale)
 
-    yield from weights_dict.items()
+        if name.endswith(".wo_a.weight") and tensor.dtype == torch.float8_e4m3fn:
+            scale_name = name.replace(".wo_a.weight", ".wo_a.scale")
+            assert scale_name in pending_scales, (
+                f"wo_a.scale must appear before wo_a.weight in checkpoint, "
+                f"missing {scale_name}"
+            )
+            scale = pending_scales.pop(scale_name)
+            yield name, _dequant_fp8(tensor, scale)
+            continue
+
+        yield name, tensor
+
+    for scale_name, scale_tensor in pending_scales.items():
+        yield scale_name, scale_tensor

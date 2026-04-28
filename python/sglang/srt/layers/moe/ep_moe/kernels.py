@@ -3,17 +3,20 @@ import logging
 import torch
 import triton
 
-from sglang.srt.utils import ceil_div, is_cuda, is_musa
+from sglang.srt.utils import ceil_div, is_cuda, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_hip = is_hip()
 _is_musa = is_musa()
 
 if _is_cuda or _is_musa:
     from sglang.srt.layers.quantization.fp8_kernel import (
         sglang_per_token_group_quant_fp8 as per_token_group_quant_fp8,
     )
+elif _is_hip:
+    from sglang.srt.layers.quantization.fp8_kernel import per_token_group_quant_fp8
 
 import triton.language as tl
 
