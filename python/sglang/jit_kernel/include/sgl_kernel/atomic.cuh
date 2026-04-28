@@ -1,8 +1,20 @@
+/// \file atomic.cuh
+/// \brief Device-side atomic operations.
+
 #pragma once
 #include <sgl_kernel/utils.cuh>
 
 namespace device::atomic {
 
+/**
+ * \brief Atomically computes the maximum of `*addr` and `value`, storing the
+ *        result in `*addr`.
+ * \param addr Pointer to the value in global/shared memory to be updated.
+ * \param value The value to compare against.
+ * \return The old value at `*addr` before the update.
+ * \note On CUDA, this uses `atomicMax`/`atomicMin` on the reinterpreted
+ *       integer representation. On ROCm, a CAS loop is used as a fallback.
+ */
 SGL_DEVICE float max(float* addr, float value) {
 #ifndef USE_ROCM
   float old;
