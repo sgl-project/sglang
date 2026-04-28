@@ -13,7 +13,10 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.distributed import get_tensor_model_parallel_rank
+from sglang.srt.distributed import (
+    get_moe_expert_parallel_world_size,
+    get_tensor_model_parallel_rank,
+)
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.utils import get_compiler_backend
 
@@ -166,6 +169,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.num_gpu_experts = kt_config.num_gpu_experts
         self.override_num_local_experts = True
         self.gpu_method.num_gpu_experts = self.num_gpu_experts
+        self.moe_ep_size = get_moe_expert_parallel_world_size()
         self.tp_rank = get_tensor_model_parallel_rank()
         self.gpu_experts_mask = torch.empty(0, dtype=torch.bool)
         self.logical_to_gpu_index = torch.empty(0, dtype=torch.int32)
@@ -230,6 +234,16 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         self.global_num_experts = num_experts
         self.hidden_size = hidden_size
         self.intermediate_size_per_partition = intermediate_size_per_partition
+
+        if self.moe_ep_size != 1:
+            raise NotImplementedError(
+                "KTransformers heterogeneous MoE does not currently support expert parallelism. "
+                "Please launch with --expert-parallel-size 1."
+            )
+        if self.num_gpu_experts > num_experts:
+            raise ValueError(
+                f"kt_num_gpu_experts ({self.num_gpu_experts}) exceeds the number of local experts ({num_experts})."
+            )
 
         self.gpu_experts_mask = torch.zeros(num_experts, dtype=torch.bool)
         self.gpu_experts_mask[: self.num_gpu_experts] = True
