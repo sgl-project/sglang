@@ -460,8 +460,8 @@ export const DeepSeekV4Deployment = () => {
     flags.push("  --host 0.0.0.0");
     flags.push("  --port 30000");
 
-    // Assemble: [HW env] [recipe env] [common env] \ sglang serve \ flags...
-    const envAll = [...HW_ENV, ...recipeEnv, ...COMMON_ENV];
+    // Assemble: [HW env] [recipe env] \ sglang serve \ flags...
+    const envAll = [...HW_ENV, ...recipeEnv];
     const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
     const base = `${envBlock}sglang serve \\\n${flags.join(" \\\n")}`;
     // GB200 multinode may need machine-specific NVSHMEM / Gloo env vars;
@@ -544,7 +544,7 @@ export const DeepSeekV4Deployment = () => {
       if (hardware === "h200" && modelSize === "big") {
         roleEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128");
       }
-      const envAll = [...HW_ENV, ...roleEnv, ...MNNVL_ENV, ...COMMON_ENV];
+      const envAll = [...HW_ENV, ...roleEnv, ...MNNVL_ENV];
       const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
 
       const flags = [];
