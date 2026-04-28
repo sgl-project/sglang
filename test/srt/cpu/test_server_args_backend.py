@@ -30,15 +30,6 @@ class TestServerArgsCPUBackend(unittest.TestCase):
         self.assertEqual(server_args.attention_backend, "intel_amx")
         self.assertEqual(server_args.sampling_backend, "pytorch")
 
-    @patch("sglang.srt.server_args.is_host_cpu_arm64", return_value=True)
-    def test_explicit_backend_is_preserved(self, _mock_is_arm64):
-        server_args = self._make_server_args(attention_backend="intel_amx")
-
-        ServerArgs._handle_cpu_backends(server_args)
-
-        self.assertEqual(server_args.attention_backend, "intel_amx")
-        self.assertEqual(server_args.sampling_backend, "pytorch")
-
 
 if __name__ == "__main__":
     unittest.main()

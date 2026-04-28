@@ -83,6 +83,7 @@ suite_xeon = {
         TestFile("cpu/test_qkv_proj_with_rope.py"),
         TestFile("cpu/test_qwen3.py"),
         TestFile("cpu/test_rope.py"),
+        TestFile("cpu/test_server_args_backend.py"),
         TestFile("cpu/test_shared_expert.py"),
         TestFile("cpu/test_topk.py"),
     ],
