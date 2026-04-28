@@ -13,6 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.jit_kernel.fixup_zero_kv import fixup_zero_kv_rows
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
@@ -1121,7 +1122,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 dtype=self.q_data_type,
                 device=q.device,
             )
-            return flashinfer.prefill.trtllm_ragged_attention_deepseek(
+            result = flashinfer.prefill.trtllm_ragged_attention_deepseek(
                 **common_trtllm_args,
                 seq_lens=forward_batch.prefix_chunk_seq_lens[chunk_idx],
                 max_kv_len=forward_batch.prefix_chunk_max_seq_lens[chunk_idx],
@@ -1131,6 +1132,25 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 return_lse=True,
                 out=out,
             )
+
+            # The TRT-LLM ragged attention cubin kernel does not correctly
+            # handle rows with kv_len == 0: it leaves stale data in the
+            # workspace softmaxStats buffer and may produce non-zero output
+            # for those rows.  Fix up by forcing out=0 and lse=-inf for
+            # zero-KV rows so that downstream merge_state ignores them.
+            # Skip entirely when this chunk has no zero-KV rows (pure CPU
+            # check, precomputed in prepare_chunked_prefix_cache_info).
+            if forward_batch.prefix_chunk_has_zero_kv[chunk_idx]:
+                out_tensor, lse_tensor = result
+                fixup_zero_kv_rows(
+                    out_tensor,
+                    lse_tensor,
+                    forward_batch.prefix_chunk_seq_lens[chunk_idx],
+                    self.forward_prefill_metadata.cum_seq_lens,
+                    self.forward_prefill_metadata.max_seq_len,
+                )
+
+            return result
         else:
             out = torch.zeros(
                 q.shape[0],

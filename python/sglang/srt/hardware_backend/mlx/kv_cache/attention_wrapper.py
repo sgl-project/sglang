@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -22,6 +22,24 @@ class BatchedDecodeContext:
     seq_lens: list[int]  # per-request token count before the new token
     # layer_caches[layer_idx][req_idx] = ContiguousKVCache
     layer_caches: list[list[ContiguousKVCache]]
+
+    # Derived tensors/metadata, shared across all layers in one forward pass.
+    offsets: mx.array = field(init=False)
+    max_len: int = field(init=False)
+    valid_lens: mx.array = field(init=False)
+    needs_padding: bool = field(init=False)
+    pad_sizes: list[int] = field(init=False)
+    positions: Optional[mx.array] = field(init=False)
+
+    def __post_init__(self) -> None:
+        seq_lens = self.seq_lens
+        max_seq_len = max(seq_lens)
+        self.offsets = mx.array(seq_lens, dtype=mx.int32)
+        self.max_len = max_seq_len + 1
+        self.valid_lens = self.offsets + 1
+        self.needs_padding = min(seq_lens) < max_seq_len
+        self.pad_sizes = [max_seq_len - s for s in seq_lens]
+        self.positions = mx.arange(self.max_len) if self.needs_padding else None
 
 
 def set_context(ctx: Optional[BatchedDecodeContext]) -> None:
@@ -78,12 +96,13 @@ class MLXAttentionWrapper(nn.Module):
         values = values.transpose(0, 2, 1, 3)
 
         # Vectorized RoPE with per-batch offsets
-        offsets = mx.array(ctx.seq_lens, dtype=mx.int32)
+        offsets = ctx.offsets
         queries = inner.rope(queries, offset=offsets)
         keys = inner.rope(keys, offset=offsets)
 
         layer_caches = ctx.layer_caches[layer_idx]
-        max_len = max(ctx.seq_lens) + 1
+        max_len = ctx.max_len
+        pad_sizes = ctx.pad_sizes
 
         # TODO: replace per-request loop with native batched/ragged
         # attention once mx.fast.scaled_dot_product_attention supports
@@ -95,10 +114,9 @@ class MLXAttentionWrapper(nn.Module):
             layer_caches[i].write_token(keys[i : i + 1], values[i : i + 1])
 
             k_all, v_all = layer_caches[i].get_kv()
-            curr_len = layer_caches[i].offset
 
-            if curr_len < max_len:
-                pad = max_len - curr_len
+            pad = pad_sizes[i]
+            if pad > 0:
                 k_pad = mx.zeros(
                     (1, inner.n_kv_heads, pad, head_dim), dtype=k_all.dtype
                 )
@@ -115,11 +133,8 @@ class MLXAttentionWrapper(nn.Module):
         values_b = mx.concatenate(all_v, axis=0)
 
         attn_mask = None
-        seq_lens_plus1 = [s + 1 for s in ctx.seq_lens]
-        if min(seq_lens_plus1) < max_len:
-            positions = mx.arange(max_len)
-            valid_lens = mx.array(seq_lens_plus1, dtype=mx.int32)
-            mask_bool = positions[None, :] >= valid_lens[:, None]
+        if ctx.needs_padding:
+            mask_bool = ctx.positions[None, :] >= ctx.valid_lens[:, None]
             attn_mask = mx.where(
                 mask_bool[:, None, None, :],
                 mx.array(mx.finfo(queries.dtype).min, dtype=queries.dtype),

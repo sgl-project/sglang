@@ -1,0 +1,39 @@
+[package]
+name = "sglang-grpc"
+version = "0.1.0"
+edition = "2024"
+description = "In-process Rust gRPC server for SGLang"
+license = "Apache-2.0"
+
+[lib]
+name = "_core"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.23", features = ["extension-module"] }
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.12", features = ["gzip", "transport"] }
+prost = "0.13"
+crossbeam-channel = "0.5"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde_json = "1"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+tokio-stream = "0.1"
+async-stream = "0.3"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[features]
+default = ["pyo3/extension-module"]
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = 1

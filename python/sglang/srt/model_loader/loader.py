@@ -199,7 +199,12 @@ def _get_quantization_config(
     remap_prefix = getattr(model_class, "remap_prefix", None)
     # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
     if model_config.quantization == "quark":
-        packed_modules_mapping.update({"gate_up_proj": ["gate_proj", "up_proj"]})
+        packed_modules_mapping.update(
+            {
+                "gate_up_proj": ["gate_proj", "up_proj"],
+                "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+            }
+        )
 
     if _is_npu:
         packed_modules_mapping.update(
@@ -2027,6 +2032,8 @@ class GGUFModelLoader(BaseModelLoader):
         # hack: ggufs have a different name than transformers
         if model_type == "cohere":
             model_type = "command-r"
+        elif model_type == "qwen3_moe":
+            model_type = "qwen3moe"
         arch = None
         for key, value in gguf.MODEL_ARCH_NAMES.items():
             if value == model_type:

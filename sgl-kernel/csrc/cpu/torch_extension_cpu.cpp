@@ -200,8 +200,11 @@ at::Tensor int4_scaled_mm_cpu(
     at::Tensor& x, at::Tensor& w, at::Tensor& w_zeros, at::Tensor& w_scales, std::optional<at::Tensor> bias);
 
 // weight prepack for int4 weights
-std::tuple<at::Tensor, at::Tensor, at::Tensor>
-convert_weight_packed_scale_zp(at::Tensor qweight, at::Tensor qzeros, at::Tensor scales);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> convert_weight_packed_scale_zp(
+    at::Tensor qweight,  // awq: (*, K, N / 8)  ||  gptq: (*, K / 8, N) , int32
+    at::Tensor qzeros,   // awq: (*, K / group_size, N / 8) ||  gptq: (*, K / group_size, N / 8) , int32
+    at::Tensor scales,   // awq: (*, K / group_size, N) ||  gptq: (*, K / group_size, N) , bfloat16
+    int64_t quant_method_4bit);
 
 // bmm
 void bmm_cpu(at::Tensor& out, at::Tensor& mat1, at::Tensor& mat2, bool is_vnni, const std::optional<at::Tensor>& scale);
@@ -226,8 +229,8 @@ at::Tensor shared_expert_cpu(
     at::Tensor& hidden_states,
     at::Tensor& w1,
     at::Tensor& w2,
-    at::Tensor& fused_experts_out,
-    double routed_scaling_factor,
+    const std::optional<at::Tensor>& fused_experts_out,
+    const std::optional<double> routed_scaling_factor,
     bool inplace,
     bool use_int8_w8a8,
     bool use_fp8_w8a16,
@@ -364,6 +367,15 @@ fused_gdn_gating_cpu(const at::Tensor& A_log, const at::Tensor& a, const at::Ten
 
 // fused_qkvzba_split_reshape_cat_cpu
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_reshape_cat_cpu(
+    const at::Tensor& mixed_qkvz,
+    const at::Tensor& mixed_ba,
+    int64_t num_heads_qk,
+    int64_t num_heads_v,
+    int64_t head_qk,
+    int64_t head_v);
+
+// fused_qkvzba_split_reshape_cat_cpu_contiguous
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> fused_qkvzba_split_reshape_cat_contiguous_cpu(
     const at::Tensor& mixed_qkvz,
     const at::Tensor& mixed_ba,
     int64_t num_heads_qk,
@@ -520,8 +532,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // weight prepack for int4 weights
   m.def(
-      "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales) -> (Tensor, Tensor, "
-      "Tensor)");
+      "convert_weight_packed_scale_zp(Tensor weight, Tensor qzeros, Tensor scales, int quant_method_4bit) -> (Tensor, "
+      "Tensor, Tensor)");
   m.impl("convert_weight_packed_scale_zp", torch::kCPU, &convert_weight_packed_scale_zp);
 
   // bmm
@@ -554,7 +566,7 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // shared expert
   m.def(
-      "shared_expert_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor fused_experts_out, float "
+      "shared_expert_cpu(Tensor hidden_states, Tensor w1, Tensor w2, Tensor? fused_experts_out, float? "
       "routed_scaling_factor, bool inplace, bool use_int8_w8a8, bool use_fp8_w8a16, Tensor? w1_scale, Tensor? "
       "w2_scale, int[]? block_size, bool is_vnni) -> Tensor");
   m.impl("shared_expert_cpu", torch::kCPU, &shared_expert_cpu);
@@ -618,6 +630,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_qkvzba_split_reshape_cat_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int num_heads_v, int "
       "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
   m.impl("fused_qkvzba_split_reshape_cat_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_cpu);
+  // fused_qkvzba_split_reshape_cat_contiguous_cpu
+  m.def(
+      "fused_qkvzba_split_reshape_cat_contiguous_cpu(Tensor mixed_qkvz, Tensor mixed_ba, int num_heads_qk, int "
+      "num_heads_v, int "
+      "head_qk, int head_v) -> (Tensor, Tensor, Tensor, Tensor)");
+  m.impl("fused_qkvzba_split_reshape_cat_contiguous_cpu", torch::kCPU, &fused_qkvzba_split_reshape_cat_contiguous_cpu);
 
   // image preprocessor
   m.def(

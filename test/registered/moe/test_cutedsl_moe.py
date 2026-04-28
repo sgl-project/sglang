@@ -16,7 +16,7 @@ except ImportError:
     CuteDslMoEWrapper = None
     convert_sf_to_mma_layout = None
 
-register_cuda_ci(est_time=590, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=427, suite="stage-c-test-4-gpu-b200-small")
 
 SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
 SKIP_REASON = "Nvfp4 Requires compute capability of 10 or above."
@@ -473,188 +473,25 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids):
     ).sum(dim=1)
 
 
-class TestFlashinferCutedslMoe(unittest.TestCase):
-    @unittest.skipIf(SKIP_TEST, SKIP_REASON)
-    def test_flashinfer_cutedsl_moe_masked(self):
-        # Test parameters
-        test_cases = [
-            (2, 128, 256, 1),
-            (2, 128, 256, 2),
-            (2, 128, 256, 4),
-            (16, 128, 512, 1),
-            (16, 128, 512, 2),
-            (16, 128, 512, 4),
-        ]
+class TestCuteDslV2(unittest.TestCase):
+    """Correctness tests for the CuteDSL v2 (standard) path.
 
-        for bs, hidden_dim, inter_dim, topk in test_cases:
-            with self.subTest(
-                bs=bs, hidden_dim=hidden_dim, inter_dim=inter_dim, topk=topk
-            ):
-                with torch.inference_mode():
-                    torch.manual_seed(42)
-                    device = "cuda"
-                    dtype = torch.bfloat16
-                    num_experts = 8
-                    hidden_states = (
-                        torch.randn(bs, hidden_dim, dtype=torch.bfloat16, device=device)
-                        / 5.0
-                    )
-                    w1 = (
-                        torch.randn(
-                            num_experts,
-                            2 * inter_dim,
-                            hidden_dim,
-                            dtype=torch.bfloat16,
-                            device=device,
-                        )
-                        / 10.0
-                    )
-                    w2 = (
-                        torch.randn(
-                            num_experts,
-                            hidden_dim,
-                            inter_dim,
-                            dtype=torch.bfloat16,
-                            device=device,
-                        )
-                        / 10.0
-                    )
-                    router_logits = torch.randn(bs, num_experts, dtype=torch.float32)
+    The v2 path uses CuteDslMoEWrapper with:
+      - W13 in [Up, Gate] order (load_up_proj_weight_first = True)
+      - W13 interleaved in 64-row chunks (interleave_w13_halves)
+      - MMA-layout blockscales (convert_sf_to_mma_layout)
 
-                    hidden_states_expanded = (
-                        hidden_states.view(bs, -1, hidden_dim)
-                        .repeat(1, topk, 1)
-                        .reshape(-1, hidden_dim)
-                    )
-                    hidden_states_3d, masked_m, topk_idx, routing_weights = (
-                        prepare_inputs(
-                            hidden_states_expanded, router_logits, num_experts, topk
-                        )
-                    )
-
-                    w1_amax = w1.abs().amax(dim=(1, 2)).to(torch.float32).to(w1.device)
-                    w2_amax = w2.abs().amax(dim=(1, 2)).to(torch.float32).to(w2.device)
-                    input_global_scale = torch.ones(
-                        (num_experts,), dtype=torch.float32, device=hidden_states.device
-                    )
-
-                    w1_global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
-                    w2_global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
-                    a2_global_scale = torch.ones(
-                        (num_experts,), dtype=torch.float32, device=hidden_states.device
-                    )  # assume intermediate scale is 1.0
-
-                    w1_fp4, w1_blockscale = scaled_fp4_grouped_quantize(
-                        w1,
-                        torch.ones(num_experts, dtype=torch.int32, device=w1.device)
-                        * 2
-                        * inter_dim,
-                        w1_global_scale,
-                    )
-                    w2_fp4, w2_blockscale = scaled_fp4_grouped_quantize(
-                        w2,
-                        torch.ones(num_experts, dtype=torch.int32, device=w2.device)
-                        * hidden_dim,
-                        w2_global_scale,
-                    )
-
-                    w1_alpha = 1.0 / (input_global_scale * w1_global_scale)
-                    w2_alpha = 1.0 / (a2_global_scale * w2_global_scale)
-
-                    out = flashinfer_cutedsl_moe_masked(
-                        (hidden_states_3d.to(hidden_states.device), None),
-                        input_global_scale,
-                        w1_fp4.permute(2, 0, 1),
-                        w1_blockscale,
-                        w1_alpha,
-                        w2_fp4.permute(2, 0, 1),
-                        a2_global_scale,
-                        w2_blockscale,
-                        w2_alpha,
-                        masked_m.to(hidden_states.device),
-                    )
-
-                    # reference
-                    a_fp4, a_scale_interleaved = fp4_quantize(
-                        hidden_states, input_global_scale
-                    )
-                    a_in_dtype = dequantize_nvfp4_to_dtype(
-                        a_fp4,
-                        a_scale_interleaved,
-                        input_global_scale,
-                        dtype=hidden_states.dtype,
-                        device=hidden_states.device,
-                        block_size=16,
-                    )
-                    w1_d = torch.empty(
-                        (num_experts, 2 * inter_dim, hidden_dim),
-                        device=w1.device,
-                        dtype=w1.dtype,
-                    )
-                    w2_d = torch.empty(
-                        (num_experts, hidden_dim, inter_dim),
-                        device=w2.device,
-                        dtype=w2.dtype,
-                    )
-
-                    for idx in range(0, num_experts):
-                        w1_fp4_sliced, w1_blockscale_sliced = fp4_quantize(
-                            w1[idx], w1_global_scale[idx]
-                        )
-                        w2_fp4_sliced, w2_blockscale_sliced = fp4_quantize(
-                            w2[idx], w2_global_scale[idx]
-                        )
-                        w1_d[idx] = dequantize_nvfp4_to_dtype(
-                            w1_fp4_sliced,
-                            w1_blockscale_sliced,
-                            w1_global_scale[idx],
-                            dtype=w1.dtype,
-                            device=w1.device,
-                            block_size=16,
-                        )
-                        w2_d[idx] = dequantize_nvfp4_to_dtype(
-                            w2_fp4_sliced,
-                            w2_blockscale_sliced,
-                            w2_global_scale[idx],
-                            dtype=w2.dtype,
-                            device=w2.device,
-                            block_size=16,
-                        )
-
-                    ref_output = torch_moe_nvfp4(
-                        a_in_dtype,
-                        w1_d,
-                        w2_d,
-                        topk,
-                        routing_weights.to(a_in_dtype.device),
-                        topk_idx.to(a_in_dtype.device),
-                    )
-                    out_weighted = torch.zeros_like(
-                        ref_output, device=out.device, dtype=out.dtype
-                    )
-
-                    positions = torch.nonzero(masked_m[topk_idx], as_tuple=False)
-                    rows, cols = positions[:, 0], positions[:, 1]
-                    experts = topk_idx[rows, cols]
-                    for i in range(num_experts):
-                        mask = experts == i
-                        if mask.any():
-                            idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
-                            r, c = rows[idx], cols[idx]
-                            out_weighted[r] += out[i, : len(r), :] * routing_weights[
-                                r, c
-                            ].to(out.device).unsqueeze(-1)
-                    torch.testing.assert_close(
-                        out_weighted.cpu(), ref_output.cpu(), atol=5e-2, rtol=5e-2
-                    )
+    This is the path used with --moe-runner-backend flashinfer_cutedsl and
+    --moe-a2a-backend none or flashinfer (i.e. NOT deepep).
+    """
 
     @unittest.skipIf(SKIP_TEST, SKIP_REASON)
     @unittest.skipIf(
         CuteDslMoEWrapper is None or convert_sf_to_mma_layout is None,
         "CuteDslMoEWrapper / convert_sf_to_mma_layout not available",
     )
-    def test_cutedsl_moe_wrapper_run(self):
-        """Call CuteDslMoEWrapper.run() with MMA-layout tensors and verify against reference."""
+    def test_v2_wrapper_correctness(self):
+        """CuteDslMoEWrapper.run() with MMA-layout tensors vs PyTorch reference."""
         test_cases = [
             # (num_tokens, hidden_size, intermediate_size, num_experts, top_k)
             # Minimum dimensions match FlashInfer's test_wrapper_accuracy:
@@ -739,8 +576,8 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
         CuteDslMoEWrapper is None or convert_sf_to_mma_layout is None,
         "CuteDslMoEWrapper / convert_sf_to_mma_layout not available",
     )
-    def test_cutedsl_cuda_graph_parity(self):
-        """Verify non-graph and cuda_graph wrappers produce identical results.
+    def test_v2_cuda_graph_parity(self):
+        """Verify non-graph and cuda_graph v2 wrappers produce identical results.
 
         Also checks both match the pure-PyTorch reference, and that a second
         cuda_graph pass reuses buffers deterministically (subsumes the former
@@ -841,13 +678,13 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
         CuteDslMoEWrapper is None or convert_sf_to_mma_layout is None,
         "CuteDslMoEWrapper / convert_sf_to_mma_layout not available",
     )
-    def test_cutedsl_ep_sharded_allreduce(self):
-        """Verify EP-sharded execution: partial outputs from EP ranks sum to full result.
+    def test_v2_ep_sharded_allreduce(self):
+        """Verify EP-sharded v2 execution: partial outputs from EP ranks sum to full result.
 
         Simulates the EP=TP all-reduce pattern used by the CuteDSL moe_runner when
-        ep_size > 1 and moe_a2a_backend=none. Each "rank" runs a wrapper with
+        ep_size > 1 and moe_a2a_backend=none. Each "rank" runs a v2 wrapper with
         num_local_experts < num_experts and a corresponding local_expert_offset,
-        receiving only the local slice of weights/scales/alphas — matching the
+        receiving only the local slice of weights/scales/alphas -- matching the
         real runtime contract where each rank holds only its own expert partition.
         The partial outputs are summed (simulating tensor_model_parallel_all_reduce)
         and compared against a single wrapper processing all experts.
@@ -938,6 +775,546 @@ class TestFlashinferCutedslMoe(unittest.TestCase):
                         f"(ep_size={ep_size}, tokens={num_tokens})"
                     ),
                 )
+
+
+class TestCuteDslV1(unittest.TestCase):
+    """Correctness tests for the CuteDSL v1 (deepep) path.
+
+    The v1 path (apply_without_routing_weights -> flashinfer_cutedsl_moe_masked)
+    is used when --moe-runner-backend flashinfer_cutedsl and --moe-a2a-backend
+    deepep are combined.  It expects:
+      - W13 in default [Gate, Up] order (load_up_proj_weight_first = False)
+      - W13 NOT interleaved (no interleave_w13_halves)
+      - Swizzled blockscales (w13_blockscale_swizzled, not MMA layout)
+
+    A regression that accidentally applies v2 transforms (interleave,
+    [Up,Gate] flip, MMA blockscales) to v1 weights would cause these tests
+    to fail with numerical mismatch against the PyTorch reference.
+
+    The companion v2 (standard) path correctness is covered by TestCuteDslV2.
+    """
+
+    @unittest.skipIf(SKIP_TEST, SKIP_REASON)
+    def test_v1_masked_kernel_bf16_input(self):
+        """V1 masked kernel with BF16 activations (kernel quantizes internally).
+
+        Weights are in v1 layout: [Gate, Up] order, non-interleaved, swizzled
+        blockscales.  This mirrors the production path when DeepEP dispatch
+        does NOT pre-quantize activations (MOE_NVFP4_DISPATCH is off).
+        """
+        test_cases = [
+            # (bs, hidden_dim, inter_dim, topk)
+            (2, 128, 256, 1),
+            (2, 128, 256, 2),
+            (2, 128, 256, 4),
+            (16, 128, 512, 1),
+            (16, 128, 512, 2),
+            (16, 128, 512, 4),
+        ]
+
+        for bs, hidden_dim, inter_dim, topk in test_cases:
+            with self.subTest(
+                bs=bs, hidden_dim=hidden_dim, inter_dim=inter_dim, topk=topk
+            ):
+                with torch.inference_mode():
+                    torch.manual_seed(42)
+                    device = "cuda"
+                    num_experts = 8
+                    hidden_states = (
+                        torch.randn(bs, hidden_dim, dtype=torch.bfloat16, device=device)
+                        / 5.0
+                    )
+                    w1 = (
+                        torch.randn(
+                            num_experts,
+                            2 * inter_dim,
+                            hidden_dim,
+                            dtype=torch.bfloat16,
+                            device=device,
+                        )
+                        / 10.0
+                    )
+                    w2 = (
+                        torch.randn(
+                            num_experts,
+                            hidden_dim,
+                            inter_dim,
+                            dtype=torch.bfloat16,
+                            device=device,
+                        )
+                        / 10.0
+                    )
+                    router_logits = torch.randn(bs, num_experts, dtype=torch.float32)
+
+                    hidden_states_expanded = (
+                        hidden_states.view(bs, -1, hidden_dim)
+                        .repeat(1, topk, 1)
+                        .reshape(-1, hidden_dim)
+                    )
+                    hidden_states_3d, masked_m, topk_idx, routing_weights = (
+                        prepare_inputs(
+                            hidden_states_expanded, router_logits, num_experts, topk
+                        )
+                    )
+
+                    w1_amax = w1.abs().amax(dim=(1, 2)).to(torch.float32).to(w1.device)
+                    w2_amax = w2.abs().amax(dim=(1, 2)).to(torch.float32).to(w2.device)
+                    input_global_scale = torch.ones(
+                        (num_experts,), dtype=torch.float32, device=hidden_states.device
+                    )
+
+                    w1_global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
+                    w2_global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
+                    a2_global_scale = torch.ones(
+                        (num_experts,), dtype=torch.float32, device=hidden_states.device
+                    )
+
+                    w1_fp4, w1_blockscale = scaled_fp4_grouped_quantize(
+                        w1,
+                        torch.ones(num_experts, dtype=torch.int32, device=w1.device)
+                        * 2
+                        * inter_dim,
+                        w1_global_scale,
+                    )
+                    w2_fp4, w2_blockscale = scaled_fp4_grouped_quantize(
+                        w2,
+                        torch.ones(num_experts, dtype=torch.int32, device=w2.device)
+                        * hidden_dim,
+                        w2_global_scale,
+                    )
+
+                    w1_alpha = 1.0 / (input_global_scale * w1_global_scale)
+                    w2_alpha = 1.0 / (a2_global_scale * w2_global_scale)
+
+                    out = flashinfer_cutedsl_moe_masked(
+                        (hidden_states_3d.to(hidden_states.device), None),
+                        input_global_scale,
+                        w1_fp4.permute(2, 0, 1),
+                        w1_blockscale,
+                        w1_alpha,
+                        w2_fp4.permute(2, 0, 1),
+                        a2_global_scale,
+                        w2_blockscale,
+                        w2_alpha,
+                        masked_m.to(hidden_states.device),
+                    )
+
+                    a_fp4, a_scale_interleaved = fp4_quantize(
+                        hidden_states, input_global_scale
+                    )
+                    a_in_dtype = dequantize_nvfp4_to_dtype(
+                        a_fp4,
+                        a_scale_interleaved,
+                        input_global_scale,
+                        dtype=hidden_states.dtype,
+                        device=hidden_states.device,
+                        block_size=16,
+                    )
+                    w1_d = torch.empty(
+                        (num_experts, 2 * inter_dim, hidden_dim),
+                        device=w1.device,
+                        dtype=w1.dtype,
+                    )
+                    w2_d = torch.empty(
+                        (num_experts, hidden_dim, inter_dim),
+                        device=w2.device,
+                        dtype=w2.dtype,
+                    )
+
+                    for idx in range(0, num_experts):
+                        w1_fp4_sliced, w1_blockscale_sliced = fp4_quantize(
+                            w1[idx], w1_global_scale[idx]
+                        )
+                        w2_fp4_sliced, w2_blockscale_sliced = fp4_quantize(
+                            w2[idx], w2_global_scale[idx]
+                        )
+                        w1_d[idx] = dequantize_nvfp4_to_dtype(
+                            w1_fp4_sliced,
+                            w1_blockscale_sliced,
+                            w1_global_scale[idx],
+                            dtype=w1.dtype,
+                            device=w1.device,
+                            block_size=16,
+                        )
+                        w2_d[idx] = dequantize_nvfp4_to_dtype(
+                            w2_fp4_sliced,
+                            w2_blockscale_sliced,
+                            w2_global_scale[idx],
+                            dtype=w2.dtype,
+                            device=w2.device,
+                            block_size=16,
+                        )
+
+                    ref_output = torch_moe_nvfp4(
+                        a_in_dtype,
+                        w1_d,
+                        w2_d,
+                        topk,
+                        routing_weights.to(a_in_dtype.device),
+                        topk_idx.to(a_in_dtype.device),
+                    )
+                    out_weighted = torch.zeros_like(
+                        ref_output, device=out.device, dtype=out.dtype
+                    )
+
+                    positions = torch.nonzero(masked_m[topk_idx], as_tuple=False)
+                    rows, cols = positions[:, 0], positions[:, 1]
+                    experts = topk_idx[rows, cols]
+                    for i in range(num_experts):
+                        mask = experts == i
+                        if mask.any():
+                            idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                            r, c = rows[idx], cols[idx]
+                            out_weighted[r] += out[i, : len(r), :] * routing_weights[
+                                r, c
+                            ].to(out.device).unsqueeze(-1)
+                    torch.testing.assert_close(
+                        out_weighted.cpu(), ref_output.cpu(), atol=5e-2, rtol=5e-2
+                    )
+
+    @unittest.skipIf(SKIP_TEST, SKIP_REASON)
+    def test_v1_masked_kernel_rejects_v2_w13_layout(self):
+        """Applying the v2 W13 transform must break the v1 masked path."""
+        with torch.inference_mode():
+            torch.manual_seed(42)
+            device = "cuda"
+            num_experts, bs, hidden_dim, inter_dim, topk = 8, 16, 128, 512, 2
+
+            hidden_states = (
+                torch.randn(bs, hidden_dim, dtype=torch.bfloat16, device=device) / 5.0
+            )
+            w1 = (
+                torch.randn(
+                    num_experts,
+                    2 * inter_dim,
+                    hidden_dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                / 10.0
+            )
+            w2 = (
+                torch.randn(
+                    num_experts,
+                    hidden_dim,
+                    inter_dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                / 10.0
+            )
+            router_logits = torch.randn(bs, num_experts, dtype=torch.float32)
+
+            hidden_expanded = (
+                hidden_states.view(bs, -1, hidden_dim)
+                .repeat(1, topk, 1)
+                .reshape(-1, hidden_dim)
+            )
+            hidden_3d, masked_m, topk_idx, routing_weights = prepare_inputs(
+                hidden_expanded, router_logits, num_experts, topk
+            )
+
+            input_global_scale = torch.ones(
+                (num_experts,), dtype=torch.float32, device=device
+            )
+            w1_amax = w1.abs().amax(dim=(1, 2)).to(torch.float32)
+            w2_amax = w2.abs().amax(dim=(1, 2)).to(torch.float32)
+            w1_global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
+            w2_global_scale = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
+            a2_global_scale = torch.ones(
+                (num_experts,), dtype=torch.float32, device=device
+            )
+
+            expert_sizes_w1 = (
+                torch.ones(num_experts, dtype=torch.int32, device=device)
+                * 2
+                * inter_dim
+            )
+            expert_sizes_w2 = (
+                torch.ones(num_experts, dtype=torch.int32, device=device) * hidden_dim
+            )
+            w1_fp4, w1_blockscale = scaled_fp4_grouped_quantize(
+                w1, expert_sizes_w1, w1_global_scale
+            )
+            w2_fp4, w2_blockscale = scaled_fp4_grouped_quantize(
+                w2, expert_sizes_w2, w2_global_scale
+            )
+
+            # The v2 standard path flips W13 to [Up, Gate] order and interleaves
+            # 64-row chunks for CuteDslMoEWrapper. The v1 masked kernel must not
+            # receive that transformed layout.
+            w1_v2 = torch.cat((w1[:, inter_dim:, :], w1[:, :inter_dim, :]), dim=1)
+            w1_v2 = _interleave_w13_halves(w1_v2, group_size=64, dim=1).contiguous()
+            w1_fp4_v2, w1_blockscale_v2 = scaled_fp4_grouped_quantize(
+                w1_v2, expert_sizes_w1, w1_global_scale
+            )
+
+            w1_alpha = 1.0 / (input_global_scale * w1_global_scale)
+            w2_alpha = 1.0 / (a2_global_scale * w2_global_scale)
+
+            out_v1 = flashinfer_cutedsl_moe_masked(
+                (hidden_3d.to(device), None),
+                input_global_scale,
+                w1_fp4.permute(2, 0, 1),
+                w1_blockscale,
+                w1_alpha,
+                w2_fp4.permute(2, 0, 1),
+                a2_global_scale,
+                w2_blockscale,
+                w2_alpha,
+                masked_m.to(device),
+            )
+            out_v2_layout = flashinfer_cutedsl_moe_masked(
+                (hidden_3d.to(device), None),
+                input_global_scale,
+                w1_fp4_v2.permute(2, 0, 1),
+                w1_blockscale_v2,
+                w1_alpha,
+                w2_fp4.permute(2, 0, 1),
+                a2_global_scale,
+                w2_blockscale,
+                w2_alpha,
+                masked_m.to(device),
+            )
+
+            a_fp4, a_scale_interleaved = fp4_quantize(hidden_states, input_global_scale)
+            a_in_dtype = dequantize_nvfp4_to_dtype(
+                a_fp4,
+                a_scale_interleaved,
+                input_global_scale,
+                dtype=hidden_states.dtype,
+                device=device,
+                block_size=16,
+            )
+            w1_d = torch.empty(
+                (num_experts, 2 * inter_dim, hidden_dim),
+                device=device,
+                dtype=w1.dtype,
+            )
+            w2_d = torch.empty(
+                (num_experts, hidden_dim, inter_dim), device=device, dtype=w2.dtype
+            )
+
+            for idx in range(num_experts):
+                w1_fp4_sliced, w1_blockscale_sliced = fp4_quantize(
+                    w1[idx], w1_global_scale[idx]
+                )
+                w2_fp4_sliced, w2_blockscale_sliced = fp4_quantize(
+                    w2[idx], w2_global_scale[idx]
+                )
+                w1_d[idx] = dequantize_nvfp4_to_dtype(
+                    w1_fp4_sliced,
+                    w1_blockscale_sliced,
+                    w1_global_scale[idx],
+                    dtype=w1.dtype,
+                    device=device,
+                    block_size=16,
+                )
+                w2_d[idx] = dequantize_nvfp4_to_dtype(
+                    w2_fp4_sliced,
+                    w2_blockscale_sliced,
+                    w2_global_scale[idx],
+                    dtype=w2.dtype,
+                    device=device,
+                    block_size=16,
+                )
+
+            ref_output = torch_moe_nvfp4(
+                a_in_dtype,
+                w1_d,
+                w2_d,
+                topk,
+                routing_weights.to(device),
+                topk_idx.to(device),
+            )
+
+            positions = torch.nonzero(masked_m[topk_idx], as_tuple=False)
+            rows, cols = positions[:, 0], positions[:, 1]
+            experts = topk_idx[rows, cols]
+
+            def combine_weighted_output(out: torch.Tensor) -> torch.Tensor:
+                out_weighted = torch.zeros_like(
+                    ref_output, device=device, dtype=out.dtype
+                )
+                for i in range(num_experts):
+                    mask = experts == i
+                    if mask.any():
+                        idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                        r, c = rows[idx], cols[idx]
+                        out_weighted[r] += out[i, : len(r), :] * routing_weights[
+                            r, c
+                        ].to(device).unsqueeze(-1)
+                return out_weighted
+
+            out_v1_weighted = combine_weighted_output(out_v1)
+            out_v2_layout_weighted = combine_weighted_output(out_v2_layout)
+
+            torch.testing.assert_close(
+                out_v1_weighted.cpu(), ref_output.cpu(), atol=5e-2, rtol=5e-2
+            )
+            with self.assertRaises(AssertionError):
+                torch.testing.assert_close(
+                    out_v2_layout_weighted.cpu(),
+                    ref_output.cpu(),
+                    atol=5e-2,
+                    rtol=5e-2,
+                )
+
+    @unittest.skipIf(SKIP_TEST, SKIP_REASON)
+    def test_v1_masked_kernel_fp4_input(self):
+        """V1 masked kernel with pre-quantized FP4 activations.
+
+        In production with MOE_NVFP4_DISPATCH, the DeepEP dispatcher quantizes
+        activations during dispatch.  The v1 kernel receives
+        hidden_states=(fp4_data, blockscale) instead of (bf16_data, None) and
+        skips its internal scaled_fp4_grouped_quantize call.
+        """
+        with torch.inference_mode():
+            torch.manual_seed(42)
+            device = "cuda"
+            num_experts, bs, hidden_dim, inter_dim, topk = 8, 16, 128, 512, 2
+
+            hidden_states = (
+                torch.randn(bs, hidden_dim, dtype=torch.bfloat16, device=device) / 5.0
+            )
+            w1 = (
+                torch.randn(
+                    num_experts,
+                    2 * inter_dim,
+                    hidden_dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                / 10.0
+            )
+            w2 = (
+                torch.randn(
+                    num_experts,
+                    hidden_dim,
+                    inter_dim,
+                    dtype=torch.bfloat16,
+                    device=device,
+                )
+                / 10.0
+            )
+            router_logits = torch.randn(bs, num_experts, dtype=torch.float32)
+
+            hidden_expanded = (
+                hidden_states.view(bs, -1, hidden_dim)
+                .repeat(1, topk, 1)
+                .reshape(-1, hidden_dim)
+            )
+            hidden_3d, masked_m, topk_idx, routing_weights = prepare_inputs(
+                hidden_expanded, router_logits, num_experts, topk
+            )
+
+            input_gs = torch.ones(num_experts, dtype=torch.float32, device=device)
+            w1_amax = w1.abs().amax(dim=(1, 2)).to(torch.float32)
+            w2_amax = w2.abs().amax(dim=(1, 2)).to(torch.float32)
+            w1_gs = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
+            w2_gs = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
+            a2_gs = torch.ones(num_experts, dtype=torch.float32, device=device)
+
+            expert_sizes_w1 = (
+                torch.ones(num_experts, dtype=torch.int32, device=device)
+                * 2
+                * inter_dim
+            )
+            expert_sizes_w2 = (
+                torch.ones(num_experts, dtype=torch.int32, device=device) * hidden_dim
+            )
+            w1_fp4, w1_bs = scaled_fp4_grouped_quantize(w1, expert_sizes_w1, w1_gs)
+            w2_fp4, w2_bs = scaled_fp4_grouped_quantize(w2, expert_sizes_w2, w2_gs)
+            w1_alpha = 1.0 / (input_gs * w1_gs)
+            w2_alpha = 1.0 / (a2_gs * w2_gs)
+
+            # Pre-quantize activations -- simulates what DeepEP dispatch does
+            # when MOE_NVFP4_DISPATCH is enabled.  The kernel expects
+            # (m, k//2, num_experts) layout from scaled_fp4_grouped_quantize.
+            a_q, a_q_sf = scaled_fp4_grouped_quantize(
+                hidden_3d.to(device),
+                masked_m.to(device),
+                input_gs,
+            )
+
+            out = flashinfer_cutedsl_moe_masked(
+                (a_q, a_q_sf),
+                input_gs,
+                w1_fp4.permute(2, 0, 1),
+                w1_bs,
+                w1_alpha,
+                w2_fp4.permute(2, 0, 1),
+                a2_gs,
+                w2_bs,
+                w2_alpha,
+                masked_m.to(device),
+            )
+
+            # PyTorch reference (same as the bf16 input test)
+            a_fp4, a_scale = fp4_quantize(hidden_states, input_gs)
+            a_deq = dequantize_nvfp4_to_dtype(
+                a_fp4,
+                a_scale,
+                input_gs,
+                dtype=torch.bfloat16,
+                device=device,
+                block_size=16,
+            )
+            w1_d = torch.empty(
+                (num_experts, 2 * inter_dim, hidden_dim),
+                device=device,
+                dtype=w1.dtype,
+            )
+            w2_d = torch.empty(
+                (num_experts, hidden_dim, inter_dim), device=device, dtype=w2.dtype
+            )
+            for idx in range(num_experts):
+                w1_fp4_sliced, w1_blockscale_sliced = fp4_quantize(w1[idx], w1_gs[idx])
+                w2_fp4_sliced, w2_blockscale_sliced = fp4_quantize(w2[idx], w2_gs[idx])
+                w1_d[idx] = dequantize_nvfp4_to_dtype(
+                    w1_fp4_sliced,
+                    w1_blockscale_sliced,
+                    w1_gs[idx],
+                    dtype=w1.dtype,
+                    device=device,
+                    block_size=16,
+                )
+                w2_d[idx] = dequantize_nvfp4_to_dtype(
+                    w2_fp4_sliced,
+                    w2_blockscale_sliced,
+                    w2_gs[idx],
+                    dtype=w2.dtype,
+                    device=device,
+                    block_size=16,
+                )
+            ref = torch_moe_nvfp4(
+                a_deq,
+                w1_d,
+                w2_d,
+                topk,
+                routing_weights.to(device),
+                topk_idx.to(device),
+            )
+
+            out_weighted = torch.zeros_like(ref, device=device)
+            positions = torch.nonzero(masked_m[topk_idx], as_tuple=False)
+            rows, cols = positions[:, 0], positions[:, 1]
+            experts = topk_idx[rows, cols]
+            for i in range(num_experts):
+                mask = experts == i
+                if mask.any():
+                    idx = torch.nonzero(mask, as_tuple=False).squeeze(-1)
+                    r, c = rows[idx], cols[idx]
+                    out_weighted[r] += out[i, : len(r), :] * routing_weights[r, c].to(
+                        device
+                    ).unsqueeze(-1)
+
+            torch.testing.assert_close(
+                out_weighted.cpu(),
+                ref.cpu(),
+                atol=5e-2,
+                rtol=5e-2,
+            )
 
 
 if __name__ == "__main__":
