@@ -382,9 +382,10 @@ class USPAttention(nn.Module):
             if backend_enum not in (
                 AttentionBackendEnum.FA,
                 AttentionBackendEnum.SAGE_ATTN,
+                AttentionBackendEnum.AITER,
             ):
                 raise RuntimeError(
-                    f"Ring Attention is only supported for FlashAttention or SageAttention backends, "
+                    f"Ring Attention is only supported for FlashAttention, SageAttention and AITER backends, "
                     f"but got {backend_enum.name}. "
                     f"Please ensure your platform supports these backends."
                 )

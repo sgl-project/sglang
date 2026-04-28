@@ -205,6 +205,7 @@ def _mla_prefill_ps_attention(
     q_scale: Optional[torch.Tensor] = None,
     k_scale: Optional[torch.Tensor] = None,
     v_scale: Optional[torch.Tensor] = None,
+    return_softmax_lse: bool,
 ) -> torch.Tensor:
     """
     Run mla_prefill_ps_asm_fwd + mla_reduce_v1 on 4D batch tensors.
@@ -297,8 +298,11 @@ def _mla_prefill_ps_attention(
         output,
         final_lse,
     )
-
-    return output.view(B, S_q, H, D_v)
+    output = output.view(B, S_q, H, D_v)
+    if return_softmax_lse:
+        return output, final_lse
+    else:   
+        return output
 
 
 class AITerImpl(AttentionImpl):
@@ -332,6 +336,7 @@ class AITerImpl(AttentionImpl):
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
+        return_softmax_lse: bool = False,
     ) -> torch.Tensor:
         """
         Performs attention using one of:
@@ -367,6 +372,7 @@ class AITerImpl(AttentionImpl):
                     q_scale=q_scale,
                     k_scale=k_scale,
                     v_scale=v_scale,
+                    return_lse=return_softmax_lse,
                 )
 
             logger.warning_once(
@@ -380,7 +386,7 @@ class AITerImpl(AttentionImpl):
             )
 
         # BF16 path
-        output, _ = aiter.flash_attn_func(
+        output, softmax_lse = aiter.flash_attn_func(
             query,
             key,
             value,
@@ -389,4 +395,7 @@ class AITerImpl(AttentionImpl):
             return_attn_probs=False,
             return_lse=True,
         )
-        return output
+        if return_softmax_lse:
+            return output, softmax_lse
+        else:
+            return output
