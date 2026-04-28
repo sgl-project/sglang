@@ -457,12 +457,13 @@ class NgramVerifyInput(SpecInput):
         self.num_accepted_tokens = self.num_accepted_drafts + 1
 
         num_accepted_drafts_cpu = self.num_accepted_drafts.cpu()
+        num_accepted_tokens_cpu = num_accepted_drafts_cpu + 1
         num_accepted_drafts = num_accepted_drafts_cpu.sum().item()
 
         self._free_cache(batch, page_size, num_accepted_drafts_cpu)
 
         batch.seq_lens.add_(self.num_accepted_tokens)
-        batch.seq_lens_cpu.add_(num_accepted_drafts_cpu + 1)
+        batch.seq_lens_cpu.add_(num_accepted_tokens_cpu)
 
         return logits_output, self.verified_id, num_accepted_drafts
 

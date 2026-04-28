@@ -526,8 +526,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             # num_accepted_drafts is drafts-only; extend QO length per req is +1 (bonus token).
             extend_lens = spec_info.num_accepted_tokens[:bs]
-            if spec_info.num_accepted_drafts_cpu:
-                metadata.max_seq_len_q = max(spec_info.num_accepted_drafts_cpu) + 1
+            if spec_info.num_accepted_tokens_cpu:
+                metadata.max_seq_len_q = max(spec_info.num_accepted_tokens_cpu)
             else:
                 metadata.max_seq_len_q = 1
 
