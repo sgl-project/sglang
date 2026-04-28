@@ -85,6 +85,41 @@ class SchedulerOutputProcessorMixin:
 
         return None
 
+    def init_return_logprob_containers(self) -> None:
+        """Initialize return_logprob output containers during scheduler init."""
+        self.input_token_logprobs_val = []
+        self.input_token_logprobs_idx = []
+        self.output_token_logprobs_val = []
+        self.output_token_logprobs_idx = []
+        self.input_top_logprobs_val = []
+        self.input_top_logprobs_idx = []
+        self.output_top_logprobs_val = []
+        self.output_top_logprobs_idx = []
+        self.input_token_ids_logprobs_val = []
+        self.input_token_ids_logprobs_idx = []
+        self.output_token_ids_logprobs_val = []
+        self.output_token_ids_logprobs_idx = []
+
+    def clear_list(self):
+        for name in [
+            "input_token_logprobs_val",
+            "input_token_logprobs_idx",
+            "output_token_logprobs_val",
+            "output_token_logprobs_idx",
+            "input_top_logprobs_val",
+            "input_top_logprobs_idx",
+            "output_top_logprobs_val",
+            "output_top_logprobs_idx",
+            "input_token_ids_logprobs_val",
+            "input_token_ids_logprobs_idx",
+            "output_token_ids_logprobs_val",
+            "output_token_ids_logprobs_idx",
+        ]:
+            if hasattr(self, name):
+                getattr(self, name).clear()
+            else:
+                setattr(self, name, [])
+
     def process_batch_result_prebuilt(self: Scheduler, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
         for req in batch.reqs:
@@ -972,29 +1007,22 @@ class SchedulerOutputProcessorMixin:
 
         time_stats = []
 
-        if return_logprob:
-            input_token_logprobs_val = []
-            input_token_logprobs_idx = []
-            output_token_logprobs_val = []
-            output_token_logprobs_idx = []
-            input_top_logprobs_val = []
-            input_top_logprobs_idx = []
-            output_top_logprobs_val = []
-            output_top_logprobs_idx = []
-            input_token_ids_logprobs_val = []
-            input_token_ids_logprobs_idx = []
-            output_token_ids_logprobs_val = []
-            output_token_ids_logprobs_idx = []
-        else:
-            input_token_logprobs_val = input_token_logprobs_idx = (
-                output_token_logprobs_val
-            ) = output_token_logprobs_idx = input_top_logprobs_val = (
-                input_top_logprobs_idx
-            ) = output_top_logprobs_val = output_top_logprobs_idx = (
-                input_token_ids_logprobs_val
-            ) = input_token_ids_logprobs_idx = output_token_ids_logprobs_val = (
-                output_token_ids_logprobs_idx
-            ) = None
+        if self.input_token_logprobs_val != None:
+            self.clear_list()
+
+        if not return_logprob:
+            self.input_token_logprobs_val = None
+            self.input_token_logprobs_idx = None
+            self.output_token_logprobs_val = None
+            self.output_token_logprobs_idx = None
+            self.input_top_logprobs_val = None
+            self.input_top_logprobs_idx = None
+            self.output_top_logprobs_val = None
+            self.output_top_logprobs_idx = None
+            self.input_token_ids_logprobs_val = None
+            self.input_token_ids_logprobs_idx = None
+            self.output_token_ids_logprobs_val = None
+            self.output_token_ids_logprobs_idx = None
 
         for req in reqs:
             if req is skip_req:
@@ -1083,65 +1111,69 @@ class SchedulerOutputProcessorMixin:
                         # Only send when input logprobs have been computed (after prefill)
                         and req.input_token_logprobs_val is not None
                     ):
-                        input_token_logprobs_val.append(req.input_token_logprobs_val)
-                        input_token_logprobs_idx.append(req.input_token_logprobs_idx)
-                        input_top_logprobs_val.append(req.input_top_logprobs_val)
-                        input_top_logprobs_idx.append(req.input_top_logprobs_idx)
-                        input_token_ids_logprobs_val.append(
+                        self.input_token_logprobs_val.append(
+                            req.input_token_logprobs_val
+                        )
+                        self.input_token_logprobs_idx.append(
+                            req.input_token_logprobs_idx
+                        )
+                        self.input_top_logprobs_val.append(req.input_top_logprobs_val)
+                        self.input_top_logprobs_idx.append(req.input_top_logprobs_idx)
+                        self.input_token_ids_logprobs_val.append(
                             req.input_token_ids_logprobs_val
                         )
-                        input_token_ids_logprobs_idx.append(
+                        self.input_token_ids_logprobs_idx.append(
                             req.input_token_ids_logprobs_idx
                         )
                         req.input_logprob_sent = True
                     else:
-                        input_token_logprobs_val.append([])
-                        input_token_logprobs_idx.append([])
-                        input_top_logprobs_val.append([])
-                        input_top_logprobs_idx.append([])
-                        input_token_ids_logprobs_val.append([])
-                        input_token_ids_logprobs_idx.append([])
+                        self.input_token_logprobs_val.append([])
+                        self.input_token_logprobs_idx.append([])
+                        self.input_top_logprobs_val.append([])
+                        self.input_top_logprobs_idx.append([])
+                        self.input_token_ids_logprobs_val.append([])
+                        self.input_token_ids_logprobs_idx.append([])
 
                     if req.return_logprob:
                         logprob_end = max(len(output_ids_), 1)
-                        output_token_logprobs_val.append(
+                        self.output_token_logprobs_val.append(
                             req.output_token_logprobs_val[
                                 send_output_token_logprobs_offset:logprob_end
                             ]
                         )
-                        output_token_logprobs_idx.append(
+                        self.output_token_logprobs_idx.append(
                             req.output_token_logprobs_idx[
                                 send_output_token_logprobs_offset:logprob_end
                             ]
                         )
-                        output_top_logprobs_val.append(
+                        self.output_top_logprobs_val.append(
                             req.output_top_logprobs_val[
                                 send_output_token_logprobs_offset:logprob_end
                             ]
                         )
-                        output_top_logprobs_idx.append(
+                        self.output_top_logprobs_idx.append(
                             req.output_top_logprobs_idx[
                                 send_output_token_logprobs_offset:logprob_end
                             ]
                         )
-                        output_token_ids_logprobs_val.append(
+                        self.output_token_ids_logprobs_val.append(
                             req.output_token_ids_logprobs_val[
                                 send_output_token_logprobs_offset:logprob_end
                             ]
                         )
-                        output_token_ids_logprobs_idx.append(
+                        self.output_token_ids_logprobs_idx.append(
                             req.output_token_ids_logprobs_idx[
                                 send_output_token_logprobs_offset:logprob_end
                             ]
                         )
                         req.send_output_token_logprobs_offset = logprob_end
                     else:
-                        output_token_logprobs_val.append([])
-                        output_token_logprobs_idx.append([])
-                        output_top_logprobs_val.append([])
-                        output_top_logprobs_idx.append([])
-                        output_token_ids_logprobs_val.append([])
-                        output_token_ids_logprobs_idx.append([])
+                        self.output_token_logprobs_val.append([])
+                        self.output_token_logprobs_idx.append([])
+                        self.output_top_logprobs_val.append([])
+                        self.output_top_logprobs_idx.append([])
+                        self.output_token_ids_logprobs_val.append([])
+                        self.output_token_ids_logprobs_idx.append([])
 
                 if req.return_hidden_states:
                     if output_hidden_states is None:
@@ -1192,18 +1224,18 @@ class SchedulerOutputProcessorMixin:
                     completion_tokens=completion_tokens,
                     cached_tokens=cached_tokens,
                     cached_tokens_details=cached_tokens_details,
-                    input_token_logprobs_val=input_token_logprobs_val,
-                    input_token_logprobs_idx=input_token_logprobs_idx,
-                    output_token_logprobs_val=output_token_logprobs_val,
-                    output_token_logprobs_idx=output_token_logprobs_idx,
-                    input_top_logprobs_val=input_top_logprobs_val,
-                    input_top_logprobs_idx=input_top_logprobs_idx,
-                    output_top_logprobs_val=output_top_logprobs_val,
-                    output_top_logprobs_idx=output_top_logprobs_idx,
-                    input_token_ids_logprobs_val=input_token_ids_logprobs_val,
-                    input_token_ids_logprobs_idx=input_token_ids_logprobs_idx,
-                    output_token_ids_logprobs_val=output_token_ids_logprobs_val,
-                    output_token_ids_logprobs_idx=output_token_ids_logprobs_idx,
+                    input_token_logprobs_val=self.input_token_logprobs_val,
+                    input_token_logprobs_idx=self.input_token_logprobs_idx,
+                    output_token_logprobs_val=self.output_token_logprobs_val,
+                    output_token_logprobs_idx=self.output_token_logprobs_idx,
+                    input_top_logprobs_val=self.input_top_logprobs_val,
+                    input_top_logprobs_idx=self.input_top_logprobs_idx,
+                    output_top_logprobs_val=self.output_top_logprobs_val,
+                    output_top_logprobs_idx=self.output_top_logprobs_idx,
+                    input_token_ids_logprobs_val=self.input_token_ids_logprobs_val,
+                    input_token_ids_logprobs_idx=self.input_token_ids_logprobs_idx,
+                    output_token_ids_logprobs_val=self.output_token_ids_logprobs_val,
+                    output_token_ids_logprobs_idx=self.output_token_ids_logprobs_idx,
                     output_token_entropy_val=None,
                     output_hidden_states=output_hidden_states,
                     routed_experts=routed_experts,

@@ -407,6 +407,7 @@ class Scheduler(
 
         # Init inter-process communication
         self.init_ipc_channels(port_args)
+        self.init_return_logprob_containers()
 
         # Init PD-multiplexing context
         if self.enable_pdmux:
@@ -1888,6 +1889,8 @@ class Scheduler(
                 multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
             )
             req.tokenizer = self.tokenizer
+            req.eos_token_id = self.tokenizer.eos_token_id
+            req.additional_stop_token_ids = self.tokenizer.additional_stop_token_ids
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
@@ -1944,6 +1947,8 @@ class Scheduler(
                 http_worker_ipc=recv_req.http_worker_ipc,
             )
             req.tokenizer = self.tokenizer
+            req.eos_token_id = self.tokenizer.eos_token_id
+            req.additional_stop_token_ids = self.tokenizer.additional_stop_token_ids
             req.set_finish_with_abort(error_msg)
             self.init_req_max_new_tokens(req)
             self._add_request_to_queue(req)
@@ -2210,6 +2215,8 @@ class Scheduler(
             multi_item_delimiter_indices=recv_req.multi_item_delimiter_indices,
         )
         req.tokenizer = self.tokenizer
+        req.eos_token_id = self.tokenizer.eos_token_id
+        req.additional_stop_token_ids = self.tokenizer.additional_stop_token_ids
 
         # Handle multimodal inputs
         if recv_req.image_inputs is not None:
