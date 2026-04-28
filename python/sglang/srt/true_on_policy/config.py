@@ -111,14 +111,14 @@ def should_use_tp_invariant_row_linear(
     server_args: Optional[Any] = None,
     row_linear_enable_inv: Optional[bool] = None,
 ) -> bool:
-    if row_linear_enable_inv is None:
-        row_linear_enable_inv = os.environ.get("ROW_LINEAR_ENABLE_INV", "0") == "1"
+    policy_enabled = resolve_true_on_policy_runtime_policy(
+        _get_server_args(server_args)
+    ).tp_invariant_row_linear
+    if row_linear_enable_inv is not None:
+        policy_enabled = policy_enabled and row_linear_enable_inv
 
     return (
-        resolve_true_on_policy_runtime_policy(
-            _get_server_args(server_args)
-        ).tp_invariant_row_linear
-        and row_linear_enable_inv
+        policy_enabled
         and k_size >= ROW_LINEAR_INV_BLOCK_K
         and k_size % ROW_LINEAR_INV_BLOCK_K == 0
     )

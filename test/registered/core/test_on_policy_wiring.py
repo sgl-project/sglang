@@ -304,6 +304,17 @@ class TestOnPolicyHelpers(unittest.TestCase):
             )
         )
 
+    def test_tp_invariant_row_linear_selection_is_contract_owned(self):
+        server_args = SimpleNamespace(rl_on_policy_target="fsdp_tp")
+
+        with patch.dict(os.environ, {"ROW_LINEAR_ENABLE_INV": "0"}):
+            self.assertTrue(
+                should_use_tp_invariant_row_linear(
+                    256,
+                    server_args=server_args,
+                )
+            )
+
     def test_contract_resolver_preserves_legacy_target_behavior(self):
         policy = resolve_true_on_policy_runtime_policy(
             SimpleNamespace(
@@ -585,7 +596,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
             ),
         )
 
-    def test_row_linear_env_var_gate(self):
+    def test_row_linear_explicit_override_can_disable(self):
         server_args = SimpleNamespace(rl_on_policy_target="fsdp_tp")
         self.assertFalse(
             should_use_tp_invariant_row_linear(
