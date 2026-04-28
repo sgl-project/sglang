@@ -1,0 +1,31 @@
+# SMOKE TEST — verifies the full SuperGPQA pipeline end-to-end.
+# Tiny dataset + single-cell sweep so the whole thing finishes in a few
+# minutes. Use `supergpqa_think.yaml` for the real run.
+task: supergpqa
+variant: smoke
+
+dataset:
+  limit: 8                     # 8 prompts total — enough to exercise all 4 disciplines
+  seed: 1234
+
+sampling:
+  enable_thinking: true
+  max_tokens: 8192
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5
+  frequency_penalty: 0.5
+
+calibration:
+  num_prompts: 8               # calibrate on all 8 smoke prompts
+  mc: 32                       # small mc so KV fits quickly on one A100-80GB
+  gpu: 4
+  port: 31304
+  nccl_port: 41304
+
+sweep:
+  mc_list: [32]                # single cell at mc=32
+  dynamic_variants: [thr128]           # single variant
+  gpus: [4]                    # stay on GPU 4 (GPU 5 reserved for lcb_v6 smoke)
+  num_prompts: 8               # all 8 prompts

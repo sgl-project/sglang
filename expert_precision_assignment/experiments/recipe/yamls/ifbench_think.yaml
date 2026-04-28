@@ -1,0 +1,39 @@
+# IFBench with Qwen3 thinking mode enabled (canonical recipe).
+# Artifact prefix: ifbench_think
+#
+# Notes:
+# - Full 300-prompt IFBench with thinking on hits max_tokens=8192 on ~100% of
+#   requests (Qwen3 thinks for a long time). Sweep runtime is ~4× the nothink
+#   variant.  Scores are often worse than nothink due to thinking-mode
+#   repetition pathologies (see journal: rows 1/3/10 in the sample-16 calib).
+# - frequency_penalty=0.5 reduces but does not eliminate paragraph-level
+#   rewrite loops.  For the primary evaluation run use ifbench_nothink; use
+#   this recipe only when comparing thinking vs. non-thinking.
+task: ifbench
+variant: think
+
+dataset:
+  limit: 0                    # 0 = all 300 prompts
+
+sampling:
+  enable_thinking: true
+  max_tokens: 8192
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5
+  frequency_penalty: 0.5
+
+calibration:
+  num_prompts: 256
+  mc: 128
+  gpu: 4
+  port: 31304
+  nccl_port: 41304
+
+sweep:
+  mc_list: [8, 16, 32, 64, 128, 256]
+  dynamic_variants: [hot0, hot20, hot40, hot60, hot80, hot100,
+             thr32, thr64, thr128, thr256, thr512]
+  gpus: [4, 5, 6, 7]
+  num_prompts: 0              # 0 = all

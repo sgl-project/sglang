@@ -4,16 +4,16 @@ output/
 # Generated sweep artifacts — regenerable via run_sweep.sh.
 # Commit only aggregated summary tables + plots (PNG / CSV); drop the
 # per-run JSON/JSONL + server logs.
-profile/results/**/*.jsonl
-profile/results/**/*.json
-profile/results/**/*.log
-profile/results/*.log
+experiments/data/results/**/*.jsonl
+experiments/data/results/**/*.json
+experiments/data/results/**/*.log
+experiments/data/results/*.log
 # Repo-root .gitignore globally ignores *.csv; whitelist aggregated summaries.
-!profile/results/**/summary.csv
+!experiments/data/results/**/summary.csv
 
 # KV calibration outputs — regenerable via run_calib.sh.
 # Dataset disk cache is large (~1 GB) and always rebuildable.
-profile/kv_calib/
+experiments/data/kv_calib/
 
 # Python caches
 __pycache__/

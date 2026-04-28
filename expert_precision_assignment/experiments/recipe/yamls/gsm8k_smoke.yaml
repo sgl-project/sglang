@@ -1,0 +1,40 @@
+# SMOKE TEST — verifies the bench_eval (lm-eval-harness) pipeline path
+# end-to-end on gsm8k. Tiny limit + single-cell sweep so the whole thing
+# finishes in a few minutes.
+#
+# bench_eval-mode tasks (gsm8k, mmlu_*, hellaswag, winogrande, etc.) have
+# no prepare_prompts script — lm-eval pulls the dataset itself, so the
+# `prep` stage is a no-op and `scoring.enabled=false` skips the offline
+# scorer (bench_eval already reports accuracy inside the trace).
+task: gsm8k
+variant: smoke
+
+# dataset section is unused for bench_eval mode (lm-eval pulls from HF).
+dataset:
+  limit: 0
+
+sampling:
+  enable_thinking: false
+  max_tokens: 512
+  temperature: 0
+  top_p: 1.0
+  top_k: 0
+  presence_penalty: 0
+  frequency_penalty: 0
+
+calibration:
+  num_prompts: 8     # → CALIB_LIMIT for bench_eval (8 docs)
+  mc: 32
+  gpu: 4
+  port: 31304
+  nccl_port: 41304
+
+sweep:
+  mc_list: [32]      # single cell at mc=32
+  dynamic_variants: [hess0]  # single hessian-routing variant
+  gpus: [4]
+  num_prompts: 0     # ignored in bench_eval mode
+  limit: 8           # bench_eval --limit (8 docs per cell)
+
+scoring:
+  enabled: false     # bench_eval has built-in accuracy

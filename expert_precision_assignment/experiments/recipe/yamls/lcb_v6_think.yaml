@@ -1,0 +1,48 @@
+# LiveCodeBench v6 (1,055 competitive-programming problems).
+# Code generation benefits from thinking — the model uses it to plan
+# algorithms before emitting the fenced ```python``` block.
+#
+# Optional contamination filter: add a date window if comparing against
+# a pre-training cutoff.  Example:
+#     dataset:
+#       start_date: "2024-08-01"
+#       end_date:   "2025-04-15"
+task: livecodebench_v6
+variant: think
+
+dataset:
+  limit: 0
+  start_date: null
+  end_date: null
+
+sampling:
+  enable_thinking: true
+  max_tokens: 8192
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5
+  frequency_penalty: 0.5
+
+calibration:
+  num_prompts: 128            # LCB problems are long; 128 is enough for KV sizing
+  mc: 128
+  gpu: 4
+  port: 31304
+  nccl_port: 41304
+
+sweep:
+  mc_list: [8, 16, 32, 64, 128, 256]
+  dynamic_variants: [hot0, hot20, hot40, hot60, hot80, hot100,
+             thr32, thr64, thr128, thr256, thr512]
+  gpus: [4, 5, 6, 7]
+  num_prompts: 0
+
+scoring:
+  # !!! SECURITY — LCB scoring EXECUTES model-generated Python locally.
+  # The lcb_runner harness applies a CPU time-limit but is NOT a sandbox.
+  # For untrusted models, either flip this off and score manually in a
+  # container, or ensure you trust what Qwen3 produced on your sweep.
+  enabled: true
+  # Per-test-case timeout (seconds).  LCB default is 6.
+  extra_args: ["--timeout", "6"]

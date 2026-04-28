@@ -39,7 +39,15 @@ def _make_layer(config):
 def _make_inputs(with_logits=False):
     torch.manual_seed(0)
     x = torch.randn(16, H, dtype=torch.bfloat16, device="cuda")
-    topk_ids = torch.randint(0, E, (16, K), device="cuda")
+    # Cover every expert with >=1 routed slot. The fused-Marlin INT4 MoE
+    # kernel produces wildly wrong output (~1e+33 magnitudes) when only 1
+    # or 2 INT4 experts in the layer receive any tokens, an artifact of the
+    # kernel that's unrelated to the heter dispatch logic these tests cover.
+    n_slots = 16 * K
+    base = torch.arange(E, device="cuda").repeat((n_slots + E - 1) // E)[:n_slots]
+    perm_gen = torch.Generator(device="cuda").manual_seed(1)
+    perm = torch.randperm(n_slots, device="cuda", generator=perm_gen)
+    topk_ids = base[perm].view(16, K)
     topk_weights = torch.rand(16, K, dtype=torch.bfloat16, device="cuda")
     router_logits = torch.randn(16, E, device="cuda") if with_logits else None
     return x, make_topk_output(topk_weights, topk_ids, router_logits)
@@ -81,6 +89,7 @@ class TestSamePrecisionSplitBF16:
         one_cfg = {
             "groups": [{"name": "all", "num_bits": 16, "size_ratio": 1.0}],
             "policy": "random", "policy_params": {"seed": SEED},
+            "bf16_promotion_threshold": 10**9,
         }
         layer1 = _make_layer(one_cfg)
         layer1.w13_weight.data.copy_(bf16_w13)
@@ -93,6 +102,7 @@ class TestSamePrecisionSplitBF16:
                 {"name": "g1", "num_bits": 16, "size_ratio": 0.5},
             ],
             "policy": "random", "policy_params": {"seed": SEED},
+            "bf16_promotion_threshold": 10**9,
         }
         layer2 = _make_layer(two_cfg)
         layer2.w13_weight.data.copy_(bf16_w13)
@@ -108,6 +118,7 @@ class TestSamePrecisionSplitBF16:
         one_cfg = {
             "groups": [{"name": "all", "num_bits": 16, "size_ratio": 1.0}],
             "policy": "random", "policy_params": {"seed": SEED},
+            "bf16_promotion_threshold": 10**9,
         }
         layer1 = _make_layer(one_cfg)
         layer1.w13_weight.data.copy_(bf16_w13)
@@ -121,6 +132,7 @@ class TestSamePrecisionSplitBF16:
                 {"name": "g2", "num_bits": 16, "size_ratio": 0.25},
             ],
             "policy": "random", "policy_params": {"seed": SEED},
+            "bf16_promotion_threshold": 10**9,
         }
         layer3 = _make_layer(three_cfg)
         layer3.w13_weight.data.copy_(bf16_w13)
@@ -139,6 +151,7 @@ class TestSamePrecisionSplitINT4:
         one_cfg = {
             "groups": [{"name": "all", "num_bits": 4, "size_ratio": 1.0, "group_size": GROUP_SIZE}],
             "policy": "random", "policy_params": {"seed": SEED},
+            "bf16_promotion_threshold": 10**9,
         }
         layer = _make_layer(one_cfg)
         _fill_int4(layer, bf16_w13, bf16_w2)
@@ -155,6 +168,7 @@ class TestSamePrecisionSplitINT4:
         one_cfg = {
             "groups": [{"name": "all", "num_bits": 4, "size_ratio": 1.0, "group_size": GROUP_SIZE}],
             "policy": "random", "policy_params": {"seed": SEED},
+            "bf16_promotion_threshold": 10**9,
         }
         layer_one = _make_layer(one_cfg)
         _fill_int4(layer_one, bf16_w13, bf16_w2)
@@ -165,6 +179,7 @@ class TestSamePrecisionSplitINT4:
                 {"name": "g1", "num_bits": 4, "size_ratio": 0.5, "group_size": GROUP_SIZE},
             ],
             "policy": "random", "policy_params": {"seed": SEED},
+            "bf16_promotion_threshold": 10**9,
         }
         layer_two = _make_layer(two_cfg)
         _fill_int4(layer_two, bf16_w13, bf16_w2)
@@ -196,6 +211,7 @@ class TestMixedPrecisionSplit:
         cfg = {
             "groups": [{"name": "all", "num_bits": 16, "size_ratio": 1.0}],
             "policy": "random", "policy_params": {"seed": SEED},
+            "bf16_promotion_threshold": 10**9,
         }
         layer = _make_layer(cfg)
         layer.w13_weight.data.copy_(bf16_w13)
@@ -207,6 +223,7 @@ class TestMixedPrecisionSplit:
         cfg = {
             "groups": [{"name": "all", "num_bits": 4, "size_ratio": 1.0, "group_size": GROUP_SIZE}],
             "policy": "random", "policy_params": {"seed": SEED},
+            "bf16_promotion_threshold": 10**9,
         }
         layer = _make_layer(cfg)
         _fill_int4(layer, bf16_w13, bf16_w2)
@@ -220,6 +237,7 @@ class TestMixedPrecisionSplit:
                 {"name": "high_prec", "num_bits": 16, "size_ratio": 0.5},
             ],
             "policy": "random", "policy_params": {"seed": SEED},
+            "bf16_promotion_threshold": 10**9,
         }
         layer = _make_layer(cfg)
         layer.w13_weight.data.copy_(bf16_w13)
@@ -239,7 +257,24 @@ class TestMixedPrecisionSplit:
         assert out_bf16.isfinite().all(), "BF16 output contains NaN/Inf"
         assert out_int4.isfinite().all(), "INT4 output contains NaN/Inf"
 
+
+        # Add to test_int4_vs_bf16_bounded_mse, replacing the print block:                                
+        diff = (out_bf16.float() - out_int4.float())                                                      
+        sq = diff.pow(2)                                                                                  
+        print("out_int4 stats:", out_int4.abs().max().item(), out_int4.abs().mean().item())               
+        print("rows with |int4| > 1.0:", (out_int4.abs().max(dim=1).values > 1.0).nonzero().flatten().tolist())                                                                
+        print("worst row:", sq.max(dim=1).values.argmax().item())                                         
+        worst = sq.max(dim=1).values.argmax().item()                                                      
+        print(f"row {worst}: bf16 max={out_bf16[worst].abs().max():.4e}, int4 max={out_int4[worst].abs().max():.4e}")                                                           
+        print("topk_ids[worst]:", topk_out.topk_ids[worst].tolist())                                      
+        print("topk_weights[worst]:", topk_out.topk_weights[worst].tolist())    
+        # print(out_bf16.float().view(-1)[:5])
+        # print(out_int4.float().view(-1)[:5])
+        # print((out_bf16.float() - out_int4.float()).view(-1)[:5])
+        # print((out_bf16.float() - out_int4.float()).pow(2).view(-1)[:5])
+        assert (out_bf16.float() - out_int4.float()).isfinite().all(), "Difference between BF16 and INT4 contains NaN/Inf"
         mse = (out_bf16.float() - out_int4.float()).pow(2).mean().item()
+        print(f"INT4 vs BF16 MSE: {mse:.6f}")
         assert mse > 0, "INT4 should differ from BF16 (quantization error)"
         assert mse < 1.0, f"INT4 vs BF16 MSE too large: {mse}"
 
@@ -294,7 +329,8 @@ class TestBatchSizeGatedForward:
                 {"name": "bf16", "num_bits": 16, "size_ratio": 0.5},
             ],
             "policy": "expert_batch",
-            "policy_params": {"threshold": threshold},
+            "policy_params": {},
+            "bf16_promotion_threshold": threshold,
         }
         layer = _make_layer(cfg)
         layer.w13_weight.data.copy_(bf16_w13)
@@ -310,6 +346,7 @@ class TestBatchSizeGatedForward:
                  **({"group_size": GROUP_SIZE} if num_bits == 4 else {})},
             ],
             "policy": "random", "policy_params": {"seed": SEED},
+            "bf16_promotion_threshold": 10**9,
         }
         layer = _make_layer(cfg)
         if num_bits == 16:
@@ -322,7 +359,13 @@ class TestBatchSizeGatedForward:
     def _make_inputs_n(self, n, with_logits=False):
         torch.manual_seed(0)
         x = torch.randn(n, H, dtype=torch.bfloat16, device="cuda")
-        topk_ids = torch.randint(0, E, (n, K), device="cuda")
+        # Cover every expert with >=1 routed slot — see _make_inputs above
+        # for the fused-Marlin INT4 MoE kernel limitation we're working around.
+        n_slots = n * K
+        base = torch.arange(E, device="cuda").repeat((n_slots + E - 1) // E)[:n_slots]
+        perm_gen = torch.Generator(device="cuda").manual_seed(1)
+        perm = torch.randperm(n_slots, device="cuda", generator=perm_gen)
+        topk_ids = base[perm].view(n, K)
         topk_weights = torch.rand(n, K, dtype=torch.bfloat16, device="cuda")
         router_logits = torch.randn(n, E, device="cuda") if with_logits else None
         return x, make_topk_output(topk_weights, topk_ids, router_logits)
@@ -392,7 +435,8 @@ class TestBatchSizeGatedForward:
                 {"name": "bf16", "num_bits": 16, "size_ratio": 0.5},
             ],
             "policy": "expert_batch",
-            "policy_params": {"threshold": threshold},
+            "policy_params": {},
+            "bf16_promotion_threshold": threshold,
         }
         int4_only_experts = [0, 1, 5, 6]
         layer = HeterFusedMoE(

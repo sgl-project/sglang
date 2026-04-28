@@ -1,0 +1,41 @@
+# SMOKE TEST — verifies the full LCB v6 pipeline end-to-end.
+# Tiny dataset + single-cell sweep so the whole thing finishes in a few
+# minutes. Use `lcb_v6_think.yaml` for the real run.
+#
+# Scoring is DISABLED:
+#   1. lcb_runner is not vendored yet (scoring/vendored/lcb_runner missing).
+#   2. LCB scoring EXECUTES model-generated Python — not a sandbox-safe
+#      default for a smoke test. Vendor lcb_runner + run in a container
+#      for real eval.
+task: livecodebench_v6
+variant: smoke
+
+dataset:
+  limit: 4                     # 4 problems — LCB prompts are large
+  start_date: null
+  end_date: null
+
+sampling:
+  enable_thinking: true
+  max_tokens: 8192
+  temperature: 0.6
+  top_p: 0.95
+  top_k: 20
+  presence_penalty: 1.5
+  frequency_penalty: 0.5
+
+calibration:
+  num_prompts: 4
+  mc: 32                       # small mc so KV fits quickly on one A100-80GB
+  gpu: 5
+  port: 31305
+  nccl_port: 41305
+
+sweep:
+  mc_list: [32]
+  dynamic_variants: [thr128]
+  gpus: [5]                    # stay on GPU 5 (GPU 4 reserved for supergpqa smoke)
+  num_prompts: 4
+
+scoring:
+  enabled: false               # disable — lcb_runner not vendored + safety

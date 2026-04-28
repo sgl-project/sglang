@@ -12,6 +12,7 @@
     }
   ],
   "policy": "expert_batch",
-  "policy_params": {"threshold": 128},
+  "policy_params": {},
+  "bf16_promotion_threshold": 128,
   "int4_only_experts_file": "/data/huanchen/sglang/test/test_heter_moe/e2e/partial_bf16/int4_only_experts.json"
 }

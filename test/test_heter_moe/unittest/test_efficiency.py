@@ -30,7 +30,7 @@ SEED = 42
 # Must be large so compute dominates kernel launch overhead; the
 # hypothesis (INT4 < mixed < BF16) only holds in the compute-bound regime.
 # ---------------------------------------------------------------------------
-KERN_K, KERN_N, KERN_E, KERN_TOP_K = 2048, 1536, 128, 8
+KERN_K, KERN_N, KERN_E, KERN_TOP_K = 2048, 768, 128, 8
 KERN_GROUP_SIZE = 128
 KERN_NUM_BITS = 4
 KERN_COLD_RATIO = 0.8
@@ -274,6 +274,7 @@ def bf16_layer(layer_shared_weights):
         "groups": [{"name": "all", "num_bits": 16, "size_ratio": 1.0}],
         "policy": "random",
         "policy_params": {"seed": SEED},
+        "bf16_promotion_threshold": 10**9,
     }
     layer = _make_layer(cfg)
     layer.w13_weight.data.copy_(bf16_w13)
@@ -296,6 +297,7 @@ def mixed_layer(layer_shared_weights):
         ],
         "policy": "random",
         "policy_params": {"seed": SEED},
+        "bf16_promotion_threshold": 10**9,
     }
     layer = _make_layer(cfg)
     layer.w13_weight.data.copy_(bf16_w13)
@@ -305,23 +307,34 @@ def mixed_layer(layer_shared_weights):
 
 
 # ---------------------------------------------------------------------------
-# 1.4.1 Latency ordering: INT4 <= mixed <= BF16
+# 1.4.1 Latency table for fused heterogeneous {BF16, INT4} MoE
 #
-# Benchmarks at the raw kernel level with large dimensions so the
-# hypothesis holds in the compute-bound regime. At small problem sizes,
-# double kernel launch overhead makes mixed slower than pure BF16.
+# Prints per-batch latencies across pure BF16, pure INT4, cold/hot split,
+# and back-to-back mixed. The only asserted invariant is mix ≈ cold+hot
+# (no surprise overhead from interleaving the two kernels). Pure-BF16 vs
+# pure-INT4 ordering is regime-dependent (memory-bound at small M,
+# compute-bound at large M) and assumes a tuned BF16 tile config exists
+# for (E, intermediate_size, GPU); inspect the printed table.
 # ---------------------------------------------------------------------------
 
 
 PER_EXPERT_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+# Granular sweep around the BF16↔INT4 crossover identified from the coarse
+# sweep above (BF16 wins at M/e=128, INT4 wins at M/e=64). Step 8.
+CROSSOVER_BATCH_SIZES = list(range(48, 96 + 1, 8))
 
 
 @pytest.mark.skipif(not CUDA_AVAILABLE, reason="CUDA not available")
 class TestFusedLatencyOrdering:
-    """Fused {BF16, INT4} latency should be between pure BF16 and pure INT4.
+    """Microbenchmark heterogeneous {BF16, INT4} MoE at Qwen3-30B-A3B shape.
 
-    Uses raw kernel calls (outplace_fused_experts / fused_marlin_moe) with
-    large dimensions (E=64, K=2048, N=768) to ensure compute-bound regime.
+    Shape: E=128, K=2048, N=768 (per-expert intermediate). Uses raw kernel
+    calls (outplace_fused_experts / fused_marlin_moe). The pure-BF16 path
+    requires the tuned tile config at
+      python/sglang/srt/layers/moe/fused_moe_triton/configs/triton_<ver>/
+        E=128,N=768,device_name=<gpu>.json
+    Without it, the kernel falls back to a default tile and BF16 numbers
+    will be 1.5–3x slower than they should be.
     """
 
     def test_latency_between_pure_precisions(self):
@@ -452,25 +465,97 @@ class TestFusedLatencyOrdering:
             f"E={KERN_E}, K={KERN_K}, N={KERN_N}, top_k={KERN_TOP_K}"
         )
 
-        # ---- Assertions (20% tolerance for measurement noise) ----
-        tol = 0.20
+        # ---- Sanity invariant ----
+        # Mixed = cold INT4 + hot BF16 run back-to-back. Should be ≈ the
+        # sum of running them separately, with at most a small graph-fusion
+        # benefit. We don't assert pure-INT4 vs pure-BF16 ordering: with a
+        # properly tuned BF16 tile, BF16 wins at high M (compute-bound;
+        # Ampere has no native int4 tensor cores). With the default
+        # fallback tile, BF16 loses everywhere. Inspect the table above.
+        tol = 0.10
         failures = []
         for M, M_g, bf16, int4, cold, hot, mix in rows:
-            if not (int4 <= bf16 * (1 + tol)):
+            if not (mix <= (cold + hot) * (1 + tol)):
                 failures.append(
-                    f"M/e={M}: INT4 ({int4:.3f}ms) > BF16 ({bf16:.3f}ms)"
-                )
-            if not (int4 * (1 - tol) <= mix):
-                failures.append(
-                    f"M/e={M}: mixed ({mix:.3f}ms) < INT4 ({int4:.3f}ms)"
-                )
-            if not (mix <= bf16 * (1 + tol)):
-                failures.append(
-                    f"M/e={M}: mixed ({mix:.3f}ms) > BF16 ({bf16:.3f}ms)"
+                    f"M/e={M}: mixed ({mix:.3f}ms) > cold+hot "
+                    f"({cold + hot:.3f}ms) by >{int(tol * 100)}%"
                 )
         assert not failures, (
-            "Latency ordering violated:\n  " + "\n  ".join(failures)
+            "Mixed kernel has unexpected overhead vs sequential cold+hot:\n  "
+            + "\n  ".join(failures)
         )
+
+    def test_int4_bf16_crossover(self):
+        """Granular sweep to locate the BF16↔INT4 crossover.
+
+        Times pure BF16 vs pure INT4 (Marlin) at M/e ∈ {64, 80, 96, 112,
+        128}. Diagnostic only — no latency assertion. Reports the
+        smallest M/e where BF16 ≤ INT4.
+        """
+        from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import (
+            fused_marlin_moe,
+        )
+        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
+            outplace_fused_experts,
+        )
+
+        device = torch.device("cuda")
+        bf16_w13, bf16_w2 = _make_bf16_weights(device)
+        int4_w1, int4_w2, int4_s1, int4_s2 = _make_int4_weights(device)
+
+        rows = []
+        for m_per_expert in CROSSOVER_BATCH_SIZES:
+            x, topk_w, topk_ids, gating = _make_kernel_inputs(m_per_expert, device)
+            M_global = x.shape[0]
+
+            lat_bf16 = _bench(
+                lambda: outplace_fused_experts(
+                    x, bf16_w13, bf16_w2, topk_w, topk_ids
+                ),
+                device,
+            )
+            lat_int4 = _bench(
+                lambda: fused_marlin_moe(
+                    x, int4_w1, int4_w2, int4_s1, int4_s2,
+                    gating, topk_w, topk_ids,
+                    num_bits=KERN_NUM_BITS, is_k_full=True,
+                ),
+                device,
+            )
+            rows.append((m_per_expert, M_global, lat_bf16, lat_int4))
+
+        W = 72
+        print(f"\n{'=' * W}")
+        print(
+            f"BF16↔INT4 crossover sweep  "
+            f"(E={KERN_E}, K={KERN_K}, N={KERN_N}, top_k={KERN_TOP_K})"
+        )
+        print("-" * W)
+        print(
+            f"{'M/e':>5} {'Mglob':>6} | "
+            f"{'a16w16':>9} {'a16w4':>9} | "
+            f"{'BF16/INT4':>10} {'winner':>8}"
+        )
+        print("-" * W)
+        crossover = None
+        for M, M_g, bf16, int4 in rows:
+            ratio = bf16 / int4
+            winner = "BF16" if bf16 < int4 else "INT4"
+            if crossover is None and bf16 <= int4:
+                crossover = M
+            print(
+                f"{M:>5} {M_g:>6} | "
+                f"{bf16:9.3f} {int4:9.3f} | "
+                f"{ratio:>10.3f} {winner:>8}"
+            )
+        print("=" * W)
+        if crossover is not None:
+            print(f"Crossover: BF16 first wins at M/e = {crossover}")
+        else:
+            print(
+                f"No crossover within {CROSSOVER_BATCH_SIZES} "
+                f"— INT4 wins through M/e={CROSSOVER_BATCH_SIZES[-1]}"
+            )
 
 
 # ---------------------------------------------------------------------------

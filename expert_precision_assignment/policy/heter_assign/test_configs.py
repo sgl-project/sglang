@@ -1,6 +1,6 @@
 """Smoke test for generated mc configs.
 
-Walks ``profile/configs/mc{mc}/`` and validates, for each mc:
+Walks ``experiments/data/configs/mc{mc}/`` and validates, for each mc:
 
 1. ``heter_config.json`` has the expected schema (groups, policy, file ref).
 2. ``int4_only_experts.json`` covers valid (layer, expert) ids within the

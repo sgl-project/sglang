@@ -1,0 +1,43 @@
+# gsm8k benchmark with INT4 attention swap.
+# Sweeps the canonical hess0..hess100 ladder at mc=64 across GPUs 0-3.
+# `quant.attention_num_bits: 4` swaps every layer's self_attn.qkv_proj+o_proj
+# to INT4 GPTQ-Marlin at server load (in addition to whatever expert-quant
+# policy hess<N> selects).
+#
+# bench_eval mode — lm-eval pulls gsm8k itself, so prep is a no-op and
+# scoring is built into the trace (scoring.enabled=false).
+task: gsm8k
+variant: attn_int4
+
+dataset:
+  limit: 0
+
+sampling:
+  enable_thinking: false
+  max_tokens: 512
+  temperature: 0
+  top_p: 1.0
+  top_k: 0
+  presence_penalty: 0
+  frequency_penalty: 0
+
+calibration:
+  num_prompts: 128
+  mc: 64           # must match sweep.mc_list entry
+  gpu: 0
+  port: 31310
+  nccl_port: 41310
+
+sweep:
+  mc_list: [64]
+  dynamic_variants: [hess0, hess20, hess40, hess60, hess80, hess100]
+  attention_num_bits: 4
+  heter_residence: hybrid
+
+  gpus: [0, 1, 2, 3]
+
+  num_prompts: 0    # ignored in bench_eval mode
+  limit: 0          # 0 = full gsm8k test split (1319 docs)
+
+scoring:
+  enabled: false    # bench_eval reports strict-match / flex-extract in-trace

@@ -6,6 +6,16 @@ with shape ``[N, K]``.  Non-group expert slots use sentinel expert ID
 (``num_experts``) and zero scale so the kernel skips them.
 
 All operations use fixed-shape GPU tensors -- torch.compile and CUDA graph safe.
+
+Layered design:
+  - The ABC owns a per-expert routed-token-count tensor and a universal
+    "promote any expert with count >= threshold to BF16" rule. The threshold
+    is a required ctor arg sourced from ``heter_config.bf16_promotion_threshold``.
+  - Subclasses implement ``_assign(counts, ...)`` -- the policy-specific
+    expert-to-group scoring strategy. They may read the precomputed counts.
+  - ``int4_only_mask`` is the final word: experts in that mask have no BF16
+    weights loaded, so they stay INT4 even when the threshold rule would
+    promote them. ``bf16_only_mask`` is also a final-word forced override.
 """
 
 import abc
@@ -91,15 +101,28 @@ def _assign_by_score_gpu(
 class HeterDispatchPolicy(abc.ABC):
     """Base class for heterogeneous MoE dispatch policies.
 
-    Subclasses implement ``_assign()`` -- the expert-to-group assignment
-    strategy.  ``dispatch()`` calls ``_assign()``, then builds per-group
-    ``(experts, scales)`` tuples with sentinel masking via ``torch.where``.
+    Layered responsibilities:
+
+    * ABC owns ``_token_count_buf`` (per-expert routed-token counts), populated
+      every dispatch by ``_compute_token_counts`` from ``token_selected_experts``.
+    * Subclasses implement ``_assign(counts, experts, scales)`` -- the
+      policy-specific scoring strategy.  They may read ``counts`` rather than
+      recomputing.  Children also (optionally) hold a per-expert score buffer
+      e.g.  ``_weight_sum_buf`` for total-weight ranking or static ``_importance``
+      for Hessian weighting.
+    * After ``_assign`` returns, ``dispatch`` applies the universal **BF16
+      promotion rule**: any expert with ``count >= bf16_promotion_threshold``
+      goes to the BF16 group regardless of policy choice.
+    * ``_dispatch_from_expert_to_group`` then applies forced-precision masks
+      (``int4_only`` first, ``bf16_only`` last), so an INT4-only expert stays
+      INT4 even when the threshold rule would have promoted it.
     """
 
     def __init__(
         self,
         num_experts: int,
         group_size_ratios: List[float],
+        bf16_promotion_threshold: int,
         device: Optional[torch.device] = None,
         int4_only_mask: Optional[torch.Tensor] = None,
         int4_group_idx: int = 0,
@@ -111,19 +134,43 @@ class HeterDispatchPolicy(abc.ABC):
         if device is None:
             device = torch.device("cuda")
         self._device = device
-        self._expert_to_group_buf = torch.empty(
+        # Pre-zero the assignment buffer at construction time so that cold
+        # downstream kernels (e.g. Marlin INT4) never read stale CUDA-allocator
+        # memory before ``_assign`` populates it.
+        self._expert_to_group_buf = torch.zeros(
+            num_experts, dtype=torch.long, device=device)
+        # Scratch tensor used by ``dispatch`` when applying the universal
+        # BF16 promotion rule.  Decoupled from the buffer the policy's
+        # ``_assign`` returns so that mutating the dispatch result never
+        # corrupts the policy's internal state across calls.
+        self._dispatch_scratch = torch.zeros(
             num_experts, dtype=torch.long, device=device)
         self._group_labels: Optional[torch.Tensor] = None
         if len(group_size_ratios) > 2:
             self._group_labels = _build_group_labels(
                 num_experts, group_size_ratios, device)
 
-        # INT4-only constraint: force these experts to int4_group_idx
+        # INT4-only / BF16-only forced-precision masks (final word in dispatch).
         self._int4_only_mask = int4_only_mask
         self._int4_group_idx = int4_group_idx
-        # BF16-only constraint: force these experts to bf16_group_idx
         self._bf16_only_mask = bf16_only_mask
         self._bf16_group_idx = bf16_group_idx
+
+        # Universal token-count tensor + ones buffer shared by all subclasses.
+        # The counts buffer is sized ``num_experts + 1``: the extra slot at
+        # index ``num_experts`` is a "trash" sink for out-of-range routing
+        # indices (e.g. EP non-local sentinels < 0, or the Marlin
+        # ``num_experts`` sentinel) so ``scatter_add_`` never trips its
+        # bounds check. Subclasses see only the first ``num_experts`` entries
+        # via the slice returned from ``_compute_token_counts``.
+        self._token_count_buf = torch.zeros(
+            num_experts + 1, device=self._device, dtype=torch.float32)
+        self._ones_buf = torch.ones(
+            num_experts, device=self._device, dtype=torch.float32)
+
+        # Universal BF16 promotion threshold. Required: must be specified in
+        # heter_config.json and threaded by the runtime.
+        self._bf16_promotion_threshold = int(bf16_promotion_threshold)
 
     @property
     def num_experts(self) -> int:
@@ -137,13 +184,57 @@ class HeterDispatchPolicy(abc.ABC):
     def group_size_ratios(self) -> List[float]:
         return self._group_size_ratios
 
+    @property
+    def bf16_promotion_threshold(self) -> int:
+        return self._bf16_promotion_threshold
+
+    def _compute_token_counts(
+        self,
+        token_selected_experts: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Populate ``self._token_count_buf`` with per-expert routed counts.
+
+        Returns the buffer.  When ``token_selected_experts is None``, the
+        buffer is zeroed (no expert can cross threshold) -- subclasses can
+        treat that case as "no routing info".
+
+        EP layers remap non-local experts to negative sentinels (and Marlin
+        uses ``num_experts`` as its sentinel); both must be filtered out of
+        the scatter_add_ to keep CUDA's bounds-checker happy without forcing
+        a host sync. We do this by routing all out-of-range indices to a
+        dedicated trash slot at the end of an oversized counts buffer, then
+        slicing it off.
+        """
+        counts = self._token_count_buf
+        counts.zero_()
+        if token_selected_experts is None:
+            return counts[:self._num_experts]
+        flat = token_selected_experts.reshape(-1).long()
+        # Map any out-of-range (negative or >= num_experts) index to the
+        # trash slot at index ``num_experts``.  This is a single in-place
+        # ``where`` against a host-known scalar -- no allocations.
+        valid = (flat >= 0) & (flat < self._num_experts)
+        safe = torch.where(valid, flat, self._num_experts)
+        n = safe.shape[0]
+        if self._ones_buf.shape[0] < n:
+            self._ones_buf = torch.ones(
+                n, device=self._device, dtype=torch.float32)
+        counts.scatter_add_(0, safe, self._ones_buf[:n])
+        return counts[:self._num_experts]
+
     @abc.abstractmethod
     def _assign(
         self,
+        token_counts: torch.Tensor,
         token_selected_experts: Optional[torch.Tensor],
         token_final_scales: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        """Return ``expert_to_group`` tensor ``[num_experts]`` on GPU."""
+        """Return ``expert_to_group`` tensor ``[num_experts]`` on GPU.
+
+        Children may read ``token_counts`` (precomputed by the ABC) instead
+        of recomputing.  The ABC's ``dispatch`` will then apply the universal
+        threshold-promotion rule on top of whatever assignment is returned.
+        """
         ...
 
     def dispatch(
@@ -161,12 +252,24 @@ class HeterDispatchPolicy(abc.ABC):
             sentinel: expert ID for non-group slots. Default -1 (Triton
                 kernels skip -1). Marlin INT4 needs ``num_experts``.
         """
-        expert_to_group = self._assign(
-            token_selected_experts,
-            token_final_scales,
+        token_counts = self._compute_token_counts(token_selected_experts)
+        policy_assignment = self._assign(
+            token_counts, token_selected_experts, token_final_scales,
         )
+        # Copy into our dedicated dispatch scratch before applying the
+        # threshold rule so we never mutate whatever buffer the policy
+        # returned (some children share that buffer with their own state).
+        scratch = self._dispatch_scratch
+        scratch.copy_(policy_assignment)
+        # Universal BF16 promotion: any expert with count >= threshold goes
+        # to BF16, regardless of policy assignment. ``int4_only_mask`` in
+        # ``_dispatch_from_expert_to_group`` then forces ``int4_only`` experts
+        # back to INT4 (no BF16 weights loaded), so the threshold rule is
+        # safe even for forced-INT4 experts.
+        is_promoted = token_counts >= self._bf16_promotion_threshold
+        scratch[is_promoted] = self._bf16_group_idx
         return self._dispatch_from_expert_to_group(
-            expert_to_group, token_selected_experts, token_final_scales,
+            scratch, token_selected_experts, token_final_scales,
             sentinel=sentinel)
 
     def should_skip_group(self, group_idx: int, num_tokens: int) -> bool:
@@ -184,10 +287,11 @@ class HeterDispatchPolicy(abc.ABC):
         sentinel: int = -1,
     ) -> List[GroupDispatchTuple]:
         """Build per-group dispatch tuples using torch.where (fixed shapes)."""
-        # Force INT4-only experts to INT4 group before building dispatches
+        # INT4-only experts have no BF16 weights loaded -- force back to INT4
+        # even if the threshold rule promoted them.
         if self._int4_only_mask is not None:
             expert_to_group[self._int4_only_mask] = self._int4_group_idx
-        # Force BF16-only experts to BF16 group (no INT4 weights available)
+        # BF16-only experts have no INT4 weights -- force to BF16.
         if self._bf16_only_mask is not None:
             expert_to_group[self._bf16_only_mask] = self._bf16_group_idx
 
@@ -213,6 +317,7 @@ class RandomHeterDispatch(HeterDispatchPolicy):
         self,
         num_experts: int,
         group_size_ratios: List[float],
+        bf16_promotion_threshold: int,
         seed: int = 42,
         device: Optional[torch.device] = None,
         int4_only_mask: Optional[torch.Tensor] = None,
@@ -220,17 +325,25 @@ class RandomHeterDispatch(HeterDispatchPolicy):
         bf16_only_mask: Optional[torch.Tensor] = None,
         bf16_group_idx: int = 1,
     ):
-        super().__init__(num_experts, group_size_ratios, device=device,
-                         int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
-                         bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx)
+        super().__init__(
+            num_experts, group_size_ratios,
+            bf16_promotion_threshold=bf16_promotion_threshold,
+            device=device,
+            int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
+            bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx,
+        )
         gen = torch.Generator(device=self._device).manual_seed(seed)
         scores = torch.rand(
             num_experts, device=self._device, generator=gen)
+        # Write the random assignment directly into ``_expert_to_group_buf``
+        # at construction time. The ABC's ``dispatch`` does NOT mutate this
+        # buffer -- it copies into ``_dispatch_scratch`` first -- so a single
+        # init-time write is sufficient for all subsequent calls.
         _assign_by_score_gpu(
             scores, num_experts, group_size_ratios,
             self._expert_to_group_buf, self._group_labels)
 
-    def _assign(self, token_selected_experts, token_final_scales):
+    def _assign(self, token_counts, token_selected_experts, token_final_scales):
         return self._expert_to_group_buf
 
 
@@ -245,6 +358,7 @@ class ConfidenceThresholdHeterDispatch(HeterDispatchPolicy):
         self,
         num_experts: int,
         group_size_ratios: List[float],
+        bf16_promotion_threshold: int,
         confidence_threshold: float = 0.5,
         fallback_seed: int = 42,
         device: Optional[torch.device] = None,
@@ -253,41 +367,45 @@ class ConfidenceThresholdHeterDispatch(HeterDispatchPolicy):
         bf16_only_mask: Optional[torch.Tensor] = None,
         bf16_group_idx: int = 1,
     ):
-        super().__init__(num_experts, group_size_ratios, device=device,
-                         int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
-                         bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx)
+        super().__init__(
+            num_experts, group_size_ratios,
+            bf16_promotion_threshold=bf16_promotion_threshold,
+            device=device,
+            int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
+            bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx,
+        )
         self._confidence_threshold = confidence_threshold
         self._fallback = RandomHeterDispatch(
-            num_experts, group_size_ratios, seed=fallback_seed, device=device,
+            num_experts, group_size_ratios,
+            bf16_promotion_threshold=bf16_promotion_threshold,
+            seed=fallback_seed, device=device,
             int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
             bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx)
         self._expert_weight_sum = torch.empty(
             num_experts, device=self._device, dtype=torch.float32)
-        self._expert_count_buf = torch.zeros(
-            num_experts, device=self._device, dtype=torch.float32)
-        self._ones_buf = torch.ones(
+        # Reciprocal-of-counts buffer used as the divisor for mean weight.
+        # Pre-allocated to avoid per-dispatch alloc; populated each call.
+        self._inv_count_buf = torch.empty(
             num_experts, device=self._device, dtype=torch.float32)
 
-    def _assign(self, token_selected_experts, token_final_scales):
+    def _assign(self, token_counts, token_selected_experts, token_final_scales):
         if token_selected_experts is None or token_final_scales is None:
             return self._fallback._assign(
-                token_selected_experts, token_final_scales)
+                token_counts, token_selected_experts, token_final_scales)
 
         buf = self._expert_weight_sum
         flat_experts = token_selected_experts.reshape(-1).long()
         flat_scales = token_final_scales.reshape(-1)
-        n = flat_experts.shape[0]
-        if self._ones_buf.shape[0] < n:
-            self._ones_buf = torch.ones(n, device=self._device, dtype=torch.float32)
 
         buf.zero_()
         buf.scatter_add_(0, flat_experts, flat_scales)
 
-        expert_count = self._expert_count_buf
-        expert_count.zero_()
-        expert_count.scatter_add_(0, flat_experts, self._ones_buf[:n])
-        expert_count.clamp_min_(1.0)
-        buf.div_(expert_count)
+        # Mean weight = sum(weight) / count, with count clamped to >=1 for
+        # zero-routed experts. Do not mutate the ABC's ``token_counts`` buffer
+        # in place -- the ABC re-reads it for the threshold rule after we return.
+        inv = self._inv_count_buf
+        inv.copy_(token_counts).clamp_(min=1.0).reciprocal_()
+        buf.mul_(inv)
 
         return _assign_by_score_gpu(
             buf, self._num_experts, self._group_size_ratios,
@@ -305,6 +423,7 @@ class TotalWeightHeterDispatch(HeterDispatchPolicy):
         self,
         num_experts: int,
         group_size_ratios: List[float],
+        bf16_promotion_threshold: int,
         fallback_seed: int = 42,
         device: Optional[torch.device] = None,
         int4_only_mask: Optional[torch.Tensor] = None,
@@ -312,20 +431,26 @@ class TotalWeightHeterDispatch(HeterDispatchPolicy):
         bf16_only_mask: Optional[torch.Tensor] = None,
         bf16_group_idx: int = 1,
     ):
-        super().__init__(num_experts, group_size_ratios, device=device,
-                         int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
-                         bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx)
+        super().__init__(
+            num_experts, group_size_ratios,
+            bf16_promotion_threshold=bf16_promotion_threshold,
+            device=device,
+            int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
+            bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx,
+        )
         self._fallback = RandomHeterDispatch(
-            num_experts, group_size_ratios, seed=fallback_seed, device=device,
+            num_experts, group_size_ratios,
+            bf16_promotion_threshold=bf16_promotion_threshold,
+            seed=fallback_seed, device=device,
             int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
             bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx)
         self._weight_sum_buf = torch.empty(
             num_experts, device=self._device, dtype=torch.float32)
 
-    def _assign(self, token_selected_experts, token_final_scales):
+    def _assign(self, token_counts, token_selected_experts, token_final_scales):
         if token_selected_experts is None or token_final_scales is None:
             return self._fallback._assign(
-                token_selected_experts, token_final_scales)
+                token_counts, token_selected_experts, token_final_scales)
 
         buf = self._weight_sum_buf
         flat_experts = token_selected_experts.reshape(-1).long()
@@ -347,6 +472,11 @@ class HessianWeightedRoutingWeightsDispatch(HeterDispatchPolicy):
     noise floor, or all-ones when a layer has no statistically meaningful
     hessian signal). High product -> last group (high-precision).
     Falls back to random when signals are unavailable.
+
+    Threshold-promotion on top: any expert whose routed-token count crosses
+    ``bf16_promotion_threshold`` is forced to BF16 by the ABC after this
+    policy's score-based assignment, i.e. policy_hot ∪ count_hot.
+    ``int4_only_mask`` still wins as a final override.
     """
 
     def __init__(
@@ -354,6 +484,7 @@ class HessianWeightedRoutingWeightsDispatch(HeterDispatchPolicy):
         num_experts: int,
         group_size_ratios: List[float],
         importance: torch.Tensor,
+        bf16_promotion_threshold: int,
         fallback_seed: int = 42,
         device: Optional[torch.device] = None,
         int4_only_mask: Optional[torch.Tensor] = None,
@@ -361,9 +492,13 @@ class HessianWeightedRoutingWeightsDispatch(HeterDispatchPolicy):
         bf16_only_mask: Optional[torch.Tensor] = None,
         bf16_group_idx: int = 1,
     ):
-        super().__init__(num_experts, group_size_ratios, device=device,
-                         int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
-                         bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx)
+        super().__init__(
+            num_experts, group_size_ratios,
+            bf16_promotion_threshold=bf16_promotion_threshold,
+            device=device,
+            int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
+            bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx,
+        )
         assert importance.shape == (num_experts,), (
             f"importance shape {tuple(importance.shape)} "
             f"!= (num_experts={num_experts},)"
@@ -371,16 +506,18 @@ class HessianWeightedRoutingWeightsDispatch(HeterDispatchPolicy):
         self._importance = importance.to(
             device=self._device, dtype=torch.float32)
         self._fallback = RandomHeterDispatch(
-            num_experts, group_size_ratios, seed=fallback_seed, device=device,
+            num_experts, group_size_ratios,
+            bf16_promotion_threshold=bf16_promotion_threshold,
+            seed=fallback_seed, device=device,
             int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
             bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx)
         self._weight_sum_buf = torch.empty(
             num_experts, device=self._device, dtype=torch.float32)
 
-    def _assign(self, token_selected_experts, token_final_scales):
+    def _assign(self, token_counts, token_selected_experts, token_final_scales):
         if token_selected_experts is None or token_final_scales is None:
             return self._fallback._assign(
-                token_selected_experts, token_final_scales)
+                token_counts, token_selected_experts, token_final_scales)
 
         buf = self._weight_sum_buf
         flat_experts = token_selected_experts.reshape(-1).long()
@@ -406,6 +543,7 @@ class ExpertLoadHeterDispatch(HeterDispatchPolicy):
         self,
         num_experts: int,
         group_size_ratios: List[float],
+        bf16_promotion_threshold: int,
         fallback_seed: int = 42,
         device: Optional[torch.device] = None,
         int4_only_mask: Optional[torch.Tensor] = None,
@@ -413,53 +551,46 @@ class ExpertLoadHeterDispatch(HeterDispatchPolicy):
         bf16_only_mask: Optional[torch.Tensor] = None,
         bf16_group_idx: int = 1,
     ):
-        super().__init__(num_experts, group_size_ratios, device=device,
-                         int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
-                         bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx)
+        super().__init__(
+            num_experts, group_size_ratios,
+            bf16_promotion_threshold=bf16_promotion_threshold,
+            device=device,
+            int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
+            bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx,
+        )
         self._fallback = RandomHeterDispatch(
-            num_experts, group_size_ratios, seed=fallback_seed, device=device,
+            num_experts, group_size_ratios,
+            bf16_promotion_threshold=bf16_promotion_threshold,
+            seed=fallback_seed, device=device,
             int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
             bf16_only_mask=bf16_only_mask, bf16_group_idx=bf16_group_idx)
-        self._count_buf = torch.zeros(
-            num_experts, device=self._device, dtype=torch.float32)
-        self._ones_buf = torch.ones(
-            num_experts, device=self._device, dtype=torch.float32)
 
-    def _assign(self, token_selected_experts, token_final_scales):
+    def _assign(self, token_counts, token_selected_experts, token_final_scales):
         if token_selected_experts is None:
             return self._fallback._assign(
-                token_selected_experts, token_final_scales)
-
-        flat_experts = token_selected_experts.reshape(-1).long()
-        n = flat_experts.shape[0]
-        if self._ones_buf.shape[0] < n:
-            self._ones_buf = torch.ones(n, device=self._device, dtype=torch.float32)
-        counts = self._count_buf
-        counts.zero_()
-        counts.scatter_add_(0, flat_experts, self._ones_buf[:n])
-
+                token_counts, token_selected_experts, token_final_scales)
+        # ABC's token_counts is the load -- use directly as the score.
         return _assign_by_score_gpu(
-            counts, self._num_experts, self._group_size_ratios,
+            token_counts, self._num_experts, self._group_size_ratios,
             self._expert_to_group_buf, self._group_labels)
 
 
 class ExpertBatchGatedHeterDispatch(HeterDispatchPolicy):
-    """Per-expert hot/cold gating by token count.
+    """No-scoring dispatch: every expert defaults to INT4.
 
-    Assignment is per-expert: experts with >= ``threshold`` routed tokens
-    go BF16, the rest INT4. INT4-only experts are forced back to INT4 by
-    the base dispatch helper. BF16-only experts are forced to BF16.
+    The ABC's universal BF16 promotion rule then promotes any expert whose
+    routed-token count crosses ``bf16_promotion_threshold`` to BF16.
+    ``int4_only`` experts stay INT4 by mask (no BF16 weights loaded).
 
-    Short-circuit falls back to a global-batch host-side bound: when the
-    whole batch has fewer than ``threshold`` tokens, no single expert can
-    reach the threshold, so the BF16 group is provably empty.
+    Useful as a baseline policy when there is no scoring signal -- the
+    behavior reduces to pure count-gated promotion.
     """
 
     def __init__(
         self,
         num_experts: int,
         group_size_ratios: List[float],
-        threshold: int = 128,
+        bf16_promotion_threshold: int,
         device: Optional[torch.device] = None,
         int4_only_mask: Optional[torch.Tensor] = None,
         int4_group_idx: int = 0,
@@ -470,42 +601,28 @@ class ExpertBatchGatedHeterDispatch(HeterDispatchPolicy):
             bf16_group_idx if bf16_group_idx is not None
             else (1 - int4_group_idx)
         )
-        super().__init__(num_experts, group_size_ratios, device=device,
-                         int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
-                         bf16_only_mask=bf16_only_mask, bf16_group_idx=_bf16_gidx)
-        self._threshold = threshold
-        self._count_buf = torch.zeros(
-            num_experts, device=self._device, dtype=torch.float32)
-        self._ones_buf = torch.ones(
-            num_experts, device=self._device, dtype=torch.float32)
+        super().__init__(
+            num_experts, group_size_ratios,
+            bf16_promotion_threshold=bf16_promotion_threshold,
+            device=device,
+            int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
+            bf16_only_mask=bf16_only_mask, bf16_group_idx=_bf16_gidx,
+        )
 
-    @property
-    def threshold(self) -> int:
-        return self._threshold
-
-    def _global_batch_below_threshold(self, num_tokens: int) -> bool:
-        return num_tokens < self._threshold
-
-    def _assign(self, token_selected_experts, token_final_scales):
-        if token_selected_experts is None:
-            self._expert_to_group_buf.fill_(self._int4_group_idx)
-            return self._expert_to_group_buf
-
-        flat = token_selected_experts.reshape(-1).long()
-        n = flat.shape[0]
-        if self._ones_buf.shape[0] < n:
-            self._ones_buf = torch.ones(
-                n, device=self._device, dtype=torch.float32)
-        counts = self._count_buf
-        counts.zero_()
-        counts.scatter_add_(0, flat, self._ones_buf[:n])
-
-        is_hot = counts >= self._threshold
+    def _assign(self, token_counts, token_selected_experts, token_final_scales):
+        # Default everyone to INT4; the ABC's threshold rule then promotes
+        # >=threshold experts to BF16, and forced masks have the final word.
         self._expert_to_group_buf.fill_(self._int4_group_idx)
-        self._expert_to_group_buf[is_hot] = self._bf16_group_idx
         return self._expert_to_group_buf
 
+    def _global_batch_below_threshold(self, num_tokens: int) -> bool:
+        return num_tokens < self._bf16_promotion_threshold
+
     def should_skip_group(self, group_idx: int, num_tokens: int) -> bool:
+        # Base assignment is all-INT4, so the BF16 group can only be populated
+        # by the threshold rule. When the global batch has fewer than threshold
+        # tokens, no expert can cross threshold, so the BF16 group is provably
+        # empty and safe to skip.
         if (self._global_batch_below_threshold(num_tokens)
                 and group_idx == self._bf16_group_idx):
             return True

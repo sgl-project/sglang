@@ -51,6 +51,7 @@ def _make_bf16_config():
     return {
         "groups": [{"name": "all", "num_bits": 16, "size_ratio": 1.0}],
         "policy": "random", "policy_params": {"seed": SEED},
+        "bf16_promotion_threshold": 10**9,
     }
 
 
@@ -61,6 +62,7 @@ def _make_mixed_config():
             {"name": "hot_bf16", "num_bits": 16, "size_ratio": 0.5},
         ],
         "policy": "random", "policy_params": {"seed": SEED},
+        "bf16_promotion_threshold": 10**9,
     }
 
 

@@ -16,7 +16,8 @@ class TestBf16OnlyExperts(unittest.TestCase):
                 {"name": "hot", "num_bits": 16},
             ],
             "policy": "expert_batch",
-            "policy_params": {"threshold": 128},
+            "policy_params": {},
+            "bf16_promotion_threshold": 128,
         }
         cfg.update(extra)
         p = os.path.join(d, "heter.json")

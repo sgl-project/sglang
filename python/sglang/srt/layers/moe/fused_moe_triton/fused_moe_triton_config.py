@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import functools
+import glob
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -113,6 +115,41 @@ def get_moe_configs(
                 )
                 # If a configuration has been found, return it
                 return {int(key): val for key, val in json.load(f).items()}
+
+    # Closest-E fallback: scan for a config matching the same
+    # (N, dtype, device, block_shape, per_channel_quant, down_moe) but
+    # any num_experts. The Triton tile shape (BLOCK_M/N/K, GROUP_SIZE_M,
+    # num_warps, num_stages) is largely E-invariant for fixed inner-GEMM
+    # dims, so a config tuned at E' ≠ E is close to optimal — much better
+    # than get_default_config(). Critical for heterogeneous MoE setups
+    # where per-layer expert count varies (e.g. precision-assignment
+    # policies that BF16 a different number of experts per layer).
+    glob_name = re.sub(r"^E=\d+,", "E=*,", json_file_name)
+    e_re = re.compile(r"^E=(\d+),")
+    search_versions = [triton_version] + [
+        v for v in supported_triton_versions if v != triton_version
+    ]
+    for try_version in search_versions:
+        search_dir = os.path.join(
+            config_dir, "configs", f"triton_{try_version.replace('.', '_')}"
+        )
+        if not os.path.isdir(search_dir):
+            continue
+        matches = glob.glob(os.path.join(search_dir, glob_name))
+        if not matches:
+            continue
+        def _extract_e(path: str) -> int:
+            m = e_re.match(os.path.basename(path))
+            return int(m.group(1)) if m else 10**9
+        best = min(matches, key=lambda p: abs(_extract_e(p) - E))
+        with open(best) as f:
+            logger.warning(
+                f"No exact MoE config for E={E},N={N}; using closest-E fallback "
+                f"{best} (tuned for E={_extract_e(best)}). Tile choice is largely "
+                f"E-invariant for fixed (N, K, dtype, device), so this is near-"
+                f"optimal — but consider tuning E={E} for the last few percent."
+            )
+            return {int(key): val for key, val in json.load(f).items()}
 
     # If no optimized configuration is available, we will use the default configuration when down_moe is False
     # When down_moe is True, we will try to use the config for down_moe=False

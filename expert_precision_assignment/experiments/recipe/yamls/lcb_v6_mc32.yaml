@@ -1,0 +1,39 @@
+# LiveCodeBench v6 — canonical Qwen3 thinking config, single-concurrency sweep at mc=32.
+# Sweeps all 11 heter-precision variants; full 1,055-problem dataset.
+# GPU pool: 4-7 (supergpqa_mc32 runs parallel on 0-3).
+#
+# Scoring DISABLED: lcb_runner not vendored (external-code-integration
+# permission gate). Traces retained for offline scoring in a container.
+task: livecodebench_v6
+variant: mc32
+
+dataset:
+  limit: 0
+  start_date: null
+  end_date: null
+
+sampling:
+  enable_thinking: true
+  max_tokens: 24576
+  temperature: 0
+  top_p: 1
+  top_k: 20
+  presence_penalty: 1.5
+  frequency_penalty: 0.5
+
+calibration:
+  num_prompts: 128
+  mc: 32
+  gpu: 4
+  port: 31321
+  nccl_port: 41321
+
+sweep:
+  mc_list: [32]
+  dynamic_variants: [hot0, hot20, hot40, hot60, hot80, hot100]
+  gpus: [4, 5, 6, 7]
+  num_prompts: 0
+
+scoring:
+  enabled: false
+  extra_args: ["--timeout", "6"]
