@@ -13,7 +13,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
 
 
 class TestSLRUAccuracy(unittest.TestCase):
@@ -62,9 +62,7 @@ class TestSLRUAccuracy(unittest.TestCase):
         """Test that SLRU eviction mechanism works correctly"""
 
         # Insert one key-value three times (high frequency access)
-        frequent_key = RadixKey(
-            token_ids=[1, 2], extra_key=None
-        )  # High hit rate, should be retained
+        frequent_key = RadixKey([1, 2])  # High hit rate, should be retained
         frequent_val = torch.tensor([10, 20], dtype=torch.int64)
 
         # Insert the frequent key multiple times to increase its hit count
@@ -72,9 +70,7 @@ class TestSLRUAccuracy(unittest.TestCase):
             self.cache.insert(InsertParams(key=frequent_key, value=frequent_val))
 
         # Insert first low-frequency key-value pair that should be evicted
-        first_low_freq_key = RadixKey(
-            token_ids=[5, 6], extra_key=None
-        )  # Low hit rate, should be evicted
+        first_low_freq_key = RadixKey([5, 6])  # Low hit rate, should be evicted
         first_low_freq_val = torch.tensor([50, 60], dtype=torch.int64)
 
         self.cache.insert(
@@ -84,18 +80,14 @@ class TestSLRUAccuracy(unittest.TestCase):
         # Insert other key-values once each (low frequency access) - fill up the cache
         other_keys = []
         for i in range(4):  # Reduce the number to fit in our smaller cache
-            key = RadixKey(
-                token_ids=[i + 10], extra_key=None
-            )  # Unique keys for low-frequency items
+            key = RadixKey([i + 10])  # Unique keys for low-frequency items
             val = torch.tensor([i + 100], dtype=torch.int64)
             self.cache.insert(InsertParams(key=key, value=val))
             other_keys.append(key)
 
         # Now insert more items to trigger evictions
         for i in range(6, 10):  # Add more items to definitely exceed capacity
-            key = RadixKey(
-                token_ids=[i * 2], extra_key=None
-            )  # Different pattern to avoid conflicts
+            key = RadixKey([i * 2])  # Different pattern to avoid conflicts
             val = torch.tensor([i * 200], dtype=torch.int64)
             self.cache.insert(InsertParams(key=key, value=val))
 

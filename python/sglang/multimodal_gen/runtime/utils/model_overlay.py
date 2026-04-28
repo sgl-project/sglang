@@ -27,8 +27,7 @@ logger = init_logger(__name__)
 BUILTIN_MODEL_OVERLAY_REGISTRY: dict[str, dict[str, Any]] = {
     "Lightricks/LTX-2.3": {
         "overlay_repo_id": "MickJ/LTX-2.3-overlay",
-        "overlay_revision": "main",
-        "bundled_overlay_subdir": "ltx_2_3",
+        "overlay_revision": "e0cc94f279ec16bb87c230134d40319f6ce40c5e",
     },
 }
 

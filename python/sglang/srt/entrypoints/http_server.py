@@ -636,10 +636,7 @@ async def server_info():
         await _global_state.tokenizer_manager.get_internal_state()
     )
 
-    # This field is not serializable.
-    if hasattr(_global_state.tokenizer_manager.server_args, "model_config"):
-        del _global_state.tokenizer_manager.server_args.model_config
-
+    # server_args.model_config is not serializable but should be excluded by asdict.
     return {
         **dataclasses.asdict(_global_state.tokenizer_manager.server_args),
         **_global_state.scheduler_info,
@@ -650,12 +647,29 @@ async def server_info():
 
 @app.get("/get_load")
 async def get_load():
-    """Get load metrics (deprecated - use /v1/loads instead)."""
+    """Get load metrics (deprecated - use /v1/loads instead).
+
+    Legacy shim backed by /v1/loads. Projects GetLoadsReqOutput down to the
+    historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
+    num_pending_tokens, ts_tic) so existing clients keep working.
+    """
     logger.warning(
         "Endpoint '/get_load' is deprecated and will be removed in a future version. "
         "Please use '/v1/loads' instead."
     )
-    return await _global_state.tokenizer_manager.get_load()
+    load_results = await _global_state.tokenizer_manager.get_loads(include=["core"])
+    ts = time.perf_counter()
+    return [
+        {
+            "dp_rank": r.dp_rank,
+            "num_reqs": r.num_running_reqs + r.num_waiting_reqs,
+            "num_waiting_reqs": r.num_waiting_reqs,
+            "num_tokens": r.num_total_tokens,
+            "num_pending_tokens": r.num_total_tokens - r.num_used_tokens,
+            "ts_tic": ts,
+        }
+        for r in load_results
+    ]
 
 
 # example usage:
@@ -814,7 +828,7 @@ async def list_external_corpora():
     return ORJSONResponse(
         {
             "success": result.success,
-            "corpus_ids": result.corpus_ids,
+            "corpus_token_counts": result.corpus_token_counts,
             "message": result.message,
         },
         status_code=200 if result.success else HTTPStatus.BAD_REQUEST,

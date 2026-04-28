@@ -397,6 +397,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            if self._engine_paused:
+                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -409,7 +411,7 @@ class SchedulerDisaggregationPrefillMixin:
                 result = self.run_batch(batch)
                 self.process_batch_result(batch, result)
             else:
-                self.self_check_during_idle()
+                self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
 
@@ -428,6 +430,8 @@ class SchedulerDisaggregationPrefillMixin:
             self.waiting_queue.extend(
                 self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
             )
+            if self._engine_paused:
+                continue
 
             # Get the next batch to run
             batch = self.get_next_disagg_prefill_batch_to_run()
@@ -448,7 +452,7 @@ class SchedulerDisaggregationPrefillMixin:
                 self.process_batch_result(tmp_batch, tmp_result)
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
-                self.self_check_during_idle()
+                self.on_idle()
 
             self.process_disagg_prefill_inflight_queue()
 
@@ -484,6 +488,9 @@ class SchedulerDisaggregationPrefillMixin:
 
         if copy_done is not None:
             copy_done.synchronize()
+        if result.routed_experts_output is not None:
+            result.routed_experts_output.finalize()
+            result.routed_experts_output = None
 
         logprob_pt = 0
         # Transfer kv for prefill completed requests and add it into disagg_prefill_inflight_queue

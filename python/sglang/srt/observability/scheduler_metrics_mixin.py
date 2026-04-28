@@ -12,8 +12,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     DisaggregationMetrics,
-    GetLoadReqInput,
-    GetLoadReqOutput,
     GetLoadsReqInput,
     GetLoadsReqOutput,
     LoRAMetrics,
@@ -30,7 +28,6 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
-from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.device_timer import DeviceTimer, GapTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
@@ -41,7 +38,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
+RECORD_STEP_TIME = envs.SGLANG_RECORD_STEP_TIME.get()
 LOG_FORWARD_ITERS = envs.SGLANG_LOG_FORWARD_ITERS.get()
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 
@@ -55,6 +52,7 @@ class PrefillStats:
     new_token_ratio: float
     num_running_reqs: QueueCount
     num_new_seqs: int  # len(can_run_list)
+    num_pending_tokens: int = 0
 
     @classmethod
     def from_adder(
@@ -62,6 +60,7 @@ class PrefillStats:
         adder: PrefillAdder,
         running_reqs: List[Req],
         enable_priority_scheduling: bool = False,
+        num_pending_tokens: int = 0,
     ):
         return cls(
             log_input_tokens=adder.log_input_tokens,
@@ -71,6 +70,7 @@ class PrefillStats:
                 running_reqs, enable_priority_scheduling
             ),
             num_new_seqs=len(adder.can_run_list),
+            num_pending_tokens=num_pending_tokens,
         )
 
 
@@ -95,7 +95,6 @@ class SchedulerMetricsMixin:
         self.num_generated_tokens = 0
         self.last_decode_stats_tic = time.perf_counter()
         self.last_prefill_stats_tic = time.perf_counter()
-        self.last_prefill_tokens = 0
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
@@ -147,6 +146,7 @@ class SchedulerMetricsMixin:
                 labels=labels,
                 enable_lora=self.enable_lora,
                 enable_hierarchical_cache=self.enable_hierarchical_cache,
+                enable_streaming_session=self.server_args.enable_streaming_session,
                 server_args=self.server_args,
             )
             self.enable_mfu_metrics = bool(self.server_args.enable_mfu_metrics)
@@ -164,14 +164,17 @@ class SchedulerMetricsMixin:
                     reporter=self.metrics_collector.increment_gpu_overlap_wait_seconds,
                 )
 
-        if self.enable_kv_cache_events:
-            self.init_kv_events(self.server_args.kv_events_config)
+        self.init_kv_events(self.server_args.kv_events_config)
 
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
         )
 
     def init_kv_events(self: Scheduler, kv_events_config: Optional[str]):
+        self.enable_kv_cache_events = bool(
+            kv_events_config and self.attn_tp_rank == 0 and self.attn_cp_rank == 0
+        )
+
         if self.enable_kv_cache_events:
             self.kv_event_publisher = EventPublisherFactory.create(
                 kv_events_config, self.attn_dp_rank
@@ -335,52 +338,15 @@ class SchedulerMetricsMixin:
         ):
             return
 
-        gap_latency = time.perf_counter() - self.last_prefill_stats_tic
-        self.last_prefill_stats_tic = time.perf_counter()
-        self.last_input_throughput = self.last_prefill_tokens / gap_latency
-        self.last_prefill_tokens = prefill_stats.log_input_tokens
-
-        # TODO: generalize this for various memory pools
-        msg_parts = []
-        num_used = token_usage = full_token_usage = None
-
-        if self.is_hybrid_swa:
-            full_num_used, swa_num_used, full_tok, swa_token_usage, *_ = (
-                self._get_swa_token_info()
-            )
-            num_used = max(full_num_used, swa_num_used)
-            token_usage = max(full_tok, swa_token_usage)
-            full_token_usage = full_tok
-            msg_parts += [
-                f"full token usage: {full_tok:.2f}",
-                f"swa token usage: {swa_token_usage:.2f}",
-            ]
-
-        if self.is_hybrid_ssm:
-            num_used_m, _, full_tok_m, mamba_usage, *_ = self._get_mamba_token_info()
-            num_used = max(num_used, num_used_m) if num_used is not None else num_used_m
-            token_usage = (
-                max(token_usage, mamba_usage)
-                if token_usage is not None
-                else max(full_tok_m, mamba_usage)
-            )
-            if full_token_usage is None:
-                full_token_usage = full_tok_m
-                msg_parts.append(f"full token usage: {full_tok_m:.2f}")
-            msg_parts.append(f"mamba usage: {mamba_usage:.2f}")
-
-        if full_token_usage is None:
-            num_used, tok, _, _ = self._get_token_info()
-            full_token_usage = tok
-            token_usage = tok
-            msg_parts.append(f"token usage: {tok:.2f}")
-
-        assert (
-            num_used is not None
-            and token_usage is not None
-            and full_token_usage is not None
+        now = time.perf_counter()
+        gap_latency = now - self.last_prefill_stats_tic
+        self.last_prefill_stats_tic = now
+        self.last_input_throughput = (
+            prefill_stats.log_input_tokens / gap_latency if gap_latency > 0 else 0.0
         )
-        token_usage_msg = ", ".join(msg_parts) + ", "
+
+        pool_stats = self.get_pool_stats()
+        token_usage_msg = ", ".join(pool_stats.get_prefill_usage_msg_parts()) + ", "
 
         self.stats.new_token_ratio = prefill_stats.new_token_ratio
         iter_msg = f" [{self.forward_ct + 1}]" if LOG_FORWARD_ITERS else ""
@@ -393,6 +359,7 @@ class SchedulerMetricsMixin:
             f"{token_usage_msg}"
             f"#running-req: {prefill_stats.num_running_reqs.total}, "
             f"#queue-req: {len(self.waiting_queue)}, "
+            f"#pending-token: {prefill_stats.num_pending_tokens}, "
         )
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -409,6 +376,7 @@ class SchedulerMetricsMixin:
             {
                 "cpu": "cpu graph",
                 "npu": "npu graph",
+                "musa": "musa graph",
             },
         )
 
@@ -450,13 +418,7 @@ class SchedulerMetricsMixin:
 
             self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_running_reqs_offline_batch = 0
-            self.stats.num_used_tokens = num_used
-            self.stats.token_usage = token_usage
-            self.stats.full_token_usage = full_token_usage
-            if self.is_hybrid_swa:
-                self.stats.swa_token_usage = swa_token_usage
-            if self.is_hybrid_ssm:
-                self.stats.mamba_usage = mamba_usage
+            pool_stats.update_scheduler_stats(self.stats)
 
             priority_enabled = self.enable_priority_scheduling
             self.stats.num_queue_reqs = QueueCount.from_reqs(
@@ -547,57 +509,8 @@ class SchedulerMetricsMixin:
         num_running_reqs = len(batch.reqs)
         num_running_reqs_offline_batch = 0
 
-        # TODO: generalize this for various memory pools
-        msg_parts = []
-        num_used = token_usage = full_token_usage = None
-
-        if self.is_hybrid_swa:
-            full_num_used, swa_num_used, full_tok, swa_token_usage, *_ = (
-                self._get_swa_token_info()
-            )
-            num_used = max(full_num_used, swa_num_used)
-            token_usage = max(full_tok, swa_token_usage)
-            full_token_usage = full_tok
-            msg_parts += [
-                f"#full token: {full_num_used}",
-                f"full token usage: {full_tok:.2f}",
-                f"#swa token: {swa_num_used}",
-                f"swa token usage: {swa_token_usage:.2f}",
-            ]
-
-        if self.is_hybrid_ssm:
-            num_used_m, mamba_num, full_tok_m, mamba_usage, *_ = (
-                self._get_mamba_token_info()
-            )
-            num_used = max(num_used, num_used_m) if num_used is not None else num_used_m
-            token_usage = (
-                max(token_usage, mamba_usage)
-                if token_usage is not None
-                else max(full_tok_m, mamba_usage)
-            )
-            if full_token_usage is None:
-                full_token_usage = full_tok_m
-                msg_parts += [
-                    f"#full token: {num_used_m}",
-                    f"full token usage: {full_tok_m:.2f}",
-                ]
-            msg_parts += [
-                f"mamba num: {mamba_num}",
-                f"mamba usage: {mamba_usage:.2f}",
-            ]
-
-        if full_token_usage is None:
-            num_used, tok, _, _ = self._get_token_info()
-            full_token_usage = tok
-            token_usage = tok
-            msg_parts.append(f"#token: {num_used}, token usage: {tok:.2f}")
-
-        assert (
-            num_used is not None
-            and token_usage is not None
-            and full_token_usage is not None
-        )
-        token_usage_msg = ", ".join(msg_parts) + ", "
+        pool_stats = self.get_pool_stats()
+        token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
 
         if RECORD_STEP_TIME:
             self.step_time_dict[num_running_reqs].append(
@@ -649,6 +562,7 @@ class SchedulerMetricsMixin:
             {
                 "cpu": "cpu graph",
                 "npu": "npu graph",
+                "musa": "musa graph",
             },
         )
         msg += (
@@ -682,15 +596,7 @@ class SchedulerMetricsMixin:
                 batch.reqs, priority_enabled
             )
             self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
-            self.stats.num_used_tokens = num_used
-            # maximum usage of all pools
-            self.stats.token_usage = token_usage
-            # usage of full attention
-            self.stats.full_token_usage = full_token_usage
-            if self.is_hybrid_swa:
-                self.stats.swa_token_usage = swa_token_usage
-            if self.is_hybrid_ssm:
-                self.stats.mamba_usage = mamba_usage
+            pool_stats.update_scheduler_stats(self.stats)
             self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
             self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = QueueCount.from_reqs(
@@ -700,6 +606,8 @@ class SchedulerMetricsMixin:
             self.stats.cache_hit_rate = cache_hit_rate
 
             self.stats.max_total_num_tokens = self.max_total_num_tokens
+            self.stats.num_streaming_sessions = self._streaming_session_count()
+            self.stats.streaming_session_held_tokens = self._session_held_tokens()
 
             # Speculative decoding
             self.stats.spec_accept_rate = spec_accept_rate
@@ -862,34 +770,25 @@ class SchedulerMetricsMixin:
                     self.stats.token_usage / 0.9,
                 )
 
-    def get_load(self: Scheduler, _: GetLoadReqInput = None) -> GetLoadReqOutput:
-        if self.is_hybrid_swa:
-            full_num_used, swa_num_used, *_ = self._get_swa_token_info()
-            num_tokens = max(full_num_used, swa_num_used)
-        elif self.is_hybrid_ssm:
-            num_tokens = self._get_mamba_token_info()[0]
-        else:
-            num_tokens = self._get_token_info()[0]
+    def _get_num_pending_tokens(self: Scheduler, chunk_deduct: int = 0) -> int:
+        """Get the total number of tokens pending prefill.
 
-        # Tokens in waiting queue, bootstrap queue, prealloc queue
-        waiting_queues = [self.waiting_queue]
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            waiting_queues.append(self.disagg_prefill_bootstrap_queue.queue)
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            waiting_queues.append(self.disagg_decode_prealloc_queue.queue)
-            waiting_queues.append(self.disagg_decode_transfer_queue.queue)
-            waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
+        This includes tokens from waiting queue requests plus remaining tokens
+        from the currently chunked request.
 
-        num_tokens += sum(req.seqlen for queue in waiting_queues for req in queue)
-        num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
-
-        return GetLoadReqOutput(
-            dp_rank=self.dp_rank,
-            num_reqs=len(self.running_batch.reqs) + num_waiting_reqs,
-            num_waiting_reqs=num_waiting_reqs,
-            num_tokens=num_tokens,
-            ts_tic=time.perf_counter(),
-        )
+        Args:
+            chunk_deduct: extra tokens to subtract from the chunked request's
+                remaining count. At batch-scheduling time the current chunk
+                has been planned but ``prefix_indices`` does not yet include it,
+                so callers pass ``extend_input_len`` here. At load-reporting
+                time ``prefix_indices`` is already up-to-date, so the default
+                0 is correct.
+        """
+        num_pending_tokens = sum(req.seqlen for req in self.waiting_queue)
+        if self.chunked_req is not None:
+            req = self.chunked_req
+            num_pending_tokens += req.seqlen - len(req.prefix_indices) - chunk_deduct
+        return num_pending_tokens
 
     def get_loads(self: Scheduler, req: GetLoadsReqInput = None) -> GetLoadsReqOutput:
         """
@@ -918,19 +817,9 @@ class SchedulerMetricsMixin:
             waiting_queues.append(self.disagg_decode_prealloc_queue.retracted_queue)
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
-
-        if self.is_hybrid_swa:
-            full_num_used, swa_num_used, *_ = self._get_swa_token_info()
-            num_used_tokens = max(full_num_used, swa_num_used)
-        elif self.is_hybrid_ssm:
-            num_used_tokens = self._get_mamba_token_info()[0]
-        else:
-            num_used_tokens = self._get_token_info()[0]
-
-        token_usage = (
-            num_used_tokens / self.max_total_num_tokens
-            if self.max_total_num_tokens > 0
-            else 0.0
+        num_used_tokens, kv_token_usage = self.get_pool_stats().get_kv_token_stats()
+        num_total_tokens = num_used_tokens + sum(
+            req.seqlen for queue in waiting_queues for req in queue
         )
 
         memory = None
@@ -1016,8 +905,9 @@ class SchedulerMetricsMixin:
             num_running_reqs=num_running_reqs,
             num_waiting_reqs=num_waiting_reqs,
             num_used_tokens=num_used_tokens,
+            num_total_tokens=num_total_tokens,
             max_total_num_tokens=self.max_total_num_tokens,
-            token_usage=round(token_usage, 4),
+            token_usage=round(kv_token_usage, 4),
             gen_throughput=round(self.stats.gen_throughput, 2),
             cache_hit_rate=round(self.stats.cache_hit_rate, 4),
             utilization=round(self.stats.utilization, 4),

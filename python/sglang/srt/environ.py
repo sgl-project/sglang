@@ -3,7 +3,7 @@ import subprocess
 import warnings
 from contextlib import ExitStack, contextmanager
 from enum import IntEnum
-from typing import Any
+from typing import Any, Optional
 
 
 @contextmanager
@@ -163,6 +163,7 @@ class Envs:
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
+    SGLANG_PREFETCH_BLOCK_SIZE_MB = EnvInt(16)
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)
@@ -205,7 +206,7 @@ class Envs:
     SGLANG_TEST_REQUEST_TIME_STATS = EnvBool(False)
     SGLANG_DISABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(False)
     SGLANG_SIMULATE_ACC_LEN = EnvFloat(-1)
-    SGLANG_SIMULATE_ACC_METHOD = EnvStr("multinomial")
+    SGLANG_SIMULATE_ACC_METHOD = EnvStr("match-expected")
     SGLANG_TORCH_PROFILER_DIR = EnvStr("/tmp")
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
@@ -243,6 +244,7 @@ class Envs:
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
+    SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK = EnvBool(False)
     # Extra slots in req_to_token_pool for decode workers (only effective when
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
     # can overlap with decode execution without raising max_running_requests.
@@ -263,6 +265,13 @@ class Envs:
     SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH = EnvBool(False)
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL = EnvInt(120)
+    SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER = EnvFloat(1.0)
+    # For non-streaming requests, the scheduler still flushes intermediate
+    # output batches to the tokenizer manager every N decoded tokens so that
+    # `first_token_time`/TTFT can be recorded. Lower this (e.g. to 1) to get
+    # an accurate TTFT for benchmarking; the upstream default of 50 trades
+    # off some TTFT-metric accuracy for less IPC overhead.
+    SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
 
     # Test: pd-disaggregation
     SGLANG_TEST_PD_DISAGG_BACKEND = EnvStr("mooncake")
@@ -313,8 +322,10 @@ class Envs:
 
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
+    SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
+    SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(4096)
 
     # MPS (Apple Silicon)
     SGLANG_USE_MLX = EnvBool(False)
@@ -329,7 +340,12 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # Quantize x to int8 in the dispatch operator
+    DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
+
+    # MTHREADS & MUSA
+    SGLANG_MUSA_FA3_FORCE_UPDATE_METADATA = EnvBool(False)
 
     # Quantization
     SGLANG_INT4_WEIGHT = EnvBool(False)
@@ -338,7 +354,6 @@ class Envs:
     SGLANG_FORCE_FP8_MARLIN = EnvBool(False)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
-    SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2 = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     SGLANG_QUANT_ALLOW_DOWNCASTING = EnvBool(False)
     SGLANG_FP8_IGNORED_LAYERS = EnvStr("")
@@ -383,6 +398,7 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+    SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
 
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)
@@ -463,12 +479,18 @@ class Envs:
     # VLM Item CUDA IPC Transport
     SGLANG_USE_CUDA_IPC_TRANSPORT = EnvBool(False)
     SGLANG_USE_IPC_POOL_HANDLE_CACHE = EnvBool(False)
-    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(4 * 1024)
+    SGLANG_MM_FEATURE_CACHE_MB = EnvInt(1 * 1024)
     SGLANG_MM_ITEM_MEM_POOL_RECYCLE_INTERVAL_SEC = EnvFloat(0.05)
 
     # Mamba
     SGLANG_MAMBA_CONV_DTYPE = EnvStr("bfloat16")
     SGLANG_MAMBA_SSM_DTYPE = EnvStr(None)
+
+    # Unified Radix Tree
+    SGLANG_ENABLE_UNIFIED_RADIX_TREE = EnvBool(False)
+
+    # Breakable CUDA Graph
+    SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
 
     # Release & Resume Memory
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
@@ -503,6 +525,10 @@ class Envs:
     # Encoder receiver selection: http|grpc (used by EPD paths).
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
 
+    # Native gRPC server (internal, not yet user-facing)
+    SGLANG_GRPC_PORT = EnvInt(None)
+    SGLANG_ENABLE_GRPC = EnvBool(False)
+
     # External models
     SGLANG_EXTERNAL_MODEL_PACKAGE = EnvStr("")
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
@@ -516,8 +542,8 @@ class Envs:
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)
     SGLANG_ENABLE_METRICS_DP_ATTENTION = EnvBool(False)
 
-    # Tokenizer
-    SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
+    # Tokenizer (Kimi tiktoken: cache all_special_tokens / all_special_ids; the ITL can differ by +10x under high batch size).
+    SGLANG_PATCH_TOKENIZER = EnvBool(True)
 
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
@@ -541,17 +567,24 @@ class Envs:
     # Sglang Cache Dir
     SGLANG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/sglang"))
 
+    # Plugin system
+    SGLANG_PLATFORM = EnvStr("")
+    SGLANG_PLUGINS = EnvStr("")
+
 
 envs = Envs()
 EnvField._allow_set_name = False
 
 
-def _print_deprecated_env(new_name: str, old_name: str):
+def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):
     if old_name in os.environ:
-        warnings.warn(
-            f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
-        )
-        os.environ[new_name] = os.environ[old_name]
+        if new_name is None:
+            warnings.warn(f"Environment variable {old_name} has been deprecated.")
+        else:
+            warnings.warn(
+                f"Environment variable {old_name} will be deprecated, please use {new_name} instead"
+            )
+            os.environ[new_name] = os.environ[old_name]
 
 
 def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
@@ -564,14 +597,15 @@ def _warn_deprecated_env_to_cli_flag(env_name: str, suggestion: str):
 
 
 def _convert_SGL_to_SGLANG():
-    _print_deprecated_env("SGLANG_LOG_GC", "SGLANG_GC_LOG")
+    _print_deprecated_env("SGLANG_GC_LOG", "SGLANG_LOG_GC")
     _print_deprecated_env(
-        "SGLANG_MOE_NVFP4_DISPATCH", "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH"
+        "SGLANG_CUTEDSL_MOE_NVFP4_DISPATCH", "SGLANG_MOE_NVFP4_DISPATCH"
     )
     _print_deprecated_env(
-        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
+        "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
     )
+    _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
     _deprecated_ms_to_s = {
         "SGLANG_QUEUED_TIMEOUT_MS": "SGLANG_REQ_WAITING_TIMEOUT",
         "SGLANG_FORWARD_TIMEOUT_MS": "SGLANG_REQ_RUNNING_TIMEOUT",

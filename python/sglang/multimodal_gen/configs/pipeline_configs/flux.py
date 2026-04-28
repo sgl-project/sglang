@@ -81,6 +81,13 @@ class FluxPipelineConfig(ImagePipelineConfig):
         ]
     )
 
+    def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
+        # Flux v1 does not use attention masks for text encoders.
+        return None
+
+    def get_text_encoder_pooler_output(self, outputs, encoder_index):
+        return outputs.pooler_output
+
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
 
@@ -364,6 +371,8 @@ class Flux2PipelineConfig(FluxPipelineConfig):
 
     task_type: ModelTaskType = ModelTaskType.TI2I
 
+    vae_precision: str = "bf16"
+
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
 
     text_encoder_configs: tuple[EncoderConfig, ...] = field(
@@ -388,6 +397,14 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             )
         ]
     )
+
+    def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
+        # Flux2 uses standard attention masks (unlike Flux v1).
+        return text_inputs.get("attention_mask")
+
+    def get_text_encoder_pooler_output(self, outputs, encoder_index):
+        # Flux2 does not use pooler output.
+        return None
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         messages = build_flux2_text_messages(prompts)
@@ -446,7 +463,22 @@ class Flux2PipelineConfig(FluxPipelineConfig):
     def preprocess_condition_image(
         self, image, target_width, target_height, vae_image_processor: VaeImageProcessor
     ):
-        img = image.resize((target_width, target_height), PIL.Image.Resampling.LANCZOS)
+        target_area = 1024 * 1024
+        img = image
+        if image.width * image.height > target_area:
+            resize_to_target_area = getattr(
+                vae_image_processor, "_resize_to_target_area", None
+            )
+            if callable(resize_to_target_area):
+                img = resize_to_target_area(image, target_area)
+            else:
+                scale = math.sqrt(target_area / (image.width * image.height))
+                resized_width = int(image.width * scale)
+                resized_height = int(image.height * scale)
+                img = image.resize(
+                    (resized_width, resized_height), PIL.Image.Resampling.LANCZOS
+                )
+
         image_width, image_height = img.size
         vae_scale_factor = self.vae_config.arch_config.vae_scale_factor
         multiple_of = vae_scale_factor * 2
@@ -530,6 +562,19 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         # patchify
         image_latents = _patchify_latents(image_latents)
         return image_latents
+
+    def normalize_vae_encode(self, image_latents, vae):
+        if not self._check_vae_has_bn(vae):
+            return None
+
+        latents_bn_mean = vae.bn.running_mean.view(1, -1, 1, 1).to(
+            image_latents.device, image_latents.dtype
+        )
+        latents_bn_std = torch.sqrt(
+            vae.bn.running_var.view(1, -1, 1, 1)
+            + self.vae_config.arch_config.batch_norm_eps
+        ).to(image_latents.device, image_latents.dtype)
+        return (image_latents - latents_bn_mean) / latents_bn_std
 
     def _check_vae_has_bn(self, vae):
         """Check if VAE has bn attribute (cached check to avoid repeated hasattr calls)."""

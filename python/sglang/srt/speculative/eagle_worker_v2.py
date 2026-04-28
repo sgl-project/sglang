@@ -17,13 +17,16 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_group
-from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
-from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logprobs
-from sglang.srt.managers.io_struct import UpdateWeightsFromTensorReqInput
+from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
+from sglang.srt.managers.io_struct import (
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromIPCReqInput,
+    UpdateWeightsFromTensorReqInput,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -361,9 +364,9 @@ class EagleDraftWorker(BaseDraftWorker):
         (
             tree_mask,
             position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
             draft_input.verified_id,
@@ -384,10 +387,10 @@ class EagleDraftWorker(BaseDraftWorker):
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
@@ -729,6 +732,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     model_worker_batch
                 )
             assert verify_input.is_verify_input()
+            # Record a CUDA event after draft() GPU work is dispatched.
+            # This event will be waited on by plan_stream in verify()
+            # to ensure draft CUDA graph kernels finish before plan_stream
+            # begins metadata preparation.
+            if self.plan_stream:
+                self._draft_done_event = torch.get_device_module(self.device).Event()
+                self._draft_done_event.record()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
             with self.draft_worker.draft_tp_context(
@@ -755,6 +765,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
+            # Wait for the draft CUDA graph to finish before plan_stream
+            # begins its work. Using an event is more targeted than
+            # wait_stream(main_stream) — it only waits for draft GPU
+            # work, not all queued main_stream operations.
+            if self.plan_stream and hasattr(self, "_draft_done_event"):
+                self.plan_stream.wait_event(self._draft_done_event)
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,
@@ -783,10 +799,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         # Prepare grammar data on CPU if needed
         if batch.has_grammar:
-            retrieve_next_token_cpu = verify_input.retrive_next_token.cpu()
-            retrieve_next_sibling_cpu = verify_input.retrive_next_sibling.cpu()
+            retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
+            retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
             draft_tokens_cpu = verify_input.draft_token.view(
-                verify_input.retrive_next_token.shape
+                verify_input.retrieve_next_token.shape
             ).cpu()
 
         # Run target verify batch in the main compute stream (GPU compute)
@@ -813,7 +829,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
             if vocab_mask is not None:
                 assert verify_input.grammar is not None
-                vocab_mask = vocab_mask.to(verify_input.retrive_next_token.device)
+                vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
                 # NOTE: otherwise, this vocab mask will be the one from the previous extend stage
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
@@ -852,7 +868,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         if batch.return_logprob and not batch.forward_mode.is_idle():
-            self._compute_spec_v2_logprobs(batch, logits_output, predict, accept_index)
+            compute_spec_v2_logprobs(
+                batch, logits_output, predict, accept_index, self.speculative_num_steps
+            )
 
         # Construct the next draft input
         next_draft_input = EagleDraftInput(
@@ -867,73 +885,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
+            routed_experts_output=forward_batch_output.routed_experts_output,
         )
-
-    def _compute_spec_v2_logprobs(
-        self,
-        batch: ModelWorkerBatch,
-        logits_output: LogitsProcessorOutput,
-        predict: torch.Tensor,
-        accept_index: torch.Tensor,
-    ):
-        """Compute logprobs for accepted tokens on GPU in the forward stream.
-
-        Stores results in logits_output fields so they flow through copy_to_cpu().
-        """
-
-        bs = len(batch.seq_lens)
-        max_accept = self.speculative_num_steps + 1
-        device = predict.device
-
-        flat_accept_idx = accept_index.long().reshape(-1)
-        gathered_logits = logits_output.next_token_logits[flat_accept_idx]
-
-        if (
-            batch.sampling_info.is_all_greedy
-            or envs.SGLANG_RETURN_ORIGINAL_LOGPROB.get()
-        ):
-            gathered_logprobs = torch.nn.functional.log_softmax(gathered_logits, dim=-1)
-        else:
-            temperatures = torch.repeat_interleave(
-                batch.sampling_info.temperatures,
-                max_accept,
-                dim=0,
-            )
-            gathered_logprobs = torch.nn.functional.log_softmax(
-                gathered_logits / temperatures, dim=-1
-            )
-        gathered_logprobs.clamp_(min=torch.finfo(gathered_logprobs.dtype).min)
-
-        accepted_token_ids = predict[flat_accept_idx]
-        token_logprobs = gathered_logprobs[
-            torch.arange(bs * max_accept, device=device),
-            accepted_token_ids.long(),
-        ]
-        logits_output.next_token_logprobs = token_logprobs.reshape(bs, max_accept)
-
-        if batch.top_logprobs_nums and any(x > 0 for x in batch.top_logprobs_nums):
-            top_logprobs_nums_expanded = [
-                num for num in batch.top_logprobs_nums for _ in range(max_accept)
-            ]
-            (
-                logits_output.next_token_top_logprobs_val,
-                logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(
-                gathered_logprobs, top_logprobs_nums_expanded, no_copy_to_cpu=True
-            )
-
-        if batch.token_ids_logprobs and any(
-            x is not None for x in batch.token_ids_logprobs
-        ):
-            token_ids_logprobs_expanded = [
-                ids for ids in batch.token_ids_logprobs for _ in range(max_accept)
-            ]
-            (
-                logits_output.next_token_token_ids_logprobs_val,
-                logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(
-                gathered_logprobs, token_ids_logprobs_expanded, no_copy_to_cpu=True
-            )
 
     def _mamba_verify_update(
         self,
@@ -1042,6 +995,24 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.token_to_kv_pool_allocator.get_kvcache().move_kv_cache(
             tgt_cache_loc, accepted_out_cache_loc
         )
+
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        success, message = self._draft_worker.draft_runner.update_weights_from_disk(
+            recv_req.model_path,
+            recv_req.load_format,
+            recapture_cuda_graph=recv_req.recapture_cuda_graph,
+        )
+        if not success:
+            return success, message
+        return True, "Succeeded to update model weights."
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        success, message = self._draft_worker.draft_runner.update_weights_from_ipc(
+            recv_req
+        )
+        if not success:
+            return success, message
+        return True, "Succeeded to update model weights."
 
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         monkey_patch_torch_reductions()

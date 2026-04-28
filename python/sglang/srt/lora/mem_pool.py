@@ -1,10 +1,17 @@
 import logging
 import re
-from typing import Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Set, Tuple, Union
 
 import torch
 
-from sglang.srt.distributed import divide
+from sglang.srt.distributed import (
+    divide,
+    get_moe_expert_parallel_rank,
+    get_moe_expert_parallel_world_size,
+    get_moe_tensor_parallel_rank,
+    get_moe_tensor_parallel_world_size,
+    get_pp_group,
+)
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.layers import BaseLayerWithLoRA
 from sglang.srt.lora.lora import LoRAAdapter
@@ -12,6 +19,7 @@ from sglang.srt.lora.lora_config import LoRAConfig
 from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.lora.utils import (
     EMBEDDING_NAMES,
+    REPLICATED_LINEAR_LORA_NAMES,
     ROW_PARALLELISM_LINEAR_LORA_NAMES,
     LoRAType,
     get_hidden_dim,
@@ -45,6 +53,43 @@ class EmptySlot:
 EMPTY_SLOT = EmptySlot()
 
 
+def _get_moe_ep_context() -> Tuple[int, int]:
+    """Return `(moe_ep_size, moe_ep_rank)`, or `(1, 0)` if the MoE EP group
+    is not initialized (hermetic tests or pure-TP launches)."""
+    try:
+        return get_moe_expert_parallel_world_size(), get_moe_expert_parallel_rank()
+    except Exception:  # pragma: no cover - MoE EP group not initialized
+        return 1, 0
+
+
+def _get_moe_tp_context() -> Tuple[int, int]:
+    """Return `(moe_tp_size, moe_tp_rank)`, or `(1, 0)` if the MoE TP group
+    is not initialized. Under `--tp N --ep N` the outer attention TP group
+    is consumed entirely by EP, leaving `moe_tp_size == 1`, so per-expert
+    MoE weights are NOT sharded along their inner dim even though attention
+    weights are."""
+    try:
+        return get_moe_tensor_parallel_world_size(), get_moe_tensor_parallel_rank()
+    except Exception:  # pragma: no cover - MoE TP group not initialized
+        return 1, 0
+
+
+def _moe_runner_keeps_global_expert_ids() -> bool:
+    """True if the active MoE runner keeps global `topk_ids` instead of
+    remapping to local IDs. Mirrors the predicate in `StandardDispatcher`."""
+    try:
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
+
+        b = get_moe_runner_backend()
+        return (
+            b.is_flashinfer_cutlass()
+            or b.is_flashinfer_cutedsl()
+            or b.is_flashinfer_trtllm_routed()
+        )
+    except Exception:  # pragma: no cover - backend not initialized
+        return False
+
+
 class LoRAMemoryPool:
     """Class for memory pool management of lora modules"""
 
@@ -61,6 +106,7 @@ class LoRAMemoryPool:
         eviction_policy: str,
         lora_added_tokens_size: int,
         experts_shared_outer_loras: bool = False,
+        strict_loading: bool = False,
     ):
         self.base_hf_config: AutoConfig = base_hf_config
         self.num_layer: int = base_hf_config.num_hidden_layers
@@ -72,6 +118,33 @@ class LoRAMemoryPool:
         self.max_lora_rank: int = max_lora_rank
         self.target_modules: Set[str] = target_modules
         self.experts_shared_outer_loras: bool = experts_shared_outer_loras
+        self.strict_loading: bool = strict_loading
+
+        # Under EP with a Triton/DeepGEMM runner, `StandardDispatcher` remaps
+        # global `topk_ids` -> local expert IDs before the MoE kernel, so
+        # per-expert LoRA buffers must be sized and keyed by the local slice.
+        # FlashInfer CUTLASS/CuteDSL/TRTLLM-routed keep global IDs, and an
+        # uneven expert split (`num_experts % moe_ep_size != 0`, shouldn't
+        # happen in practice) is also treated as globally-keyed so we don't
+        # silently truncate experts.
+        self.moe_ep_size, self.moe_ep_rank = _get_moe_ep_context()
+        num_experts_global = self._get_num_experts(base_model)
+        self.moe_use_local_expert_ids = (
+            self.moe_ep_size > 1
+            and not _moe_runner_keeps_global_expert_ids()
+            and num_experts_global % self.moe_ep_size == 0
+        )
+
+        # Per-expert MoE weights are sharded by `moe_tp_size`, NOT the outer
+        # `tp_size`: `moe_tp_size = tp_size // ep_size // dp_size`, so under
+        # e.g. `--tp 4 --ep 4` each rank holds full-width expert weights
+        # (`moe_tp_size == 1`). Sizing per-expert LoRA buffers by `tp_size`
+        # here would yield a 4x-narrower inner dim than the adapter weight
+        # (which `FusedMoEWithLoRA.slice_moe_lora_{a,b}_weights` correctly
+        # skip-slices when `moe_tp_size <= 1`), producing a shape-mismatch
+        # assert during weight load. Non-MoE modules still shard by
+        # `tp_size` because attention TP is unchanged.
+        self.moe_tp_size, self.moe_tp_rank = _get_moe_tp_context()
 
         # Initialize eviction policy
         self.eviction_policy = get_eviction_policy(eviction_policy)
@@ -154,6 +227,53 @@ class LoRAMemoryPool:
             or 1
         )
 
+    def _get_num_local_experts(self, base_model: torch.nn.Module) -> int:
+        """Experts owned by this rank. Equals the global count when EP is
+        off, the runner keeps global IDs, or the split isn't even (all
+        three cases fold into `moe_use_local_expert_ids == False`)."""
+        total = self._get_num_experts(base_model)
+        if not self.moe_use_local_expert_ids:
+            return total
+        return total // self.moe_ep_size
+
+    def _global_to_local_expert_id(self, global_eid: int) -> Optional[int]:
+        """Map a global expert id to this rank's local id, or `None` if
+        the expert is not owned by this rank. Pass-through when buffers
+        are globally-keyed."""
+        if not self.moe_use_local_expert_ids:
+            return global_eid
+        local = global_eid - self.moe_ep_rank * self._num_experts_local
+        return local if 0 <= local < self._num_experts_local else None
+
+    def _iter_local_expert_weights(
+        self,
+        weights: Union[torch.Tensor, Dict[int, torch.Tensor]],
+    ) -> Iterator[Tuple[int, torch.Tensor]]:
+        """Yield `(local_expert_id, weight)` pairs for per-expert MoE LoRA
+        inputs, filtered/remapped to this rank's slice. Accepts either a
+        `{global_eid: 2D tensor}` dict or a 3D `[num_experts, *, *]` tensor."""
+        if isinstance(weights, dict):
+            for gid, w in weights.items():
+                lid = self._global_to_local_expert_id(gid)
+                if lid is not None:
+                    yield lid, w
+            return
+
+        if isinstance(weights, torch.Tensor) and weights.dim() == 3:
+            total = weights.shape[0]
+            if self.moe_use_local_expert_ids:
+                start = self.moe_ep_rank * self._num_experts_local
+                count = max(0, min(self._num_experts_local, total - start))
+            else:
+                start, count = 0, total
+            for i in range(count):
+                yield i, weights[start + i]
+            return
+
+        raise TypeError(
+            f"Expected dict or 3D torch.Tensor, got {type(weights).__name__}."
+        )
+
     def _get_standard_shape(
         self,
         module_name: str,
@@ -188,12 +308,19 @@ class LoRAMemoryPool:
             module_name, self.base_hf_config, base_model, layer_idx
         )
         c = get_stacked_multiply(module_name)
-        if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            input_dim = divide(input_dim, self.tp_size)
+        # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
+        effective_tp_size = (
+            self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
+        )
+        if (
+            effective_tp_size > 1
+            and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            and module_name not in REPLICATED_LINEAR_LORA_NAMES
+        ):
+            input_dim = divide(input_dim, effective_tp_size)
 
         if self.is_moe_module(module_name):
-            num_experts = self._get_num_experts(base_model)
-            expert_dim = num_experts
+            expert_dim = self._get_num_local_experts(base_model)
             if self.experts_shared_outer_loras and module_name == "gate_up_proj_moe":
                 expert_dim = 1
             return (
@@ -240,13 +367,20 @@ class LoRAMemoryPool:
         _, output_dim = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        if self.tp_size > 1 and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES:
-            output_dim = divide(output_dim, self.tp_size)
+        # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
+        effective_tp_size = (
+            self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
+        )
+        if (
+            effective_tp_size > 1
+            and module_name not in ROW_PARALLELISM_LINEAR_LORA_NAMES
+            and module_name not in REPLICATED_LINEAR_LORA_NAMES
+        ):
+            output_dim = divide(output_dim, effective_tp_size)
 
         # Check if MoE module and return appropriate shape
         if self.is_moe_module(module_name):
-            num_experts = self._get_num_experts(base_model)
-            expert_dim = num_experts
+            expert_dim = self._get_num_local_experts(base_model)
             if self.experts_shared_outer_loras and module_name == "down_proj_moe":
                 expert_dim = 1
             return (self.max_loras_per_batch, expert_dim, output_dim, max_lora_dim)
@@ -278,6 +412,10 @@ class LoRAMemoryPool:
 
     def init_buffers(self, base_model: torch.nn.Module):
         device = next(base_model.parameters()).device
+
+        # Cached once so the per-expert load path doesn't re-walk the HF
+        # config for every adapter.
+        self._num_experts_local: int = self._get_num_local_experts(base_model)
 
         def init_buffer(
             buffer: Dict[str, List[torch.Tensor]],
@@ -524,6 +662,43 @@ class LoRAMemoryPool:
 
         assert lora_adapter is not None
         lora_rank = lora_adapter.config.r
+
+        # Pre-validate weight names against target modules across all layers
+        # and embedding weights.  This catches mismatches before any GPU
+        # buffers are mutated.
+        skipped_weight_names: set = set()
+        matched_modules: set = set()
+        all_weight_names: list = []
+        for layer in lora_adapter.layers:
+            all_weight_names.extend(layer.weights.keys())
+        if lora_adapter.embedding_layers:
+            all_weight_names.extend(lora_adapter.embedding_layers.keys())
+        for name in all_weight_names:
+            try:
+                target_module = get_target_module_name(name, self.target_modules)
+                matched_modules.add(target_module)
+            except ValueError:
+                skipped_weight_names.add(name)
+        if matched_modules:
+            logger.info(
+                "LoRA adapter '%s': loaded weights for target modules %s.",
+                uid,
+                sorted(matched_modules),
+            )
+        if skipped_weight_names:
+            msg = (
+                f"LoRA adapter '{uid}': {len(skipped_weight_names)} weight(s) "
+                f"skipped because they did not match any target module in "
+                f"{sorted(self.target_modules)}. Skipped weights: "
+                f"{sorted(skipped_weight_names)}. This likely indicates a "
+                f"mismatch between the adapter's target modules and the base "
+                f"model architecture."
+            )
+            if self.strict_loading:
+                raise ValueError(msg)
+            else:
+                logger.warning(msg)
+
         for layer_id in range(self.num_layer):
             layer_weights = lora_adapter.layers[layer_id].weights
             # - Standard: module_name -> torch.Tensor
@@ -567,65 +742,70 @@ class LoRAMemoryPool:
                     else:
                         temp_B_buffer[target_module] = weights
 
-            if self.tp_size > 1:
-                cur_layer_modules = lora_modules[layer_id]
-                for module_name, module in cur_layer_modules.items():
-                    # TODO (Jonahcb): check if the code can be refactored to avoid the special handling for FusedMoEWithLoRA
-                    # Handle FusedMoEWithLoRA specially - it contains multiple target modules
-                    from sglang.srt.lora.layers import FusedMoEWithLoRA
+            cur_layer_modules = lora_modules[layer_id]
+            for module_name, module in cur_layer_modules.items():
+                # TODO (Jonahcb): check if the code can be refactored to avoid the special handling for FusedMoEWithLoRA
+                # Handle FusedMoEWithLoRA specially - it contains multiple target modules
+                from sglang.srt.lora.layers import FusedMoEWithLoRA
 
-                    if isinstance(module, FusedMoEWithLoRA):
-                        moe_target_modules = ["gate_up_proj_moe", "down_proj_moe"]
-                        for target_module in moe_target_modules:
-                            if temp_A_buffer.get(target_module) is not None:
-                                temp_A_buffer[target_module] = (
-                                    module.slice_moe_lora_a_weights(
-                                        temp_A_buffer[target_module],
-                                        self.tp_rank,
-                                        target_module,
-                                    )
+                if isinstance(module, FusedMoEWithLoRA):
+                    moe_target_modules = ["gate_up_proj_moe", "down_proj_moe"]
+                    for target_module in moe_target_modules:
+                        if temp_A_buffer.get(target_module) is not None:
+                            temp_A_buffer[target_module] = (
+                                module.slice_moe_lora_a_weights(
+                                    temp_A_buffer[target_module],
+                                    self.tp_rank,
+                                    target_module,
                                 )
-                            if temp_B_buffer.get(target_module) is not None:
-                                temp_B_buffer[target_module] = (
-                                    module.slice_moe_lora_b_weights(
-                                        temp_B_buffer[target_module],
-                                        self.tp_rank,
-                                        target_module,
-                                    )
+                            )
+                        if temp_B_buffer.get(target_module) is not None:
+                            temp_B_buffer[target_module] = (
+                                module.slice_moe_lora_b_weights(
+                                    temp_B_buffer[target_module],
+                                    self.tp_rank,
+                                    target_module,
                                 )
+                            )
 
-                        continue
+                    continue
 
-                    # Handle regular modules
-                    target_module = get_target_module_name(
-                        module_name, self.target_modules
-                    )
+                # Handle regular modules
+                target_module = get_target_module_name(module_name, self.target_modules)
 
-                    if temp_A_buffer[target_module] is None:
-                        # Skip weight slicing if the weight is not present in the adapter
-                        continue
+                if temp_A_buffer[target_module] is None:
+                    # Skip weight slicing if the weight is not present in the adapter
+                    continue
 
-                    # Handle standard modules
-                    temp_A_buffer[target_module] = module.slice_lora_a_weights(
-                        temp_A_buffer[target_module], self.tp_rank
-                    )
-                    temp_B_buffer[target_module] = module.slice_lora_b_weights(
-                        temp_B_buffer[target_module], self.tp_rank
-                    )
+                # Handle standard modules
+                temp_A_buffer[target_module] = module.slice_lora_a_weights(
+                    temp_A_buffer[target_module], self.tp_rank
+                )
+                temp_B_buffer[target_module] = module.slice_lora_b_weights(
+                    temp_B_buffer[target_module], self.tp_rank
+                )
 
             for name, weights in temp_A_buffer.items():
                 c = get_stacked_multiply(name)
+                max_r = self.max_lora_rank
                 target_buffer = self.A_buffer[name][layer_id]
 
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
                     if self.experts_shared_outer_loras and name == "gate_up_proj_moe":
-                        if isinstance(weights, torch.Tensor) and weights.dim() == 3:
+                        if weights is None:
+                            representative_weight = None
+                            buffer_view = target_buffer[
+                                buffer_id, 0, : lora_rank * c, :
+                            ]
+                            load_lora_weight_tensor(buffer_view, None)
+                        elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
                             if weights.shape[0] != 1:
                                 raise ValueError(
                                     f"experts_shared_outer_loras is enabled but "
                                     f"gate_up_proj_moe lora_A has expert_dim="
                                     f"{weights.shape[0]} (expected 1)."
                                 )
+                            representative_weight = weights[0]
                             buffer_view = target_buffer[
                                 buffer_id, 0, : lora_rank * c, :
                             ]
@@ -638,6 +818,7 @@ class LoRAMemoryPool:
                                     f"{len(weights)} entries (expected 1)."
                                 )
                             rep = next(iter(weights.values()))
+                            representative_weight = rep
                             buffer_view = target_buffer[
                                 buffer_id, 0, : lora_rank * c, :
                             ]
@@ -648,18 +829,46 @@ class LoRAMemoryPool:
                                 f"type={type(weights)}, "
                                 f"shape={weights.shape if isinstance(weights, torch.Tensor) else 'N/A'}"
                             )
-                    elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
-                        for eid in range(weights.shape[0]):
-                            buffer_view = target_buffer[
-                                buffer_id, eid, : lora_rank * c, :
-                            ]
-                            load_lora_weight_tensor(buffer_view, weights[eid])
-                    elif isinstance(weights, dict):
-                        for expert_id, expert_weight in weights.items():
-                            buffer_view = target_buffer[
-                                buffer_id, expert_id, : lora_rank * c, :
-                            ]
-                            load_lora_weight_tensor(buffer_view, expert_weight)
+                        # Place each stacked component at max_rank-spaced
+                        # positions so the kernel's [:max_r] / [max_r:2*max_r]
+                        # slicing is correct.
+                        target_buffer[buffer_id, 0].zero_()
+                        if representative_weight is not None:
+                            for ci in range(c):
+                                buffer_view = target_buffer[
+                                    buffer_id, 0, ci * max_r : ci * max_r + lora_rank, :
+                                ]
+                                load_lora_weight_tensor(
+                                    buffer_view,
+                                    representative_weight[
+                                        ci * lora_rank : (ci + 1) * lora_rank, :
+                                    ],
+                                )
+                    elif isinstance(weights, (torch.Tensor, dict)):
+                        # Zero first so any local-expert slot the adapter
+                        # doesn't fill (e.g. out-of-rank under EP) is clean;
+                        # then load owned slots at max_rank-spaced offsets so
+                        # the MoE kernel's [:max_r] / [max_r:2*max_r] slicing
+                        # is correct.
+                        target_buffer[buffer_id].zero_()
+                        for local_eid, expert_weight in self._iter_local_expert_weights(
+                            weights
+                        ):
+                            if expert_weight is None:
+                                continue
+                            for ci in range(c):
+                                buffer_view = target_buffer[
+                                    buffer_id,
+                                    local_eid,
+                                    ci * max_r : ci * max_r + lora_rank,
+                                    :,
+                                ]
+                                load_lora_weight_tensor(
+                                    buffer_view,
+                                    expert_weight[
+                                        ci * lora_rank : (ci + 1) * lora_rank, :
+                                    ],
+                                )
                 else:
                     buffer_view = target_buffer[buffer_id, : lora_rank * c, :]
                     load_lora_weight_tensor(buffer_view, weights)
@@ -669,7 +878,10 @@ class LoRAMemoryPool:
 
                 if name in ["gate_up_proj_moe", "down_proj_moe"]:
                     if self.experts_shared_outer_loras and name == "down_proj_moe":
-                        if isinstance(weights, torch.Tensor) and weights.dim() == 3:
+                        if weights is None:
+                            buffer_view = target_buffer[buffer_id, 0, :, :lora_rank]
+                            load_lora_weight_tensor(buffer_view, None)
+                        elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
                             if weights.shape[0] != 1:
                                 raise ValueError(
                                     f"experts_shared_outer_loras is enabled but "
@@ -681,6 +893,8 @@ class LoRAMemoryPool:
                             if w is not None:
                                 w = w * lora_adapter.scaling
                             load_lora_weight_tensor(buffer_view, w)
+                            # Zero beyond loaded rank — MoE kernel reads full max_rank
+                            target_buffer[buffer_id, 0, :, lora_rank:].zero_()
                         elif isinstance(weights, dict) and len(weights) > 0:
                             if len(weights) != 1:
                                 raise ValueError(
@@ -693,27 +907,25 @@ class LoRAMemoryPool:
                             if rep is not None:
                                 rep = rep * lora_adapter.scaling
                             load_lora_weight_tensor(buffer_view, rep)
+                            # Zero beyond loaded rank — MoE kernel reads full max_rank
+                            target_buffer[buffer_id, 0, :, lora_rank:].zero_()
                         else:
                             raise ValueError(
                                 f"Unexpected weight format for shared outer down_proj_moe lora_B: "
                                 f"type={type(weights)}, "
                                 f"shape={weights.shape if isinstance(weights, torch.Tensor) else 'N/A'}"
                             )
-                    elif isinstance(weights, torch.Tensor) and weights.dim() == 3:
-                        for eid in range(weights.shape[0]):
-                            buffer_view = target_buffer[buffer_id, eid, :, :lora_rank]
-                            w = weights[eid]
+                    elif isinstance(weights, (torch.Tensor, dict)):
+                        # Zero out slots this rank owns but the adapter
+                        # doesn't fill (padded-out / out-of-rank experts);
+                        # then scale+load the ones it does.
+                        target_buffer[buffer_id].zero_()
+                        for local_eid, w in self._iter_local_expert_weights(weights):
                             if w is not None:
                                 w = w * lora_adapter.scaling
-                            load_lora_weight_tensor(buffer_view, w)
-                    elif isinstance(weights, dict):
-                        for expert_id, expert_weight in weights.items():
                             buffer_view = target_buffer[
-                                buffer_id, expert_id, :, :lora_rank
+                                buffer_id, local_eid, :, :lora_rank
                             ]
-                            w = expert_weight
-                            if w is not None:
-                                w = w * lora_adapter.scaling
                             load_lora_weight_tensor(buffer_view, w)
                 else:
                     buffer_view = target_buffer[buffer_id, :, :lora_rank]
@@ -762,6 +974,7 @@ class LoRAMemoryPool:
 
                 elif (
                     target_module == "lm_head"
+                    and lora_lm_head_module is not None
                     and "lm_head" in name
                     and ("lora_embedding_A" in name or "lora_A" in name)
                 ):
@@ -774,12 +987,14 @@ class LoRAMemoryPool:
                     load_lora_weight_tensor(buffer_view, weights)
                 elif (
                     target_module == "lm_head"
+                    and lora_lm_head_module is not None
                     and "lm_head" in name
                     and ("lora_embedding_B" in name or "lora_B" in name)
                 ):
+                    assert lora_lm_head_module is not None
                     lora_b_weights = weights
                     # Slice B along vocab dimension for this TP rank
-                    if self.tp_size > 1 and lora_lm_head_module is not None:
+                    if self.tp_size > 1:
                         lora_b_weights = lora_lm_head_module.slice_lora_b_weights(
                             lora_b_weights, self.tp_rank
                         )
@@ -790,6 +1005,27 @@ class LoRAMemoryPool:
                         :lora_rank,
                     ]
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
+                elif (
+                    target_module == "lm_head"
+                    and "lm_head" in name
+                    and (
+                        "lora_embedding_A" in name
+                        or "lora_A" in name
+                        or "lora_embedding_B" in name
+                        or "lora_B" in name
+                    )
+                ):
+                    # Only assert for genuine LoRA A/B deltas. Non-LoRA adapter
+                    # entries (e.g. `base_layer.weight` emitted by PEFT for
+                    # tied-embedding lm_head) fall through and are handled by
+                    # the base weight loader, mirroring embed_tokens behavior.
+                    # Non-last PP stages do not own lm_head, so adapters can
+                    # legitimately contain lm_head LoRA weights with no local
+                    # module to load them into, otherwise we should have been able to load this weight.
+                    assert (
+                        not get_pp_group().is_last_rank
+                    ), f"Failed to load lm_head LoRA weight: {name}, this is only expected to happen on non-last PP stages."
+                    continue
         else:
             # Zero out embedding/lm_head buffers for adapters without embedding LoRA
             # to avoid using garbage values from uninitialized memory

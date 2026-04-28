@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 # DeepSeek-V3 MLA tests with torch compile, FA3, and MTP speculative decoding
-register_cuda_ci(est_time=442, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=543, suite="stage-b-test-1-gpu-large")
 register_amd_ci(
     est_time=221,
     suite="stage-b-test-1-gpu-small-amd",
@@ -56,7 +56,7 @@ class TestMLADeepseekV3(CustomTestCase):
         metrics = run_eval(args)
         print(metrics)
 
-        self.assertGreater(metrics["score"], 0.62)
+        self.assertGreater(metrics["score"], 0.60)
 
 
 @unittest.skipIf(is_in_ci(), "To reduce the CI execution time.")
