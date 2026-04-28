@@ -1,4 +1,5 @@
-export const MOVADeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const MOVADeployment = ({ urlStatePrefix = 'mova' }) => {
   // Config options
   const options = {
     hardware: {
@@ -33,6 +34,8 @@ export const MOVADeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   // Detect dark mode
   useEffect(() => {

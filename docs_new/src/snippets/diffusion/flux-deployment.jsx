@@ -1,4 +1,5 @@
-export const FluxDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const FluxDeployment = ({ urlStatePrefix = 'flux' }) => {
   const config = {
     modelFamily: 'FLUX',
 
@@ -86,6 +87,8 @@ export const FluxDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

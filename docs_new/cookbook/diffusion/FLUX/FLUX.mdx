@@ -4,6 +4,8 @@ metatags:
     description: "Deploy FLUX diffusion models with SGLang - 12B/32B rectified flow transformers for high-quality text-to-image generation."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { FluxDeployment } from '/src/snippets/diffusion/flux-deployment.jsx';
 
 ## 1. Model Introduction
@@ -46,7 +48,7 @@ FLUX models are optimized for high-quality image generation. The recommended lau
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform and model version. SGLang supports serving FLUX on NVIDIA B200, H200, H100, and AMD MI355X, MI325X, MI300X GPUs.
 
-<FluxDeployment />
+<FluxDeployment urlStatePrefix="flux" />
 
 ### 3.2 Configuration Tips
 

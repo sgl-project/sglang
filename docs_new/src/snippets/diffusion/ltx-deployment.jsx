@@ -1,4 +1,5 @@
-export const LTXDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const LTXDeployment = ({ urlStatePrefix = 'ltx' }) => {
   const options = {
     hardware: {
       name: 'hardware',
@@ -64,6 +65,8 @@ export const LTXDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

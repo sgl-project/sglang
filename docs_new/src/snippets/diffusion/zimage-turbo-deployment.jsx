@@ -1,4 +1,5 @@
-export const ZImageTurboDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const ZImageTurboDeployment = ({ urlStatePrefix = 'zimage-turbo' }) => {
   const config = {
     modelFamily: 'Z-Image-Turbo',
 
@@ -70,6 +71,8 @@ export const ZImageTurboDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   useEffect(() => {
     const checkDarkMode = () => {

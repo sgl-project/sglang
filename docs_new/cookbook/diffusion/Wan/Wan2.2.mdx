@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Wan2.2 video generation models with SGLang - MoE architecture, cinematic aesthetics, and efficient 720P@24fps generation."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { Wan22Deployment } from '/src/snippets/diffusion/wan22-deployment.jsx';
 
 ## 1. Model Introduction
@@ -35,7 +37,7 @@ The Wan2.2 series offers models in various sizes, architectures and input types,
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size. SGLang supports serving Wan2.2 on NVIDIA B200, H200 and AMD MI300X, MI325X and MI355X GPUs.
 
-<Wan22Deployment />
+<Wan22Deployment urlStatePrefix="wan22" />
 
 ### 3.2 Configuration Tips
 

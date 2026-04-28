@@ -1,5 +1,5 @@
-
-    export const Wan22Deployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const Wan22Deployment = ({ urlStatePrefix = 'wan22' }) => {
       const options = {
         hardware: {
           name: 'hardware',
@@ -64,6 +64,8 @@
 
       const [values, setValues] = useState(getInitialState);
       const [isDark, setIsDark] = useState(false);
+
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
       useEffect(() => {
         const checkDarkMode = () => {

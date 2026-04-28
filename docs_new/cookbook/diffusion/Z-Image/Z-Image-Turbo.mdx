@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Z-Image-Turbo with SGLang - community contribution guide for Z-Image's fast image generation model."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { ZImageTurboDeployment } from '/src/snippets/diffusion/zimage-turbo-deployment.jsx';
 
 ## 1. Model Introduction
@@ -38,7 +40,7 @@ Z-Image-Turbo is optimized for high-quality image generation with only 8 inferen
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
 
-<ZImageTurboDeployment />
+<ZImageTurboDeployment urlStatePrefix="zimage-turbo" />
 
 ### 3.2 Configuration Tips
 

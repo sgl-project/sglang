@@ -4,6 +4,8 @@ metatags:
     description: "Deploy Qwen-Image with SGLang - community contribution guide for Qwen's image generation model."
 ---
 
+import { useUrlStatePersistence } from "/src/snippets/shared/url-state-persistence.jsx";
+
 import { QwenImageDeployment } from '/src/snippets/diffusion/qwen-image-deployment.jsx';
 
 ## 1. Model Introduction
@@ -28,7 +30,7 @@ Qwen-Image is a text-to-image model. The recommended launch configurations vary 
 
 **Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
 
-<QwenImageDeployment />
+<QwenImageDeployment urlStatePrefix="qwen-image" />
 
 ### 3.2 Configuration Tips
 

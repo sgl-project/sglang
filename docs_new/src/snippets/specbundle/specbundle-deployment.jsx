@@ -1,4 +1,5 @@
-export const SpecBundleDeployment = () => {
+import { useUrlStatePersistence } from '/src/snippets/shared/url-state-persistence.jsx';
+export const SpecBundleDeployment = ({ urlStatePrefix = 'specbundle' }) => {
   // Config options based on SpecBundleConfigGenerator - matching original structure exactly
   const baseConfig = {
     options: {
@@ -56,6 +57,8 @@ export const SpecBundleDeployment = () => {
 
   const [values, setValues] = useState(getInitialState);
   const [isDark, setIsDark] = useState(false);
+  
+  useUrlStatePersistence(values, setValues, { prefix: urlStatePrefix });
 
   // Detect dark mode
   useEffect(() => {
