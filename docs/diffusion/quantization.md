@@ -57,23 +57,22 @@ Published checkpoints keep the serialized quantization config as
 `quant_method=modelopt`; the FP8 vs NVFP4 split below is a documentation label
 derived from `quant_algo`.
 
-Seven of the eight repos live under `BBuf/*`. The FLUX.2 NVFP4 entry keeps the
+Seven of the eight repos live under `lmsys/*`. The FLUX.2 NVFP4 entry keeps the
 official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
 
 | Quant Algo | Base Model | Preferred CLI | HF Repo | Current Scope | Notes |
 | --- | --- | --- | --- | --- | --- |
-| `FP8` | `black-forest-labs/FLUX.1-dev` | `--transformer-path` | `BBuf/flux1-dev-modelopt-fp8-sglang-transformer` | single-transformer override, deterministic latent/image comparison, H100 benchmark, torch-profiler trace | SGLang converter keeps a validated BF16 fallback set for modulation and FF projection layers; use `--model-id FLUX.1-dev` for local mirrors |
-| `FP8` | `black-forest-labs/FLUX.2-dev` | `--transformer-path` | `BBuf/flux2-dev-modelopt-fp8-sglang-transformer` | single-transformer override load and generation path | published SGLang-ready transformer override |
-| `FP8` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `--transformer-path` | `BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer` | primary `transformer` quantized, `transformer_2` kept BF16 | primary-transformer-only path; keep `transformer_2` on the base checkpoint, and do not describe this as dual-transformer full-model FP8 unless that path is validated separately |
-| `FP8` | `Qwen/Qwen-Image` | `--transformer-path` | `BBuf/Qwen-Image-ModelOpt-FP8-SGLang` | single-transformer override, BF16-vs-FP8 image comparison, H100 benchmark, torch-profiler trace | shares the Qwen Image FP8 fallback preset; keep `img_in`, `txt_in`, timestep embedder, `norm_out.linear`, `proj_out`, `img_mod`/`txt_mod`, and `img_mlp.net.2` in BF16 |
-| `FP8` | `Qwen/Qwen-Image-Edit-2511` | `--transformer-path` | `BBuf/Qwen-Image-Edit-ModelOpt-FP8-SGLang` | TI2I edit smoke, BF16-vs-FP8 image comparison, H100 benchmark | shares `QwenImageTransformer2DModel` with Qwen Image and uses the same Qwen Image FP8 fallback preset |
-| `NVFP4` | `black-forest-labs/FLUX.1-dev` | `--transformer-path` | `BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer` | mixed BF16+NVFP4 transformer override, correctness validation, 4x RTX 5090 benchmark, torch-profiler trace | use `build_modelopt_nvfp4_transformer.py`; validated builder keeps selected FLUX.1 modules in BF16 and sets `swap_weight_nibbles=false` |
+| `FP8` | `black-forest-labs/FLUX.1-dev` | `--transformer-path` | `lmsys/flux1-dev-modelopt-fp8-sglang-transformer` | single-transformer override, deterministic latent/image comparison, H100 benchmark, torch-profiler trace | SGLang converter keeps a validated BF16 fallback set for modulation and FF projection layers; use `--model-id FLUX.1-dev` for local mirrors |
+| `FP8` | `black-forest-labs/FLUX.2-dev` | `--transformer-path` | `lmsys/flux2-dev-modelopt-fp8-sglang-transformer` | single-transformer override load and generation path | published SGLang-ready transformer override |
+| `FP8` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `--transformer-path` | `lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer` | primary `transformer` quantized, `transformer_2` kept BF16 | primary-transformer-only path; keep `transformer_2` on the base checkpoint, and do not describe this as dual-transformer full-model FP8 unless that path is validated separately |
+| `FP8` | `Qwen/Qwen-Image` | `--transformer-path` | `lmsys/qwen-image-modelopt-fp8-sglang-transformer` | single-transformer override, BF16-vs-FP8 image comparison, H100 benchmark, torch-profiler trace | shares the Qwen Image FP8 fallback preset; keep `img_in`, `txt_in`, timestep embedder, `norm_out.linear`, `proj_out`, `img_mod`/`txt_mod`, and `img_mlp.net.2` in BF16 |
+| `FP8` | `Qwen/Qwen-Image-Edit-2511` | `--transformer-path` | `lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer` | TI2I edit smoke, BF16-vs-FP8 image comparison, H100 benchmark | shares `QwenImageTransformer2DModel` with Qwen Image and uses the same Qwen Image FP8 fallback preset |
+| `NVFP4` | `black-forest-labs/FLUX.1-dev` | `--transformer-path` | `lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer` | mixed BF16+NVFP4 transformer override, correctness validation, 4x RTX 5090 benchmark, torch-profiler trace | use `build_modelopt_nvfp4_transformer.py`; validated builder keeps selected FLUX.1 modules in BF16 and sets `swap_weight_nibbles=false` |
 | `NVFP4` | `black-forest-labs/FLUX.2-dev` | `--transformer-weights-path` | `black-forest-labs/FLUX.2-dev-NVFP4` | packed-QKV load path | official raw export repo; validated packed export detection and runtime layout handling |
-| `NVFP4` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `--transformer-path` | `BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer` | primary `transformer` quantized with ModelOpt NVFP4, `transformer_2` kept BF16 | primary-transformer-only path; keep `transformer_2` on the base checkpoint, and current B200/Blackwell bring-up uses `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn` |
+| `NVFP4` | `Wan-AI/Wan2.2-T2V-A14B-Diffusers` | `--transformer-path` | `lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer` | primary `transformer` quantized with ModelOpt NVFP4, `transformer_2` kept BF16 | primary-transformer-only path; keep `transformer_2` on the base checkpoint, and current B200/Blackwell bring-up uses `SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn` |
 
-The FLUX and Wan entries are also the intended case set for the B200 diffusion
-CI job (`multimodal-gen-test-1-b200`). The Qwen Image FP8 entries are currently
-H100 manual-validation artifacts.
+These eight checkpoints are also the intended case set for the B200 diffusion
+CI job (`multimodal-gen-test-1-b200`).
 
 ## ModelOpt FP8
 
@@ -86,7 +85,7 @@ overrides. If the repo or local directory already contains `config.json`, use
 ```bash
 sglang generate \
   --model-path black-forest-labs/FLUX.2-dev \
-  --transformer-path BBuf/flux2-dev-modelopt-fp8-sglang-transformer \
+  --transformer-path lmsys/flux2-dev-modelopt-fp8-sglang-transformer \
   --prompt "A Logo With Bold Large Text: SGL Diffusion" \
   --save-output
 ```
@@ -94,7 +93,7 @@ sglang generate \
 ```bash
 sglang generate \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --transformer-path BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer \
+  --transformer-path lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer \
   --prompt "a fox walking through neon rain" \
   --save-output
 ```
@@ -102,7 +101,7 @@ sglang generate \
 ```bash
 sglang generate \
   --model-path Qwen/Qwen-Image \
-  --transformer-path BBuf/Qwen-Image-ModelOpt-FP8-SGLang \
+  --transformer-path lmsys/qwen-image-modelopt-fp8-sglang-transformer \
   --prompt "A tiny astronaut reading a book under a glass greenhouse" \
   --save-output
 ```
@@ -110,7 +109,7 @@ sglang generate \
 ```bash
 sglang generate \
   --model-path Qwen/Qwen-Image-Edit-2511 \
-  --transformer-path BBuf/Qwen-Image-Edit-ModelOpt-FP8-SGLang \
+  --transformer-path lmsys/qwen-image-edit-modelopt-fp8-sglang-transformer \
   --image-path /path/to/input.png \
   --prompt "Turn the scene into a warm watercolor illustration" \
   --save-output
@@ -156,7 +155,7 @@ For mixed ModelOpt NVFP4 transformer overrides that already contain
 ```bash
 sglang generate \
   --model-path black-forest-labs/FLUX.1-dev \
-  --transformer-path BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer \
+  --transformer-path lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer \
   --prompt "A Logo With Bold Large Text: SGL Diffusion" \
   --save-output
 ```
@@ -189,7 +188,7 @@ was quantized:
 SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn \
 sglang generate \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --transformer-path BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer \
+  --transformer-path lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer \
   --prompt "a fox walking through neon rain" \
   --save-output
 ```
