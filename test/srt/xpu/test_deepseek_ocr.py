@@ -56,7 +56,6 @@ class TestDeepSeekOCR(CustomTestCase):
             except Exception:
                 # Force kill if it didn't exit cleanly in time
                 kill_process_tree(cls.process.pid)
-        cls._cleanup_xpu_memory()
 
     def get_request_json(self, max_new_tokens=32, n=1):
         response = requests.post(
