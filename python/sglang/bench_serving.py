@@ -463,9 +463,12 @@ async def async_request_openai_chat_completions(
                             else:
                                 data = json.loads(chunk)
 
-                                # Check if this chunk contains content
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
+                                # Reasoning models stream thoughts via
+                                # `reasoning_content`; count them like content.
+                                delta = data.get("choices", [{}])[0].get("delta") or {}
+                                content = (delta.get("content") or "") + (
+                                    delta.get("reasoning_content") or ""
+                                )
 
                                 if content:
                                     timestamp = time.perf_counter()
