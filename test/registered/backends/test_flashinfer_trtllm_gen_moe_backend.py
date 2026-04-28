@@ -115,7 +115,7 @@ class FlashinferTrtllmGenMoeBackendMXFP8Base:
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "Qwen/Qwen3-30B-A3B-Instruct-2507"
+        cls.model = "zianglih/Qwen3-30B-A3B-Instruct-2507-MXFP8"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -123,10 +123,8 @@ class FlashinferTrtllmGenMoeBackendMXFP8Base:
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env={**os.environ, "SGLANG_ENABLE_JIT_DEEPGEMM": "False"},
             other_args=[
-                "--quantization",
-                "mxfp8",
                 "--fp8-gemm-backend",
-                "flashinfer_trtllm",
+                "flashinfer_cutlass",
                 "--moe-runner-backend",
                 cls.backend,
                 "--tp-size",

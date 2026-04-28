@@ -324,6 +324,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
 
         # Initialize async dynamic batch tokenizer if enabled (common for both multimodal and non-multimodal)
@@ -470,7 +471,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bucket_time_to_first_token=self.server_args.bucket_time_to_first_token,
                 bucket_e2e_request_latency=self.server_args.bucket_e2e_request_latency,
                 bucket_inter_token_latency=self.server_args.bucket_inter_token_latency,
-                collect_tokens_histogram=self.server_args.collect_tokens_histogram,
             )
 
             start_cpu_monitor_thread("tokenizer")
@@ -730,14 +730,24 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_text, is_cross_encoder_request
                 )
 
-        if self.mm_processor and obj.contains_mm_input():
+        contains_mm_input = obj.contains_mm_input()
+        is_mossvl = (
+            "MossVLForConditionalGeneration"
+            in self.model_config.hf_config.architectures
+        )
+        should_run_mm_processor = self.mm_processor is not None and (
+            contains_mm_input or is_mossvl
+        )
+
+        if should_run_mm_processor:
             if obj.image_data is not None and not isinstance(obj.image_data, list):
                 obj.image_data = [obj.image_data]
             if obj.video_data is not None and not isinstance(obj.video_data, list):
                 obj.video_data = [obj.video_data]
             if obj.audio_data is not None and not isinstance(obj.audio_data, list):
                 obj.audio_data = [obj.audio_data]
-            self._validate_mm_limits(obj)
+            if contains_mm_input:
+                self._validate_mm_limits(obj)
 
             mm_inputs = None
 
@@ -2682,6 +2692,7 @@ def _get_processor_wrapper(server_args):
             trust_remote_code=server_args.trust_remote_code,
             revision=server_args.revision,
             use_fast=not server_args.disable_fast_image_processor,
+            tokenizer_backend=server_args.tokenizer_backend,
         )
     except ValueError as e:
         error_message = str(e)
@@ -2695,6 +2706,7 @@ def _get_processor_wrapper(server_args):
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
                 use_fast=True,
+                tokenizer_backend=server_args.tokenizer_backend,
             )
         else:
             raise e
