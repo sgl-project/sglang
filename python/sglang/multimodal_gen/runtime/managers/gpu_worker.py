@@ -6,7 +6,9 @@ import logging
 import multiprocessing as mp
 import os
 import time
-from typing import List, Union
+from contextlib import ExitStack
+from dataclasses import dataclass, field
+from typing import Any, Callable, List, Union
 
 import torch
 from setproctitle import setproctitle
@@ -58,9 +60,23 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
     PerformanceLogger,
     capture_memory_snapshot,
 )
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
+from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class _ExpandedOutputParts:
+    tensor_outputs: list[torch.Tensor] = field(default_factory=list)
+    list_outputs: list[Any] = field(default_factory=list)
+    tensor_audio: list[torch.Tensor] = field(default_factory=list)
+    trajectory_latents: list[torch.Tensor] = field(default_factory=list)
+    noise_preds: list[torch.Tensor] = field(default_factory=list)
+    output_file_paths: list[str] = field(default_factory=list)
+    metrics_list: list[Any] = field(default_factory=list)
+    trajectory_decoded_parts: list[list[torch.Tensor]] | None = None
 
 
 class GPUWorker:
@@ -208,86 +224,118 @@ class GPUWorker:
             f"Related offload server args to disable: {suggested_args_str}"
         )
 
-    def execute_forward(self, batch: List[Req]) -> OutputBatch:
+    def execute_forward(
+        self, batch: List[Req], return_req: bool = False
+    ) -> OutputBatch | Req:
         """
         Execute a forward pass.
+
+        Args:
+            batch: List of requests to process.
+            return_req: If True, return the raw Req instead of OutputBatch.
+                Used by disaggregated pipelines to access intermediate tensors.
         """
         assert self.pipeline is not None
+        if len(batch) > 1:
+            if return_req:
+                raise ValueError(
+                    "Grouped execute_forward does not support return_req=True"
+                )
+            # batched reqs is only possible with `num_outputs_per_prompt > 1` now
+            self._validate_group_forward_reqs(batch)
+            return self._execute_forward_batch(batch)
+
         req = batch[0]
+        return self._execute_forward_common(
+            req,
+            forward_fn=lambda: self.pipeline.forward(req, self.server_args),
+            log_reqs=[req],
+            return_req=return_req,
+            save_output_paths=lambda output_batch: self._save_output_paths(
+                req, output_batch
+            ),
+            error_context=f"request {req.request_id}",
+        )
+
+    def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch:
+        """Execute expanded multi-output requests as one grouped forward."""
+        # TODO: support early return or mix-stage execution for reqs in a group
+        assert self.pipeline is not None
+        req = batch[0]
+        return self._execute_forward_common(
+            req,
+            forward_fn=lambda: self._forward_group(batch),
+            log_reqs=batch,
+            return_req=False,
+            save_output_paths=lambda output_batch: self._save_group_output_paths(
+                batch, output_batch
+            ),
+            error_context=f"grouped request {req.request_id}",
+        )
+
+    def _execute_forward_common(
+        self,
+        req: Req,
+        *,
+        forward_fn: Callable[[], Req | OutputBatch],
+        log_reqs: list[Req],
+        return_req: bool,
+        save_output_paths: Callable[[OutputBatch], None],
+        error_context: str,
+    ) -> OutputBatch | Req:
+        """
+        Args:
+            forward_fn: the actual forward function for reqs
+        """
         output_batch = None
         try:
-            if self.rank == 0:
+            if self.rank == 0 and not current_platform.is_cpu():
                 torch.get_device_module().reset_peak_memory_stats()
 
             start_time = time.monotonic()
 
-            # capture memory baseline before forward
-            if self.rank == 0 and req.metrics:
+            request_metrics = [
+                item.metrics for item in log_reqs if item.metrics is not None
+            ]
+            if self.rank == 0 and request_metrics and not current_platform.is_cpu():
                 baseline_snapshot = capture_memory_snapshot()
-                req.metrics.record_memory_snapshot("before_forward", baseline_snapshot)
+                for metrics in request_metrics:
+                    metrics.record_memory_snapshot("before_forward", baseline_snapshot)
 
-            req.log(server_args=self.server_args)
-            result = self.pipeline.forward(req, self.server_args)
+            for item in log_reqs:
+                item.log(server_args=self.server_args)
+            with ExitStack() as stack:
+                for item in log_reqs:
+                    stack.enter_context(
+                        trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
+                    )
+                result = forward_fn()
 
-            if isinstance(result, Req):
-                output_batch = OutputBatch(
-                    output=result.output,
-                    audio=getattr(result, "audio", None),
-                    audio_sample_rate=getattr(result, "audio_sample_rate", None),
-                    metrics=result.metrics,
-                    trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
-                    trajectory_latents=getattr(result, "trajectory_latents", None),
-                    rollout_trajectory_data=getattr(
-                        result, "rollout_trajectory_data", None
-                    ),
-                    noise_pred=getattr(result, "noise_pred", None),
-                    trajectory_decoded=getattr(result, "trajectory_decoded", None),
-                )
-            else:
-                output_batch = result
+            if return_req and isinstance(result, Req):
+                return result
 
-            # capture memory after forward (peak)
-            if self.rank == 0 and output_batch.metrics:
+            output_batch = self._to_output_batch(result)
+
+            output_metrics = self._iter_output_metrics(output_batch)
+            if self.rank == 0 and output_metrics and not current_platform.is_cpu():
                 peak_snapshot = capture_memory_snapshot()
-                output_batch.metrics.record_memory_snapshot(
-                    "after_forward", peak_snapshot
-                )
+                for metrics in output_metrics:
+                    metrics.record_memory_snapshot("after_forward", peak_snapshot)
 
             if (
                 self.rank == 0
                 and not req.suppress_logs
+                and not current_platform.is_cpu()
                 and logger.isEnabledFor(logging.DEBUG)
             ):
                 self.do_mem_analysis(output_batch)
 
             duration_ms = (time.monotonic() - start_time) * 1000
-            output_batch.metrics.total_duration_ms = duration_ms
+            for metrics in output_metrics:
+                metrics.total_duration_ms = duration_ms
 
-            # Save output to file and return file path only if requested. Avoid the serialization
-            # and deserialization overhead between scheduler_client and gpu_worker.
             if req.save_output and req.return_file_paths_only:
-                if self.rank == 0 and output_batch.output is not None:
-                    output_paths = save_outputs(
-                        output_batch.output,
-                        req.data_type,
-                        req.fps,
-                        True,
-                        lambda idx: req.output_file_path(len(output_batch.output), idx),
-                        audio=output_batch.audio,
-                        audio_sample_rate=output_batch.audio_sample_rate,
-                        output_compression=req.output_compression,
-                        enable_frame_interpolation=req.enable_frame_interpolation,
-                        frame_interpolation_exp=req.frame_interpolation_exp,
-                        frame_interpolation_scale=req.frame_interpolation_scale,
-                        frame_interpolation_model_path=req.frame_interpolation_model_path,
-                        enable_upscaling=req.enable_upscaling,
-                        upscaling_model_path=req.upscaling_model_path,
-                        upscaling_scale=req.upscaling_scale,
-                    )
-                    output_batch.output_file_paths = output_paths
-
-                # No rank needs to hold on to generated tensors once the file-path
-                # response has been materialized on rank 0
+                save_output_paths(output_batch)
                 output_batch.output = None
                 output_batch.audio = None
                 output_batch.audio_sample_rate = None
@@ -295,13 +343,13 @@ class GPUWorker:
                 if torch.cuda.is_initialized():
                     torch.cuda.empty_cache()
 
-            # TODO: extract to avoid duplication
+            if torch.cuda.is_initialized() and output_batch.output is None:
+                torch.cuda.empty_cache()
+
             if req.perf_dump_path is not None or envs.SGLANG_DIFFUSION_STAGE_LOGGING:
-                # Avoid logging warmup perf records that share the same request_id.
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
 
-            # dump per-request perf report to specified file (server mode)
             if (
                 req.perf_dump_path is not None
                 and not req.is_warmup
@@ -315,14 +363,239 @@ class GPUWorker:
                 )
         except Exception as e:
             logger.error(
-                f"Error executing request {req.request_id}: {e}", exc_info=True
+                f"Error executing {error_context}: {e}",
+                exc_info=True,
             )
             if isinstance(e, _oom_exceptions()):
                 logger.warning(OOM_MSG)
             if output_batch is None:
                 output_batch = OutputBatch()
-            output_batch.error = f"Error executing request {req.request_id}: {e}"
+            output_batch.error = f"Error executing {error_context}: {e}"
         return output_batch
+
+    def _forward_group(self, batch: list[Req]) -> OutputBatch:
+        assert self.pipeline is not None
+        results = self.pipeline.forward_batch(batch, self.server_args)
+        output_batches = [self._to_output_batch(result) for result in results]
+        return self._merge_expanded_output_batches(output_batches)
+
+    def _save_output_paths(self, req: Req, output_batch: OutputBatch) -> None:
+        if self.rank != 0 or output_batch.output is None:
+            return
+
+        output_batch.output_file_paths = save_outputs(
+            output_batch.output,
+            req.data_type,
+            req.fps,
+            True,
+            lambda idx: req.output_file_path(len(output_batch.output), idx),
+            audio=output_batch.audio,
+            audio_sample_rate=output_batch.audio_sample_rate,
+            output_compression=req.output_compression,
+            enable_frame_interpolation=req.enable_frame_interpolation,
+            frame_interpolation_exp=req.frame_interpolation_exp,
+            frame_interpolation_scale=req.frame_interpolation_scale,
+            frame_interpolation_model_path=req.frame_interpolation_model_path,
+            enable_upscaling=req.enable_upscaling,
+            upscaling_model_path=req.upscaling_model_path,
+            upscaling_scale=req.upscaling_scale,
+        )
+
+    def _save_group_output_paths(
+        self,
+        reqs: list[Req],
+        output_batch: OutputBatch,
+    ) -> None:
+        if self.rank != 0 or output_batch.output is None:
+            return
+        if len(output_batch.output) != len(reqs):
+            raise RuntimeError(
+                f"Expected {len(reqs)} grouped outputs, got {len(output_batch.output)}"
+            )
+
+        first_req = reqs[0]
+        output_batch.output_file_paths = save_outputs(
+            output_batch.output,
+            first_req.data_type,
+            first_req.fps,
+            True,
+            lambda idx: reqs[idx].output_file_path(1, 0),
+            audio=output_batch.audio,
+            audio_sample_rate=output_batch.audio_sample_rate,
+            output_compression=first_req.output_compression,
+            enable_frame_interpolation=first_req.enable_frame_interpolation,
+            frame_interpolation_exp=first_req.frame_interpolation_exp,
+            frame_interpolation_scale=first_req.frame_interpolation_scale,
+            frame_interpolation_model_path=first_req.frame_interpolation_model_path,
+            enable_upscaling=first_req.enable_upscaling,
+            upscaling_model_path=first_req.upscaling_model_path,
+            upscaling_scale=first_req.upscaling_scale,
+        )
+
+    @staticmethod
+    def _validate_group_forward_reqs(reqs: list[Req]) -> None:
+        """Validate fields that the grouped output/save path treats as shared."""
+        first_req = reqs[0]
+        shared_output_fields = (
+            "save_output",
+            "return_file_paths_only",
+            "data_type",
+            "fps",
+            "output_compression",
+            "enable_frame_interpolation",
+            "frame_interpolation_exp",
+            "frame_interpolation_scale",
+            "frame_interpolation_model_path",
+            "enable_upscaling",
+            "upscaling_model_path",
+            "upscaling_scale",
+        )
+        for req in reqs[1:]:
+            mismatched = [
+                field
+                for field in shared_output_fields
+                if getattr(req, field) != getattr(first_req, field)
+            ]
+            if mismatched:
+                raise ValueError(
+                    "Grouped execute_forward requires matching output settings; "
+                    f"mismatched fields: {mismatched}"
+                )
+
+    @staticmethod
+    def _iter_output_metrics(output_batch: OutputBatch):
+        """Return all metrics objects carried by an output batch."""
+        if output_batch.metrics_list is not None:
+            return [
+                metrics for metrics in output_batch.metrics_list if metrics is not None
+            ]
+        if output_batch.metrics is not None:
+            return [output_batch.metrics]
+        return []
+
+    @staticmethod
+    def _to_output_batch(result: Req | OutputBatch) -> OutputBatch:
+        if isinstance(result, Req):
+            return GPUWorker._req_to_output_batch(result)
+        return result
+
+    @staticmethod
+    def _req_to_output_batch(result: Req) -> OutputBatch:
+        return OutputBatch(
+            output=result.output,
+            audio=getattr(result, "audio", None),
+            audio_sample_rate=getattr(result, "audio_sample_rate", None),
+            metrics=result.metrics,
+            trajectory_timesteps=getattr(result, "trajectory_timesteps", None),
+            trajectory_latents=getattr(result, "trajectory_latents", None),
+            rollout_trajectory_data=getattr(result, "rollout_trajectory_data", None),
+            noise_pred=getattr(result, "noise_pred", None),
+            trajectory_decoded=getattr(result, "trajectory_decoded", None),
+        )
+
+    @staticmethod
+    def _merge_expanded_output_batches(
+        output_batches: list[OutputBatch],
+    ) -> OutputBatch:
+        """Merge per-output batches produced by grouped execution."""
+        merged = OutputBatch()
+        parts = _ExpandedOutputParts()
+
+        for output_batch in output_batches:
+            GPUWorker._merge_expanded_singletons(merged, output_batch)
+            GPUWorker._collect_expanded_parts(parts, output_batch)
+
+        GPUWorker._finalize_expanded_parts(
+            merged,
+            parts,
+            audio_sample_rate=output_batches[0].audio_sample_rate,
+        )
+
+        return merged
+
+    @staticmethod
+    def _merge_expanded_singletons(
+        merged: OutputBatch, output_batch: OutputBatch
+    ) -> None:
+        if output_batch.error is not None and merged.error is None:
+            merged.error = output_batch.error
+        merged.peak_memory_mb = max(merged.peak_memory_mb, output_batch.peak_memory_mb)
+        if (
+            merged.trajectory_timesteps is None
+            and output_batch.trajectory_timesteps is not None
+        ):
+            merged.trajectory_timesteps = output_batch.trajectory_timesteps
+        if (
+            merged.rollout_trajectory_data is None
+            and output_batch.rollout_trajectory_data is not None
+        ):
+            merged.rollout_trajectory_data = output_batch.rollout_trajectory_data
+
+    @staticmethod
+    def _collect_expanded_parts(
+        parts: _ExpandedOutputParts, output_batch: OutputBatch
+    ) -> None:
+        """Collect expanded outputs"""
+        parts.metrics_list.append(output_batch.metrics)
+        if output_batch.output_file_paths:
+            parts.output_file_paths.extend(output_batch.output_file_paths)
+        if isinstance(output_batch.output, torch.Tensor):
+            parts.tensor_outputs.append(output_batch.output)
+        elif output_batch.output is not None:
+            parts.list_outputs.extend(output_batch.output)
+        if isinstance(output_batch.audio, torch.Tensor):
+            parts.tensor_audio.append(output_batch.audio)
+        if isinstance(output_batch.trajectory_latents, torch.Tensor):
+            parts.trajectory_latents.append(output_batch.trajectory_latents)
+        if isinstance(output_batch.noise_pred, torch.Tensor):
+            parts.noise_preds.append(output_batch.noise_pred)
+        if output_batch.trajectory_decoded:
+            GPUWorker._collect_trajectory_decoded(
+                parts, output_batch.trajectory_decoded
+            )
+
+    @staticmethod
+    def _collect_trajectory_decoded(
+        parts: _ExpandedOutputParts, trajectory_decoded: list[torch.Tensor]
+    ) -> None:
+        if parts.trajectory_decoded_parts is None:
+            parts.trajectory_decoded_parts = [[] for _ in trajectory_decoded]
+        for index, decoded in enumerate(trajectory_decoded):
+            parts.trajectory_decoded_parts[index].append(decoded)
+
+    @staticmethod
+    def _finalize_expanded_parts(
+        merged: OutputBatch,
+        parts: _ExpandedOutputParts,
+        *,
+        audio_sample_rate: int | None,
+    ) -> None:
+        """
+        merge batched output
+        """
+        if parts.output_file_paths:
+            merged.output_file_paths = parts.output_file_paths
+        if any(metrics is not None for metrics in parts.metrics_list):
+            merged.metrics_list = parts.metrics_list
+            merged.metrics = next(
+                metrics for metrics in parts.metrics_list if metrics is not None
+            )
+        if parts.tensor_outputs:
+            merged.output = torch.cat(parts.tensor_outputs, dim=0)
+        elif parts.list_outputs:
+            merged.output = parts.list_outputs
+        if parts.tensor_audio:
+            merged.audio = torch.cat(parts.tensor_audio, dim=0)
+            merged.audio_sample_rate = audio_sample_rate
+        if parts.trajectory_latents:
+            merged.trajectory_latents = torch.cat(parts.trajectory_latents, dim=0)
+        if parts.noise_preds:
+            merged.noise_pred = torch.cat(parts.noise_preds, dim=0)
+        if parts.trajectory_decoded_parts:
+            merged.trajectory_decoded = [
+                torch.cat(decoded_step, dim=0)
+                for decoded_step in parts.trajectory_decoded_parts
+            ]
 
     def get_can_stay_resident_components(
         self, remaining_gpu_mem_gb: float
@@ -512,6 +785,10 @@ def run_scheduler_process(
     elif current_platform.is_musa():
         set_musa_arch()
 
+    if server_args.enable_trace:
+        process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
+        trace_set_thread_info(f"DiffWorker_rank{rank}")
+
     port_args = PortArgs.from_server_args(server_args)
 
     # start the scheduler event loop
@@ -526,6 +803,7 @@ def run_scheduler_process(
             port_args=port_args,
             task_pipes_to_slaves=task_pipes_to_slaves,
             result_pipes_from_slaves=result_pipes_from_slaves,
+            local_rank=local_rank,
         )
         logger.info(f"Worker {rank}: Scheduler loop started.")
         pipe_writer.send(

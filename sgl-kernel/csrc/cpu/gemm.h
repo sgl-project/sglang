@@ -77,6 +77,16 @@ constexpr bool operator==(int64_t a, CPUQuantMethod b) {
   return a == static_cast<int64_t>(b);
 }
 
+enum class CPUQuantAlgo : int64_t { AWQ = 0, GPTQ = 1 };
+
+constexpr bool operator==(CPUQuantAlgo a, int64_t b) {
+  return static_cast<int64_t>(a) == b;
+}
+
+constexpr bool operator==(int64_t a, CPUQuantAlgo b) {
+  return a == static_cast<int64_t>(b);
+}
+
 inline int64_t get_4bit_block_k_size(int64_t group_size) {
   return group_size > 128 ? 128 : group_size;
 }

@@ -21,6 +21,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_gfx95_supported,
     _is_hip,
+    _is_musa,
     _use_aiter,
     _use_aiter_gfx95,
 )
@@ -60,6 +61,9 @@ if _is_cuda:
 
 
 if _use_aiter:
+    from aiter.ops.fused_qk_norm_rope_cache_quant import (
+        fused_qk_rmsnorm as fused_qk_rmsnorm_bf16,
+    )
     from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant import (
         batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched_tensor_quant,
     )
@@ -160,6 +164,15 @@ class DeepseekMLAForwardMixin:
                                 output_unquantized_inp1=False,
                             )
 
+                    elif _use_aiter:
+                        q, k_nope = fused_qk_rmsnorm_bf16(
+                            q,
+                            self.q_a_layernorm.weight,
+                            self.q_a_layernorm.variance_epsilon,
+                            k_nope,
+                            self.kv_a_layernorm.weight,
+                            self.kv_a_layernorm.variance_epsilon,
+                        )
                     else:
                         q = self.q_a_layernorm(q)
                         k_nope = self.kv_a_layernorm(k_nope)
@@ -541,6 +554,11 @@ class DeepseekMLAForwardMixin:
                     torch.bfloat16,
                 )
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        elif _is_musa:
+            attn_bmm_output = torch.bmm(
+                attn_output.to(torch.bfloat16).transpose(0, 1), self.w_vc
+            )
+            attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
             if is_in_piecewise_cuda_graph():
                 # torch dynamo requires out= op was called where output tensor was non-contiguous
