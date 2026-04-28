@@ -3491,7 +3491,8 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
-            self.disable_overlap_schedule = True
+            # NOTE: overlap schedule is always enabled for ngram spec
+            self.disable_overlap_schedule = False
             self.enable_mixed_chunk = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
@@ -3499,6 +3500,10 @@ class ServerArgs:
                 logger.warning(
                     "speculative_num_draft_tokens is set to 12 by default for ngram speculative decoding. "
                     "You can override this by explicitly setting --speculative-num-draft-tokens."
+                )
+            if self.speculative_num_steps is None:
+                self.speculative_num_steps = (
+                    self.speculative_num_draft_tokens // self.speculative_eagle_topk
                 )
             if self.speculative_ngram_external_corpus_path is not None:
                 if self.speculative_ngram_external_sam_budget <= 0:
@@ -3520,7 +3525,7 @@ class ServerArgs:
                         f"speculative_num_draft_tokens - 1 ({self.speculative_num_draft_tokens - 1})."
                     )
             logger.warning(
-                "The overlap scheduler and mixed chunked prefill are disabled because of "
+                "The mixed chunked prefill are disabled because of "
                 "using ngram speculative decoding."
             )
 

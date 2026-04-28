@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
-from typing import Optional, Tuple
+from typing import ClassVar, Optional, Tuple
 
 import torch
 import triton
@@ -20,6 +20,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.utils import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.sampler import apply_custom_logit_processor
+from sglang.srt.managers.overlap_utils import FutureIndices
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.common import (
     alloc_paged_token_slots_extend,
@@ -27,6 +28,11 @@ from sglang.srt.mem_cache.common import (
     get_last_loc,
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.eagle_info_v2 import (
+    EagleDraftInputV2Mixin,
+    EagleVerifyInputV2Mixin,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     TREE_SPEC_KERNEL_AVAILABLE,
@@ -48,28 +54,52 @@ elif is_hip():
 
 
 @dataclass
-class NgramVerifyInput(SpecInput):
+class NgramVerifyInput(SpecInput, EagleDraftInputV2Mixin, EagleVerifyInputV2Mixin):
+    # Constant: alloc length per decode step
+    ALLOC_LEN_PER_DECODE: ClassVar[int] = None
+
     def __init__(
         self,
-        draft_token: torch.Tensor,
-        tree_mask: torch.Tensor,
-        positions: torch.Tensor,
-        retrieve_index: torch.Tensor,
-        retrieve_next_token: torch.Tensor,
-        retrieve_next_sibling: torch.Tensor,
-        draft_token_num: int,
+        server_args: ServerArgs = None,
+        draft_token: torch.Tensor = None,
+        custom_mask: torch.Tensor = None,
+        positions: torch.Tensor = None,
+        retrieve_index: torch.Tensor = None,
+        retrieve_next_token: torch.Tensor = None,
+        retrieve_next_sibling: torch.Tensor = None,
+        draft_token_num: int = -1,
         grammar: BaseGrammarObject = None,
+        future_indices: Optional[FutureIndices] = None,
+        new_seq_lens: Optional[torch.Tensor] = None,
+        verify_done: Optional[torch.cuda.Event] = None,
+        verified_tokens: Optional[torch.Tensor] = None,
+        accept_lens: Optional[torch.Tensor] = None,
     ):
         super().__init__(SpecInputType.NGRAM_VERIFY)
         self.draft_token = draft_token
-        self.custom_mask = tree_mask
+        self.custom_mask = custom_mask
         self.positions = positions
         self.retrieve_index = retrieve_index
         self.retrieve_next_token = retrieve_next_token
         self.retrieve_next_sibling = retrieve_next_sibling
-        self.draft_token_num = draft_token_num
-        self.device = self.custom_mask.device
+
+        self.draft_token_num = (
+            draft_token_num
+            if draft_token_num != -1
+            else server_args.speculative_num_draft_tokens
+        )
         self.grammar = grammar
+
+        # Inputs for V2 overlap worker
+        self.future_indices = future_indices
+        self.new_seq_lens = new_seq_lens
+        self.verify_done = verify_done
+        self.verified_tokens = verified_tokens
+        self.accept_lens = accept_lens
+
+        self.device = (
+            custom_mask.device if custom_mask is not None else new_seq_lens.device
+        )
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
@@ -139,7 +169,9 @@ class NgramVerifyInput(SpecInput):
         )
 
         kv_indices = torch.empty(
-            cum_kv_seq_len[-1], dtype=torch.int32, device=self.device
+            paged_kernel_lens_sum + self.draft_token_num * bs,
+            dtype=torch.int32,
+            device=self.device,
         )
 
         create_flashinfer_kv_indices_triton[(bs,)](
@@ -151,7 +183,28 @@ class NgramVerifyInput(SpecInput):
             kv_indices,
             req_to_token.size(1),
         )
-        return kv_indices, cum_kv_seq_len, self.qo_indptr, self.custom_mask
+
+        # Pad custom_mask when CUDA graph pads batch size beyond the actual number of requests.
+        mask_numel = (
+            paged_kernel_lens_sum * self.draft_token_num
+            + (self.draft_token_num**2) * bs
+        )
+        custom_mask = self.custom_mask
+        if custom_mask.numel() < mask_numel:
+            custom_mask = torch.cat(
+                [
+                    custom_mask,
+                    torch.full(
+                        (mask_numel - custom_mask.numel(),),
+                        True,
+                        dtype=torch.bool,
+                        device=self.device,
+                    ),
+                ],
+                dim=0,
+            )
+
+        return kv_indices, cum_kv_seq_len, self.qo_indptr, custom_mask
 
     def _fill_requests(
         self,
@@ -456,7 +509,14 @@ class NgramVerifyInput(SpecInput):
         return logits_output, self.verified_id, num_accepted_tokens
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
-        pass
+        self.verified_tokens = self.verified_tokens.reshape(-1, self.draft_token_num)[
+            new_indices, :
+        ]
+        self.verified_tokens = self.verified_tokens.flatten()
+        self.accept_lens = self.accept_lens[new_indices]
 
     def merge_batch(self, spec_info: NgramVerifyInput):
-        pass
+        self.verified_tokens = torch.cat(
+            (self.verified_tokens, spec_info.verified_tokens), dim=0
+        )
+        self.accept_lens = torch.cat((self.accept_lens, spec_info.accept_lens), dim=0)

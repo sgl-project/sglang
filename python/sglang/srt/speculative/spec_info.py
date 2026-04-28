@@ -54,7 +54,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return self.is_eagle() or self.is_standalone() or self.is_ngram()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -110,11 +110,7 @@ class SpeculativeAlgorithm(Enum):
 
             return StandaloneWorker
         elif self.is_ngram():
-            if enable_overlap:
-                raise ValueError(
-                    f"Speculative algorithm {self.name} does not support overlap worker creation."
-                )
-
+            # NOTE: NgramWorker only supports spec v2, no longer supports spec v1
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker

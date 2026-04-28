@@ -5,8 +5,7 @@ import numpy as np
 import torch
 from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
-from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
-from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -14,9 +13,13 @@ from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
+from sglang.srt.speculative.eagle_info_v2 import (
+    assign_extend_cache_locs_func,
+    move_accepted_tokens_to_target_kvcache,
+)
 from sglang.srt.speculative.ngram_info import NgramVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import generate_token_bitmask
+from sglang.srt.speculative.spec_utils import generate_token_bitmask, maybe_detect_nan
 
 logger = logging.getLogger(__name__)
 
@@ -37,12 +40,23 @@ class NGRAMWorker:
         nccl_port: int,
         target_worker: TpModelWorker,
     ):
+        self.server_args = server_args
         self.target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self.tp_rank = tp_rank
         self.page_size = server_args.page_size
         self.draft_token_num: int = server_args.speculative_num_draft_tokens
         self.max_trie_depth: int = server_args.speculative_ngram_max_trie_depth
+        self.speculative_num_draft_tokens = server_args.speculative_num_draft_tokens
+        self.topk = server_args.speculative_eagle_topk
+        self.speculative_num_steps = server_args.speculative_num_steps
+        # Set constant
+        NgramVerifyInput.ALLOC_LEN_PER_DECODE = max(
+            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
+        )
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
+            target_worker.get_memory_pool()
+        )
 
         self.max_batch_size = target_worker.max_running_requests
         self.device = f"cuda:{gpu_id}" if gpu_id >= 0 else "cuda"
@@ -154,21 +168,45 @@ class NGRAMWorker:
             )
 
     def _prepare_draft_tokens(
-        self, batch: ScheduleBatch
+        self, batch: ModelWorkerBatch
     ) -> tuple[np.ndarray, np.ndarray]:
-        bs = batch.batch_size()
+        bs = len(batch.reqs)
+        stride = self.draft_token_num
+
+        prev_token_ids, prev_accept_lens = (
+            batch.spec_info.verified_tokens,
+            batch.spec_info.accept_lens,
+        )
+        if not prev_token_ids.is_cpu:
+            prev_token_ids = prev_token_ids.cpu()
+            prev_accept_lens = prev_accept_lens.cpu()
+        self.prev_token_ids = prev_token_ids.tolist()
+        self.prev_accept_lens = prev_accept_lens.tolist()
 
         self.ngram_corpus.synchronize()
         req_ids = []
         batch_tokens = []
         total_lens = []
+        assert len(batch.reqs) == len(self.prev_accept_lens)
+        i = 0
         for req in batch.reqs:
+            # grammar doesn't support overlap and output_ids will be complete.
+            prev_tokens = (
+                self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
+                if not batch.has_grammar
+                else []
+            )
             check_token = self._efficient_concat_last_n(
-                req.origin_input_ids, req.output_ids, self.max_trie_depth
+                req.origin_input_ids,
+                req.output_ids + prev_tokens,
+                self.max_trie_depth,
             )
             req_ids.append(req.rid)
             batch_tokens.append(check_token)
-            total_lens.append(len(req.origin_input_ids) + len(req.output_ids))
+            i += 1
+            total_lens.append(
+                len(req.origin_input_ids) + len(req.output_ids) + len(prev_tokens)
+            )
         req_drafts, mask = self.ngram_corpus.batch_get(
             req_ids, batch_tokens, total_lens
         )
@@ -180,11 +218,11 @@ class NGRAMWorker:
         ), f"{total_draft_token_num=}, {bs=}, {self.draft_token_num=}"
         return req_drafts, mask
 
-    def _prepare_for_speculative_decoding(self, batch: ScheduleBatch):
+    def _prepare_for_speculative_decoding(self, batch: ModelWorkerBatch):
         if batch.forward_mode.is_extend():
             return
 
-        bs = batch.batch_size()
+        bs = len(batch.reqs)
 
         retrieve_index = self.retrieve_indexes_batch[bs]
         retrieve_next_token = self.retrieve_next_token_batch[bs]
@@ -197,6 +235,7 @@ class NGRAMWorker:
         tree_mask.copy_(torch.from_numpy(mask), non_blocking=True)
         draft_tokens.copy_(torch.from_numpy(req_drafts), non_blocking=True)
 
+        # generate positions and some indices using tree_mask
         reconstruct_indices_from_tree_mask(
             tree_mask,
             batch.seq_lens,
@@ -212,88 +251,122 @@ class NGRAMWorker:
         # Testing shows about 8% performance improvement (the effect is roughly proportional to batch size).
         if USE_FULL_MASK:
             tree_mask = []
-            mask = mask.reshape(
-                batch.batch_size(), self.draft_token_num, self.draft_token_num
-            )
-            for i, req in enumerate(batch.reqs):
-                seq_len = len(req.origin_input_ids) + len(req.output_ids)
-                req_mask = torch.ones((self.draft_token_num, seq_len - 1)).cuda()
+            mask = mask.reshape(bs, self.draft_token_num, self.draft_token_num)
+            # TODO(siyuan): the for loop here leads to significant overhead in large batch size. Can be written into a kernel.
+            for i in range(bs):
+                seq_len = batch.seq_lens_cpu[i]
+                req_mask = torch.ones(
+                    (self.draft_token_num, seq_len), device=self.device
+                )
                 req_mask = torch.cat(
-                    (req_mask, torch.from_numpy(mask[i]).cuda()), dim=1
+                    (
+                        req_mask,
+                        torch.from_numpy(mask[i]).to(
+                            device=self.device, non_blocking=True
+                        ),
+                    ),
+                    dim=1,
                 ).to(torch.bool)
                 tree_mask.append(req_mask.flatten())
             tree_mask = torch.cat(tree_mask, dim=0)
 
         batch.spec_algorithm = SpeculativeAlgorithm.NGRAM
         batch.forward_mode = ForwardMode.TARGET_VERIFY
-        batch.spec_info = NgramVerifyInput(
-            draft_tokens,
-            tree_mask,
-            positions,
-            retrieve_index,
-            retrieve_next_token,
-            retrieve_next_sibling,
-            self.draft_token_num,
+        batch.input_ids = draft_tokens
+        batch.out_cache_loc = assign_extend_cache_locs_func(
+            req_pool_indices=batch.req_pool_indices,
+            req_to_token=batch.req_to_token_pool.req_to_token,
+            start_offset=batch.seq_lens,
+            end_offset=batch.seq_lens + self.draft_token_num,
+            batch_size=bs,
+            draft_token_num=self.draft_token_num,
+            device=self.device,
         )
-        batch.spec_info.prepare_for_verify(batch, self.page_size)
+        batch.spec_info = NgramVerifyInput(
+            server_args=self.server_args,
+            draft_token=draft_tokens,
+            custom_mask=tree_mask,
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            draft_token_num=self.draft_token_num,
+        )
 
-    def _update_ngram_corpus(self, batch: ScheduleBatch):
+    def _update_ngram_corpus(self, batch: ModelWorkerBatch):
         batch_tokens = []
+        i, stride = 0, self.draft_token_num
         for req in batch.reqs:
             # FIXME: Whether to insert 'extend' into the cache or not, after testing,
             # there is not much difference, so we will not insert it for now.
             # if batch.forward_mode.is_extend():
             #     put_ids = req.origin_input_ids + req.output_ids
             # else:
+            prev_tokens = (
+                self.prev_token_ids[i * stride : i * stride + self.prev_accept_lens[i]]
+                if not batch.has_grammar
+                else []
+            )
             put_ids = self._efficient_concat_last_n(
-                req.origin_input_ids, req.output_ids, self.max_trie_depth
+                req.origin_input_ids, req.output_ids + prev_tokens, self.max_trie_depth
             )
             batch_tokens.append(put_ids)
+            i += 1
         self.ngram_corpus.batch_put(batch_tokens)
 
-    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
+    def forward_batch_generation(
+        self, model_worker_batch: ModelWorkerBatch
+    ) -> GenerationBatchResult:
+        model_worker_batch.seq_lens.record_stream(
+            torch.get_device_module(self.device).current_stream()
+        )
+        bs = len(model_worker_batch.seq_lens)
 
-        self._prepare_for_speculative_decoding(batch)
+        set_time_batch(
+            model_worker_batch.reqs, "set_spec_draft_start_time", trace_only=True
+        )
+        self._prepare_for_speculative_decoding(model_worker_batch)
+        set_time_batch(
+            model_worker_batch.reqs, "set_spec_draft_end_time", trace_only=True
+        )
 
-        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
-
-        model_worker_batch = batch.get_model_worker_batch()
-        spec_info = model_worker_batch.spec_info
-        num_accepted_tokens = 0
-        accept_lens = None
-        accept_length_per_req_cpu = None
+        verify_input: NgramVerifyInput = model_worker_batch.spec_info
+        accept_length = torch.tensor([1] * bs, dtype=torch.int32, device=self.device)
 
         if model_worker_batch.forward_mode.is_target_verify():
-            if batch.has_grammar:
-                retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
-                retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
-                draft_tokens_cpu = spec_info.draft_token.view(
-                    spec_info.retrieve_next_token.shape
+            # Prepare grammar data on CPU if needed
+            if model_worker_batch.has_grammar:
+                retrieve_next_token_cpu = verify_input.retrieve_next_token.cpu()
+                retrieve_next_sibling_cpu = verify_input.retrieve_next_sibling.cpu()
+                draft_tokens_cpu = verify_input.draft_token.view(
+                    verify_input.retrieve_next_token.shape
                 ).cpu()
 
-            set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
+            set_time_batch(
+                model_worker_batch.reqs, "set_spec_verify_start_time", trace_only=True
+            )
 
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch, is_verify=True
             )
+
             logits_output, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.can_run_cuda_graph,
             )
 
-            verify_input: NgramVerifyInput = model_worker_batch.spec_info
+            # Generate vocab mask for constrained decoding
             vocab_mask = None
-            if batch.has_grammar:
+            if model_worker_batch.has_grammar:
                 # Generate the logit mask for structured output.
                 # Overlap the CPU operations for bitmask generation with the forward pass.
                 vocab_mask = generate_token_bitmask(
-                    batch.reqs,
+                    model_worker_batch.reqs,
                     verify_input,
                     retrieve_next_token_cpu,
                     retrieve_next_sibling_cpu,
                     draft_tokens_cpu,
-                    batch.sampling_info.vocab_size,
+                    model_worker_batch.sampling_info.vocab_size,
                 )
 
                 if vocab_mask is not None:
@@ -301,54 +374,84 @@ class NGRAMWorker:
                     vocab_mask = vocab_mask.to(verify_input.retrieve_next_token.device)
                     # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
                     # and will be applied to produce wrong results
-                    batch.sampling_info.vocab_mask = None
+                    model_worker_batch.sampling_info.vocab_mask = None
 
-            logits_output, next_token_ids, num_accepted_tokens = verify_input.verify(
-                batch, logits_output, self.page_size, vocab_mask
+            # Sample
+            maybe_detect_nan(
+                logits_output.next_token_logits, "verify: target model logits"
             )
-            accept_length_per_req_cpu = verify_input.accept_length.cpu().tolist()
+            (
+                predict,
+                accept_length,
+                accept_index,
+            ) = verify_input.sample(model_worker_batch, logits_output, vocab_mask)
+            new_seq_lens = model_worker_batch.seq_lens + accept_length
+            verified_tokens = predict[accept_index].flatten()
+            next_token_ids = verified_tokens
+
+            # copy kvcache will not use the new_seq_lens
+            move_accepted_tokens_to_target_kvcache(
+                model_worker_batch,
+                accept_index,
+                accept_length,
+                self.token_to_kv_pool_allocator,
+                self.draft_token_num,
+            )
+            # TODO logprobs for ngram spec v2
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
 
             if get_global_tracing_enabled():
-                for idx, req in enumerate(batch.reqs):
+                for idx, req in enumerate(model_worker_batch.reqs):
                     accepted = (
                         verify_input.accept_length[idx].item()
                         if verify_input.accept_length is not None
                         else 0
                     )
                     req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
-
-            # Store accept_lens for per-request metrics
-            accept_lens = verify_input.accept_length
-            if batch.return_logprob:
-                add_output_logprobs_for_spec_v1(batch, verify_input, logits_output)
-            self._update_ngram_corpus(batch)
+            self._update_ngram_corpus(model_worker_batch)
             # Clean up per-request match state for finished/retracted requests.
-            # State entries are created in _prepare_draft_tokens and cleaned here.
-            # If a request is removed without passing through verify, the entry
-            # persists until reset(); this is acceptable because MatchState is small.
             finished_req_ids = []
-            for req in batch.reqs:
+            for req in model_worker_batch.reqs:
                 if req.finished() or req.is_retracted:
                     finished_req_ids.append(req.rid)
             if finished_req_ids:
                 self.ngram_corpus.erase_match_state(finished_req_ids)
-            batch.forward_mode = ForwardMode.DECODE
+            model_worker_batch.forward_mode = ForwardMode.DECODE
 
         else:
             batch_result = self.target_worker.forward_batch_generation(
                 model_worker_batch
             )
-            logits_output, next_token_ids, can_run_cuda_graph = (
+            logits_output, predict, can_run_cuda_graph = (
                 batch_result.logits_output,
                 batch_result.next_token_ids,
                 batch_result.can_run_cuda_graph,
             )
+            new_seq_lens = model_worker_batch.seq_lens.clone()
 
+            verified_tokens = torch.zeros(
+                bs, self.draft_token_num, dtype=torch.int32, device=self.device
+            )
+            verified_tokens[:, 0] = predict
+            verified_tokens = verified_tokens.flatten()
+            next_token_ids = predict
+            verify_done = torch.get_device_module(self.device).Event()
+            verify_done.record()
+
+        # Construct the next draft input
+        next_draft_input = NgramVerifyInput(
+            server_args=self.server_args,
+            draft_token_num=self.draft_token_num,
+            new_seq_lens=new_seq_lens,
+            verify_done=verify_done,
+            verified_tokens=verified_tokens,
+            accept_lens=accept_length,
+        )
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=next_token_ids,
-            num_accepted_tokens=num_accepted_tokens,
-            accept_length_per_req_cpu=accept_length_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
-            accept_lens=accept_lens,
+            accept_lens=accept_length,
+            next_draft_input=next_draft_input,
         )
