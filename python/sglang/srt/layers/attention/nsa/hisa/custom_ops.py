@@ -1059,7 +1059,7 @@ def fp8_native_block_sparse_mqa_attn_return_logits_interface(q, k, k_scale, topk
     seq_len, heads, index_dim = q.shape
     seq_len_kv = k.shape[0]
     topk = topk_block_index.shape[1]
-    
+
     block_sparse_mqa_attn_return_logits_kernel = fp8_native_block_sparse_mqa_attn_return_logits(heads=heads, index_dim=index_dim, kv_block_size=kv_block_size, topk=topk)
     logits = torch.empty([seq_len, topk * kv_block_size], device=q.device, dtype=torch.float32)
     block_sparse_mqa_attn_return_logits_kernel(
@@ -1073,6 +1073,200 @@ def fp8_native_block_sparse_mqa_attn_return_logits_interface(q, k, k_scale, topk
         cu_seqlen_ke,
     )
     return logits
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
+def fp8_native_block_sparse_mqa_attn_return_logits_grouped(
+    kv_block_size,    # K, must be < block_N and divide block_N
+    topk,             # must be divisible by G = block_N // K
+    heads,
+    index_dim,
+    block_N=128,      # GEMM tile / parallelism dial.
+    threads=256,
+):
+    """Grouped variant of ``fp8_native_block_sparse_mqa_attn_return_logits``
+    for K < block_N.
+
+    Direct copy of the ``..._kernel_for_small_pooling_size`` vanilla
+    kernel above (which works at K=block_N=64), with only the per-iter
+    K-tensor load and output-column indexing widened from ``K`` rows
+    (1 topk index) to ``block_N = G*K`` rows (G consecutive topk
+    indices). Same shared-memory layout, same warp-spec friendly
+    load+gemm+post-process pattern, same mask shape — just
+    Python-unrolled over the G groups so the IR stays at one nesting
+    level (no T.serial(G) inside T.serial(num_chunks), which would
+    fragment producer/consumer pairing across loop boundaries).
+
+    Constraints: ``block_N % K == 0`` and ``topk % G == 0``. Use the
+    non-grouped variant when K >= block_N.
+    """
+    fp8_dtype = T.float8_e4m3fn
+    accum_dtype = T.float32
+    index_dtype = T.int32
+    topk_index_dtype = T.int64
+
+    assert block_N % kv_block_size == 0, (
+        f"block_N ({block_N}) must be divisible by kv_block_size ({kv_block_size})"
+    )
+    G = block_N // kv_block_size
+    assert topk % G == 0, (
+        f"topk ({topk}) must be divisible by G ({G})"
+    )
+    num_chunks = topk // G
+
+    H_per_block = heads
+
+    seq_len = T.dynamic("seq_len")
+    seq_len_kv = T.dynamic("seq_len_kv")
+
+    index_q_shape = [seq_len * heads, index_dim]
+    index_k_shape = [seq_len_kv, index_dim]
+    index_k_scale_shape = [seq_len_kv]
+    logits_shape = [seq_len, topk * kv_block_size]
+
+    @T.prim_func
+    def fp8_native_block_sparse_mqa_attn_return_logits_grouped_kernel(
+        IndexQ: T.Tensor(index_q_shape, fp8_dtype),  # type: ignore
+        IndexK: T.Tensor(index_k_shape, fp8_dtype),  # type: ignore
+        IndexKScale: T.Tensor(index_k_scale_shape, accum_dtype),  # type: ignore
+        TopKBlockIndex: T.Tensor([seq_len, topk], topk_index_dtype),  # type: ignore
+        Logits: T.Tensor(logits_shape, accum_dtype),  # type: ignore
+        Weights: T.Tensor([seq_len, heads], accum_dtype),  # type: ignore
+        CuSeqLenKS: T.Tensor([seq_len], index_dtype),  # type: ignore
+        CuSeqLenKE: T.Tensor([seq_len], index_dtype),  # type: ignore
+    ):
+        with T.Kernel(seq_len, threads=threads) as bx:
+            index_q_shared = T.alloc_shared([H_per_block, index_dim], fp8_dtype)
+            index_k_shared = T.alloc_shared([block_N, index_dim], fp8_dtype)
+            scale_shared = T.alloc_shared([block_N], accum_dtype)
+
+            s = T.alloc_fragment([block_N, H_per_block], accum_dtype)
+            s_reshaped = T.reshape(s, (block_N, H_per_block // heads, heads))
+            logits = T.alloc_fragment([block_N, H_per_block // heads], accum_dtype)
+            weights = T.alloc_fragment([H_per_block // heads, heads], accum_dtype)
+
+            seq_len_i = bx
+
+            cu_k_s_min = CuSeqLenKS[seq_len_i]
+            cu_k_e_max = CuSeqLenKE[seq_len_i]
+
+            T.copy(IndexQ[seq_len_i * heads:seq_len_i * heads + H_per_block, :], index_q_shared)
+            T.copy(Weights[seq_len_i, :], weights)
+
+            for n_i in T.serial(num_chunks):
+                n_i_start = n_i * G
+
+                # CHANGE vs vanilla: load G K-blocks into the [block_N, D]
+                # tile (vanilla loads block_N=K rows from one topk
+                # index). G is constexpr → Python-unroll keeps each
+                # T.copy at the same nesting level as the GEMM consumer
+                # (a T.serial(G) inner loop would split warp-spec
+                # producer/consumer scopes).
+                for g_i in range(G):
+                    topk_block_id = T.cast(TopKBlockIndex[seq_len_i, n_i_start + g_i], index_dtype)
+                    block_s_i = topk_block_id * kv_block_size
+                    T.copy(
+                        IndexK[block_s_i:block_s_i + kv_block_size, :],
+                        index_k_shared[g_i * kv_block_size:(g_i + 1) * kv_block_size, :],
+                    )
+
+                # CHANGE vs vanilla: scale source addr depends on
+                # ``bn_i // K`` (which group), not a single ``block_s_i``.
+                # ``T.Parallel(block_N)`` matches the existing 256-thread
+                # extent (``T.Parallel(K)`` would be too small at K<64
+                # → loop-layout error).
+                for bn_i in T.Parallel(block_N):
+                    g_i = bn_i // kv_block_size
+                    b_i = bn_i - g_i * kv_block_size
+                    topk_block_id = T.cast(TopKBlockIndex[seq_len_i, n_i_start + g_i], index_dtype)
+                    scale_shared[bn_i] = IndexKScale[topk_block_id * kv_block_size + b_i]
+
+                T.gemm(
+                    index_k_shared,
+                    index_q_shared,
+                    s,
+                    transpose_B=True,
+                    clear_accum=True,
+                    policy=T.GemmWarpPolicy.FullRow,
+                )
+
+                for bn_i, bq_i, h_i in T.Parallel(block_N, H_per_block // heads, heads):
+                    s_reshaped[bn_i, bq_i, h_i] = (T.max(s_reshaped[bn_i, bq_i, h_i] * scale_shared[bn_i], 0) * weights[bq_i, h_i])
+
+                T.reduce_sum(s_reshaped, logits, dim=-1, clear=True)
+
+                # CHANGE vs vanilla: per-row k_i uses its group's
+                # ``block_s_i`` (same lookup as scale write).
+                for i_i in T.Parallel(block_N):
+                    g_i = i_i // kv_block_size
+                    b_i = i_i - g_i * kv_block_size
+                    topk_block_id = T.cast(TopKBlockIndex[seq_len_i, n_i_start + g_i], index_dtype)
+                    k_i = topk_block_id * kv_block_size + b_i
+                    if k_i < cu_k_s_min or k_i >= cu_k_e_max:
+                        logits[i_i, 0] = -T.infinity(accum_dtype)
+
+                # CHANGE vs vanilla: output offset uses ``n_i_start``
+                # (G groups stored back-to-back).
+                for bn_i in T.Parallel(block_N):
+                    Logits[seq_len_i, n_i_start * kv_block_size + bn_i] = logits[bn_i, 0]
+
+    return fp8_native_block_sparse_mqa_attn_return_logits_grouped_kernel
+
+
+def fp8_native_block_sparse_mqa_attn_return_logits_grouped_interface(
+    q, k, k_scale, topk_block_index, kv_block_size, weights,
+    cu_seqlen_ks, cu_seqlen_ke, block_N=128,
+):
+    """Tilelang grouped block-sparse MQA for K < block_N.
+
+    Same I/O contract as ``fp8_native_block_sparse_mqa_attn_return_logits_interface``,
+    but pads the topk dim up to a multiple of ``G = block_N // K`` so the
+    grouped kernel's ``topk % G == 0`` constraint holds. Padding entries
+    use a sentinel ``-1`` that the kernel masks to ``-inf``; we slice the
+    output back to the original ``topk * K`` width.
+    """
+    seq_len, heads, index_dim = q.shape
+    topk = topk_block_index.shape[1]
+    assert block_N % kv_block_size == 0, (
+        f"block_N ({block_N}) must be divisible by kv_block_size ({kv_block_size})"
+    )
+    G = block_N // kv_block_size
+    pad = (G - (topk % G)) % G
+    topk_padded = topk + pad
+
+    if pad > 0:
+        topk_pad = torch.full(
+            (seq_len, pad), -1,
+            device=topk_block_index.device, dtype=topk_block_index.dtype,
+        )
+        topk_block_index_padded = torch.cat([topk_block_index, topk_pad], dim=1)
+    else:
+        topk_block_index_padded = topk_block_index
+
+    kernel = fp8_native_block_sparse_mqa_attn_return_logits_grouped(
+        heads=heads, index_dim=index_dim,
+        kv_block_size=kv_block_size, topk=topk_padded,
+        block_N=block_N,
+    )
+    logits_padded = torch.empty(
+        [seq_len, topk_padded * kv_block_size],
+        device=q.device, dtype=torch.float32,
+    )
+    kernel(
+        q.view(seq_len * heads, index_dim),
+        k, k_scale,
+        topk_block_index_padded,
+        logits_padded,
+        weights,
+        cu_seqlen_ks, cu_seqlen_ke,
+    )
+    if pad > 0:
+        return logits_padded[:, : topk * kv_block_size].contiguous()
+    return logits_padded
 
 
 def fp8_native_hierarchy_mqa_logits(
