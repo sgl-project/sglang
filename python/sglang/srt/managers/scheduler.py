@@ -3271,6 +3271,19 @@ class Scheduler(
                 self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
             )
 
+        adaptive_metrics = self._get_adaptive_spec_metrics()
+        if adaptive_metrics["enabled"]:
+            ret["adaptive_spec_enabled"] = adaptive_metrics["enabled"]
+            ret["adaptive_spec_current_steps"] = adaptive_metrics["current_steps"]
+            ret["adaptive_spec_previous_steps"] = adaptive_metrics["previous_steps"]
+            ret["adaptive_spec_num_tier_switches"] = adaptive_metrics[
+                "num_tier_switches"
+            ]
+            ret["adaptive_spec_ema_accept_length"] = adaptive_metrics["ema_accept_len"]
+            ret["adaptive_spec_last_batch_accept_length"] = adaptive_metrics[
+                "last_batch_accept_len"
+            ]
+
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 

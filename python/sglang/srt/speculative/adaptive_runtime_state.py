@@ -82,10 +82,24 @@ class AdaptiveController:
             config=cfg,
         )
         self._states: dict[int, SpecRuntimeState] = {}
+        self._active_steps: int | None = None
+        self.previous_steps: int | None = None
+        self.num_tier_switches = 0
 
     @property
     def candidate_steps(self) -> list[int]:
         return self.params.candidate_steps
+
+    def get_metrics(self) -> dict[str, float | int]:
+        """Return low-cardinality observability state for adaptive spec."""
+        return {
+            "enabled": 1,
+            "current_steps": self.params.current_steps,
+            "previous_steps": self.previous_steps or 0,
+            "num_tier_switches": self.num_tier_switches,
+            "ema_accept_len": self.params.ema_accept_len,
+            "last_batch_accept_len": self.params.last_batch_accept_len,
+        }
 
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.
@@ -118,4 +132,11 @@ class AdaptiveController:
             raise ValueError(
                 f"Missing adaptive runtime state for steps={speculative_num_steps}"
             )
+        if (
+            self._active_steps is not None
+            and self._active_steps != speculative_num_steps
+        ):
+            self.previous_steps = self._active_steps
+            self.num_tier_switches += 1
+        self._active_steps = speculative_num_steps
         self.worker.apply_runtime_state(state)

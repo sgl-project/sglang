@@ -96,9 +96,9 @@ class AdaptiveSpeculativeParams:
         cfg = config or {}
         # TODO: Wider range of candidate_steps (once lazy init is supported).
         self.candidate_steps = sorted(set(cfg.get("candidate_steps", [1, 3, 7])))
-        assert (
-            len(self.candidate_steps) >= 2
-        ), "candidate_steps must have at least 2 distinct values"
+        assert len(self.candidate_steps) >= 2, (
+            "candidate_steps must have at least 2 distinct values"
+        )
 
         self.min_steps = self.candidate_steps[0]
         self.max_steps = self.candidate_steps[-1]
@@ -115,6 +115,7 @@ class AdaptiveSpeculativeParams:
 
         # Initialize EMA at current steps - 1 (neutral starting point)
         self.ema_accept_len = float(self.current_steps - 1)
+        self.last_batch_accept_len = 0.0
         self._batch_count = 0
 
         logger.info(
@@ -132,6 +133,7 @@ class AdaptiveSpeculativeParams:
             return False
 
         batch_avg = sum(accept_lengths) / len(accept_lengths)
+        self.last_batch_accept_len = batch_avg
         self.ema_accept_len = (
             1 - self.ema_alpha
         ) * self.ema_accept_len + self.ema_alpha * batch_avg
