@@ -153,6 +153,8 @@ class GenerateReqInput(BaseReq):
     video_data: Optional[MultimodalDataInputFormat] = None
     # The audio input. Like image data, it can be a file name, a url, or base64 encoded string.
     audio_data: Optional[MultimodalDataInputFormat] = None
+    # Whether to extract and process audio from video inputs.
+    use_audio_in_video: bool = False
     # The sampling_params. See descriptions below.
     sampling_params: Optional[Union[List[Dict], Dict]] = None
     # Whether to return logprobs.
@@ -249,6 +251,10 @@ class GenerateReqInput(BaseReq):
     min_dynamic_patch: Optional[int] = None
     image_max_dynamic_patch: Optional[int] = None
     video_max_dynamic_patch: Optional[int] = None
+
+    # Pre-computed delimiter indices for multi-item scoring.
+    # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+    multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
     def contains_mm_input(self) -> bool:
         return (
@@ -685,6 +691,11 @@ class GenerateReqInput(BaseReq):
             external_trace_header=self.external_trace_header,
             http_worker_ipc=self.http_worker_ipc,
             received_time=self.received_time,
+            multi_item_delimiter_indices=(
+                self.multi_item_delimiter_indices[i]
+                if self.multi_item_delimiter_indices is not None
+                else None
+            ),
         )
         cache[i] = sub
         return sub
@@ -774,6 +785,9 @@ class TokenizedGenerateReqInput(BaseReq):
     need_wait_for_mm_inputs: bool = False
     num_items_assigned: Optional[Dict[Modality, List[int]]] = None
 
+    # Pre-computed delimiter indices for multi-item scoring
+    multi_item_delimiter_indices: Optional[List[int]] = None
+
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
@@ -854,6 +868,10 @@ class EmbeddingReqInput(BaseReq):
 
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
+
+    # Pre-computed delimiter indices for multi-item scoring.
+    # Batch-level: List[List[int]] (one per request). After __getitem__: List[int].
+    multi_item_delimiter_indices: Optional[Union[List[List[int]], List[int]]] = None
 
     def normalize_batch_and_arguments(self):
         # at least one of text, input_ids, or image should be provided
@@ -957,6 +975,11 @@ class EmbeddingReqInput(BaseReq):
                 is_cross_encoder_request=True,
                 http_worker_ipc=self.http_worker_ipc,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
+                multi_item_delimiter_indices=(
+                    self.multi_item_delimiter_indices[i]
+                    if self.multi_item_delimiter_indices is not None
+                    else None
+                ),
             )
         else:
             sub = EmbeddingReqInput(
@@ -981,6 +1004,11 @@ class EmbeddingReqInput(BaseReq):
                 http_worker_ipc=self.http_worker_ipc,
                 received_time=self.received_time,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
+                multi_item_delimiter_indices=(
+                    self.multi_item_delimiter_indices[i]
+                    if self.multi_item_delimiter_indices is not None
+                    else None
+                ),
             )
         cache[i] = sub
         return sub
@@ -1009,6 +1037,8 @@ class TokenizedEmbeddingReqInput(BaseReq):
 
     # LoRA related
     lora_id: Optional[str] = None  # None means just use the base model
+    # Pre-computed delimiter indices for multi-item scoring
+    multi_item_delimiter_indices: Optional[List[int]] = None
     # For observability
     time_stats: Optional[Union[APIServerReqTimeStats, DPControllerReqTimeStats]] = None
 
@@ -1388,6 +1418,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
 
 
 @dataclass
@@ -1415,6 +1447,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq):
     weight_version: Optional[str] = None
     # Optional: Determine whether to disable updating the draft model
     disable_draft_model: Optional[bool] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
 
 
 @dataclass
@@ -1449,6 +1483,8 @@ class UpdateWeightsFromIPCReqInput(BaseReq):
     flush_cache: bool = True
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
 
 
 @dataclass

@@ -91,7 +91,7 @@ TEST_CASES = {
             "batch_size": 1,
             "max_seq_len": 32,
             "page_size": 32,
-            "description": "Minimal smoke test",
+            "description": "Minimal sanity check",
         },
         {
             "name": "batch",
@@ -731,7 +731,7 @@ class TestTRTLLMMLA(CustomTestCase):
                 self.assertFalse(torch.isinf(output).any(), "Output contains Inf")
 
     def test_shape_sanity(self):
-        """Smoke test decode across several configurations."""
+        """Check decode shapes across several configurations."""
         print(f"\nRunning shape sanity tests...")
 
         for test_case in TEST_CASES["shape_sanity_tests"]:
