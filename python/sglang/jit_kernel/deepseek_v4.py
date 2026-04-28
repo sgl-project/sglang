@@ -1168,65 +1168,6 @@ def rmsnorm_self(q: torch.Tensor, eps: float) -> torch.Tensor:
     return out
 
 
-@cache_once
-def _jit_torch_cublas_bf16_fp32() -> Any:
-    import torch.utils.cpp_extension
-
-    source = """
-#include <torch/extension.h>
-#include <ATen/cuda/CUDAContext.h>
-#include <cublas_v2.h>
-
-torch::Tensor linear_bf16_fp32(
-    torch::Tensor X,
-    torch::Tensor W)
-{
-    int batch = X.size(0);
-    int in_features = X.size(1);
-    int out_features = W.size(0);
-
-    auto Y = torch::empty(
-        {batch, out_features},
-        torch::dtype(torch::kFloat32).device(X.device()));
-
-    cublasHandle_t handle = at::cuda::getCurrentCUDABlasHandle();
-
-    float alpha = 1.0f;
-    float beta = 0.0f;
-
-    cublasGemmEx(
-        handle,
-        CUBLAS_OP_T,
-        CUBLAS_OP_N,
-        out_features,
-        batch,
-        in_features,
-        &alpha,
-        W.data_ptr(), CUDA_R_16BF, in_features,
-        X.data_ptr(), CUDA_R_16BF, in_features,
-        &beta,
-        Y.data_ptr(), CUDA_R_32F, out_features,
-        CUBLAS_COMPUTE_32F,
-        CUBLAS_GEMM_DEFAULT_TENSOR_OP
-    );
-
-    return Y;
-}
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("linear_bf16_fp32", &linear_bf16_fp32, "BF16xBF16 -> FP32 linear (no bias)");
-}
-"""
-    module = torch.utils.cpp_extension.load_inline(
-        name="linear_bf16_fp32",
-        cpp_sources="",
-        cuda_sources=source,
-        extra_cflags=["-O3"],
-        extra_cuda_cflags=["-O3"],
-        verbose=False,
-    )
-    return module
-
 
 def linear_bf16_fp32(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     from sglang.srt.environ import envs
@@ -1245,8 +1186,9 @@ def _dispatch_bf16_fp32_backend(
     x: torch.Tensor, y: torch.Tensor, *, algo: str
 ) -> torch.Tensor:
     if algo == "cublas":
-        module = _jit_torch_cublas_bf16_fp32()
-        return module.linear_bf16_fp32(x, y)
+        # cuBLAS BF16xBF16 -> FP32 GEMM via PyTorch native API (torch >= 2.9).
+        # Bit-exact and matches the previous JIT cublasGemmEx kernel.
+        return torch.mm(x, y.t(), out_dtype=torch.float32)
     elif algo == "deep_gemm":
         import deep_gemm
 
@@ -1267,7 +1209,6 @@ def _compile_one(*input_tuple) -> None:
 def compile_aot():
     c_dtype = torch.float32
     jobs = [
-        ("cublas", _jit_torch_cublas_bf16_fp32),
         ("common", _jit_common_module),
         ("mask_topk", _jit_mask_topk_module),
         ("topk", _jit_topk_module),
