@@ -365,6 +365,7 @@ class OutputBatch:
 
     # logged metrics info, directly from Req.timings
     metrics: Optional["RequestMetrics"] = None
+    metrics_list: Optional[list[Optional["RequestMetrics"]]] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None

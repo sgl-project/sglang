@@ -128,7 +128,7 @@ class SamplingParams:
 
     # Batch info
     num_outputs_per_prompt: int = 1
-    seed: int = 42
+    seed: int | list[int] = 42
     generator_device: str | None = None  # None means use the pipeline/model default
 
     # Original dimensions (before VAE scaling)
@@ -311,6 +311,23 @@ class SamplingParams:
         ):
             raise ValueError(
                 f"num_outputs_per_prompt must be a positive int, got {self.num_outputs_per_prompt!r}"
+            )
+
+        if isinstance(self.seed, list):
+            if not self.seed:
+                raise ValueError("seed list must not be empty")
+            for seed in self.seed:
+                if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+                    raise ValueError(
+                        f"seed list must contain non-negative ints, got {self.seed!r}"
+                    )
+        elif (
+            isinstance(self.seed, bool)
+            or not isinstance(self.seed, int)
+            or self.seed < 0
+        ):
+            raise ValueError(
+                "seed must be a non-negative int or list of ints, " f"got {self.seed!r}"
             )
 
         # Used by seconds() and video writer; fps <= 0 is always invalid.
@@ -728,6 +745,7 @@ class SamplingParams:
         add_argument(
             "--seed",
             type=int,
+            nargs="+",
             help="Random seed for generation",
         )
         add_argument(
@@ -961,11 +979,14 @@ class SamplingParams:
         sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
         args_attrs = set(vars(args).keys())
         attrs = sampling_params_fields & args_attrs
-        return {
+        cli_args = {
             attr: getattr(args, attr)
             for attr in attrs
             if hasattr(args, attr) and getattr(args, attr) is not None
         }
+        if isinstance(cli_args.get("seed"), list) and len(cli_args["seed"]) == 1:
+            cli_args["seed"] = cli_args["seed"][0]
+        return cli_args
 
     def output_file_path(self):
         if self.output_path is None:
