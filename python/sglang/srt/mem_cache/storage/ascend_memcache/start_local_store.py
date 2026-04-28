@@ -1,59 +1,128 @@
-import json
 import argparse
+import json
+import logging
 import os
+import signal
+import sys
+import time
+from typing import Any
+
 from memcache_hybrid import DistributedObjectStore, LocalConfig
 
-def launch_local_store(json_path):
-    """
-    Load configuration from a JSON file and start the DistributedObjectStore.
-    """
-    # 1. Load JSON file content
-    try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except Exception as e:
-        print(f"Error loading JSON: {e}")
-        return
+logger = logging.getLogger("ascend_memcache.start_local_store")
 
-    # 2. Instantiate the configuration object
-    config = LocalConfig()
+# Keys consumed by this launcher, not forwarded to LocalConfig.
+_CTRL_KEYS = frozenset({"device_id", "init_bm"})
 
-    # 3. Dynamically inject JSON key-value pairs into the config object
-    # This ensures all necessary parameters are inside the config object
+
+def _load_json_config(config_path: str) -> dict[str, Any]:
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file must contain a JSON object: {config_path}")
+    return data
+
+
+def _apply_local_config(config: LocalConfig, data: dict[str, Any]) -> list[str]:
+    unknown: list[str] = []
     for key, value in data.items():
+        if key in _CTRL_KEYS:
+            continue
         if hasattr(config, key):
             setattr(config, key, value)
-            print(f"Set config.{key} = {value}")
         else:
-            # If your LocalConfig doesn't have device_id as an attribute, 
-            # it might be handled via environment variables or other config fields.
-            print(f"Note: '{key}' is not a direct attribute of LocalConfig. Skipping attribute injection...")
+            unknown.append(key)
+    return unknown
 
-    # 4. Initialize the store
-    print(f"Successfully loaded {json_path}. Initializing DistributedObjectStore...")
+
+def launch_local_store(config_path: str, block: bool = True) -> int:
+    try:
+        config_data = _load_json_config(config_path)
+    except Exception as e:
+        logger.error("Failed to load local store config from %s: %s", config_path, e)
+        return 1
+
+    local_cfg = LocalConfig()
+    unknown = _apply_local_config(local_cfg, config_data)
+    if unknown:
+        logger.warning("Ignoring unknown LocalConfig keys: %s", unknown)
+
+    device_id = int(config_data.get("device_id", 0))
+    init_bm = bool(config_data.get("init_bm", True))
+
     store = DistributedObjectStore()
+    ret = store.setup(local_cfg)
+    if ret != 0:
+        logger.error("DistributedObjectStore.setup failed, ret=%s", ret)
+        return ret if isinstance(ret, int) else 2
 
-    # 5. Correct Setup: Only pass the config object
-    # Based on the TypeError, this is the ONLY supported signature:
-    # (self: _pymmc.DistributedObjectStore, config: _pymmc.LocalConfig) -> int
-    ret = store.setup(config)
-    
-    if ret == 0:
-        print(f"DistributedObjectStore initialized successfully! (Return code: {ret})")
-    else:
-        print(f"DistributedObjectStore failed to start. Return code: {ret}")
+    ret = store.init(device_id, init_bm)
+    if ret != 0:
+        logger.error(
+            "DistributedObjectStore.init failed, device_id=%s init_bm=%s ret=%s",
+            device_id,
+            init_bm,
+            ret,
+        )
+        return ret if isinstance(ret, int) else 3
 
-if __name__ == "__main__":
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_path = os.path.join(script_dir, 'localservice_config.json')
-
-    parser = argparse.ArgumentParser(description="Launch Local DistributedObjectStore via JSON.")
-    parser.add_argument(
-        '--config_path', 
-        type=str, 
-        default=default_path,
-        help=f"Path to the local config JSON file (default: {default_path})"
+    logger.info(
+        "Local store started successfully: config=%s device_id=%s init_bm=%s",
+        config_path,
+        device_id,
+        init_bm,
     )
 
+    if not block:
+        return 0
+
+    stop = {"value": False}
+
+    def _handle_sig(_signum, _frame):
+        stop["value"] = True
+
+    signal.signal(signal.SIGINT, _handle_sig)
+    signal.signal(signal.SIGTERM, _handle_sig)
+
+    logger.info("Local store is running. Press Ctrl+C to stop.")
+    try:
+        while not stop["value"]:
+            time.sleep(1)
+    finally:
+        try:
+            store.close()
+        except Exception as e:
+            logger.warning("DistributedObjectStore.close failed: %s", e)
+    logger.info("Local store stopped.")
+    return 0
+
+
+def main() -> int:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    default_path = os.path.join(script_dir, "localservice_config.json")
+
+    parser = argparse.ArgumentParser(
+        description="Launch Ascend MemCache local DistributedObjectStore via JSON."
+    )
+    parser.add_argument(
+        "--config_path",
+        type=str,
+        default=default_path,
+        help=f"Path to local config JSON (default: {default_path})",
+    )
+    parser.add_argument(
+        "--no-block",
+        action="store_true",
+        help="Initialize store and exit without keeping process alive.",
+    )
     args = parser.parse_args()
-    launch_local_store(args.config_path)
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    return launch_local_store(args.config_path, block=not args.no_block)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

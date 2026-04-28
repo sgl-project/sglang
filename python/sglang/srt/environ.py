@@ -314,6 +314,9 @@ class Envs:
     MOONCAKE_CHECK_SERVER = EnvBool(False)
     MOONCAKE_STANDALONE_STORAGE = EnvBool(False)
 
+    # Ascend MemCache (HiCache L3); see https://gitcode.com/Ascend/memcache
+    SGLANG_HICACHE_MEMCACHE_CONFIG_PATH = EnvStr(None)
+
     # AMD & ROCm
     SGLANG_USE_AITER = EnvBool(False)
     SGLANG_USE_AITER_UNIFIED_ATTN = EnvBool(False)

@@ -1,59 +1,82 @@
-import json
 import argparse
+import json
+import logging
 import os
-from memcache_hybrid import MetaService, MetaConfig
+import sys
+from typing import Any
 
-def launch_with_json(json_path):
-    """
-    Load configuration from a JSON file and start the MetaService.
-    """
-    # 1. Load JSON file content
-    try:
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        print(f"Error: Configuration file '{json_path}' not found.")
-        return
-    except json.JSONDecodeError:
-        print(f"Error: Failed to decode JSON from '{json_path}'.")
-        return
+from memcache_hybrid import MetaConfig, MetaService
 
-    # 2. Instantiate the configuration object
-    config = MetaConfig()
+logger = logging.getLogger("ascend_memcache.start_meta_service")
 
-    # 3. Dynamically inject JSON key-value pairs into the config object
+
+def _load_json_config(config_path: str) -> dict[str, Any]:
+    with open(config_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        raise ValueError(f"Config file must contain a JSON object: {config_path}")
+    return data
+
+
+def _apply_meta_config(config: MetaConfig, data: dict[str, Any]) -> list[str]:
+    unknown: list[str] = []
     for key, value in data.items():
         if hasattr(config, key):
             setattr(config, key, value)
         else:
-            print(f"Warning: Configuration key '{key}' is not a valid MetaConfig attribute. Skipping...")
+            unknown.append(key)
+    return unknown
 
-    # 4. Launch the service
-    print(f"Successfully loaded {json_path}. Starting service...")
-    
-    # Initialize service with the populated config object
-    MetaService.setup(config)
-    
-    # Start the main service loop/process
-    MetaService.main()
 
-if __name__ == "__main__":
-    # Get the directory where the script is located
+def launch_meta_service(config_path: str) -> int:
+    try:
+        config_data = _load_json_config(config_path)
+    except Exception as e:
+        logger.error("Failed to load meta service config from %s: %s", config_path, e)
+        return 1
+
+    meta_cfg = MetaConfig()
+    unknown = _apply_meta_config(meta_cfg, config_data)
+    if unknown:
+        logger.warning("Ignoring unknown MetaConfig keys: %s", unknown)
+
+    try:
+        setup_ret = MetaService.setup(meta_cfg)
+        if isinstance(setup_ret, int) and setup_ret != 0:
+            logger.error("MetaService.setup failed, ret=%s", setup_ret)
+            return setup_ret
+        logger.info("MetaService setup succeeded with config=%s", config_path)
+        MetaService.main()
+        return 0
+    except KeyboardInterrupt:
+        logger.info("MetaService interrupted by user.")
+        return 0
+    except Exception as e:
+        logger.error("MetaService failed to run: %s", e)
+        return 2
+
+
+def main() -> int:
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    # Set default config path to the same directory as the script
-    default_path = os.path.join(script_dir, 'metaservice_config.json')
+    default_path = os.path.join(script_dir, "metaservice_config.json")
 
-    parser = argparse.ArgumentParser(description="Launch MetaService using a JSON configuration file.")
-    
-    # Added the config_path argument
-    parser.add_argument(
-        '--config_path', 
-        type=str, 
-        default=default_path,
-        help=f"Path to the configuration JSON file (default: {default_path})"
+    parser = argparse.ArgumentParser(
+        description="Launch Ascend MemCache MetaService via JSON."
     )
-
+    parser.add_argument(
+        "--config_path",
+        type=str,
+        default=default_path,
+        help=f"Path to meta service JSON config (default: {default_path})",
+    )
     args = parser.parse_args()
 
-    # Launch with the provided or default path
-    launch_with_json(args.config_path)
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    return launch_meta_service(args.config_path)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
