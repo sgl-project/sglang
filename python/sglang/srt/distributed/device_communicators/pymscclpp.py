@@ -25,7 +25,7 @@ logger = logging.getLogger(__name__)
 
 
 class PyMscclppCommunicator:
-    _SUPPORTED_WORLD_SIZES = [8, 16]
+    _SUPPORTED_WORLD_SIZES = [8, 16, 32]
     _SUPPORTED_DTYPE = [torch.float, torch.float16, torch.bfloat16]
 
     def _is_symm_mem_enabled(self) -> bool:
@@ -51,16 +51,17 @@ class PyMscclppCommunicator:
 
     def _create_dsl_algorithms(self):
         dsl_algos_config = []
-        if self.world_size // self.nranks_per_node == 2:
+        n_nodes = self.world_size // self.nranks_per_node
+        if n_nodes == 2 or n_nodes == 4:
             for tbg in [1, 2, 4, 8]:
                 for num_threads_per_block in [256, 512, 768, 1024]:
                     spec = self.mscclpp.language.AlgoSpec(
-                        name=f"allreduce_1node_{tbg}TBG_{num_threads_per_block}TPB",
+                        name=f"allreduce_{n_nodes}node_{tbg}TBG_{num_threads_per_block}TPB",
                         collective=self.mscclpp.language.collectives.AllReduce(
-                            16, 1, True
+                            self.world_size, 1, True
                         ),
-                        nranks_per_node=8,
-                        world_size=16,
+                        nranks_per_node=self.nranks_per_node,
+                        world_size=self.world_size,
                         in_place=True,
                         instances=1,
                         protocol="LL",
@@ -69,11 +70,11 @@ class PyMscclppCommunicator:
                         reuse_resources=True,
                         use_double_scratch_buffer=True,
                         min_message_size=tbg * (1 << 10),
-                        max_message_size=2 << 20,
+                        max_message_size=8 << 20,
                         tags={"default": 1},
                     )
                     algo = self.mscclpp.compile(
-                        self.def_algo.allreduce_2nodes,
+                        self.def_algo.allreduce_multi_nodes,
                         spec,
                         self.rank,
                         thread_block_group_size=tbg,
@@ -122,7 +123,7 @@ class PyMscclppCommunicator:
         if self.world_size == 8:
             self.algos_config = self._create_native_algorithms()
             self._tune(5, 10, 20, self.algos_config)
-        elif self.world_size == 16:
+        elif self.world_size == 16 or self.world_size == 32:
             self.dsl_algos_config = self._create_dsl_algorithms()
             self._tune(5, 10, 20, self.dsl_algos_config)
 
