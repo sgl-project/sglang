@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import os
 from typing import Any, Iterator, Optional
 
 import torch
@@ -128,15 +127,13 @@ def should_use_tp_invariant_tree_all_reduce(
     server_args: Optional[Any] = None,
     accl_binary_tree_enabled: Optional[bool] = None,
 ) -> bool:
-    if accl_binary_tree_enabled is None:
-        accl_binary_tree_enabled = os.environ.get("ACCL_BINARY_TREE_ENABLE") == "1"
+    policy_enabled = resolve_true_on_policy_runtime_policy(
+        _get_server_args(server_args)
+    ).deterministic_tree_all_reduce
+    if accl_binary_tree_enabled is not None:
+        policy_enabled = policy_enabled and not accl_binary_tree_enabled
 
-    return (
-        resolve_true_on_policy_runtime_policy(
-            _get_server_args(server_args)
-        ).deterministic_tree_all_reduce
-        and not accl_binary_tree_enabled
-    )
+    return policy_enabled
 
 
 @contextlib.contextmanager
@@ -155,105 +152,15 @@ def patch_prefill_only_deterministic_inference_for_cuda_graph(
         yield False
         return
 
-    saved_server_state = {
-        "enable_deterministic_inference": getattr(
-            server_args, "enable_deterministic_inference", False
-        ),
-        "enable_flashinfer_allreduce_fusion": getattr(
-            server_args, "enable_flashinfer_allreduce_fusion", False
-        ),
-        "rl_on_policy_target": getattr(server_args, "rl_on_policy_target", None),
-        "true_on_policy_contract": getattr(
-            server_args, "true_on_policy_contract", None
-        ),
-        "disable_custom_all_reduce": getattr(
-            server_args, "disable_custom_all_reduce", False
-        ),
-    }
-    saved_global_state = None
-    if global_server_args is not None:
-        saved_global_state = {
-            "enable_deterministic_inference": getattr(
-                global_server_args, "enable_deterministic_inference", False
-            ),
-            "enable_flashinfer_allreduce_fusion": getattr(
-                global_server_args, "enable_flashinfer_allreduce_fusion", False
-            ),
-            "rl_on_policy_target": getattr(
-                global_server_args, "rl_on_policy_target", None
-            ),
-            "true_on_policy_contract": getattr(
-                global_server_args, "true_on_policy_contract", None
-            ),
-            "disable_custom_all_reduce": getattr(
-                global_server_args, "disable_custom_all_reduce", False
-            ),
-        }
-
     saved_num_splits = None
     if attn_backend is not None and hasattr(attn_backend, "num_splits"):
         saved_num_splits = attn_backend.num_splits
 
-    env_keys = [
-        "SGLANG_ENABLE_DETERMINISTIC_INFERENCE",
-        "SGLANG_DISABLE_CUSTOM_ALL_REDUCE",
-        "NCCL_ALGO",
-        "ACCL_BINARY_TREE_ENABLE",
-    ]
-    saved_env = {key: os.environ.get(key) for key in env_keys}
-
-    from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
-        disable_batch_invariant_mode,
-        enable_batch_invariant_mode,
-    )
-    from sglang.srt.tp_invariant_ops import (
-        disable_tp_invariant_mode,
-        enable_tp_invariant_mode,
-    )
-
-    def _apply_mutation(obj: Any) -> None:
-        obj.enable_deterministic_inference = False
-        obj.enable_flashinfer_allreduce_fusion = True
-        obj.rl_on_policy_target = None
-        obj.true_on_policy_contract = None
-        obj.disable_custom_all_reduce = False
-
-    def _restore(obj: Any, state: dict[str, Any]) -> None:
-        for key, value in state.items():
-            setattr(obj, key, value)
-
     try:
-        _apply_mutation(server_args)
-        if global_server_args is not None:
-            _apply_mutation(global_server_args)
-
-        os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "0"
-        os.environ["SGLANG_DISABLE_CUSTOM_ALL_REDUCE"] = "0"
-        os.environ.pop("NCCL_ALGO", None)
-        if os.environ.get("ACCL_BINARY_TREE_ENABLE") == "1":
-            os.environ["ACCL_BINARY_TREE_ENABLE"] = "0"
-
         if attn_backend is not None and hasattr(attn_backend, "num_splits"):
             attn_backend.num_splits = 0
 
-        disable_batch_invariant_mode()
-        disable_tp_invariant_mode()
         yield True
     finally:
-        _restore(server_args, saved_server_state)
-        if global_server_args is not None and saved_global_state is not None:
-            _restore(global_server_args, saved_global_state)
-
-        for key, value in saved_env.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
-
         if attn_backend is not None and hasattr(attn_backend, "num_splits"):
             attn_backend.num_splits = saved_num_splits
-
-        if saved_server_state["enable_deterministic_inference"]:
-            enable_batch_invariant_mode()
-        if saved_server_state["rl_on_policy_target"] == "fsdp_tp":
-            enable_tp_invariant_mode()

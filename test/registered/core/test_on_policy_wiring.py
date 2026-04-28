@@ -423,6 +423,16 @@ class TestOnPolicyHelpers(unittest.TestCase):
             )
         )
 
+    def test_tree_all_reduce_selection_is_contract_owned(self):
+        server_args = SimpleNamespace(rl_on_policy_target="fsdp_tp")
+
+        with patch.dict(os.environ, {"ACCL_BINARY_TREE_ENABLE": "1"}):
+            self.assertTrue(
+                should_use_tp_invariant_tree_all_reduce(
+                    server_args=server_args,
+                )
+            )
+
     def test_attention_handoff_tree_reduce_uses_attention_tp_group(self):
         from sglang.srt.layers.communicator import CommunicateWithAllReduceAndLayerNormFn
 
@@ -474,7 +484,7 @@ class TestOnPolicyHelpers(unittest.TestCase):
         torch.testing.assert_close(output, hidden_states + 10.0 + residual)
         torch.testing.assert_close(output_residual, residual)
 
-    def test_prefill_only_cuda_graph_patch_temporarily_disables_on_policy_state(self):
+    def test_prefill_only_cuda_graph_patch_only_scopes_attention_splits(self):
         server_args = SimpleNamespace(
             enable_prefill_only_deterministic_inference=True,
             enable_deterministic_inference=True,
@@ -502,46 +512,12 @@ class TestOnPolicyHelpers(unittest.TestCase):
             },
             clear=False,
         ):
-            batch_pkg = types.ModuleType("sglang.srt.batch_invariant_ops")
-            batch_mod = types.ModuleType(
-                "sglang.srt.batch_invariant_ops.batch_invariant_ops"
-            )
-            tp_mod = types.ModuleType("sglang.srt.tp_invariant_ops")
-            batch_mod.disable_batch_invariant_mode = unittest.mock.MagicMock()
-            batch_mod.enable_batch_invariant_mode = unittest.mock.MagicMock()
-            tp_mod.disable_tp_invariant_mode = unittest.mock.MagicMock()
-            tp_mod.enable_tp_invariant_mode = unittest.mock.MagicMock()
-
-            with patch.dict(
-                sys.modules,
-                {
-                    "sglang.srt.batch_invariant_ops": batch_pkg,
-                    "sglang.srt.batch_invariant_ops.batch_invariant_ops": batch_mod,
-                    "sglang.srt.tp_invariant_ops": tp_mod,
-                },
-            ):
-                with patch_prefill_only_deterministic_inference_for_cuda_graph(
-                    server_args,
-                    attn_backend=attn_backend,
-                    global_server_args=global_server_args,
-                ) as patched:
-                    self.assertTrue(patched)
-                    self.assertFalse(server_args.enable_deterministic_inference)
-                    self.assertTrue(server_args.enable_flashinfer_allreduce_fusion)
-                    self.assertIsNone(server_args.rl_on_policy_target)
-                    self.assertIsNone(server_args.true_on_policy_contract)
-                    self.assertIsNone(global_server_args.rl_on_policy_target)
-                    self.assertIsNone(global_server_args.true_on_policy_contract)
-                    self.assertEqual(attn_backend.num_splits, 0)
-                    self.assertEqual(
-                        os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"], "0"
-                    )
-                    self.assertEqual(
-                        os.environ["SGLANG_DISABLE_CUSTOM_ALL_REDUCE"], "0"
-                    )
-                    batch_mod.disable_batch_invariant_mode.assert_called_once()
-                    tp_mod.disable_tp_invariant_mode.assert_called_once()
-
+            with patch_prefill_only_deterministic_inference_for_cuda_graph(
+                server_args,
+                attn_backend=attn_backend,
+                global_server_args=global_server_args,
+            ) as patched:
+                self.assertTrue(patched)
                 self.assertTrue(server_args.enable_deterministic_inference)
                 self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
                 self.assertEqual(server_args.rl_on_policy_target, "fsdp_tp")
@@ -554,15 +530,32 @@ class TestOnPolicyHelpers(unittest.TestCase):
                     global_server_args.true_on_policy_contract,
                     QWEN3_DENSE_TRUE_ON_POLICY_V1,
                 )
-                self.assertTrue(server_args.disable_custom_all_reduce)
-                self.assertEqual(attn_backend.num_splits, 1)
+                self.assertEqual(attn_backend.num_splits, 0)
                 self.assertEqual(
                     os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"], "1"
                 )
                 self.assertEqual(os.environ["SGLANG_DISABLE_CUSTOM_ALL_REDUCE"], "1")
                 self.assertEqual(os.environ["NCCL_ALGO"], "allreduce:tree")
-                batch_mod.enable_batch_invariant_mode.assert_called_once()
-                tp_mod.enable_tp_invariant_mode.assert_called_once()
+
+            self.assertTrue(server_args.enable_deterministic_inference)
+            self.assertFalse(server_args.enable_flashinfer_allreduce_fusion)
+            self.assertEqual(server_args.rl_on_policy_target, "fsdp_tp")
+            self.assertEqual(
+                server_args.true_on_policy_contract,
+                QWEN3_DENSE_TRUE_ON_POLICY_V1,
+            )
+            self.assertEqual(global_server_args.rl_on_policy_target, "fsdp_tp")
+            self.assertEqual(
+                global_server_args.true_on_policy_contract,
+                QWEN3_DENSE_TRUE_ON_POLICY_V1,
+            )
+            self.assertTrue(server_args.disable_custom_all_reduce)
+            self.assertEqual(attn_backend.num_splits, 1)
+            self.assertEqual(
+                os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"], "1"
+            )
+            self.assertEqual(os.environ["SGLANG_DISABLE_CUSTOM_ALL_REDUCE"], "1")
+            self.assertEqual(os.environ["NCCL_ALGO"], "allreduce:tree")
 
     def test_row_linear_k_alignment_edge_cases(self):
         server_args = SimpleNamespace(rl_on_policy_target="fsdp_tp")
