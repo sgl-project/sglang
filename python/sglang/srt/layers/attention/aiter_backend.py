@@ -39,6 +39,7 @@ try:
         mha_batch_prefill_func,
         mla_prefill_ps_asm_fwd,
         mla_reduce_v1,
+        pa_fwd_asm,
         paged_attention_ragged,
     )
     from aiter.mla import mla_decode_fwd, mla_prefill_fwd
@@ -58,6 +59,8 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
+
+_use_asm_attention = get_bool_env_var("SGLANG_USE_ASM_ATTENTION")
 
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
@@ -102,6 +105,7 @@ class ForwardMetadata:
     max_extend_len: Optional[int] = None
     fp8_prefill_kv_indices: Optional[torch.Tensor] = None
     swa_page_table: Optional[torch.Tensor] = None
+    asm_block_tables: Optional[torch.Tensor] = None
 
 
 global_workspace_buffer = None
@@ -232,6 +236,12 @@ class AiterAttnBackend(AttentionBackend):
         self.logits_soft_cap = 0.0
 
         self.forward_metadata: ForwardMetadata = None
+
+        if _use_asm_attention and not self.use_mla:
+            max_kv_pages = (self.max_context_len + self.page_size - 1) // self.page_size
+            self._asm_block_tables_buf = torch.zeros(
+                (max_bs, max_kv_pages), dtype=torch.int32, device=self.device
+            )
 
         if self.use_mla:
             _valid_heads = self.num_head in (4, 8) or (
@@ -680,6 +690,8 @@ class AiterAttnBackend(AttentionBackend):
         swa_page_table = None
         max_kv_len = forward_batch.seq_lens_cpu.max().item()
 
+        asm_block_tables = None
+
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
@@ -698,6 +710,28 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices,
                         self.req_to_token.stride(0),
                     )
+
+                    if _use_asm_attention and not self.use_mla:
+                        page_size = self.page_size
+                        max_kv_pages = (max_kv_len + page_size - 1) // page_size
+                        bt_buf = self._asm_block_tables_buf
+                        bt_buf[:bs, :max_kv_pages].zero_()
+                        tmp_2d = torch.zeros(
+                            bs, max_kv_len, dtype=torch.int32, device=self.device
+                        )
+                        create_flashmla_kv_indices_triton[(bs,)](
+                            self.req_to_token,
+                            forward_batch.req_pool_indices,
+                            forward_batch.seq_lens,
+                            None,
+                            tmp_2d,
+                            self.req_to_token.stride(0),
+                            max_kv_len,
+                            1,
+                        )
+                        transformed = self._transform_table_1_to_real(tmp_2d)
+                        bt_buf[:bs, :max_kv_pages].copy_(transformed[:, :max_kv_pages])
+                        asm_block_tables = bt_buf
                 else:
                     max_q_len = 1
                     page_size = self.page_size
@@ -788,6 +822,7 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
                 run_graph=False,
                 swa_page_table=swa_page_table,
+                asm_block_tables=(asm_block_tables if _use_asm_attention else None),
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -1315,6 +1350,17 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices,
                         self.req_to_token.stride(0),
                     )
+
+                    if _use_asm_attention and not self.use_mla:
+                        page_size_c = self.page_size
+                        max_kv_pages_c = (max_kv_len + page_size_c - 1) // page_size_c
+                        self._asm_block_tables_buf.zero_()
+                        pi_c = self.req_to_token[req_pool_indices[:bs], :max_kv_len]
+                        tr_c = self._transform_table_1_to_real(pi_c)
+                        cols_c = min(
+                            max_kv_pages_c, self._asm_block_tables_buf.shape[1]
+                        )
+                        self._asm_block_tables_buf[:bs, :cols_c].copy_(tr_c[:, :cols_c])
                 else:
                     max_q_len = 1
                     max_num_blocks_per_seq = (
@@ -1697,6 +1743,16 @@ class AiterAttnBackend(AttentionBackend):
                         kv_indices,
                         self.req_to_token.stride(0),
                     )
+
+                    if _use_asm_attention and not self.use_mla:
+                        page_size = self.page_size
+                        max_kv_pages = (max_kv_len + page_size - 1) // page_size
+                        bt_buf = self._asm_block_tables_buf
+                        bt_buf.zero_()
+                        pi_asm = self.req_to_token[req_pool_indices[:bs], :max_kv_len]
+                        tr_asm = self._transform_table_1_to_real(pi_asm)
+                        cols = min(max_kv_pages, bt_buf.shape[1])
+                        bt_buf[:bs, :cols].copy_(tr_asm[:, :cols])
                 else:
                     max_q_len = 1
                     max_num_blocks_per_seq = (
@@ -2099,6 +2155,12 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+                elif _use_asm_attention and hasattr(
+                    forward_batch.token_to_kv_pool, "set_kv_buffer_asm"
+                ):
+                    forward_batch.token_to_kv_pool.set_kv_buffer_asm(
+                        layer.layer_id, cache_loc, k, v
+                    )
                 else:
                     forward_batch.token_to_kv_pool.set_kv_buffer(
                         layer, cache_loc, k, v, k_descale, v_descale
@@ -2386,43 +2448,60 @@ class AiterAttnBackend(AttentionBackend):
 
             bs0 = forward_batch.batch_size + 1
 
-            # To keep the mha_batch_prefill_func function parameters
-            # declare the necessary parameter and assign None as default value
-            q_descale = None
+            if (
+                _use_asm_attention
+                and k is not None
+                and self.forward_metadata.max_q_len == self.forward_metadata.max_kv_len
+            ):
+                o = flash_attn_varlen_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k.contiguous().view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v.contiguous().view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    self.qo_indptr[:bs0],
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_q_len,
+                    softmax_scale=layer.scaling,
+                    causal=True,
+                )
+            else:
+                q_descale = None
+                if self.kv_cache_dtype == fp8_dtype:
+                    q = q.to(fp8_dtype)
+                    q_descale = (
+                        layer.k_scale if layer.k_scale is not None else self.k_scale
+                    )
 
-            # TODO kkhuang-amd need to remove it when mha_batch_prefill_func support fp8-kv
-            if self.kv_cache_dtype == fp8_dtype:
-                q = q.to(fp8_dtype)
-                q_descale = layer.k_scale if layer.k_scale is not None else self.k_scale
+                window_size = (-1, -1)
+                page_table = self.forward_metadata.kv_indices
 
-            window_size = (-1, -1)
-            page_table = self.forward_metadata.kv_indices
-
-            if layer.sliding_window_size is not None and layer.sliding_window_size > -1:
-                window_size = (layer.sliding_window_size, -1)
-                if self.forward_metadata.swa_page_table is not None:
-                    page_table = self.forward_metadata.swa_page_table
-
-            o = mha_batch_prefill_func(
-                q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
-                k_cache,
-                v_cache,
-                self.qo_indptr[:bs0],
-                self.forward_metadata.kv_indptr[:bs0],
-                page_table,
-                self.forward_metadata.max_q_len,
-                self.forward_metadata.max_kv_len,
-                causal=True,
-                logits_soft_cap=self.logits_soft_cap,
-                alibi_slopes=None,
-                return_lse=False,
-                return_attn_probs=False,
-                window_size=window_size,
-                sink_ptr=sinks,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-            )
+                if (
+                    layer.sliding_window_size is not None
+                    and layer.sliding_window_size > -1
+                ):
+                    window_size = (layer.sliding_window_size, -1)
+                    if self.forward_metadata.swa_page_table is not None:
+                        page_table = self.forward_metadata.swa_page_table
+                o = mha_batch_prefill_func(
+                    q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k_cache,
+                    v_cache,
+                    self.qo_indptr[:bs0],
+                    self.forward_metadata.kv_indptr[:bs0],
+                    page_table,
+                    self.forward_metadata.max_q_len,
+                    self.forward_metadata.max_kv_len,
+                    causal=True,
+                    logits_soft_cap=self.logits_soft_cap,
+                    alibi_slopes=None,
+                    return_lse=False,
+                    return_attn_probs=False,
+                    window_size=window_size,
+                    sink_ptr=sinks,
+                    q_descale=q_descale,
+                    k_descale=k_descale,
+                    v_descale=v_descale,
+                )
 
             # The fp8bf16 aiter prefill kernel returns bf16 even when the
             # model computes in fp16. Cast back so the attention output keeps
@@ -2477,6 +2556,29 @@ class AiterAttnBackend(AttentionBackend):
                     slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
                     k_scale=k_descale,
                     v_scale=v_descale,
+                )
+            elif self.use_triton_unified_attention and self.kv_cache_dtype == fp8_dtype:
+                # [PATCH] FP8 non-SWA: use launch_reshape_and_cache_flash to
+                # fuse bf16→fp8 cast + paged write in one Triton kernel,
+                # eliminating separate float8_copy + store_kvcache overhead.
+                token_to_kv_pool = forward_batch.token_to_kv_pool
+                k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                launch_reshape_and_cache_flash(
+                    k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    forward_batch.out_cache_loc,
+                )
+            elif _use_asm_attention and hasattr(
+                forward_batch.token_to_kv_pool, "set_kv_buffer_asm"
+            ):
+                forward_batch.token_to_kv_pool.set_kv_buffer_asm(
+                    layer.layer_id, forward_batch.out_cache_loc, k, v
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(
@@ -2565,6 +2667,27 @@ class AiterAttnBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     sinks=sinks,
+                )
+            elif _use_asm_attention and hasattr(self, "_asm_block_tables_buf"):
+                block_tables = self._asm_block_tables_buf
+                max_qlen = self.forward_metadata.max_q_len or 1
+                k_scale_asm, v_scale_asm = (
+                    forward_batch.token_to_kv_pool.get_kv_scale_buffer(layer.layer_id)
+                    if hasattr(forward_batch.token_to_kv_pool, "get_kv_scale_buffer")
+                    else (None, None)
+                )
+                pa_fwd_asm(
+                    q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    k_cache,
+                    v_cache,
+                    block_tables,
+                    forward_batch.seq_lens,
+                    block_tables.stride(0),
+                    max_qlen=max_qlen,
+                    K_QScale=k_scale_asm,
+                    V_QScale=v_scale_asm,
+                    out_=o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                    high_precision=0,
                 )
             else:
                 if self.kv_cache_dtype == fp8_dtype:
