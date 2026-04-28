@@ -173,6 +173,7 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = None
         self.is_not_in_free_group = True
         self.free_group = []
+        self.hisparse_coordinator = None
         self.clear()
 
         self._kvcache.register_mapping(
@@ -183,10 +184,18 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def size_full(self) -> int:
         return self._size_full
 
+    def register_hisparse_coordinator(self, coordinator) -> None:
+        self.hisparse_coordinator = coordinator
+
     def available_size(self) -> int:
+        hisparse_available = self.hisparse_attn_allocator.available_size()
+        if self.hisparse_coordinator is not None and self.hisparse_coordinator.dynamic:
+            hisparse_available += (
+                self.hisparse_coordinator.reclaimable_resident_tokens()
+            )
         return min(
             self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size(),
+            hisparse_available,
         )
 
     def alloc(self, need_size: int):
@@ -283,11 +292,16 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             > self.logical_attn_allocator.available_size() // self.page_size
         ):
             return None
-        if (
-            num_new_pages
-            > self.hisparse_attn_allocator.available_size() // self.page_size
-        ):
-            return None
+        need_hisparse_tokens = num_new_pages * self.page_size
+        if need_hisparse_tokens > self.hisparse_attn_allocator.available_size():
+            if (
+                self.hisparse_coordinator is None
+                or not self.hisparse_coordinator.dynamic
+                or not self.hisparse_coordinator.demote_until_hisparse_available(
+                    need_hisparse_tokens
+                )
+            ):
+                return None
 
         logical_indices = self.logical_attn_allocator.alloc_extend(
             prefix_lens,

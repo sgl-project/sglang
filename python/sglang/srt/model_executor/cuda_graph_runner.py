@@ -739,6 +739,15 @@ class CudaGraphRunner:
             return "lora"
         return "nolora"
 
+    def _resolve_graph_variant(self, forward_batch: ForwardBatch):
+        variant_label = self._resolve_lora_variant(forward_batch)
+        coordinator = self.model_runner.hisparse_coordinator
+        if coordinator is not None:
+            variant_label = coordinator.cuda_graph_variant_label(
+                variant_label, forward_batch=forward_batch
+            )
+        return variant_label
+
     def can_run(self, forward_batch: ForwardBatch):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -754,7 +763,7 @@ class CudaGraphRunner:
         else:
             cuda_graph_bs = forward_batch.batch_size
 
-        variant_label = self._resolve_lora_variant(forward_batch)
+        variant_label = self._resolve_graph_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         graph_key = self._make_graph_key(cuda_graph_bs, stream_idx, variant_label)
 
@@ -858,6 +867,14 @@ class CudaGraphRunner:
                 if getattr(self, "record_nolora_graph", False)
                 else [(None, None)]
             )
+            hisparse_coordinator = self.model_runner.hisparse_coordinator
+            hisparse_variants = (
+                hisparse_coordinator.cuda_graph_capture_variants(
+                    self.capture_forward_mode
+                )
+                if hisparse_coordinator is not None
+                else (None,)
+            )
             for i, bs in enumerate(capture_range):
                 if get_tensor_model_parallel_rank() == 0:
                     avail_mem = get_available_gpu_memory(
@@ -869,21 +886,28 @@ class CudaGraphRunner:
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
 
-                for variant_label, variant_has_lora in lora_variants:
-                    _set_capture_lora_variant(variant_label)
-                    with patch_model(
-                        self.model_runner.model,
-                        bs in self.compile_bs,
-                        num_tokens=bs * self.num_tokens_per_bs,
-                        tp_group=self.model_runner.tp_group,
-                    ) as forward:
-                        (
-                            graph,
-                            output_buffers,
-                        ) = self.capture_one_batch_size(bs, forward, stream_idx)
-                        key = _default_make_graph_key(bs, stream_idx, variant_label)
-                        self.graphs[key] = graph
-                        self.output_buffers[key] = output_buffers
+                for hisparse_variant in hisparse_variants:
+                    for variant_label, _ in lora_variants:
+                        _set_capture_lora_variant(variant_label)
+                        if hisparse_coordinator is not None:
+                            variant_label = hisparse_coordinator.cuda_graph_variant_label(
+                                variant_label, hisparse_variant=hisparse_variant
+                            )
+                        with patch_model(
+                            self.model_runner.model,
+                            bs in self.compile_bs,
+                            num_tokens=bs * self.num_tokens_per_bs,
+                            tp_group=self.model_runner.tp_group,
+                        ) as forward:
+                            (
+                                graph,
+                                output_buffers,
+                            ) = self.capture_one_batch_size(
+                                bs, forward, stream_idx, hisparse_variant
+                            )
+                            key = _default_make_graph_key(bs, stream_idx, variant_label)
+                            self.graphs[key] = graph
+                            self.output_buffers[key] = output_buffers
 
         # Trigger CUDA graph capture for specific shapes.
         # Capture the large shapes first so that the smaller shapes
@@ -948,7 +972,11 @@ class CudaGraphRunner:
         return torch.cuda.CUDAGraph()
 
     def capture_one_batch_size(
-        self, bs: int, forward: Callable, stream_idx: Optional[int] = None
+        self,
+        bs: int,
+        forward: Callable,
+        stream_idx: Optional[int] = None,
+        hisparse_variant: Optional[str] = None,
     ):
         buffers: DecodeInputBuffers = self.buffers
         graph = self._create_device_graph()
@@ -1088,10 +1116,10 @@ class CudaGraphRunner:
             lora_ids=lora_ids,
         )
 
-        # HiSparse: set coordinator so the hisparse code path is captured into the graph
-        forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
-        if forward_batch.hisparse_coordinator is not None:
-            forward_batch.hisparse_coordinator.num_real_reqs.fill_(bs)
+        if self.model_runner.hisparse_coordinator is not None:
+            self.model_runner.hisparse_coordinator.prepare_cuda_graph_forward_batch(
+                forward_batch, bs, hisparse_variant
+            )
 
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
@@ -1102,6 +1130,10 @@ class CudaGraphRunner:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
         # Attention backend
+        if forward_batch.hisparse_coordinator is not None:
+            forward_batch.hisparse_coordinator.set_cuda_graph_replay(
+                attn_backend, forward_batch
+            )
         attn_backend.init_forward_metadata_capture_cuda_graph(
             bs,
             num_tokens,
@@ -1267,6 +1299,10 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.attn_backend
+        if forward_batch.hisparse_coordinator is not None:
+            forward_batch.hisparse_coordinator.set_cuda_graph_replay(
+                attn_backend, forward_batch
+            )
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -1310,7 +1346,7 @@ class CudaGraphRunner:
                 )
 
         # Replay
-        variant_label = self._resolve_lora_variant(forward_batch)
+        variant_label = self._resolve_graph_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         graph_key = self._make_graph_key(self.bs, stream_idx, variant_label)
         self.graphs[graph_key].replay()

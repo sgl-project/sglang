@@ -726,6 +726,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     else self.tp_group.cpu_group
                 ),
                 host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
+                dynamic=hisparse_cfg.dynamic,
             )
 
         # Init routed experts capturer
@@ -3014,6 +3015,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        forward_batch.hisparse_coordinator = self.hisparse_coordinator
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
@@ -3028,6 +3030,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if (
             self.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode()
+            and self.hisparse_coordinator.should_wait_for_pending_backup_before_forward(
+                forward_batch
+            )
         ):
             self.hisparse_coordinator.wait_for_pending_backup()
 
@@ -3061,7 +3066,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
         forward_batch.hisparse_coordinator = self.hisparse_coordinator
-        if self.hisparse_coordinator is not None:
+        if forward_batch.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
         if forward_batch.forward_mode.is_decode():

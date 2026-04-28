@@ -16,6 +16,7 @@ from sglang.srt.utils import get_device_module
 device_module = get_device_module()
 
 from sglang.jit_kernel.hisparse import load_cache_to_device_buffer_mla
+from sglang.srt.managers.hisparse_dynamic import HiSparseDynamicMixin
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ class HiSparseTokenStats(NamedTuple):
     host_token_usage: float
 
 
-class HiSparseCoordinator:
+class HiSparseCoordinator(HiSparseDynamicMixin):
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -44,12 +45,14 @@ class HiSparseCoordinator:
         device: str,
         tp_group: torch.distributed.ProcessGroup,
         host_to_device_ratio: int = 2,
+        dynamic: bool = False,
     ):
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.top_k = top_k
         self.device_buffer_size = device_buffer_size
         self.device = device
+        self.dynamic = dynamic
 
         self.mem_pool_device: HiSparseNSATokenToKVPool = (
             self.token_to_kv_pool_allocator.get_kvcache()
@@ -93,6 +96,7 @@ class HiSparseCoordinator:
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
+        self._init_dynamic_hisparse_state(max_num_reqs, device)
 
         # initialize data structures for swap-in kernel
         layer_num = self.mem_pool_device.layer_num
@@ -151,6 +155,8 @@ class HiSparseCoordinator:
 
     def admit_request_into_staging(self, req: Req) -> None:
         req.hisparse_staging = True
+        self._mark_hisparse_staging(req)
+
         logical_indices = self.req_to_token_pool.req_to_token[
             req.req_pool_idx, : len(req.fill_ids)
         ]
@@ -218,6 +224,7 @@ class HiSparseCoordinator:
 
         req.staging = False
         self._skip_first_backup[req.req_pool_idx] = True
+        self._mark_hisparse_swap(req, req.kv_allocated_len)
         logger.debug("HiSparse: admitting request %s directly", req.rid)
 
     def _preload_to_device_buffer(self, req: Req) -> None:
@@ -296,10 +303,7 @@ class HiSparseCoordinator:
         finish_count = int(queue_size.item())
         while finish_count > 0:
             _, _, req = self.ack_staging_queue.pop(0)
-            # prepare device buffer and update req
-            self.alloc_device_buffer(req)
-            req.hisparse_staging = False
-            self._skip_first_backup[req.req_pool_idx] = True
+            self._finish_hisparse_staging(req)
             finish_count -= 1
             ready_reqs.append(req)
         return ready_reqs
@@ -386,9 +390,19 @@ class HiSparseCoordinator:
     ) -> None:
         req_pool_indices_cpu = req_pool_indices.cpu()
 
+        if self._maybe_map_last_loc_dynamic(
+            seq_lens,
+            out_cache_loc,
+            req_pool_indices,
+            seq_lens_cpu,
+            req_pool_indices_cpu,
+        ):
+            return
+
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
+
         # Grow device buffers if needed and resolve the latest-token slot.
         reserved_buffer_loc = self._grow_device_buffers(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
@@ -591,6 +605,9 @@ class HiSparseCoordinator:
         Must be called when aborting a request that has been admitted into staging
         but has not yet completed (i.e. req.hisparse_staging is True).
         """
+        if self._maybe_abort_staging_request_dynamic(req):
+            return
+
         # Remove from staging queue
         self.ack_staging_queue = [
             act for act in self.ack_staging_queue if act.req is not req
@@ -614,6 +631,9 @@ class HiSparseCoordinator:
             self.request_finished(req)
 
     def request_finished(self, req: Req):
+        if self._maybe_request_finished_dynamic(req):
+            return
+
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
@@ -690,5 +710,6 @@ class HiSparseCoordinator:
             page_size=1,
             block_size=block_size,
             num_real_reqs=self.num_real_reqs,
+            **self._dynamic_swap_kernel_kwargs(),
         )
         return top_k_indices
