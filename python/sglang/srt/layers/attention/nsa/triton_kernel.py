@@ -3,7 +3,6 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel.utils import is_arch_support_pdl
 
 
 # Triton implementation
@@ -18,7 +17,6 @@ def _act_quant_kernel(
     round_scale: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
-    USE_GDC: tl.constexpr = False,
 ):
     """
     Triton kernel for activation quantization.
@@ -46,9 +44,6 @@ def _act_quant_kernel(
     row_mask = rows < M
     col_mask = cols < N
     mask = row_mask[:, None] & col_mask[None, :]
-
-    if USE_GDC:
-        tl.extra.cuda.gdc_wait()
 
     # Load input data
     x_ptrs = X_ptr + rows[:, None] * N + cols[None, :]
@@ -86,9 +81,6 @@ def _act_quant_kernel(
     s_ptrs = S_ptr + rows * (N // group_size) + s_cols
     s_mask = row_mask
     tl.store(s_ptrs, scale, mask=s_mask)
-
-    if USE_GDC:
-        tl.extra.cuda.gdc_launch_dependents()
 
 
 def act_quant(
@@ -128,8 +120,6 @@ def act_quant(
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, block_size))
     round_scale = scale_fmt is not None
 
-    pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-
     _act_quant_kernel[grid](
         x_flat,
         y_flat,
@@ -141,7 +131,6 @@ def act_quant(
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         num_stages=0 if round_scale else 2,
-        **pdl_kwargs,
     )
 
     return y, s
