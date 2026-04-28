@@ -1,113 +1,590 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Gluon extend-attention dispatch for gfx950 (MI350X / CDNA4).
+"""SGLang-facing Gluon extend-attention dispatch for gfx950.
 
-Public entry point: :func:`gluon_extend_attention_fwd`. Supports symmetric
-heads only (Lq == Lv) at D in {64, 128, 256} with BF16 or FP8 KV cache.
-Mixed-dim / DeepSeek MLA heads live on a separate ``mla_prefill`` branch
-and are out of scope here.
+Public entry point: :func:`gluon_extend_attention_fwd`. The API mirrors
+SGLang's Triton extend-attention backend for symmetric heads only
+(``Lq == Lv``) at D in {64, 128, 256}, with BF16 or OCP FP8 KV cache.
+DeepSeek MLA / mixed-dim heads live in a separate ``mla_prefill`` branch.
 
-Dispatch picks between four kernel bodies (BF16 basic, BF16 WCA persistent,
-FP8 basic, FP8 WCA persistent). All kernels are launched via the standard
-Triton ``kernel[grid](...)`` JIT entry point. Triton's own compile cache
-avoids recompilation on warm launches; a small shape-keyed tile-config
-cache avoids rerunning the heuristic tree on every call, and WCA metadata
-(split-K workspace, dummy mask buffers) is computed once and reused across
-the attention layers of a single forward pass. The persistent kernel walks
-``qo_indptr`` directly via an inline O(B) scan to resolve
-``tile_idx -> (seq, head, block_m)`` -- no cumsum tensor is needed.
+This module is intentionally a fast host entry point, not a pure wrapper:
+it owns feature gating, shape-keyed dispatch heuristics, WCA/split-K
+workspace reuse, and the direct Triton/Gluon ``kernel[grid](...)``
+launches. The kernel bodies themselves are the schedule-specific wrappers
+in this file:
 
-Env vars
---------
-- ``SGLANG_GLUON_FP8_KV_FORCE_BF16=1`` (user-facing safety rail): cast
-  FP8 KV to BF16 per call and route through the IS_FP8=False path. Used
-  when a new FP8 config hits a numerical issue in production.
+* ``gluon_extend_attn_serial_fwd`` for serial NS=1 data-centric tiles.
+* ``gluon_extend_attn_fwd_4w`` for the 4-warp software-pipeline schedule.
+* ``gluon_extend_attn_fwd_8w`` for the 8-warp pingpong schedule.
+
+Regular attention, sliding-window attention, and attention sinks all need
+to stay on fast paths. The only deliberate exclusion is WCA/split-K for
+SWA+sinks together, because that combination is unsafe in the WCA
+body; it remains supported through the non-WCA data-centric launch.
+
+Terminology: data-centric launches use a rectangular 3D grid where each
+CTA maps directly to one ``(seq, head, block_m)`` tile. WCA launches a
+compact 1D grid over an output-tile estimate; the in-kernel scan rejects
+any overestimated slots, and each CTA may walk
+``tile_idx += total_programs`` to cover more logical tiles. Therefore
+``SPLIT_K == 1`` WCA means "no prefix partition/reduction", not "the
+data-centric kernel".
 """
 
 import functools
-import logging
-import math
-import os
+from enum import IntEnum
+from typing import NamedTuple
 
 import torch
 import triton
 
-# Unified extend kernel. One JITFunction covers every path:
-#   * IS_PERSISTENT    basic 3D grid vs persistent-CTA tile sweep
-#   * SPLIT_K          prefix partitioning for persistent (SPLIT_K > 1)
-#   * IS_FP8           BF16 vs FP8 KV cache
-from ._kernel_gfx950 import gluon_extend_attn_fwd as _kernel
-
-_dummy_cm = None
-_dummy_mi = None
-_dummy_mi_size = 0
-_dummy_wkvo = None
-_dummy_wkvo_size = 0
-# Singleton passed to the kernel when HAS_SINK=False. The kernel body
-# never loads from it and DCE eliminates the path.
-_dummy_sinks = None
-# Singletons passed to the kernel on the IS_PERSISTENT=False path.
-# Triton specializes CompiledKernel on pointer element dtype, so they must
-# match the live tensor dtypes on the persistent path (fp32 / int32). The
-# kernel body gates every access on `if IS_PERSISTENT:` so these are never
-# dereferenced in the basic path; allocating 1 element is sufficient.
-_dummy_partial_out = None
-_dummy_partial_lse = None
-_dummy_tile_done = None
-
-_LOGGED_FP8_KV_MODE = False
-logger = logging.getLogger(__name__)
+from ._common import (
+    gluon,
+    gl,
+    ExtendAttentionLayouts,
+    ExtendAttnConfig,
+    ExtendAttnProgram,
+    ExtendAttnSerialProgram,
+    ExtendAttnSwPipeline4WProgram,
+    ExtendAttnPingpong8WProgram,
+)
 
 
-def _ensure_dummies(device, mi_size, wkvo_size):
-    """Lazy-init module-level singleton dummy tensors on first use."""
-    global _dummy_cm, _dummy_mi, _dummy_mi_size, _dummy_wkvo, _dummy_wkvo_size
-    global _dummy_sinks
-    global _dummy_partial_out, _dummy_partial_lse, _dummy_tile_done
-    if _dummy_cm is None:
-        _dummy_cm = torch.empty(0, dtype=torch.uint8, device=device)
-    if _dummy_mi is None or _dummy_mi_size < mi_size:
-        _dummy_mi = torch.zeros(mi_size, dtype=torch.int64, device=device)
-        _dummy_mi_size = mi_size
-    if _dummy_wkvo is None or _dummy_wkvo_size < wkvo_size:
-        _dummy_wkvo = torch.zeros(wkvo_size, dtype=torch.int32, device=device)
-        _dummy_wkvo_size = wkvo_size
-    if _dummy_sinks is None:
-        _dummy_sinks = torch.zeros(1, dtype=torch.bfloat16, device=device)
-    if _dummy_partial_out is None:
-        _dummy_partial_out = torch.empty(1, dtype=torch.float32, device=device)
-    if _dummy_partial_lse is None:
-        _dummy_partial_lse = torch.empty(1, dtype=torch.float32, device=device)
-    if _dummy_tile_done is None:
-        _dummy_tile_done = torch.zeros(1, dtype=torch.int32, device=device)
+# ===---------------------------------------------------------------------===#
+# Serial kernel (NS=1, NW in {2, 4})
+# ===---------------------------------------------------------------------===#
 
 
-# User-facing safety rail: cast FP8 KV to BF16 at call time (pays a
-# per-call dtype cast). Referenced in user-visible error messages.
-_FP8_KV_FORCE_BF16 = int(os.getenv("SGLANG_GLUON_FP8_KV_FORCE_BF16", "0")) != 0
+@gluon.jit
+def gluon_extend_attn_serial_fwd(
+    Q_Extend,
+    K_Extend,
+    V_Extend,
+    O_Extend,
+    K_Buffer,
+    V_Buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    Mask,
+    MaskIndptr,
+    WindowKvOffsets,
+    Sinks,
+    sm_scale,
+    kv_group_num,
+    stride_qbs,
+    stride_qh,
+    stride_kbs,
+    stride_kh,
+    stride_vbs,
+    stride_vh,
+    stride_obs,
+    stride_oh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    IS_CAUSAL: gl.constexpr,
+    USE_CUSTOM_MASK: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_DMODEL: gl.constexpr,
+    IS_FP8: gl.constexpr = False,
+    Sinks_present: gl.constexpr = False,
+    LOGIT_CAP: gl.constexpr = 0.0,
+    XAI_TEMPERATURE_LEN: gl.constexpr = -1,
+    SLIDING_WINDOW_SIZE: gl.constexpr = -1,
+    HAS_WINDOW_OFFSETS: gl.constexpr = False,
+    v_scale=1.0,
+    # XCD-aware PID remap metadata. The serial kernel is non-WCA and keeps
+    # these as identity defaults; 4w/8w data-centric and WCA wrappers may
+    # opt in through the dispatcher policy.
+    XCD_REMAP: gl.constexpr = False,
+    NUM_XCDS: gl.constexpr = 8,
+    XCD_CHUNK: gl.constexpr = 1,
+    XCD_MODE: gl.constexpr = 1,
+):
+    """Serial Gluon extend-attention kernel for gfx950 (NS=1, NW in {2, 4}).
+
+    See ``ExtendAttnSerialProgram.run`` in ``_common.py`` for the body.
+    Always launched as a 3D data-centric grid (one tile per CTA); there is no
+    WCA variant.
+    """
+    num_warps: gl.constexpr = gl.num_warps()
+    BLOCK_DV: gl.constexpr = BLOCK_DMODEL
+
+    layouts: gl.constexpr = ExtendAttentionLayouts(
+        IS_FP8, num_warps, Q_Extend.dtype.element_ty, K_Buffer.dtype.element_ty,
+    )
+    cfg: gl.constexpr = ExtendAttnConfig(
+        layouts=layouts,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_DV=BLOCK_DV,
+        NUM_STAGES=1,
+        EXT_BLOCK_N=0, EXT_NUM_STAGES=0,
+        num_warps=num_warps,
+        IS_CAUSAL=IS_CAUSAL, USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        ENABLE_PREFIX_UNMASKED=False,
+        LOGIT_CAP=LOGIT_CAP,
+        XAI_TEMPERATURE_LEN=XAI_TEMPERATURE_LEN,
+        SLIDING_WINDOW_SIZE=SLIDING_WINDOW_SIZE,
+        HAS_WINDOW_OFFSETS=HAS_WINDOW_OFFSETS,
+        IS_FP8=IS_FP8, HAS_SINK=Sinks_present,
+        IS_WCA=False, SPLIT_K=1,
+        XCD_REMAP=XCD_REMAP, NUM_XCDS=NUM_XCDS, XCD_CHUNK=XCD_CHUNK,
+        XCD_MODE=XCD_MODE,
+    )
+    # Optional tensor slots use constexpr placeholders when the feature is off.
+    # See ``ExtendAttnProgram`` for the union-typed aggregate fields.
+    if Sinks_present:
+        Sinks_arg = Sinks
+    else:
+        Sinks_arg = gl.constexpr(0)
+
+    state = ExtendAttnProgram.initialize(
+        cfg,
+        Q_Extend, K_Extend, V_Extend, O_Extend, K_Buffer, V_Buffer,
+        qo_indptr, kv_indptr, kv_indices,
+        Mask, MaskIndptr, WindowKvOffsets, Sinks_arg,
+        stride_qbs, stride_qh,
+        stride_kbs, stride_kh,
+        stride_vbs, stride_vh,
+        stride_obs, stride_oh,
+        stride_buf_kbs, stride_buf_kh,
+        stride_buf_vbs, stride_buf_vh,
+        sm_scale, kv_group_num, v_scale,
+        0, 0, 0, 0, 0, 0, 0,  # WCA / split-K workspace (unused on the serial kernel)
+    )
+    pgm = ExtendAttnSerialProgram(state)
+    pgm.run()
+
+
+# ===---------------------------------------------------------------------===#
+# 4-Warp sw-pipeline BF16 + FP8 KV Kernel (NS>=2, D>=128, NW<8)
+# ===---------------------------------------------------------------------===#
+
+
+@gluon.jit
+def gluon_extend_attn_fwd_4w(
+    Q_Extend,
+    K_Extend,
+    V_Extend,
+    O_Extend,
+    K_Buffer,
+    V_Buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    Mask,
+    MaskIndptr,
+    WindowKvOffsets,
+    sm_scale,
+    kv_group_num,
+    stride_qbs,
+    stride_qh,
+    stride_kbs,
+    stride_kh,
+    stride_vbs,
+    stride_vh,
+    stride_obs,
+    stride_oh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    IS_CAUSAL: gl.constexpr,
+    USE_CUSTOM_MASK: gl.constexpr,
+    ENABLE_PREFIX_UNMASKED: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_DMODEL: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    Sinks,
+    HAS_SINK: gl.constexpr,
+    LOGIT_CAP: gl.constexpr,
+    XAI_TEMPERATURE_LEN: gl.constexpr,
+    SLIDING_WINDOW_SIZE: gl.constexpr,
+    HAS_WINDOW_OFFSETS: gl.constexpr,
+    v_scale,
+    # Scheduling metadata: ``0`` (int) defaults are re-wrapped
+    # to ``gl.constexpr(0)`` inside ``ExtendAttnProgram.__init__`` on the
+    # identity path. The dispatcher passes real values for WCA/split-K and
+    # opt-in data-centric XCD remap launches.
+    num_heads=0,
+    total_valid_tiles=0,
+    total_programs=0,
+    partial_out=0,
+    partial_lse=0,
+    tile_done=0,
+    actual_batch_size=0,
+    IS_WCA: gl.constexpr = False,
+    SPLIT_K: gl.constexpr = 1,
+    IS_FP8: gl.constexpr = False,
+    EXT_BLOCK_N: gl.constexpr = 0,
+    EXT_NUM_STAGES: gl.constexpr = 0,
+    # XCD-aware PID remap (MI350X: 8 XCDs); identity defaults below,
+    # dispatcher fills real values from the launch policy.
+    XCD_REMAP: gl.constexpr = False,
+    NUM_XCDS: gl.constexpr = 8,
+    XCD_CHUNK: gl.constexpr = 1,
+    XCD_MODE: gl.constexpr = 1,
+):
+    """4-warp software-pipelined Gluon extend-attention kernel for gfx950.
+
+    See ``ExtendAttnSwPipeline4WProgram.run`` in ``_common.py`` for the body.
+    Invariants: ``NUM_STAGES>=2``, ``BLOCK_DMODEL>=128``, and
+    ``num_warps<8``.
+    """
+    num_warps: gl.constexpr = gl.num_warps()
+    BLOCK_DV: gl.constexpr = BLOCK_DMODEL
+
+    layouts: gl.constexpr = ExtendAttentionLayouts(
+        IS_FP8, num_warps, Q_Extend.dtype.element_ty, K_Buffer.dtype.element_ty,
+    )
+    cfg: gl.constexpr = ExtendAttnConfig(
+        layouts=layouts,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_DV=BLOCK_DV,
+        NUM_STAGES=NUM_STAGES,
+        EXT_BLOCK_N=EXT_BLOCK_N, EXT_NUM_STAGES=EXT_NUM_STAGES,
+        num_warps=num_warps,
+        IS_CAUSAL=IS_CAUSAL, USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        ENABLE_PREFIX_UNMASKED=ENABLE_PREFIX_UNMASKED,
+        LOGIT_CAP=LOGIT_CAP,
+        XAI_TEMPERATURE_LEN=XAI_TEMPERATURE_LEN,
+        SLIDING_WINDOW_SIZE=SLIDING_WINDOW_SIZE,
+        HAS_WINDOW_OFFSETS=HAS_WINDOW_OFFSETS,
+        IS_FP8=IS_FP8, HAS_SINK=HAS_SINK,
+        IS_WCA=IS_WCA, SPLIT_K=SPLIT_K,
+        XCD_REMAP=XCD_REMAP, NUM_XCDS=NUM_XCDS, XCD_CHUNK=XCD_CHUNK,
+        XCD_MODE=XCD_MODE,
+    )
+    # Optional tensor slots use constexpr placeholders when the feature is off.
+    if HAS_SINK:
+        Sinks_arg = Sinks
+    else:
+        Sinks_arg = gl.constexpr(0)
+
+    state = ExtendAttnProgram.initialize(
+        cfg,
+        Q_Extend, K_Extend, V_Extend, O_Extend, K_Buffer, V_Buffer,
+        qo_indptr, kv_indptr, kv_indices,
+        Mask, MaskIndptr, WindowKvOffsets, Sinks_arg,
+        stride_qbs, stride_qh,
+        stride_kbs, stride_kh,
+        stride_vbs, stride_vh,
+        stride_obs, stride_oh,
+        stride_buf_kbs, stride_buf_kh,
+        stride_buf_vbs, stride_buf_vh,
+        sm_scale, kv_group_num, v_scale,
+        num_heads, total_valid_tiles, total_programs,
+        partial_out, partial_lse, tile_done, actual_batch_size,
+    )
+    pgm = ExtendAttnSwPipeline4WProgram(state)
+    pgm.run()
+
+
+# ===---------------------------------------------------------------------===#
+# 8-Warp Pingpong BF16 + FP8 KV Kernel (NS>=2, NW>=8)
+# ===---------------------------------------------------------------------===#
+
+
+@gluon.jit
+def gluon_extend_attn_fwd_8w(
+    Q_Extend,
+    K_Extend,
+    V_Extend,
+    O_Extend,
+    K_Buffer,
+    V_Buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    Mask,
+    MaskIndptr,
+    WindowKvOffsets,
+    sm_scale,
+    kv_group_num,
+    stride_qbs,
+    stride_qh,
+    stride_kbs,
+    stride_kh,
+    stride_vbs,
+    stride_vh,
+    stride_obs,
+    stride_oh,
+    stride_buf_kbs,
+    stride_buf_kh,
+    stride_buf_vbs,
+    stride_buf_vh,
+    IS_CAUSAL: gl.constexpr,
+    USE_CUSTOM_MASK: gl.constexpr,
+    ENABLE_PREFIX_UNMASKED: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BLOCK_DMODEL: gl.constexpr,
+    NUM_STAGES: gl.constexpr,
+    Sinks,
+    HAS_SINK: gl.constexpr,
+    LOGIT_CAP: gl.constexpr,
+    XAI_TEMPERATURE_LEN: gl.constexpr,
+    SLIDING_WINDOW_SIZE: gl.constexpr,
+    HAS_WINDOW_OFFSETS: gl.constexpr,
+    v_scale,
+    # Scheduling metadata: same convention as the 4w wrapper.
+    num_heads=0,
+    total_valid_tiles=0,
+    total_programs=0,
+    partial_out=0,
+    partial_lse=0,
+    tile_done=0,
+    actual_batch_size=0,
+    IS_WCA: gl.constexpr = False,
+    SPLIT_K: gl.constexpr = 1,
+    IS_FP8: gl.constexpr = False,
+    EXT_BLOCK_N: gl.constexpr = 0,
+    EXT_NUM_STAGES: gl.constexpr = 0,
+    XCD_REMAP: gl.constexpr = False,
+    NUM_XCDS: gl.constexpr = 8,
+    XCD_CHUNK: gl.constexpr = 1,
+    XCD_MODE: gl.constexpr = 1,
+):
+    """8-warp pingpong Gluon extend-attention kernel for gfx950.
+
+    See ``ExtendAttnPingpong8WProgram.run`` in ``_common.py`` for the body.
+    """
+    num_warps: gl.constexpr = gl.num_warps()
+    BLOCK_DV: gl.constexpr = BLOCK_DMODEL
+
+    layouts: gl.constexpr = ExtendAttentionLayouts(
+        IS_FP8, num_warps, Q_Extend.dtype.element_ty, K_Buffer.dtype.element_ty,
+    )
+    cfg: gl.constexpr = ExtendAttnConfig(
+        layouts=layouts,
+        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
+        BLOCK_DMODEL=BLOCK_DMODEL, BLOCK_DV=BLOCK_DV,
+        NUM_STAGES=NUM_STAGES,
+        EXT_BLOCK_N=EXT_BLOCK_N, EXT_NUM_STAGES=EXT_NUM_STAGES,
+        num_warps=num_warps,
+        IS_CAUSAL=IS_CAUSAL, USE_CUSTOM_MASK=USE_CUSTOM_MASK,
+        ENABLE_PREFIX_UNMASKED=ENABLE_PREFIX_UNMASKED,
+        LOGIT_CAP=LOGIT_CAP,
+        XAI_TEMPERATURE_LEN=XAI_TEMPERATURE_LEN,
+        SLIDING_WINDOW_SIZE=SLIDING_WINDOW_SIZE,
+        HAS_WINDOW_OFFSETS=HAS_WINDOW_OFFSETS,
+        IS_FP8=IS_FP8, HAS_SINK=HAS_SINK,
+        IS_WCA=IS_WCA, SPLIT_K=SPLIT_K,
+        XCD_REMAP=XCD_REMAP, NUM_XCDS=NUM_XCDS, XCD_CHUNK=XCD_CHUNK,
+        XCD_MODE=XCD_MODE,
+    )
+    if HAS_SINK:
+        Sinks_arg = Sinks
+    else:
+        Sinks_arg = gl.constexpr(0)
+
+    state = ExtendAttnProgram.initialize(
+        cfg,
+        Q_Extend, K_Extend, V_Extend, O_Extend, K_Buffer, V_Buffer,
+        qo_indptr, kv_indptr, kv_indices,
+        Mask, MaskIndptr, WindowKvOffsets, Sinks_arg,
+        stride_qbs, stride_qh,
+        stride_kbs, stride_kh,
+        stride_vbs, stride_vh,
+        stride_obs, stride_oh,
+        stride_buf_kbs, stride_buf_kh,
+        stride_buf_vbs, stride_buf_vh,
+        sm_scale, kv_group_num, v_scale,
+        num_heads, total_valid_tiles, total_programs,
+        partial_out, partial_lse, tile_done, actual_batch_size,
+    )
+    pgm = ExtendAttnPingpong8WProgram(state)
+    pgm.run()
+
 
 
 # ===-----------------------------------------------------------------------===#
-# Persistent / split-K launch helpers
+# Module state: XCD remap policy and host-side dispatch caches
 # ===-----------------------------------------------------------------------===#
-#
-# ``_launch_persistent`` and ``_launch_splitk`` wrap ``_kernel`` with
-# IS_PERSISTENT=True and SPLIT_K=1 vs >1 respectively. The ``_fp8``
-# variants do the same with IS_FP8=True. Kernels launch via the standard
-# ``kernel[grid](...)`` path; Triton's own compile cache absorbs the JIT
-# cost on warm calls.
+
+# XCD-aware PID remap (MI350X: 8 XCDs x 32 CUs x 4 MB L2-per-XCD).
+# Selected WCA and D64 BF16 data-centric launches opt into first-class remap
+# policies below; serial kernels stay on the identity mapping.
+_NUM_XCDS = 8  # gfx950 / MI350X constant
+_XCD_CHUNK = 8
 
 
+class XcdRemapMode(IntEnum):
+    OFF = 0
+    CHUNKED = 1
+    ATTENTION = 2
+
+
+class XcdRemapConfig(NamedTuple):
+    enabled: bool
+    num_xcds: int
+    chunk: int
+    mode: XcdRemapMode
+
+
+def _disabled_xcd_remap_config() -> XcdRemapConfig:
+    return XcdRemapConfig(False, _NUM_XCDS, 1, XcdRemapMode.CHUNKED)
+
+
+def _select_xcd_chunk(total_valid_tiles: int) -> int:
+    return max(1, min(_XCD_CHUNK, max(1, int(total_valid_tiles) // _NUM_XCDS)))
+
+
+def _select_data_centric_xcd_mode(
+    *,
+    block_dmodel: int,
+    kv_is_fp8: bool,
+    head_num: int,
+    batch_size: int,
+    total_valid_tiles: int,
+    sliding_window_size: int,
+) -> XcdRemapMode:
+    """First-class XCD remap policy for the rectangular 3D data grid."""
+    if int(block_dmodel) != 64 or kv_is_fp8 or int(batch_size) < 8:
+        return XcdRemapMode.OFF
+
+    data_blocks = int(total_valid_tiles) // max(1, int(batch_size) * int(head_num))
+    if (
+        int(batch_size) >= 16
+        and data_blocks == 8
+        and int(sliding_window_size) <= 0
+    ):
+        return XcdRemapMode.ATTENTION
+    return XcdRemapMode.CHUNKED
+
+
+def _select_wca_xcd_mode(
+    *,
+    split_k: int,
+    block_dmodel: int,
+    kv_is_fp8: bool,
+    head_num: int,
+    batch_size: int,
+    total_extend_rows: int,
+    sliding_window_size: int,
+    logit_cap: float,
+) -> XcdRemapMode:
+    """First-class XCD remap policy for WCA/split-K launches."""
+    long_qh32_non_swa = (
+        int(head_num) == 32
+        and int(sliding_window_size) <= 0
+        and (
+            (int(batch_size) >= 32 and int(total_extend_rows) < 4096)
+            or (max(1, int(split_k)) > 1 and float(logit_cap) > 0.0)
+        )
+    )
+    if int(block_dmodel) == 128 and not kv_is_fp8 and not long_qh32_non_swa:
+        return XcdRemapMode.CHUNKED
+    return XcdRemapMode.OFF
+
+
+def _select_xcd_remap_config(
+    *,
+    is_wca: bool,
+    is_serial: bool,
+    split_k: int,
+    total_valid_tiles: int,
+    block_dmodel: int,
+    kv_is_fp8: bool,
+    head_num: int,
+    batch_size: int,
+    total_extend_rows: int,
+    sliding_window_size: int,
+    logit_cap: float,
+) -> XcdRemapConfig:
+    """Select the host-side XCD remap policy for a launch.
+
+    The production heuristic is intentionally narrower than "all WCA":
+    A/B data showed reliable wins on D128 BF16 WCA, but FP8 and D256 had
+    mixed results, and qH=32 non-SWA B32 / split-logit shapes regressed.
+    D64 BF16 data-centric launches use a separate rectangular-grid policy.
+    """
+    if total_valid_tiles <= 0:
+        return _disabled_xcd_remap_config()
+    if not is_wca:
+        if is_serial:
+            return _disabled_xcd_remap_config()
+        # D64 BF16 data-centric A/B showed chunked is broadly positive for
+        # B>=8. The decode-style contiguous remap only clearly wins for the
+        # high-batch, 8-block, non-SWA shapes; leave smaller cases on chunked.
+        mode = _select_data_centric_xcd_mode(
+            block_dmodel=block_dmodel,
+            kv_is_fp8=kv_is_fp8,
+            head_num=head_num,
+            batch_size=batch_size,
+            total_valid_tiles=total_valid_tiles,
+            sliding_window_size=sliding_window_size,
+        )
+        if mode == XcdRemapMode.OFF:
+            return _disabled_xcd_remap_config()
+        return XcdRemapConfig(
+            True, _NUM_XCDS, _select_xcd_chunk(total_valid_tiles), mode,
+        )
+
+    mode = _select_wca_xcd_mode(
+        split_k=split_k,
+        block_dmodel=block_dmodel,
+        kv_is_fp8=kv_is_fp8,
+        head_num=head_num,
+        batch_size=batch_size,
+        total_extend_rows=total_extend_rows,
+        sliding_window_size=sliding_window_size,
+        logit_cap=logit_cap,
+    )
+    if mode == XcdRemapMode.OFF:
+        return _disabled_xcd_remap_config()
+    return XcdRemapConfig(
+        True, _NUM_XCDS, _select_xcd_chunk(total_valid_tiles), mode,
+    )
+
+
+# ===-----------------------------------------------------------------------===#
+# Route predicate helpers
+# ===-----------------------------------------------------------------------===#
+
+
+def _should_route_serial_data_centric_bf16(
+    Lq: int,
+    batch_size: int,
+    max_len_extend: int,
+    total_prefix_len: int | None,
+) -> bool:
+    """Preflight for BF16 shapes that should use the serial kernel.
+
+    The serial kernel handles regular attention, SWA, sinks, and custom masks
+    itself, so this route is feature-complete for BF16.
+    """
+    if Lq not in (64, 128):
+        return False
+    avg_pfx = total_prefix_len // max(batch_size, 1) if total_prefix_len else 0
+    if Lq == 64:
+        if batch_size == 1 and avg_pfx <= 1024 and max_len_extend <= 256:
+            return True
+        if 2 <= batch_size <= 7 and avg_pfx <= 1024 and max_len_extend <= 128:
+            return True
+        if batch_size >= 8 and avg_pfx <= 1024 and max_len_extend <= 64:
+            return True
+    else:  # Lq == 128
+        if batch_size == 1 and avg_pfx <= 512 and max_len_extend <= 256:
+            return True
+        if 2 <= batch_size <= 7 and avg_pfx <= 512 and max_len_extend <= 128:
+            return True
+        if 8 <= batch_size <= 15 and avg_pfx <= 512 and max_len_extend <= 64:
+            return True
+    return False
+
+# Tiny manual cache for a pure shape transform. ``Lq`` only takes a few
+# production values, but this helper is on every dispatch path.
 _QK_SPLIT_CACHE = {}
 
 
 def _resolve_qk_split_dims(Lq: int):
-    """Return BLOCK_DMODEL (next power of 2 >= Lq, >= 16).
-
-    The production dispatcher only routes power-of-2 Lq (64/128/256), so
-    BLOCK_DMODEL == Lq and no separate ACTUAL_BLOCK_DMODEL is needed.
-    """
+    """Return BLOCK_DMODEL (next power of 2 >= Lq, >= 16)."""
     cached = _QK_SPLIT_CACHE.get(Lq)
     if cached is not None:
         return cached
@@ -116,49 +593,55 @@ def _resolve_qk_split_dims(Lq: int):
     return block_dmodel
 
 
+# CU count is hardware state, not input-dependent. Most serving processes bind
+# one GPU, so ``_single_device_num_CUs`` avoids even the per-device dict lookup
+# after the first query while still handling multi-device tests correctly.
 _cached_num_CUs = {}
+_single_device_num_CUs = None
 
 
 def _get_num_CUs(device):
+    """Return CU count, cached for the common one-GPU-per-process serving case."""
+    global _single_device_num_CUs
+    if _single_device_num_CUs is not None:
+        return _single_device_num_CUs
     idx = device.index if hasattr(device, 'index') and device.index is not None else 0
-    if idx not in _cached_num_CUs:
-        _cached_num_CUs[idx] = torch.cuda.get_device_properties(device).multi_processor_count
-    return _cached_num_CUs[idx]
+    cached = _cached_num_CUs.get(idx)
+    if cached is None:
+        cached = torch.cuda.get_device_properties(device).multi_processor_count
+        _cached_num_CUs[idx] = cached
+    _single_device_num_CUs = cached
+    return cached
 
 
-# Cached dummies for the no-custom-mask / no-sliding-window persistent path.
-# Reused across launches; the zeroed mask_indptr buffer grows monotonically
-# and any prefix is valid (the kernel reads index 0 for a "no mask" batch).
-_dummy_cm_lh = None
-_dummy_mi_lh = None
-_dummy_wkvo_lh = None
-_dummy_mi_cap = 0
-_dummy_wkvo_cap = 0
+# ===-----------------------------------------------------------------------===#
+# WCA grid and split-K scheduling helpers
+# ===-----------------------------------------------------------------------===#
 
 
-def _ensure_dummy_mask_tensors(device, q_total, batch_size):
-    """Return (custom_mask, mask_indptr, window_kv_offsets) dummy tensors
-    for the persistent path when USE_CUSTOM_MASK=False."""
-    global _dummy_cm_lh, _dummy_mi_lh, _dummy_wkvo_lh
-    global _dummy_mi_cap, _dummy_wkvo_cap
-    if _dummy_cm_lh is None or _dummy_cm_lh.device != device:
-        _dummy_cm_lh = torch.empty(0, dtype=torch.uint8, device=device)
-    needed_mi = q_total + 1
-    if _dummy_mi_lh is None or _dummy_mi_lh.device != device or _dummy_mi_cap < needed_mi:
-        _dummy_mi_cap = max(needed_mi, 1024)
-        _dummy_mi_lh = torch.zeros(_dummy_mi_cap, dtype=torch.int64, device=device)
-    if _dummy_wkvo_lh is None or _dummy_wkvo_lh.device != device or _dummy_wkvo_cap < batch_size:
-        _dummy_wkvo_cap = max(batch_size, 256)
-        _dummy_wkvo_lh = torch.zeros(_dummy_wkvo_cap, dtype=torch.int32, device=device)
-    return _dummy_cm_lh, _dummy_mi_lh[:needed_mi], _dummy_wkvo_lh[:batch_size]
-
-
-def _select_persistent_grid(total_valid_tiles: int, num_CUs: int) -> int:
-    """Pick CTA count for the persistent kernel.
+def _select_wca_grid(total_valid_tiles: int, num_CUs: int) -> int:
+    """Pick CTA count for the WCA kernel.
 
     When there are more tiles than CUs we cap at 2*CUs for good occupancy.
     When there are fewer tiles than CUs (decode, spec-decode) we use all
     available tiles -- split-K will eventually fill the remaining CUs.
+
+    Example on MI350X (256 CUs), before split-K:
+      * 250 compact WCA output tiles with a short prefix launches 250 CTAs.
+        The remaining 6 CUs simply have no CTA for this kernel; no extra
+        scheduler work or inter-CTA coordination happens.
+      * 500 compact WCA output tiles launches 256 CTAs. CTA p handles
+        tile_idx p, then p + 256. CTAs 0..243 process two output tiles
+        each, while CTAs 244..255 process only their first tile because
+        p + 256 is outside the 500-tile range.
+
+    If the prefix is long enough and the compact output-tile count is below
+    the CU count, ``_get_wca_grid_config`` may promote to split-K. For
+    example, 250 output tiles with ``SPLIT_K=2`` becomes 500 logical
+    tile-splits, still launched as 256 CTAs. Then tile_idx 0/1 are
+    ``(output=0, split=0/1)``, tile_idx 256/257 are
+    ``(output=128, split=0/1)``, and the last-arriving split for an
+    output tile performs the in-kernel reduction.
     """
     if total_valid_tiles >= 2 * num_CUs:
         return 2 * num_CUs
@@ -167,7 +650,7 @@ def _select_persistent_grid(total_valid_tiles: int, num_CUs: int) -> int:
     return total_valid_tiles
 
 
-def _select_k_splits(total_output_tiles, num_CUs, min_prefix_blocks=4):
+def _select_k_splits(total_output_tiles, num_CUs):
     """Choose SPLIT_K for prefix partitioning across CTAs.
 
     Goal: fill the GPU when there are fewer output tiles than CUs.
@@ -192,16 +675,6 @@ def _select_k_splits(total_output_tiles, num_CUs, min_prefix_blocks=4):
     return 8
 
 
-_splitk_dummy = None
-
-
-def _ensure_splitk_dummy(device):
-    global _splitk_dummy
-    if _splitk_dummy is None or _splitk_dummy.device != device:
-        _splitk_dummy = torch.empty(1, dtype=torch.float32, device=device)
-    return _splitk_dummy
-
-
 _splitk_ws_out = None
 _splitk_ws_lse = None
 _splitk_ws_done = None
@@ -210,6 +683,15 @@ _splitk_ws_done = None
 def _ensure_splitk_workspace(total_splits, total_output_tiles, BLOCK_M, BLOCK_DV, device):
     """Return (partial_out, partial_lse, tile_done) workspace tensors,
     re-using cached allocations when possible.
+
+    ``partial_out`` / ``partial_lse`` intentionally skip per-call
+    zero-init: each split-K CTA writes to its own slot with ``po_mask ==
+    r_m_mask``; the winner CTA reads with the same mask and supplies
+    ``other=0.0`` / ``other=-inf`` for masked-off lanes. Initial /
+    stale memory is therefore never observed, so zeroing these buffers
+    would add two GPU launches plus roughly 6-10us of CPU ATen overhead
+    per SPLIT_K>1 call. ``tile_done`` must still be zeroed because it is
+    the atomic counter that drives the winner selection.
     """
     global _splitk_ws_out, _splitk_ws_lse, _splitk_ws_done
     if (
@@ -237,36 +719,97 @@ def _ensure_splitk_workspace(total_splits, total_output_tiles, BLOCK_M, BLOCK_DV
         cap_td = max(total_output_tiles, 2048)
         _splitk_ws_done = torch.empty(cap_td, dtype=torch.int32, device=device)
         td = _splitk_ws_done[:total_output_tiles]
-    po.zero_()
-    pl.fill_(float("-inf"))
     td.zero_()
     return po, pl, td
 
 
-def _prepare_persistent_masks(
+def _prepare_wca_masks(
     q_extend, batch_size, custom_mask, mask_indptr, window_kv_offsets,
 ):
-    """Return ``(custom_mask, mask_indptr, window_kv_offsets, USE_CUSTOM_MASK)``
-    with every tensor materialized (dummy when absent). Shared by the BF16
-    and FP8 persistent launchers."""
-    USE_CUSTOM_MASK = custom_mask is not None
-    if not USE_CUSTOM_MASK:
-        custom_mask, mask_indptr, _wkvo = _ensure_dummy_mask_tensors(
-            q_extend.device, q_extend.shape[0], batch_size,
-        )
-        if window_kv_offsets is None:
-            window_kv_offsets = _wkvo
-    elif window_kv_offsets is None:
-        _, _, window_kv_offsets = _ensure_dummy_mask_tensors(
-            q_extend.device, q_extend.shape[0], batch_size,
-        )
-    return custom_mask, mask_indptr, window_kv_offsets, USE_CUSTOM_MASK
+    """Normalize optional mask args without placeholder allocations."""
+    use_custom_mask = custom_mask is not None
+    has_window_offsets = window_kv_offsets is not None
+    if not use_custom_mask:
+        custom_mask = 0
+        mask_indptr = 0
+    if not has_window_offsets:
+        window_kv_offsets = 0
+    return custom_mask, mask_indptr, window_kv_offsets, use_custom_mask, has_window_offsets
 
 
-def _finalize_persistent_grid(
+_FINALIZE_SKIP = (True,)
+
+
+class WcaGridConfig(NamedTuple):
+    skip: bool
+    total_output_tiles: int
+    total_valid_tiles: int
+    total_programs: int
+    split_k: int
+    grid: tuple[int]
+
+
+def _device_cache_index(device) -> int:
+    return device.index if hasattr(device, "index") and device.index is not None else 0
+
+
+@functools.lru_cache(maxsize=2048)
+def _get_wca_grid_config(
+    batch_size: int,
+    head_num: int,
+    total_extend_rows: int,
+    BLOCK_M: int,
+    BLOCK_N: int,
+    BLOCK_DV: int,
+    device_idx: int,
+    num_CUs: int,
+    total_prefix_len: int,
+    SPLIT_K: int,
+) -> WcaGridConfig:
+    """Cached scalar WCA grid policy.
+
+    Tensor workspaces are still allocated/sliced per call; this cache only
+    stores shape-derived integers that repeat across layers.
+
+    ``total_output_tiles`` is a compact upper bound for the WCA tile
+    count, computed from total extension rows plus one tail allowance per
+    sequence. It intentionally avoids the full rectangular
+    ``batch * ceil(max_ext / BLOCK_M)`` grid; any remaining overestimate
+    is rejected by ``_schedule_wca`` when its scan fails to find a real
+    sequence tile. ``total_valid_tiles`` is this bound multiplied by
+    ``split_k``. When callers pass ``SPLIT_K <= 1`` we may still promote
+    to split-K for long-prefix decode-like shapes that underfill the 256
+    CUs on MI350X.
+    """
+    total_output_tiles = (
+        (total_extend_rows + batch_size * (BLOCK_M - 1)) // BLOCK_M
+    ) * head_num
+    if total_output_tiles == 0:
+        return WcaGridConfig(True, 0, 0, 0, 1, (0,))
+
+    split_k = max(1, int(SPLIT_K))
+    if split_k <= 1:
+        split_k = 1
+        if total_output_tiles < num_CUs:
+            avg_kv_len = total_prefix_len // max(1, batch_size)
+            if avg_kv_len >= 4 * BLOCK_N:
+                split_k = _select_k_splits(total_output_tiles, num_CUs)
+
+    total_valid_tiles = total_output_tiles * split_k
+    total_programs = _select_wca_grid(total_valid_tiles, num_CUs)
+    return WcaGridConfig(
+        False,
+        total_output_tiles,
+        total_valid_tiles,
+        total_programs,
+        split_k,
+        (total_programs,),
+    )
+
+
+def _finalize_wca_grid(
     *,
     q_extend,
-    kv_indptr,
     batch_size,
     head_num,
     BLOCK_M,
@@ -276,61 +819,517 @@ def _finalize_persistent_grid(
     total_prefix_len,
     SPLIT_K,
 ):
-    """Shared persistent-grid finalization: compute the tight tile count,
-    decide split-K, allocate (or re-use) the workspace, and return the
-    kernel-invocation kwargs shared by BF16 and FP8 launchers.
+    """Shared WCA-grid finalization: compute the tight tile count,
+    decide split-K, allocate (or re-use) the workspace.
 
-    Returns ``dict`` with keys:
-        total_valid_tiles, total_output_tiles, total_programs,
-        partial_out, partial_lse, tile_done, SPLIT_K, grid, skip.
-    ``skip=True`` signals the launcher to return immediately (empty work).
+    Returns a positional tuple::
+        (skip, total_valid_tiles, total_programs,
+         partial_out, partial_lse, tile_done, SPLIT_K, grid)
+
+    The skip=True branch returns the cached ``_FINALIZE_SKIP``
+    singleton ``(True,)`` so the caller's unpack works.
     """
     total_extend_rows = q_extend.shape[0]
-    total_output_tiles = (
-        (total_extend_rows + batch_size * (BLOCK_M - 1)) // BLOCK_M
-    ) * head_num
-    if total_output_tiles == 0:
-        return {"skip": True}
-
     num_CUs = _get_num_CUs(device)
+    prefix_len = 0 if total_prefix_len is None else int(total_prefix_len)
+    grid_cfg = _get_wca_grid_config(
+        batch_size,
+        head_num,
+        total_extend_rows,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_DV,
+        _device_cache_index(device),
+        num_CUs,
+        prefix_len,
+        SPLIT_K,
+    )
+    if grid_cfg.skip:
+        return _FINALIZE_SKIP
 
-    if SPLIT_K <= 1:
-        SPLIT_K = 1
-        if total_output_tiles < num_CUs:
-            if total_prefix_len is not None:
-                avg_kv_len = total_prefix_len // max(1, batch_size)
-            else:
-                avg_kv_len = int((kv_indptr[-1] - kv_indptr[0]).item()) // max(1, batch_size)
-            if avg_kv_len >= 4 * BLOCK_N:
-                SPLIT_K = _select_k_splits(total_output_tiles, num_CUs)
-
-    if SPLIT_K > 1:
-        total_splits = total_output_tiles * SPLIT_K
+    if grid_cfg.split_k > 1:
+        total_splits = grid_cfg.total_valid_tiles
         partial_out, partial_lse, tile_done = _ensure_splitk_workspace(
-            total_splits, total_output_tiles, BLOCK_M, BLOCK_DV, device,
+            total_splits, grid_cfg.total_output_tiles, BLOCK_M, BLOCK_DV, device,
         )
-        total_valid_tiles = total_splits
     else:
-        partial_out = _ensure_splitk_dummy(device)
-        partial_lse = _ensure_splitk_dummy(device)
-        tile_done = _ensure_splitk_dummy(device)
-        total_valid_tiles = total_output_tiles
+        partial_out = partial_lse = tile_done = 0
+    return (
+        False,
+        grid_cfg.total_valid_tiles,
+        grid_cfg.total_programs,
+        partial_out,
+        partial_lse,
+        tile_done,
+        grid_cfg.split_k,
+        grid_cfg.grid,
+    )
 
-    total_programs = _select_persistent_grid(total_valid_tiles, num_CUs)
-    return {
-        "skip": False,
-        "total_valid_tiles": total_valid_tiles,
-        "total_output_tiles": total_output_tiles,
-        "total_programs": total_programs,
-        "partial_out": partial_out,
-        "partial_lse": partial_lse,
-        "tile_done": tile_done,
-        "SPLIT_K": SPLIT_K,
-        "grid": (total_programs,),
-    }
+# ===-----------------------------------------------------------------------===#
+# Data-centric path heuristic configs
+# ===-----------------------------------------------------------------------===#
 
 
-def _launch_persistent(
+class PrefixBucket(IntEnum):
+    """Average prefix length bucket used by sync-free route heuristics."""
+
+    NONE = 0       # no prefix / prefill from scratch
+    TINY = 1       # avg < 512
+    MODERATE = 2   # avg < 2048
+    LARGE = 3      # avg < 8192
+    HUGE = 4       # avg >= 8192
+
+
+class HeuristicConfig(NamedTuple):
+    """Kernel tile config selected before launch.
+
+    ``pad_k`` / ``pad_v`` are currently only non-default for D=256 layouts;
+    ``ext_*`` may differ from the prefix values on FP8 paths.
+    """
+
+    block_m: int
+    block_n: int
+    num_warps: int
+    num_stages: int
+    pad_k: int = 16
+    pad_v: int = 16
+    ext_block_n: int | None = None
+    ext_num_stages: int | None = None
+
+    def with_default_extend(self):
+        return self._replace(
+            ext_block_n=self.block_n if self.ext_block_n is None else self.ext_block_n,
+            ext_num_stages=(
+                self.num_stages if self.ext_num_stages is None else self.ext_num_stages
+            ),
+        )
+
+
+# FP8 dispatch defaults for the rare D not in {64, 128} fallthrough. The
+# main D=64 / D=128 FP8 paths have these baked in explicitly.
+_FP8_DEFAULT_BN = 128
+_FP8_DEFAULT_NS = 2
+_FP8_DEFAULT_EXT_BN = 64
+_FP8_DEFAULT_EXT_NS = 3
+
+
+def _pfx_bucket(total_prefix_len, batch_size) -> PrefixBucket:
+    """Bucket average per-sequence prefix length for dispatch."""
+    if total_prefix_len is None or total_prefix_len <= 0 or batch_size <= 0:
+        return PrefixBucket.NONE
+    avg = total_prefix_len // batch_size
+    if avg < 512:
+        return PrefixBucket.TINY
+    if avg < 2048:
+        return PrefixBucket.MODERATE
+    if avg < 8192:
+        return PrefixBucket.LARGE
+    return PrefixBucket.HUGE
+
+
+def _prefix_proxy_from_bucket(prefix_bucket: PrefixBucket) -> int:
+    """Representative avg-prefix proxy for sync-free cached config keys."""
+    if prefix_bucket <= PrefixBucket.TINY:
+        return 0
+    if prefix_bucket == PrefixBucket.MODERATE:
+        return 1024
+    if prefix_bucket == PrefixBucket.LARGE:
+        return 2048
+    return 8192
+
+
+def _select_d256_heuristic_config(
+    batch_size: int,
+    max_len_extend: int,
+    min_len_extend: int | None,
+    total_prefix_len: int | None,
+    total_extend_len: int | None,
+    prefix_bucket: PrefixBucket = PrefixBucket.NONE,
+) -> HeuristicConfig:
+    """D=256 BF16 launch policy (Gemma-class models).
+
+    Returns a full ``HeuristicConfig``. D=256 BF16 uses ``BN=32``; the
+    tuple also carries ``pad_k``/``pad_v`` because those layout pads differ
+    from the D64/D128 default wiring. NS=1 is never emitted because the
+    prefix-pipelined kernel asserts NS>=2 for determinism.
+    """
+    min_ext = max_len_extend if min_len_extend is None else min_len_extend
+    total_ext = (
+        batch_size * max_len_extend if total_extend_len is None else total_extend_len
+    )
+
+    # Without exact totals, fall back to the bucket proxy so the tree doesn't
+    # treat every shape as no-prefix and mis-route decode batches to the
+    # extend-dominated config.
+    if total_prefix_len is not None and total_prefix_len > 0:
+        avg_pfx = total_prefix_len // max(1, batch_size)
+        total_tokens = max(1, total_prefix_len + total_ext)
+        prefix_frac = total_prefix_len / total_tokens
+    else:
+        avg_pfx = _prefix_proxy_from_bucket(prefix_bucket)
+        total_est = max(1, avg_pfx + max_len_extend)
+        prefix_frac = avg_pfx / total_est
+    ext_ratio = max_len_extend / max(1, min_ext)
+
+    def cfg(block_m: int, num_warps: int, num_stages: int) -> HeuristicConfig:
+        return HeuristicConfig(
+            block_m, 32, num_warps, num_stages, 16, 16, 32, num_stages
+        )
+
+    if batch_size >= 4 and max_len_extend >= 256:
+        return cfg(128, 8, 2)
+    if batch_size == 1 and max_len_extend >= 2048:
+        return cfg(128, 8, 2)
+
+    if max_len_extend >= 768:
+        if batch_size <= 2:
+            return cfg(64, 4, 2)
+        return cfg(128, 8, 3)
+
+    # Extend-dominated (prefix_frac small): BM=128 only earns its keep at
+    # B>=3 with at least one BM row of per-seq work; small-ext decode batches
+    # stay on BM=64 to keep pad ratio under control.
+    if prefix_frac <= 0.55:
+        if batch_size <= 2 or max_len_extend <= 64:
+            return cfg(64, 4, 2)
+        return cfg(128, 8, 3)
+
+    if batch_size <= 4:
+        if max_len_extend <= 128 and avg_pfx >= 2048:
+            return cfg(64, 4, 4)
+        return cfg(64, 4, 2)
+
+    if batch_size >= 8 and max_len_extend >= 128 and avg_pfx >= 2048:
+        return cfg(128, 8, 3)
+
+    if max_len_extend <= 64 and avg_pfx >= 2048:
+        return cfg(64, 4, 2)
+
+    if ext_ratio <= 2.5:
+        return cfg(64, 4, 2)
+
+    return cfg(64, 8, 4)
+
+
+def _select_d64_bf16_data_centric_config(
+    batch_size, max_len_extend, pfx_bucket, head_num,
+):
+    """Pick the normal D=64 BF16 data-centric config before refinements."""
+    total_ext = batch_size * max_len_extend
+    if batch_size >= 8 and max_len_extend <= 128 and pfx_bucket >= PrefixBucket.MODERATE:
+        return HeuristicConfig(128, 128, 4, 4).with_default_extend()
+    if batch_size >= 16 and max_len_extend <= 32:
+        return HeuristicConfig(64, 64, 4, 4).with_default_extend()
+    if batch_size >= 16:
+        if max_len_extend >= 512:
+            return HeuristicConfig(256, 64, 8, 2).with_default_extend()
+        return HeuristicConfig(64, 64, 4, 4).with_default_extend()
+    if batch_size >= 4:
+        if total_ext >= 2048 or max_len_extend >= 512:
+            return HeuristicConfig(256, 64, 8, 2).with_default_extend()
+        if batch_size <= 7:
+            return HeuristicConfig(128, 64, 8, 4).with_default_extend()
+        return HeuristicConfig(64, 64, 4, 4).with_default_extend()
+
+    # B<=3: the BM crossover depends on H_q because lower H already
+    # under-subscribes the wave grid.
+    h = head_num or 0
+    if batch_size == 1 and h >= 64 and max_len_extend >= 1600:
+        return HeuristicConfig(256, 64, 8, 2).with_default_extend()
+    if batch_size == 1 and h == 32 and max_len_extend >= 1500:
+        return HeuristicConfig(256, 64, 8, 2).with_default_extend()
+    if max_len_extend >= 2048:
+        return HeuristicConfig(256, 64, 8, 2).with_default_extend()
+    return HeuristicConfig(128, 64, 8, 4).with_default_extend()
+
+
+def _select_d128_bf16_data_centric_config(
+    batch_size, max_len_extend, pfx_bucket, head_num,
+):
+    """Pick the normal D=128 BF16 data-centric config before refinements."""
+    total_ext = batch_size * max_len_extend
+    if batch_size >= 16 and max_len_extend <= 16:
+        return HeuristicConfig(16, 64, 4, 2).with_default_extend()
+    if batch_size >= 16 and max_len_extend <= 64:
+        return HeuristicConfig(64, 64, 4, 2).with_default_extend()
+    if pfx_bucket >= PrefixBucket.LARGE and max_len_extend >= 4096:
+        return HeuristicConfig(128, 64, 8, 2).with_default_extend()
+    if pfx_bucket >= PrefixBucket.MODERATE and max_len_extend >= 2048:
+        return HeuristicConfig(128, 64, 8, 2).with_default_extend()
+    if batch_size == 1:
+        h = head_num or 0
+        if h >= 64 and max_len_extend >= 2000:
+            return HeuristicConfig(128, 64, 8, 2).with_default_extend()
+        if h >= 64 and max_len_extend >= 1024:
+            return HeuristicConfig(128, 64, 8, 4).with_default_extend()
+        return HeuristicConfig(64, 64, 4, 2).with_default_extend()
+    if batch_size <= 4:
+        return HeuristicConfig(64, 64, 4, 2).with_default_extend()
+    if total_ext >= 32768:
+        return HeuristicConfig(128, 64, 8, 2).with_default_extend()
+    return HeuristicConfig(64, 64, 4, 2).with_default_extend()
+
+
+def _select_bf16_data_centric_base_config(
+    Lq,
+    batch_size,
+    max_len_extend,
+    prefix_bucket,
+    head_num,
+    *,
+    min_len_extend=None,
+    total_prefix_len=None,
+    total_extend_len=None,
+) -> HeuristicConfig:
+    """Single BF16 data-centric base selector for fast and full paths."""
+    if Lq == 256:
+        return _select_d256_heuristic_config(
+            batch_size, max_len_extend, min_len_extend,
+            total_prefix_len, total_extend_len, prefix_bucket,
+        )
+    if Lq == 64:
+        return _select_d64_bf16_data_centric_config(
+            batch_size, max_len_extend, prefix_bucket, head_num,
+        )
+    return _select_d128_bf16_data_centric_config(
+        batch_size, max_len_extend, prefix_bucket, head_num,
+    )
+
+
+def _apply_data_centric_policy_refinements(
+    cfg: HeuristicConfig,
+    Lq,
+    batch_size,
+    max_len_extend,
+    prefix_bucket,
+    is_fp8,
+    sliding_window_size,
+) -> HeuristicConfig:
+    """Ordered refinement pipeline for data-centric launch configs.
+
+    Order matters: start from the normal BF16 base policy, then apply targeted
+    D64 BF16, FP8, SWA, and correctness refinements.
+    """
+    if (
+        not is_fp8
+        and Lq == 64
+        and sliding_window_size <= 0
+        and batch_size >= 16
+        and max_len_extend == 256
+    ):
+        # Large-B uniform full-attn at ext==256: lift BM so the grid fully
+        # covers the available CUs.
+        cfg = HeuristicConfig(256, 64, 8, 2).with_default_extend()
+
+    if is_fp8:
+        if Lq == 128:
+            cfg = HeuristicConfig(128, 128, 8, 2, 16, 16, 128, 2)
+            if batch_size == 1 and max_len_extend <= 256:
+                cfg = cfg._replace(block_m=64)
+            elif batch_size >= 32 and max_len_extend <= 8 and prefix_bucket <= PrefixBucket.MODERATE:
+                # Spec-verify / draft-extend continuous batches: BM=64 NW=4
+                # avoids pad-heavy Q tiles.
+                cfg = cfg._replace(block_m=64, num_warps=4)
+            elif batch_size >= 16 and max_len_extend <= 64:
+                # Decode-continuation: max_ext < BM leaves Q tiles mostly
+                # padding at BM=128. Drop to the serial kernel.
+                cfg = cfg._replace(block_m=64, num_warps=4, num_stages=1, ext_num_stages=1)
+            elif batch_size >= 8 and max_len_extend <= 64 and prefix_bucket >= PrefixBucket.LARGE:
+                # Long prefix at moderate batch: keep NS=2 to pipeline the
+                # prefix phase, but above B=15 the DMA cost outpaces per-tile
+                # work so go fully serial.
+                cfg = cfg._replace(block_m=64, num_warps=4)
+                if batch_size > 15:
+                    cfg = cfg._replace(num_stages=1, ext_num_stages=1)
+        elif Lq == 64:
+            cfg = HeuristicConfig(128, 128, 4, 1, 16, 16, 128, 1)
+            # NS stays at 1: the D=64 FP8 data-centric body is NW=4 only and
+            # the kernel asserts NS=1 for BLOCK_DMODEL<128. Drop BM on
+            # pad-heavy tiles.
+            if (
+                max_len_extend <= 8
+                or (batch_size >= 16 and max_len_extend <= 128)
+                or (
+                    batch_size >= 8
+                    and max_len_extend <= 64
+                    and prefix_bucket >= PrefixBucket.LARGE
+                )
+            ):
+                cfg = cfg._replace(block_m=64)
+        else:
+            # Lq not in {64, 128} is filtered upstream for FP8; this fallback
+            # only fires if an internal caller bypasses the public guards.
+            cfg = cfg._replace(
+                block_n=32 if Lq >= 256 else _FP8_DEFAULT_BN,
+                num_warps=min(cfg.num_warps, 4) if Lq < 128 else cfg.num_warps,
+                num_stages=_FP8_DEFAULT_NS,
+                ext_block_n=_FP8_DEFAULT_EXT_BN,
+                ext_num_stages=_FP8_DEFAULT_EXT_NS,
+            )
+
+    if (
+        not is_fp8
+        and Lq == 64
+        and sliding_window_size > 0
+        and sliding_window_size < max_len_extend
+    ):
+        # The per-tile key band is ~(BM + sw) wide regardless of tile count,
+        # so the BM=256 plain-causal winner over-fetches under SWA.
+        total_ext = batch_size * max_len_extend
+        if max_len_extend >= 1024 and total_ext >= 2048:
+            cfg = HeuristicConfig(64, 64, 2, 2).with_default_extend()
+        elif max_len_extend > 16 * sliding_window_size:
+            cfg = cfg._replace(
+                block_m=min(cfg.block_m, 128),
+                num_warps=4,
+                num_stages=2,
+                ext_num_stages=2,
+            )
+        elif cfg.block_m > 128:
+            cfg = cfg._replace(block_m=128, num_stages=4, ext_num_stages=4)
+
+    block_dmodel = _resolve_qk_split_dims(Lq)
+    # Routing invariant: the 4w sw-pipeline kernel asserts D>=128. D<128
+    # NW<=4 must emit NS=1 so the serial kernel takes the launch instead.
+    if cfg.num_warps <= 4 and block_dmodel < 128:
+        cfg = cfg._replace(num_stages=1, ext_num_stages=1)
+
+    # Correctness clamps shared by fastpath and full-dispatch data-centric:
+    #  * D=64 NW=8 BM=256 is nondeterministic at NS!=2.
+    #  * D>=256 NW=8 NS=1 races on the DMA ring.
+    if (
+        block_dmodel == 64
+        and cfg.num_warps == 8
+        and cfg.block_m == 256
+        and cfg.num_stages != 2
+    ):
+        cfg = cfg._replace(num_stages=2, ext_num_stages=2)
+    if block_dmodel >= 256 and cfg.num_warps == 8 and cfg.num_stages == 1:
+        cfg = cfg._replace(num_stages=2, ext_num_stages=2)
+
+    return cfg.with_default_extend()
+
+
+def _select_data_centric_heuristic_config(
+    Lq,
+    batch_size,
+    max_len_extend,
+    prefix_bucket,
+    is_fp8,
+    sliding_window_size=-1,
+    head_num=None,
+    *,
+    min_len_extend=None,
+    total_prefix_len=None,
+    total_extend_len=None,
+) -> HeuristicConfig:
+    """Select the data-centric tile policy for both fast and full paths.
+
+    The normal BF16 base policy is shared. FP8, SWA, and correctness-specific
+    refinements are applied afterward so the route stays easy to audit.
+    """
+    cfg = _select_bf16_data_centric_base_config(
+        Lq,
+        batch_size,
+        max_len_extend,
+        PrefixBucket(prefix_bucket),
+        head_num,
+        min_len_extend=min_len_extend,
+        total_prefix_len=total_prefix_len,
+        total_extend_len=total_extend_len,
+    )
+    return _apply_data_centric_policy_refinements(
+        cfg,
+        Lq,
+        batch_size,
+        max_len_extend,
+        PrefixBucket(prefix_bucket),
+        is_fp8,
+        sliding_window_size,
+    )
+
+
+@functools.lru_cache(maxsize=2048)
+def _get_data_centric_heuristic_config(
+    Lq, batch_size, max_len_extend, pfx_bucket, is_fp8, sliding_window_size=-1,
+    head_num=None,
+):
+    """Cached sync-free data-centric heuristic config.
+
+    The cache key remains the serving-safe tuple available without a GPU sync:
+    ``(Lq, batch_size, max_len_extend, pfx_bucket, is_fp8,
+    sliding_window_size, head_num)``. Full dispatch can call
+    ``_select_data_centric_heuristic_config`` directly with exact length hints.
+    On cache hits, Python returns the stored ``HeuristicConfig`` before this
+    function body runs, so the selector tree is skipped entirely.
+    """
+    return _select_data_centric_heuristic_config(
+        Lq,
+        batch_size,
+        max_len_extend,
+        PrefixBucket(pfx_bucket),
+        is_fp8,
+        sliding_window_size=sliding_window_size,
+        head_num=head_num,
+        min_len_extend=max_len_extend,
+        total_prefix_len=None,
+        total_extend_len=batch_size * max_len_extend,
+    )
+
+@functools.lru_cache(maxsize=2048)
+def _get_exact_data_centric_heuristic_config(
+    Lq,
+    batch_size,
+    max_len_extend,
+    min_len_extend,
+    total_prefix_len,
+    total_extend_len,
+    pfx_bucket,
+    is_fp8,
+    sliding_window_size=-1,
+    head_num=None,
+    use_custom_mask=False,
+):
+    """Cached exact-hint data-centric config for full/custom-mask dispatch.
+
+    These LRU caches store only Python scalar launch decisions. They never own
+    tensor memory and are safe to reuse across layers because all dynamic data
+    still flows through the real kernel arguments.
+
+    ``use_custom_mask`` is currently a future-proof key bit: the tile selector
+    does not inspect mask data, but mask-aware policies can diverge later
+    without invalidating older cache entries.
+    """
+    return _select_data_centric_heuristic_config(
+        Lq,
+        batch_size,
+        max_len_extend,
+        PrefixBucket(pfx_bucket),
+        is_fp8,
+        sliding_window_size=sliding_window_size,
+        head_num=head_num,
+        min_len_extend=min_len_extend,
+        total_prefix_len=total_prefix_len,
+        total_extend_len=total_extend_len,
+    )
+
+
+# ===-----------------------------------------------------------------------===#
+# Unified launch helpers
+# ===-----------------------------------------------------------------------===#
+
+
+def _is_serial_schedule(num_stages, num_warps, block_dmodel, kv_is_fp8):
+    """Host-side predicate for the NS=1 serial kernel wrapper."""
+    return (
+        num_stages == 1
+        and num_warps in (2, 4)
+        and block_dmodel in (64, 128, 256)
+        and not (kv_is_fp8 and block_dmodel == 256)
+    )
+
+
+def _launch_attention_grid(
     q_extend,
     k_extend,
     v_extend,
@@ -340,190 +1339,414 @@ def _launch_persistent(
     qo_indptr,
     kv_indptr,
     kv_indices,
-    custom_mask,
-    is_causal,
+    mask,
     mask_indptr,
+    window_kv_offsets,
+    *,
+    use_custom_mask,
+    is_causal,
     max_len_extend,
-    k_scale=1.0,
-    v_scale=1.0,
-    sm_scale=None,
-    logit_cap=0.0,
-    sliding_window_size=-1,
-    sinks=None,
-    window_kv_offsets=None,
-    xai_temperature_len=-1,
+    k_scale,
+    v_scale,
+    sm_scale,
+    logit_cap,
+    sliding_window_size,
+    sinks,
+    xai_temperature_len,
+    Lq,
+    head_num,
+    batch_size,
+    kv_is_fp8,
+    has_window_offsets,
+    grid,
+    block_m,
+    block_n,
+    block_dmodel,
+    num_stages,
+    num_warps,
+    ext_block_n=None,
+    ext_num_stages=None,
     enable_prefix_unmasked=True,
-    min_len_extend=None,
-    total_prefix_len=None,
+    is_wca=False,
+    split_k=1,
+    total_valid_tiles=0,
+    total_programs=0,
+    partial_out=0,
+    partial_lse=0,
+    tile_done=0,
+    actual_batch_size=0,
+    total_prefix_len_hint=None,
+    total_extend_len_hint=None,
+    min_len_extend_hint=None,
 ):
-    Lq = q_extend.shape[-1]
-    BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
+    """Single host-side launch body for all extend-attention grids.
 
-    batch_size = qo_indptr.shape[0] - 1
-    custom_mask, mask_indptr, window_kv_offsets, USE_CUSTOM_MASK = (
-        _prepare_persistent_masks(
-            q_extend, batch_size, custom_mask, mask_indptr, window_kv_offsets,
-        )
+    Route helpers above this function decide *what* to run: serial vs 4w/8w,
+    WCA vs data-centric, split-K workspace, FP8 extend block shape. This body
+    owns the shared mechanics: stride extraction, schedule-wrapper selection,
+    XCD metadata, and the explicit ``kernel[grid](...)`` call.
+    """
+    sm_scale_local = (sm_scale if sm_scale is not None else Lq**-0.5) * k_scale
+    kv_group_num = head_num // k_extend.shape[1]
+    use_serial_kernel = _is_serial_schedule(
+        num_stages, num_warps, block_dmodel, kv_is_fp8,
     )
-    assert q_extend.shape[1] % k_extend.shape[1] == 0
-
-    BLOCK_N = 32 if BLOCK_DMODEL >= 256 else 64
-
-    if min_len_extend is None:
-        # Conservative fallback; the GPU-computed min would cost ~6ms of
-        # CPU sync on heterogeneous batches. Tile selection below only
-        # uses min_len_extend to shrink BM on skewed batches, so max is
-        # safe and slightly pessimistic.
-        min_len_extend = max_len_extend
-    head_num = q_extend.shape[1]
-
-    # Tile-config auto-select. Two regimes on top of the D>=256 and
-    # default BM=128 NW=8 paths:
-    #   * small-tile (BM=64 NW=4 NS=2): per-seq work is small or the
-    #     batch is ragged enough that BM=128 wastes compute on masked
-    #     tokens, OR Lq=128 ext-dominated chat-mix. Exception: big-B chat
-    #     with a substantial prefix -- each tile iterates the full
-    #     per-seq prefix regardless of BM, so larger BM amortizes the
-    #     scan over more query rows.
-    _het_ratio = max_len_extend / max(min_len_extend, 1)
-    _total_pfx_est = (
-        total_prefix_len if total_prefix_len is not None
-        else kv_indices.numel()
-    )
-    _total_ext = q_extend.shape[0]
-    _avg_ext = _total_ext / max(1, batch_size)
-    _pfx_dominated_big_b = (
-        batch_size >= 8
-        and _total_pfx_est >= batch_size * 1024
-        and 32 <= max_len_extend <= 512
-    )
-    _lq128_ext_dominated = (
-        Lq == 128 and _total_pfx_est < 4 * _total_ext
-    )
-    _use_small_tile = (
-        not _pfx_dominated_big_b
-        and (
-            max_len_extend <= 128
-            or (max_len_extend <= 256 and _het_ratio >= 2.0)
-            or (min_len_extend < 64 and max_len_extend <= 512 and batch_size <= 4)
-            or _lq128_ext_dominated
-        )
-    )
-
-    if BLOCK_DMODEL >= 256:
-        BLOCK_M = 64
-        num_warps = 4
-    elif _use_small_tile:
-        BLOCK_M = 64
-        num_warps = 4
-    elif batch_size <= 4:
-        BLOCK_M = 128
-        num_warps = 8
-    else:
-        # BM=256 hits an LLVM iota_range assertion in the persistent kernel
-        # on some shapes; BM=128 is the largest safe M-tile (and matches
-        # what CK picks on these shapes).
-        BLOCK_M = 128
-        num_warps = 8
-
-    if BLOCK_DMODEL >= 256:
-        NUM_STAGES = 1
-    elif BLOCK_M == 64 and num_warps == 4:
-        NUM_STAGES = 2
-    elif BLOCK_M == 64:
-        NUM_STAGES = 1
-    else:
-        NUM_STAGES = 4
-
-    if BLOCK_M == 128 and num_warps == 8 and NUM_STAGES == 2:
-        NUM_STAGES = 3
-
-    sm_scale = sm_scale or 1.0 / math.sqrt(Lq)
-    sm_scale = sm_scale * k_scale
-    kv_group_num = q_extend.shape[1] // k_extend.shape[1]
-
-    device = q_extend.device
-    # BF16 cheap degenerate guard: if ``max_len_extend`` is 0 the tight
-    # tile bound below over-provisions one tile per head anyway; catch
-    # that case with the loose upper bound so we don't launch a no-op
-    # grid on totally empty inputs.
-    if batch_size * head_num * ((max_len_extend + BLOCK_M - 1) // BLOCK_M) == 0:
-        return
-
-    _gfinal = _finalize_persistent_grid(
-        q_extend=q_extend,
-        kv_indptr=kv_indptr,
-        batch_size=batch_size,
+    xcd_config = _select_xcd_remap_config(
+        is_wca=is_wca,
+        is_serial=use_serial_kernel,
+        split_k=split_k,
+        total_valid_tiles=total_valid_tiles,
+        block_dmodel=block_dmodel,
+        kv_is_fp8=kv_is_fp8,
         head_num=head_num,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_DV=BLOCK_DMODEL,
-        device=device,
-        total_prefix_len=total_prefix_len,
-        SPLIT_K=1,
+        batch_size=batch_size,
+        total_extend_rows=q_extend.shape[0],
+        sliding_window_size=sliding_window_size,
+        logit_cap=logit_cap,
     )
-    if _gfinal["skip"]:
+
+    q_s0, q_s1 = q_extend.stride(0), q_extend.stride(1)
+    k_s0, k_s1 = k_extend.stride(0), k_extend.stride(1)
+    v_s0, v_s1 = v_extend.stride(0), v_extend.stride(1)
+    o_s0, o_s1 = o_extend.stride(0), o_extend.stride(1)
+    kb_s0, kb_s1 = k_buffer.stride(0), k_buffer.stride(1)
+    vb_s0, vb_s1 = v_buffer.stride(0), v_buffer.stride(1)
+
+    if use_serial_kernel:
+        serial_extra = {"IS_FP8": True} if kv_is_fp8 else {}
+        gluon_extend_attn_serial_fwd[grid](
+            q_extend, k_extend, v_extend, o_extend,
+            k_buffer, v_buffer,
+            qo_indptr, kv_indptr, kv_indices,
+            mask, mask_indptr, window_kv_offsets,
+            sinks,
+            sm_scale_local,
+            kv_group_num,
+            q_s0, q_s1,
+            k_s0, k_s1,
+            v_s0, v_s1,
+            o_s0, o_s1,
+            kb_s0, kb_s1,
+            vb_s0, vb_s1,
+            IS_CAUSAL=is_causal,
+            USE_CUSTOM_MASK=use_custom_mask,
+            BLOCK_M=block_m,
+            BLOCK_N=block_n,
+            BLOCK_DMODEL=block_dmodel,
+            Sinks_present=sinks is not None,
+            LOGIT_CAP=logit_cap,
+            XAI_TEMPERATURE_LEN=xai_temperature_len,
+            SLIDING_WINDOW_SIZE=sliding_window_size,
+            HAS_WINDOW_OFFSETS=has_window_offsets,
+            v_scale=v_scale,
+            **serial_extra,
+            num_warps=num_warps,
+            num_stages=1,
+            waves_per_eu=2,
+            matrix_instr_nonkdim=32,
+        )
         return
 
-    total_valid_tiles = _gfinal["total_valid_tiles"]
-    total_programs = _gfinal["total_programs"]
-    partial_out = _gfinal["partial_out"]
-    partial_lse = _gfinal["partial_lse"]
-    tile_done = _gfinal["tile_done"]
-    SPLIT_K = _gfinal["SPLIT_K"]
-    grid = _gfinal["grid"]
+    schedule_kernel = gluon_extend_attn_fwd_8w if num_warps >= 8 else gluon_extend_attn_fwd_4w
+    kernel_extra = {}
+    if kv_is_fp8:
+        kernel_extra["IS_FP8"] = True
+        kernel_extra["EXT_BLOCK_N"] = ext_block_n if ext_block_n is not None else block_n
+        kernel_extra["EXT_NUM_STAGES"] = ext_num_stages if ext_num_stages is not None else num_stages
 
-    _enable_prefix_unmasked = enable_prefix_unmasked
-    _has_sink = sinks is not None
-    _v_scale_final = 1.0 if SPLIT_K > 1 else v_scale
-
-    _kernel[grid](
-        q_extend,
-        k_extend,
-        v_extend,
-        o_extend,
-        k_buffer,
-        v_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        custom_mask,
-        mask_indptr,
-        window_kv_offsets,
-        sm_scale,
+    schedule_kernel[grid](
+        q_extend, k_extend, v_extend, o_extend,
+        k_buffer, v_buffer,
+        qo_indptr, kv_indptr, kv_indices,
+        mask, mask_indptr, window_kv_offsets,
+        sm_scale_local,
         kv_group_num,
-        q_extend.stride(0), q_extend.stride(1),
-        k_extend.stride(0), k_extend.stride(1),
-        v_extend.stride(0), v_extend.stride(1),
-        o_extend.stride(0), o_extend.stride(1),
-        k_buffer.stride(0), k_buffer.stride(1),
-        v_buffer.stride(0), v_buffer.stride(1),
+        q_s0, q_s1,
+        k_s0, k_s1,
+        v_s0, v_s1,
+        o_s0, o_s1,
+        kb_s0, kb_s1,
+        vb_s0, vb_s1,
         IS_CAUSAL=is_causal,
-        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        ENABLE_PREFIX_UNMASKED=_enable_prefix_unmasked,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        NUM_STAGES=NUM_STAGES,
+        USE_CUSTOM_MASK=use_custom_mask,
+        ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        BLOCK_DMODEL=block_dmodel,
+        NUM_STAGES=num_stages,
+        **kernel_extra,
         Sinks=sinks,
-        HAS_SINK=_has_sink,
+        HAS_SINK=sinks is not None,
         LOGIT_CAP=logit_cap,
         XAI_TEMPERATURE_LEN=xai_temperature_len,
         SLIDING_WINDOW_SIZE=sliding_window_size,
-        v_scale=_v_scale_final,
+        HAS_WINDOW_OFFSETS=has_window_offsets,
+        v_scale=1.0 if split_k > 1 else v_scale,
         num_heads=head_num,
         total_valid_tiles=total_valid_tiles,
         total_programs=total_programs,
         partial_out=partial_out,
         partial_lse=partial_lse,
         tile_done=tile_done,
-        actual_batch_size=batch_size,
-        IS_PERSISTENT=True,
-        SPLIT_K=SPLIT_K,
+        actual_batch_size=actual_batch_size,
+        IS_WCA=is_wca,
+        SPLIT_K=split_k,
+        XCD_REMAP=xcd_config.enabled,
+        NUM_XCDS=xcd_config.num_xcds,
+        XCD_CHUNK=xcd_config.chunk,
+        XCD_MODE=int(xcd_config.mode),
         num_warps=num_warps,
         num_stages=1,
         waves_per_eu=2,
         matrix_instr_nonkdim=32,
+    )
+
+
+def _select_wca_heuristic_config(
+    *,
+    Lq,
+    block_dmodel,
+    batch_size,
+    max_len_extend,
+    min_len_extend,
+    total_prefix_len,
+    total_extend_rows,
+    kv_is_fp8,
+    split_k,
+    forced_config=None,
+) -> HeuristicConfig:
+    """Pick the WCA/split-K tile config before workspace finalization."""
+    if forced_config is not None:
+        return forced_config.with_default_extend()
+
+    if kv_is_fp8:
+        block_n = 128 if Lq == 128 else (32 if block_dmodel >= 256 else 64)
+        if split_k > 1:
+            return HeuristicConfig(
+                128, block_n, 8, _FP8_DEFAULT_NS,
+                16, 16, _FP8_DEFAULT_EXT_BN, _FP8_DEFAULT_EXT_NS,
+            )
+        if block_dmodel >= 256:
+            block_m, num_warps = 64, 4
+        elif max_len_extend <= 128:
+            block_m, num_warps = 128, 8
+        elif batch_size <= 4:
+            block_m, num_warps = 128, 8
+        elif min_len_extend >= 64 and max_len_extend >= 256:
+            block_m, num_warps = 256, 8
+        else:
+            block_m, num_warps = 128, 8
+        return HeuristicConfig(
+            block_m, block_n, num_warps, _FP8_DEFAULT_NS,
+            16, 16, _FP8_DEFAULT_EXT_BN, _FP8_DEFAULT_EXT_NS,
+        )
+
+    block_n = 32 if block_dmodel >= 256 else 64
+    total_pfx_est = max(0, int(total_prefix_len or 0))
+    het_ratio = max_len_extend / max(min_len_extend, 1)
+    pfx_dominated_big_b = (
+        batch_size >= 8
+        and total_pfx_est >= batch_size * 1024
+        and 32 <= max_len_extend <= 512
+    )
+    lq128_ext_dominated = Lq == 128 and total_pfx_est < 4 * total_extend_rows
+    use_small_tile = (
+        not pfx_dominated_big_b
+        and (
+            max_len_extend <= 128
+            or (max_len_extend <= 256 and het_ratio >= 2.0)
+            or (min_len_extend < 64 and max_len_extend <= 512 and batch_size <= 4)
+            or lq128_ext_dominated
+        )
+    )
+
+    if block_dmodel >= 256:
+        block_m, num_warps = 64, 4
+    elif use_small_tile:
+        block_m, num_warps = 64, 4
+    elif batch_size <= 4:
+        block_m, num_warps = 128, 8
+    else:
+        # BM=256 hits an LLVM iota_range assertion in the WCA kernel on some
+        # shapes; BM=128 is the largest safe M-tile.
+        block_m, num_warps = 128, 8
+
+    if block_m == 64 and num_warps == 4:
+        num_stages = 2
+    elif block_dmodel >= 256:
+        num_stages = 2
+    else:
+        num_stages = 4
+    if block_m == 128 and num_warps == 8 and num_stages == 2:
+        num_stages = 3
+
+    return HeuristicConfig(block_m, block_n, num_warps, num_stages).with_default_extend()
+
+
+def _heuristic_config_cache_key(cfg: HeuristicConfig | None):
+    if cfg is None:
+        return None
+    cfg = cfg.with_default_extend()
+    return (
+        cfg.block_m,
+        cfg.block_n,
+        cfg.num_warps,
+        cfg.num_stages,
+        cfg.pad_k,
+        cfg.pad_v,
+        cfg.ext_block_n,
+        cfg.ext_num_stages,
+    )
+
+
+@functools.lru_cache(maxsize=2048)
+def _get_wca_heuristic_config(
+    Lq,
+    block_dmodel,
+    batch_size,
+    max_len_extend,
+    min_len_extend,
+    total_prefix_len,
+    total_extend_rows,
+    kv_is_fp8,
+    split_k,
+    forced_config_key,
+) -> HeuristicConfig:
+    """Cached WCA/split-K tile config keyed on scalar launch facts."""
+    forced_config = (
+        HeuristicConfig(*forced_config_key).with_default_extend()
+        if forced_config_key is not None
+        else None
+    )
+    return _select_wca_heuristic_config(
+        Lq=Lq,
+        block_dmodel=block_dmodel,
+        batch_size=batch_size,
+        max_len_extend=max_len_extend,
+        min_len_extend=min_len_extend,
+        total_prefix_len=total_prefix_len,
+        total_extend_rows=total_extend_rows,
+        kv_is_fp8=kv_is_fp8,
+        split_k=split_k,
+        forced_config=forced_config,
+    )
+
+
+def _launch_wca(
+    q_extend, k_extend, v_extend, o_extend,
+    k_buffer, v_buffer,
+    qo_indptr, kv_indptr, kv_indices,
+    custom_mask, is_causal, mask_indptr, max_len_extend,
+    k_scale, v_scale, sm_scale, logit_cap,
+    sliding_window_size, sinks, window_kv_offsets, xai_temperature_len,
+    kv_is_fp8, total_prefix_len, min_len_extend,
+    *,
+    split_k=1,
+    forced_config=None,
+    enable_prefix_unmasked=True,
+):
+    """Launch WCA or split-K through the unified 4w/8w launch body.
+
+    ``split_k == 1`` still selects ``IS_WCA=True``: the kernel gets a 1D
+    compact tile space and the in-kernel strided tile walk. Only the
+    split-K prefix partition, partial workspace, and final reduction are
+    disabled.
+    """
+    q_shape = q_extend.shape
+    Lq = q_shape[-1]
+    block_dmodel = _resolve_qk_split_dims(Lq)
+    assert block_dmodel >= 128, (
+        f"_launch_wca: D<128 has no pipelined home; got {block_dmodel}. "
+        "Route D<128 through data-centric."
+    )
+
+    batch_size = qo_indptr.shape[0] - 1
+    head_num = q_shape[1]
+    if min_len_extend is None:
+        min_len_extend = max_len_extend
+    total_prefix_len_policy = (
+        int(total_prefix_len) if total_prefix_len is not None else kv_indices.numel()
+    )
+
+    mask, mask_indptr, window_kv_offsets, use_custom_mask, has_window_offsets = _prepare_wca_masks(
+        q_extend, batch_size, custom_mask, mask_indptr, window_kv_offsets,
+    )
+    cfg = _get_wca_heuristic_config(
+        Lq,
+        block_dmodel,
+        batch_size,
+        max_len_extend,
+        min_len_extend,
+        total_prefix_len_policy,
+        q_shape[0],
+        kv_is_fp8,
+        split_k,
+        _heuristic_config_cache_key(forced_config),
+    )
+
+    grid_state = _finalize_wca_grid(
+        q_extend=q_extend,
+        batch_size=batch_size,
+        head_num=head_num,
+        BLOCK_M=cfg.block_m,
+        BLOCK_N=cfg.block_n,
+        BLOCK_DV=block_dmodel,
+        device=q_extend.device,
+        total_prefix_len=total_prefix_len_policy,
+        SPLIT_K=split_k,
+    )
+    if grid_state[0]:
+        return
+    (
+        _skip,
+        total_valid_tiles,
+        total_programs,
+        partial_out,
+        partial_lse,
+        tile_done,
+        split_k,
+        grid,
+    ) = grid_state
+
+    _launch_attention_grid(
+        q_extend, k_extend, v_extend, o_extend,
+        k_buffer, v_buffer,
+        qo_indptr, kv_indptr, kv_indices,
+        mask, mask_indptr, window_kv_offsets,
+        use_custom_mask=use_custom_mask,
+        is_causal=is_causal,
+        max_len_extend=max_len_extend,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        sm_scale=sm_scale,
+        logit_cap=logit_cap,
+        sliding_window_size=sliding_window_size,
+        sinks=sinks,
+        xai_temperature_len=xai_temperature_len,
+        Lq=Lq,
+        head_num=head_num,
+        batch_size=batch_size,
+        kv_is_fp8=kv_is_fp8,
+        has_window_offsets=has_window_offsets,
+        grid=grid,
+        block_m=cfg.block_m,
+        block_n=cfg.block_n,
+        block_dmodel=block_dmodel,
+        num_stages=cfg.num_stages,
+        num_warps=cfg.num_warps,
+        ext_block_n=cfg.ext_block_n,
+        ext_num_stages=cfg.ext_num_stages,
+        enable_prefix_unmasked=enable_prefix_unmasked,
+        is_wca=True,
+        split_k=split_k,
+        total_valid_tiles=total_valid_tiles,
+        total_programs=total_programs,
+        partial_out=partial_out,
+        partial_lse=partial_lse,
+        tile_done=tile_done,
+        actual_batch_size=batch_size,
+        total_prefix_len_hint=total_prefix_len_policy,
+        min_len_extend_hint=min_len_extend,
     )
 
 
@@ -537,509 +1760,162 @@ def _launch_splitk(
     sinks, xai_temperature_len, sliding_window_size,
     BLOCK_M, BLOCK_N, num_warps, NUM_STAGES,
     total_prefix_len=None,
+    kv_is_fp8=False,
 ):
-    """Split-K persistent kernel: partitions prefix across CTAs, then reduces."""
+    """Route through WCA, adding split-K only when it improves CU fill."""
     head_num = q_extend.shape[1]
-    device = q_extend.device
     batch_size = qo_indptr.shape[0] - 1
-
-    total_output_tiles = (
-        batch_size * head_num * ((max_len_extend + BLOCK_M - 1) // BLOCK_M)
-    )
+    total_output_tiles = batch_size * head_num * ((max_len_extend + BLOCK_M - 1) // BLOCK_M)
     if total_output_tiles == 0:
         return
 
-    num_CUs = _get_num_CUs(device)
-    if total_prefix_len is not None:
-        avg_kv_len = total_prefix_len // max(1, batch_size)
-    else:
-        avg_kv_len = int((kv_indptr[-1] - kv_indptr[0]).item()) // max(1, batch_size)
-    need_real_splitk = (
-        total_output_tiles < num_CUs and avg_kv_len >= 4 * BLOCK_N
+    num_CUs = _get_num_CUs(q_extend.device)
+    total_prefix_len_policy = (
+        int(total_prefix_len) if total_prefix_len is not None else kv_indices.numel()
     )
-
-    if not need_real_splitk:
-        _launch_persistent(
+    avg_kv_len = total_prefix_len_policy // max(1, batch_size)
+    if not (total_output_tiles < num_CUs and avg_kv_len >= 4 * BLOCK_N):
+        _launch_wca(
             q_extend, k_extend, v_extend, o_extend,
             k_buffer, v_buffer,
             qo_indptr, kv_indptr, kv_indices,
-            custom_mask, is_causal, mask_indptr,
-            max_len_extend,
-            k_scale=k_scale, v_scale=v_scale, sm_scale=sm_scale,
-            logit_cap=logit_cap,
-            min_len_extend=min_len_extend,
-            sinks=sinks,
-            xai_temperature_len=xai_temperature_len,
-            sliding_window_size=sliding_window_size,
-            window_kv_offsets=window_kv_offsets,
-            total_prefix_len=total_prefix_len,
+            custom_mask, is_causal, mask_indptr, max_len_extend,
+            k_scale, v_scale, sm_scale, logit_cap,
+            sliding_window_size, sinks, window_kv_offsets, xai_temperature_len,
+            kv_is_fp8, total_prefix_len_policy, min_len_extend,
         )
         return
 
-    BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
-
-    SPLIT_K = _select_k_splits(total_output_tiles, num_CUs)
-
-    if BLOCK_DMODEL < 256:
-        BLOCK_M = 128
-        num_warps = 8
-        NUM_STAGES = 4
-
-    USE_CUSTOM_MASK = custom_mask is not None
-    _bs_splitk = qo_indptr.shape[0] - 1
-    if not USE_CUSTOM_MASK:
-        custom_mask, mask_indptr, _wkvo_dummy = _ensure_dummy_mask_tensors(
-            device, q_extend.shape[0], _bs_splitk,
+    split_k = _select_k_splits(total_output_tiles, num_CUs)
+    block_dmodel = _resolve_qk_split_dims(Lq)
+    if kv_is_fp8:
+        forced = HeuristicConfig(
+            128,
+            128 if Lq <= 128 else (32 if block_dmodel >= 256 else 64),
+            8,
+            _FP8_DEFAULT_NS,
+            16,
+            16,
+            _FP8_DEFAULT_EXT_BN,
+            _FP8_DEFAULT_EXT_NS,
         )
-        if window_kv_offsets is None:
-            window_kv_offsets = _wkvo_dummy
-    elif window_kv_offsets is None:
-        _, _, window_kv_offsets = _ensure_dummy_mask_tensors(
-            device, q_extend.shape[0], _bs_splitk,
-        )
-    enable_prefix_unmasked = is_causal
+    elif block_dmodel < 256:
+        forced = HeuristicConfig(128, BLOCK_N, 8, 4).with_default_extend()
+    else:
+        forced = HeuristicConfig(BLOCK_M, BLOCK_N, num_warps, NUM_STAGES).with_default_extend()
 
-    sm_scale = sm_scale or 1.0 / math.sqrt(Lq)
-    sm_scale = sm_scale * k_scale
-    kv_group_num = q_extend.shape[1] // k_extend.shape[1]
-
-    # Tight sync-free upper bound on total_output_tiles (see _launch_persistent).
-    # BLOCK_M may have shifted above, so this is recomputed here.
-    total_output_tiles = (
-        (q_extend.shape[0] + batch_size * (BLOCK_M - 1)) // BLOCK_M
-    ) * head_num
-
-    total_splits = total_output_tiles * SPLIT_K
-    partial_out, partial_lse, tile_done = _ensure_splitk_workspace(
-        total_splits, total_output_tiles, BLOCK_M, BLOCK_DMODEL, device,
-    )
-
-    total_valid_tiles = total_output_tiles * SPLIT_K
-    total_programs = min(total_valid_tiles, 2 * num_CUs)
-    grid = (total_programs,)
-
-    _has_sink = sinks is not None
-    _v_scale_final = 1.0 if SPLIT_K > 1 else v_scale
-
-    _kernel[grid](
+    _launch_wca(
         q_extend, k_extend, v_extend, o_extend,
         k_buffer, v_buffer,
         qo_indptr, kv_indptr, kv_indices,
-        custom_mask, mask_indptr, window_kv_offsets,
-        sm_scale, kv_group_num,
-        q_extend.stride(0), q_extend.stride(1),
-        k_extend.stride(0), k_extend.stride(1),
-        v_extend.stride(0), v_extend.stride(1),
-        o_extend.stride(0), o_extend.stride(1),
-        k_buffer.stride(0), k_buffer.stride(1),
-        v_buffer.stride(0), v_buffer.stride(1),
-        IS_CAUSAL=is_causal,
-        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        NUM_STAGES=NUM_STAGES,
-        Sinks=sinks, HAS_SINK=_has_sink,
-        LOGIT_CAP=logit_cap,
-        XAI_TEMPERATURE_LEN=xai_temperature_len,
-        SLIDING_WINDOW_SIZE=sliding_window_size,
-        v_scale=_v_scale_final,
-        num_heads=head_num,
-        total_valid_tiles=total_valid_tiles, total_programs=total_programs,
-        partial_out=partial_out, partial_lse=partial_lse,
-        tile_done=tile_done,
-        actual_batch_size=batch_size,
-        IS_PERSISTENT=True, SPLIT_K=SPLIT_K,
-        num_warps=num_warps, num_stages=1,
-        waves_per_eu=2,
-        matrix_instr_nonkdim=32,
+        custom_mask, is_causal, mask_indptr, max_len_extend,
+        k_scale, v_scale, sm_scale, logit_cap,
+        sliding_window_size, sinks, window_kv_offsets, xai_temperature_len,
+        kv_is_fp8, total_prefix_len_policy, min_len_extend,
+        split_k=split_k,
+        forced_config=forced,
+        enable_prefix_unmasked=is_causal,
     )
 
 
-# ===-----------------------------------------------------------------------===#
-# Basic-path tile-config heuristics
-# ===-----------------------------------------------------------------------===#
-
-
-def _select_d256_dispatch(
-    batch_size: int,
-    max_len_extend: int,
-    min_len_extend: int,
-    total_prefix_len: int,
-    total_extend_len: int,
-    avg_pfx_proxy: int = 0,
+def _launch_data_centric_grid(
+    q_extend,
+    k_extend,
+    v_extend,
+    o_extend,
+    k_buffer,
+    v_buffer,
+    qo_indptr,
+    kv_indptr,
+    kv_indices,
+    is_causal,
+    max_len_extend,
+    k_scale,
+    v_scale,
+    sm_scale,
+    logit_cap,
+    sliding_window_size,
+    sinks,
+    xai_temperature_len,
+    Lq,
+    head_num,
+    batch_size,
+    kv_is_fp8,
+    *,
+    BLOCK_M,
+    BLOCK_N,
+    BLOCK_DMODEL,
+    NUM_STAGES,
+    num_warps,
+    custom_mask_arg=None,
+    mask_indptr_arg=None,
+    window_kv_offsets_arg=None,
+    ext_block_n=None,
+    ext_num_stages=None,
+    total_prefix_len_hint=None,
+    total_extend_len_hint=None,
+    min_len_extend_hint=None,
 ):
-    """D=256 launch policy (Gemma-style models).
+    """Normalize masks and launch the 3D data-centric grid.
 
-    Two BM regimes at D=256:
-      * BM=128 NW=8 (NS=2 or 3) for extend-dominated prefill (ext >= 256
-        per seq, or B=1 long extend): more query rows per tile amortises
-        the D=256 K/V load.
-      * BM=64 NW=4 (NS=2-4) for decode-like or small-ext batched shapes:
-        with ext < 128 the query tile is mostly pad at BM=128 and a
-        smaller tile halves pad waste and doubles grid size.
-
-    ``avg_pfx_proxy`` is a coarse bucket proxy for avg per-seq prefix
-    used when the caller does not thread ``total_prefix_len`` through
-    (e.g. the cached basic dispatch); the D=256 tree never needs the
-    exact prefix length, only whether it dominates the total token count.
-
-    NS=1 is avoided even where it would win: the prefix-pipelined kernel
-    hard-asserts NS>=2 for determinism, so NS=2 is used throughout at a
-    3-6% cost (within BF16 noise) on shapes where NS=1 would have won.
+    Data-centric CTAs do not walk a compact tile list. The grid is
+    rectangular ``(batch, heads, ceil(max_ext / BLOCK_M))``; invalid tail
+    tiles are masked inside the kernel.
     """
-    # When total_prefix_len is unknown, fall back to the bucket proxy for
-    # both the avg-pfx and prefix-frac decisions. Otherwise the tree
-    # treats every shape as "no prefix" and mis-routes decode-like batched
-    # workloads to the BM=128 ext-dominated config.
-    if total_prefix_len > 0:
-        avg_pfx = total_prefix_len // max(1, batch_size)
-        total_tokens = max(1, total_prefix_len + total_extend_len)
-        prefix_frac = total_prefix_len / total_tokens
+    use_custom_mask = custom_mask_arg is not None
+    if use_custom_mask:
+        mask = custom_mask_arg
+        mask_indptr = mask_indptr_arg
     else:
-        avg_pfx = avg_pfx_proxy
-        # prefix_frac proxy: avg_pfx_proxy vs max_len_extend gives the
-        # right "is prefix heavy" signal for the tree below.
-        _total_est = max(1, avg_pfx_proxy + max_len_extend)
-        prefix_frac = avg_pfx_proxy / _total_est
-    ext_ratio = max_len_extend / max(1, min_len_extend)
+        mask = 0
+        mask_indptr = 0
+    has_window_offsets = window_kv_offsets_arg is not None
+    window_kv_offsets = window_kv_offsets_arg if has_window_offsets else 0
 
-    if batch_size >= 4 and max_len_extend >= 256:
-        return 128, 8, 2, 16, 16
-    if batch_size == 1 and max_len_extend >= 2048:
-        return 128, 8, 2, 16, 16
-
-    if max_len_extend >= 768:
-        if batch_size <= 2:
-            return 64, 4, 2, 16, 16
-        return 128, 8, 3, 16, 16
-
-    # Extend-dominated at B>=3 (prefix_frac small): the BM=128 kernel
-    # earns its keep iff the per-seq extend is at least one BM row of
-    # real work. For small-ext decode-like batches the pad ratio wins.
-    if prefix_frac <= 0.55:
-        if batch_size <= 2 or max_len_extend <= 64:
-            return 64, 4, 2, 16, 16
-        return 128, 8, 3, 16, 16
-
-    if batch_size <= 4:
-        if max_len_extend <= 128 and avg_pfx >= 2048:
-            return 64, 4, 4, 16, 16
-        return 64, 4, 2, 16, 16
-
-    if batch_size >= 8 and max_len_extend >= 128 and avg_pfx >= 2048:
-        return 128, 8, 3, 16, 16
-
-    if max_len_extend <= 64 and avg_pfx >= 2048:
-        return 64, 4, 2, 16, 16
-
-    if ext_ratio <= 2.5:
-        return 64, 4, 2, 16, 16
-
-    return 64, 8, 4, 16, 16
-
-
-# FP8 dispatch defaults for the rare D not in {64, 128} fallthrough. The
-# main D=64 / D=128 FP8 paths have these baked in explicitly.
-_FP8_DEFAULT_BN = 128
-_FP8_DEFAULT_NS = 2
-_FP8_DEFAULT_EXT_BN = 64
-_FP8_DEFAULT_EXT_NS = 3
-
-
-def _pfx_bucket(total_prefix_len, batch_size):
-    """Bucket average per-sequence prefix length for dispatch.
-
-    0 = no prefix (prefill from scratch)
-    1 = tiny prefix      (avg < 512)
-    2 = moderate prefix  (avg < 2048)
-    3 = large prefix     (avg < 8192)
-    4 = huge prefix      (avg >= 8192)
-    """
-    if total_prefix_len is None or total_prefix_len <= 0 or batch_size <= 0:
-        return 0
-    avg = total_prefix_len // batch_size
-    if avg < 512:
-        return 1
-    if avg < 2048:
-        return 2
-    if avg < 8192:
-        return 3
-    return 4
-
-
-def _dispatch_d64_bf16(batch_size, max_len_extend, pfx_bucket, head_num):
-    """Pick (BM, NW, NS) for the D=64 BF16 basic kernel.
-
-    Per-shape winners from the AITER/CK grid (see bench_fp8_vs_ck.py).
-    B=1 uses ``head_num`` to choose BM — the win from BM=256 depends on
-    how the grid ``(1, H, ceil(S/BM))`` fills waves across 256 CUs.
-    """
-    _total_ext = batch_size * max_len_extend
-    if batch_size >= 8 and max_len_extend <= 128 and pfx_bucket >= 2:
-        return 128, 128, 4, 4
-    if batch_size >= 16 and max_len_extend <= 32:
-        return 64, 64, 4, 4
-    if batch_size >= 16:
-        if max_len_extend >= 512:
-            return 256, 64, 8, 2
-        return 64, 64, 4, 4
-    if batch_size >= 4:
-        if _total_ext >= 2048 or max_len_extend >= 512:
-            return 256, 64, 8, 2
-        if batch_size <= 7:
-            return 128, 64, 8, 4
-        return 64, 64, 4, 4
-
-    # B=1..3. H_q>=64 crosses over to BM=256 at S>=1600; H_q=32 at S>=1500
-    # (lower H already under-subscribes so BM=256's bigger per-tile work
-    # dominates earlier). B=2,3 keep the conservative S>=2048 boundary.
-    _h = head_num or 0
-    if batch_size == 1 and _h >= 64 and max_len_extend >= 1600:
-        return 256, 64, 8, 2
-    if batch_size == 1 and _h == 32 and max_len_extend >= 1500:
-        return 256, 64, 8, 2
-    if max_len_extend >= 2048:
-        return 256, 64, 8, 2
-    return 128, 64, 8, 4
-
-
-def _dispatch_d128_bf16(batch_size, max_len_extend, pfx_bucket, head_num):
-    """Pick (BM, NW, NS) for the D=128 BF16 basic kernel.
-
-    NS=1 is unsafe on the prefix-pipelined path (DMA-ring races) and
-    benches within +-3% of NS=2, so NS>=2 throughout. BM=256 NW=8 NS=2
-    is avoided at D=128: a latent reduction-order issue produces
-    max_err ~5e-3 to 1.3e-2 on ~0.1% of outputs. BM=128 NS=2 at H>=64
-    captures most of the win; H=32 stays on BM=64 NW=4.
-    """
-    _total_ext = batch_size * max_len_extend
-    if batch_size >= 16 and max_len_extend <= 16:
-        return 16, 64, 4, 2
-    if batch_size >= 16 and max_len_extend <= 64:
-        return 64, 64, 4, 2
-    if pfx_bucket >= 3 and max_len_extend >= 4096:
-        return 128, 64, 8, 2
-    if pfx_bucket >= 2 and max_len_extend >= 2048:
-        return 128, 64, 8, 2
-    if batch_size == 1:
-        _h = head_num or 0
-        if _h >= 64 and max_len_extend >= 2000:
-            return 128, 64, 8, 2
-        if _h >= 64 and max_len_extend >= 1024:
-            return 128, 64, 8, 4
-        return 64, 64, 4, 2
-    if batch_size <= 4:
-        return 64, 64, 4, 2
-    if _total_ext >= 32768:
-        return 128, 64, 8, 2
-    return 64, 64, 4, 2
-
-
-def _d64_bf16_batched_overrides(BM, BN, NW, NS, batch_size, max_len_extend,
-                                sliding_window_size, total_ext):
-    """Post-process the D=64 BF16 config for batched edge cases.
-
-    EXT_BN/EXT_NS are derived from the post-override (BM, BN, NW, NS)
-    by the caller, not here, so the BM=256 NS=2→NS=4 promotion propagates
-    correctly.
-    """
-    # B>=16 ext==256 full-attn: BM=64 undersubscribes 256 CUs by 4x,
-    # route to BM=256.
-    if (
-        sliding_window_size <= 0
-        and batch_size >= 16 and max_len_extend == 256
-    ):
-        BM, BN, NW, NS = 256, 64, 8, 2
-
-    # BM=256 NW=8 gets an extra stage on batched prefill shapes with
-    # occupancy headroom. Skip for B=1 — single-seq ShareGPT already sits
-    # at the occupancy floor and the extra stage only eats LDS/regs.
-    if (
-        BM == 256 and NW == 8 and NS == 2
-        and max_len_extend >= 1024
-        and batch_size != 1
-        and (max_len_extend <= 8192 or total_ext <= 32768)
-    ):
-        NS = 4
-    return BM, BN, NW, NS
-
-
-def _apply_fp8_overrides(Lq, batch_size, max_len_extend, pfx_bucket,
-                         BM, BN, NW, NS, total_ext):
-    """FP8 basic dispatch. Invariants:
-
-    * NS>=2 on the 8-warp pipelined path (NS=1 is bit-nondeterministic;
-      NS>=3 OOMs LDS at BN=128).
-    * D<128 only has the NW=4 NS=1 serial path; pipelined layouts are
-      not wired up. BM>128 at NW=4 blows register pressure.
-    """
-    if Lq == 128:
-        BM, BN, NW, NS = 128, 128, 8, 2
-        EXT_BN, EXT_NS = 128, 2
-        if batch_size == 1 and max_len_extend <= 256:
-            BM = 64
-        elif (
-            batch_size >= 32
-            and max_len_extend <= 8
-            and pfx_bucket <= 2
-        ):
-            # Decode / spec-verify / draft-extend on short-prefix
-            # continuous batches: BM=64 NW=4 avoids pad-heavy tiles.
-            BM, NW = 64, 4
-        elif batch_size >= 16 and max_len_extend <= 64:
-            # Small-batch decode-continuation bucket. With BM=128, Q tiles
-            # waste 50-87% of rows when max_ext < BM, which is exactly the
-            # pattern ShareGPT radix-on hammers (B in {16,32}, ext in
-            # {16,32,64}, pfx 512-2k). Pure-serial NW=4 NS=1 at BM=64
-            # closes the gap — sweep over 10 weak-bucket shapes moves
-            # this path from 0.66x-1.02x to 1.25x-1.55x vs Triton.
-            # Kernel body has the NW<8 serial branch guarded by
-            # `USE_PINGPONG = num_warps >= 8`; NS=1 skips the DMA pipeline.
-            BM, NW, NS = 64, 4, 1
-            EXT_NS = 1
-        elif (
-            batch_size >= 8
-            and max_len_extend <= 64
-            and pfx_bucket >= 3
-        ):
-            # Long-prefix short-extend at moderate batch (B in [8,15]
-            # with avg pfx>=2k). Same pad-waste argument as the B>=16
-            # clause but the prefix is long enough that tile-utilisation
-            # on the prefix phase also matters. At B<=15 NS=2 (pipelined
-            # loads on top of MFMA) wins 1.5-1.8x over NS=1 across all
-            # of pfx_bucket>=3: bench shows B=8 ext=32 pfx=16k
-            # 585->326us, B=8 ext=64 pfx=8k 265->156us, B=8 ext=1
-            # pfx=4k 137->86us, and B=8 het decode 519->286us with NS=2.
-            # NS=1 only stays the right call at B>=16 where the DMA
-            # overhead isn't amortized because per-tile work is tiny.
-            BM, NW = 64, 4
-            if batch_size <= 15:
-                NS, EXT_NS = 2, 2
-            else:
-                NS, EXT_NS = 1, 1
-        return BM, BN, NW, NS, EXT_BN, EXT_NS
-
-    if Lq == 64:
-        BM, BN, NW, NS = 128, 128, 4, 1
-        EXT_BN, EXT_NS = 128, 1
-        # BM=64 wins wherever tiles are pad-heavy. NS stays at 1 on
-        # the D=64 FP8 basic path (the kernel static_asserts NS=1 for
-        # BLOCK_DMODEL<128 on the 4-warp path; NS>=2 would need the
-        # persistent kernel which has its own dedicated D<128 branch).
-        if max_len_extend <= 8 or (
-            batch_size >= 16 and max_len_extend <= 128
-        ) or (
-            # B in [8,15] short-ext long-pfx decode-continuation and
-            # short-ext heterogeneous decode (forced to basic at D=64
-            # FP8): BM=128 pads 50-87% of Q rows; BM=64 gets full Q
-            # utilization at the same NS=1 and beats BM=128 by ~15%
-            # (bench: B=8 ext=64 pfx=8192 245->192us, B=8 ext=32
-            # pfx=16384 474->374us, B=8 het decode 437->~380us).
-            batch_size >= 8
-            and max_len_extend <= 64
-            and pfx_bucket >= 3
-        ):
-            BM = 64
-        return BM, BN, NW, NS, EXT_BN, EXT_NS
-
-    # Lq == 256 (and other unusual D that land here) — serial fallback.
-    BN = 32 if Lq >= 256 else _FP8_DEFAULT_BN
-    NS = _FP8_DEFAULT_NS
-    NW = min(NW, 4) if Lq < 128 else NW
-    EXT_BN = _FP8_DEFAULT_EXT_BN
-    EXT_NS = _FP8_DEFAULT_EXT_NS
-    if Lq >= 256 and NW <= 4:
-        EXT_NS = 1 if total_ext >= 512 else 2
-    return BM, BN, NW, NS, EXT_BN, EXT_NS
-
-
-def _apply_d64_swa_overrides(BM, BN, NW, NS, EXT_BN, EXT_NS,
-                             batch_size, max_len_extend, sliding_window_size):
-    """BF16 D=64 sliding-window override.
-
-    The per-tile key band is ~(BM + sw) wide regardless of tile count, so
-    BM=256 (base-tree win for plain causal) wastes work. Smaller BM splits
-    the static window across more CTAs and hides memory latency. Gates
-    tuned on D=64 H=32 kvH=4 sw=127.
-    """
-    total_ext = batch_size * max_len_extend
-    if max_len_extend >= 1024 and total_ext >= 2048:
-        BM, BN, NW, NS = 64, 64, 2, 2
-        EXT_BN, EXT_NS = BN, NS
-    elif max_len_extend > 16 * sliding_window_size:
-        if BM > 128:
-            BM = 128
-        NW, NS = 4, 2
-        EXT_NS = NS
-    elif BM > 128:
-        BM, NS = 128, 4
-        EXT_NS = NS
-    return BM, BN, NW, NS, EXT_BN, EXT_NS
-
-
-@functools.lru_cache(maxsize=2048)
-def _get_basic_dispatch_config(
-    Lq, batch_size, max_len_extend, pfx_bucket, is_fp8, sliding_window_size=-1,
-    head_num=None,
-):
-    """Route to the per-(Lq, dtype) helper and apply SWA / batched overrides.
-
-    Returns (BLOCK_M, BLOCK_N, num_warps, NUM_STAGES, PAD_K, PAD_V,
-    EXT_BLOCK_N, EXT_NUM_STAGES) for the basic (non-persistent) kernel.
-    Memoized on the full argument tuple -- the heuristic tree is a step
-    function with ~6 configs per (Lq, is_fp8) pair, so the live cache
-    stays small and hit rate is near-100% in production.
-    """
-    _total_ext = batch_size * max_len_extend
-    _PAD_K, _PAD_V = 16, 16
-
-    if Lq == 256:
-        _avg_pfx_proxy = (
-            0 if pfx_bucket <= 1
-            else 1024 if pfx_bucket == 2
-            else 2048 if pfx_bucket == 3
-            else 8192
-        )
-        _BM, _NW, _NS, _PAD_K, _PAD_V = _select_d256_dispatch(
-            batch_size, max_len_extend, max_len_extend, 0, _total_ext,
-            avg_pfx_proxy=_avg_pfx_proxy,
-        )
-        _BN = 32
-        _EXT_BN, _EXT_NS = _BN, _NS
-    elif Lq == 64:
-        _BM, _BN, _NW, _NS = _dispatch_d64_bf16(
-            batch_size, max_len_extend, pfx_bucket, head_num
-        )
-        _BM, _BN, _NW, _NS = _d64_bf16_batched_overrides(
-            _BM, _BN, _NW, _NS, batch_size, max_len_extend,
-            sliding_window_size, _total_ext,
-        )
-        _EXT_BN, _EXT_NS = _BN, _NS
-    else:
-        _BM, _BN, _NW, _NS = _dispatch_d128_bf16(
-            batch_size, max_len_extend, pfx_bucket, head_num
-        )
-        _EXT_BN, _EXT_NS = _BN, _NS
-
-    if is_fp8:
-        _BM, _BN, _NW, _NS, _EXT_BN, _EXT_NS = _apply_fp8_overrides(
-            Lq, batch_size, max_len_extend, pfx_bucket,
-            _BM, _BN, _NW, _NS, _total_ext,
-        )
-
-    if (
-        not is_fp8
-        and Lq == 64
-        and sliding_window_size > 0
-        and sliding_window_size < max_len_extend
-    ):
-        _BM, _BN, _NW, _NS, _EXT_BN, _EXT_NS = _apply_d64_swa_overrides(
-            _BM, _BN, _NW, _NS, _EXT_BN, _EXT_NS,
-            batch_size, max_len_extend, sliding_window_size,
-        )
-
-    return _BM, _BN, _NW, _NS, _PAD_K, _PAD_V, _EXT_BN, _EXT_NS
+    use_serial = _is_serial_schedule(NUM_STAGES, num_warps, BLOCK_DMODEL, kv_is_fp8)
+    grid = (batch_size, head_num, (max_len_extend + BLOCK_M - 1) // BLOCK_M)
+    data_xcd_candidate = (
+        not use_serial
+        and int(BLOCK_DMODEL) == 64
+        and not kv_is_fp8
+        and int(batch_size) >= 8
+    )
+    data_total_programs = grid[0] * grid[1] * grid[2] if data_xcd_candidate else 0
+    _launch_attention_grid(
+        q_extend, k_extend, v_extend, o_extend,
+        k_buffer, v_buffer,
+        qo_indptr, kv_indptr, kv_indices,
+        mask, mask_indptr, window_kv_offsets,
+        use_custom_mask=use_custom_mask,
+        is_causal=is_causal,
+        max_len_extend=max_len_extend,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        sm_scale=sm_scale,
+        logit_cap=logit_cap,
+        sliding_window_size=sliding_window_size,
+        sinks=sinks,
+        xai_temperature_len=xai_temperature_len,
+        Lq=Lq,
+        head_num=head_num,
+        batch_size=batch_size,
+        kv_is_fp8=kv_is_fp8,
+        has_window_offsets=has_window_offsets,
+        grid=grid,
+        block_m=BLOCK_M,
+        block_n=BLOCK_N,
+        block_dmodel=BLOCK_DMODEL,
+        num_stages=NUM_STAGES,
+        num_warps=num_warps,
+        ext_block_n=ext_block_n,
+        ext_num_stages=ext_num_stages,
+        enable_prefix_unmasked=is_causal,
+        total_valid_tiles=data_total_programs,
+        actual_batch_size=batch_size if data_xcd_candidate else 0,
+        total_prefix_len_hint=total_prefix_len_hint,
+        total_extend_len_hint=total_extend_len_hint,
+        min_len_extend_hint=min_len_extend_hint,
+    )
 
 
 def gluon_extend_attention_fwd(
@@ -1060,9 +1936,8 @@ def gluon_extend_attention_fwd(
     v_scale=1.0,
     sm_scale=None,
     logit_cap=0.0,
-    # ``skip_prefix_custom_mask`` is accepted for API parity with the Triton
-    # extend-attention backend. Gluon always skips the prefix custom-mask path
-    # (it was dead code pre-cleanup), so this argument is ignored.
+    # Accepted for API parity with the Triton backend; Gluon always
+    # skips the prefix custom-mask path.
     skip_prefix_custom_mask=True,  # noqa: ARG001
     sliding_window_size=-1,
     sinks=None,
@@ -1072,8 +1947,6 @@ def gluon_extend_attention_fwd(
     total_prefix_len=None,
     total_extend_len=None,
 ):
-    global _LOGGED_FP8_KV_MODE
-    # Cache shape tuples once; downstream accesses use tuple indexing.
     _q_shape = q_extend.shape
     Lq = _q_shape[-1]
     Lv = v_extend.shape[-1]
@@ -1095,32 +1968,15 @@ def gluon_extend_attention_fwd(
         if custom_mask is not None and Lq <= 128:
             raise NotImplementedError(
                 "Gluon FP8 KV + custom_mask is not supported on D<=128. Use "
-                "BF16 KV for spec-decode verify, or set "
-                "SGLANG_GLUON_FP8_KV_FORCE_BF16=1."
+                "BF16 KV for spec-decode verify."
             )
         # FP8 KV + D=256 fails Triton IR lowering (MFMA_F8 emits
         # unrealized_conversion_cast the backend can't materialize).
         if Lq == 256:
             raise NotImplementedError(
                 "Gluon FP8 KV extend is not supported at head-dim 256. Use "
-                "BF16 KV (Gemma and other D=256 models ship BF16), or set "
-                "SGLANG_GLUON_FP8_KV_FORCE_BF16=1."
+                "BF16 KV (Gemma and other D=256 models ship BF16)."
             )
-        if _FP8_KV_FORCE_BF16:
-            bridge_dtype = q_extend.dtype
-            k_buffer = k_buffer.to(bridge_dtype)
-            v_buffer = v_buffer.to(bridge_dtype)
-            _kv_is_fp8 = False
-        if not _LOGGED_FP8_KV_MODE:
-            if _kv_is_fp8:
-                logger.info(
-                    "Gluon FP8 KV path active: native fp8 symmetric kernels enabled."
-                )
-            else:
-                logger.warning(
-                    "Gluon FP8 KV bridge enabled: casting fp8 KV buffers to non-fp8 kernels."
-                )
-            _LOGGED_FP8_KV_MODE = True
     if Lq != Lv:
         raise ValueError(
             f"Gluon extend attention only supports symmetric heads (Lq == Lv), "
@@ -1129,53 +1985,87 @@ def gluon_extend_attention_fwd(
     batch_size = qo_indptr.shape[0] - 1
     head_num = _q_shape[1]
 
-    # Uniform detection without hitting the GPU: `q_extend.shape[0]`
-    # already equals sum(ext_i); if it equals B * max_ext, every seq
-    # has length max_ext.
-    _total_extend_rows = _q_shape[0]
-    _uniform_by_shape = (_total_extend_rows == batch_size * max_len_extend)
-    _uniform_like = (batch_size <= 1 or _uniform_by_shape)
-
-    _has_sink = sinks is not None
-
-    # WCA eligibility: no custom mask. Custom-mask workloads always fall
-    # back to the basic per-batch grid.
-    _can_route_wca = custom_mask is None
-    _is_uniform = (batch_size <= 1 or min_len_extend == max_len_extend
-                   or _uniform_by_shape)
-    _is_ragged_ext = _can_route_wca and not _is_uniform and batch_size >= 2
-    # Small-ext + big-prefix-skew (e.g. spec-decode) — looks uniform but
-    # the longest-prefix CTA dominates; WCA persistent regains ~1.7x.
+    # Route order is intentionally explicit: cheap BF16 serial preflight,
+    # sync-free WCA eligibility, cached data-centric config, then the full
+    # dispatch fallback for custom masks / heterogeneous cases. Here
+    # "fastpath" means the host can make a route/config choice from cheap
+    # shape metadata (B, max extension length, total prefix hint/bucket) without
+    # materializing exact per-sequence reductions or mask-specific state. It is
+    # not a separate kernel family; it just avoids slow Python/GPU-sync work
+    # before launching the same serial, data-centric, WCA, or split-K kernels.
+    # WCA and split-K stay separate because they allocate workspace and launch a
+    # 1D work-centric grid rather than the 3D data-centric grid.
     _total_pfx_est_pre = (
         total_prefix_len if total_prefix_len is not None
         else kv_indices.numel()
     )
+
+    # BF16 serial-kernel preflight: cheap (Lq, B, ext, pfx) gate before
+    # the heavier _is_ragged setup. The serial kernel itself handles
+    # SWA and custom masks (see ``gluon_extend_attn_serial_fwd`` in
+    # this file); FP8 KV is excluded here.
+    if (
+        not _kv_is_fp8
+        and _should_route_serial_data_centric_bf16(
+            Lq, batch_size, max_len_extend, _total_pfx_est_pre
+        )
+    ):
+        _BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
+        _launch_data_centric_grid(
+            q_extend, k_extend, v_extend, o_extend,
+            k_buffer, v_buffer,
+            qo_indptr, kv_indptr, kv_indices,
+            is_causal, max_len_extend,
+            k_scale, v_scale, sm_scale, logit_cap,
+            sliding_window_size, sinks, xai_temperature_len,
+            Lq, head_num, batch_size, _kv_is_fp8,
+            BLOCK_M=64,
+            BLOCK_N=64,
+            BLOCK_DMODEL=_BLOCK_DMODEL,
+            NUM_STAGES=1,
+            num_warps=4,
+            custom_mask_arg=custom_mask,
+            mask_indptr_arg=mask_indptr,
+            window_kv_offsets_arg=window_kv_offsets,
+            total_prefix_len_hint=_total_pfx_est_pre,
+            total_extend_len_hint=total_extend_len,
+            min_len_extend_hint=min_len_extend,
+        )
+        return
+
+    # Sync-free uniform detection: q_extend.shape[0] == sum(ext_i),
+    # so if it equals B * max_ext every seq has length max_ext.
+    _total_extend_rows = _q_shape[0]
+    _uniform_by_shape = (_total_extend_rows == batch_size * max_len_extend)
+
+    # WCA (and split-K, which shares the same kernel body) does
+    # not support SWA + sinks. The combination produces NaN on prefix-
+    # dominated shapes and trips an LLVM iota_range assertion during compile
+    # on others. The non-WCA data-centric kernels handle SWA+sinks fine, so
+    # the fastpath block stays reachable -- only the WCA / split-K dispatch
+    # points are gated off for these shapes.
+    _has_sw_sinks = sliding_window_size > 0 and sinks is not None
+    _can_use_fastpath = custom_mask is None
+    _can_route_wca = _can_use_fastpath and not _has_sw_sinks
+    _is_uniform = (batch_size <= 1 or min_len_extend == max_len_extend
+                   or _uniform_by_shape)
+    _is_ragged_ext = _can_route_wca and not _is_uniform and batch_size >= 2
+    # Small-ext + big-prefix-skew (e.g. spec-decode): looks uniform but
+    # the longest-prefix CTA dominates, so WCA reclaims these.
+    _prefix_bucket_fastpath = _pfx_bucket(_total_pfx_est_pre, batch_size)
     _is_ragged_pfx = (
         _can_route_wca
         and batch_size >= 4
         and max_len_extend <= 128
         and _total_pfx_est_pre >= batch_size * 2048
-        # FP8 D=128 short-extend stays on basic after the small-bucket
-        # retune (1.4-1.5x vs Triton) instead of WCA persistent (0.64-
-        # 0.66x vs Triton on the same shapes). Genuine pfx-skew would
-        # still benefit from WCA but we can't cheaply distinguish it from
-        # uniform at dispatch time.
+        # FP8 small-extend carve-outs: data-centric (split-K or NS=1) is faster
+        # than WCA on these buckets. The _need_wca gate below
+        # still sends long-prefix B<=4 back to WCA when useful.
         and not (_kv_is_fp8 and Lq == 128 and max_len_extend <= 64)
-        # FP8 D=128 B<=4 ext=128: basic SPLIT_K=2 fills the grid (128
-        # output tiles x 2 splits = 256 CTAs = gfx950 num_CUs) without
-        # paying ~25us of WCA setup. Moderate prefix doesn't amortize
-        # WCA at this batch size. Persistent still handles genuinely
-        # long prefixes at B<=4 via the explicit _need_persistent gate
-        # below (_avg_pfx >= 16384).
         and not (
             _kv_is_fp8 and Lq == 128
             and batch_size <= 4 and max_len_extend >= 128
         )
-        # FP8 D=64 B>=8 ext<=64 long-prefix: persistent (NS=2) loses
-        # ~0.82x to basic (NS=1) here because the D=64 pipelined path
-        # doesn't amortize the extra DMA stage at small per-tile work.
-        # Basic BM=128 BN=128 NW=4 NS=1 beats WCA BM=128 BN=128 NW=4 NS=2
-        # by ~20% on B=8 ext=64 pfx=8192 and B=8 ext=32 pfx=16384.
         and not (
             _kv_is_fp8 and Lq == 64
             and batch_size >= 8 and max_len_extend <= 64
@@ -1187,74 +2077,80 @@ def gluon_extend_attention_fwd(
     if _kv_is_fp8 and not _is_uniform and max_len_extend <= 64:
         _is_ragged = False
 
-    def _dispatch_wca():
-        """Launch the WCA (persistent-CTA) kernel; picks BF16 vs FP8 by
-        checking ``_kv_is_fp8`` in the enclosing scope. All three WCA call
-        sites below share the identical argument list, so factor it once."""
-        _fn = _launch_persistent_fp8 if _kv_is_fp8 else _launch_persistent
-        _min_ext = min_len_extend if min_len_extend is not None else max_len_extend
-        _fn(
-            q_extend, k_extend, v_extend, o_extend,
-            k_buffer, v_buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            custom_mask, is_causal, mask_indptr, max_len_extend,
-            k_scale=k_scale, v_scale=v_scale, sm_scale=sm_scale,
-            logit_cap=logit_cap,
-            sliding_window_size=sliding_window_size,
-            sinks=sinks, window_kv_offsets=window_kv_offsets,
-            xai_temperature_len=xai_temperature_len,
-            min_len_extend=_min_ext,
-            total_prefix_len=total_prefix_len,
-        )
+    _is_d64_tiny_prefix_small_ext = (
+        _can_use_fastpath
+        and Lq == 64
+        and not _kv_is_fp8
+        and _prefix_bucket_fastpath == PrefixBucket.TINY
+        and max_len_extend <= 64
+        and batch_size <= 8
+    )
 
-    # D=128 B<=4: every WCA clause requires B>=5 so short-circuit.
-    # D=256 stays on basic (tuned tree is sufficient and WCA BM=256 has
-    # LDS issues).
+    # WCA scope: only D=128 BF16/FP8 has a pipelined WCA home.
+    # D<128 kernels assert D>=128 (4w sw-pipe and FP8 8w pingpong), and
+    # D=256 WCA hits LDS pressure issues; both fall through to data-centric.
+    # D=128 B<=4 never satisfies the WCA clauses below, so skip.
     _skip_wca_check = (
         Lq == 128
         and not _kv_is_fp8
         and not _is_ragged_pfx
         and batch_size <= 4
     )
-    if _is_ragged and Lq <= 128 and not _skip_wca_check:
+    if _is_ragged and Lq == 128 and not _skip_wca_check:
         _total_ext = _total_extend_rows
         _grid_est = batch_size * max_len_extend
         _waste_frac = 1.0 - _total_ext / max(1, _grid_est)
         _total_pfx_est = _total_pfx_est_pre
-        if Lq == 128:
-            # D=128: WCA only reliably dominates at B>=5 (basic avoids
-            # ~25us of WCA Python-side setup at smaller B).
-            _use_wca = (
-                _is_ragged_pfx
-                or (max_len_extend >= 1024 and _waste_frac > 0.05 and batch_size >= 5)
-                or (batch_size >= 8 and _total_pfx_est >= batch_size * 1024)
-                or (batch_size >= 8 and max_len_extend >= 768 and _waste_frac >= 0.4)
-                or (max_len_extend >= 768 and _waste_frac >= 0.2 and batch_size >= 5)
-                or (batch_size >= 16 and _waste_frac >= 0.2)
-            )
-        else:
-            ext_ratio = (
-                max_len_extend / max(1, min_len_extend)
-                if min_len_extend else float("inf")
-            )
-            _use_wca = (
-                (batch_size >= 8 and _total_pfx_est >= batch_size * 1024
-                 and max_len_extend >= 32)
-                or (ext_ratio > 4.0 and max_len_extend >= 256)
-                or (ext_ratio > 20.0 and max_len_extend >= 64
-                    and (batch_size >= 5 or _total_pfx_est >= 512))
-            )
+        _use_wca = (
+            _is_ragged_pfx
+            or (max_len_extend >= 1024 and _waste_frac > 0.05 and batch_size >= 5)
+            or (batch_size >= 8 and _total_pfx_est >= batch_size * 1024)
+            or (batch_size >= 8 and max_len_extend >= 768 and _waste_frac >= 0.4)
+            or (max_len_extend >= 768 and _waste_frac >= 0.2 and batch_size >= 5)
+            or (batch_size >= 16 and _waste_frac >= 0.2)
+        )
         if _use_wca:
-            # Launcher picks the BM/NW tile config internally (small-tile for
-            # ext-dominated or ragged batches, big-tile for prefix-dominated
-            # chat-mix).
-            _dispatch_wca()
+            _launch_wca(
+                q_extend, k_extend, v_extend, o_extend,
+                k_buffer, v_buffer,
+                qo_indptr, kv_indptr, kv_indices,
+                custom_mask, is_causal, mask_indptr, max_len_extend,
+                k_scale, v_scale, sm_scale, logit_cap,
+                sliding_window_size, sinks, window_kv_offsets,
+                xai_temperature_len,
+                _kv_is_fp8, _total_pfx_est_pre, min_len_extend,
+            )
             return
 
-    if _can_route_wca:
+    if _can_use_fastpath:
         _BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
-        if Lq <= 128:
+        # D=64 BF16 tiny-prefix small-extend: NS=1 serial data-centric kernel.
+        if _is_d64_tiny_prefix_small_ext:
+            _launch_data_centric_grid(
+                q_extend, k_extend, v_extend, o_extend,
+                k_buffer, v_buffer,
+                qo_indptr, kv_indptr, kv_indices,
+                is_causal, max_len_extend,
+                k_scale, v_scale, sm_scale, logit_cap,
+                sliding_window_size, sinks, xai_temperature_len,
+                Lq, head_num, batch_size, _kv_is_fp8,
+                BLOCK_M=64,
+                BLOCK_N=64,
+                BLOCK_DMODEL=_BLOCK_DMODEL,
+                NUM_STAGES=1,
+                num_warps=4,
+                window_kv_offsets_arg=window_kv_offsets,
+                total_prefix_len_hint=_total_pfx_est_pre,
+                total_extend_len_hint=total_extend_len,
+                min_len_extend_hint=min_len_extend,
+            )
+            return
+
+        # D=128 long-prefix decode-like shapes route to WCA.
+        # (D=64 has no pipelined WCA home; D=256 is handled by
+        # the dedicated block below.)
+        if Lq == 128:
             _BM_est = 128
             _n_m_est = (max_len_extend + _BM_est - 1) // _BM_est
             _total_tiles_est = batch_size * head_num * _n_m_est
@@ -1263,195 +2159,160 @@ def gluon_extend_attention_fwd(
             _total_pfx = total_prefix_len if total_prefix_len is not None else 0
             _avg_pfx = _total_pfx // max(1, batch_size)
             if _kv_is_fp8:
-                if Lq == 128:
-                    # B=4 ext>=128 with moderate prefix goes through the
-                    # splitk path instead (SPLIT_K=2 on B=4 fills the grid
-                    # and we drop ~20us of WCA setup). Long prefix (>=16k)
-                    # or short extend (<=64) keeps the straight persistent
-                    # win on decode-like shapes.
-                    _need_persistent = (
-                        _total_tiles_est < _num_CUs
-                        and (
-                            (_avg_pfx >= 4096 and max_len_extend <= 64)
-                            or (_avg_pfx >= 4096 and max_len_extend <= 128
-                                and batch_size >= 5)
-                            or (_avg_pfx >= 16384 and max_len_extend <= 256)
-                        )
+                _need_wca = (
+                    _total_tiles_est < _num_CUs
+                    and (
+                        (_avg_pfx >= 4096 and max_len_extend <= 64)
+                        or (_avg_pfx >= 4096 and max_len_extend <= 128
+                            and batch_size >= 5)
+                        or (_avg_pfx >= 16384 and max_len_extend <= 256)
                     )
-                elif Lq == 64:
-                    # B>=8 ext<=64 long-pfx: basic NS=1 beats persistent
-                    # NS=2 by ~20%. Keep persistent only on B<=7 here.
-                    _need_persistent = (
-                        _total_tiles_est < _num_CUs
-                        and (
-                            (_avg_pfx >= 4096 and max_len_extend <= 256)
-                            or (_avg_pfx >= 16384 and max_len_extend <= 512)
-                        )
-                        and not (
-                            batch_size >= 8 and max_len_extend <= 64
-                            and _avg_pfx >= 8192
-                        )
-                    )
-                else:
-                    _need_persistent = (
-                        Lq < 256
-                        and _total_tiles_est < _num_CUs
-                        and _avg_pfx >= 4096
-                        and batch_size * max_len_extend <= 2048
-                    )
+                )
             else:
-                if Lq == 128:
-                    _need_persistent = (
-                        _avg_pfx >= 4096
-                        and (batch_size >= 4 or _avg_pfx >= 16384)
-                        and _total_tiles_est < _num_CUs
-                    )
-                elif Lq == 64:
-                    _need_persistent = (
-                        _total_tiles_est < _num_CUs
-                        and (
-                            (max_len_extend >= 128
-                             and (batch_size >= 8 or max_len_extend >= 1024))
-                            or (_avg_pfx >= 4096
-                                and (batch_size >= 8
-                                     or (batch_size <= 2 and _avg_pfx >= 16384)))
-                        )
-                    )
-                else:
-                    _need_persistent = (
-                        _total_tiles_est < _num_CUs
-                        and (
-                            (max_len_extend >= 128
-                             and (batch_size >= 8 or max_len_extend >= 1024))
-                            or (_avg_pfx >= 4096
-                                and (batch_size >= 8
-                                     or (batch_size <= 2 and _avg_pfx >= 16384)))
-                        )
-                    )
-            if _need_persistent and _can_route_wca:
-                # Both launchers auto-select tiles for prefix-dominated
-                # chat-mix (BF16 via _use_small_tile+_lq128_ext_dominated,
-                # FP8 via _fp8_prefix_dominated).
-                _dispatch_wca()
+                _need_wca = (
+                    _avg_pfx >= 4096
+                    and (batch_size >= 4 or _avg_pfx >= 16384)
+                    and _total_tiles_est < _num_CUs
+                )
+            if _need_wca and _can_route_wca:
+                _launch_wca(
+                    q_extend, k_extend, v_extend, o_extend,
+                    k_buffer, v_buffer,
+                    qo_indptr, kv_indptr, kv_indices,
+                    custom_mask, is_causal, mask_indptr, max_len_extend,
+                    k_scale, v_scale, sm_scale, logit_cap,
+                    sliding_window_size, sinks, window_kv_offsets,
+                    xai_temperature_len,
+                    _kv_is_fp8, _total_pfx_est_pre, min_len_extend,
+                )
                 return
 
-        _sm = (sm_scale if sm_scale is not None else Lq**-0.5) * k_scale
-        _kv_gn = head_num // k_extend.shape[1]
-        _wkvo = window_kv_offsets
-        if _wkvo is None or _dummy_cm is None:
-            _ensure_dummies(q_extend.device, q_extend.shape[0] + 1, batch_size)
-        if _wkvo is None:
-            _wkvo = _dummy_wkvo[:batch_size]
-
-        # D=256 prefix-aware WCA routing. FP8 D=256 persistent overflows
-        # LDS (204KB > 160KB) and hits LLVM codegen bugs, so BF16 only.
+        # D=256 BF16 prefix-aware WCA routing. FP8 D=256 is unsupported
+        # upstream (the entry guard already raised for that case).
         if Lq == 256 and not _kv_is_fp8:
             _total_pfx_256 = total_prefix_len if total_prefix_len is not None else 0
             _avg_pfx_256 = _total_pfx_256 // max(1, batch_size)
             _n_m_256 = (max_len_extend + 63) // 64
             _tiles_256 = batch_size * head_num * _n_m_256
-            _need_persistent_256 = (
+            _need_wca_256 = (
                 _avg_pfx_256 >= 4096
                 and (batch_size >= 8 or (batch_size <= 2 and _avg_pfx_256 >= 16384))
                 and _tiles_256 < _get_num_CUs(q_extend.device)
             )
-            if _need_persistent_256 and _can_route_wca:
-                _dispatch_wca()
+            if _need_wca_256 and _can_route_wca:
+                _launch_wca(
+                    q_extend, k_extend, v_extend, o_extend,
+                    k_buffer, v_buffer,
+                    qo_indptr, kv_indptr, kv_indices,
+                    custom_mask, is_causal, mask_indptr, max_len_extend,
+                    k_scale, v_scale, sm_scale, logit_cap,
+                    sliding_window_size, sinks, window_kv_offsets,
+                    xai_temperature_len,
+                    _kv_is_fp8, _total_pfx_est_pre, min_len_extend,
+                )
                 return
 
-        # Cached dispatch config lookup (O(0.1us) after warmup).
-        _pfx_b_full = _pfx_bucket(total_prefix_len, batch_size)
-        _BM, _BN, _NW, _NS, _, _, _EXT_BN, _EXT_NS = (
-            _get_basic_dispatch_config(
-                Lq, batch_size, max_len_extend, _pfx_b_full, _kv_is_fp8,
-                sliding_window_size=sliding_window_size,
-                head_num=head_num,
-            )
+        _cfg = _get_data_centric_heuristic_config(
+            Lq, batch_size, max_len_extend, _prefix_bucket_fastpath, _kv_is_fp8,
+            sliding_window_size=sliding_window_size,
+            head_num=head_num,
         )
 
-        # Cache strides once (avoid 12 separate Python->C++ calls).
-        _q_s0, _q_s1 = q_extend.stride(0), q_extend.stride(1)
-        _k_s0, _k_s1 = k_extend.stride(0), k_extend.stride(1)
-        _v_s0, _v_s1 = v_extend.stride(0), v_extend.stride(1)
-        _o_s0, _o_s1 = o_extend.stride(0), o_extend.stride(1)
-        _kb_s0, _kb_s1 = k_buffer.stride(0), k_buffer.stride(1)
-        _vb_s0, _vb_s1 = v_buffer.stride(0), v_buffer.stride(1)
-
-        _kernel_extra = {
-            "IS_FP8": True,
-            "EXT_BLOCK_N": _EXT_BN, "EXT_NUM_STAGES": _EXT_NS,
-        } if _kv_is_fp8 else {}
-
-        _grid = (batch_size, head_num, (max_len_extend + _BM - 1) // _BM)
-        # Both BF16 and FP8 unified kernels take the persistent-superset
-        # signature. IS_PERSISTENT=False collapses the outer tile loop to a
-        # single pass and DCE eliminates every access to the persistent-only
-        # runtime args, so integer zeros for scalars and 1-element module
-        # dummies for the pointer workspaces are sufficient. Persistent args
-        # go in via kwargs because the signature interleaves constexprs
-        # between the stride block and the persistent-only runtime block.
-        _kernel[_grid](
+        _launch_data_centric_grid(
             q_extend, k_extend, v_extend, o_extend,
             k_buffer, v_buffer,
             qo_indptr, kv_indptr, kv_indices,
-            _dummy_cm, _dummy_mi[: q_extend.shape[0] + 1], _wkvo,
-            _sm, _kv_gn,
-            _q_s0, _q_s1, _k_s0, _k_s1, _v_s0, _v_s1,
-            _o_s0, _o_s1, _kb_s0, _kb_s1, _vb_s0, _vb_s1,
-            IS_CAUSAL=is_causal,
-            USE_CUSTOM_MASK=False,
-            ENABLE_PREFIX_UNMASKED=is_causal,
-            BLOCK_M=_BM, BLOCK_N=_BN,
+            is_causal, max_len_extend,
+            k_scale, v_scale, sm_scale, logit_cap,
+            sliding_window_size, sinks, xai_temperature_len,
+            Lq, head_num, batch_size, _kv_is_fp8,
+            BLOCK_M=_cfg.block_m,
+            BLOCK_N=_cfg.block_n,
             BLOCK_DMODEL=_BLOCK_DMODEL,
-            NUM_STAGES=_NS,
-            **_kernel_extra,
-            Sinks=sinks, HAS_SINK=sinks is not None,
-            LOGIT_CAP=logit_cap,
-            XAI_TEMPERATURE_LEN=xai_temperature_len,
-            SLIDING_WINDOW_SIZE=sliding_window_size,
-            v_scale=v_scale,
-            num_heads=0,
-            total_valid_tiles=0, total_programs=0,
-            partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
-            tile_done=_dummy_tile_done,
-            actual_batch_size=0,
-            IS_PERSISTENT=False, SPLIT_K=1,
-            num_warps=_NW, num_stages=1, waves_per_eu=2,
-            matrix_instr_nonkdim=32,
+            NUM_STAGES=_cfg.num_stages,
+            num_warps=_cfg.num_warps,
+            ext_block_n=_cfg.ext_block_n,
+            ext_num_stages=_cfg.ext_num_stages,
+            window_kv_offsets_arg=window_kv_offsets,
+            total_prefix_len_hint=total_prefix_len,
+            total_extend_len_hint=total_extend_len,
+            min_len_extend_hint=min_len_extend,
         )
         return
 
-    # Full dispatch path: heterogeneous batches, custom_mask, test overrides.
+    if custom_mask is not None:
+        # Custom masks cannot use WCA/split-K today, but the data-centric tile
+        # choice is shape-derived and cacheable with exact length hints.
+        BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
+        if total_prefix_len is None:
+            total_prefix_len = kv_indices.numel()
+        if total_extend_len is None:
+            total_extend_len = q_extend.shape[0]
+        if min_len_extend is None:
+            min_len_extend = max_len_extend
+        _prefix_bucket_custom_mask = _pfx_bucket(total_prefix_len, batch_size)
+        _cfg = _get_exact_data_centric_heuristic_config(
+            Lq,
+            batch_size,
+            max_len_extend,
+            min_len_extend,
+            total_prefix_len,
+            total_extend_len,
+            _prefix_bucket_custom_mask,
+            _kv_is_fp8,
+            sliding_window_size,
+            head_num,
+            True,
+        )
+        _launch_data_centric_grid(
+            q_extend, k_extend, v_extend, o_extend,
+            k_buffer, v_buffer,
+            qo_indptr, kv_indptr, kv_indices,
+            is_causal, max_len_extend,
+            k_scale, v_scale, sm_scale, logit_cap,
+            sliding_window_size, sinks, xai_temperature_len,
+            Lq, head_num, batch_size, _kv_is_fp8,
+            BLOCK_M=_cfg.block_m,
+            BLOCK_N=_cfg.block_n,
+            BLOCK_DMODEL=BLOCK_DMODEL,
+            NUM_STAGES=_cfg.num_stages,
+            num_warps=_cfg.num_warps,
+            custom_mask_arg=custom_mask,
+            mask_indptr_arg=mask_indptr,
+            window_kv_offsets_arg=window_kv_offsets,
+            ext_block_n=_cfg.ext_block_n,
+            ext_num_stages=_cfg.ext_num_stages,
+            total_prefix_len_hint=total_prefix_len,
+            total_extend_len_hint=total_extend_len,
+            min_len_extend_hint=min_len_extend,
+        )
+        return
+
+    # Full dispatch path: heterogeneous batches and exact-hint fallbacks.
     BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
 
-    # min_len_extend is only needed below on the D>=256 / persistent / splitk
-    # branches. Computing it eagerly would cost a ~15us GPU sync; compute
-    # lazily at the point of use.
+    # min_len_extend is materialized lazily below -- computing it eagerly
+    # costs a ~15us GPU sync on heterogeneous batches.
 
-    _ensure_dummies(q_extend.device, q_extend.shape[0] + 1, batch_size)
-
-    num_CUs = _get_num_CUs(q_extend.device)
-
-    _BM_est = 64 if Lq < 256 else 128
-    total_tiles_est = (
-        batch_size * head_num * ((max_len_extend + _BM_est - 1) // _BM_est)
+    # Split-K delegates to the WCA body, so SWA+sinks shapes
+    # intentionally skip it and fall through to the data-centric path below.
+    _use_splitk = (
+        (Lq > 64)
+        and (Lq <= 128)
+        and (custom_mask is None)
+        and not _has_sw_sinks
     )
 
-    # Default routing: splitk for D<=128 causal (no custom_mask), basic
-    # otherwise. D>=256 always falls through to the basic path below.
-    use_splitk = (Lq <= 128) and (custom_mask is None)
-
-    if use_splitk:
+    if _use_splitk:
         _BN = 32 if BLOCK_DMODEL >= 256 else 64
         if min_len_extend is None:
             min_len_extend = max_len_extend
-        _sk_fn = _launch_splitk_fp8 if _kv_is_fp8 else _launch_splitk
-        _sk_fn(
+        _launch_splitk(
             q_extend, k_extend, v_extend, o_extend,
             k_buffer, v_buffer,
             qo_indptr, kv_indptr, kv_indices,
             custom_mask, mask_indptr,
-            window_kv_offsets if window_kv_offsets is not None else _dummy_wkvo[:batch_size],
+            window_kv_offsets,
             sm_scale, k_scale, v_scale, logit_cap,
             Lq, is_causal, max_len_extend, min_len_extend,
             sinks, xai_temperature_len, sliding_window_size,
@@ -1460,447 +2321,53 @@ def gluon_extend_attention_fwd(
             num_warps=4,
             NUM_STAGES=2,
             total_prefix_len=total_prefix_len,
+            kv_is_fp8=_kv_is_fp8,
         )
         return
 
-    enable_prefix_unmasked = is_causal
-
-    USE_CUSTOM_MASK = custom_mask is not None
-    if not USE_CUSTOM_MASK:
-        custom_mask = _dummy_cm
-        mask_indptr = _dummy_mi[: q_extend.shape[0] + 1]
-    if window_kv_offsets is None:
-        window_kv_offsets = _dummy_wkvo[:batch_size]
-
-    if BLOCK_DMODEL >= 256:
-        BLOCK_N = 32
-    else:
-        BLOCK_N = 64
-    if _kv_is_fp8 and BLOCK_DMODEL < 256:
-        BLOCK_N = 128
-    EXT_BLOCK_N = BLOCK_N
-    NUM_STAGES = 1
-
-    if BLOCK_DMODEL >= 256:
-        # Caller should pass total_{prefix,extend}_len; fall back to
-        # CPU-side proxies instead of a GPU reduction on miss.
-        if total_prefix_len is None or total_extend_len is None:
-            if total_prefix_len is None:
-                total_prefix_len = kv_indices.numel()
-            if total_extend_len is None:
-                total_extend_len = q_extend.shape[0]
-        if min_len_extend is None:
-            min_len_extend = max_len_extend
-        BLOCK_M, num_warps, NUM_STAGES, _, _ = _select_d256_dispatch(
-            batch_size,
-            max_len_extend,
-            min_len_extend,
-            total_prefix_len,
-            total_extend_len,
-        )
-    elif BLOCK_DMODEL == 64:
-        _total_ext = batch_size * max_len_extend
-        if batch_size >= 16:
-            if max_len_extend <= 64:
-                BLOCK_M, num_warps = 64, 4
-            elif max_len_extend <= 256:
-                BLOCK_M, num_warps = 64, 4
-            elif max_len_extend <= 512:
-                BLOCK_M, num_warps = 256, 4
-            else:
-                BLOCK_M, num_warps = 256, 8
-        elif batch_size >= 4:
-            if max_len_extend <= 64:
-                BLOCK_M, num_warps = 64, 4
-            elif _total_ext >= 2048 or max_len_extend >= 512:
-                BLOCK_M, num_warps = 256, 8
-            else:
-                BLOCK_M, num_warps = 64, 4
-        else:
-            if max_len_extend >= 2048:
-                BLOCK_M, num_warps = 256, 8
-            else:
-                BLOCK_M, num_warps = 128, 8
-    elif BLOCK_DMODEL == 128:
-        _total_ext_full = batch_size * max_len_extend
-        if batch_size >= 16 and max_len_extend <= 16:
-            BLOCK_M, num_warps = 16, 4
-        elif batch_size >= 16 and max_len_extend <= 64:
-            BLOCK_M, num_warps = 64, 4
-        elif batch_size == 1:
-            BLOCK_M, num_warps = 64, 4
-        elif _total_ext_full >= 32768:
-            BLOCK_M, num_warps = 256, 8
-        else:
-            BLOCK_M, num_warps = 64, 4
-    else:
-        BLOCK_M = 128
-        num_warps = 8
-
-    if BLOCK_DMODEL >= 256:
-        pass  # NUM_STAGES already set by _select_d256_dispatch
-    elif BLOCK_DMODEL == 64:
-        if BLOCK_M == 256 and num_warps == 8:
-            NUM_STAGES = 2
-        else:
-            NUM_STAGES = 4
-    elif BLOCK_DMODEL == 128:
-        if BLOCK_M >= 256:
-            NUM_STAGES = 2
-        elif num_warps == 8 and BLOCK_M == 128:
-            NUM_STAGES = 4
-        elif num_warps == 4:
-            NUM_STAGES = 2
-        else:
-            NUM_STAGES = 2
-    elif BLOCK_M == 64:
-        NUM_STAGES = 1
-    else:
-        NUM_STAGES = 4
-
-    # FP8 never reaches this BF16 basic path: the dispatcher either splits
-    # (Lq<=128, no custom_mask), routes to _launch_basic_fp8 on custom_mask
-    # (via the FP8-specific full path), or raises on D=256 / D<=128+custom_mask.
-    EXT_NUM_STAGES = NUM_STAGES
-
-    # Correctness guards (D=64 NW=8 BM=256 is nondeterministic at NS!=2;
-    # D>=256 NW=8 NS=1 races on the DMA ring).
-    if BLOCK_DMODEL == 64 and num_warps == 8:
-        if BLOCK_M in (64, 128) and NUM_STAGES == 1:
-            NUM_STAGES = 2
-        if BLOCK_M == 256 and NUM_STAGES in (1, 3, 4):
-            NUM_STAGES = 2
-    if BLOCK_DMODEL >= 256 and num_warps == 8 and NUM_STAGES == 1:
-        NUM_STAGES = 2
-
-    sm_scale = sm_scale or 1.0 / math.sqrt(Lq)
-    sm_scale = sm_scale * k_scale
-    kv_group_num = q_extend.shape[1] // k_extend.shape[1]
-
-    # Cache strides and splitk dummy once.
-    _q_s0, _q_s1 = q_extend.stride(0), q_extend.stride(1)
-    _k_s0, _k_s1 = k_extend.stride(0), k_extend.stride(1)
-    _v_s0, _v_s1 = v_extend.stride(0), v_extend.stride(1)
-    _o_s0, _o_s1 = o_extend.stride(0), o_extend.stride(1)
-    _kb_s0, _kb_s1 = k_buffer.stride(0), k_buffer.stride(1)
-    _vb_s0, _vb_s1 = v_buffer.stride(0), v_buffer.stride(1)
-
-    _kernel_extra_full = {
-        "IS_FP8": True,
-        "EXT_BLOCK_N": EXT_BLOCK_N,
-        "EXT_NUM_STAGES": EXT_NUM_STAGES,
-    } if _kv_is_fp8 else {}
-
-    # Both BF16 and FP8 unified kernels take the persistent-superset
-    # signature; IS_PERSISTENT=False collapses to the basic 3D-grid body.
-    # Persistent runtime args go in as kwargs since the signature
-    # interleaves constexprs between the stride block and the persistent-
-    # only runtime block.
-    _grid_full = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    _kernel[_grid_full](
-        q_extend, k_extend, v_extend, o_extend,
-        k_buffer, v_buffer,
-        qo_indptr, kv_indptr, kv_indices,
-        custom_mask, mask_indptr, window_kv_offsets,
-        sm_scale, kv_group_num,
-        _q_s0, _q_s1, _k_s0, _k_s1, _v_s0, _v_s1,
-        _o_s0, _o_s1, _kb_s0, _kb_s1, _vb_s0, _vb_s1,
-        IS_CAUSAL=is_causal,
-        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        NUM_STAGES=NUM_STAGES,
-        **_kernel_extra_full,
-        Sinks=sinks, HAS_SINK=sinks is not None,
-        LOGIT_CAP=logit_cap,
-        XAI_TEMPERATURE_LEN=xai_temperature_len,
-        SLIDING_WINDOW_SIZE=sliding_window_size,
-        v_scale=v_scale,
-        num_heads=0,
-        total_valid_tiles=0, total_programs=0,
-        partial_out=_dummy_partial_out, partial_lse=_dummy_partial_lse,
-        tile_done=_dummy_tile_done,
-        actual_batch_size=0,
-        IS_PERSISTENT=False, SPLIT_K=1,
-        num_warps=num_warps, num_stages=1,
-        waves_per_eu=2,
-        matrix_instr_nonkdim=32,
-    )
-
-
-# FP8 persistent / split-K launchers.
-
-
-def _launch_persistent_fp8(
-    q_extend,
-    k_extend,
-    v_extend,
-    o_extend,
-    k_buffer,
-    v_buffer,
-    qo_indptr,
-    kv_indptr,
-    kv_indices,
-    custom_mask,
-    is_causal,
-    mask_indptr,
-    max_len_extend,
-    k_scale=1.0,
-    v_scale=1.0,
-    sm_scale=None,
-    logit_cap=0.0,
-    sliding_window_size=-1,
-    sinks=None,
-    window_kv_offsets=None,
-    xai_temperature_len=-1,
-    enable_prefix_unmasked=True,
-    min_len_extend=None,
-    SPLIT_K=1,
-    total_prefix_len=None,
-):
-    """Launch the FP8 persistent-CTA kernel, managing split-K workspace
-    and the dummy mask tensors when ``USE_CUSTOM_MASK`` is False."""
-    Lq = q_extend.shape[-1]
-    BLOCK_DMODEL = _resolve_qk_split_dims(Lq)
-
-    batch_size = qo_indptr.shape[0] - 1
-    custom_mask, mask_indptr, window_kv_offsets, USE_CUSTOM_MASK = (
-        _prepare_persistent_masks(
-            q_extend, batch_size, custom_mask, mask_indptr, window_kv_offsets,
-        )
-    )
-    assert q_extend.shape[1] % k_extend.shape[1] == 0
-
-    BLOCK_DV = BLOCK_DMODEL
-
+    # Use the same data-centric selector as the fast path. Full dispatch can
+    # provide exact length hints when available; missing hints fall back to
+    # cheap CPU-side proxies instead of materializing GPU reductions here.
+    if total_prefix_len is None:
+        total_prefix_len = kv_indices.numel()
+    if total_extend_len is None:
+        total_extend_len = q_extend.shape[0]
     if min_len_extend is None:
         min_len_extend = max_len_extend
-    head_num = q_extend.shape[1]
-
-    # Prefix-dominated chat-mix detection (Lq=128 only in practice, since
-    # D>=256 FP8 is unsupported): when the per-seq prefix is large enough
-    # that each tile iterates a long prefix, BM=64 NW=4 NS=1 BN=128 beats
-    # the default BM>=128 NW=8 by ~1.5-2x (no waste on short extends,
-    # better LDS/CU utilization per tile).
-    #
-    # B=4 edge: at batch==4 with ext>=128, per-tile compute on the prefix
-    # phase is substantial and the basic BM=128 NW=8 NS=2 cfg beats the
-    # small-tile here (bench: B=4 ext=128 pfx=4096 0.81x -> 1.03x). So
-    # require either B>=5, an even longer prefix (>=16k), or a short
-    # extend (ext<=64) to keep the small-tile win on decode-heavy shapes.
-    _total_pfx_fp8 = total_prefix_len if total_prefix_len is not None else 0
-    _avg_pfx_fp8 = _total_pfx_fp8 // max(1, batch_size)
-    _fp8_prefix_dominated = (
-        Lq == 128
-        and _avg_pfx_fp8 >= 4096
-        and (
-            batch_size >= 5
-            or _avg_pfx_fp8 >= 16384
-            or (batch_size >= 4 and max_len_extend <= 64)
-        )
+    _prefix_bucket_full_dispatch = _pfx_bucket(total_prefix_len, batch_size)
+    _cfg = _get_exact_data_centric_heuristic_config(
+        Lq,
+        batch_size,
+        max_len_extend,
+        min_len_extend,
+        total_prefix_len,
+        total_extend_len,
+        _prefix_bucket_full_dispatch,
+        _kv_is_fp8,
+        sliding_window_size,
+        head_num,
+        False,
     )
 
-    if SPLIT_K > 1:
-        # Split-K reduction is only correct at the BM=128 NW=8 big-tile
-        # config; pre-selected by ``_launch_splitk_fp8`` before it dispatches
-        # here with SPLIT_K>1.
-        BLOCK_M = 128
-        BLOCK_N = 128 if Lq <= 128 else (32 if BLOCK_DMODEL >= 256 else 64)
-        num_warps = 8
-        NUM_STAGES = _FP8_DEFAULT_NS
-    elif _fp8_prefix_dominated:
-        BLOCK_M = 64
-        BLOCK_N = 128
-        num_warps = 4
-        NUM_STAGES = 1
-    else:
-        BLOCK_N = 128 if Lq <= 128 else (32 if BLOCK_DMODEL >= 256 else 64)
-        if max(BLOCK_DMODEL, BLOCK_DV) >= 256:
-            BLOCK_M = 64
-            num_warps = 4
-        elif max_len_extend <= 128:
-            BLOCK_M = 128
-            num_warps = 8
-        elif batch_size <= 4:
-            BLOCK_M = 128
-            num_warps = 8
-        elif BLOCK_DMODEL >= 128 and min_len_extend >= 64 and max_len_extend >= 256:
-            BLOCK_M = 256
-            num_warps = 8
-        else:
-            BLOCK_M = 128
-            num_warps = 8
-
-        if Lq < 128:
-            num_warps = min(num_warps, 4)
-
-        NUM_STAGES = _FP8_DEFAULT_NS
-
-    EXT_BLOCK_N = _FP8_DEFAULT_EXT_BN
-    EXT_NUM_STAGES = _FP8_DEFAULT_EXT_NS
-
-    sm_scale = sm_scale or 1.0 / math.sqrt(Lq)
-    sm_scale = sm_scale * k_scale
-    kv_group_num = q_extend.shape[1] // k_extend.shape[1]
-
-    device = q_extend.device
-
-    _gfinal = _finalize_persistent_grid(
-        q_extend=q_extend,
-        kv_indptr=kv_indptr,
-        batch_size=batch_size,
-        head_num=head_num,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_DV=BLOCK_DV,
-        device=device,
-        total_prefix_len=total_prefix_len,
-        SPLIT_K=SPLIT_K,
-    )
-    if _gfinal["skip"]:
-        return
-
-    total_valid_tiles = _gfinal["total_valid_tiles"]
-    total_programs = _gfinal["total_programs"]
-    partial_out = _gfinal["partial_out"]
-    partial_lse = _gfinal["partial_lse"]
-    tile_done = _gfinal["tile_done"]
-    SPLIT_K = _gfinal["SPLIT_K"]
-    grid = _gfinal["grid"]
-
-    _kernel[grid](
-        q_extend,
-        k_extend,
-        v_extend,
-        o_extend,
-        k_buffer,
-        v_buffer,
-        qo_indptr,
-        kv_indptr,
-        kv_indices,
-        custom_mask,
-        mask_indptr,
-        window_kv_offsets,
-        sm_scale,
-        kv_group_num,
-        q_extend.stride(0),
-        q_extend.stride(1),
-        k_extend.stride(0),
-        k_extend.stride(1),
-        v_extend.stride(0),
-        v_extend.stride(1),
-        o_extend.stride(0),
-        o_extend.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
-        IS_CAUSAL=is_causal,
-        USE_CUSTOM_MASK=USE_CUSTOM_MASK,
-        ENABLE_PREFIX_UNMASKED=enable_prefix_unmasked,
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
-        BLOCK_DMODEL=BLOCK_DMODEL,
-        NUM_STAGES=NUM_STAGES,
-        Sinks=sinks,
-        HAS_SINK=sinks is not None,
-        LOGIT_CAP=logit_cap,
-        XAI_TEMPERATURE_LEN=xai_temperature_len,
-        SLIDING_WINDOW_SIZE=sliding_window_size,
-        v_scale=1.0 if SPLIT_K > 1 else v_scale,
-        num_heads=head_num,
-        total_valid_tiles=total_valid_tiles,
-        total_programs=total_programs,
-        partial_out=partial_out,
-        partial_lse=partial_lse,
-        tile_done=tile_done,
-        actual_batch_size=batch_size,
-        IS_PERSISTENT=True,
-        SPLIT_K=SPLIT_K,
-        IS_FP8=True,
-        EXT_BLOCK_N=EXT_BLOCK_N,
-        EXT_NUM_STAGES=EXT_NUM_STAGES,
-        num_warps=num_warps,
-        num_stages=1,
-        waves_per_eu=2,
-        matrix_instr_nonkdim=32,
-    )
-
-
-def _launch_splitk_fp8(
-    q_extend, k_extend, v_extend, o_extend,
-    k_buffer, v_buffer,
-    qo_indptr, kv_indptr, kv_indices,
-    custom_mask, mask_indptr, window_kv_offsets,
-    sm_scale, k_scale, v_scale, logit_cap,
-    Lq, is_causal, max_len_extend, min_len_extend,
-    sinks, xai_temperature_len, sliding_window_size,
-    BLOCK_M, BLOCK_N, num_warps, NUM_STAGES,
-    total_prefix_len=None,
-):
-    """Pick ``SPLIT_K`` and delegate to ``_launch_persistent_fp8``; falls
-    back to SPLIT_K=1 when the tiles-per-CU / pfx-per-BN heuristics
-    don't justify a multi-split reduction.
-
-    The pre-selected ``BLOCK_M`` / ``num_warps`` / ``NUM_STAGES`` are
-    inputs to the SPLIT_K=1 tile estimate; the persistent launcher
-    re-picks tiles for SPLIT_K>1 (it must use BM=128 NW=8 NS=default).
-    """
-    head_num = q_extend.shape[1]
-    device = q_extend.device
-    batch_size = qo_indptr.shape[0] - 1
-
-    total_output_tiles = (
-        batch_size * head_num * ((max_len_extend + BLOCK_M - 1) // BLOCK_M)
-    )
-    if total_output_tiles == 0:
-        return
-
-    num_CUs = _get_num_CUs(device)
-    if total_prefix_len is not None:
-        avg_kv_len = total_prefix_len // max(1, batch_size)
-    else:
-        avg_kv_len = int((kv_indptr[-1] - kv_indptr[0]).item()) // max(1, batch_size)
-    need_real_splitk = (
-        total_output_tiles < num_CUs and avg_kv_len >= 4 * BLOCK_N
-    )
-
-    if not need_real_splitk:
-        _launch_persistent_fp8(
-            q_extend, k_extend, v_extend, o_extend,
-            k_buffer, v_buffer,
-            qo_indptr, kv_indptr, kv_indices,
-            custom_mask, is_causal, mask_indptr,
-            max_len_extend,
-            k_scale=k_scale, v_scale=v_scale, sm_scale=sm_scale,
-            logit_cap=logit_cap,
-            min_len_extend=min_len_extend,
-            sinks=sinks,
-            xai_temperature_len=xai_temperature_len,
-            sliding_window_size=sliding_window_size,
-            window_kv_offsets=window_kv_offsets,
-            total_prefix_len=total_prefix_len,
-        )
-        return
-
-    SPLIT_K = _select_k_splits(total_output_tiles, num_CUs)
-    enable_prefix_unmasked = is_causal
-
-    _launch_persistent_fp8(
+    _launch_data_centric_grid(
         q_extend, k_extend, v_extend, o_extend,
         k_buffer, v_buffer,
         qo_indptr, kv_indptr, kv_indices,
-        custom_mask, is_causal, mask_indptr,
-        max_len_extend,
-        k_scale=k_scale, v_scale=v_scale, sm_scale=sm_scale,
-        logit_cap=logit_cap,
-        min_len_extend=min_len_extend,
-        sinks=sinks,
-        xai_temperature_len=xai_temperature_len,
-        sliding_window_size=sliding_window_size,
-        window_kv_offsets=window_kv_offsets,
-        enable_prefix_unmasked=enable_prefix_unmasked,
-        SPLIT_K=SPLIT_K,
-        total_prefix_len=total_prefix_len,
+        is_causal, max_len_extend,
+        k_scale, v_scale, sm_scale, logit_cap,
+        sliding_window_size, sinks, xai_temperature_len,
+        Lq, head_num, batch_size, _kv_is_fp8,
+        BLOCK_M=_cfg.block_m,
+        BLOCK_N=_cfg.block_n,
+        BLOCK_DMODEL=BLOCK_DMODEL,
+        NUM_STAGES=_cfg.num_stages,
+        num_warps=_cfg.num_warps,
+        custom_mask_arg=custom_mask,
+        mask_indptr_arg=mask_indptr,
+        window_kv_offsets_arg=window_kv_offsets,
+        ext_block_n=_cfg.ext_block_n,
+        ext_num_stages=_cfg.ext_num_stages,
+        total_prefix_len_hint=total_prefix_len,
+        total_extend_len_hint=total_extend_len,
+        min_len_extend_hint=min_len_extend,
     )

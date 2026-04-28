@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 _GLUON_SUPPORTED_HEAD_DIMS = {64, 128, 256}
 _FP8_KV_DTYPES = {torch.float8_e4m3fn, torch.float8_e4m3fnuz}
+_GLUON_SUPPORTED_FP8_KV_DTYPES = {torch.float8_e4m3fn}
 
 _GLUON_FN: Optional[Callable] = None
 
@@ -67,9 +68,9 @@ def _gluon_supports(
     Lv = v_extend.shape[-1]
     if Lq not in _GLUON_SUPPORTED_HEAD_DIMS or Lq != Lv:
         return False
-    if not is_causal:
-        return False
     kv_is_fp8 = k_buffer.dtype in _FP8_KV_DTYPES
+    if kv_is_fp8 and k_buffer.dtype not in _GLUON_SUPPORTED_FP8_KV_DTYPES:
+        return False
     # D=256 FP8 KV and D<=128 FP8 KV + custom mask are not implemented.
     if kv_is_fp8 and (Lq == 256 or (custom_mask is not None and Lq <= 128)):
         return False

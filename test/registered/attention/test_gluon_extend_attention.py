@@ -143,7 +143,7 @@ class TestGluonSupports(CustomTestCase):
         from sglang.srt.layers.attention.gluon_extend_attention import _gluon_supports
         q = self._mktensor((4, 8, 128), dtype=torch.bfloat16)
         v = self._mktensor((4, 4, 128), dtype=torch.bfloat16)
-        kb = self._mktensor((16, 4, 128), dtype=torch.float8_e4m3fnuz)
+        kb = self._mktensor((16, 4, 128), dtype=torch.float8_e4m3fn)
         self.assertFalse(
             _gluon_supports(
                 q, v, kb,
@@ -152,14 +152,22 @@ class TestGluonSupports(CustomTestCase):
             )
         )
 
-    def test_non_causal_falls_back(self):
-        """Non-causal extend (encoder / vision tower) is not yet
-        supported by the Gluon kernel, so it must route to Triton."""
+    def test_fnuz_fp8_kv_falls_back(self):
+        from sglang.srt.layers.attention.gluon_extend_attention import _gluon_supports
+        q = self._mktensor((4, 8, 128), dtype=torch.bfloat16)
+        v = self._mktensor((4, 4, 128), dtype=torch.bfloat16)
+        kb = self._mktensor((16, 4, 128), dtype=torch.float8_e4m3fnuz)
+        self.assertFalse(
+            _gluon_supports(q, v, kb, custom_mask=None, is_causal=True)
+        )
+
+    def test_non_causal_supported(self):
+        """Non-causal symmetric-head extend is now covered by the Gluon kernel."""
         from sglang.srt.layers.attention.gluon_extend_attention import _gluon_supports
         q = self._mktensor((4, 8, 128))
         v = self._mktensor((4, 4, 128))
         kb = self._mktensor((16, 4, 128))
-        self.assertFalse(
+        self.assertTrue(
             _gluon_supports(q, v, kb, custom_mask=None, is_causal=False)
         )
 

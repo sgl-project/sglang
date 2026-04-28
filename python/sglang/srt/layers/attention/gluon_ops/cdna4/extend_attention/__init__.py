@@ -7,10 +7,10 @@ covering the Triton-extend feature set: causal + sliding-window,
 attention sinks (GPT-OSS), logit capping (Grok / Gemma 2), GQA up to
 32:8, and D in {64, 128, 256}.
 
-The canonical research copy lives here (``kernels/cdna4/fa/extend/``);
-a mirror is vendored into SGLang at
+This package is the standalone Gluon-kernels home for the extend
+kernel; the SGLang fork vendors a mirror of these files at
 ``python/sglang/srt/layers/attention/gluon_ops/cdna4/extend_attention/``
-and consumed by ``TritonAttnBackend`` behind
+and consumes them through ``TritonAttnBackend`` behind
 ``--enable-gluon-extend-attention``.
 
 Public entry point:
@@ -18,12 +18,11 @@ Public entry point:
 * :func:`gluon_extend_attention_fwd` -- drop-in replacement for the
   Triton extend-attention reference, symmetric heads.
 
-No prewarm helpers are exposed. All launches go through the standard
-Triton ``kernel[grid](...)`` JIT entry point; Triton's own compile
-cache handles first-call JIT. A shape-keyed tile-config cache and
-per-forward WCA metadata reuse (split-K workspace, dummy mask
-buffers, persistent-grid size) keep warm-launch CPU overhead at the
-Triton-launcher floor (~5-6 us).
+All launches go through Triton's ``kernel[grid](...)`` JIT entry
+point; Triton's compile cache handles first-call JIT. A shape-keyed
+tile-config cache and per-forward WCA metadata reuse (split-K
+workspace, WCA-grid size) keep warm-launch
+CPU overhead at the Triton-launcher floor.
 """
 
 from .extend_attention_gfx950 import _get_num_CUs  # noqa: F401
