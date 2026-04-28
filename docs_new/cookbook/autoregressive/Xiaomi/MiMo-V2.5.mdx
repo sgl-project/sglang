@@ -43,7 +43,7 @@ tag: NEW
 **Key Features:**
 
 - **Hybrid Attention Architecture**: Interleaves Sliding Window Attention (SWA) and Global Attention (GA) for reduced KV cache while preserving long-context capability.
-- **Multi-Token Prediction (MTP)**: 3-layer MTP module accelerates decoding (329M params on V2.5; V2.5-Pro supports EAGLE speculative decoding on top of MTP).
+- **Multi-Token Prediction (MTP)**: 3-layer MTP module accelerates decoding. Both variants support EAGLE speculative decoding with MTP weights.
 - **1M-Token Context**: Both variants support up to 1 million token context windows.
 - **Agentic Capabilities**: Post-training with large-scale agentic RL achieves strong performance on coding, reasoning, and tool-use benchmarks.
 - **MiMo-V2.5 Multimodal** (V2.5 only): Native omnimodal architecture with a 729M-param ViT Vision Encoder (28 layers: 24 SWA + 4 Full) and a 261M-param Audio Transformer (24 layers: 12 SWA + 12 Full); supports image, video, and audio understanding via standard OpenAI-compatible multimodal API.
@@ -84,9 +84,10 @@ import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deploym
 - EAGLE speculative decoding (3 steps, topk=1) typically yields a 2–3× decode speedup. Requires `SGLANG_ENABLE_SPEC_V2=1`; on Hopper also pass `--enable-multi-layer-eagle`.
 
 **MiMo-V2.5 (310B):**
-- The checkpoint has a TP=4-interleaved fused `qkv_proj`; attention-TP per DP group **must** be 4. So DP-attention is always required (`--dp = TP / 4`), and total GPUs must be a multiple of 4. A bare `--tp 8` without `--dp 2` will fail to load with `MiMoV2Omni fused qkv_proj checkpoint is TP=4-interleaved; got tp_size=8`.
+- The checkpoint has a TP=4-interleaved fused `qkv_proj`; attention-TP per DP group **must** be 4. Use `--dp = TP / 4`; for TP > 4 this also requires DP-attention. Total GPUs must be a multiple of 4. A bare `--tp 8` without `--dp 2` will fail to load with `MiMoV2 fused qkv_proj checkpoint is TP=4-interleaved; got attention tp_size=8`.
 - Single-node deployments: H100/H200 8× GPUs (`--tp 8 --dp 2`), B200 4× GPUs (`--tp 4`, dp=1, no DP-attn flag needed), GB300 4× GPUs (`--tp 4`, single NVL4 node). FP8 quantization.
 - `--enable-dp-lm-head` and `--mm-enable-dp-encoder` are required whenever `--enable-dp-attention` is on, to keep LM head and encoder sharding consistent.
+- EAGLE MTP uses the checkpoint's MTP weights. For H100/H200, enable `SGLANG_ENABLE_SPEC_V2=1`, `--speculative-algorithm EAGLE`, and `--enable-multi-layer-eagle`.
 - **Multimodal**: Supports image, video, and audio understanding; see Section 4.3 for invocation examples.
 
 **DeepEP (optional toggle, Hopper-only):**
@@ -324,7 +325,7 @@ The user wants to know the weather in Beijing. I have a function available calle
 
 ## 5. Benchmark
 
-Accuracy numbers come from `sglang.test.run_eval` (GSM8K standard 5-shot, MMMU validation split). Speed numbers come from `sglang.bench_serving` against the [ShareGPT_Vicuna_unfiltered](https://huggingface.co/datasets/anon8231489123/ShareGPT_Vicuna_unfiltered) dataset; each request is configured with 1024 input tokens and 1024 output tokens to represent a typical medium-length conversation.
+Accuracy numbers come from `sglang.test.run_eval` (GSM8K standard 5-shot, MMMU validation split). Speed numbers come from `sglang.bench_serving` with generated random prompts; text runs use 1024 input tokens and 1024 output tokens per request, and the image run uses 2 random 720p images per request.
 
 ### 5.1 Accuracy Benchmark
 
@@ -440,13 +441,13 @@ Pending update — replace with real bench_serving output after the throughput r
 
 - Hardware: NVIDIA H200 GPU (8×)
 - Model: `XiaomiMiMo/MiMo-V2.5` (FP8)
-- Tensor Parallelism: 8 (DP-attention with `--dp-size 2`)
-- Recipe: Balanced (DP-attn)
-- sglang version: 1.1.2.dev9066
+- Tensor Parallelism: 8 (DP-attention with `--dp 2`)
+- Recipe: Balanced (DP-attn + EAGLE MTP)
+- sglang version: `0.0.0.dev1+g7d99af439` (`lmsysorg/sglang:dev-mimo-v2.5`)
 
 #### 5.3.1 Latency-Sensitive Benchmark
 
-- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
+- **Model Deployment Command:** select MiMo-V2.5, H200, and EAGLE MTP in the [command panel above](#3-model-deployment).
 - Benchmark Command:
 
 ```shell Command
@@ -469,43 +470,44 @@ Backend:                                 sglang
 Traffic request rate:                    inf
 Max request concurrency:                 1
 Successful requests:                     10
-Benchmark duration (s):                  26.41
+Benchmark duration (s):                  14.72
 Total input tokens:                      1997
 Total input text tokens:                 1997
 Total generated tokens:                  2798
-Total generated tokens (retokenized):    2669
-Request throughput (req/s):              0.38
-Input token throughput (tok/s):          75.60
-Output token throughput (tok/s):         105.93
-Peak output token throughput (tok/s):    110.00
+Total generated tokens (retokenized):    2697
+Request throughput (req/s):              0.68
+Input token throughput (tok/s):          135.67
+Output token throughput (tok/s):         190.09
+Peak output token throughput (tok/s):    245.00
 Peak concurrent requests:                3
-Total token throughput (tok/s):          181.53
+Total token throughput (tok/s):          325.77
 Concurrency:                             1.00
+Accept length:                           3.08
 ----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   2639.75
-Median E2E Latency (ms):                 2928.14
-P90 E2E Latency (ms):                    4107.62
-P99 E2E Latency (ms):                    4830.83
+Mean E2E Latency (ms):                   1469.98
+Median E2E Latency (ms):                 1652.84
+P90 E2E Latency (ms):                    2210.80
+P99 E2E Latency (ms):                    2823.86
 ---------------Time to First Token----------------
-Mean TTFT (ms):                          73.94
-Median TTFT (ms):                        74.09
-P99 TTFT (ms):                           79.90
+Mean TTFT (ms):                          143.89
+Median TTFT (ms):                        99.25
+P99 TTFT (ms):                           481.01
 -----Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          9.19
-Median TPOT (ms):                        9.21
-P99 TPOT (ms):                           9.24
+Mean TPOT (ms):                          4.87
+Median TPOT (ms):                        4.30
+P99 TPOT (ms):                           6.64
 ---------------Inter-Token Latency----------------
-Mean ITL (ms):                           9.20
-Median ITL (ms):                         9.21
-P95 ITL (ms):                            9.31
-P99 ITL (ms):                            9.43
-Max ITL (ms):                            16.43
+Mean ITL (ms):                           4.76
+Median ITL (ms):                         3.46
+P95 ITL (ms):                            13.52
+P99 ITL (ms):                            13.84
+Max ITL (ms):                            74.37
 ==================================================
 ```
 
 #### 5.3.2 Throughput-Sensitive Benchmark
 
-- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
+- **Model Deployment Command:** select MiMo-V2.5, H200, and EAGLE MTP in the [command panel above](#3-model-deployment).
 - Benchmark Command:
 
 ```shell Command
@@ -528,43 +530,44 @@ Backend:                                 sglang
 Traffic request rate:                    inf
 Max request concurrency:                 100
 Successful requests:                     1000
-Benchmark duration (s):                  87.23
+Benchmark duration (s):                  93.41
 Total input tokens:                      302118
 Total input text tokens:                 302118
 Total generated tokens:                  195775
-Total generated tokens (retokenized):    190470
-Request throughput (req/s):              11.46
-Input token throughput (tok/s):          3463.61
-Output token throughput (tok/s):         2244.45
-Peak output token throughput (tok/s):    4274.00
-Peak concurrent requests:                122
-Total token throughput (tok/s):          5708.05
-Concurrency:                             87.80
+Total generated tokens (retokenized):    188139
+Request throughput (req/s):              10.71
+Input token throughput (tok/s):          3234.48
+Output token throughput (tok/s):         2095.97
+Peak output token throughput (tok/s):    3019.00
+Peak concurrent requests:                121
+Total token throughput (tok/s):          5330.45
+Concurrency:                             91.04
+Accept length:                           2.95
 ----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   7658.29
-Median E2E Latency (ms):                 5195.82
-P90 E2E Latency (ms):                    18382.07
-P99 E2E Latency (ms):                    32849.04
+Mean E2E Latency (ms):                   8503.45
+Median E2E Latency (ms):                 7491.96
+P90 E2E Latency (ms):                    13706.99
+P99 E2E Latency (ms):                    20474.33
 ---------------Time to First Token----------------
-Mean TTFT (ms):                          188.32
-Median TTFT (ms):                        138.69
-P99 TTFT (ms):                           746.89
+Mean TTFT (ms):                          4399.20
+Median TTFT (ms):                        4333.35
+P99 TTFT (ms):                           8004.81
 -----Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          40.13
-Median TPOT (ms):                        40.68
-P99 TPOT (ms):                           80.38
+Mean TPOT (ms):                          58.23
+Median TPOT (ms):                        21.78
+P99 TPOT (ms):                           747.79
 ---------------Inter-Token Latency----------------
-Mean ITL (ms):                           38.42
-Median ITL (ms):                         21.63
-P95 ITL (ms):                            82.64
-P99 ITL (ms):                            119.66
-Max ITL (ms):                            726.36
+Mean ITL (ms):                           20.06
+Median ITL (ms):                         15.28
+P95 ITL (ms):                            48.36
+P99 ITL (ms):                            96.99
+Max ITL (ms):                            969.61
 ==================================================
 ```
 
 #### 5.3.3 Multimodal (Image) Benchmark
 
-- **Model Deployment Command:** see the [command panel above](#3-model-deployment).
+- **Model Deployment Command:** select MiMo-V2.5, H200, and EAGLE MTP in the [command panel above](#3-model-deployment).
 - Benchmark Command:
 
 ```shell Command
@@ -590,37 +593,38 @@ Backend:                                 sglang-oai-chat
 Traffic request rate:                    inf
 Max request concurrency:                 1
 Successful requests:                     10
-Benchmark duration (s):                  41.89
-Total input tokens:                      18514
-Total input text tokens:                 874
-Total input vision tokens:               17640
+Benchmark duration (s):                  25.73
+Total input tokens:                      661
+Total input text tokens:                 631
+Total input vision tokens:               30
 Total generated tokens:                  4220
-Total generated tokens (retokenized):    1478
-Request throughput (req/s):              0.24
-Input token throughput (tok/s):          442.01
-Output token throughput (tok/s):         100.75
-Peak output token throughput (tok/s):    107.00
+Total generated tokens (retokenized):    0
+Request throughput (req/s):              0.39
+Input token throughput (tok/s):          25.69
+Output token throughput (tok/s):         164.03
+Peak output token throughput (tok/s):    1.00
 Peak concurrent requests:                2
-Total token throughput (tok/s):          542.76
+Total token throughput (tok/s):          189.73
 Concurrency:                             1.00
+Accept length:                           2.94
 ----------------End-to-End Latency----------------
-Mean E2E Latency (ms):                   4186.79
-Median E2E Latency (ms):                 3366.20
-P90 E2E Latency (ms):                    7545.54
-P99 E2E Latency (ms):                    9180.85
+Mean E2E Latency (ms):                   2570.74
+Median E2E Latency (ms):                 2411.92
+P90 E2E Latency (ms):                    3711.62
+P99 E2E Latency (ms):                    4949.74
 ---------------Time to First Token----------------
-Mean TTFT (ms):                          1284.90
-Median TTFT (ms):                        622.81
-P99 TTFT (ms):                           5030.79
+Mean TTFT (ms):                          0.00
+Median TTFT (ms):                        0.00
+P99 TTFT (ms):                           0.00
 -----Time per Output Token (excl. 1st token)------
-Mean TPOT (ms):                          7.36
-Median TPOT (ms):                        8.45
-P99 TPOT (ms):                           10.94
+Mean TPOT (ms):                          7.31
+Median TPOT (ms):                        6.17
+P99 TPOT (ms):                           17.18
 ---------------Inter-Token Latency----------------
-Mean ITL (ms):                           9.54
-Median ITL (ms):                         9.45
-P95 ITL (ms):                            9.58
-P99 ITL (ms):                            11.12
-Max ITL (ms):                            37.67
+Mean ITL (ms):                           0.00
+Median ITL (ms):                         0.00
+P95 ITL (ms):                            0.00
+P99 ITL (ms):                            0.00
+Max ITL (ms):                            0.00
 ==================================================
 ```
