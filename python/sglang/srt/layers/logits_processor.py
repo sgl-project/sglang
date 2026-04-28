@@ -21,6 +21,7 @@ import torch
 import triton
 import triton.language as tl
 from torch import nn
+from triton.language.extra import libdevice
 
 from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
@@ -1109,39 +1110,49 @@ class LogitsProcessor(nn.Module):
 def fused_softcap_kernel(
     full_logits_ptr,
     softcapping_value,
-    n_elements,
+    ncols,
+    row_stride,
     BLOCK_SIZE: tl.constexpr,
 ):
+    row = tl.program_id(1).to(tl.int64)
     pid = tl.program_id(0).to(tl.int64)
     block_start = pid * BLOCK_SIZE
     offsets = block_start + tl.arange(0, BLOCK_SIZE)
-    mask = offsets < n_elements
+    mask = offsets < ncols
 
     # Load values
-    x = tl.load(full_logits_ptr + offsets, mask=mask)
+    row_ptr = full_logits_ptr + row * row_stride
+    x = tl.load(row_ptr + offsets, mask=mask)
 
     # Perform operations in-place
     x = x / softcapping_value
-
-    # Manual tanh implementation using exp
-    exp2x = tl.exp(2 * x)
-    x = (exp2x - 1) / (exp2x + 1)
-
+    x = libdevice.tanh(x)
     x = x * softcapping_value
 
     # Store result
-    tl.store(full_logits_ptr + offsets, x, mask=mask)
+    tl.store(row_ptr + offsets, x, mask=mask)
 
 
 def fused_softcap(full_logits, final_logit_softcapping):
-    n_elements = full_logits.numel()
+    if full_logits.is_contiguous():
+        nrows, ncols = 1, full_logits.numel()
+        row_stride = ncols
+    else:
+        assert full_logits.ndim == 2, "non-contiguous softcap requires 2D tensor"
+        assert (
+            full_logits.stride(1) == 1
+        ), "non-contiguous softcap requires contiguous columns"
+        nrows, ncols = full_logits.shape
+        row_stride = full_logits.stride(0)
+
     BLOCK_SIZE = 1024
-    grid = ((n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE, 1, 1)
+    grid = ((ncols + BLOCK_SIZE - 1) // BLOCK_SIZE, nrows)
 
     fused_softcap_kernel[grid](
         full_logits_ptr=full_logits,
         softcapping_value=final_logit_softcapping,
-        n_elements=n_elements,
+        ncols=ncols,
+        row_stride=row_stride,
         BLOCK_SIZE=BLOCK_SIZE,
     )
     return full_logits
