@@ -20,8 +20,6 @@ The **Ling-2.6** family from inclusionAI is the next iteration of the Ling insta
 - **BF16**: [inclusionAI/Ling-2.6-flash](https://huggingface.co/inclusionAI/Ling-2.6-flash) — 104B total / 7.4B active
 - **FP8 (E4M3)**: [inclusionAI/Ling-2.6-1T](https://huggingface.co/inclusionAI/Ling-2.6-1T) — ~1T total
 
-> Both Hugging Face repositories are **private** at the time of writing — request access via the model card page.
-
 **License:** MIT
 
 ## 2. SGLang Installation
@@ -53,7 +51,7 @@ import { Ling26FlashDeployment } from '/src/snippets/autoregressive/ling-26-flas
 - Native context is 128K. Enable YaRN (`--json-model-override-args '{"rope_scaling": {"rope_type": "yarn", "factor": 2.0, ...}}'`) to extend to 256K — the snippet does this for you.
 - `--tool-call-parser qwen25` matches the model's `<tool_call>...</tool_call>` schema.
 - The recommended baseline does **not** include `--reasoning-parser qwen3`. Ling-2.6 is a controllable-reasoning model whose chat template defaults to `detailed thinking off`; the SGLang `qwen3` reasoning parser, in contrast, assumes default-thinking semantics and would mis-route normal output into `reasoning_content`. Only enable it if you specifically want `<think>...</think>` blocks split out — see [§4.3 Thinking Mode](#43-thinking-mode-detailed-thinking-onoff).
-- **MTP (multi-token prediction)** is supported by the model but, at the time of writing, requires a patched SGLang branch published by inclusionAI — see the [model card](https://huggingface.co/inclusionAI/Ling-2.6-flash#run-inference). Once that fix lands upstream the standard launch command above can simply add `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --mamba-scheduler-strategy extra_buffer`.
+- **MTP (multi-token prediction)** is supported. Add `--speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 --mamba-scheduler-strategy extra_buffer` to enable it — see the [model card](https://huggingface.co/inclusionAI/Ling-2.6-flash#run-inference) for the full example.
 
 ### 3.2 Ling-2.6-1T
 
@@ -218,7 +216,7 @@ For more API examples, see the [SGLang Basic Usage Guide](../../../docs/basic_us
 
 ### GSM8K (Ling-2.6-1T, GB300 × 4)
 
-Validated on a single GB300 node with `--tp 4`:
+Reference run on a single GB300 node with `--tp 4`:
 
 ```bash Command
 python3 benchmark/gsm8k/bench_sglang.py
