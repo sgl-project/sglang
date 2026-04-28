@@ -1486,7 +1486,8 @@ async def handle_encode_request(request: dict):
         # The semaphore must gate both broadcast and encode together because
         # encoding uses distributed collectives across all TP ranks.
         wait_start = time.time()
-        if encoder.running_encode_count >= encoder.encoder_max_running_requests:
+        throttled = encoder.running_encode_count >= encoder.encoder_max_running_requests
+        if throttled:
             logger.warning(
                 f"[{req_id}] Encode request throttled: "
                 f"{encoder.running_encode_count}/{encoder.encoder_max_running_requests} "
@@ -1495,17 +1496,18 @@ async def handle_encode_request(request: dict):
         async with encoder.encode_semaphore:
             wait_duration = time.time() - wait_start
             encoder.running_encode_count += 1
-            if wait_duration > 0.01:
-                logger.info(
-                    f"[{req_id}] Semaphore acquired after {wait_duration:.3f}s, "
-                    f"running: {encoder.running_encode_count}/{encoder.encoder_max_running_requests}"
-                )
             try:
                 nbytes, embedding_len, embedding_dim, error_msg, error_code = (
                     await _broadcast_and_encode()
                 )
             finally:
                 encoder.running_encode_count -= 1
+                if throttled:
+                    encode_duration = time.time() - wait_start - wait_duration
+                    logger.info(
+                        f"[{req_id}] Encode done: waited {wait_duration:.3f}s, "
+                        f"encoded {encode_duration:.3f}s"
+                    )
 
         if error_msg:
             if encoder.server_args.encoder_transfer_backend == "zmq_to_scheduler":

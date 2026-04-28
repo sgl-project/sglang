@@ -818,12 +818,12 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
         # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
         self.assertGreater(mmmu_accuracy, 0.40)
 
-        # Verify encoder throttling was triggered (max-running-requests=2, batch_size=32)
+        # Verify encoder throttling was triggered (max-running-requests=16, batch_size=32)
         encoder_logs = self.encode_stdout.getvalue() + self.encode_stderr.getvalue()
         self.assertIn(
             "Encode request throttled",
             encoder_logs,
-            "Encoder throttling should be triggered with max-running-requests=2",
+            "Encoder throttling should be triggered with max-running-requests=16",
         )
 
 
