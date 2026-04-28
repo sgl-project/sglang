@@ -830,6 +830,10 @@ class ServerArgs:
     msprobe_dump_config: Optional[str] = None
 
     def __post_init__(self):
+        """
+        Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
+        """
+
         if self.prefill_only_disable_kv_cache:
             # This flag is intentionally scoped to embedding mode for now. Other
             # prefill-only paths (for example scoring and MIS) can benefit from
@@ -865,10 +869,6 @@ class ServerArgs:
                     "--prefill-only-disable-kv-cache requires --disable-radix-cache because the radix cache "
                     "indexes KV pool slots that no longer hold real data."
                 )
-
-        """
-        Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
-        """
 
         self._maybe_download_model_for_runai()
 
