@@ -82,14 +82,27 @@ class TestUGDiffusionPipeline(unittest.TestCase):
         self.assertEqual(result.trajectory_latents.shape[0], 3)
         self.assertEqual(result.trajectory_timesteps.shape[0], 3)
 
-        counters = pipeline.get_module("ug_bridge").runtime.get_debug_counters(
-            result.extra["ug_contexts"].full.session
-        )
+        bridge = pipeline.get_module("ug_bridge")
+        session = result.extra["ug_contexts"].full.session
+        counters = bridge.runtime.get_debug_counters(session)
         self.assertEqual(counters["prefill_count"], 1)
         self.assertEqual(counters["velocity_count"], 3)
         self.assertEqual(counters["append_image_count"], 1)
         self.assertEqual(counters["decode_count"], 2)
+        self.assertEqual(counters["srt_request_count"], 2)
+        self.assertEqual(counters["srt_last_request_id"], session.anchor_request_id)
+        self.assertEqual(counters["srt_last_origin_input_len"], 8)
+        self.assertEqual(counters["srt_mm_offsets"], [(1, 3), (6, 8)])
         self.assertEqual(counters["state"], "u_decode")
+
+        bridge.release_contexts(result.extra["ug_contexts"])
+        closed = bridge.runtime.get_debug_counters(session.session_id)
+        self.assertTrue(closed["closed"])
+        self.assertEqual(closed["state"], "done")
+        self.assertEqual(
+            bridge.runtime.session_controller.tree_cache.released_sessions,
+            [session.session_id],
+        )
 
     def test_runtime_guard_rejects_cfg_parallel(self):
         server_args = _make_server_args()

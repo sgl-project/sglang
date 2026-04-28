@@ -45,6 +45,7 @@ flowchart LR
 - 真权重多步路径暴露了两个真实集成点：SGLD 侧 latent/timestep 初始在 CPU，需要在 BAGEL adapter 内迁到模型 runtime device；BAGEL 官方 image/text context update 和 `gen_text` 依赖 bfloat16 autocast，否则 append generated image 会在 `update_context_image` 里触发 Float/BFloat16 matmul dtype mismatch。
 - G decode 又向真实路径推进了一步：`UGDecodeStage` 新增 `decode_latents` 窄接口，SRT-backed BAGEL adapter 通过官方 `InterleaveInferencer.decode_image(...)` 走 VAE decode。真权重脚本输出 `output_shape=(1, 32, 32, 3)`、`output_dtype=uint8`、`output_minmax=0..197`、`output_mean=96.56`，随后同一 session append image 并继续 U decode。
 - G init latent 也已交给模型侧定义：`UGLatentStage` 先通过 `SRTBackedUGDenoiserBridge.prepare_latents(...)` 询问 UG runtime，BAGEL backend 复用同一个 `BAGELPreparedDenoise` 里的官方 `packed_init_noises` 和 `packed_vae_position_ids`。真权重脚本输出 `latents_shape=(4, 64)`、`latent_position_ids_shape=(4,)`、`ug_latent_shape=(2, 2, 64)`、`trajectory_latents_shape=(3, 4, 64)`，不再使用 SGLD config 自行拼出的 `(1, 4, 64)` batch latent。
+- UGPipeline 装配层现在为 `SRTBackedUGDenoiserBridge` 创建带真实 `SessionController` 的 `UGSessionRuntime`。真权重脚本输出 `srt_request_count=2`、`srt_last_request_id=<session>:u2`、`srt_last_origin_input_len=10`、`srt_mm_offsets=[(8, 10)]`；`release_contexts` 后同一 session 的 `srt_mm_features_released=True`，controller session 列表为空，tree cache 收到 release session。这个闭环证明 diffusion-side pipeline 已经能让 UG prefill 和 append image 进入 SRT session/request 生命周期。
 - `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake official model 验证 `_forward_flow` 只调用一次、CFG interval 规则一致、timestep 会扩展到 latent batch。
 - `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake official inferencer 验证 U-G-U 闭环：同一 session prefill 一次、denoise 多步复用 prepared context、BAGEL decode latents 到 image、append image 后继续 U decode，并且追加新 U 输入后能进入下一轮 G marker。
 - `python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py` 用 fake loader symbols 验证真 loader 的官方构造形状和单卡 device-map pinning，不需要真实 7B 权重。
@@ -52,5 +53,5 @@ flowchart LR
 
 ## 仍未解决
 
-- 真权重已证明同 session 的 `U -> G 多步 -> append image -> U text` 控制流，但还没有把这套路径挂进 SRT engine 的真实 request/scheduler 入口。
+- 真权重已证明同 session 的 `U -> G 多步 -> append image -> U text` 控制流，也已让 U prefill / append image 进入 SRT `SessionController` 的 request 生命周期；但 U forward 本身还没有由 SRT scheduler/model runner 执行。
 - CFG/text/image 三份上下文现在仍在 BAGEL adapter 内用官方 `NaiveCache` 表达；还没有落到 SRT paged KV allocator 的真实 page/slot 生命周期。
