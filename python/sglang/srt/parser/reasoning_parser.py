@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Tuple, Type
+from typing import Dict, List, Optional, Tuple, Type
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.parser.harmony_parser import HarmonyParser
@@ -23,6 +23,7 @@ class BaseReasoningFormatDetector:
         self,
         think_start_token: str,
         think_end_token: str,
+        think_excluded_tokens: Optional[List[str]] = None,
         force_reasoning: bool = False,
         stream_reasoning: bool = True,
         tool_start_token: Optional[str] = None,
@@ -31,6 +32,7 @@ class BaseReasoningFormatDetector:
     ):
         self.think_start_token = think_start_token
         self.think_end_token = think_end_token
+        self.think_excluded_tokens = think_excluded_tokens
         self.tool_start_token = tool_start_token
         self._in_reasoning = force_reasoning
         self.stream_reasoning = stream_reasoning
@@ -237,9 +239,16 @@ class Qwen3Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
     ):
+        think_excluded_tokens = [
+            "<tool_call>",
+            "</tool_call>",
+            "<|im_end|>",
+            "<|endoftext|>",
+        ]
         super().__init__(
             "<think>",
             "</think>",
+            think_excluded_tokens=think_excluded_tokens,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
@@ -290,9 +299,22 @@ class KimiK2Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
     ):
+        think_excluded_tokens = [
+            "<think>",
+            "<|tool_calls_section_begin|>",
+            "<|tool_call_begin|>",
+            "<|tool_call_argument_begin|>",
+            "<|tool_call_section_end|>",
+            "<|tool_call_end|>",
+            "[EOS]",
+            "<|im_end|>",
+            "<|end_header_id|>",
+            "[EOT]",
+        ]
         super().__init__(
             "<think>",
             "</think>",
+            think_excluded_tokens=think_excluded_tokens,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             tool_start_token="<|tool_calls_section_begin|>",
@@ -315,9 +337,17 @@ class Glm45Detector(BaseReasoningFormatDetector):
     """
 
     def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = False):
+        think_excluded_tokens = [
+            "<tool_call>",
+            "</tool_call>",
+            "<eop>",
+            "<|user|>",
+            "<|endoftext|>",
+        ]
         super().__init__(
             "<think>",
             "</think>",
+            think_excluded_tokens=think_excluded_tokens,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             tool_start_token="<tool_call>",

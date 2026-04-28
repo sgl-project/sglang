@@ -445,6 +445,7 @@ class ServerArgs:
     enable_cache_report: bool = False
     reasoning_parser: Optional[str] = None
     strip_thinking_cache: bool = False
+    enable_strict_thinking: bool = False
     tool_call_parser: Optional[str] = None
     tool_server: Optional[str] = None
     sampling_defaults: str = "model"
@@ -4971,6 +4972,14 @@ class ServerArgs:
             help="Skip caching reasoning-model output (thinking + answer) in the "
             "radix tree on finish; keep only the prompt prefix. Opt-in: changes "
             "cache contents.",
+        )
+        parser.add_argument(
+            "--enable-strict-thinking",
+            action="store_true",
+            default=ServerArgs.enable_strict_thinking,
+            help="Enable strict token filtering during the thinking phase. "
+            "Blocks model-specific excluded tokens (e.g., tool call markers) "
+            "during reasoning. Requires a grammar backend that supports token filtering.",
         )
         tool_call_parser_choices = list(FunctionCallParser.ToolCallParserEnum.keys())
         parser.add_argument(
