@@ -13,6 +13,7 @@ is set.
 import json
 import logging
 import time
+import asyncio
 
 from aiohttp import web
 
@@ -221,11 +222,12 @@ async def serve_grpc(server_args, model_info=None):
             )
 
     try:
-        await _serve_grpc(
-            server_args,
-            model_info,
-            on_request_manager_ready=_on_request_manager_ready,
-        )
+        # Start gRPC service without callback.
+        grpc_task = asyncio.create_task(_serve_grpc(server_args, model_info))
+        # Start HTTP sidecar directly without relying on smg callback.
+        await _on_request_manager_ready(None, server_args, None)
+        # Wait for gRPC service to complete.
+        await grpc_task
     finally:
         if sidecar_runner is not None:
             try:
