@@ -1379,9 +1379,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
         if self.server_args.debug_tensor_dump_output_folder is not None:
+            dump_folder = self.server_args.debug_tensor_dump_output_folder
+            if self.spec_algorithm.is_eagle():
+                role = "draft" if self.is_draft_worker else "target"
+                dump_folder = os.path.join(dump_folder, role)
             register_forward_hook_for_model(
                 self.model,
-                self.server_args.debug_tensor_dump_output_folder,
+                dump_folder,
                 self.server_args.debug_tensor_dump_layers,
                 self.tp_size,
                 self.tp_rank,

@@ -6254,7 +6254,11 @@ class ServerArgs:
             "--debug-tensor-dump-output-folder",
             type=str,
             default=ServerArgs.debug_tensor_dump_output_folder,
-            help="The output folder for dumping tensors.",
+            help=(
+                "The output folder for dumping tensors. "
+                "In Eagle mode, tensor outputs from draft and target models "
+                "are stored in separate subdirectories ('draft' and 'target')."
+            ),
         )
         parser.add_argument(
             "--debug-tensor-dump-layers",
