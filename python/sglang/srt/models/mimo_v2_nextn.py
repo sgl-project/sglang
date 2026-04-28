@@ -28,6 +28,7 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import (
     get_attention_tp_rank,
+    get_attention_tp_size,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -39,15 +40,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.mimo_v2_flash import (
+from sglang.srt.models.mimo_v2 import (
     MiMoV2Attention,
-    MiMoV2FlashForCausalLM,
+    MiMoV2ForCausalLM,
     MiMoV2MLP,
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 
-MiMoV2FlashConfig = None
+MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +56,7 @@ logger = logging.getLogger(__name__)
 class MiMoV2MTPLayer(nn.Module):
     def __init__(
         self,
-        config: MiMoV2FlashConfig,
+        config: MiMoV2Config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -71,7 +72,11 @@ class MiMoV2MTPLayer(nn.Module):
             and rope_scaling.get("rope_type") == "default"
         ):
             rope_scaling = None
-        max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+        max_position_embeddings = getattr(
+            config,
+            "context_len",
+            getattr(config, "max_position_embeddings", 32768),
+        )
 
         self.self_attn = MiMoV2Attention(
             hidden_size=self.hidden_size,
@@ -228,7 +233,7 @@ class MiMoV2ModelNextN(nn.Module):
         return hidden_states, hidden_states_before_norm
 
 
-class MiMoV2MTP(MiMoV2FlashForCausalLM):
+class MiMoV2MTP(MiMoV2ForCausalLM):
 
     def __init__(
         self,
@@ -295,6 +300,16 @@ class MiMoV2MTP(MiMoV2FlashForCausalLM):
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
             name = self.map_model_name_to_mtp_param_name(name)
+
+            # Support fused qkv_proj checkpoint (Pro format)
+            if "qkv_proj" in name:
+                if name in params_dict:
+                    tp_size = get_attention_tp_size()
+                    tp_rank = get_attention_tp_rank()
+                    param = params_dict[name]
+                    loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
+                    default_weight_loader(param, loaded_weight)
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
 

@@ -4,9 +4,6 @@ Usage:
     python3.10 -m pytest test/registered/hicache/test_hicache_storage_mooncake_backend.py -v
 """
 
-# TODO: Segmentation fault occurs when upgraded to Cu13. Ref: https://github.com/sgl-project/sglang/actions/runs/24601791606/job/71942123195?pr=23119")
-# Should move back to registered test after it's fixed
-
 import os
 import subprocess
 import time
@@ -15,12 +12,16 @@ import unittest
 import requests
 from test_hicache_storage_file_backend import HiCacheStorageBaseMixin
 
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_MLA_MODEL_NAME_FOR_TEST,
     CustomTestCase,
     find_available_port,
+    get_gpu_count,
     is_in_ci,
 )
+
+register_cuda_ci(est_time=236, suite="stage-b-test-2-gpu-large")
 
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
@@ -257,6 +258,39 @@ class TestMooncakeBackendMLAModel(
         server_args, env_vars = super()._get_additional_server_args_and_env()
         server_args["--hicache-mem-layout"] = "page_first"
         server_args["--tp-size"] = 2
+        return server_args, env_vars
+
+
+@unittest.skipUnless(get_gpu_count() >= 2, "Requires at least 2 CUDA GPUs for TP2+CP2")
+class TestMooncakeBackendQwen330BCP2(
+    HiCacheStorageMooncakeBackendBaseMixin, CustomTestCase
+):
+    """Qwen3-30B with Mooncake HiCache storage, CP2, and TP2."""
+
+    @classmethod
+    def _get_model_name(cls):
+        return "Qwen/Qwen3-30B-A3B-FP8"
+
+    @classmethod
+    def _get_additional_server_args_and_env(cls):
+        server_args, env_vars = super()._get_additional_server_args_and_env()
+        server_args.update(
+            {
+                "--tp-size": 2,
+                "--moe-dp-size": 2,
+                "--attn-cp-size": 2,
+                "--enable-prefill-context-parallel": True,
+                "--trust-remote-code": True,
+                "--cuda-graph-max-bs": 32,
+                "--max-running-requests": 32,
+                "--max-total-tokens": 8192,
+                "--model-loader-extra-config": (
+                    '{"enable_multithread_load": true, "num_threads": 64}'
+                ),
+                "--hicache-mem-layout": "page_first_direct",
+                "--hicache-io-backend": "direct",
+            }
+        )
         return server_args, env_vars
 
 

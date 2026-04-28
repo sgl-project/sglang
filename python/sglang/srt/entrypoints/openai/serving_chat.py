@@ -419,6 +419,7 @@ class OpenAIServingChat(OpenAIServingBase):
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
+            use_audio_in_video=getattr(request, "use_audio_in_video", False),
         )
 
         return adapted_request, request

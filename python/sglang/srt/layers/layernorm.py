@@ -110,6 +110,7 @@ logger = logging.getLogger(__name__)
 
 if _is_npu:
     import torch_npu
+    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
 
 def _forward_with_allreduce_fusion(
@@ -672,11 +673,13 @@ class GemmaRMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            x = x + residual
-            residual = x
+            norm_out, residual = add_gemma_rms_norm(
+                x, self.weight, residual, self.variance_epsilon
+            )
+            return norm_out, residual
 
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
-        return x if residual is None else (x, residual)
+        return x
 
     def forward_xpu(
         self,
