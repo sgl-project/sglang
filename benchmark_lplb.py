@@ -16,11 +16,39 @@ DISPATCH = sys.argv[1]       # "dynamic" or "lp"
 DATASET = sys.argv[2]        # "mmlu"
 START = int(sys.argv[3])     # start index (skip stat-collection portion)
 OUTPUT_DIR = sys.argv[4]
+CONC = int(sys.argv[5]) if len(sys.argv) > 5 else 128
+MAX_TOKENS = int(sys.argv[6]) if len(sys.argv) > 6 else 1
 SERVER = "http://localhost:30000"
-CONC = 128
 WARMUP_N = 5
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def verify_backend(server: str, expected: str) -> None:
+    """Hit /server_info and abort if `ep_dispatch_algorithm` doesn't match.
+
+    Guards against the case where a previous server (with a different config)
+    is still answering /health while the current one boots — otherwise we'd
+    silently benchmark the wrong dispatcher.
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"{server}/server_info", timeout=10) as r:
+            info = json.load(r)
+    except Exception as e:
+        raise SystemExit(f"[{DISPATCH}] Failed to fetch /server_info: {e}")
+    actual = info.get("ep_dispatch_algorithm")
+    if actual != expected:
+        raise SystemExit(
+            f"[{DISPATCH}] Server reports ep_dispatch_algorithm={actual!r} but "
+            f"benchmark expects {expected!r}. Aborting to avoid silently "
+            "measuring the wrong dispatcher."
+        )
+    print(f"[{DISPATCH}] Verified server is running ep_dispatch_algorithm={actual!r}", flush=True)
+
+
+verify_backend(SERVER, DISPATCH)
 
 # Load dataset
 prompts = []
@@ -41,13 +69,19 @@ async def send_one(s, sem, prompt, out):
         try:
             async with s.post(
                 SERVER + "/v1/completions",
-                json={"model": "default", "prompt": prompt, "max_tokens": 1},
-                timeout=aiohttp.ClientTimeout(total=120),
+                json={"model": "default", "prompt": prompt, "max_tokens": MAX_TOKENS},
+                timeout=aiohttp.ClientTimeout(total=3600),
             ) as r:
                 d = await r.json()
                 dt = time.perf_counter() - t0
                 if r.status == 200:
-                    out.append({"ttft": dt, "ptok": d["usage"]["prompt_tokens"], "status": 200})
+                    usage = d.get("usage", {}) or {}
+                    out.append({
+                        "ttft": dt,
+                        "ptok": usage.get("prompt_tokens", 0),
+                        "ctok": usage.get("completion_tokens", 0),
+                        "status": 200,
+                    })
                 else:
                     out.append({"ttft": dt, "err": True, "status": r.status})
         except Exception as e:
@@ -78,6 +112,7 @@ wall = time.time() - t0
 ok = [r for r in res if "err" not in r]
 ttfts = [r["ttft"] for r in ok]
 ptok = sum(r["ptok"] for r in ok)
+ctok = sum(r.get("ctok", 0) for r in ok)
 errs = len(res) - len(ok)
 
 result = {
@@ -90,17 +125,19 @@ result = {
     "n_errors": errs,
     "wall_s": round(wall, 3),
     "concurrency": CONC,
-    "max_tokens": 1,
+    "max_tokens": MAX_TOKENS,
+    "tput_input_tok_s": round(ptok / wall, 1) if wall else 0,
+    "tput_output_tok_s": round(ctok / wall, 1) if wall else 0,
+    "tput_total_tok_s": round((ptok + ctok) / wall, 1) if wall else 0,
 }
 if ttfts:
     result.update({
-        "ttft_p50": round(float(np.percentile(ttfts, 50)), 4),
-        "ttft_p90": round(float(np.percentile(ttfts, 90)), 4),
-        "ttft_p99": round(float(np.percentile(ttfts, 99)), 4),
-        "ttft_mean": round(float(np.mean(ttfts)), 4),
-        "ttft_min": round(float(np.min(ttfts)), 4),
-        "ttft_max": round(float(np.max(ttfts)), 4),
-        "tput_input_tok_s": round(ptok / wall, 1),
+        "lat_p50": round(float(np.percentile(ttfts, 50)), 4),
+        "lat_p90": round(float(np.percentile(ttfts, 90)), 4),
+        "lat_p99": round(float(np.percentile(ttfts, 99)), 4),
+        "lat_mean": round(float(np.mean(ttfts)), 4),
+        "lat_min": round(float(np.min(ttfts)), 4),
+        "lat_max": round(float(np.max(ttfts)), 4),
     })
 
 rpath = f"{OUTPUT_DIR}/{DISPATCH}_{DATASET}_result.json"
