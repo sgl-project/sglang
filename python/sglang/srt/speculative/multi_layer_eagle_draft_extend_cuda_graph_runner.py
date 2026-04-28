@@ -73,6 +73,7 @@ class MultiLayerEagleDraftExtendInputBuffers(ForwardInputBuffers):
     seq_lens_cpu: torch.Tensor
     req_pool_indices: torch.Tensor
     num_accepted_drafts: torch.Tensor
+    num_accepted_tokens: torch.Tensor
     # Per-step buffers
     extend_seq_lens: torch.Tensor
     extend_start_loc: torch.Tensor
@@ -160,6 +161,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             seq_lens = cuda_graph_buffers["seq_lens"]
             req_pool_indices = cuda_graph_buffers["req_pool_indices"]
             num_accepted_drafts = cuda_graph_buffers["num_accepted_drafts"]
+            num_accepted_tokens = cuda_graph_buffers["num_accepted_tokens"]
 
             extend_seq_lens = torch.full(
                 (self.max_bs,),
@@ -230,6 +232,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             seq_lens_cpu=seq_lens_cpu,
             req_pool_indices=req_pool_indices,
             num_accepted_drafts=num_accepted_drafts,
+            num_accepted_tokens=num_accepted_tokens,
             extend_seq_lens=extend_seq_lens,
             extend_start_loc=extend_start_loc,
             mrope_positions=mrope_positions,
@@ -302,6 +305,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         extend_seq_lens_cpu = self.extend_seq_lens_cpu[:bs]
         extend_start_loc = buffers.extend_start_loc[:bs]
         num_accepted_drafts = buffers.num_accepted_drafts[:bs]
+        num_accepted_tokens = buffers.num_accepted_tokens[:bs]
         out_cache_loc = buffers.out_cache_loc[:num_tokens]
         positions = buffers.positions[:num_tokens]
         mrope_positions = buffers.mrope_positions[:, :num_tokens]
@@ -348,6 +352,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
         spec_info = EagleDraftInput(
             hidden_states=hidden_states,
             num_accepted_drafts=num_accepted_drafts,
+            num_accepted_tokens=num_accepted_tokens,
         )
         spec_info.positions = None
 
@@ -522,6 +527,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             buffers.num_accepted_drafts[:raw_bs].copy_(
                 forward_batch.spec_info.num_accepted_drafts
             )
+            buffers.num_accepted_tokens[:raw_bs].copy_(
+                forward_batch.spec_info.num_accepted_tokens
+            )
         buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
 
         if forward_batch.seq_lens_cpu is not None:
@@ -559,6 +567,7 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
 
         forward_batch.spec_info.hidden_states = buffers.hidden_states[:num_tokens]
         forward_batch.spec_info.num_accepted_drafts = buffers.num_accepted_drafts[:bs]
+        forward_batch.spec_info.num_accepted_tokens = buffers.num_accepted_tokens[:bs]
         forward_batch.spec_info.num_tokens_per_req = self.num_tokens_per_bs
         forward_batch.spec_info.num_tokens_for_logprob_per_req = 1
         forward_batch.spec_info.positions = buffers.positions[:num_tokens]
@@ -589,6 +598,9 @@ class MultiLayerEagleDraftExtendCudaGraphRunner:
             unpadding_bs = num_tokens
         elif bs != raw_bs:
             forward_batch.spec_info.num_accepted_drafts = buffers.num_accepted_drafts[
+                :raw_bs
+            ]
+            forward_batch.spec_info.num_accepted_tokens = buffers.num_accepted_tokens[
                 :raw_bs
             ]
             unpadding_bs = raw_bs
@@ -681,6 +693,9 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
             self.cuda_graph_buffers["num_accepted_drafts"] = torch.full(
                 (self.max_bs,), 1, dtype=torch.int32
             )
+            self.cuda_graph_buffers["num_accepted_tokens"] = torch.full(
+                (self.max_bs,), 1, dtype=torch.int32
+            )
 
         for step in range(self.speculative_num_steps - 1, -1, -1):
             if self.runners[step] is not None:
@@ -711,11 +726,14 @@ class MultiLayerEagleMultiStepDraftExtendCudaGraphRunner:
         self.cuda_graph_buffers["out_cache_loc"].zero_()
         self.cuda_graph_buffers["swa_out_cache_loc"].zero_()
         self.cuda_graph_buffers["positions"].zero_()
-        # `batch_result.accept_lens` is drafts + bonus; the buffer keeps the
-        # drafts-only convention that matches `spec_info.num_accepted_drafts`.
-        self.cuda_graph_buffers["num_accepted_drafts"][
-            : forward_batch.batch_size
-        ].copy_(batch_result.accept_lens - 1)
+        # `batch_result.accept_lens` is drafts + bonus.
+        bs = forward_batch.batch_size
+        self.cuda_graph_buffers["num_accepted_drafts"][:bs].copy_(
+            batch_result.accept_lens - 1
+        )
+        self.cuda_graph_buffers["num_accepted_tokens"][:bs].copy_(
+            batch_result.accept_lens
+        )
 
     def get_runner(self, step):
         return self.runners[step]

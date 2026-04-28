@@ -659,6 +659,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
         num_accepted_drafts_backup = batch.spec_info.num_accepted_drafts
+        num_accepted_tokens_backup = batch.spec_info.num_accepted_tokens
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
@@ -756,4 +757,5 @@ class MultiLayerEagleWorker(TpModelWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
         batch.spec_info.num_accepted_drafts = num_accepted_drafts_backup
+        batch.spec_info.num_accepted_tokens = num_accepted_tokens_backup
         batch.return_logprob = return_logprob_backup
