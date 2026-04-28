@@ -329,12 +329,10 @@ class NightlyBenchmarkRunner:
                 server_info = response.json()
                 internal_states = server_info.get("internal_states", [])
                 if internal_states and len(internal_states) > 0:
-                    num_accepted_drafts = internal_states[0].get(
-                        "avg_spec_accept_length"
-                    )
-                    if num_accepted_drafts is not None:
-                        print(f"  avg_spec_accept_length={num_accepted_drafts:.2f}")
-                        return num_accepted_drafts
+                    accept_length = internal_states[0].get("avg_spec_accept_length")
+                    if accept_length is not None:
+                        print(f"  avg_spec_accept_length={accept_length:.2f}")
+                        return accept_length
         except Exception as e:
             print(f"  Warning: Could not fetch spec accept length: {e}")
         return None

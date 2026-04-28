@@ -820,7 +820,7 @@ def get_report_summary(
 
     for res in results:
         hourly_cost = hourly_cost_per_gpu * server_args.tp_size
-        num_accepted_drafts = f"{res.acc_length:.2f}" if res.acc_length > 0 else "n/a"
+        accept_length = f"{res.acc_length:.2f}" if res.acc_length > 0 else "n/a"
         itl_ms = 1000 * res.batch_size / res.output_throughput
         input_cost = 1e6 / (res.input_throughput * input_util) / 3600 * hourly_cost
         output_cost = 1e6 / res.output_throughput / 3600 * hourly_cost
@@ -834,7 +834,7 @@ def get_report_summary(
             f"{res.latency:.2f}",
             f"{res.input_throughput:.2f}",
             f"{res.output_throughput:.2f}",
-            num_accepted_drafts,
+            accept_length,
             f"{itl_ms:.2f}",
             f"{input_cost:.2f}",
             f"{output_cost:.2f}",
