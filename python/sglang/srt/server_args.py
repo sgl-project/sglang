@@ -665,11 +665,6 @@ class ServerArgs:
     disaggregation_bootstrap_port: int = 8998
     disaggregation_decode_tp: Optional[int] = None
     disaggregation_decode_dp: Optional[int] = None
-    # Tells a non-spec prefill node which speculative algorithm the decode
-    # node runs, so prefill sizes its metadata hidden-state buffer to match
-    # the decode-side spec module. Decode reads its own --speculative-*
-    # args and ignores this. Allowed values match --speculative-algorithm.
-    disaggregation_decode_speculative_algorithm: Optional[str] = None
     disaggregation_prefill_pp: Optional[int] = 1
     disaggregation_ib_device: Optional[str] = None
     disaggregation_decode_enable_offload_kvcache: bool = False
@@ -5034,19 +5029,6 @@ class ServerArgs:
             type=int,
             default=ServerArgs.disaggregation_decode_dp,
             help="Decode dp size. If not set, it matches the dp size of the current engine. This is only set on the prefill server.",
-        )
-        parser.add_argument(
-            "--disaggregation-decode-speculative-algorithm",
-            type=str,
-            default=ServerArgs.disaggregation_decode_speculative_algorithm,
-            choices=["EAGLE", "EAGLE3", "STANDALONE"],
-            help="Speculative algorithm running on the decode node. Set on a "
-            "prefill node that itself does not run a draft model so the "
-            "metadata hidden-state buffer is sized to match the decode-side "
-            "spec module. Decode bootstraps spec_info from a zero-init "
-            "buffer (mock) and recovers real conditioning after the first "
-            "verify; only the first decode iteration's accept length is "
-            "affected.",
         )
         parser.add_argument(
             "--disaggregation-prefill-pp",

@@ -1,14 +1,14 @@
 """DSv4 Flash PD-disaggregation test with NIXL transfer backend.
 
 Asymmetric P/D config: prefill runs no spec module, decode runs EAGLE
-MTP. Prefill uses --disaggregation-decode-speculative-algorithm so it
-sizes the metadata hidden-state buffer to match the decode-side spec
-module; the buffer is shipped zero-initialized (prefill has no draft
-model to populate it). Decode treats the zeros as mock conditioning
-for the first draft step. Verified spec decoding makes those bad
-drafts get rejected by target; from the second iteration onward, real
-target hidden flows through normally. Amortized cost is ~1 wasted
-draft step per request, < 1% throughput hit on long generations.
+MTP. The metadata hidden-state buffer is allocated at full
+spec_hidden_size on both sides unconditionally; prefill has no draft
+model to populate it, so the wire data stays zero, and decode treats
+the zeros as mock conditioning for the first draft step. Verified
+spec decoding makes those bad drafts get rejected by target; from
+iteration 2 onward, real target hidden flows through normally.
+Amortized cost is ~1 wasted draft step per request, < 1% throughput
+hit on long generations.
 
 Topology (1 H200 node, 8 GPUs total):
   - Prefill: GPU 0-3, tp=4 — pure TP, no EP (no deepep), no DP
@@ -67,9 +67,10 @@ class TestDSv4FlashPDDisaggNIXL(PDDisaggregationServerBase):
 
     @classmethod
     def start_prefill(cls):
-        # Prefill: TP=4, no EP, no DP attention, no spec module. The decode
-        # node runs EAGLE MTP; --disaggregation-decode-speculative-algorithm
-        # tells prefill to size the metadata hidden-state buffer to match.
+        # Prefill: TP=4, no EP, no DP attention, no spec module. The
+        # metadata hidden-state buffer is sized to spec_hidden_size on
+        # both sides automatically (see scheduler.py), so no flag tells
+        # prefill about the decode-side spec config.
         prefill_args = [
             "--trust-remote-code",
             "--disaggregation-mode",
@@ -88,8 +89,6 @@ class TestDSv4FlashPDDisaggNIXL(PDDisaggregationServerBase):
             "4",
             "--disaggregation-decode-dp",
             "4",
-            "--disaggregation-decode-speculative-algorithm",
-            "EAGLE",
             *cls.transfer_backend,
             *cls.rdma_devices,
         ]
