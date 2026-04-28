@@ -379,6 +379,7 @@ def _sparse_paged_mqa_kernel(
     stride_bt_b, stride_bt_mb,
     # shapes
     max_blocks,
+    num_phys,                      # kv_cache.shape[0] — for phys bound (defensive)
     # constexpr
     PAGED_BLOCK_SIZE: tl.constexpr,
     KV_BLOCK_SIZE: tl.constexpr,
@@ -410,6 +411,9 @@ def _sparse_paged_mqa_kernel(
         BlockTables_ptr + b * stride_bt_b + logical_page * stride_bt_mb,
         mask=valid_page, other=0,
     ).to(tl.int32)
+    # Defensive: clamp phys to [0, num_phys) before using as offset.
+    valid = valid_page & (phys >= 0) & (phys < num_phys)
+    phys = tl.where(valid, phys, 0)
 
     # --- Q [H, D] fp8 ---
     h_offs = tl.arange(0, HEADS)
@@ -461,7 +465,7 @@ def _sparse_paged_mqa_kernel(
     # --- Mask out-of-range positions (-inf) ---
     context_len = tl.load(ContextLens_ptr + b)
     k_i = block_s_i + bn_offs
-    pos_valid = (k_i >= 0) & (k_i < context_len) & valid_page
+    pos_valid = (k_i >= 0) & (k_i < context_len) & valid
     logits = tl.where(pos_valid, logits, float("-inf"))
 
     # --- Store logits at [b, seq_i, n_i * KV_BLOCK_SIZE + sub_i * PAGED_BLOCK_SIZE + bn_offs] ---
@@ -493,6 +497,7 @@ def _sparse_paged_mqa_grouped_kernel(
     stride_w_b, stride_w_s, stride_w_h,
     stride_bt_b, stride_bt_mb,
     max_blocks,
+    num_phys,                          # kv_cache.shape[0] — for phys bound (defensive)
     PAGED_BLOCK_SIZE: tl.constexpr,    # 64
     KV_BLOCK_SIZE: tl.constexpr,       # k_block_size, must divide PAGED_BLOCK_SIZE
     HEADS: tl.constexpr,
@@ -554,15 +559,22 @@ def _sparse_paged_mqa_grouped_kernel(
         mask=valid_page, other=0,
     ).to(tl.int32)                                              # [GEMM_TILE]
 
+    # Defensive: clamp phys to [0, num_phys) — if BlockTables has any
+    # spurious value (stale, allocator race) this prevents OOB on the K
+    # load below. SK15 / SK16 have the same defense.
+    valid_per_row = valid_page & (phys_per_row >= 0) & (phys_per_row < num_phys)
+    safe_phys = tl.where(valid_per_row, phys_per_row, 0)
+    safe_row = tl.where(valid_per_row, row_within_page, 0)
+
     # --- K tile [GEMM_TILE, D] fp8 (per-row gather) ---
     k = tl.load(
-        KvCacheFp8_ptr + phys_per_row[:, None] * stride_kv8_p
-        + (row_within_page[:, None] * DIM + d_offs[None, :]) * stride_kv8_b
+        KvCacheFp8_ptr + safe_phys[:, None] * stride_kv8_p
+        + (safe_row[:, None] * DIM + d_offs[None, :]) * stride_kv8_b
     )                                                           # fp8 [GEMM_TILE, D]
     # --- K per-token scale [GEMM_TILE] f32 ---
     k_scale = tl.load(
-        KvCacheFp32_ptr + phys_per_row * stride_kv32_p
-        + (SCALE_OFFSET + row_within_page) * stride_kv32_b
+        KvCacheFp32_ptr + safe_phys * stride_kv32_p
+        + (SCALE_OFFSET + safe_row) * stride_kv32_b
     )                                                           # f32 [GEMM_TILE]
 
     # --- GEMM: [GEMM_TILE, D] @ [D, H] = [GEMM_TILE, H] ---
@@ -572,9 +584,9 @@ def _sparse_paged_mqa_grouped_kernel(
     s = s * w[None, :]
     logits = tl.sum(s, axis=1)                                  # [GEMM_TILE] f32
 
-    # --- Mask: token_abs >= 0, < context_len, valid page ---
+    # --- Mask: token_abs >= 0, < context_len, valid page+phys ---
     context_len = tl.load(ContextLens_ptr + b)
-    pos_valid = (token_abs >= 0) & (token_abs < context_len) & valid_page
+    pos_valid = (token_abs >= 0) & (token_abs < context_len) & valid_per_row
     logits = tl.where(pos_valid, logits, float("-inf"))
 
     # --- Store: rows are contiguous in logits[..., n_i_start*k : n_i_start*k + GEMM_TILE] ---
@@ -669,6 +681,7 @@ def sparse_paged_mqa_triton(
             weights.stride(0), weights.stride(1), weights.stride(2),
             block_tables.stride(0), block_tables.stride(1),
             max_blocks,
+            num_phys_blocks,
             PAGED_BLOCK_SIZE=paged_block_size,
             KV_BLOCK_SIZE=kv_block_size,
             HEADS=H,
@@ -694,6 +707,7 @@ def sparse_paged_mqa_triton(
         weights.stride(0), weights.stride(1), weights.stride(2),
         block_tables.stride(0), block_tables.stride(1),
         max_blocks,
+        num_phys_blocks,
         PAGED_BLOCK_SIZE=paged_block_size,
         KV_BLOCK_SIZE=kv_block_size,
         HEADS=H,
@@ -979,6 +993,7 @@ def _batch_decode_pool_mqa_v3_kernel(
     stride_pt_b, stride_pt_n,
     stride_logits_b, stride_logits_n,
     stride_w_b, stride_w_h,
+    num_pool_phys,                # pool_k_pages.shape[0] — for phys bound (defensive)
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
     PP: tl.constexpr,  # pool_page_size (= 64)
@@ -987,6 +1002,11 @@ def _batch_decode_pool_mqa_v3_kernel(
     lp = tl.program_id(1)  # logical pool page
 
     phys = tl.load(PageTables_ptr + b * stride_pt_b + lp * stride_pt_n).to(tl.int32)
+    # Defensive: clamp pool phys to [0, num_pool_phys). Prevents OOB on the
+    # K/scale loads if PageTables holds stale or sentinel values for logical
+    # pool pages past the current ContextLensPool watermark.
+    phys_valid = (phys >= 0) & (phys < num_pool_phys)
+    phys = tl.where(phys_valid, phys, 0)
 
     h_offs = tl.arange(0, HEADS)
     d_offs = tl.arange(0, DIM)
@@ -1020,8 +1040,8 @@ def _batch_decode_pool_mqa_v3_kernel(
     # tl.where → one select chain instead of two.
     k_e = tl.load(ContextLensPool_ptr + b)
     pool_idx = lp * PP + bn_offs
-    pos_valid = pool_idx < k_e
-    pos_maintain = (pool_idx == 0) | (pool_idx == (k_e - 1))
+    pos_valid = (pool_idx < k_e) & phys_valid
+    pos_maintain = ((pool_idx == 0) | (pool_idx == (k_e - 1))) & phys_valid
     logits = tl.where(
         pos_maintain, float("inf"),
         tl.where(pos_valid, logits, float("-inf")),
@@ -1055,6 +1075,7 @@ def batch_decode_pool_mqa_v3_triton(
     w_2d = weights_f32.view(B, H).contiguous()
     pk8 = pool_k_pages.view(torch.float8_e4m3fn)
     pk32 = pool_k_pages.view(torch.float32)
+    num_pool_phys = pool_k_pages.shape[0]
 
     logits = torch.empty(
         (B, max_pp * pool_page_size), device=q_fp8.device, dtype=torch.float32,
@@ -1068,6 +1089,7 @@ def batch_decode_pool_mqa_v3_triton(
         pool_page_tables.stride(0), pool_page_tables.stride(1),
         logits.stride(0), logits.stride(1),
         w_2d.stride(0), w_2d.stride(1),
+        num_pool_phys,
         HEADS=H, DIM=D, PP=pool_page_size,
     )
     return logits.unsqueeze(1)  # [B, 1, max_pp * PP]
@@ -1104,6 +1126,7 @@ def _paged_mean_pooling_kernel(
     stride_bk_b, stride_bk_n, stride_bk_d,
     stride_bks_b, stride_bks_n,
     max_blocks,
+    num_phys,                          # kv_cache.shape[0] — for phys bound (defensive)
     PAGED_BLOCK_SIZE: tl.constexpr,
     POOLING_BLOCK_SIZE: tl.constexpr,  # K=128
     DIM: tl.constexpr,
@@ -1138,6 +1161,9 @@ def _paged_mean_pooling_kernel(
             BlockTables_ptr + b * stride_bt_b + logical_page * stride_bt_mb,
             mask=valid_page, other=0,
         ).to(tl.int32)
+        # Defensive: clamp phys to [0, num_phys) to prevent OOB on K loads.
+        phys_valid = valid_page & (phys >= 0) & (phys < num_phys)
+        phys = tl.where(phys_valid, phys, 0)
 
         # Load K tile [PAGED_BLOCK_SIZE, D] fp8, convert to f32.
         k_byte = bn_offs[:, None] * DIM + d_offs[None, :]
@@ -1150,9 +1176,9 @@ def _paged_mean_pooling_kernel(
             + (SCALE_OFFSET + bn_offs) * stride_kv32_b,
         )
 
-        # Zero out tokens past k_end.
+        # Zero out tokens past k_end (and rows from invalid pages).
         tl_block_idx = paged_block_s + bn_offs
-        in_block = tl_block_idx < k_end
+        in_block = (tl_block_idx < k_end) & phys_valid
         k = tl.where(in_block[:, None], k, 0.0)
         # Multiply scale applied to dequantized fp8.
         k = k * scale[:, None]
@@ -1192,6 +1218,7 @@ def _paged_mean_pooling_grouped_kernel(
     stride_bks_b, stride_bks_n,
     max_blocks,
     num_pool_total,                       # for masked-store of last group
+    num_phys,                             # kv_cache.shape[0] — for phys bound (defensive)
     PAGED_BLOCK_SIZE: tl.constexpr,       # 64 (paged page size)
     POOLING_BLOCK_SIZE: tl.constexpr,     # k_block_size, < 64
     DIM: tl.constexpr,
@@ -1220,11 +1247,14 @@ def _paged_mean_pooling_grouped_kernel(
         BlockTables_ptr + b * stride_bt_b + logical_page * stride_bt_mb,
         mask=valid_page, other=0,
     ).to(tl.int32)
+    # Defensive: clamp phys to [0, num_phys) before use as offset.
+    phys_valid = valid_page & (phys >= 0) & (phys < num_phys)
+    phys = tl.where(phys_valid, phys, 0)
 
     d_offs = tl.arange(0, DIM)
     bn_offs = tl.arange(0, GEMM_TILE)
     rows = k_start + bn_offs
-    in_seq = rows < seq_len
+    in_seq = (rows < seq_len) & phys_valid
 
     # Single page-load of K [GEMM_TILE=64, D] fp8.
     k = tl.load(
@@ -1322,6 +1352,7 @@ def paged_mean_pooling_triton(
             blocked_k_scale.stride(0), blocked_k_scale.stride(1),
             max_blocks,
             max_num_pooling_blocks,
+            num_phys,
             PAGED_BLOCK_SIZE=paged_block_size,
             POOLING_BLOCK_SIZE=k_block_size,
             DIM=D,
@@ -1340,6 +1371,7 @@ def paged_mean_pooling_triton(
             blocked_k.stride(0), blocked_k.stride(1), blocked_k.stride(2),
             blocked_k_scale.stride(0), blocked_k_scale.stride(1),
             max_blocks,
+            num_phys,
             PAGED_BLOCK_SIZE=paged_block_size,
             POOLING_BLOCK_SIZE=k_block_size,
             DIM=D,
@@ -1609,6 +1641,7 @@ def _update_pool_for_completed_blocks_kernel(
     max_kv_blocks,
     max_pool_pages,
     max_ctx,
+    num_pool_phys,                      # pool_k_pages.shape[0] — for output phys bound
     PAGED_BLOCK_SIZE: tl.constexpr,    # 64
     POOLING_BLOCK_SIZE: tl.constexpr,   # K = k_block_size
     POOL_PAGE_SIZE: tl.constexpr,       # 64
@@ -1647,6 +1680,10 @@ def _update_pool_for_completed_blocks_kernel(
         + logical_pp_per_g * stride_ppt_n,
         mask=pp_valid, other=0,
     ).to(tl.int32)                                                    # [G]
+    # Defensive: clamp output phys to [0, num_pool_phys) — if PoolPageTables
+    # holds a stale/sentinel value the masked-store below could otherwise OOB.
+    out_valid_per_g = pp_valid & (phys_out_per_g >= 0) & (phys_out_per_g < num_pool_phys)
+    phys_out_per_g = tl.where(out_valid_per_g, phys_out_per_g, 0)
 
     # Source: GEMM_TILE consecutive logical tokens starting at base_token
     base_token = (prev_complete + pblk_rel_start) * K
@@ -1655,13 +1692,21 @@ def _update_pool_for_completed_blocks_kernel(
     in_ctx = (token_logical >= 0) & (token_logical < new_len) & (token_logical < max_ctx)
     safe_token = tl.where(in_ctx, token_logical, 0)
 
-    # Per-row phys page lookup via ReqToToken (safe pointer, mask later)
+    # Per-row phys page lookup via ReqToToken (safe pointer, mask later).
+    # Gate on `buf_pos >= 0` BEFORE the divmod: with Triton's C-style trunc
+    # integer division, a negative buf_pos (e.g. sentinel -1) would compute
+    # phys_per_row = 0 (truncated toward zero) and row_within_page = -1,
+    # passing the (phys_per_row >= 0) check yet producing a negative byte
+    # offset on the K-cache load below — a real OOB. Caught by
+    # test_oob_sanitizer.py poison-phase.
     buf_pos = tl.load(
         ReqToToken_ptr + req_idx * stride_r2t_b + safe_token * stride_r2t_t,
     )
-    phys_per_row = (buf_pos // PAGED_BLOCK_SIZE).to(tl.int32)
-    row_within_page = (buf_pos - phys_per_row * PAGED_BLOCK_SIZE).to(tl.int32)
-    src_valid = in_ctx & (phys_per_row >= 0) & (phys_per_row < max_kv_blocks)
+    pos_nonneg = buf_pos >= 0
+    safe_buf_pos = tl.where(pos_nonneg, buf_pos, 0)
+    phys_per_row = (safe_buf_pos // PAGED_BLOCK_SIZE).to(tl.int32)
+    row_within_page = (safe_buf_pos - phys_per_row * PAGED_BLOCK_SIZE).to(tl.int32)
+    src_valid = in_ctx & pos_nonneg & (phys_per_row < max_kv_blocks)
     safe_phys = tl.where(src_valid, phys_per_row, 0)
     safe_row = tl.where(src_valid, row_within_page, 0)
 
@@ -1693,12 +1738,12 @@ def _update_pool_for_completed_blocks_kernel(
     # Paged store of G fp8 rows
     out_addr = (phys_out_per_g[:, None] * stride_pkp8_p
                 + (slot_per_g[:, None] * DIM + d_offs[None, :]) * stride_pkp8_b)
-    tl.store(PoolKPagesFp8_ptr + out_addr, out_fp8, mask=valid_per_g[:, None])
+    tl.store(PoolKPagesFp8_ptr + out_addr, out_fp8, mask=out_valid_per_g[:, None])
 
     # Paged store of G f32 scales
     scale_addr = (phys_out_per_g * stride_pkp32_p
                   + (SCALE_OFFSET_OUT + slot_per_g) * stride_pkp32_b)
-    tl.store(PoolKPagesFp32_ptr + scale_addr, block_scale, mask=valid_per_g)
+    tl.store(PoolKPagesFp32_ptr + scale_addr, block_scale, mask=out_valid_per_g)
 
 
 # ---------------------------------------------------------------------------
@@ -1734,8 +1779,10 @@ def _tail_only_v3_kernel(
     stride_ppt_b, stride_ppt_n,
     stride_pkp8_p, stride_pkp8_b,
     stride_pkp32_p, stride_pkp32_b,
-    max_kv_blocks,
+    max_blocks_per_req,    # block_tables.shape[1] — for logical_pp bounds
+    num_phys,              # kv_cache.shape[0] — for phys bounds (defensive)
     max_pool_pages,
+    num_pool_phys,         # pool_k_pages.shape[0] — for output phys bound
     PAGED_BLOCK_SIZE: tl.constexpr,    # 64
     POOLING_BLOCK_SIZE: tl.constexpr,   # K
     POOL_PAGE_SIZE: tl.constexpr,       # 64
@@ -1765,12 +1812,16 @@ def _tail_only_v3_kernel(
     # Per-row phys page lookup via BlockTables[b, ...].
     logical_pp_per_row = token_logical // PAGED_BLOCK_SIZE
     row_within_page = token_logical - logical_pp_per_row * PAGED_BLOCK_SIZE
-    src_valid = in_block & (logical_pp_per_row >= 0) & (logical_pp_per_row < max_kv_blocks)
+    src_valid = in_block & (logical_pp_per_row >= 0) & (logical_pp_per_row < max_blocks_per_req)
     safe_logical = tl.where(src_valid, logical_pp_per_row, 0)
 
     phys_per_row = tl.load(
         BlockTables_ptr + b * stride_bt_b + safe_logical * stride_bt_n,
     ).to(tl.int32)
+    # Defensive: clamp phys to [0, num_phys) — if BlockTables has any
+    # spurious value (stale data, allocator race) this prevents OOB on the
+    # K-cache load below. SK15 does this; SK16 was missing it.
+    src_valid = src_valid & (phys_per_row >= 0) & (phys_per_row < num_phys)
     phys_safe = tl.where(src_valid, phys_per_row, 0)
     row_safe = tl.where(src_valid, row_within_page, 0)
 
@@ -1803,6 +1854,11 @@ def _tail_only_v3_kernel(
     phys_out = tl.load(
         PoolPageTables_ptr + b * stride_ppt_b + logical_pp_out * stride_ppt_n,
     ).to(tl.int32)
+    # Defensive: skip the store entirely if phys_out is OOB. Avoids any
+    # corrupt write into pool_k_pages when PoolPageTables holds a stale
+    # sentinel (e.g. -1 / large positive).
+    if (phys_out < 0) | (phys_out >= num_pool_phys):
+        return
 
     out_fp8_offs = (phys_out * stride_pkp8_p
                     + (slot_out * DIM + d_offs) * stride_pkp8_b)
@@ -1836,6 +1892,7 @@ def tail_only_v3_triton(
     kv_f32 = kv_cache_flat.view(torch.float32)
     pkp_fp8 = pool_k_pages.view(torch.float8_e4m3fn)
     pkp_f32 = pool_k_pages.view(torch.float32)
+    num_pool_phys = pool_k_pages.shape[0]
 
     grid = (B,)
     _tail_only_v3_kernel[grid](
@@ -1848,8 +1905,10 @@ def tail_only_v3_triton(
         pool_page_tables.stride(0), pool_page_tables.stride(1),
         pkp_fp8.stride(0), pkp_fp8.stride(1),
         pkp_f32.stride(0), pkp_f32.stride(1),
-        max_blocks,
+        max_blocks,         # max_blocks_per_req — for logical_pp bound
+        num_phys,           # num_phys           — for phys bound (defensive)
         max_pool_pages,
+        num_pool_phys,      # for output phys bound (defensive)
         PAGED_BLOCK_SIZE=paged_block_size,
         POOLING_BLOCK_SIZE=k_block_size,
         POOL_PAGE_SIZE=pool_page_size,
@@ -1895,6 +1954,7 @@ def update_pool_for_completed_blocks_triton(
     kv_f32 = kv_cache_flat.view(torch.float32)
     pkp_fp8 = pool_k_pages.view(torch.float8_e4m3fn)
     pkp_f32 = pool_k_pages.view(torch.float32)
+    num_pool_phys = pool_k_pages.shape[0]
 
     grid = (B, num_chunks)
     _update_pool_for_completed_blocks_kernel[grid](
@@ -1914,6 +1974,7 @@ def update_pool_for_completed_blocks_triton(
         num_phys,
         max_pool_pages,
         max_ctx,
+        num_pool_phys,
         PAGED_BLOCK_SIZE=paged_block_size,
         POOLING_BLOCK_SIZE=k_block_size,
         POOL_PAGE_SIZE=pool_page_size,
@@ -1921,3 +1982,5 @@ def update_pool_for_completed_blocks_triton(
         GROUP_SIZE=GROUP_SIZE,
         GEMM_TILE=GEMM_TILE,
     )
+
+

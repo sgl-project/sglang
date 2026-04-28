@@ -54,6 +54,83 @@ Goal: 让 hisa 在 `k_block_size ∈ {8, 16, 32, 64, 128}` 全范围工作，cac
 - `[ ]` 若 K≥64 也想统一走 SK15/SK16 triton（减少 tilelang 维护面），需要先确认无回归
 - `[?]` SK1–SK4 的 group 维度 G 当前是按 K 静态选；后续可以做更细的 auto-tune
 
+**In Progress — 间歇性 silent crash 排查（2026-04-28）**
+
+K=16 配置下 server 跑一段时间挂掉，无 traceback。按 OOB 几率性触发模式定位。
+
+- `[x]` SK16 `_tail_only_v3_kernel` 漏检 `phys < num_phys` 的防御边界检查已补（命名上 SK15 的 `max_kv_blocks` = num_phys，SK16 的 `max_kv_blocks` = `block_tables.shape[1]`，含义不一致是历史遗留，已在 wrapper 拆成 `max_blocks_per_req` + `num_phys` 两个参数）。不一定是当前 crash 的根因（K=128 用 legacy 同样无此检查但 user 没出事），但这是真实 latent bug，对齐 SK15 的安全 profile。
+- `[x]` **批量补齐 phys 边界检查（2026-04-28）**——把同一个防御 pattern 扩展到所有读/写 phys 的 kernel：
+    - 输入侧（读 main KV phys）：`_sparse_paged_mqa_kernel`（legacy）、`_sparse_paged_mqa_grouped_kernel`、`_paged_mean_pooling_kernel`（legacy）、`_paged_mean_pooling_grouped_kernel` —— 全部加 `valid &= (phys >= 0) & (phys < num_phys)` 后 clamp。wrapper 多传一个 `num_phys_blocks` 参数。
+    - pool 侧（读/写 pool_k_pages phys）：`_batch_decode_pool_mqa_v3_kernel`（read）、`_update_pool_for_completed_blocks_kernel` 输出端（SK15 的 store 之前漏了，masked-store 用 `out_valid_per_g` 而不是 `valid_per_g`）、`_tail_only_v3_kernel` 输出端（SK16 的 store 之前漏了，加 early-return）。三个 wrapper 都多传 `num_pool_phys`。
+    - `test_cross_k_block_size` + 其它 3 个 precision test K∈{8,16,32,64,128} 都通过，无回归。
+- `[x]` **`hisa_triton/test_oob_sanitizer.py` 写好（2026-04-28）**——专项压测：每个 phys-loading kernel 跑 clean + poisoned 两 phase。poisoned 把 BlockTables / PoolPageTables / ReqToToken ~30% 替换成 sentinel（-1 / INT_MAX / num_phys 等）。clean 应全过；poisoned 在 clamp 都到位时也应全过；任何 missing clamp → 裸跑 cudaErrorIllegalAddress / sanitizer 报 invalid global read。
+- `[x]` **真实 OOB 抓到并修了（SK15 SK15 SK15）**：`_update_pool_for_completed_blocks_kernel` 在读 `req_to_token` 后做 `phys = buf_pos // 64`。当 `buf_pos < 0`（比如 stale -1）时，**Triton 的 C-style trunc-div 让 phys = 0、row = -1** —— `phys >= 0` 检查通过、`phys < num_phys` 通过，src_valid=True，但用 row=-1 算出的 K-load 字节偏移是负数 → 真实 OOB。修法：在 div 之前先 gate `buf_pos >= 0`，把 buf_pos clamp 成 0 再做 divmod。
+- `[!]` **教训：compute-sanitizer 不一定能抓到所有 OOB**。第一次开 sanitizer 跑这个测试，ERROR SUMMARY 报 0 errors；裸跑（无 sanitizer）才崩。原因猜测：sanitizer memcheck 检查的是“访问是否在已分配 cudaMalloc 范围内”，OOB 字节偏移可能落到相邻 PyTorch alloc 上（也是合法 device memory）就不报；但实际执行触发了 Xid 13。**结论：用户线上间歇性 silent crash 很可能就是这一类——只有触发到未映射页时才挂，touched-but-different-alloc 时静默跑错数。修完这条路径之后用户那个 K=16 长跑 crash 应该就消失了。**
+
+**Pending — block_topk fast-path（K=16 长上下文加速，2026-04-28）**
+
+K=16 ctx=128K 解码 e2e 比 K=128 慢 1.55x（80μs vs 52μs，per layer）。pipeline-stage bench 定位结果：
+```
+                K=16 (μs)  K=128 (μs)  ratio
+update_pool       10.4       8.8       1.19    （SK15 vs tilelang，差距很小）
+tail-refresh       7.6       9.0       0.84    （SK16 vs tilelang，triton 反超）
+block-MQA          9.6       8.0       1.20    （pool_pages 8x → grid 大）
+torch.topk        38.4      13.8       2.78  ★（block_topk 512 vs 64，N=8192 vs 1024）
+sparse-paged-MQA  14.1      12.0       1.17
+TOTAL             80.0      51.6       1.55
+```
+
+**`torch.topk` 一项就占了 K=16/K=128 总时间差的 ~25 μs（差距 28μs 的 89%）**。kernel 实现侧已饱和（SK15/SK16 跟 tilelang 在公平对比下 17.8μs vs 17.8μs 持平），剩下唯一有大头收益的优化是替掉 `torch.topk`。
+
+诊断已经做的事：
+- `[x]` 验证 `sgl_kernel.fast_topk_v2` 写死 K=2048（deepseek-v3.2 final indexer 专用），block_topk={64,…,1024} 用不了。
+- `[x]` `hisa_triton/benchmark_pipeline.py` 已支持 K-dependent block_topk（`--topk-tokens 8192`）+ `--force {auto,triton,tilelang}` 切换 SK15/SK16 vs tilelang 公平对比。
+- `[x]` 验证 cudagraph capture 对 `torch.topk` 几乎无加速（90-95%），所以 40μs 是真实 GPU 工作时间，不是 launch overhead——**替换有意义，能拿真收益**。
+- `[~]` 试了 3 条 triton 路全败：(1) 迭代 argmax K 次 runtime loop = 10x 慢（control-flow 不 fuse），(2) `tl.sort` packed int64 一次性排 = 8x 慢（bitonic O(N log²N)），(3) `tl.static_range` 完全 unroll K + N=16K = 编译跑 23 分钟没结束（IR 爆炸），全部丢弃。
+
+可参考的实现（按集成成本排序）：
+- `[ ]` **`sgl-kernel/csrc/elementwise/topk.cu` 的 `fast_topk_cuda_tl`** ★ 最低成本：仓库里已经有 CUB-style radix-select 的 CUDA 实现，改自 tilelang `examples/deepseek_v32/topk_selector.py`。算法对任何 K 都通用（2-pass 8-bit histogram + threshold bucket），只是源码 line 23 写死 `constexpr int TopK = 2048`。改造方案：
+    - 把 `TopK` 改成 `template <int K>`，按 production K 集合（{64, 128, 256, 512, 1024} = 8192 / k_block_size）实例化 5 个 kernel。
+    - 加一个新 dispatch `fast_topk_block_v2`（与 `fast_topk_v2` 并存）按运行时 K 选模板。
+    - 改 `pool_k_cache` orchestrator 调用：把 `torch.topk(...)` 换成 `fast_topk_block_v2(scores, lengths=full_lens, topk=block_topk)`。
+    - 加 byte-equal 单元测试 + microbench。
+    - **预估工程量：1 天。**
+    - **实测收益（在 K=2048 上跑现成 `fast_topk_v2`，借此推断各 K）：**
+        ```
+        config                          torch     sgl(radix)   speedup
+        B= 1  N= 8192  K=2048           41.9μs    13.4μs       3.12x
+        B=10  N= 8192  K=2048           46.9μs    13.4μs       3.49x
+        B=32  N= 8192  K=2048           50.1μs    14.6μs       3.43x
+        B= 1  N=16384  K=2048           73.9μs    17.4μs       4.24x
+        ```
+        radix-select 时间**几乎跟 K 无关**（pure O(N), 2-pass histogram）。所以推断：
+        - K=16 path（top-512 of 8192）: 45 → ~13 μs，**省 32μs**
+        - K=128 path（top-64 of 1024）: 14 → ~5-7 μs，**省 7μs**
+        - **K=16 e2e/layer：80μs → ~50μs，跟 K=128 的 52μs 基本持平**（1.55x 慢的差距抹平）。
+- `[ ]` 备选：CUB 的 `cub::DeviceRadixSelect` 直接 cudaWrap（最稳，但要新建一个 .cu 文件 + cmake 集成）。
+- `[ ]` 备选：Faiss `WarpSelect`（github.com/facebookresearch/faiss/blob/main/faiss/gpu/utils/warpselect/）—— warp-level bitonic merge，也是工业级实现。
+- `[ ]` 备选：RAFT `select_warpsort`（rapidsai/raft）。
+
+工具链：
+- `hisa_triton/benchmark_pipeline.py` 已经写好，新 topk kernel 接好之后用 `--Ks 8 16 32 64 128` 跑端到端对比就行。
+- `/tmp/topk_check.py` 是个独立的 microbench + correctness check，可以参考扩展成正式 test。
+
+**Pending — 结构性重构（提升可维护性，2026-04-28）**
+
+目标：当前 dispatch 散在 4 个 wrapper 各自的 if/else 里 + 9 个 kernel 文件，结构性差。重构使代码可读性 / 可维护性提升，性能保持不变（dispatch 本来就是免费的）。
+
+- `[ ]` **K-dispatch 统一进 kernel constexpr**（仿照 SK15 的设计）
+    - 把 4 个 Category B wrapper（sparse_paged / block_sparse / paged_mean_pool / block_mean_pool）的 grouped + non-grouped 合并成单个 triton kernel + constexpr GROUP_SIZE。
+    - K=64 / K=128 退化情形（GROUP_SIZE=1）需要 bench 验证不掉性能。
+    - 收益：源码减少 ~50%，dispatch 集中在一处。0 runtime perf 改善（compile-time specialization）。
+- `[ ]` **未实现 / 未验证分支统一 raise NotImplementedError 而不是 silent fallthrough**
+    - 例如 `_get_topk_paged` 在 spec decoding（next_n>1）已经 raise；但其他可能踩坑的分支需要扫一遍。
+    - `release_kv_cache` 里 SessionAwareCache 路径（`req.req_pool_idx is None` 后 return）应该显式 raise 或 log warn 提示 hisa pool pages 没被回收。
+    - `decode_kvcache_offload_manager.py` 里 `req_to_token_pool.free(req)` 也没挂 hisa free hook —— 加一个 `assert not isinstance(kv_pool, HisaNSATokenToKVPool)` 或显式 raise。
+- `[ ]` **dispatch 表中心化**
+    - `hisa_triton/dispatch.py` 集中所有 K-dispatch 决策（kernel 选择 + tile size + group size）。各 wrapper 改成调它。
+    - 类似 vLLM 的 `kernel_registry`，跨 wrapper 的 dispatch 逻辑统一。
+
 **Pending — kernel followup 实验（基于 2026-04-27 优化对照）**
 
 经过对所有 hisa_triton kernel 的小 K vs 大 K 优化对照，没有发现"大 K 已经验证有效但小 K 漏掉"的优化。但有两个**大 K 没试过、小 K 也没试过**的方向值得评估：
