@@ -1,135 +1,201 @@
-#!/usr/bin/env python3
-"""Functional test for LPLB solver — verifies correctness without a full server."""
-import sys
+"""Functional tests for LPLB solver — verifies correctness without a full server.
+
+Run with `pytest test_lplb.py -v` from the sglang/ root.
+"""
+import pytest
 import torch
 
-def test_torch_solver():
-    """Test the IPM solver directly."""
-    from sglang.jit_kernel.lplb.torch_solver import solve_ipm
 
-    # Simple LP: min x3 s.t. x1 + x2 = 1, x1 + x3 >= 0.5 (reformulated)
-    # Standard form: min c^T x s.t. Ax = b, x >= 0
-    NC, NV = 4, 6
-    A = torch.randn(NC, NV, dtype=torch.float32)
-    b = A @ torch.ones(NV, dtype=torch.float32)  # feasible point x=1
-    c = torch.zeros(NV, dtype=torch.float32)
-    c[-2] = 1.0   # minimize second-to-last
-    c[-1] = 1000.0  # Big-M penalty
-
-    x = solve_ipm(A, b, c, num_iters=5)
-    assert x.shape == (NV,), f"Shape mismatch: {x.shape}"
-    assert x.dtype == torch.float32
-    assert torch.isfinite(x).all(), "Non-finite values in solution"
-    print(f"  torch_solver: OK (x range [{x.min():.4f}, {x.max():.4f}])")
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
 
 
-def test_lplb_solver_init():
-    """Test LPLBSolver initialization with a realistic config."""
+@pytest.fixture
+def lplb_solver():
+    """Build an LPLBSolver with a realistic small config:
+    4 GPUs × 10 phy/GPU = 40 physical experts; first 8 logical experts are
+    replicated 2× (giving 8 redundant logicals, 16 redundant physicals).
+    """
     from sglang.srt.eplb.lplb_solver import LPLBSolver
 
     num_gpus = 4
     num_logical = 32
-    num_phy_per_gpu = 10  # 40 total physical
+    num_phy_per_gpu = 10
     num_phy = num_gpus * num_phy_per_gpu  # 40
 
-    # Build phy2log: first 32 are 1:1, next 8 are copies of experts 0-7
+    # phy2log: first 32 are 1:1 mapping, next 8 are duplicate copies of 0-7.
     phy2log = torch.arange(num_logical, dtype=torch.int64)
-    extra = torch.arange(8, dtype=torch.int64)  # 8 redundant copies
-    phy2log = torch.cat([phy2log, extra])  # 40 physical experts
+    extra = torch.arange(8, dtype=torch.int64)
+    phy2log = torch.cat([phy2log, extra])  # 40 entries
 
-    # Build log2phy: experts 0-7 have 2 copies each, rest have 1
+    # log2phy[i] lists the physical IDs for logical i; -1 padding when fewer
+    # than max_copies entries.
     max_copies = 2
     log2phy = torch.full((num_logical, max_copies), -1, dtype=torch.int64)
     for i in range(num_logical):
-        log2phy[i, 0] = i  # primary copy
+        log2phy[i, 0] = i
     for i in range(8):
-        log2phy[i, 1] = num_logical + i  # redundant copy
+        log2phy[i, 1] = num_logical + i
 
     num_valid = torch.ones(num_logical, dtype=torch.int64)
-    num_valid[:8] = 2  # first 8 have 2 copies
+    num_valid[:8] = 2
 
-    solver = LPLBSolver(
+    return LPLBSolver(
         phy2log=phy2log,
         log2phy=log2phy,
         num_gpus=num_gpus,
-        ep_group=None,  # single rank
+        ep_group=None,
         logical_to_all_physical_map_num_valid=num_valid,
     )
 
-    assert solver.num_logical == num_logical
-    assert solver.num_phy == num_phy
-    assert solver._has_redundancy
-    assert solver.num_red_log == 8
-    print(f"  LPLBSolver init: OK (red_log={solver.num_red_log}, "
-          f"red_phy={solver.num_red_phy}, single={solver.num_single})")
-    return solver, log2phy, num_valid
+
+@pytest.fixture
+def dispatch_info_factory():
+    """Build a minimal ExpertLocationDispatchInfo for probability-dispatch tests."""
+    from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+
+    def _build(num_logical: int, max_copies: int = 2):
+        log2phy_map = torch.zeros(num_logical, max_copies, dtype=torch.int64)
+        for i in range(num_logical):
+            log2phy_map[i, 0] = i
+            log2phy_map[i, 1] = i + num_logical
+        num_valid = torch.full((num_logical,), max_copies, dtype=torch.int64)
+        return ExpertLocationDispatchInfo(
+            ep_dispatch_algorithm="lp",
+            partial_logical_to_rank_dispatch_physical_map=None,
+            partial_logical_to_all_physical_map=log2phy_map,
+            partial_logical_to_all_physical_map_num_valid=num_valid,
+            num_physical_experts=num_logical * 2,
+            lplb_solver=None,
+        )
+
+    return _build
 
 
-def test_lplb_solve(solver):
-    """Test solve() with sample token counts."""
-    # Simulate token counts: experts 0-7 are hot (more tokens)
-    topk_ids = torch.randint(0, solver.num_logical, (64, 8), dtype=torch.int32)
-    # Bias toward experts 0-7
-    hot_tokens = torch.randint(0, 8, (32, 8), dtype=torch.int32)
-    topk_ids[:32] = hot_tokens
+# ---------------------------------------------------------------------------
+# Direct IPM solver
+# ---------------------------------------------------------------------------
 
-    log2phy_prob = solver.solve(topk_ids)
 
-    assert log2phy_prob.shape == (solver.num_logical, solver.max_copies)
+def test_torch_solver_returns_finite_solution():
+    """The IPM solver returns a finite-valued vector of the right shape."""
+    from sglang.jit_kernel.lplb.torch_solver import solve_ipm
+
+    nc, nv = 4, 6
+    a = torch.randn(nc, nv, dtype=torch.float32)
+    b = a @ torch.ones(nv, dtype=torch.float32)  # feasible point at x=1
+    c = torch.zeros(nv, dtype=torch.float32)
+    c[-2] = 1.0  # minimize second-to-last (the LP slack)
+    c[-1] = 1000.0  # Big-M penalty
+
+    x = solve_ipm(a, b, c, num_iters=5)
+
+    assert x.shape == (nv,)
+    assert x.dtype == torch.float32
+    assert torch.isfinite(x).all(), "Non-finite values in solution"
+
+
+# ---------------------------------------------------------------------------
+# LPLBSolver — init, solve, determinism
+# ---------------------------------------------------------------------------
+
+
+def test_lplb_solver_init_dimensions(lplb_solver):
+    """Constructor populates the expected shape attributes."""
+    assert lplb_solver.num_logical == 32
+    assert lplb_solver.num_phy == 40
+    assert lplb_solver._has_redundancy
+    assert lplb_solver.num_red_log == 8
+
+
+def test_lplb_solver_rejects_non_divisible_phy_count():
+    """num_phy must be divisible by num_gpus (per-rank-contiguous ownership);
+    EPLB allocations that violate this should fail loudly at init time, not
+    silently produce wrong B1/B2 matrices."""
+    from sglang.srt.eplb.lplb_solver import LPLBSolver
+
+    num_gpus = 4
+    num_logical = 16
+    # 17 physical experts — not divisible by 4.
+    phy2log = torch.cat(
+        [
+            torch.arange(num_logical, dtype=torch.int64),
+            torch.tensor([0], dtype=torch.int64),
+        ]
+    )
+    log2phy = torch.full((num_logical, 2), -1, dtype=torch.int64)
+    for i in range(num_logical):
+        log2phy[i, 0] = i
+    log2phy[0, 1] = num_logical
+    num_valid = torch.ones(num_logical, dtype=torch.int64)
+    num_valid[0] = 2
+
+    with pytest.raises(ValueError, match="divisible by num_gpus"):
+        LPLBSolver(
+            phy2log=phy2log,
+            log2phy=log2phy,
+            num_gpus=num_gpus,
+            ep_group=None,
+            logical_to_all_physical_map_num_valid=num_valid,
+        )
+
+
+def test_lplb_solve_returns_valid_probabilities(lplb_solver):
+    """solve() returns a finite, non-negative probability tensor of the right shape,
+    with non-zero mass on every replicated expert's primary copy and at least
+    one secondary copy."""
+    topk_ids = torch.randint(0, lplb_solver.num_logical, (64, 8), dtype=torch.int32)
+    # Bias toward experts 0-7 so the replicated copies see traffic.
+    topk_ids[:32] = torch.randint(0, 8, (32, 8), dtype=torch.int32)
+
+    log2phy_prob = lplb_solver.solve(topk_ids)
+
+    assert log2phy_prob.shape == (lplb_solver.num_logical, lplb_solver.max_copies)
     assert log2phy_prob.dtype == torch.float32
     assert torch.isfinite(log2phy_prob).all(), "Non-finite in log2phy_prob"
     assert (log2phy_prob >= 0).all(), "Negative probabilities"
 
-    # Replicated experts should have non-zero probabilities for both copies
-    rep_probs = log2phy_prob[:8]  # first 8 are replicated
+    rep_probs = log2phy_prob[:8]  # the 8 logically-replicated experts
     assert (rep_probs[:, 0] > 0).all(), "Primary copy has zero prob"
-    # At least some secondary copies should have non-zero prob
     assert (rep_probs[:, 1] > 0).any(), "All secondary copies have zero prob"
 
-    print(f"  solve(): OK (shape={log2phy_prob.shape}, "
-          f"sum range [{log2phy_prob.sum(dim=1).min():.4f}, "
-          f"{log2phy_prob.sum(dim=1).max():.4f}])")
-    return log2phy_prob
 
-
-def test_lplb_solve_empty(solver):
-    """Test solve() with empty topk_ids (idle rank scenario)."""
+def test_lplb_solve_handles_empty_topk(lplb_solver):
+    """An empty topk_ids tensor (idle DP rank) must still produce a valid output."""
     empty_ids = torch.empty((0, 8), dtype=torch.int32)
-    log2phy_prob = solver.solve(empty_ids)
+    log2phy_prob = lplb_solver.solve(empty_ids)
 
-    assert log2phy_prob.shape == (solver.num_logical, solver.max_copies)
+    assert log2phy_prob.shape == (lplb_solver.num_logical, lplb_solver.max_copies)
     assert torch.isfinite(log2phy_prob).all()
-    print(f"  solve(empty): OK (shape={log2phy_prob.shape})")
 
 
-def test_probability_dispatch():
-    """Test _topk_ids_logical_to_physical_probability."""
+def test_lplb_solve_is_deterministic(lplb_solver):
+    """Same input → same output (the IPM has no internal randomness)."""
+    topk_ids = torch.tensor([[0, 1], [2, 3], [0, 4]], dtype=torch.int32)
+    prob1 = lplb_solver.solve(topk_ids)
+    prob2 = lplb_solver.solve(topk_ids)
+    assert torch.allclose(prob1, prob2, atol=1e-6), (
+        f"Non-deterministic: max diff = {(prob1 - prob2).abs().max()}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Probability-based physical dispatch
+# ---------------------------------------------------------------------------
+
+
+def test_probability_dispatch_returns_valid_physical_ids(dispatch_info_factory):
+    """_topk_ids_logical_to_physical_probability picks valid physical IDs
+    given a non-degenerate probability distribution."""
     from sglang.srt.eplb.expert_location_dispatch import (
         _topk_ids_logical_to_physical_probability,
-        ExpertLocationDispatchInfo,
     )
 
     num_logical = 8
-    max_copies = 2
-    # log2phy_map: expert i -> physical [i, i+8]
-    log2phy_map = torch.zeros(num_logical, max_copies, dtype=torch.int64)
-    for i in range(num_logical):
-        log2phy_map[i, 0] = i
-        log2phy_map[i, 1] = i + num_logical
+    info = dispatch_info_factory(num_logical, max_copies=2)
 
-    num_valid = torch.full((num_logical,), 2, dtype=torch.int64)
-
-    info = ExpertLocationDispatchInfo(
-        ep_dispatch_algorithm="lp",
-        partial_logical_to_rank_dispatch_physical_map=None,
-        partial_logical_to_all_physical_map=log2phy_map,
-        partial_logical_to_all_physical_map_num_valid=num_valid,
-        num_physical_experts=num_logical * 2,
-        lplb_solver=None,
-    )
-
-    # Create probabilities: 70% primary, 30% secondary
-    log2phy_prob = torch.zeros(num_logical, max_copies, dtype=torch.float32)
+    log2phy_prob = torch.zeros(num_logical, 2, dtype=torch.float32)
     log2phy_prob[:, 0] = 0.7
     log2phy_prob[:, 1] = 0.3
 
@@ -137,51 +203,38 @@ def test_probability_dispatch():
     result = _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
 
     assert result.shape == topk_ids.shape
-    # All results should be valid physical IDs
     assert (result >= 0).all()
     assert (result < num_logical * 2).all()
-    print(f"  probability_dispatch: OK (result={result.tolist()})")
 
 
-def test_probability_dispatch_zero_probs():
-    """Test fallback when probabilities are zero."""
+def test_probability_dispatch_falls_back_when_probs_zero(dispatch_info_factory):
+    """All-zero probabilities trigger the uniform fallback over valid physical IDs."""
     from sglang.srt.eplb.expert_location_dispatch import (
         _topk_ids_logical_to_physical_probability,
-        ExpertLocationDispatchInfo,
     )
 
     num_logical = 4
-    max_copies = 2
-    log2phy_map = torch.zeros(num_logical, max_copies, dtype=torch.int64)
-    for i in range(num_logical):
-        log2phy_map[i, 0] = i
-        log2phy_map[i, 1] = i + num_logical
+    info = dispatch_info_factory(num_logical, max_copies=2)
 
-    num_valid = torch.full((num_logical,), 2, dtype=torch.int64)
-    info = ExpertLocationDispatchInfo(
-        ep_dispatch_algorithm="lp",
-        partial_logical_to_rank_dispatch_physical_map=None,
-        partial_logical_to_all_physical_map=log2phy_map,
-        partial_logical_to_all_physical_map_num_valid=num_valid,
-        num_physical_experts=num_logical * 2,
-        lplb_solver=None,
-    )
-
-    # All-zero probabilities should trigger fallback to uniform
-    log2phy_prob = torch.zeros(num_logical, max_copies, dtype=torch.float32)
+    log2phy_prob = torch.zeros(num_logical, 2, dtype=torch.float32)
     topk_ids = torch.tensor([[0, 1]], dtype=torch.int32)
     result = _topk_ids_logical_to_physical_probability(topk_ids, info, log2phy_prob)
+
     assert result.shape == topk_ids.shape
     assert (result >= 0).all()
-    print(f"  zero_probs_fallback: OK (result={result.tolist()})")
 
 
-def test_global_solver_registry():
-    """Test the global solver get/set/clear functions."""
+# ---------------------------------------------------------------------------
+# Global solver registry
+# ---------------------------------------------------------------------------
+
+
+def test_global_solver_registry_get_set_clear():
+    """The per-layer global LPLB-solver registry behaves like a normal dict."""
     from sglang.srt.eplb.lplb_solver import (
+        clear_global_lplb_solvers,
         get_global_lplb_solver,
         set_global_lplb_solver,
-        clear_global_lplb_solvers,
     )
 
     clear_global_lplb_solvers()
@@ -194,75 +247,63 @@ def test_global_solver_registry():
 
     clear_global_lplb_solvers()
     assert get_global_lplb_solver(0) is None
-    print("  global_registry: OK")
 
 
-def test_solve_determinism(solver):
-    """Test that same input produces same output (no randomness in solver)."""
-    counts = torch.zeros(solver.num_logical, dtype=torch.float32)
-    counts[:8] = torch.tensor([10, 20, 15, 5, 8, 12, 25, 3], dtype=torch.float32)
-    counts[8:16] = 5.0
-
-    # Build topk_ids from counts
-    topk_ids = torch.tensor([[0, 1], [2, 3], [0, 4]], dtype=torch.int32)
-
-    prob1 = solver.solve(topk_ids)
-    prob2 = solver.solve(topk_ids)
-
-    assert torch.allclose(prob1, prob2, atol=1e-6), \
-        f"Non-deterministic: max diff = {(prob1 - prob2).abs().max()}"
-    print("  determinism: OK")
+# ---------------------------------------------------------------------------
+# Model-architecture allowlist (P1.8)
+# ---------------------------------------------------------------------------
 
 
-if __name__ == "__main__":
-    print("=" * 50)
-    print("LPLB Functional Tests")
-    print("=" * 50)
+@pytest.mark.parametrize(
+    "arch",
+    [
+        # Direct DeepSeek targets.
+        "DeepseekV2ForCausalLM",
+        "DeepseekV3ForCausalLM",
+        "DeepseekV32ForCausalLM",
+        # DeepSeek-derived: subclass DeepseekV2/V3 and reuse safe MoE paths.
+        "MistralLarge3ForCausalLM",
+        "MistralLarge3ForCausalLMEagle",
+        "Glm4MoeLiteForCausalLM",
+        "GlmMoeDsaForCausalLM",
+    ],
+)
+def test_lplb_supports_deepseek_architectures(arch):
+    """The DeepSeek family + its direct subclasses must be allowed — they all
+    inherit the empty-rank `solver.solve()` participation from deepseek_v2.py."""
+    from sglang.srt.eplb.lplb_solver import assert_lplb_supported_model
 
-    tests = [
-        ("torch_solver", test_torch_solver),
-        ("lplb_solver_init", lambda: test_lplb_solver_init()),
-        ("lplb_solve", None),  # needs solver from init
-        ("lplb_solve_empty", None),
-        ("solve_determinism", None),
-        ("probability_dispatch", test_probability_dispatch),
-        ("zero_probs_fallback", test_probability_dispatch_zero_probs),
-        ("global_registry", test_global_solver_registry),
-    ]
+    # Should not raise.
+    assert_lplb_supported_model(arch)
 
-    passed = 0
-    failed = 0
 
-    # Independent tests
-    for name, fn in tests:
-        if fn is None:
-            continue
-        try:
-            fn()
-            passed += 1
-        except Exception as e:
-            print(f"  {name}: FAILED — {e}")
-            import traceback; traceback.print_exc()
-            failed += 1
+@pytest.mark.parametrize(
+    "arch",
+    [
+        # The 10 unsafe MoE families enumerated by the cross-cutting sweep.
+        "Qwen2MoeForCausalLM",
+        "Qwen3MoeForCausalLM",
+        "Glm4MoeForCausalLM",
+        "BailingMoEForCausalLM",
+        "ExaoneMoEForCausalLM",
+        "Step3p5ForCausalLM",
+        "MiMoV2FlashForCausalLM",
+        "LLaDA2MoeModelLM",
+        "MiniMaxM2ForCausalLM",
+        "SDARMoeForCausalLM",
+    ],
+)
+def test_lplb_rejects_unsafe_non_deepseek_moe(arch):
+    """Every non-DeepSeek MoE model the sweep flagged must raise
+    NotImplementedError before any LP solver is created. The error must name
+    the architecture, point to the dispatch flag, and explain the deadlock
+    cause so users know what's wrong."""
+    from sglang.srt.eplb.lplb_solver import assert_lplb_supported_model
 
-    # Tests that depend on solver instance
-    try:
-        solver, log2phy, num_valid = test_lplb_solver_init()
-        passed += 1  # init already counted above, skip
+    with pytest.raises(NotImplementedError) as excinfo:
+        assert_lplb_supported_model(arch)
 
-        test_lplb_solve(solver)
-        passed += 1
-
-        test_lplb_solve_empty(solver)
-        passed += 1
-
-        test_solve_determinism(solver)
-        passed += 1
-    except Exception as e:
-        print(f"  solver tests: FAILED — {e}")
-        import traceback; traceback.print_exc()
-        failed += 1
-
-    print()
-    print(f"Results: {passed} passed, {failed} failed")
-    sys.exit(1 if failed > 0 else 0)
+    msg = str(excinfo.value)
+    assert arch in msg, f"Error doesn't name the architecture: {msg}"
+    assert "ep-dispatch-algorithm lp" in msg, f"Error doesn't reference the flag: {msg}"
+    assert "all-reduce" in msg, f"Error doesn't explain the deadlock cause: {msg}"
