@@ -18,11 +18,19 @@ from sglang.srt.utils import ceil_div
 
 logger = logging.getLogger(__name__)
 
+ONLINE_C128 = envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+
 
 def get_compress_state_ring_size(
     compress_ratio: int, is_speculative: bool = False
 ) -> int:
     assert compress_ratio in [4, 128], f"Unsupported {compress_ratio = }"
+    # Online c128 keeps a single (max, sum, kv) state per index instead of a
+    # 128-slot ring buffer of raw tokens, so ring_size collapses to 1. Online
+    # is incompatible with speculative decode for now.
+    if compress_ratio == 128 and ONLINE_C128:
+        assert not is_speculative, "online c128 does not support MTP"
+        return 1
     if is_speculative:
         return 16 if compress_ratio == 4 else 256
     else:
@@ -388,15 +396,18 @@ class DeepSeekV4TokenToKVPool(KVCache):
             start_layer,
             end_layer,
         )
+        c4_logical_size = c128_size * 32
 
         logger.info(
             "Initialize DeepSeekV4TokenToKVPool with "
-            f"{max_num_reqs=} {swa_size=} {c4_size=} {c128_size=} "
+            f"{max_num_reqs=} {swa_size=} {c4_size=} "
+            f"{c4_logical_size=} {c128_size=} "
             f"{c4_state_pool_size=} {c128_state_pool_size=}"
         )
 
         self.max_num_reqs = max_num_reqs
         self.c4_size = c4_size
+        self.c4_logical_size = c4_logical_size
         self.c128_size = c128_size
         self.c4_state_pool_size = c4_state_pool_size
         self.c128_state_pool_size = c128_state_pool_size
@@ -456,7 +467,7 @@ class DeepSeekV4TokenToKVPool(KVCache):
         )
 
         self.c4_indexer_kv_pool = DeepSeekV4IndexerPool(
-            c4_size,
+            self.c4_logical_size,
             c4_page_size,
             dtype,
             indexer_head_dim,
@@ -611,7 +622,6 @@ class DeepSeekV4TokenToKVPool(KVCache):
             compress_state_pool = indexer_compress_state_pool = None
             size = c4_state_pool_size if ratio == 4 else c128_state_pool_size
             ring_size = self.get_ring_size(ratio) if ratio != 0 else 0
-
             if ratio != 0:
                 compress_state_pool = CompressStatePool(
                     size=size,
@@ -623,6 +633,7 @@ class DeepSeekV4TokenToKVPool(KVCache):
                     device=self.device,
                     enable_memory_saver=enable_memory_saver,
                     ratio=ratio,
+                    online=(ratio == 128 and ONLINE_C128),
                 )
 
             if ratio == 4:

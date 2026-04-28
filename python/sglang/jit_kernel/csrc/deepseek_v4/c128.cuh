@@ -70,10 +70,8 @@ struct Compress128PrefillParams {
   /** \brief Shape: `[batch_size, ]`*/
   const int32_t* __restrict__ load_indices;
   /** \brief The following part is plan info. */
-
   const Plan128* __restrict__ compress_plan;
   const Plan128* __restrict__ write_plan;
-
   uint32_t num_compress;
   uint32_t num_write;
 };

@@ -71,9 +71,12 @@ class CompressorBackend:
         if is_paged:
             metadata = self.get_paged_compress_metadata(compress_ratio)
             coff = 2 if is_overlap_compress(compress_ratio) else 1
-            last_dim = 2 * head_dim * coff
-            assert kv_score_buffer.shape[-1] == last_dim
-            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+            if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+                kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
+            else:
+                last_dim = 2 * head_dim * coff
+                assert kv_score_buffer.shape[-1] == last_dim
+                kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
         else:
             plan = make_compressor_plan(compress_ratio, forward_batch)
             metadata = (forward_batch.req_pool_indices.to(torch.int32), None, plan)
@@ -223,7 +226,7 @@ def create_paged_compressor_data(
 ) -> FusedCompressMetadata:
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
-    assert ring_size % compress_ratio == 0
+    # assert ring_size % compress_ratio == 0
 
     def clip_down(positions: torch.Tensor) -> torch.Tensor:
         return positions // compress_ratio * compress_ratio
@@ -273,6 +276,11 @@ def create_paged_compressor_data(
             use_cuda_graph=use_prefill_cuda_graph,
             **plan_kwargs,
         )
+        _maybe_dump_metadata_extras(
+            token_to_kv_pool=token_to_kv_pool,
+            compress_ratio=compress_ratio,
+            plan=plan,
+        )
     else:
         write_positions = clip_down(seq_lens - 1)
         write_loc = get_raw_loc(write_positions)
@@ -284,3 +292,27 @@ def create_paged_compressor_data(
         plan = CompressorDecodePlan(compress_ratio, seq_lens.to(torch.int32))
 
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
+
+
+def _maybe_dump_metadata_extras(
+    *,
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    compress_ratio: int,
+    plan: CompressorPrefillPlan,
+) -> None:
+    from sglang.jit_kernel.deepseek_v4 import maybe_dump_compress_metadata_extras
+
+    try:
+        ratio_idx = list(token_to_kv_pool.compression_ratios).index(compress_ratio)
+        pool = token_to_kv_pool.compress_state_pools[ratio_idx]
+        kv = pool.kv_score_buffer.kv_score
+        shape, dtype = kv.shape, kv.dtype
+    except (AttributeError, ValueError, IndexError):
+        return
+    maybe_dump_compress_metadata_extras(
+        compress_ratio=compress_ratio,
+        kv_score_buffer_shape=shape,
+        kv_score_buffer_dtype=dtype,
+        plan_compress_plan=plan.compress_plan,
+        plan_write_plan=plan.write_plan,
+    )

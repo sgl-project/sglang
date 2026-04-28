@@ -8,6 +8,7 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.server_args import get_global_server_args
@@ -268,6 +269,17 @@ class _ProfilerTorch(_ProfilerConcreteBase):
         torchprof_activities = [
             activity_map[a] for a in self.activities if a in activity_map
         ]
+
+        if (
+            envs.SGLANG_HACK_WARMUP_KINETO.get()
+            and not _is_npu
+            and torch.profiler.ProfilerActivity.CUDA in torchprof_activities
+        ):
+            from sglang.srt.managers.scheduler_profiler_mixin import (
+                _warmup_kineto_once,
+            )
+
+            _warmup_kineto_once()
 
         self.torch_profiler = torch.profiler.profile(
             activities=torchprof_activities,

@@ -243,5 +243,128 @@ def _tester() -> None:
     print("[tester] all OK")
 
 
+def _bench_one_rank(rank: int, dump_dir: str, shape: tuple, n_iters: int, queue) -> None:
+    """Run inside a child process: alloc GPU tensor, dump N times, report timings."""
+    import time
+
+    import torch
+
+    n_gpus = torch.cuda.device_count()
+    torch.cuda.set_device(rank % n_gpus)
+    try:
+        t = torch.zeros(shape, dtype=torch.int32, device="cuda")
+    except torch.cuda.OutOfMemoryError as e:
+        queue.put((rank, "OOM", str(e)[:200]))
+        return
+    torch.cuda.synchronize()
+    nbytes = t.numel() * t.element_size()
+
+    d = MmapDumper(os.path.join(dump_dir, f"rank{rank}"))
+    times = []
+    for _ in range(n_iters):
+        t0 = time.perf_counter()
+        d.dump({"req_to_token_partial": t})
+        times.append(time.perf_counter() - t0)
+    queue.put((rank, "OK", times, nbytes))
+
+
+def _bench_speed(dump_dir_root: str = "/dev/shm/mmap_dumper_bench") -> None:
+    import multiprocessing as mp
+    import shutil
+
+    import torch
+
+    if not torch.cuda.is_available():
+        print("[bench] no CUDA, skip")
+        return
+
+    n_gpus = torch.cuda.device_count()
+    n_ranks = min(8, n_gpus)
+    print(f"[bench] using {n_ranks} ranks (GPUs available: {n_gpus})")
+    print(f"[bench] dump dir root = {dump_dir_root}")
+
+    shutil.rmtree(dump_dir_root, ignore_errors=True)
+    os.makedirs(dump_dir_root, exist_ok=True)
+
+    try:
+        _bench_speed_inner(dump_dir_root, n_ranks)
+    finally:
+        shutil.rmtree(dump_dir_root, ignore_errors=True)
+        print(f"[bench] cleaned {dump_dir_root}")
+    print("[bench] done")
+
+
+def _bench_speed_inner(dump_dir_root: str, n_ranks: int) -> None:
+    import multiprocessing as mp
+    import shutil
+
+    # Default: only run SMALL (the new fast path).
+    # Set SGLANG_DUMP_BENCH_BIG=1 to also run BIG (old slow path) for comparison.
+    big = os.environ.get("SGLANG_DUMP_BENCH_BIG", "0") not in ("", "0", "false", "False")
+    scenarios = [
+        ("SMALL (4608, 10000) ~ 184 MB", (4608, 10000), 5),
+    ]
+    if big:
+        scenarios.insert(0, ("BIG (4608, 1048580) ~ 18 GB", (4608, 1048580), 3))
+
+    ctx = mp.get_context("spawn")
+    for label, shape, n_iters in scenarios:
+        nbytes = shape[0] * shape[1] * 4
+        print(f"\n=== {label} ===")
+        if dump_dir_root.startswith("/host/data") and nbytes * n_ranks > 130 * 2**30:
+            print(f"  skip: would write {nbytes * n_ranks / 2**30:.1f} GB to /host/data (~93% full)")
+            continue
+
+        # Concurrent: 8 ranks at once
+        queue = ctx.Queue()
+        procs = [
+            ctx.Process(
+                target=_bench_one_rank,
+                args=(r, os.path.join(dump_dir_root, "concurrent"), shape, n_iters, queue),
+            )
+            for r in range(n_ranks)
+        ]
+        import time as _time
+
+        wall_t0 = _time.perf_counter()
+        for p in procs:
+            p.start()
+        results = [queue.get() for _ in range(n_ranks)]
+        for p in procs:
+            p.join()
+        wall_total = _time.perf_counter() - wall_t0
+
+        results.sort(key=lambda x: x[0])
+        all_oom = all(r[1] == "OOM" for r in results)
+        if all_oom:
+            print("  all ranks OOM, skip")
+            continue
+        print(
+            f"  CONCURRENT 8-rank wall total = {wall_total*1000:.0f} ms "
+            f"(includes process spawn + GPU init + tensor alloc)"
+        )
+        for rank, status, *rest in results:
+            if status == "OOM":
+                print(f"    rank {rank}: OOM ({rest[0]})")
+                continue
+            times, nb = rest
+            t_min = min(times) * 1000
+            t_med = sorted(times)[len(times) // 2] * 1000
+            t_max = max(times) * 1000
+            mb = nb / 2**20
+            print(
+                f"    rank {rank}: dump nbytes={mb:.0f} MB, "
+                f"per-call min={t_min:.1f} ms, median={t_med:.1f} ms, max={t_max:.1f} ms"
+            )
+
+        shutil.rmtree(os.path.join(dump_dir_root, "concurrent"), ignore_errors=True)
+
+
 if __name__ == "__main__":
-    _tester()
+    import sys
+
+    if len(sys.argv) > 1 and sys.argv[1] == "bench":
+        dump_dir = sys.argv[2] if len(sys.argv) > 2 else "/dev/shm/mmap_dumper_bench"
+        _bench_speed(dump_dir)
+    else:
+        _tester()
