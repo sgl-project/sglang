@@ -306,8 +306,8 @@ class TestMamba(unittest.TestCase):
         tree.sanity_check()
 
     def test_mamba_radix_cache_kv_events(self):
-        tree, allocator, _, make_dummy_req = (
-            self._setup_tree_and_allocator(enable_kv_cache_events=True)
+        tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator(
+            enable_kv_cache_events=True
         )
         tree.take_events()  # Clear the reset event.
 
@@ -360,8 +360,8 @@ class TestMamba(unittest.TestCase):
         self.assertCountEqual(removed_hashes, stored_hashes)
 
     def test_mamba_radix_cache_kv_events_split_hash(self):
-        tree, allocator, _, make_dummy_req = (
-            self._setup_tree_and_allocator(enable_kv_cache_events=True)
+        tree, allocator, _, make_dummy_req = self._setup_tree_and_allocator(
+            enable_kv_cache_events=True
         )
         tree.take_events()  # Clear the reset event.
 
