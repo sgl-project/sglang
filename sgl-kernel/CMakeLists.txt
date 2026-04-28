@@ -52,15 +52,6 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-cutlass)
 
-# fmt
-FetchContent_Declare(
-    repo-fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt
-    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-fmt)
-
 # Triton kernel
 FetchContent_Declare(
     repo-triton
@@ -207,6 +198,18 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_90a,code=sm_90a"
+    )
+endif()
+
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-DENABLE_NVFP4=1"
+    )
+endif()
+
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
@@ -317,11 +320,6 @@ set(SOURCES
     "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform_cuda.cu"
     "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform.cpp"
 
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
 set(INCLUDES
@@ -332,7 +330,6 @@ set(INCLUDES
     ${repo-mscclpp_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
-    ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
 
 # =========================== Common SM90 Build ============================= #
@@ -349,6 +346,34 @@ set_target_properties(common_ops_sm90_build PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
 )
 
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import torch; print(int(torch._C._GLIBCXX_USE_CXX11_ABI))"
+    OUTPUT_VARIABLE TORCH_CXX11_ABI
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+if(TORCH_CXX11_ABI STREQUAL "0")
+    message(STATUS "Using old C++ ABI (-D_GLIBCXX_USE_CXX11_ABI=0)")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=0")
+else()
+    message(STATUS "Using new C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI=1)")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -D_GLIBCXX_USE_CXX11_ABI=1")
+endif()
+
+# mscclpp option
+set(MSCCLPP_USE_CUDA ON)
+set(MSCCLPP_BYPASS_GPU_CHECK ON)
+set(MSCCLPP_BUILD_TESTS OFF)
+add_subdirectory(
+    ${repo-mscclpp_SOURCE_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}/mscclpp-build
+)
+
+target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
+
+install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
 
 # ============================ Extra Install: triton kernels ============================= #
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
