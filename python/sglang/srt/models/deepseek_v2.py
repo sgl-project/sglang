@@ -532,9 +532,20 @@ class DeepseekV2MoE(nn.Module):
         self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
+        self._shared_expert_tp1 = False
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
             intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-            # disable tp for shared experts when enable deepep moe, or with fp4 allgather
+            # disable tp for shared experts when enable deepep moe, or with fp4 allgather,
+            # or when DSV4 FP4 experts are used (shared experts remain FP8 whose scale
+            # shape may not be divisible by tp_size, e.g. scale [24,56] vs tp=16).
+            _shared_expert_use_tp1 = (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_mooncake()
+                or get_moe_a2a_backend().is_ascend_fuseep()
+                or get_moe_a2a_backend().is_flashinfer()
+                or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                or envs.SGLANG_DSV4_SHARED_EXPERT_TP1.get()
+            )
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=intermediate_size,
@@ -545,14 +556,11 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
-                    if get_moe_a2a_backend().is_deepep()
-                    or get_moe_a2a_backend().is_mooncake()
-                    or get_moe_a2a_backend().is_ascend_fuseep()
-                    or get_moe_a2a_backend().is_flashinfer()
-                    or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                    if _shared_expert_use_tp1
                     else {}
                 ),
             )
+            self._shared_expert_tp1 = _shared_expert_use_tp1
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
             ) and self.shared_experts.gate_up_proj.quant_method.quant_config.get_name() in {
@@ -708,11 +716,15 @@ class DeepseekV2MoE(nn.Module):
             isinstance(self.experts.quant_method, DeepSeekMxfp4MoEMethod)
             and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
         ):
-            final_hidden_states = shared_output.add_(
-                final_hidden_states, alpha=self.routed_scaling_factor
-            )
+            if not self._shared_expert_tp1:
+                final_hidden_states = shared_output.add_(
+                    final_hidden_states, alpha=self.routed_scaling_factor
+                )
+            else:
+                final_hidden_states.mul_(self.routed_scaling_factor)
         else:
-            final_hidden_states += shared_output
+            if not self._shared_expert_tp1:
+                final_hidden_states += shared_output
 
         if (
             self.tp_size > 1
@@ -721,6 +733,10 @@ class DeepseekV2MoE(nn.Module):
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        # When shared expert uses TP1 (replicated weights), its output is already
+        # complete and must be added AFTER all-reduce to avoid being summed tp_size times.
+        if self._shared_expert_tp1:
+            final_hidden_states += shared_output
         return final_hidden_states
 
     def forward_normal(
@@ -798,14 +814,14 @@ class DeepseekV2MoE(nn.Module):
             isinstance(self.experts.quant_method, DeepSeekMxfp4MoEMethod)
             and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
         ):
-            if shared_output is not None:
+            if shared_output is not None and not self._shared_expert_tp1:
                 final_hidden_states = shared_output.add_(
                     final_hidden_states, alpha=self.routed_scaling_factor
                 )
             else:
                 final_hidden_states.mul_(self.routed_scaling_factor)
         else:
-            if shared_output is not None:
+            if shared_output is not None and not self._shared_expert_tp1:
                 final_hidden_states += shared_output
 
         if (
@@ -815,6 +831,10 @@ class DeepseekV2MoE(nn.Module):
             and not should_use_flashinfer_cutlass_moe_fp4_allgather()
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+        # When shared expert uses TP1 (replicated weights), its output is already
+        # complete and must be added AFTER all-reduce to avoid being summed tp_size times.
+        if shared_output is not None and self._shared_expert_tp1:
+            final_hidden_states += shared_output
         return final_hidden_states
 
     def forward_cpu(
