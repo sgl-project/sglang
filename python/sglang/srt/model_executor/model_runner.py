@@ -106,6 +106,7 @@ from sglang.srt.eplb.expert_location import (
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
 from sglang.srt.eplb.lplb_solver import (
     LPLBSolver,
+    assert_lplb_supported_model,
     clear_global_lplb_solvers,
     set_global_lplb_solver,
 )
@@ -1585,6 +1586,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def _init_lplb_solvers(self):
         """Initialize per-layer LPLB solvers from current expert location metadata."""
         from sglang.srt.distributed import get_moe_ep_group
+
+        # Gate: refuse LP for non-DeepSeek MoE families whose empty-token paths
+        # don't participate in the EP all-reduce (would deadlock under DP-
+        # attention). Failure here happens before any forward pass.
+        architectures = getattr(self.model_config.hf_config, "architectures", None)
+        if architectures:
+            assert_lplb_supported_model(architectures[0])
 
         metadata = get_global_expert_location_metadata()
         if metadata is None:
