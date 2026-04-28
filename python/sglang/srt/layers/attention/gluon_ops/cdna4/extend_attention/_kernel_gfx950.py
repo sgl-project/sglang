@@ -125,9 +125,8 @@ def gluon_extend_attn_fwd(
     if IS_FP8:
         tl.static_assert(
             BLOCK_DMODEL != 256,
-            "FP8 D=256 is unsupported on gfx950 (MFMA_F8 unrealized_conversion_cast). "
-            "Use BF16 KV cache for D=256 models (Gemma3 etc) or set "
-            "SGLANG_GLUON_FP8_KV_FORCE_BF16=1.",
+            "FP8 D=256 is unsupported by this kernel. "
+            "Use BF16 KV cache for D=256 models (Gemma3 etc).",
         )
         # FP8 basic-path rails: the D<128 async-DMA layouts don't fit the
         # v_async_layout register bases; LLVM fails with

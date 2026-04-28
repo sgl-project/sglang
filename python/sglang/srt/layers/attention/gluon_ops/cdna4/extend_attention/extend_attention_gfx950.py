@@ -1404,7 +1404,6 @@ def _launch_attention_grid(
         sliding_window_size=sliding_window_size,
         logit_cap=logit_cap,
     )
-
     q_s0, q_s1 = q_extend.stride(0), q_extend.stride(1)
     k_s0, k_s1 = k_extend.stride(0), k_extend.stride(1)
     v_s0, v_s1 = v_extend.stride(0), v_extend.stride(1)
@@ -2101,14 +2100,22 @@ def gluon_extend_attention_fwd(
         _grid_est = batch_size * max_len_extend
         _waste_frac = 1.0 - _total_ext / max(1, _grid_est)
         _total_pfx_est = _total_pfx_est_pre
-        _use_wca = (
-            _is_ragged_pfx
-            or (max_len_extend >= 1024 and _waste_frac > 0.05 and batch_size >= 5)
-            or (batch_size >= 8 and _total_pfx_est >= batch_size * 1024)
-            or (batch_size >= 8 and max_len_extend >= 768 and _waste_frac >= 0.4)
-            or (max_len_extend >= 768 and _waste_frac >= 0.2 and batch_size >= 5)
-            or (batch_size >= 16 and _waste_frac >= 0.2)
-        )
+        if _kv_is_fp8:
+            # FP8 WCA is only profitable for prefix-driven shapes. ShareGPT-like
+            # first-prefill batches (ragged ext, total_prefix_len == 0) measured
+            # 2.6-3.4x slower than Triton on Llama-70B TP=1; route those through
+            # data-centric instead. BF16 keeps the broader ragged-prefill WCA
+            # policy because those same shapes are ~1.8-2.2x faster than Triton.
+            _use_wca = _is_ragged_pfx
+        else:
+            _use_wca = (
+                _is_ragged_pfx
+                or (max_len_extend >= 1024 and _waste_frac > 0.05 and batch_size >= 5)
+                or (batch_size >= 8 and _total_pfx_est >= batch_size * 1024)
+                or (batch_size >= 8 and max_len_extend >= 768 and _waste_frac >= 0.4)
+                or (max_len_extend >= 768 and _waste_frac >= 0.2 and batch_size >= 5)
+                or (batch_size >= 16 and _waste_frac >= 0.2)
+            )
         if _use_wca:
             _launch_wca(
                 q_extend, k_extend, v_extend, o_extend,

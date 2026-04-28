@@ -120,13 +120,22 @@ class TestGluonSupports(CustomTestCase):
         return torch.empty(shape, dtype=dtype, device="meta")
 
     def test_unsupported_head_dim_falls_back(self):
-        from sglang.srt.layers.attention.gluon_extend_attention import _gluon_supports
+        from sglang.srt.layers.attention.gluon_extend_attention import (
+            _gluon_supports,
+            _gluon_unsupported_reason,
+        )
         for D in (80, 96, 192):
             q = self._mktensor((4, 8, D))
             v = self._mktensor((4, 4, D))
             kb = self._mktensor((16, 4, D))
             self.assertFalse(
                 _gluon_supports(q, v, kb, custom_mask=None, is_causal=True)
+            )
+            self.assertEqual(
+                _gluon_unsupported_reason(
+                    q, v, kb, custom_mask=None, is_causal=True,
+                ),
+                f"unsupported_head_dim_{D}",
             )
 
     def test_mismatched_lq_lv_falls_back(self):
@@ -153,12 +162,35 @@ class TestGluonSupports(CustomTestCase):
         )
 
     def test_fnuz_fp8_kv_falls_back(self):
-        from sglang.srt.layers.attention.gluon_extend_attention import _gluon_supports
+        from sglang.srt.layers.attention.gluon_extend_attention import (
+            _gluon_supports,
+            _gluon_unsupported_reason,
+        )
         q = self._mktensor((4, 8, 128), dtype=torch.bfloat16)
         v = self._mktensor((4, 4, 128), dtype=torch.bfloat16)
         kb = self._mktensor((16, 4, 128), dtype=torch.float8_e4m3fnuz)
         self.assertFalse(
             _gluon_supports(q, v, kb, custom_mask=None, is_causal=True)
+        )
+        self.assertEqual(
+            _gluon_unsupported_reason(q, v, kb, custom_mask=None, is_causal=True),
+            "unsupported_fp8_dtype_torch.float8_e4m3fnuz",
+        )
+
+    def test_fp8_d256_falls_back(self):
+        from sglang.srt.layers.attention.gluon_extend_attention import (
+            _gluon_supports,
+            _gluon_unsupported_reason,
+        )
+        q = self._mktensor((4, 8, 256), dtype=torch.bfloat16)
+        v = self._mktensor((4, 4, 256), dtype=torch.bfloat16)
+        kb = self._mktensor((16, 4, 256), dtype=torch.float8_e4m3fn)
+        self.assertFalse(
+            _gluon_supports(q, v, kb, custom_mask=None, is_causal=True)
+        )
+        self.assertEqual(
+            _gluon_unsupported_reason(q, v, kb, custom_mask=None, is_causal=True),
+            "unsupported_fp8_d256",
         )
 
     def test_non_causal_supported(self):
@@ -198,6 +230,74 @@ class TestGluonSupports(CustomTestCase):
 
             fwd = mod.make_extend_attention_fwd(_stub)
             self.assertIs(fwd, _stub)
+        finally:
+            mod._GLUON_FN = saved_fn
+            mod._try_import_gluon = saved_try
+
+    def _meta_wrapper_args(self, D=128, kv_dtype=torch.bfloat16):
+        q = self._mktensor((4, 8, D), dtype=torch.bfloat16)
+        k = self._mktensor((4, 4, D), dtype=torch.bfloat16)
+        v = self._mktensor((4, 4, D), dtype=torch.bfloat16)
+        o = self._mktensor((4, 8, D), dtype=torch.bfloat16)
+        kb = self._mktensor((16, 4, D), dtype=kv_dtype)
+        vb = self._mktensor((16, 4, D), dtype=kv_dtype)
+        qo = torch.empty((2,), dtype=torch.int32, device="meta")
+        kvp = torch.empty((2,), dtype=torch.int32, device="meta")
+        kvi = torch.empty((0,), dtype=torch.int64, device="meta")
+        return q, k, v, o, kb, vb, qo, kvp, kvi
+
+    def test_wrapper_unsupported_shape_uses_fallback(self):
+        import sglang.srt.layers.attention.gluon_extend_attention as mod
+
+        saved_fn = mod._GLUON_FN
+        saved_try = mod._try_import_gluon
+        try:
+            def _should_not_run(*args, **kwargs):
+                raise AssertionError("unsupported shape should not call Gluon")
+
+            mod._GLUON_FN = _should_not_run
+            mod._try_import_gluon = lambda: True
+
+            def _fallback(*args, **kwargs):
+                return "triton-result"
+
+            fwd = mod.make_extend_attention_fwd(_fallback)
+            result = fwd(
+                *self._meta_wrapper_args(D=80),
+                None, True, None, 1,
+                total_prefix_len=0,
+                total_extend_len=4,
+                min_len_extend=1,
+            )
+            self.assertEqual(result, "triton-result")
+        finally:
+            mod._GLUON_FN = saved_fn
+            mod._try_import_gluon = saved_try
+
+    def test_wrapper_exception_uses_fallback(self):
+        import sglang.srt.layers.attention.gluon_extend_attention as mod
+
+        saved_fn = mod._GLUON_FN
+        saved_try = mod._try_import_gluon
+        try:
+            def _raise(*args, **kwargs):
+                raise RuntimeError("boom")
+
+            mod._GLUON_FN = _raise
+            mod._try_import_gluon = lambda: True
+
+            def _fallback(*args, **kwargs):
+                return "triton-result"
+
+            fwd = mod.make_extend_attention_fwd(_fallback)
+            result = fwd(
+                *self._meta_wrapper_args(D=128),
+                None, True, None, 1,
+                total_prefix_len=0,
+                total_extend_len=4,
+                min_len_extend=1,
+            )
+            self.assertEqual(result, "triton-result")
         finally:
             mod._GLUON_FN = saved_fn
             mod._try_import_gluon = saved_try
@@ -303,7 +403,6 @@ class TestGluonKernelParity(CustomTestCase):
         o_gluon = self._run_gluon(inputs, is_causal=True, sinks=sinks)
         o_triton = self._run_triton(inputs, is_causal=True, sinks=sinks)
         torch.testing.assert_close(o_gluon, o_triton, rtol=2e-2, atol=2e-3)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1015,13 +1015,19 @@ class TritonAttnBackend(AttentionBackend):
             if self._gluon_extend_enabled
             else {}
         )
+        q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        k_contig = k.contiguous()
+        v_contig = v.contiguous()
+        o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        key_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        value_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
         self.extend_attention_fwd(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            k.contiguous(),
-            v.contiguous(),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+            q_view,
+            k_contig,
+            v_contig,
+            o_view,
+            key_buffer,
+            value_buffer,
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,

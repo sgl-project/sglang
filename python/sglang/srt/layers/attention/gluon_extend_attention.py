@@ -64,17 +64,33 @@ def _gluon_supports(
     does not implement. Keep in sync with the ``raise`` guards at the top of
     ``gluon_extend_attention_fwd``; falling through would work but costs a
     raised ``ValueError`` per call."""
+    return _gluon_unsupported_reason(
+        q_extend, v_extend, k_buffer, custom_mask, is_causal
+    ) is None
+
+
+def _gluon_unsupported_reason(
+    q_extend: torch.Tensor,
+    v_extend: torch.Tensor,
+    k_buffer: torch.Tensor,
+    custom_mask,
+    is_causal: bool,
+) -> Optional[str]:
     Lq = q_extend.shape[-1]
     Lv = v_extend.shape[-1]
-    if Lq not in _GLUON_SUPPORTED_HEAD_DIMS or Lq != Lv:
-        return False
+    if Lq not in _GLUON_SUPPORTED_HEAD_DIMS:
+        return f"unsupported_head_dim_{Lq}"
+    if Lq != Lv:
+        return f"mismatched_qv_dim_{Lq}_{Lv}"
     kv_is_fp8 = k_buffer.dtype in _FP8_KV_DTYPES
     if kv_is_fp8 and k_buffer.dtype not in _GLUON_SUPPORTED_FP8_KV_DTYPES:
-        return False
+        return f"unsupported_fp8_dtype_{k_buffer.dtype}"
     # D=256 FP8 KV and D<=128 FP8 KV + custom mask are not implemented.
-    if kv_is_fp8 and (Lq == 256 or (custom_mask is not None and Lq <= 128)):
-        return False
-    return True
+    if kv_is_fp8 and Lq == 256:
+        return "unsupported_fp8_d256"
+    if kv_is_fp8 and custom_mask is not None and Lq <= 128:
+        return "unsupported_fp8_custom_mask"
+    return None
 
 
 def make_extend_attention_fwd(triton_fallback: Callable) -> Callable:
@@ -116,7 +132,10 @@ def make_extend_attention_fwd(triton_fallback: Callable) -> Callable:
                 xai_temperature_len=xai_temperature_len,
             )
 
-        if not _gluon_supports(q_extend, v_extend, k_buffer, custom_mask, is_causal):
+        unsupported_reason = _gluon_unsupported_reason(
+            q_extend, v_extend, k_buffer, custom_mask, is_causal
+        )
+        if unsupported_reason is not None:
             return _fallback()
 
         try:
