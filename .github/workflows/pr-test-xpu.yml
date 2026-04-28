@@ -71,7 +71,7 @@ jobs:
   build-and-test:
     needs: [check-changes, pr-gate]
     if: needs.check-changes.outputs.main_package == 'true'
-    runs-on: b70
+    runs-on: intel-bmg
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
