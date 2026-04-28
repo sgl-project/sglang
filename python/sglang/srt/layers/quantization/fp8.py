@@ -153,7 +153,7 @@ def convert_fp4_experts_to_fp8(
     s = s.float().view(E, bOut, fp8_blk_n, bIn, -1).transpose(2, 3).flatten(3)
 
     # Compute per-block scale and apply offset
-    scale_max = s.amax(dim=-1, keepdim=True) / (2**MAX_OFFSET_BITS)
+    scale_max = s.amax(dim=-1, keepdim=True).clamp(min=1e-12) / (2**MAX_OFFSET_BITS)
     offset = (
         (s / scale_max)
         .unflatten(-1, (fp8_blk_n, -1))
