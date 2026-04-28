@@ -200,17 +200,15 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
         # Cap the pool at max concurrent requests * slots_per_req to avoid allocating failed.
         slots_per_req = 1 + (
-            self.mamba_ping_pong_track_buffer_size
-            if enable_mamba_extra_buffer
-            else 0
+            self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
         )
         max_slots_needed = (size + pre_alloc_size) * slots_per_req
         if mamba_size is not None:
-            effective_mamba_size = min(mamba_size, max_slots_needed)
-            if mamba_size > max_slots_needed:
+            effective_mamba_size = max(mamba_size, max_slots_needed)
+            if mamba_size < max_slots_needed:
                 logger.warning(
-                    "mamba_size (%d) exceeds max_slots_needed (%d = %d reqs * %d slots/req), "
-                    "capping effective_mamba_size to %d",
+                    "mamba_size (%d) is less than decode side's max_slots_needed (%d = %d reqs * %d slots/req), "
+                    "raising effective_mamba_size to %d",
                     mamba_size,
                     max_slots_needed,
                     size + pre_alloc_size,
