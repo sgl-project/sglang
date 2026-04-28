@@ -454,7 +454,7 @@ def _ensure_fastokens_patched():
 
     fastokens.patch_transformers()
     _fastokens_patched = True
-    logger.info("fastokens backend enabled — transformers patched successfully")
+    logger.info("fastokens backend enabled - transformers patched successfully")
 
 
 def get_tokenizer(

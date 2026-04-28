@@ -162,6 +162,7 @@ test = [
   "pytest-cov",
   "diff-cover",
   "sentence_transformers",
+  "sglang[fastokens]",
   "tabulate",
   "granian>=2.6.0",
 ]

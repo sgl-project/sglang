@@ -5,10 +5,12 @@ backend of the loaded tokenizer with fastokens' _TokenizerShim.
 import unittest
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import (
+    DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+    CustomTestCase,
+)
 
-# Qwen3-0.6B is small and ungated, so it works in CI without HF_TOKEN.
-TOKENIZER_MODEL = "Qwen/Qwen3-0.6B"
+TOKENIZER_MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
 register_cpu_ci(est_time=30, suite="stage-a-test-cpu")
 
