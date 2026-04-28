@@ -8,12 +8,12 @@ This module contains implementations of prompt encoding stages for diffusion pip
 """
 
 import inspect
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
-from sglang.multimodal_gen.configs.pipeline_configs import FluxPipelineConfig
-from sglang.multimodal_gen.configs.pipeline_configs.flux import Flux2PipelineConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -30,6 +30,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class TextEncodingFingerprint:
+    prompt: Any
+    negative_prompt: Any
+    do_classifier_free_guidance: bool
+    prompt_template: Any
+    max_sequence_length: int | None
+
+
 class TextEncodingStage(PipelineStage):
     """
     Stage for encoding text prompts into embeddings for diffusion models.
@@ -37,6 +46,18 @@ class TextEncodingStage(PipelineStage):
     This stage handles the encoding of text prompts into the embedding space
     expected by the diffusion model.
     """
+
+    deduplicated_output_fields = (
+        "prompt_embeds",
+        "negative_prompt_embeds",
+        "prompt_attention_mask",
+        "negative_attention_mask",
+        "pooled_embeds",
+        "neg_pooled_embeds",
+        "clip_embedding_pos",
+        "clip_embedding_neg",
+        "is_prompt_processed",
+    )
 
     def __init__(self, text_encoders, tokenizers) -> None:
         """
@@ -109,6 +130,17 @@ class TextEncodingStage(PipelineStage):
 
         return batch
 
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> TextEncodingFingerprint:
+        return TextEncodingFingerprint(
+            prompt=self.freeze_for_dedup(batch.prompt),
+            negative_prompt=self.freeze_for_dedup(batch.negative_prompt),
+            do_classifier_free_guidance=bool(batch.do_classifier_free_guidance),
+            prompt_template=self.freeze_for_dedup(batch.prompt_template),
+            max_sequence_length=batch.max_sequence_length,
+        )
+
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage inputs."""
         result = VerificationResult()
@@ -133,6 +165,13 @@ class TextEncodingStage(PipelineStage):
         tok_kwargs = tokenizer_kwargs | kwargs
 
         return tok_kwargs
+
+    def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
+        if not getattr(text_encoder, "uses_sglang_forward_context", True):
+            return text_encoder(**encoder_forward_kwargs)
+
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            return text_encoder(**encoder_forward_kwargs)
 
     @torch.no_grad()
     def encode_text(
@@ -256,11 +295,11 @@ class TextEncodingStage(PipelineStage):
             ).to(target_device)
 
             input_ids = text_inputs["input_ids"]
-            is_flux_v1 = isinstance(
-                server_args.pipeline_config, FluxPipelineConfig
-            ) and not isinstance(server_args.pipeline_config, Flux2PipelineConfig)
-
-            attention_mask = None if is_flux_v1 else text_inputs["attention_mask"]
+            attention_mask = (
+                server_args.pipeline_config.get_text_encoder_attention_mask(
+                    text_inputs, i
+                )
+            )
             encoder_forward_kwargs = {
                 "input_ids": input_ids,
                 "output_hidden_states": True,
@@ -269,8 +308,9 @@ class TextEncodingStage(PipelineStage):
                 encoder_forward_kwargs["attention_mask"] = attention_mask
             if "use_cache" in inspect.signature(text_encoder.forward).parameters:
                 encoder_forward_kwargs["use_cache"] = False
-            with set_forward_context(current_timestep=0, attn_metadata=None):
-                outputs: BaseEncoderOutput = text_encoder(**encoder_forward_kwargs)
+            outputs: BaseEncoderOutput = self._forward_text_encoder(
+                text_encoder, encoder_forward_kwargs
+            )
             postprocess_sig = inspect.signature(postprocess_func)
 
             postprocess_kwargs = {}
@@ -279,14 +319,21 @@ class TextEncodingStage(PipelineStage):
                 postprocess_kwargs["pipeline_config"] = server_args.pipeline_config
             prompt_embeds = postprocess_func(outputs, text_inputs, **postprocess_kwargs)
             if dtype is not None:
-                prompt_embeds = prompt_embeds.to(dtype=dtype)
+                prompt_embeds = prompt_embeds.to(device=target_device, dtype=dtype)
+            else:
+                prompt_embeds = prompt_embeds.to(device=target_device)
 
             embeds_list.append(prompt_embeds)
-            if is_flux_v1:
-                pooled_embeds_list.append(outputs.pooler_output)
+
+            pooled_output = server_args.pipeline_config.get_text_encoder_pooler_output(
+                outputs, i
+            )
+            if pooled_output is not None:
+                pooled_embeds_list.append(pooled_output.to(device=target_device))
+
             if return_attention_mask:
                 mask_to_store = (
-                    attention_mask
+                    attention_mask.to(device=target_device)
                     if attention_mask is not None
                     else torch.ones(input_ids.shape[:2], device=target_device)
                 )

@@ -9,7 +9,7 @@ from pathlib import Path
 from sglang.srt.utils.log_utils import create_log_targets, log_json
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=4, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
 
 
 class TestLogUtils(unittest.TestCase):

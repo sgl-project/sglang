@@ -1,5 +1,5 @@
 name: Check Maintenance Mode
-description: Blocks CI when maintenance mode is active (issue #21065 is open), unless the PR has the bypass-maintenance label, or env SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN=true (PR Test workflow on main only). Merging non-CI-fix PRs is prohibited during maintenance mode; in severe cases, merge permissions may be revoked.
+description: Blocks CI when maintenance mode is active (issue #21065 is open), unless the PR has the bypass-maintenance label, or env PR_TEST_BYPASS_MAINTENANCE_ON_MAIN=true (PR Test workflow on main only). Merging non-CI-fix PRs is prohibited during maintenance mode; in severe cases, merge permissions may be revoked.
 
 inputs:
   github-token:
@@ -20,7 +20,7 @@ runs:
         PR_NUMBER="${{ github.event.pull_request.number }}"
 
         # PR Test workflow only: scheduled runs and runs on main (dispatch / workflow_call) set this env
-        if [[ "${SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN:-}" == "true" ]]; then
+        if [[ "${PR_TEST_BYPASS_MAINTENANCE_ON_MAIN:-}" == "true" ]]; then
           echo "✅ PR Test on main branch; bypassing maintenance gate."
           exit 0
         fi

@@ -73,6 +73,7 @@ class LlamaMLP(nn.Module):
         reduce_results: bool = True,
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        use_dp_attention_reduce: bool = False,
     ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
@@ -93,6 +94,7 @@ class LlamaMLP(nn.Module):
             reduce_results=reduce_results,
             tp_rank=tp_rank,
             tp_size=tp_size,
+            use_dp_attention_reduce=use_dp_attention_reduce,
         )
         if hidden_act != "silu":
             raise ValueError(

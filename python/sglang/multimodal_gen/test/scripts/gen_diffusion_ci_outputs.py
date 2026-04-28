@@ -148,7 +148,7 @@ def main():
         sys.exit(0)
 
     # Run pytest with the specific test items (same as run_suite.py)
-    exit_code = run_pytest(my_items)
+    exit_code, _, _ = run_pytest(my_items)
 
     if exit_code != 0:
         if args.continue_on_error:

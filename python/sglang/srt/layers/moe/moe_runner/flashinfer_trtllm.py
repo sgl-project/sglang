@@ -275,15 +275,15 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         w13_weight.size(0),  # num_experts
     )
 
-    # Set flashinfer parameters
+    # Set flashinfer parameters in-place
+    copy_or_rebind_param(layer, "w13_weight", gemm1_weights_fp4_shuffled.contiguous())
+    copy_or_rebind_param(layer, "w2_weight", gemm2_weights_fp4_shuffled.contiguous())
     copy_or_rebind_param(
-        layer, "gemm1_weights_fp4_shuffled", gemm1_weights_fp4_shuffled
+        layer, "w13_weight_scale", gemm1_scales_fp4_shuffled.contiguous()
     )
     copy_or_rebind_param(
-        layer, "gemm2_weights_fp4_shuffled", gemm2_weights_fp4_shuffled
+        layer, "w2_weight_scale", gemm2_scales_fp4_shuffled.contiguous()
     )
-    copy_or_rebind_param(layer, "gemm1_scales_fp4_shuffled", gemm1_scales_fp4_shuffled)
-    copy_or_rebind_param(layer, "gemm2_scales_fp4_shuffled", gemm2_scales_fp4_shuffled)
 
     # Compute additional scaling factor needed for TRT-LLM
     w2_input_scale_quant = cast(torch.Tensor, layer.w2_input_scale_quant)
@@ -292,14 +292,6 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         layer,
         "g1_scale_c",
         (w2_input_scale_quant * g1_alphas).to(torch.float32),
-    )
-
-    # Clean up weights that won't be used by TRT-LLM
-    del (
-        layer.w2_weight,
-        layer.w2_weight_scale,
-        layer.w13_weight,
-        layer.w13_weight_scale,
     )
 
 
@@ -341,8 +333,7 @@ def _pack_topk_for_flashinfer_routed(
     packed_ids = topk_ids.to(torch.int32)
     packed_weights = topk_weights.to(torch.bfloat16)
     packed = (packed_ids << 16) | packed_weights.view(torch.int16).to(torch.int32)
-    # SGLang can mark padded tokens with -1 expert ids.
-    return packed.masked_fill_(packed_ids < 0, 0)
+    return packed
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp8(
@@ -560,11 +551,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     """Quantization payload consumed by FlashInfer TRT-LLM FP4 MoE kernels."""
 
-    # Shuffled FP4 weights (processed by align_fp4_moe_weights_for_flashinfer_trtllm)
-    gemm1_weights_fp4_shuffled: torch.Tensor
-    gemm2_weights_fp4_shuffled: torch.Tensor
-    gemm1_scales_fp4_shuffled: torch.Tensor
-    gemm2_scales_fp4_shuffled: torch.Tensor
+    w13_weight: torch.Tensor
+    w2_weight: torch.Tensor
+    w13_weight_scale: torch.Tensor
+    w2_weight_scale: torch.Tensor
 
     # Scaling factors
     g1_scale_c: torch.Tensor
@@ -666,18 +656,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             routing_bias=None,
             hidden_states=hs_fp4,
             hidden_states_scale=hs_scale,
-            gemm1_weights=quant_info.gemm1_weights_fp4_shuffled,
-            gemm1_weights_scale=quant_info.gemm1_scales_fp4_shuffled.view(
-                torch.float8_e4m3fn
-            ),
+            gemm1_weights=quant_info.w13_weight,
+            gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
             gemm1_clamp_limit=None,
-            gemm2_weights=quant_info.gemm2_weights_fp4_shuffled,
-            gemm2_weights_scale=quant_info.gemm2_scales_fp4_shuffled.view(
-                torch.float8_e4m3fn
-            ),
+            gemm2_weights=quant_info.w2_weight,
+            gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
             output1_scale_scalar=quant_info.g1_scale_c,
             output1_scale_gate_scalar=quant_info.g1_alphas,
@@ -716,18 +702,14 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             routing_bias=correction_bias,
             hidden_states=hs_fp4,
             hidden_states_scale=hs_scale,
-            gemm1_weights=quant_info.gemm1_weights_fp4_shuffled,
-            gemm1_weights_scale=quant_info.gemm1_scales_fp4_shuffled.view(
-                torch.float8_e4m3fn
-            ),
+            gemm1_weights=quant_info.w13_weight,
+            gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
             gemm1_bias=None,
             gemm1_alpha=None,
             gemm1_beta=None,
             gemm1_clamp_limit=None,
-            gemm2_weights=quant_info.gemm2_weights_fp4_shuffled,
-            gemm2_weights_scale=quant_info.gemm2_scales_fp4_shuffled.view(
-                torch.float8_e4m3fn
-            ),
+            gemm2_weights=quant_info.w2_weight,
+            gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
             gemm2_bias=None,
             output1_scale_scalar=quant_info.g1_scale_c,
             output1_scale_gate_scalar=quant_info.g1_alphas,

@@ -14,72 +14,6 @@ from sglang.srt.multimodal.customized_mm_processor_utils import (
 from sglang.utils import logger
 
 
-class Qwen3ASRThinkerConfig(PretrainedConfig):
-    model_type = "qwen3_asr_thinker"
-    sub_configs = {
-        "audio_config": Qwen3OmniMoeAudioEncoderConfig,
-    }
-
-    def __init__(
-        self,
-        audio_config=None,
-        text_config=None,
-        audio_token_id=151676,
-        audio_start_token_id=151669,
-        audio_end_token_id=151670,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-
-        if isinstance(audio_config, dict):
-            audio_config = Qwen3OmniMoeAudioEncoderConfig(**audio_config)
-        elif audio_config is None:
-            audio_config = Qwen3OmniMoeAudioEncoderConfig()
-        self.audio_config = audio_config
-
-        if isinstance(text_config, dict):
-            from transformers.models.qwen3.configuration_qwen3 import (
-                Qwen3Config as HFQwen3Config,
-            )
-
-            text_config = HFQwen3Config(**text_config)
-        elif text_config is None:
-            raise ValueError(
-                "Qwen3ASRThinkerConfig requires a text_config dict with "
-                "model parameters (hidden_size, num_attention_heads, etc.). "
-                "Got None."
-            )
-
-        self.text_config = text_config
-
-        self.audio_token_id = audio_token_id
-        self.audio_start_token_id = audio_start_token_id
-        self.audio_end_token_id = audio_end_token_id
-
-
-class Qwen3ASRConfig(PretrainedConfig):
-    model_type = "qwen3_asr"
-    sub_configs = {
-        "thinker_config": Qwen3ASRThinkerConfig,
-    }
-
-    def __init__(self, thinker_config=None, **kwargs):
-        super().__init__(**kwargs)
-        if thinker_config is None:
-            thinker_config = {}
-            logger.info(
-                "thinker_config is None. "
-                "Initializing Qwen3-ASR thinker with default values"
-            )
-        if isinstance(thinker_config, dict):
-            self.thinker_config = Qwen3ASRThinkerConfig(**thinker_config)
-        else:
-            self.thinker_config = thinker_config
-
-    def get_text_config(self, decoder=False) -> PretrainedConfig:
-        return self.thinker_config.text_config
-
-
 class Qwen3ASRProcessor(ProcessorMixin):
     """Minimal composite processor: WhisperFeatureExtractor + Qwen2Tokenizer.
 
@@ -167,6 +101,68 @@ class Qwen3ASRProcessor(ProcessorMixin):
         return inputs
 
 
+class Qwen3ASRThinkerConfig(PretrainedConfig):
+    model_type = "qwen3_asr_thinker"
+    sub_configs = {
+        "audio_config": Qwen3OmniMoeAudioEncoderConfig,
+    }
+
+    def __init__(
+        self,
+        audio_config=None,
+        text_config=None,
+        audio_token_id=151676,
+        audio_start_token_id=151669,
+        audio_end_token_id=151670,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        if isinstance(audio_config, dict):
+            audio_config = Qwen3OmniMoeAudioEncoderConfig(**audio_config)
+        elif audio_config is None:
+            audio_config = Qwen3OmniMoeAudioEncoderConfig()
+        self.audio_config = audio_config
+
+        from transformers.models.qwen3.configuration_qwen3 import (
+            Qwen3Config as HFQwen3Config,
+        )
+
+        if isinstance(text_config, dict):
+            text_config = HFQwen3Config(**text_config)
+        elif text_config is None:
+            text_config = HFQwen3Config()
+
+        self.text_config = text_config
+
+        self.audio_token_id = audio_token_id
+        self.audio_start_token_id = audio_start_token_id
+        self.audio_end_token_id = audio_end_token_id
+
+
+@register_customized_processor(Qwen3ASRProcessor)
+class Qwen3ASRConfig(PretrainedConfig):
+    model_type = "qwen3_asr"
+    sub_configs = {
+        "thinker_config": Qwen3ASRThinkerConfig,
+    }
+
+    def __init__(self, thinker_config=None, **kwargs):
+        super().__init__(**kwargs)
+        if thinker_config is None:
+            thinker_config = {}
+            logger.info(
+                "thinker_config is None. "
+                "Initializing Qwen3-ASR thinker with default values"
+            )
+        if isinstance(thinker_config, dict):
+            self.thinker_config = Qwen3ASRThinkerConfig(**thinker_config)
+        else:
+            self.thinker_config = thinker_config
+
+    def get_text_config(self, decoder=False) -> PretrainedConfig:
+        return self.thinker_config.text_config
+
+
 AutoConfig.register("qwen3_asr", Qwen3ASRConfig)
 AutoConfig.register("qwen3_asr_thinker", Qwen3ASRThinkerConfig)
-register_customized_processor(Qwen3ASRProcessor)(Qwen3ASRConfig)

@@ -154,12 +154,12 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         if batch.num_outputs_per_prompt != 1:
             raise ValueError("Hunyuan3D only supports num_outputs_per_prompt=1.")
 
-    def _prepare_latents(self, batch_size, dtype, device, generator):
+    def _prepare_latents(self, batch_size, dtype, device, generator, scheduler):
         from diffusers.utils.torch_utils import randn_tensor
 
         shape = (batch_size, *self.vae.latent_shape)
         latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-        return latents * getattr(self.scheduler, "init_noise_sigma", 1.0)
+        return latents * getattr(scheduler, "init_noise_sigma", 1.0)
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         # 1. Input validation
@@ -196,10 +196,11 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
             cond = cat_recursive(cond, un_cond)
 
         # 4. Latent and timestep preparation
+        scheduler = self.scheduler
         batch_size = image.shape[0]
         sigmas = np.linspace(0, 1, batch.num_inference_steps)
         timesteps, _ = retrieve_timesteps(
-            self.scheduler,
+            scheduler,
             batch.num_inference_steps,
             device,
             sigmas=sigmas,
@@ -209,7 +210,7 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         if generator is None and batch.seed is not None:
             generator = torch.Generator(device=device).manual_seed(batch.seed)
 
-        latents = self._prepare_latents(batch_size, dtype, device, generator)
+        latents = self._prepare_latents(batch_size, dtype, device, generator, scheduler)
 
         guidance = None
         if hasattr(self.model, "guidance_embed") and self.model.guidance_embed is True:
@@ -221,6 +222,7 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
         batch.prompt_embeds = [cond]
         batch.do_classifier_free_guidance = do_cfg
         batch.timesteps = timesteps
+        batch.scheduler = scheduler
         batch.latents = latents
         batch.extra["shape_guidance"] = guidance
         batch.extra["shape_image"] = image
@@ -252,6 +254,8 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
         """Prepare Hunyuan3D-specific variables for the base denoising loop."""
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
+        scheduler = batch.scheduler
+        assert scheduler is not None
         cache_dit_num_inference_steps = batch.extra.get(
             "cache_dit_num_inference_steps", batch.num_inference_steps
         )
@@ -285,10 +289,10 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
 
         guidance = batch.extra.get("shape_guidance")
         num_inference_steps = batch.num_inference_steps
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
 
         extra_step_kwargs = self.prepare_extra_func_kwargs(
-            self.scheduler.step,
+            scheduler.step,
             {"generator": batch.generator, "eta": batch.eta},
         )
 
@@ -300,6 +304,7 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
 
         return {
             "extra_step_kwargs": extra_step_kwargs,
+            "scheduler": scheduler,
             "target_dtype": target_dtype,
             "autocast_enabled": autocast_enabled,
             "timesteps": timesteps,
@@ -329,7 +334,8 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
     ):
         """Hunyuan3D-specific noise prediction with normalized timestep."""
         cond = kwargs.get("encoder_hidden_states")
-        timestep_norm = timestep / self.scheduler.config.num_train_timesteps
+        scheduler = kwargs.get("scheduler")
+        timestep_norm = timestep / scheduler.config.num_train_timesteps
         return current_model(latent_model_input, timestep_norm, cond, guidance=guidance)
 
     def _predict_noise_with_cfg(
@@ -371,6 +377,7 @@ class Hunyuan3DShapeDenoisingStage(DenoisingStage):
                 timestep=timestep_expanded,
                 target_dtype=target_dtype,
                 guidance=guidance,
+                scheduler=batch.scheduler,
                 encoder_hidden_states=cond,
             )
 

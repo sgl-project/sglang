@@ -15,6 +15,17 @@ SGL_FA3_KERNEL_REVISION = "v1"
 DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
+def _call_fa3_kernel(kernel, *args, out=None):
+    if out is None:
+        return kernel(*args)
+    try:
+        return kernel(*args, out=out)
+    except TypeError as exc:
+        if "unexpected keyword argument 'out'" not in str(exc):
+            raise
+        return kernel(*args)
+
+
 @cache_once
 def _load_fa3_kernels():
     # By default, we use the implementation from sgl-kernel,
@@ -78,6 +89,8 @@ def _is_fa3_supported(device=None) -> bool:
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
     #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
+    if torch.version.cuda is None:
+        return False
     return (torch.version.cuda >= "12.3") and (
         torch.cuda.get_device_capability(device)[0] == 9
         or torch.cuda.get_device_capability(device)[0] == 8
@@ -117,6 +130,7 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
+    out=None,
 ):
     if not _is_fa3_supported():
         raise NotImplementedError(
@@ -126,7 +140,8 @@ def flash_attn_with_kvcache(
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
 
-    return _load_fa3_kernels()["flash_attn_with_kvcache"](
+    return _call_fa3_kernel(
+        _load_fa3_kernels()["flash_attn_with_kvcache"],
         q,
         k_cache,
         v_cache,
@@ -158,6 +173,7 @@ def flash_attn_with_kvcache(
         sm_margin,
         return_softmax_lse,
         sinks,
+        out=out,
     )
 
 
@@ -187,6 +203,7 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
+    out=None,
 ):
 
     if not _is_fa3_supported():
@@ -194,7 +211,8 @@ def flash_attn_varlen_func(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
         )
 
-    return _load_fa3_kernels()["flash_attn_varlen_func"](
+    return _call_fa3_kernel(
+        _load_fa3_kernels()["flash_attn_varlen_func"],
         q,
         k,
         v,
@@ -219,4 +237,5 @@ def flash_attn_varlen_func(
         sm_margin,
         return_softmax_lse,
         sinks,
+        out=out,
     )

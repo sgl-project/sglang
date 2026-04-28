@@ -19,7 +19,12 @@ import torch
 from torch import nn
 from transformers import Qwen2Config  # Qwen3 uses Qwen2Config
 
-from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
+from sglang.srt.layers.pooler import (
+    EmbeddingPoolerOutput,
+    Pooler,
+    PoolingType,
+    score_and_pool,
+)
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -62,10 +67,9 @@ class Qwen3ForPooledOutput(nn.Module):
         assert get_embedding, f"{self.__class__.__name__} is only used for embedding"
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
-        logits = self.score(hidden_states)
-        pooled_logits = self.pooler(logits, forward_batch).embeddings
-
-        return EmbeddingPoolerOutput(pooled_logits)
+        return score_and_pool(
+            self.score, self.pooler, hidden_states, forward_batch, input_ids
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

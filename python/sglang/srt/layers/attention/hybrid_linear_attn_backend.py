@@ -139,6 +139,7 @@ class MambaAttnBackendBase(AttentionBackend):
         super().__init__()
         self.pad_slot_id = PAD_SLOT_ID
         self.device = model_runner.device
+        self.topk = model_runner.server_args.speculative_eagle_topk or 0
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.forward_metadata: ForwardMetadata = None
         self.state_indices_list = []
@@ -185,9 +186,11 @@ class MambaAttnBackendBase(AttentionBackend):
                     device=forward_batch.input_ids.device,
                 )
 
-                if forward_batch.spec_info.topk > 1:
-                    retrieve_next_token = forward_batch.spec_info.retrive_next_token
-                    retrieve_next_sibling = forward_batch.spec_info.retrive_next_sibling
+                if self.topk > 1:
+                    retrieve_next_token = forward_batch.spec_info.retrieve_next_token
+                    retrieve_next_sibling = (
+                        forward_batch.spec_info.retrieve_next_sibling
+                    )
                     # retrieve_next_token is None during dummy run so skip tensor creation
                     if retrieve_next_token is not None:
                         retrieve_parent_token = torch.empty_like(retrieve_next_token)
@@ -482,10 +485,10 @@ class MambaAttnBackendBase(AttentionBackend):
         self.state_indices_list[bs - 1][: len(mamba_indices)].copy_(mamba_indices)
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and spec_info.topk > 1:
+        if forward_mode.is_target_verify() and self.topk > 1:
             # They are None during cuda graph capture so skip the copy_...
-            # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrive_next_token)
-            # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrive_next_sibling)
+            # self.retrieve_next_token_list[bs - 1].copy_(spec_info.retrieve_next_token)
+            # self.retrieve_next_sibling_list[bs - 1].copy_(spec_info.retrieve_next_sibling)
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
@@ -543,13 +546,13 @@ class MambaAttnBackendBase(AttentionBackend):
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
 
         # If topk > 1, we need to use retrieve_next_token and retrieve_next_sibling to handle the eagle tree custom attention mask
-        if forward_mode.is_target_verify() and spec_info.topk > 1:
-            bs_without_pad = spec_info.retrive_next_token.shape[0]
+        if forward_mode.is_target_verify() and self.topk > 1:
+            bs_without_pad = spec_info.retrieve_next_token.shape[0]
             self.retrieve_next_token_list[bs - 1][:bs_without_pad].copy_(
-                spec_info.retrive_next_token
+                spec_info.retrieve_next_token
             )
             self.retrieve_next_sibling_list[bs - 1][:bs_without_pad].copy_(
-                spec_info.retrive_next_sibling
+                spec_info.retrieve_next_sibling
             )
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],

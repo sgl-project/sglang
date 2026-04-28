@@ -2,9 +2,11 @@
 
 import logging
 from enum import Enum
+from functools import cached_property
 from typing import List, Optional, Tuple
 
 import torch
+from torch.nn.parameter import UninitializedParameter
 
 from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
 from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
@@ -48,7 +50,7 @@ from sglang.srt.layers.moe.topk import (
     TopKOutput,
     TopKOutputChecker,
 )
-from sglang.srt.layers.moe.utils import RoutingMethodType
+from sglang.srt.layers.moe.utils import RoutingMethodType, is_deepep_class_backend
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -197,12 +199,20 @@ class FusedMoE(torch.nn.Module):
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.moe_tp_size = get_moe_tensor_parallel_world_size()
         self.moe_tp_rank = get_moe_tensor_parallel_rank()
-        assert (num_experts - num_fused_shared_experts) % self.moe_ep_size == 0
-        self.num_local_experts = (
-            num_experts - num_fused_shared_experts
-        ) // self.moe_ep_size + num_fused_shared_experts
 
-        self.expert_mask_gpu = None
+        # DeepEP: each rank has its own shared expert slot, so total shared
+        # weight slots = num_fused_shared_experts * ep_size.
+        # AMD/Standard: shared experts are global, slots = num_fused_shared_experts.
+        if num_fused_shared_experts > 0 and is_deepep_class_backend():
+            num_shared_slots = num_fused_shared_experts * self.moe_ep_size
+        else:
+            num_shared_slots = num_fused_shared_experts
+
+        assert (num_experts - num_shared_slots) % self.moe_ep_size == 0
+        self._num_global_routed = num_experts - num_shared_slots
+        self._num_local_routed = self._num_global_routed // self.moe_ep_size
+        self.num_local_experts = self._num_local_routed + num_fused_shared_experts
+        self._has_fused_shared = num_fused_shared_experts > 0
 
         assert intermediate_size % self.moe_tp_size == 0
         self.intermediate_size_per_partition = intermediate_size // self.moe_tp_size
@@ -315,6 +325,21 @@ class FusedMoE(torch.nn.Module):
         if self.quant_method is not None and hasattr(self.quant_method, "runner"):
             self.runner = self.quant_method.runner
 
+    @cached_property
+    def use_padded_loading(self) -> bool:
+        # This handles the case where the loaded weights are smaller than the padded expert_data
+        # Use narrow_padded_param_and_loaded_weight for:
+        # 1. CPU (always)
+        # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
+        # 3. GPU with Aiter padding
+        aiter_padded = (
+            _use_aiter
+            and hasattr(self, "w2_weight")
+            and getattr(self.w2_weight, "weight_padded", False)
+        )
+
+        return _is_cpu or self.use_flashinfer_trtllm_moe or aiter_padded
+
     def _load_per_tensor_weight_scale(
         self,
         shard_id: str,
@@ -426,12 +451,7 @@ class FusedMoE(torch.nn.Module):
         else:
             start = 0
 
-        # Use narrow_padded_param_and_loaded_weight for:
-        # 1. CPU (always)
-        # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
-        # This handles the case where the loaded weights are smaller than the padded expert_data
-        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
-        if use_padded_loading:
+        if self.use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -500,12 +520,7 @@ class FusedMoE(torch.nn.Module):
             # for w2 in TP, it shards the input_features, i.e., shard_dim=2
             shard_size = expert_data.shape[shard_dim]
 
-        # Use narrow_padded_param_and_loaded_weight for:
-        # 1. CPU (always)
-        # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
-        # This handles the case where the loaded weights are smaller than the padded expert_data
-        use_padded_loading = _is_cpu or self.use_flashinfer_trtllm_moe
-        if use_padded_loading:
+        if self.use_padded_loading:
             expert_data, loaded_weight = narrow_padded_param_and_loaded_weight(
                 expert_data,
                 loaded_weight,
@@ -555,18 +570,12 @@ class FusedMoE(torch.nn.Module):
             expert_data.copy_(loaded_weight)
 
     def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
-        num_global_routed_experts = self.num_experts - self.num_fused_shared_experts
-        num_local_routed_experts = (
-            self.num_local_experts - self.num_fused_shared_experts
-        )
-        start_idx = self.moe_ep_rank * num_local_routed_experts
-        end_idx = (self.moe_ep_rank + 1) * num_local_routed_experts
+        start_idx = self.moe_ep_rank * self._num_local_routed
+        end_idx = start_idx + self._num_local_routed
         if start_idx <= expert_id < end_idx:
             return expert_id - start_idx
-        elif (
-            self.num_fused_shared_experts > 0 and expert_id >= num_global_routed_experts
-        ):
-            return expert_id - num_global_routed_experts + num_local_routed_experts
+        elif self._has_fused_shared and expert_id >= self._num_global_routed:
+            return expert_id - self._num_global_routed + self._num_local_routed
         else:
             return -1
 
@@ -611,7 +620,7 @@ class FusedMoE(torch.nn.Module):
             )
             return
 
-        if expert_id >= self.num_experts - self.num_fused_shared_experts:
+        if self._has_fused_shared and expert_id >= self._num_global_routed:
             # This is a shared expert.
             physical_expert_ids = [expert_id]
         else:
@@ -663,6 +672,55 @@ class FusedMoE(torch.nn.Module):
             expert_id=expert_id,
         )
 
+    def _load_gguf_weight(
+        self,
+        param: torch.nn.Parameter,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        expert_id: int,
+        tp_rank: int,
+    ) -> bool:
+        """Handle GGUF weight loading.
+
+        Args:
+            param: The parameter to load the weight into.
+            loaded_weight: The weight tensor to load.
+            shard_id: The shard ID (w1, w2, or w3).
+            expert_id: The expert ID.
+            tp_rank: The tensor parallel rank.
+
+        Returns:
+            True if the weight was handled as a GGUF weight, False otherwise.
+        """
+        is_gguf_weight = getattr(param, "is_gguf_weight", False)
+        is_gguf_weight_type = getattr(param, "is_gguf_weight_type", False)
+
+        if is_gguf_weight_type:
+            # Store weight type for this expert
+            param.weight_type = loaded_weight.item()
+            return True
+
+        if is_gguf_weight:
+            output_dim = getattr(param, "output_dim", None)
+            if self.moe_tp_size > 1:
+                if shard_id in ["w1", "w3", "w2"] and output_dim == 0:
+                    shard_size = loaded_weight.size(0) // self.moe_tp_size
+                    start_idx = tp_rank * shard_size
+                    loaded_weight = loaded_weight.narrow(
+                        0, start_idx, shard_size
+                    ).clone()
+
+            # Store in data_container with expert/shard info
+            if not hasattr(param, "expert_data_map"):
+                param.expert_data_map = {}
+
+            key = (expert_id, shard_id)
+            param.expert_data_map[key] = loaded_weight
+            param.data_container.append(loaded_weight)
+            return True
+
+        return False
+
     def _weight_loader_impl(
         self,
         param: torch.nn.Parameter,
@@ -672,6 +730,10 @@ class FusedMoE(torch.nn.Module):
         expert_id: int,
     ) -> None:
         tp_rank = self.moe_tp_rank
+
+        # Special case for GGUF weights
+        if self._load_gguf_weight(param, loaded_weight, shard_id, expert_id, tp_rank):
+            return
 
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
@@ -999,15 +1061,6 @@ class FusedMoE(torch.nn.Module):
         dispatch_output = self.dispatcher.dispatch(
             hidden_states=hidden_states, topk_output=topk_output
         )
-        if _use_aiter and self.dispatcher.local_expert_mapping is not None:
-            self.expert_mask_gpu = (
-                (
-                    (self.dispatcher.local_expert_mapping >= 0)
-                    & (self.dispatcher.local_expert_mapping < self.num_local_experts)
-                )
-                .to(torch.int32)
-                .to(device="cuda")
-            )
 
         combine_input = self.run_moe_core(
             dispatch_output=dispatch_output,
@@ -1143,6 +1196,61 @@ class FusedMoE(torch.nn.Module):
             # TODO: remove this branch after MoE refactor
             self.down_gemm_overlap_args = None
             self.meta_overlap_args = None
+
+    def materialize_gguf_weights(self) -> None:
+        """Process weights after loading, especially for GGUF quantization.
+
+        This materializes GGUF UninitializedParameters from their data_containers.
+        """
+
+        for name, param in list(self.named_parameters()):
+            is_gguf_weight = getattr(param, "is_gguf_weight", False)
+
+            if is_gguf_weight and isinstance(param, UninitializedParameter):
+                data_container = getattr(param, "data_container", [])
+                expert_data_map = getattr(param, "expert_data_map", {})
+                tensor_shape = getattr(param, "tensor_shape", None)
+
+                if data_container and tensor_shape:
+                    # Determine the structure from expert_data_map
+                    num_experts = tensor_shape[0]
+
+                    # Collect weights by expert
+                    expert_weights = {}
+                    for (expert_id, shard_id), weight in expert_data_map.items():
+                        if expert_id not in expert_weights:
+                            expert_weights[expert_id] = {}
+                        expert_weights[expert_id][shard_id] = weight
+
+                    # Build the full tensor
+                    if "w13" in name:
+                        # w13 is gate+up fused
+                        weight_list = []
+                        for e in range(num_experts):
+                            if e in expert_weights:
+                                w1 = expert_weights[e].get("w1")
+                                w3 = expert_weights[e].get("w3")
+
+                                if w1 is not None and w3 is not None:
+                                    fused = torch.cat([w1, w3], dim=0)
+                                    weight_list.append(fused)
+
+                        if weight_list:
+                            stacked = torch.stack(weight_list, dim=0)
+                            param.materialize(stacked.shape, dtype=stacked.dtype)
+                            param.data.copy_(stacked)
+                    elif "w2" in name:
+                        # w2 is down projection
+                        weight_list = []
+                        for e in range(num_experts):
+                            if e in expert_weights and "w2" in expert_weights[e]:
+                                w2_weight = expert_weights[e]["w2"]
+                                weight_list.append(w2_weight)
+
+                        if weight_list:
+                            stacked = torch.stack(weight_list, dim=0)
+                            param.materialize(stacked.shape, dtype=stacked.dtype)
+                            param.data.copy_(stacked)
 
 
 @register_custom_op(out_shape="hidden_states")

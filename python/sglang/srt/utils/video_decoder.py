@@ -42,6 +42,8 @@ class VideoDecoderWrapper:
         """source: file path (str) or video bytes.
         device: "cpu" or "cuda". GPU decoding only supported with torchcodec.
         """
+        self._source_bytes = source if isinstance(source, bytes) else None
+        self._source_path = source if isinstance(source, str) else None
         self._tmp_path = None
         if _BACKEND == "torchcodec":
             kwargs = {"dimension_order": "NHWC"}
@@ -109,6 +111,20 @@ class VideoDecoderWrapper:
         else:
             arr = self._decoder.get_batch(indices).asnumpy()
             return torch.from_numpy(arr).pin_memory()
+
+    @property
+    def source_bytes(self) -> bytes | None:
+        """Return raw video bytes if available (needed for audio extraction)."""
+        if self._source_bytes is not None:
+            return self._source_bytes
+        path = self._tmp_path or self._source_path
+        if path is not None:
+            import os
+
+            if os.path.isfile(path):
+                with open(path, "rb") as f:
+                    return f.read()
+        return None
 
     def close(self):
         """Explicitly clean up temporary files."""
