@@ -253,6 +253,8 @@ class HiCacheController:
         page_size: int,
         tp_group: torch.distributed.ProcessGroup,
         load_cache_event: threading.Event,
+        attn_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        attn_tp_group: Optional[torch.distributed.ProcessGroup] = None,
         write_policy: str = "write_through_selective",
         io_backend: str = "",
         storage_backend: Optional[str] = None,
@@ -264,6 +266,9 @@ class HiCacheController:
         enable_storage_metrics: bool = False,
     ):
         self.tp_group = tp_group
+        self.attn_cp_group = attn_cp_group
+        self.attn_tp_group = attn_tp_group
+        self.prefetch_sync_groups: List[torch.distributed.ProcessGroup] = []
         self.mem_pool_device_allocator = token_to_kv_pool_allocator
         mem_pool_device = token_to_kv_pool_allocator.get_kvcache()
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
@@ -332,6 +337,51 @@ class HiCacheController:
             except ValueError as e:
                 # Preserve the historical error shape on init for unknown backends.
                 raise ValueError(f"Failed to create storage backend: {e}") from e
+
+    def get_attn_cp_rank_and_size(self) -> tuple[int, int]:
+        """Derive CP rank/size from the attn_cp process group."""
+        if self.attn_cp_group is not None:
+            return (
+                torch.distributed.get_rank(group=self.attn_cp_group),
+                torch.distributed.get_world_size(group=self.attn_cp_group),
+            )
+        return 0, 1
+
+    def _create_prefetch_sync_groups(self) -> None:
+        from sglang.srt.distributed.parallel_state import create_custom_parallel_group
+
+        self.prefetch_sync_groups = []
+        seen_rank_sets = set()
+
+        if self.attn_cp_group is not None or self.attn_tp_group is not None:
+            base_groups = [self.attn_cp_group, self.attn_tp_group]
+        else:
+            base_groups = [self.tp_group]
+
+        for group in base_groups:
+            if group is None or torch.distributed.get_world_size(group=group) == 1:
+                continue
+            group_ranks = tuple(torch.distributed.get_process_group_ranks(group))
+            if group_ranks in seen_rank_sets:
+                continue
+            seen_rank_sets.add(group_ranks)
+            self.prefetch_sync_groups.append(
+                create_custom_parallel_group(
+                    group_ranks=list(group_ranks), backend="gloo"
+                )
+            )
+
+    def _destroy_prefetch_sync_groups(self) -> None:
+        for group in self.prefetch_sync_groups:
+            try:
+                torch.distributed.destroy_process_group(group)
+            except Exception:
+                pass
+        self.prefetch_sync_groups = []
+
+    def _all_reduce_prefetch_groups(self, tensor: torch.Tensor, op) -> None:
+        for group in self.prefetch_sync_groups:
+            torch.distributed.all_reduce(tensor, op=op, group=group)
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -430,7 +480,7 @@ class HiCacheController:
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
         self.storage_backend_type = storage_backend
-        from sglang.srt.mem_cache.hicache_storage import get_hash_str
+        from sglang.srt.mem_cache.utils import get_hash_str
 
         self.get_hash_str = get_hash_str
         self.storage_config = self._generate_storage_config(
@@ -463,23 +513,18 @@ class HiCacheController:
             # tracking the number of tokens locked in prefetching, updated by the main scheduler thread
             self.prefetch_tokens_occupied = 0
 
-            # create a new communication group for synchronizing storage operations across TP workers
-            self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
-            if self.tp_world_size > 1:
-                from sglang.srt.distributed.parallel_state import (
-                    create_custom_parallel_group,
-                )
-
-                group_ranks = torch.distributed.get_process_group_ranks(self.tp_group)
-                self.prefetch_tp_group = create_custom_parallel_group(
-                    group_ranks=group_ranks, backend="gloo"
-                )
+            # Use dedicated gloo groups so storage prefetch sync is isolated
+            # from other collectives and consistent across CPxTP participants.
+            self._create_prefetch_sync_groups()
 
             # Select the get and set functions
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
 
-            if (self.storage_backend_type in ["hf3fs", "mooncake", "eic", "nixl"]) or (
+            if (
+                self.storage_backend_type
+                in ["hf3fs", "mooncake", "eic", "nixl", "simm"]
+            ) or (
                 self.storage_backend_type == "dynamic"
                 and bool(self.storage_config.extra_config.get("interface_v1", 0))
             ):
@@ -495,15 +540,7 @@ class HiCacheController:
                 self._stop_storage_threads()
             except Exception:
                 pass
-            try:
-                if hasattr(self, "prefetch_tp_group"):
-                    try:
-                        torch.distributed.destroy_process_group(self.prefetch_tp_group)
-                    except Exception:
-                        pass
-                    self.prefetch_tp_group = None
-            except Exception:
-                pass
+            self._destroy_prefetch_sync_groups()
             try:
                 if (
                     hasattr(self, "storage_backend")
@@ -540,19 +577,8 @@ class HiCacheController:
             # to avoid flipping `enable_storage` flags while threads are still alive.
             raise RuntimeError("Stop storage threads failed; detach aborted.") from e
 
-        # Best-effort destroy process group created for storage ops.
-        try:
-            if (
-                hasattr(self, "prefetch_tp_group")
-                and self.prefetch_tp_group is not None
-            ):
-                try:
-                    torch.distributed.destroy_process_group(self.prefetch_tp_group)
-                except Exception:
-                    pass
-                self.prefetch_tp_group = None
-        except Exception:
-            pass
+        # Best-effort destroy process groups created for storage ops.
+        self._destroy_prefetch_sync_groups()
 
         # Best-effort close (some backends rely on GC/destructor).
         try:
@@ -606,11 +632,15 @@ class HiCacheController:
                 and tp_lcm_size > self.tp_size
             )
 
+        attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
             tp_size=self.tp_size,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            attn_cp_rank=attn_cp_rank,
+            attn_cp_size=attn_cp_size,
             is_mla_model=is_mla_backend,
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
@@ -674,7 +704,9 @@ class HiCacheController:
             return
 
         op = CacheOperation.merge_ops(self.write_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices = self.move_indices(
+            op.host_indices, op.device_indices
+        )
         self.write_queue.clear()
 
         start_event = device_module.Event()
@@ -714,8 +746,7 @@ class HiCacheController:
         )
         return device_indices
 
-    def move_indices(self, op: CacheOperation):
-        host_indices, device_indices = op.host_indices, op.device_indices
+    def move_indices(self, host_indices: torch.Tensor, device_indices: torch.Tensor):
         # move indices to GPU if using kernels, to host if using direct indexing
         if self.io_backend == "kernel":
             if not host_indices.is_cuda:
@@ -743,7 +774,9 @@ class HiCacheController:
 
         producer_id = self.layer_done_counter.update_producer()
         op = CacheOperation.merge_ops(self.load_queue)
-        host_indices, device_indices = self.move_indices(op)
+        host_indices, device_indices = self.move_indices(
+            op.host_indices, op.device_indices
+        )
         self.load_queue.clear()
         producer_event = self.layer_done_counter.events[producer_id]
         producer_event.start_event.record()
@@ -951,16 +984,13 @@ class HiCacheController:
                 if operation is None:
                     continue
                 hash_value, storage_hit_count = self._storage_hit_query(operation)
-                if self.tp_world_size > 1:
-                    storage_hit_count_tensor = torch.tensor(
-                        storage_hit_count, dtype=torch.int
-                    )
-                    torch.distributed.all_reduce(
-                        storage_hit_count_tensor,
-                        op=torch.distributed.ReduceOp.MIN,
-                        group=self.prefetch_tp_group,
-                    )
-                    storage_hit_count = storage_hit_count_tensor.item()
+                storage_hit_count_tensor = torch.tensor(
+                    storage_hit_count, dtype=torch.int
+                )
+                self._all_reduce_prefetch_groups(
+                    storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+                )
+                storage_hit_count = storage_hit_count_tensor.item()
 
                 if storage_hit_count < self.prefetch_threshold:
                     # not to prefetch if not enough benefits

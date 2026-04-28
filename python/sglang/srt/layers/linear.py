@@ -57,6 +57,7 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "AWQMarlinLinearMethod",
     "AWQLinearMethod",
     "AWQLinearAscendMethod",
+    "AWQLinearIntelAMXMethod",
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
     "BlockInt8LinearMethod",
@@ -67,7 +68,9 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "GPTQLinearMethod",
     "FBGEMMFp8LinearMethod",
     "GPTQLinearAscendMethod",
+    "GPTQLinearIntelAMXMethod",
     "GPTQMoEAscendMethod",
+    "GPTQMoEIntelAMXMethod",
     "ModelOptFp8LinearMethod",
     "ModelOptFp4LinearMethod",
     "IPEXAWQLinearMethod",
@@ -388,7 +391,11 @@ class ColumnParallelLinear(LinearBase):
 
         # Materialize GGUF UninitializedParameter
         if is_gguf_weight and isinstance(param, UninitializedParameter):
-            param.materialize(loaded_weight.shape, dtype=loaded_weight.dtype)
+            weight_shape = list(loaded_weight.shape)
+            if output_dim is not None:
+                weight_shape[output_dim] = weight_shape[output_dim] // self.tp_size
+            param.materialize(tuple(weight_shape), dtype=loaded_weight.dtype)
+            param_data = param.data
 
         # bitsandbytes loads the weights of the specific portion
         # no need to narrow here
@@ -735,6 +742,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         for i, output_size in enumerate(output_sizes):
             shard_offsets.append((i, current_shard_offset, output_size))
             current_shard_offset += output_size
+        if _is_cpu:
+            from sglang.srt.model_loader.weight_utils import (
+                pad_loaded_weight,
+            )
+
+            loaded_weight = pad_loaded_weight(
+                loaded_weight, param.output_dim, output_sizes
+            )
 
         for shard_id, shard_offset, shard_size in shard_offsets:
             # Special case for Quantization.
@@ -747,7 +762,6 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
                 shard_size, shard_offset = param.adjust_shard_indexes_for_packing(
                     shard_size=shard_size, shard_offset=shard_offset
                 )
-
             loaded_weight_shard = loaded_weight.narrow(
                 param.output_dim, shard_offset, shard_size
             )
@@ -773,6 +787,15 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             shard_block_sizes.append(shard_block_size)
             shard_block_offsets.append(current_block_offset)
             current_block_offset += shard_block_size
+
+        if _is_cpu:
+            from sglang.srt.model_loader.weight_utils import (
+                pad_loaded_weight,
+            )
+
+            loaded_weight = pad_loaded_weight(
+                loaded_weight, param.output_dim, shard_block_sizes
+            )
 
         # Load each shard
         for shard_id, (shard_block_offset, shard_block_size) in enumerate(
@@ -1283,7 +1306,7 @@ class QKVParallelLinear(ColumnParallelLinear):
                         output_dim, start_idx, shard_size
                     )
 
-        # Special case for for AQLM codebooks.
+        # Special case for AQLM codebooks.
         elif is_metadata:
             # metadata indicates fixed size concatenated along dim 0
             shard_size = loaded_weight.shape[0]
@@ -1503,9 +1526,13 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
-        with use_symmetric_memory(
-            get_tp_group(), disabled=not is_allocation_symmetric()
-        ):
+        if self.use_dp_attention_reduce:
+            symm_ctx = use_symmetric_memory(get_attention_tp_group())
+        else:
+            symm_ctx = use_symmetric_memory(
+                get_tp_group(), disabled=not is_allocation_symmetric()
+            )
+        with symm_ctx:
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
 
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:

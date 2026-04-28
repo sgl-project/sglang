@@ -69,6 +69,7 @@ from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
 from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.utils.common import get_compiler_backend
 
+_is_npu = current_platform.is_npu()
 logger = init_logger(__name__)
 
 
@@ -126,19 +127,21 @@ class MOVATimestepPreparationStage(PipelineStage):
         self.scheduler = scheduler
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        self.scheduler.set_timesteps(
+        scheduler = self.scheduler
+        scheduler.set_timesteps(
             batch.num_inference_steps,
             denoising_strength=1.0,
-            shift=getattr(batch, "sigma_shift", self.scheduler.shift),
+            shift=getattr(batch, "sigma_shift", scheduler.shift),
         )
-        self.scheduler.set_pair_postprocess_by_name(
+        scheduler.set_pair_postprocess_by_name(
             "dual_sigma_shift",
             visual_shift=getattr(batch, "visual_shift", 5.0),
             audio_shift=getattr(batch, "audio_shift", 5.0),
         )
-        paired = self.scheduler.get_pairs()
+        paired = scheduler.get_pairs()
         batch.paired_timesteps = paired
         batch.timesteps = paired
+        batch.scheduler = scheduler
         return batch
 
 
@@ -348,13 +351,17 @@ class MOVADenoisingStage(PipelineStage):
             model_to_use.to(get_local_torch_device())
 
     def _select_visual_dit(
-        self, timestep: float, boundary_ratio: float | None, server_args: ServerArgs
+        self,
+        timestep: float,
+        boundary_ratio: float | None,
+        server_args: ServerArgs,
+        scheduler,
     ):
         if boundary_ratio is None or self.video_dit_2 is None:
             self._manage_device_placement(self.video_dit, None, server_args)
             return self.video_dit
 
-        boundary_timestep = boundary_ratio * self.scheduler.num_train_timesteps
+        boundary_timestep = boundary_ratio * scheduler.num_train_timesteps
         if timestep >= boundary_timestep:
             current_model = self.video_dit
             model_to_offload = self.video_dit_2
@@ -404,6 +411,9 @@ class MOVADenoisingStage(PipelineStage):
         paired_timesteps = batch.paired_timesteps
         if paired_timesteps is None:
             raise ValueError("paired_timesteps must be set for MOVA")
+        scheduler = batch.scheduler
+        if scheduler is None:
+            raise ValueError("scheduler must be set for MOVA denoising")
 
         y = batch.y if batch.y is not None else batch.image_latent
         if getattr(self.video_dit, "require_vae_embedding", False) and y is None:
@@ -416,7 +426,7 @@ class MOVADenoisingStage(PipelineStage):
 
         is_warmup = batch.is_warmup
         extra_step_kwargs = self.prepare_extra_func_kwargs(
-            self.scheduler.step_from_to,
+            scheduler.step_from_to,
             getattr(batch, "extra_step_kwargs", None) or {},
         )
 
@@ -430,6 +440,7 @@ class MOVADenoisingStage(PipelineStage):
                     logger=logger,
                     metrics=metrics,
                     perf_dump_path_provided=perf_dump_path_provided,
+                    record_as_step=True,
                 ):
                     pair_t = paired_timesteps[idx_step]
                     if getattr(pair_t, "shape", None) == (2,):
@@ -439,7 +450,7 @@ class MOVADenoisingStage(PipelineStage):
                         audio_timestep = pair_t
 
                     cur_visual_dit = self._select_visual_dit(
-                        timestep.item(), boundary_ratio, server_args
+                        timestep.item(), boundary_ratio, server_args, scheduler
                     )
 
                     timestep = timestep.unsqueeze(0).to(device=get_local_torch_device())
@@ -567,14 +578,14 @@ class MOVADenoisingStage(PipelineStage):
                             next_timestep = None
                             next_audio_timestep = None
 
-                        batch.latents = self.scheduler.step_from_to(
+                        batch.latents = scheduler.step_from_to(
                             visual_noise_pred,
                             timestep,
                             next_timestep,
                             batch.latents,
                             **extra_step_kwargs,
                         )
-                        batch.audio_latents = self.scheduler.step_from_to(
+                        batch.audio_latents = scheduler.step_from_to(
                             audio_noise_pred,
                             audio_timestep,
                             next_audio_timestep,
@@ -714,7 +725,14 @@ class MOVADenoisingStage(PipelineStage):
 
         # Build visual freqs for full sequence
         visual_dit._init_freqs()
-        visual_freqs = tuple(freq.to(visual_x.device) for freq in visual_dit.freqs)
+        if _is_npu:
+            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
+            visual_freqs = tuple(
+                freq.to(device=visual_x.device, dtype=torch.complex64)
+                for freq in visual_dit.freqs
+            )
+        else:
+            visual_freqs = tuple(freq.to(visual_x.device) for freq in visual_dit.freqs)
         visual_freqs = (
             torch.cat(
                 [
@@ -734,18 +752,24 @@ class MOVADenoisingStage(PipelineStage):
 
         # Build audio freqs for full sequence
         self.audio_dit._init_freqs()
-        audio_freqs = (
-            torch.cat(
-                [
-                    self.audio_dit.freqs[0][:f].view(f, -1).expand(f, -1),
-                    self.audio_dit.freqs[1][:f].view(f, -1).expand(f, -1),
-                    self.audio_dit.freqs[2][:f].view(f, -1).expand(f, -1),
-                ],
-                dim=-1,
+        if _is_npu:
+            # TODO: remove this when torch.complex128 is supported for torch.cat on NPU
+            audio_freqs = tuple(
+                freq.to(device=audio_x.device, dtype=torch.complex64)
+                for freq in self.audio_dit.freqs
             )
-            .reshape(full_audio_seq_len, 1, -1)
-            .to(audio_x.device)
-        )
+        else:
+            audio_freqs = tuple(
+                freq.to(audio_x.device) for freq in self.audio_dit.freqs
+            )
+        audio_freqs = torch.cat(
+            [
+                audio_freqs[0][:f].view(f, -1).expand(f, -1),
+                audio_freqs[1][:f].view(f, -1).expand(f, -1),
+                audio_freqs[2][:f].view(f, -1).expand(f, -1),
+            ],
+            dim=-1,
+        ).reshape(full_audio_seq_len, 1, -1)
 
         # Shard sequences for SP
         visual_x, visual_pad_len = self._shard_sequence_for_sp(visual_x, dim=1)

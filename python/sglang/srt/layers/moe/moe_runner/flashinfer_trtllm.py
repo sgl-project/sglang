@@ -31,7 +31,6 @@ from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.utils.common import (
     is_cuda_alike,
     is_flashinfer_available,
-    is_sm120_supported,
     next_power_of_2,
 )
 
@@ -41,12 +40,16 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
-if is_flashinfer_available() and is_sm120_supported():
+if is_flashinfer_available():
     from flashinfer import fp4_quantize
 elif is_cuda_alike():
     from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
 else:
     fp4_quantize = None
+
+_flashinfer_trtllm_shuffle_row_indices_cache_mxfp8: dict[
+    tuple, dict[str, torch.Tensor]
+] = {}
 
 
 def align_fp8_moe_weights_for_flashinfer_trtllm(
@@ -127,10 +130,13 @@ def align_fp8_moe_weights_for_flashinfer_trtllm(
 
 def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     """Prepare MXFP8 MoE weights/scales for FlashInfer TRT-LLM kernels."""
-    from flashinfer import (
-        reorder_rows_for_gated_act_gemm,
-        shuffle_matrix_a,
-        shuffle_matrix_sf_a,
+    from flashinfer import block_scale_interleave
+    from flashinfer.fused_moe.core import (
+        get_reorder_rows_for_gated_act_gemm_row_indices,
+    )
+    from flashinfer.utils import (
+        get_shuffle_matrix_a_row_indices,
+        get_shuffle_matrix_sf_a_row_indices,
     )
 
     w13_weight = cast(torch.Tensor, layer.w13_weight).contiguous()
@@ -145,52 +151,93 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     _, hidden_size, _ = w2_weight.shape
     epilogue_tile_m = 128
 
-    w13_interleaved = [
-        reorder_rows_for_gated_act_gemm(w13_weight[i]) for i in range(num_experts)
-    ]
-    w13_scale_interleaved = [
-        reorder_rows_for_gated_act_gemm(w13_scale[i]) for i in range(num_experts)
-    ]
+    # Reuse precomputed row-index transforms whenever shape/device are unchanged.
+    w13_weight_u8 = w13_weight.view(torch.uint8)
+    w2_weight_u8 = w2_weight.view(torch.uint8)
+    cache_key = (
+        two_n,
+        hidden_size,
+        w2_weight.shape[-1],
+        w13_scale.shape[-1],
+        w2_scale.shape[-1],
+        epilogue_tile_m,
+        (w13_weight.device.type, w13_weight.device.index),
+        (w2_weight.device.type, w2_weight.device.index),
+        (w13_scale.device.type, w13_scale.device.index),
+        (w2_scale.device.type, w2_scale.device.index),
+    )
+    cache = _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8.get(cache_key)
+    if cache is None:
+        reorder_row_indices = get_reorder_rows_for_gated_act_gemm_row_indices(
+            w13_weight_u8[0]
+        ).to(w13_weight.device)
+        w13_shuffle_row_indices = get_shuffle_matrix_a_row_indices(
+            w13_weight_u8[0], epilogue_tile_m
+        ).to(w13_weight.device)
+        w2_shuffle_row_indices = get_shuffle_matrix_a_row_indices(
+            w2_weight_u8[0], epilogue_tile_m
+        ).to(w2_weight.device)
+        w13_scale_shuffle_row_indices = get_shuffle_matrix_sf_a_row_indices(
+            w13_scale[0].reshape(two_n, -1), epilogue_tile_m
+        ).to(w13_scale.device)
+        w2_scale_shuffle_row_indices = get_shuffle_matrix_sf_a_row_indices(
+            w2_scale[0].reshape(hidden_size, -1), epilogue_tile_m
+        ).to(w2_scale.device)
+        cache = {
+            "reorder_row_indices": reorder_row_indices,
+            "w13_shuffle_row_indices": w13_shuffle_row_indices,
+            "w2_shuffle_row_indices": w2_shuffle_row_indices,
+            "w13_scale_shuffle_row_indices": w13_scale_shuffle_row_indices,
+            "w2_scale_shuffle_row_indices": w2_scale_shuffle_row_indices,
+        }
+        _flashinfer_trtllm_shuffle_row_indices_cache_mxfp8[cache_key] = cache
 
-    w13_shuffled = [
-        shuffle_matrix_a(w13_interleaved[i].view(torch.uint8), epilogue_tile_m)
-        for i in range(num_experts)
-    ]
-    w2_shuffled = [
-        shuffle_matrix_a(w2_weight[i].view(torch.uint8), epilogue_tile_m)
-        for i in range(num_experts)
-    ]
-    w13_scale_shuffled = [
-        shuffle_matrix_sf_a(
-            w13_scale_interleaved[i].view(torch.uint8).reshape(two_n, -1),
-            epilogue_tile_m,
+    reorder_row_indices = cache["reorder_row_indices"]
+    w13_shuffle_row_indices = cache["w13_shuffle_row_indices"]
+    w2_shuffle_row_indices = cache["w2_shuffle_row_indices"]
+    w13_scale_shuffle_row_indices = cache["w13_scale_shuffle_row_indices"]
+    w2_scale_shuffle_row_indices = cache["w2_scale_shuffle_row_indices"]
+
+    w13_shuffled_u8 = torch.empty_like(w13_weight_u8)
+    w2_shuffled_u8 = torch.empty_like(w2_weight_u8)
+    w13_scale_shuffled = torch.empty_like(w13_scale)
+    w2_scale_shuffled = torch.empty_like(w2_scale)
+
+    for i in range(num_experts):
+        w13_interleaved_u8 = w13_weight_u8[i].index_select(0, reorder_row_indices)
+        w13_scale_interleaved = w13_scale[i].index_select(0, reorder_row_indices)
+
+        w13_shuffled_u8[i].copy_(
+            w13_interleaved_u8.index_select(0, w13_shuffle_row_indices)
         )
-        for i in range(num_experts)
-    ]
-    w2_scale_shuffled = [
-        shuffle_matrix_sf_a(
-            w2_scale[i].view(torch.uint8).reshape(hidden_size, -1),
-            epilogue_tile_m,
+        w2_shuffled_u8[i].copy_(w2_weight_u8[i].index_select(0, w2_shuffle_row_indices))
+
+        w13_scale_linear = w13_scale_interleaved.reshape(two_n, -1)
+        w13_scale_shuffled[i].copy_(
+            block_scale_interleave(
+                w13_scale_linear.index_select(0, w13_scale_shuffle_row_indices)
+            ).reshape_as(w13_scale_shuffled[i])
         )
-        for i in range(num_experts)
-    ]
+
+        w2_scale_linear = w2_scale[i].reshape(hidden_size, -1)
+        w2_scale_shuffled[i].copy_(
+            block_scale_interleave(
+                w2_scale_linear.index_select(0, w2_scale_shuffle_row_indices)
+            ).reshape_as(w2_scale_shuffled[i])
+        )
 
     # Keep parameter identities stable for CUDA graph capture reuse.
-    copy_or_rebind_param(
-        layer, "w13_weight", torch.stack(w13_shuffled).view(torch.float8_e4m3fn)
-    )
-    copy_or_rebind_param(
-        layer, "w2_weight", torch.stack(w2_shuffled).view(torch.float8_e4m3fn)
-    )
+    copy_or_rebind_param(layer, "w13_weight", w13_shuffled_u8.view(torch.float8_e4m3fn))
+    copy_or_rebind_param(layer, "w2_weight", w2_shuffled_u8.view(torch.float8_e4m3fn))
     copy_or_rebind_param(
         layer,
         "w13_weight_scale_inv",
-        torch.stack(w13_scale_shuffled).reshape_as(w13_scale).contiguous(),
+        w13_scale_shuffled.contiguous(),
     )
     copy_or_rebind_param(
         layer,
         "w2_weight_scale_inv",
-        torch.stack(w2_scale_shuffled).reshape_as(w2_scale).contiguous(),
+        w2_scale_shuffled.contiguous(),
     )
     layer.w13_weight_scale_inv.format_ue8m0 = True
     layer.w2_weight_scale_inv.format_ue8m0 = True
@@ -228,15 +275,15 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         w13_weight.size(0),  # num_experts
     )
 
-    # Set flashinfer parameters
+    # Set flashinfer parameters in-place
+    copy_or_rebind_param(layer, "w13_weight", gemm1_weights_fp4_shuffled.contiguous())
+    copy_or_rebind_param(layer, "w2_weight", gemm2_weights_fp4_shuffled.contiguous())
     copy_or_rebind_param(
-        layer, "gemm1_weights_fp4_shuffled", gemm1_weights_fp4_shuffled
+        layer, "w13_weight_scale", gemm1_scales_fp4_shuffled.contiguous()
     )
     copy_or_rebind_param(
-        layer, "gemm2_weights_fp4_shuffled", gemm2_weights_fp4_shuffled
+        layer, "w2_weight_scale", gemm2_scales_fp4_shuffled.contiguous()
     )
-    copy_or_rebind_param(layer, "gemm1_scales_fp4_shuffled", gemm1_scales_fp4_shuffled)
-    copy_or_rebind_param(layer, "gemm2_scales_fp4_shuffled", gemm2_scales_fp4_shuffled)
 
     # Compute additional scaling factor needed for TRT-LLM
     w2_input_scale_quant = cast(torch.Tensor, layer.w2_input_scale_quant)
@@ -245,14 +292,6 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
         layer,
         "g1_scale_c",
         (w2_input_scale_quant * g1_alphas).to(torch.float32),
-    )
-
-    # Clean up weights that won't be used by TRT-LLM
-    del (
-        layer.w2_weight,
-        layer.w2_weight_scale,
-        layer.w13_weight,
-        layer.w13_weight_scale,
     )
 
 
@@ -294,8 +333,7 @@ def _pack_topk_for_flashinfer_routed(
     packed_ids = topk_ids.to(torch.int32)
     packed_weights = topk_weights.to(torch.bfloat16)
     packed = (packed_ids << 16) | packed_weights.view(torch.int16).to(torch.int32)
-    # SGLang can mark padded tokens with -1 expert ids.
-    return packed.masked_fill_(packed_ids < 0, 0)
+    return packed
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp8(
@@ -362,7 +400,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
             symm_output = torch.empty(
                 hidden_states.shape[0],
                 hidden_states.shape[1],
-                dtype=torch.bfloat16,
+                dtype=hidden_states.dtype,
                 device=hidden_states.device,
             )
 
@@ -442,9 +480,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 tune_max_num_tokens=next_power_of_2(a_q.shape[0]),
                 fp8_quantization_type=int(fp8_quantization_type),
             )
+        # TODO: Once https://github.com/flashinfer-ai/flashinfer/issues/2703 is fixed, pass output to moe kernel and remove this copy.
         symm_output.copy_(output)
         output = symm_output
     else:
+        assert TopKOutputChecker.format_is_bypassed(topk_output)
         assert quant_info.w13_input_scale is not None
         assert quant_info.output1_scales_scalar is not None
         assert quant_info.output1_scales_gate_scalar is not None
@@ -469,8 +509,15 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         # Move kernel call outside context manager to avoid graph breaks
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
+
+        # The DeepSeekV3 routing method requires float32 router logits.
+        if routing_method_type == RoutingMethodType.DeepSeekV3:
+            router_logits = router_logits.to(torch.float32)
+        else:
+            router_logits = router_logits.to(torch.bfloat16)
+
         output = trtllm_fp8_per_tensor_scale_moe_wrapper(
-            routing_logits=router_logits.to(torch.bfloat16),
+            routing_logits=router_logits,
             routing_bias=routing_bias_cast,
             hidden_states=a_q,
             gemm1_weights=quant_info.w13_weight,
@@ -504,11 +551,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     """Quantization payload consumed by FlashInfer TRT-LLM FP4 MoE kernels."""
 
-    # Shuffled FP4 weights (processed by align_fp4_moe_weights_for_flashinfer_trtllm)
-    gemm1_weights_fp4_shuffled: torch.Tensor
-    gemm2_weights_fp4_shuffled: torch.Tensor
-    gemm1_scales_fp4_shuffled: torch.Tensor
-    gemm2_scales_fp4_shuffled: torch.Tensor
+    w13_weight: torch.Tensor
+    w2_weight: torch.Tensor
+    w13_weight_scale: torch.Tensor
+    w2_weight_scale: torch.Tensor
 
     # Scaling factors
     g1_scale_c: torch.Tensor
@@ -560,13 +606,17 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferTrtllmFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
+    use_routed_topk: bool = False,
 ) -> StandardCombineInput:
     """FlashInfer TRTLLM FP4 MoE forward pass.
 
     This function handles the FP4 TRTLLM MoE path that was previously in
-    FlashInferFP4MoE.forward_impl and ModelOptNvFp4FusedMoEMethod.apply.
+    ModelOptNvFp4FusedMoEMethod.apply.
     """
-    from flashinfer.fused_moe import trtllm_fp4_block_scale_moe
+    from flashinfer.fused_moe import (
+        trtllm_fp4_block_scale_moe,
+        trtllm_fp4_block_scale_routed_moe,
+    )
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
@@ -577,25 +627,13 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
-    assert TopKOutputChecker.format_is_bypassed(topk_output)
-
-    router_logits = topk_output.router_logits
-    topk_config = topk_output.topk_config
-    routing_method_type = quant_info.routing_method_type
 
     # Quantize hidden states to FP4
     hs_fp4, hs_scale_linear = quantize_hidden_states_fp4(
         hidden_states, quant_info.w13_input_scale_quant
     )
-
-    # DeepSeekV3 style routing requires float32 router logits
-    if routing_method_type == RoutingMethodType.DeepSeekV3:
-        router_logits = router_logits.to(torch.float32)
-
-    correction_bias = (
-        None
-        if topk_config.correction_bias is None
-        else topk_config.correction_bias.to(hidden_states.dtype)
+    hs_scale = hs_scale_linear.view(torch.float8_e4m3fn).reshape(
+        *hs_scale_linear.shape[:-1], -1
     )
 
     with use_symmetric_memory(get_tp_group(), disabled=not is_allocation_symmetric()):
@@ -604,50 +642,95 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             hs_fp4.shape[-1] * 2 if hs_fp4.dtype == torch.uint8 else hs_fp4.shape[-1]
         )
         symm_output = torch.empty(
-            num_tokens, hidden_size, dtype=torch.bfloat16, device=hs_fp4.device
+            num_tokens, hidden_size, dtype=hidden_states.dtype, device=hs_fp4.device
         )
 
-    result = trtllm_fp4_block_scale_moe(
-        routing_logits=router_logits,
-        routing_bias=correction_bias,
-        hidden_states=hs_fp4,
-        hidden_states_scale=hs_scale_linear.view(torch.float8_e4m3fn).reshape(
-            *hs_scale_linear.shape[:-1], -1
-        ),
-        gemm1_weights=quant_info.gemm1_weights_fp4_shuffled,
-        gemm1_weights_scale=quant_info.gemm1_scales_fp4_shuffled.view(
-            torch.float8_e4m3fn
-        ),
-        gemm1_bias=None,
-        gemm1_alpha=None,
-        gemm1_beta=None,
-        gemm1_clamp_limit=None,
-        gemm2_weights=quant_info.gemm2_weights_fp4_shuffled,
-        gemm2_weights_scale=quant_info.gemm2_scales_fp4_shuffled.view(
-            torch.float8_e4m3fn
-        ),
-        gemm2_bias=None,
-        output1_scale_scalar=quant_info.g1_scale_c,
-        output1_scale_gate_scalar=quant_info.g1_alphas,
-        output2_scale_scalar=quant_info.g2_alphas,
-        num_experts=quant_info.global_num_experts,
-        top_k=topk_config.top_k,
-        n_group=topk_config.num_expert_group,
-        topk_group=topk_config.topk_group,
-        intermediate_size=quant_info.intermediate_size_per_partition,
-        local_expert_offset=quant_info.local_expert_offset,
-        local_num_experts=quant_info.local_num_experts,
-        routed_scaling_factor=runner_config.routed_scaling_factor,
-        tile_tokens_dim=None,
-        routing_method_type=(
-            routing_method_type
-            if routing_method_type is not None
-            else RoutingMethodType.Default
-        ),
-        do_finalize=True,
-        tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
-        output=symm_output,
-    )[0]
+    if use_routed_topk:
+        assert TopKOutputChecker.format_is_standard(topk_output)
+
+        packed_topk_ids = _pack_topk_for_flashinfer_routed(
+            topk_output.topk_ids, topk_output.topk_weights
+        )
+        result = trtllm_fp4_block_scale_routed_moe(
+            topk_ids=packed_topk_ids,
+            routing_bias=None,
+            hidden_states=hs_fp4,
+            hidden_states_scale=hs_scale,
+            gemm1_weights=quant_info.w13_weight,
+            gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=quant_info.w2_weight,
+            gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
+            gemm2_bias=None,
+            output1_scale_scalar=quant_info.g1_scale_c,
+            output1_scale_gate_scalar=quant_info.g1_alphas,
+            output2_scale_scalar=quant_info.g2_alphas,
+            num_experts=quant_info.global_num_experts,
+            top_k=topk_output.topk_ids.shape[1],
+            n_group=0,
+            topk_group=0,
+            intermediate_size=quant_info.intermediate_size_per_partition,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+            routed_scaling_factor=None,
+            routing_method_type=1,  # Unused, but must be 1 to pass validation.
+            do_finalize=True,
+            tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
+            output=symm_output,
+        )[0]
+    else:
+        assert TopKOutputChecker.format_is_bypassed(topk_output)
+
+        router_logits = topk_output.router_logits
+        topk_config = topk_output.topk_config
+        routing_method_type = quant_info.routing_method_type
+
+        # DeepSeekV3 style routing requires float32 router logits
+        if routing_method_type == RoutingMethodType.DeepSeekV3:
+            router_logits = router_logits.to(torch.float32)
+
+        correction_bias = (
+            None
+            if topk_config.correction_bias is None
+            else topk_config.correction_bias.to(hidden_states.dtype)
+        )
+        result = trtllm_fp4_block_scale_moe(
+            routing_logits=router_logits,
+            routing_bias=correction_bias,
+            hidden_states=hs_fp4,
+            hidden_states_scale=hs_scale,
+            gemm1_weights=quant_info.w13_weight,
+            gemm1_weights_scale=quant_info.w13_weight_scale.view(torch.float8_e4m3fn),
+            gemm1_bias=None,
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            gemm2_weights=quant_info.w2_weight,
+            gemm2_weights_scale=quant_info.w2_weight_scale.view(torch.float8_e4m3fn),
+            gemm2_bias=None,
+            output1_scale_scalar=quant_info.g1_scale_c,
+            output1_scale_gate_scalar=quant_info.g1_alphas,
+            output2_scale_scalar=quant_info.g2_alphas,
+            num_experts=quant_info.global_num_experts,
+            top_k=topk_config.top_k,
+            n_group=topk_config.num_expert_group,
+            topk_group=topk_config.topk_group,
+            intermediate_size=quant_info.intermediate_size_per_partition,
+            local_expert_offset=quant_info.local_expert_offset,
+            local_num_experts=quant_info.local_num_experts,
+            routed_scaling_factor=runner_config.routed_scaling_factor,
+            routing_method_type=(
+                routing_method_type
+                if routing_method_type is not None
+                else RoutingMethodType.Default
+            ),
+            do_finalize=True,
+            tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
+            output=symm_output,
+        )[0]
 
     return StandardCombineInput(hidden_states=result)
 
@@ -803,6 +886,13 @@ def fused_experts_none_to_flashinfer_trtllm_routed(
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
+    if isinstance(quant_info, FlashInferTrtllmFp4MoeQuantInfo):
+        return fused_experts_none_to_flashinfer_trtllm_fp4(
+            dispatch_output,
+            quant_info,
+            runner_config,
+            use_routed_topk=True,
+        )
     if isinstance(quant_info, FlashInferTrtllmFp8MoeQuantInfo):
         return fused_experts_none_to_flashinfer_trtllm_fp8(
             dispatch_output,

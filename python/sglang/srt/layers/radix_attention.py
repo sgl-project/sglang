@@ -23,6 +23,12 @@ from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -119,9 +125,14 @@ class RadixAttention(nn.Module):
                 output = q.new_empty((q.shape[0], self.tp_q_head_num * self.v_head_dim))
             else:
                 output = torch.empty_like(q)
-            unified_attention_with_output(
-                q, k, v, output, save_kv_cache, self.layer_id, **kwargs
-            )
+            if is_in_breakable_cuda_graph():
+                bcg_unified_attention_with_output(
+                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                )
+            else:
+                unified_attention_with_output(
+                    q, k, v, output, save_kv_cache, self.layer_id, **kwargs
+                )
             return output
         else:
             return forward_batch.attn_backend.forward(
@@ -153,21 +164,56 @@ def unified_attention_with_output(
     forward_batch = context.forward_batch
     attention_layers = context.attention_layers
     attention_layer = attention_layers[layer_id]
+    real_num_tokens = forward_batch.num_token_non_padded_cpu
+
+    query = query[:real_num_tokens]
+    key = key[:real_num_tokens]
+    value = value[:real_num_tokens]
 
     kwargs = {}
     if q_rope is not None:
-        kwargs["q_rope"] = q_rope
+        kwargs["q_rope"] = q_rope[:real_num_tokens]
     if k_rope is not None:
-        kwargs["k_rope"] = k_rope
+        kwargs["k_rope"] = k_rope[:real_num_tokens]
     if sinks is not None:
         kwargs["sinks"] = sinks
 
-    ret = forward_batch.attn_backend.forward(
-        query, key, value, attention_layer, forward_batch, save_kv_cache, **kwargs
-    )
-    assert (
-        output.numel() == ret.numel()
-    ), f"Output tensor element mismatch: {output.numel()} != {ret.numel()}"
+    original_out_cache_loc = forward_batch.out_cache_loc
+    original_out_cache_loc_swa = forward_batch.out_cache_loc_swa
+    token_to_kv_pool = forward_batch.token_to_kv_pool
+    original_swa_loc = getattr(token_to_kv_pool, "swa_loc", None)
+    # Keep the original ForwardBatch object and only narrow cache locations for
+    # this backend call so model/backend state is still written to the same batch.
+    forward_batch.out_cache_loc = original_out_cache_loc[:real_num_tokens]
+    if original_out_cache_loc_swa is not None:
+        forward_batch.out_cache_loc_swa = original_out_cache_loc_swa[:real_num_tokens]
+        if hasattr(token_to_kv_pool, "set_swa_loc"):
+            token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
-    output.view(ret.shape).copy_(ret)
+    # Store pre-allocated output for FA backend to write directly into.
+    # Must slice to real_num_tokens to match the narrowed query shape —
+    # the FA kernel validates out.size(0) == q.size(0).
+    forward_batch._attn_output = output[:real_num_tokens]
+
+    ret = forward_batch.attn_backend.forward(
+        query,
+        key,
+        value,
+        attention_layer,
+        forward_batch,
+        save_kv_cache,
+        **kwargs,
+    )
+    forward_batch.out_cache_loc = original_out_cache_loc
+    forward_batch.out_cache_loc_swa = original_out_cache_loc_swa
+    if original_out_cache_loc_swa is not None and hasattr(
+        token_to_kv_pool, "set_swa_loc"
+    ):
+        token_to_kv_pool.set_swa_loc(original_swa_loc)
+
+    if ret.data_ptr() != output.data_ptr():
+        output[:real_num_tokens].view(ret.shape).copy_(ret)
     return
+
+
+bcg_unified_attention_with_output = eager_on_graph(True)(unified_attention_with_output)

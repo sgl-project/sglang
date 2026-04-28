@@ -8,6 +8,7 @@ If the actual run is significantly better than the baseline, the improved cases 
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -35,17 +36,30 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 from sglang.multimodal_gen.test.test_utils import (
     _consistency_gt_filenames,
+    _get_consistency_gt_dir,
+    compare_with_gt,
     extract_key_frames_from_video,
+    get_consistency_gt_candidates,
+    get_consistency_gt_remote_files,
+    get_consistency_thresholds,
     get_dynamic_server_port,
+    gt_exists,
+    image_bytes_to_numpy,
+    load_consistency_gt,
     wait_for_req_perf_record,
 )
 
 logger = init_logger(__name__)
 
+# Track test cases missing estimated_full_test_time_s for time measurement output
+_MISSING_ESTIMATED_TIME_CASES: set[str] = set()
+_PENDING_BASELINE_DUMPS: dict[str, tuple["PerformanceSummary", bool]] = {}
+
 
 @pytest.fixture
 def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     """Start a diffusion server for a single case and tear it down afterwards."""
+    _fixture_start_time = time.perf_counter()
     server_args = case.server_args
 
     # Skip ring attention tests on AMD/ROCm - Ring Attention requires Flash Attention
@@ -64,11 +78,7 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     port = int(os.environ.get("SGLANG_TEST_SERVER_PORT", default_port))
     sampling_params = case.sampling_params
     extra_args = os.environ.get("SGLANG_TEST_SERVE_ARGS", "")
-
-    # In GT generation mode, force --backend diffusers
-    if os.environ.get("SGLANG_GEN_GT", "0") == "1":
-        if "--backend" not in extra_args:
-            extra_args = "--backend diffusers " + extra_args.strip()
+    extra_args = f"--model-type diffusion {extra_args}".strip()
 
     extra_args += f" --num-gpus {server_args.num_gpus}"
 
@@ -102,6 +112,10 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     if server_args.enable_warmup:
         extra_args += " --warmup"
 
+    # Strict ports: fail immediately if port is occupied instead of silently
+    # picking another one (which causes the test client to connect to the wrong server).
+    extra_args += " --strict-ports"
+
     for arg in server_args.extras:
         extra_args += f" {arg}"
 
@@ -109,12 +123,29 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
     env_vars = {}
     if server_args.enable_cache_dit:
         env_vars["SGLANG_CACHE_DIT_ENABLED"] = "true"
+    env_vars.update(server_args.env_vars)
 
     # start server
+    wait_deadline = float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200"))
+    logger.info(
+        "[server-test] Starting server for test case: %s\n"
+        "  Model: %s\n"
+        "  Port: %s\n"
+        "  Wait deadline: %ss\n"
+        "  Extra args: %s\n"
+        "  Num GPUs: %s",
+        case.id,
+        server_args.model_path,
+        port,
+        wait_deadline,
+        extra_args,
+        server_args.num_gpus,
+    )
+
     manager = ServerManager(
         model=server_args.model_path,
         port=port,
-        wait_deadline=float(os.environ.get("SGLANG_TEST_WAIT_SECS", "1200")),
+        wait_deadline=wait_deadline,
         extra_args=extra_args,
         env_vars=env_vars,
     )
@@ -125,7 +156,9 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         # pipeline class.  This avoids hard failures when a model needs a
         # newer diffusers release than what is currently installed in CI.
         msg = str(exc)
-        if "not found in diffusers" in msg or "has no attribute" in msg:
+        if "not found in diffusers" in msg or (
+            "has no attribute" in msg and "diffusers" in msg.lower()
+        ):
             pytest.skip(
                 f"Skipping {case.id}: required diffusers pipeline class "
                 f"is not available in the installed version. "
@@ -148,6 +181,38 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
         yield ctx
     finally:
         ctx.cleanup()
+
+        _fixture_end_time = time.perf_counter()
+        _measured_full_time = _fixture_end_time - _fixture_start_time
+        is_baseline_generation_mode = os.environ.get("SGLANG_GEN_BASELINE", "0") == "1"
+
+        pending_dump = _PENDING_BASELINE_DUMPS.pop(case.id, None)
+        if pending_dump is not None:
+            summary, missing_scenario = pending_dump
+            DiffusionServerBase()._dump_baseline_for_testcase(
+                case,
+                summary,
+                missing_scenario=missing_scenario,
+                measured_full_time=_measured_full_time,
+            )
+
+        scenario = BASELINE_CONFIG.scenarios.get(case.id)
+        needs_estimated_time = (
+            scenario is None or scenario.estimated_full_test_time_s is None
+        )
+
+        if needs_estimated_time and not is_baseline_generation_mode:
+            _MISSING_ESTIMATED_TIME_CASES.add(case.id)
+            logger.error(
+                f'\n{"=" * 60}\n'
+                f'Add "estimated_full_test_time_s" to scenario "{case.id}":\n\n'
+                f"File: python/sglang/multimodal_gen/test/server/perf_baselines.json\n\n"
+                f'    "{case.id}": {{\n'
+                f"        ...\n"
+                f'        "estimated_full_test_time_s": {_measured_full_time:.1f}\n'
+                f"    }}\n"
+                f'{"=" * 60}\n'
+            )
 
 
 class DiffusionServerBase:
@@ -215,18 +280,21 @@ Consider updating perf_baselines.json with the snippets below:
         ctx: ServerContext,
         case_id: str,
         generate_fn: Callable[[str, openai.Client], tuple[str, bytes]],
-    ) -> tuple[RequestPerfRecord, bytes]:
-        """Run generation and collect performance records.
+        collect_perf: bool = True,
+    ) -> tuple[RequestPerfRecord | None, bytes]:
+        """Run generation and optionally collect performance records.
 
         Returns:
             Tuple of (performance_record, content_bytes)
         """
-        log_path = ctx.perf_log_path
-        log_wait_timeout = 30
-
         client = self._client(ctx)
         rid, content = generate_fn(case_id, client)
 
+        if not collect_perf:
+            return None, content
+
+        log_path = ctx.perf_log_path
+        log_wait_timeout = 30
         req_perf_record = wait_for_req_perf_record(
             rid,
             log_path,
@@ -261,6 +329,16 @@ Consider updating perf_baselines.json with the snippets below:
             if not is_baseline_generation_mode:
                 missing_scenario = True
 
+        # Check for missing estimated_full_test_time_s
+        missing_estimated_time = False
+        if (
+            not missing_scenario
+            and not is_baseline_generation_mode
+            and scenario.estimated_full_test_time_s is None
+        ):
+            missing_estimated_time = True
+            _MISSING_ESTIMATED_TIME_CASES.add(case.id)
+
         validator_name = case.server_args.custom_validator or "default"
         validator_class = VALIDATOR_REGISTRY.get(validator_name, PerformanceValidator)
 
@@ -273,7 +351,11 @@ Consider updating perf_baselines.json with the snippets below:
         summary = validator.collect_metrics(perf_record)
 
         if case.run_perf_check:
-            if is_baseline_generation_mode or missing_scenario:
+            if is_baseline_generation_mode:
+                _PENDING_BASELINE_DUMPS[case.id] = (summary, missing_scenario)
+                return
+
+            if missing_scenario:
                 self._dump_baseline_for_testcase(case, summary, missing_scenario)
                 if missing_scenario:
                     pytest.fail(
@@ -399,6 +481,7 @@ Consider updating perf_baselines.json with the snippets below:
         case: DiffusionTestCase,
         summary: "PerformanceSummary",
         missing_scenario: bool = False,
+        measured_full_time: float | None = None,
     ) -> None:
         """Dump performance metrics as a JSON scenario for baselines."""
         import json
@@ -416,6 +499,9 @@ Consider updating perf_baselines.json with the snippets below:
             "expected_median_denoise_ms": round(summary.median_denoise_ms, 2),
         }
 
+        if measured_full_time is not None:
+            baseline["estimated_full_test_time_s"] = round(measured_full_time, 1)
+
         # Video-specific metrics
         if case.server_args.modality == "video":
             if "per_frame_generation" not in baseline["stages_ms"]:
@@ -432,6 +518,140 @@ Consider updating perf_baselines.json with the snippets below:
 
 """
         logger.error(output)
+
+    def _validate_consistency(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        """Validate output consistency against ground truth using CLIP similarity."""
+        if os.environ.get("SGLANG_SKIP_CONSISTENCY", "0") == "1":
+            logger.info(
+                f"[Consistency] Skipping consistency check for {case.id} (SGLANG_SKIP_CONSISTENCY=1)"
+            )
+            return
+
+        if not content:
+            logger.warning(
+                f"[Consistency] Skipping consistency check for {case.id}: "
+                "content is empty (generation may have timed out)"
+            )
+            return
+
+        num_gpus = case.server_args.num_gpus
+        is_video = case.server_args.modality == "video"
+        output_format = case.sampling_params.output_format
+
+        if not gt_exists(
+            case.id, num_gpus, is_video=is_video, output_format=output_format
+        ):
+            if _get_consistency_gt_dir() is not None:
+                names = ", ".join(
+                    get_consistency_gt_candidates(
+                        case.id, num_gpus, is_video, output_format
+                    )
+                )
+            else:
+                names = ", ".join(
+                    _consistency_gt_filenames(
+                        case.id, num_gpus, is_video, output_format
+                    )
+                )
+            logger.error(f"""
+--- MISSING GROUND TRUTH DETECTED ---
+GT image(s) not found for '{case.id}'.
+
+Add the expected file(s) to sglang-ci-data in diffusion-ci/consistency_gt/ with naming (n=num_gpus).
+  Image: {case.id}_{{n}}gpu.<ext> (ext from output_format: png, jpg, webp)
+  Video: {case.id}_{{n}}gpu_frame_0.png, {case.id}_{{n}}gpu_frame_mid.png, {case.id}_{{n}}gpu_frame_last.png
+
+For this case, expected file(s): {names}
+
+Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/consistency_gt/)
+
+(Optional) Per-case override in consistency_threshold.json:
+  "cases": {{
+    "{case.id}": {{
+      "clip_threshold": 0.92,
+      "ssim_threshold": 0.95,
+      "psnr_threshold": 28.0,
+      "mean_abs_diff_threshold": 8.0
+    }}
+  }}
+""")
+            pytest.fail(
+                f"GT not found for {case.id}. See logs for instructions to add GT."
+            )
+
+        gt_data = load_consistency_gt(
+            case.id, num_gpus, is_video=is_video, output_format=output_format
+        )
+        thresholds = get_consistency_thresholds(case.id, is_video=is_video)
+
+        if is_video:
+            output_frames = extract_key_frames_from_video(content)
+        else:
+            output_frames = [image_bytes_to_numpy(content)]
+
+        result = compare_with_gt(
+            output_frames=output_frames,
+            gt_data=gt_data,
+            thresholds=thresholds,
+            case_id=case.id,
+        )
+
+        if not result.passed:
+            failed_frames = []
+            gt_remote_files = get_consistency_gt_remote_files(
+                case.id,
+                num_gpus,
+                is_video=is_video,
+                output_format=output_format,
+            )
+            gt_remote_info = "\n".join(
+                f"    - {filename}: {url}" for filename, url in gt_remote_files
+            )
+            for metric in result.frame_metrics:
+                failed_metrics = []
+                if not metric.clip_passed:
+                    failed_metrics.append("clip")
+                if not metric.ssim_passed:
+                    failed_metrics.append("ssim")
+                if not metric.psnr_passed:
+                    failed_metrics.append("psnr")
+                if not metric.mean_abs_diff_passed:
+                    failed_metrics.append("mean_abs_diff")
+                if failed_metrics:
+                    failed_frames.append(
+                        f"    - f{metric.frame_index} "
+                        f"[{', '.join(failed_metrics)}] "
+                        f"clip={metric.clip_similarity:.4f} "
+                        f"ssim={metric.ssim:.4f} "
+                        f"psnr={metric.psnr:.4f} "
+                        f"mean_abs_diff={metric.mean_abs_diff:.4f}"
+                    )
+            pytest.fail(
+                f"Consistency check failed for {case.id}:\n"
+                f"  Metrics: sim={result.min_similarity:.4f}, "
+                f"ssim={result.min_ssim:.4f}, "
+                f"psnr={result.min_psnr:.4f}, "
+                f"mean_abs_diff={result.max_mean_abs_diff:.4f}\n"
+                f"  Thresholds: clip>={result.thresholds.clip_threshold}, "
+                f"ssim>={result.thresholds.ssim_threshold}, "
+                f"psnr>={result.thresholds.psnr_threshold}, "
+                f"mean_abs_diff<={result.thresholds.mean_abs_diff_threshold}\n"
+                f"  Failed frames:\n"
+                + "\n".join(failed_frames)
+                + f"\n  Compared GT files and links:\n{gt_remote_info}"
+            )
+
+        logger.info(
+            f"[Consistency] {case.id}: PASSED "
+            f"(min_similarity={result.min_similarity:.4f}, "
+            f"min_ssim={result.min_ssim:.4f}, "
+            f"min_psnr={result.min_psnr:.4f}, "
+            f"max_mean_abs_diff={result.max_mean_abs_diff:.4f})"
+        )
 
     def _save_gt_output(
         self,
@@ -486,6 +706,32 @@ Consider updating perf_baselines.json with the snippets below:
             output_path = out_dir / filenames[0]
             output_path.write_bytes(content)
             logger.info(f"Saved GT image: {output_path} (format: {detected_format})")
+
+    def _save_diffusion_artifact(
+        self,
+        case: DiffusionTestCase,
+        content: bytes,
+    ) -> None:
+        """Preserve selected generated outputs for CI artifact upload."""
+        artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
+        if not artifact_dir or not content or "modelopt" not in case.id.lower():
+            return
+
+        safe_case_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in case.id)
+        is_video = case.server_args.modality == "video"
+        if is_video:
+            filename = f"{safe_case_id}_5s.mp4"
+        else:
+            from sglang.multimodal_gen.test.test_utils import detect_image_format
+
+            suffix = case.sampling_params.output_format or detect_image_format(content)
+            filename = f"{safe_case_id}.{suffix}"
+
+        dst_dir = Path(artifact_dir) / safe_case_id
+        dst_dir.mkdir(parents=True, exist_ok=True)
+        dst = dst_dir / filename
+        dst.write_bytes(content)
+        logger.info("[Artifact] Preserved generated output: %s", dst)
 
     def _test_lora_api_functionality(
         self,
@@ -849,9 +1095,8 @@ Consider updating perf_baselines.json with the snippets below:
         # Check if we're in GT generation mode
         is_gt_gen_mode = os.environ.get("SGLANG_GEN_GT", "0") == "1"
 
-        # Dynamic LoRA loading test - tests LayerwiseOffload + set_lora interaction
-        # Server starts WITHOUT lora_path, then set_lora is called after startup
-        if case.run_lora_dynamic_load_check and not is_gt_gen_mode:
+        # GT generation also needs the dynamic set_lora step before generation.
+        if case.run_lora_dynamic_load_check:
             self._test_dynamic_lora_loading(diffusion_server, case)
 
         generate_fn = get_generate_fn(
@@ -865,50 +1110,100 @@ Consider updating perf_baselines.json with the snippets below:
             diffusion_server,
             case.id,
             generate_fn,
+            collect_perf=not is_gt_gen_mode,
         )
+        self._save_diffusion_artifact(case, content)
 
         if is_gt_gen_mode:
             # GT generation mode: save output and skip all validations/tests
             self._save_gt_output(case, content)
             return
 
-        # Validation 1: Performance
-        self._validate_and_record(case, perf_record)
+        failures: list[tuple[str, str]] = []
 
-        # Mesh correctness check (Chamfer Distance) for 3D models
+        def run_case_check(name: str, fn: Callable[[], None]) -> None:
+            try:
+                fn()
+            except BaseException as exc:
+                if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                    raise
+                failures.append((name, str(exc)))
+
+        run_case_check(
+            "performance",
+            lambda: self._validate_and_record(case, perf_record),
+        )
+
         if case.server_args.custom_validator == "mesh":
             from sglang.multimodal_gen.test.server.test_server_utils import (
                 MESH_OUTPUT_PATHS,
                 validate_mesh_correctness,
             )
 
-            mesh_path = MESH_OUTPUT_PATHS.pop(case.id, None)
-            if mesh_path:
-                validate_mesh_correctness(mesh_path)
+            def validate_mesh_output() -> None:
+                mesh_path = MESH_OUTPUT_PATHS.pop(case.id, None)
+                if mesh_path:
+                    validate_mesh_correctness(mesh_path)
 
-        # Test /v1/models endpoint for router compatibility
+            run_case_check("mesh correctness", validate_mesh_output)
+
         if case.run_models_api_check:
-            self._test_v1_models_endpoint(diffusion_server, case)
+            run_case_check(
+                "/v1/models endpoint",
+                lambda: self._test_v1_models_endpoint(diffusion_server, case),
+            )
         if case.run_t2v_input_reference_check:
-            self._test_t2v_rejects_input_reference(diffusion_server, case)
+            run_case_check(
+                "t2v input_reference rejection",
+                lambda: self._test_t2v_rejects_input_reference(diffusion_server, case),
+            )
 
-        # LoRA API functionality test with E2E validation (only for LoRA-enabled cases)
+        if case.run_consistency_check:
+            run_case_check(
+                "consistency",
+                lambda: self._validate_consistency(case, content),
+            )
+
         if case.run_lora_basic_api_check:
-            self._test_lora_api_functionality(diffusion_server, case, generate_fn)
+            run_case_check(
+                "LoRA basic API",
+                lambda: self._test_lora_api_functionality(
+                    diffusion_server, case, generate_fn
+                ),
+            )
 
         if case.run_lora_dynamic_switch_check:
-            self._test_lora_dynamic_switch_e2e(
-                diffusion_server,
-                case,
-                generate_fn,
-                case.server_args.second_lora_path,
+            run_case_check(
+                "LoRA dynamic switch",
+                lambda: self._test_lora_dynamic_switch_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.second_lora_path,
+                ),
             )
 
         if case.run_multi_lora_api_check:
-            self._test_multi_lora_e2e(
-                diffusion_server,
-                case,
-                generate_fn,
-                case.server_args.lora_path,
-                case.server_args.second_lora_path,
+            run_case_check(
+                "multi-LoRA API",
+                lambda: self._test_multi_lora_e2e(
+                    diffusion_server,
+                    case,
+                    generate_fn,
+                    case.server_args.lora_path,
+                    case.server_args.second_lora_path,
+                ),
+            )
+
+        if failures:
+            formatted_failures = []
+            for name, message in failures:
+                if "\n" in message:
+                    formatted_failures.append(f"[{name}]\n{message}")
+                else:
+                    formatted_failures.append(f"[{name}] {message}")
+            pytest.fail(
+                f"Diffusion testcase '{case.id}' failed {len(failures)} check(s):\n\n"
+                + "\n\n".join(formatted_failures),
+                pytrace=False,
             )

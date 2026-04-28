@@ -2,7 +2,7 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=9, suite="stage-a-test-cpu")
 
 import unittest
 from unittest.mock import MagicMock, patch
@@ -142,10 +142,10 @@ class TestMergeCustomLogitProcessor(CustomTestCase):
 # apply_logits_bias
 class TestApplyLogitsBias(CustomTestCase):
 
-    def test_applies_linear_penalties(self):
-        """Test that pre-accumulated linear penalties are added to logits."""
+    def test_applies_additive_penalties(self):
+        """Test that pre-accumulated additive penalties are added to logits."""
         info = _make_info(batch_size=1)
-        info.acc_linear_penalties = torch.tensor([[-1.0] * VOCAB_SIZE])
+        info.acc_additive_penalties = torch.tensor([[-1.0] * VOCAB_SIZE])
         logits = torch.zeros(1, VOCAB_SIZE)
         info.apply_logits_bias(logits)
         self.assertAlmostEqual(logits[0, 0].item(), -1.0, places=5)
@@ -181,7 +181,7 @@ class TestApplyLogitsBias(CustomTestCase):
     def test_no_bias_no_change(self):
         """Test that logits stay unchanged when no bias sources are set."""
         info = _make_info(batch_size=1)
-        info.acc_linear_penalties = None
+        info.acc_additive_penalties = None
         info.logit_bias = None
         info.vocab_mask = None
         logits = torch.zeros(1, VOCAB_SIZE)
@@ -194,20 +194,24 @@ class TestApplyLogitsBias(CustomTestCase):
 class TestUpdatePenalties(CustomTestCase):
 
     def test_required_creates_penalties_tensor(self):
-        """Test that update_penalties allocates a zero tensor and calls orchestrator.apply."""
+        """Test that update_penalties allocates a zero tensor and calls orchestrator methods."""
         orch = MagicMock(is_required=True)
+        orch.accumulate_scaling_penalties.return_value = None
         info = _make_info(batch_size=2, penalizer_orchestrator=orch)
         info.update_penalties()
-        self.assertIsNotNone(info.acc_linear_penalties)
-        self.assertEqual(info.acc_linear_penalties.shape, (2, VOCAB_SIZE))
-        orch.apply.assert_called_once()
+        self.assertIsNotNone(info.acc_additive_penalties)
+        self.assertEqual(info.acc_additive_penalties.shape, (2, VOCAB_SIZE))
+        orch.accumulate_additive_penalties.assert_called_once_with(
+            info.acc_additive_penalties
+        )
+        orch.accumulate_scaling_penalties.assert_called_once()
 
     def test_not_required_sets_none(self):
-        """Test that update_penalties sets acc_linear_penalties to None when not required."""
+        """Test that update_penalties sets acc_additive_penalties to None when not required."""
         orch = MagicMock(is_required=False)
         info = _make_info(batch_size=2, penalizer_orchestrator=orch)
         info.update_penalties()
-        self.assertIsNone(info.acc_linear_penalties)
+        self.assertIsNone(info.acc_additive_penalties)
 
 
 # update_regex_vocab_mask

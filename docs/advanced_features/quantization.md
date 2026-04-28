@@ -36,7 +36,7 @@ The following table summarizes quantization method support across NVIDIA and AMD
 | `quark_int4fp8_moe` | No | Yes | No | AMD-only; online INT4-to-FP8 MoE quantization (CDNA3/CDNA4) |
 | `awq_marlin` | Yes | No | No | Marlin kernels are CUDA-only |
 | `gptq_marlin` | Yes | No | No | Marlin kernels are CUDA-only |
-| `gguf` | Yes | No | WIP | CUDA-only kernels in sgl-kernel |
+| `gguf` | Yes | No | Yes | CUDA-only kernels in sgl-kernel; Pre-dequantized on Ascend |
 | `modelopt` / `modelopt_fp8` | Yes (Hopper/SM90+) | No | No | [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer); requires NVIDIA hardware |
 | `modelopt_fp4` | Yes (Blackwell/SM100+) | No | No | [NVIDIA ModelOpt](https://github.com/NVIDIA/Model-Optimizer); native FP4 on Blackwell (B200, GB200) |
 | `petit_nvfp4` | No | Yes (MI250/MI300X/MI325X) | No | Enables NVFP4 on ROCm via [Petit](https://github.com/causalflow-ai/petit-kernel); use `modelopt_fp4` on NVIDIA Blackwell. Auto-selected when loading NVFP4 models on AMD. See [LMSYS blog](https://lmsys.org/blog/2025-09-21-petit-amdgpu/) and [AMD ROCm blog](https://rocm.blogs.amd.com/artificial-intelligence/fp4-mixed-precision/README.html). |
@@ -74,11 +74,12 @@ Backend selection is supported only for **blockwise FP8** and **NVFP4** GEMM. Wh
 | Backend | Hardware | Description |
 |---------|----------|-------------|
 | `auto` | SM100/120 | Auto-selects: `flashinfer_cudnn` on SM120; `flashinfer_cutlass` on SM100 |
+| `cutlass` | SM100/120 | SGLang CUTLASS kernel |
 | `flashinfer_cutlass` | SM100/120 | FlashInfer CUTLASS backend |
 | `flashinfer_cudnn` | SM100/120 (CUDA 13+, cuDNN 9.15+) | FlashInfer cuDNN backend; used on SM120 for performance |
 | `flashinfer_trtllm` | SM100 | FlashInfer TensorRT-LLM backend |
 
-When FlashInfer is unavailable for NVFP4, sgl-kernel CUTLASS is used as an automatic fallback.
+When FlashInfer is unavailable for NVFP4, the SGLang CUTLASS kernel is used as an automatic fallback.
 
 ## Offline Quantization
 
