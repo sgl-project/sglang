@@ -52,6 +52,10 @@ if TYPE_CHECKING:
         StandardDispatchOutput,
     )
 
+_FLOAT4_E2M1_MAX = 6.0
+_FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
+_NVFP4_PER_TOKEN_GLOBAL_SCALE_INV = 1.0 / (_FLOAT8_E4M3_MAX * _FLOAT4_E2M1_MAX)
+
 if is_flashinfer_available():
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 elif is_cuda_alike():
@@ -821,19 +825,21 @@ def quantize_hidden_states_fp4(
     """
     Quantize hidden states to FP4 for TRTLLM MoE.
 
-    Global scale factor is set by ModelOptNvFp4FusedMoEMethod during weight loading.
-    Only block scales are computed at runtime for efficiency.
+    Global scale factor is set by ModelOptNvFp4FusedMoEMethod during weight loading
+    unless per-token activation scaling is enabled. Only block scales are computed
+    at runtime for the standard path.
 
     Returns (packed_fp4_uint8, scale_float8_e4m3fn_runtime, per_token_scale_or_none)
     """
-
     per_token_scale = None
     if use_per_token_nvfp4:
-        from flashinfer import nvfp4_quant_and_per_token_scale
+        from flashinfer import SfLayout, nvfp4_quantize
 
-        hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quant_and_per_token_scale(
+        hs_fp4_bytes, hs_sf_bytes, per_token_scale = nvfp4_quantize(
             hidden_states,
-            1.0 / 448.0 / 6.0,
+            _NVFP4_PER_TOKEN_GLOBAL_SCALE_INV,
+            sfLayout=SfLayout.layout_linear,
+            per_token_activation=True,
         )
     else:
         # flashinfer.fp4_quantize returns (packed_uint8, scale_fp8)
