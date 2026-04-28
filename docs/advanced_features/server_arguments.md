@@ -332,6 +332,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--elastic-ep-backend` | Specify the collective communication backend for elastic EP. Currently supports 'mooncake'. | `none` | `none`, `mooncake` |
 | `--enable-elastic-expert-backup` | Enable elastic EP backend to backup expert weights in DRAM feature. Currently supports 'mooncake'.| `False` | bool flag (set to enable) |
 | `--mooncake-ib-device` | The InfiniBand devices for Mooncake Backend transfer, accepts multiple comma-separated devices (e.g., --mooncake-ib-device mlx5_0,mlx5_1). Default is None, which triggers automatic device detection when Mooncake Backend is enabled. | `None` | Type: str |
+| `--elastic-ep-rejoin` | Indicates that this process is a relaunched elastic EP rank that should rejoin an existing process group during rank recovery. | `False` | bool flag (set to enable) |
 
 ## Mamba Cache
 | Argument | Description | Defaults | Options |

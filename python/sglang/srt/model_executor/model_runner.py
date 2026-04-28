@@ -75,7 +75,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.elastic_ep.elastic_ep import (
+    ElasticEPStateManager,
+    join_process_groups,
+    try_recover_ranks,
+)
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
@@ -87,6 +91,7 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
@@ -165,6 +170,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    broadcast_pyobj,
     cpu_has_amx_support,
     dynamic_import,
     empty_context,
@@ -492,6 +498,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize the model runner
         self.initialize(pre_model_load_memory)
         self.check_quantized_moe_compatibility()
+
+        if (
+            self.server_args.elastic_ep_backend is not None
+            and self.server_args.elastic_ep_rejoin
+        ):
+            join_process_groups()
+            broadcast_global_expert_location_metadata(
+                src_rank=self._get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=True
+                )
+            )
+            ElasticEPStateManager.instance().reset()
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
@@ -1081,6 +1099,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
+                recovered_rank=self.server_args.elastic_ep_rejoin,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
@@ -1091,6 +1110,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
+                recovered_rank=self.server_args.elastic_ep_rejoin,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -1463,6 +1483,66 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
+
+    def maybe_recover_ep_ranks(self):
+        # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
+        # synchronization, and this function is on the forward-path.
+        # This check only runs when `--elastic-ep-backend` is enabled, so the
+        # synchronization overhead does not propagate to other configs.
+        # Leave for future optimization of the elastic EP path.
+        if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
+            return
+
+        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
+        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
+        tp_active_ranks &= tp_active_ranks_cpu
+        # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
+        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
+        # tp-group index is the same as the global rank index.
+        ranks_to_recover = [
+            i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
+        ]
+
+        # try_recover_ranks polls peer state via Mooncake EP backend.
+        # Mooncake's internal semantics guarantee that all ranks observe
+        # consistent peer readiness state, so collective operations below
+        # are safe even though polling appears local.
+        if ranks_to_recover and try_recover_ranks(ranks_to_recover):
+            self.forward_pass_id = 0
+            self.eplb_manager.reset_generator()
+            broadcast_global_expert_location_metadata(
+                src_rank=self._get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=False
+                )
+            )
+            ElasticEPStateManager.instance().reset()
+
+            broadcast_pyobj(
+                [self.server_args.random_seed],
+                get_world_group().rank,
+                get_world_group().cpu_group,
+                src=get_world_group().ranks[0],
+            )
+            logger.info(f"recover ranks {ranks_to_recover} done")
+
+    def _get_healthy_expert_location_src_rank(
+        self, invoked_in_elastic_ep_rejoin_path: bool
+    ) -> int:
+        world_group = get_world_group()
+        # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
+        # A rank that was started as a rejoin rank may later act as a healthy
+        # rank in a subsequent recovery cycle.
+        local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
+        gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
+
+        for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
+            if not is_rejoin_rank:
+                return world_group.ranks[rank_in_group]
+
+        raise RuntimeError(
+            "No healthy rank found for broadcasting expert location metadata. "
+            "All ranks are marked as elastic_ep_rejoin."
+        )
 
     def update_weights_from_disk(
         self,
@@ -3007,6 +3087,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.msprobe_debugger is not None:
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
+
+        if self.server_args.elastic_ep_backend is not None:
+            self.maybe_recover_ep_ranks()
 
         return output
 
