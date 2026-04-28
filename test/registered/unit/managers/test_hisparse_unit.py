@@ -517,6 +517,79 @@ class TestHiSparseUnit(unittest.TestCase):
         self.allocator.logical_attn_allocator.free(kv_loc)
         self._assert_sizes_restored(initial, "alloc_free_cycle")
 
+    def test_allocator_page_size_one_alloc_free_cycle(self):
+        """alloc() maps logical to hisparse indices for ROCm page_size=1."""
+        if self.page_size != 1:
+            self.skipTest("page_size=1 alloc path is ROCm-specific")
+
+        initial = self._get_initial_sizes()
+        need_size = 16
+
+        kv_loc = self.allocator.alloc(need_size)
+        self.assertIsNotNone(kv_loc)
+        self.assertEqual(len(kv_loc), need_size)
+
+        mapping = self.allocator.full_to_hisparse_device_index_mapping[kv_loc]
+        self.assertTrue(torch.all(mapping > 0), "Mapping should be non-zero")
+        self.assertLess(self.allocator.available_size(), initial[0])
+
+        self.allocator.free(kv_loc)
+        mapping_after = self.allocator.full_to_hisparse_device_index_mapping[kv_loc]
+        self.assertTrue(torch.all(mapping_after == 0), "Mapping should be cleared")
+        self._assert_sizes_restored(initial, "page_size_one_alloc_free_cycle")
+
+    def test_decode_remap_frees_stale_page_size_one_mapping(self):
+        """map_last_loc_to_buffer frees the temporary alloc() hisparse slot."""
+        if self.page_size != 1:
+            self.skipTest("page_size=1 decode remap path is ROCm-specific")
+
+        initial = self._get_initial_sizes()
+        device = self.allocator.device
+        fill_len = 2
+        req = _make_req("decode-remap", list(range(fill_len)))
+        self._alloc_req_slot(req)
+
+        kv_loc = self._alloc_kv(req, fill_len)
+        self.coordinator.alloc_device_buffer(req)
+        self.coordinator._skip_first_backup[req.req_pool_idx] = True
+
+        out_loc = self.allocator.alloc(1)
+        self.assertIsNotNone(out_loc)
+        stale_loc = self.allocator.full_to_hisparse_device_index_mapping[
+            out_loc
+        ].clone()
+        self.assertTrue(torch.all(stale_loc > 0), "Temporary mapping should exist")
+
+        seq_len = fill_len + 1
+        self.req_to_token_pool.write((req.req_pool_idx, fill_len), out_loc)
+        req.kv_allocated_len = seq_len
+        req.kv_committed_len = seq_len
+
+        self.coordinator.map_last_loc_to_buffer(
+            seq_lens=torch.tensor([seq_len], dtype=torch.int64, device=device),
+            out_cache_loc=out_loc,
+            req_pool_indices=torch.tensor(
+                [req.req_pool_idx], dtype=torch.int64, device=device
+            ),
+            seq_lens_cpu=torch.tensor([seq_len], dtype=torch.int64),
+        )
+
+        remapped_loc = self.allocator.full_to_hisparse_device_index_mapping[out_loc]
+        self.assertTrue(torch.all(remapped_loc > 0), "Remapped loc should exist")
+        self.assertFalse(
+            torch.equal(stale_loc, remapped_loc),
+            "Decode loc should move from temporary mapping to device buffer",
+        )
+        self.assertEqual(
+            self.allocator.hisparse_attn_allocator.available_size(),
+            initial[1] - seq_len,
+        )
+
+        self.coordinator.request_finished(req)
+        self.allocator.logical_attn_allocator.free(torch.cat([kv_loc, out_loc]))
+        self._free_req_slot(req)
+        self._assert_sizes_restored(initial, "decode_remap")
+
     # ==================================================================
     # Test: Staging (PD Colocate) path
     # ==================================================================
