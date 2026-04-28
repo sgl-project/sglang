@@ -243,7 +243,7 @@ class FunctionCallParser:
                 self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
             )
             return ("json_schema", json_schema)
-        elif self.detector.supports_builtin_structural_tag():
+        elif self.detector.supports_model_structural_tag():
             is_required = tool_choice == "required" or isinstance(
                 tool_choice, ToolChoice
             )

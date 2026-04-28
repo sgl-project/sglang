@@ -363,7 +363,7 @@ class BaseFormatDetector(ABC):
         """
         raise NotImplementedError()
 
-    def supports_builtin_structural_tag(self) -> bool:
+    def supports_model_structural_tag(self) -> bool:
         """Return True if this detector supports builtin structural tag format."""
         return False
 
