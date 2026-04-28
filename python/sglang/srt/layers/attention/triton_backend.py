@@ -394,7 +394,6 @@ class TritonAttnBackend(AttentionBackend):
             )
             kv_indices = kv_indices.to(torch.int64)
             mask_indptr = None
-            # num_accepted_drafts is drafts-only; extend QO length per req is +1 (bonus token).
             max_extend_len = torch.max(spec_info.num_accepted_tokens).item()
             num_kv_splits = None
             attn_logits = None

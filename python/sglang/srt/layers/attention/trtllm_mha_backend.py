@@ -524,7 +524,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            # num_accepted_drafts is drafts-only; extend QO length per req is +1 (bonus token).
             extend_lens = spec_info.num_accepted_tokens[:bs]
             if spec_info.num_accepted_tokens_cpu:
                 metadata.max_seq_len_q = max(spec_info.num_accepted_tokens_cpu)
