@@ -878,9 +878,19 @@ class HisaIndexer(MultiPlatformOp):
             # pages but under sustained prefill they eventually hit unmapped
             # → Xid 13 → silent crash. Triton's grouped block_mean_pooling is
             # bounds-safe.
+            #
+            # Triton is now the default at all K. Per Stage 1.1 verification
+            # (test_k128_parity.py), K=128 triton matches tilelang within fp8
+            # ULP noise (topk IoU >= 0.95 on B=32 ctx=128K), and per-kernel
+            # triton is 1.5-3x faster on the GEMM hotspots. At small sq triton
+            # eats ~15μs of extra Python launch overhead vs tilelang; at
+            # prefill sq>=512 triton wins outright. Set
+            # SGLANG_HISA_DISABLE_TRITON=1 to fall back to tilelang (same env
+            # var used by the decode path).
+            use_triton = os.environ.get("SGLANG_HISA_DISABLE_TRITON") != "1"
             mqa_logits_fn = (
                 fp8_native_hierarchy_mqa_logits_triton
-                if self.hisa_k_block_size < 64
+                if use_triton or self.hisa_k_block_size < 64
                 else fp8_native_hierarchy_mqa_logits
             )
             with self._with_real_sm_count():
@@ -932,10 +942,12 @@ class HisaIndexer(MultiPlatformOp):
         ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
 
         from sgl_kernel import fast_topk_v2
-        # Same K<64 dispatch as the non-chunked branch.
+        # Same dispatch as the non-chunked branch above (triton default at all
+        # K; SGLANG_HISA_DISABLE_TRITON=1 falls back to tilelang).
+        use_triton = os.environ.get("SGLANG_HISA_DISABLE_TRITON") != "1"
         mqa_logits_fn = (
             fp8_native_hierarchy_mqa_logits_triton
-            if self.hisa_k_block_size < 64
+            if use_triton or self.hisa_k_block_size < 64
             else fp8_native_hierarchy_mqa_logits
         )
         start = 0

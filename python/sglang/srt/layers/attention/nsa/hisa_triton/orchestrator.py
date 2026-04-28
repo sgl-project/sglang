@@ -217,26 +217,24 @@ def fp8_native_hierarchy_mqa_logits_triton(
         )
         k_scales = k_scales.squeeze(1)
 
-    # Pool-blocked cu_seqlen ranges: each token's [ks, ke) maps to the pool
-    # block range [floor(ks/K), ceil(ke/K)).
-    cu_seqlen_blocked_ks = cu_seqlen_ks // k_block_size
-    cu_seqlen_blocked_ke = (cu_seqlen_ke + k_block_size - 1) // k_block_size
-    cu_seqlen_blocked_ks = cu_seqlen_blocked_ks.to(torch.int32)
-    cu_seqlen_blocked_ke = cu_seqlen_blocked_ke.to(torch.int32)
-
     # 1) Mean-pool ragged K → [num_pool, D] fp8 + [num_pool] f32 scale.
     blocked_k_fp8, blocked_k_scale = block_mean_pooling_triton(
         k_fp8=k_fp8, k_scale=k_scales, k_block_size=k_block_size,
     )
 
     # 2) Block-MQA on blocked_k → [seq, num_pool] f32 (with -inf/+inf masks).
+    # Pass raw token-space cu_seqlen + k_block_size; the kernel divides
+    # internally so we avoid 3-4 host-side PyTorch elementwise launches
+    # (floor_divide × 2, add, optional .to(int32)) that otherwise add
+    # ~30-50μs to the orchestrator at small sq.
     block_k_indexer_score = ragged_pool_mqa_triton(
         q_fp8=q_fp8,
         blocked_k_fp8=blocked_k_fp8,
         blocked_k_scale=blocked_k_scale,
         weights=weights,
-        cu_seqlen_blocked_ks=cu_seqlen_blocked_ks,
-        cu_seqlen_blocked_ke=cu_seqlen_blocked_ke,
+        cu_seqlen_ks=cu_seqlen_ks,
+        cu_seqlen_ke=cu_seqlen_ke,
+        k_block_size=k_block_size,
     )
 
     # 3) Top-k over pool blocks. bf16 + sorted=False matches the tilelang

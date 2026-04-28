@@ -212,8 +212,8 @@ def _ragged_pool_mqa_kernel(
     BKS_ptr,         # [num_pool] f32
     Logits_ptr,      # [seq, num_pool] f32 OUT
     W_ptr,           # [seq, H] f32
-    CuKS_ptr,        # [seq] i32 — ks (in blocked space) per query
-    CuKE_ptr,        # [seq] i32 — ke (in blocked space, exclusive) per query
+    CuKS_ptr,        # [seq] i32 — ks per query (raw token space when K_BLOCK_SIZE>1, else blocked)
+    CuKE_ptr,        # [seq] i32 — ke per query (raw token space, exclusive)
     stride_q_s, stride_q_h, stride_q_d,
     stride_bk_n, stride_bk_d,
     stride_bks_n,
@@ -224,6 +224,7 @@ def _ragged_pool_mqa_kernel(
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    K_BLOCK_SIZE: tl.constexpr,  # divides ks/ke to blocked space inside kernel
 ):
     seq_i = tl.program_id(0)
     chunk_idx = tl.program_id(1)
@@ -260,9 +261,13 @@ def _ragged_pool_mqa_kernel(
     logits = tl.sum(s, axis=1)                        # [BLOCK_N] f32
 
     # Apply per-query [ks, ke) mask + force_maintain (matches tilelang's
-    # clean_and_maintain_logits_kernel semantics).
-    ks = tl.load(CuKS_ptr + seq_i * stride_ks_s)
-    ke = tl.load(CuKE_ptr + seq_i * stride_ke_s)
+    # clean_and_maintain_logits_kernel semantics). When K_BLOCK_SIZE>1 the
+    # caller passes raw token-space ks/ke; we map to blocked space here so the
+    # orchestrator can skip 3-4 host-side PyTorch elementwise launches.
+    ks_raw = tl.load(CuKS_ptr + seq_i * stride_ks_s)
+    ke_raw = tl.load(CuKE_ptr + seq_i * stride_ke_s)
+    ks = ks_raw // K_BLOCK_SIZE
+    ke = (ke_raw + (K_BLOCK_SIZE - 1)) // K_BLOCK_SIZE
     pos_valid = (n_offs >= ks) & (n_offs < ke) & n_mask
     pos_maintain = ((n_offs == ks) | (n_offs == ke - 1)) & n_mask
     out = tl.where(
@@ -281,17 +286,24 @@ def ragged_pool_mqa_triton(
     blocked_k_fp8: torch.Tensor,    # [num_pool, D] fp8
     blocked_k_scale: torch.Tensor,  # [num_pool] f32
     weights: torch.Tensor,          # [seq, H] f32
-    cu_seqlen_blocked_ks: torch.Tensor,   # [seq] i32
-    cu_seqlen_blocked_ke: torch.Tensor,   # [seq] i32
+    cu_seqlen_ks: torch.Tensor,     # [seq] i32/i64 — raw token-space when k_block_size>1
+    cu_seqlen_ke: torch.Tensor,     # [seq] i32/i64 — raw token-space (exclusive)
+    k_block_size: int = 1,
     *,
     BLOCK_N: int | None = None,
 ) -> torch.Tensor:
     """Triton equivalent of ``pool_mqa_attn_return_logits_fp8_interface``.
 
     Returns logits ``[seq, num_pool]`` f32, with positions outside per-row
-    [ks, ke) set to -inf and ks / (ke-1) set to +inf (matches tilelang's
-    clean_and_maintain post-process). Output is suitable for direct
+    pool-blocked [ks, ke) set to -inf and ks / (ke-1) set to +inf (matches
+    tilelang's clean_and_maintain post-process). Output is suitable for direct
     ``torch.topk`` consumption.
+
+    ``k_block_size`` lets the kernel compute ``ks_blocked = ks // K`` and
+    ``ke_blocked = ceil(ke / K)`` internally so the caller can pass raw
+    token-space cu_seqlen, saving 3-4 host-side PyTorch elementwise launches
+    on the orchestrator hot path. Default ``k_block_size=1`` preserves the
+    pre-existing API where callers pass already-blocked cu_seqlen.
     """
     assert q_fp8.ndim == 3, f"q_fp8 should be [seq, H, D], got {q_fp8.shape}"
     seq_len, H, D = q_fp8.shape
@@ -299,10 +311,13 @@ def ragged_pool_mqa_triton(
     assert D_ == D
     assert blocked_k_scale.shape == (num_pool,)
     assert weights.shape == (seq_len, H)
-    assert cu_seqlen_blocked_ks.shape == (seq_len,)
-    assert cu_seqlen_blocked_ke.shape == (seq_len,)
-    assert cu_seqlen_blocked_ks.dtype == torch.int32
-    assert cu_seqlen_blocked_ke.dtype == torch.int32
+    assert cu_seqlen_ks.shape == (seq_len,)
+    assert cu_seqlen_ke.shape == (seq_len,)
+    # Triton's tl.load handles i32/i64 transparently; accept either so callers
+    # can skip a redundant .to(torch.int32) cast (= 1 kernel launch).
+    assert cu_seqlen_ks.dtype in (torch.int32, torch.int64)
+    assert cu_seqlen_ke.dtype in (torch.int32, torch.int64)
+    assert k_block_size >= 1
 
     logits = torch.empty(
         (seq_len, num_pool), device=q_fp8.device, dtype=torch.float32,
@@ -320,15 +335,16 @@ def ragged_pool_mqa_triton(
     grid = (seq_len, triton.cdiv(num_pool, BLOCK_N))
     _ragged_pool_mqa_kernel[grid](
         q_fp8, blocked_k_fp8, blocked_k_scale, logits, weights,
-        cu_seqlen_blocked_ks, cu_seqlen_blocked_ke,
+        cu_seqlen_ks, cu_seqlen_ke,
         q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2),
         blocked_k_fp8.stride(0), blocked_k_fp8.stride(1),
         blocked_k_scale.stride(0),
         logits.stride(0), logits.stride(1),
         weights.stride(0), weights.stride(1),
-        cu_seqlen_blocked_ks.stride(0), cu_seqlen_blocked_ke.stride(0),
+        cu_seqlen_ks.stride(0), cu_seqlen_ke.stride(0),
         num_pool,
         HEADS=H, DIM=D, BLOCK_N=BLOCK_N,
+        K_BLOCK_SIZE=k_block_size,
     )
     return logits
 
