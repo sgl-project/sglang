@@ -48,9 +48,6 @@ RUN curl -fsSL -v -o miniforge.sh -O https://github.com/conda-forge/miniforge/re
     # Append environment activation to .bashrc for interactive shells
     echo ". /home/sdp/miniforge3/bin/activate; conda activate py${PYTHON_VERSION}; . /opt/intel/oneapi/setvars.sh; cd /home/sdp" >> /home/sdp/.bashrc
 
-# Switch back to user sdp
-USER sdp
-
 RUN --mount=type=secret,id=github_token \
     cd /home/sdp && \
     . /home/sdp/miniforge3/bin/activate && \
