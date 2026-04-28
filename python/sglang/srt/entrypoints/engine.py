@@ -25,6 +25,7 @@ import multiprocessing as mp
 import os
 import random
 import signal
+import tempfile
 import threading
 import time
 from typing import AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union
@@ -60,7 +61,10 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
 )
-from sglang.srt.managers.multi_tokenizer_mixin import MultiTokenizerRouter
+from sglang.srt.managers.multi_tokenizer_mixin import (
+    MultiTokenizerRouter,
+    run_multi_detokenizer_router_process,
+)
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.template_manager import TemplateManager
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -941,6 +945,48 @@ def _launch_scheduler_processes(
     return scheduler_procs, scheduler_pipe_readers
 
 
+def _launch_detokenizer_subprocesses(
+    server_args: ServerArgs,
+    port_args: PortArgs,
+    run_detokenizer_process_func: Callable,
+) -> None:
+    """Launch detokenizer worker(s).
+
+    - When ``detokenizer_worker_num == 1``: a single detokenizer process listens on
+      ``port_args.detokenizer_ipc_name`` (the original behavior).
+    - When ``detokenizer_worker_num > 1``: each detokenizer worker gets its own
+      private IPC socket, and a ``MultiDetokenizerRouter`` process owns the
+      original ``port_args.detokenizer_ipc_name`` and fans out to them.
+    """
+    if server_args.detokenizer_worker_num <= 1:
+        mp.Process(
+            target=run_detokenizer_process_func,
+            args=(server_args, port_args),
+        ).start()
+        return
+
+    router_ipc_name = port_args.detokenizer_ipc_name
+    worker_ipc_names: List[str] = []
+    try:
+        for _ in range(server_args.detokenizer_worker_num):
+            worker_ipc = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+            port_args.detokenizer_ipc_name = worker_ipc
+            mp.Process(
+                target=run_detokenizer_process_func,
+                args=(server_args, port_args),
+            ).start()
+            worker_ipc_names.append(worker_ipc)
+    finally:
+        # Restore the public IPC name so downstream code (and the router) keeps
+        # using it.
+        port_args.detokenizer_ipc_name = router_ipc_name
+
+    mp.Process(
+        target=run_multi_detokenizer_router_process,
+        args=(worker_ipc_names, server_args, port_args),
+    ).start()
+
+
 def _launch_subprocesses(
     server_args: ServerArgs,
     init_tokenizer_manager_func: Callable,
@@ -991,15 +1037,13 @@ def _launch_subprocesses(
             )
         return None, None, scheduler_infos, port_args
 
-    # Launch detokenizer process
-    detoken_proc = mp.Process(
-        target=run_detokenizer_process_func,
-        args=(
-            server_args,
-            port_args,
-        ),
+    # Launch detokenizer process(es) — optionally fronted by a router when
+    # detokenizer_worker_num > 1.
+    _launch_detokenizer_subprocesses(
+        server_args=server_args,
+        port_args=port_args,
+        run_detokenizer_process_func=run_detokenizer_process_func,
     )
-    detoken_proc.start()
 
     # Init tokenizer manager first, as the bootstrap server is initialized here
     if server_args.tokenizer_worker_num == 1:

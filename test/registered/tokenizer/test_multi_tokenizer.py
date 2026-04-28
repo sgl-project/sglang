@@ -34,6 +34,8 @@ class TestMultiTokenizer(CustomTestCase):
             other_args=[
                 "--tokenizer-worker-num",
                 8,
+                "--detokenizer-worker-num",
+                4,
                 "--mem-fraction-static",
                 0.7,
             ],

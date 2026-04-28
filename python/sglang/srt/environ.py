@@ -463,6 +463,11 @@ class Envs:
     # Tokenizer
     SGLANG_PATCH_TOKENIZER = EnvBool(False)  # TODO enable by default
 
+    # Defaults for --tokenizer-worker-num / --detokenizer-worker-num.
+    # Used only when the CLI flag is not explicitly set (CLI wins).
+    SGLANG_TOKENIZER_WORKER_NUM = EnvInt(None)
+    SGLANG_DETOKENIZER_WORKER_NUM = EnvInt(None)
+
     # TokenizerManager
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 

@@ -276,6 +276,7 @@ class ServerArgs:
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
     tokenizer_worker_num: int = 1
+    detokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
     model_loader_extra_config: str = "{}"
@@ -2496,6 +2497,31 @@ class ServerArgs:
                 "Please choose one tokenizer batching approach."
             )
 
+        # Env-based default: only applied when CLI is not explicitly set
+        # (i.e. value still equals the dataclass default). CLI always wins.
+        if (
+            self.tokenizer_worker_num == ServerArgs.tokenizer_worker_num
+            and envs.SGLANG_TOKENIZER_WORKER_NUM.is_set()
+        ):
+            env_val = envs.SGLANG_TOKENIZER_WORKER_NUM.get()
+            if env_val is not None and env_val != self.tokenizer_worker_num:
+                logger.info(
+                    f"tokenizer_worker_num={env_val} from env "
+                    f"SGLANG_TOKENIZER_WORKER_NUM (CLI not set)."
+                )
+                self.tokenizer_worker_num = env_val
+        if (
+            self.detokenizer_worker_num == ServerArgs.detokenizer_worker_num
+            and envs.SGLANG_DETOKENIZER_WORKER_NUM.is_set()
+        ):
+            env_val = envs.SGLANG_DETOKENIZER_WORKER_NUM.get()
+            if env_val is not None and env_val != self.detokenizer_worker_num:
+                logger.info(
+                    f"detokenizer_worker_num={env_val} from env "
+                    f"SGLANG_DETOKENIZER_WORKER_NUM (CLI not set)."
+                )
+                self.detokenizer_worker_num = env_val
+
         if self.skip_tokenizer_init:
             if self.tokenizer_worker_num != 1:
                 logger.warning(
@@ -2503,6 +2529,12 @@ class ServerArgs:
                     f"(requested {self.tokenizer_worker_num})."
                 )
                 self.tokenizer_worker_num = 1
+            if self.detokenizer_worker_num != 1:
+                logger.warning(
+                    "skip_tokenizer_init=True disables detokenizer workers; forcing detokenizer_worker_num=1 "
+                    f"(requested {self.detokenizer_worker_num})."
+                )
+                self.detokenizer_worker_num = 1
 
             if self.enable_tokenizer_batch_encode:
                 logger.warning(
@@ -2749,6 +2781,13 @@ class ServerArgs:
             type=int,
             default=ServerArgs.tokenizer_worker_num,
             help="The worker num of the tokenizer manager.",
+        )
+        parser.add_argument(
+            "--detokenizer-worker-num",
+            type=int,
+            default=ServerArgs.detokenizer_worker_num,
+            help="The worker num of the detokenizer manager. "
+            "tokenizer_worker_num must be a multiple of detokenizer_worker_num.",
         )
         parser.add_argument(
             "--skip-tokenizer-init",
@@ -5025,6 +5064,11 @@ class ServerArgs:
                 )
 
         assert self.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
+        assert self.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
+        assert self.tokenizer_worker_num % self.detokenizer_worker_num == 0, (
+            f"tokenizer_worker_num ({self.tokenizer_worker_num}) must be a multiple of "
+            f"detokenizer_worker_num ({self.detokenizer_worker_num})."
+        )
         self.validate_buckets_rule(
             "--prompt-tokens-buckets", self.prompt_tokens_buckets
         )
