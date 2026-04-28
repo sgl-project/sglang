@@ -946,19 +946,31 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
+            # Asymmetric P/D: prefill itself runs no spec module but the
+            # decode node does. Match the decode-side hidden-state buffer
+            # so the cross-node transfer aligns; prefill leaves the buffer
+            # zero-initialized and decode treats it as mock conditioning.
+            decode_spec_algo = (
+                self.server_args.disaggregation_decode_speculative_algorithm
+            )
+            decode_side_needs_hidden = decode_spec_algo in (
+                "EAGLE",
+                "EAGLE3",
+                "STANDALONE",
+            )
+            local_spec_needs_hidden = (
+                self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()
+            )
+            needs_hidden = local_spec_needs_hidden or decode_side_needs_hidden
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=(
                     model_config.spec_hidden_size
-                    if self.spec_algorithm.is_eagle()
-                    or self.spec_algorithm.is_standalone()
+                    if needs_hidden
                     else 16  # minimal padding size for RDMA
                 ),
                 hidden_states_dtype=(
-                    model_config.dtype
-                    if self.spec_algorithm.is_eagle()
-                    or self.spec_algorithm.is_standalone()
-                    else torch.float32
+                    model_config.dtype if needs_hidden else torch.float32
                 ),
                 custom_mem_pool=self.token_to_kv_pool_allocator.get_kvcache().maybe_get_custom_mem_pool(),
             )
