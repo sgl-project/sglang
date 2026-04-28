@@ -80,8 +80,6 @@ export const Ling261TDeployment = () => {
   const generateCommand = () => {
     const { hardware, toolcall, reasoning } = values;
     const isSingleNode = hardware === 'gb300' || hardware === 'gb200';
-    const isGB = hardware === 'gb300' || hardware === 'gb200';
-    const envPrefix = isGB && !isSingleNode ? 'NCCL_IB_DISABLE=1 ' : '';
 
     const tail = (cmd) => {
       let out = cmd;
@@ -92,7 +90,7 @@ export const Ling261TDeployment = () => {
     };
 
     if (isSingleNode) {
-      let cmd = `python3 -m sglang.launch_server \\\n`;
+      let cmd = `sglang serve \\\n`;
       cmd += `  --model-path inclusionAI/Ling-2.6-1T \\\n`;
       cmd += `  --tp-size 4 \\\n`;
       cmd += `  --trust-remote-code \\\n`;
@@ -103,7 +101,7 @@ export const Ling261TDeployment = () => {
 
     // Two-node deployment
     const generateNodeCmd = (rank) => {
-      let cmd = `${envPrefix}python3 -m sglang.launch_server \\\n`;
+      let cmd = `sglang serve \\\n`;
       cmd += `  --model-path inclusionAI/Ling-2.6-1T \\\n`;
       cmd += `  --tp-size 8 \\\n`;
       cmd += `  --pp-size 2 \\\n`;

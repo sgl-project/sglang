@@ -88,7 +88,7 @@ export const Ling26FlashDeployment = () => {
   const generateCommand = () => {
     const { yarn, toolcall, reasoning } = values;
 
-    let cmd = `python3 -m sglang.launch_server \\\n`;
+    let cmd = `sglang serve \\\n`;
     cmd += `  --model-path inclusionAI/Ling-2.6-flash \\\n`;
     cmd += `  --tp-size 4 \\\n`;
     cmd += `  --trust-remote-code \\\n`;

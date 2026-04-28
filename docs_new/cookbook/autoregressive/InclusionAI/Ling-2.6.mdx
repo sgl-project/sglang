@@ -68,7 +68,7 @@ import { Ling261TDeployment } from '/src/snippets/autoregressive/ling-26-1t-depl
 For example, launch a Ling-2.6-1T server on a single GB300 node:
 
 ```bash Command
-python3 -m sglang.launch_server \
+sglang serve \
   --model-path inclusionAI/Ling-2.6-1T \
   --tp-size 4 \
   --trust-remote-code \
