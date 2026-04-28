@@ -23,8 +23,8 @@ export const Ling261TDeployment = () => {
       name: 'reasoning',
       title: 'Reasoning Parser',
       items: [
-        { id: 'enabled', label: 'Enabled', default: true },
-        { id: 'disabled', label: 'Disabled', default: false }
+        { id: 'disabled', label: 'Disabled', default: true },
+        { id: 'enabled', label: 'qwen3 (split <think>)', default: false }
       ]
     }
   };

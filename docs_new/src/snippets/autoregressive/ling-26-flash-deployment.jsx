@@ -26,6 +26,14 @@ export const Ling26FlashDeployment = () => {
         { id: 'enabled', label: 'Enabled', default: true },
         { id: 'disabled', label: 'Disabled', default: false }
       ]
+    },
+    reasoning: {
+      name: 'reasoning',
+      title: 'Reasoning Parser',
+      items: [
+        { id: 'disabled', label: 'Disabled', default: true },
+        { id: 'enabled', label: 'qwen3 (split <think>)', default: false }
+      ]
     }
   };
 
@@ -78,7 +86,7 @@ export const Ling26FlashDeployment = () => {
 
   // Generate command
   const generateCommand = () => {
-    const { yarn, toolcall } = values;
+    const { yarn, toolcall, reasoning } = values;
 
     let cmd = `python3 -m sglang.launch_server \\\n`;
     cmd += `  --model-path inclusionAI/Ling-2.6-flash \\\n`;
@@ -92,6 +100,9 @@ export const Ling26FlashDeployment = () => {
     }
     if (toolcall === 'enabled') {
       cmd += ` \\\n  --tool-call-parser qwen25`;
+    }
+    if (reasoning === 'enabled') {
+      cmd += ` \\\n  --reasoning-parser qwen3`;
     }
     return cmd;
   };
