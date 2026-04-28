@@ -370,6 +370,14 @@ class TestGluonKernelParity(CustomTestCase):
     def test_parity_d128_gqa_4to1(self):
         self._check_parity(D=128, H_Q=16, H_KV=4, is_causal=True)
 
+    def test_parity_d128_fp8_kv(self):
+        inputs = _build_extend_inputs(B=2, H_Q=16, H_KV=4, D=128)
+        inputs["k_buffer"] = inputs["k_buffer"].to(torch.float8_e4m3fn)
+        inputs["v_buffer"] = inputs["v_buffer"].to(torch.float8_e4m3fn)
+        o_gluon = self._run_gluon(inputs, is_causal=True)
+        o_triton = self._run_triton(inputs, is_causal=True)
+        torch.testing.assert_close(o_gluon, o_triton, rtol=5e-2, atol=5e-2)
+
     def test_parity_d256_causal(self):
         self._check_parity(D=256, H_Q=16, H_KV=8, is_causal=True)
 
