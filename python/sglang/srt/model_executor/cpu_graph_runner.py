@@ -409,6 +409,18 @@ def register_fake_ops():
         return mixed_qkv, z, b, a
 
     @torch.library.register_fake(
+        "sgl_kernel::fused_qkvzba_split_reshape_cat_contiguous_cpu"
+    )
+    def _(mixed_qkvz, mixed_ba, num_heads_qk, num_heads_v, head_qk, head_v):
+        batch = mixed_qkvz.shape[0]
+        qkv_dim = num_heads_qk * head_qk * 2 + num_heads_v * head_v
+        mixed_qkv = mixed_qkvz.new_empty(batch, qkv_dim)
+        z = mixed_qkvz.new_empty(batch, num_heads_v, head_v)
+        b = mixed_ba.new_empty(batch, num_heads_v)
+        a = mixed_ba.new_empty(batch, num_heads_v)
+        return mixed_qkv, z, b, a
+
+    @torch.library.register_fake(
         "sgl_kernel::fused_sigmoid_gating_delta_rule_update_cpu"
     )
     def _(
