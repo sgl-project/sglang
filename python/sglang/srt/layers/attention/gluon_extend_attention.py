@@ -1,15 +1,4 @@
-"""Gluon extend-attention wrapper for MI350/MI355 (gfx950 / CDNA 4).
-
-Drop-in replacement for ``triton_ops.extend_attention.extend_attention_fwd``,
-installed by :class:`TritonAttnBackend` when the user passes
-``--enable-gluon-extend-attention`` on gfx950. Kernel sources are vendored
-under ``sglang.srt.layers.attention.gluon_ops.cdna4.extend_attention``; no
-external paths or imports are required.
-
-The wrapper pre-filters shape / feature combos the Gluon kernel does not
-implement and falls back transparently to the Triton reference for those
-— or for any runtime error — so correctness is never silently compromised.
-"""
+"""Gluon extend-attention wrapper for gfx950."""
 
 from __future__ import annotations
 
@@ -29,8 +18,7 @@ _GLUON_FN: Optional[Callable] = None
 
 
 def _try_import_gluon() -> bool:
-    """Populate the cached Gluon entry point. Idempotent; returns False if
-    the import raised (wrapper stays on the Triton fallback)."""
+    """Cache the Gluon entry point if it imports cleanly."""
     global _GLUON_FN
     if _GLUON_FN is not None:
         return True
@@ -60,10 +48,7 @@ def _gluon_supports(
     custom_mask,
     is_causal: bool,
 ) -> bool:
-    """Cheap pre-dispatch filter for shape / feature combos the Gluon kernel
-    does not implement. Keep in sync with the ``raise`` guards at the top of
-    ``gluon_extend_attention_fwd``; falling through would work but costs a
-    raised ``ValueError`` per call."""
+    """Fast guard for unsupported Gluon shapes."""
     return _gluon_unsupported_reason(
         q_extend, v_extend, k_buffer, custom_mask, is_causal
     ) is None
@@ -85,7 +70,6 @@ def _gluon_unsupported_reason(
     kv_is_fp8 = k_buffer.dtype in _FP8_KV_DTYPES
     if kv_is_fp8 and k_buffer.dtype not in _GLUON_SUPPORTED_FP8_KV_DTYPES:
         return f"unsupported_fp8_dtype_{k_buffer.dtype}"
-    # D=256 FP8 KV and D<=128 FP8 KV + custom mask are not implemented.
     if kv_is_fp8 and Lq == 256:
         return "unsupported_fp8_d256"
     if kv_is_fp8 and custom_mask is not None and Lq <= 128:
@@ -94,14 +78,7 @@ def _gluon_unsupported_reason(
 
 
 def make_extend_attention_fwd(triton_fallback: Callable) -> Callable:
-    """Return a drop-in replacement for ``extend_attention_fwd``.
-
-    The returned callable matches the Triton reference signature plus three
-    optional dispatch hints (``total_prefix_len`` / ``total_extend_len`` /
-    ``min_len_extend``) that :class:`TritonAttnBackend` fills from
-    :class:`ForwardMetadata`. Unsupported shapes and any runtime exception
-    route to ``triton_fallback`` — never silent wrong output.
-    """
+    """Return a Gluon wrapper that falls back to Triton."""
     if not _try_import_gluon():
         return triton_fallback
 

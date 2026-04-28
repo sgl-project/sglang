@@ -1,10 +1,4 @@
-"""Unit tests for the Gluon extend-attention kernel and its Triton fallback.
-
-Covers kernel parity across every supported head-dim/pattern pair, the
-``make_extend_attention_fwd`` fallback invariant (unsupported shapes
-MUST route to Triton), and GPU-less preset-table sanity checks that run
-on x86 CI as well. Kernel tests are skipped when not on gfx950.
-"""
+"""Tests for Gluon extend attention and its Triton fallback."""
 
 from __future__ import annotations
 
@@ -20,13 +14,11 @@ from sglang.srt.utils import get_device, is_gfx95_supported
 from sglang.test.test_utils import CustomTestCase
 
 
-# Only the kernel tests need gfx950. The wrapper + preset tests run anywhere.
+# Kernel tests need gfx950; wrapper tests run anywhere.
 _GFX95 = is_gfx95_supported()
 
 
 def _random_shapes(B, max_prefix, max_extend, device):
-    """Shape sampler matching the Triton extend-attention test so the
-    two test files stay diff-comparable."""
     b_seq_len_prefix = torch.randint(
         1, max_prefix, (B,), dtype=torch.int32, device=device
     )
@@ -47,8 +39,6 @@ def _build_extend_inputs(
     *, B, H_Q, H_KV, D, max_prefix=512, max_extend=256,
     dtype=torch.bfloat16, device=None, seed=42,
 ):
-    """Build a realistic extend-attention call: prefix KV in the cache,
-    extend KV at the tail of the same buffer, Q for the extend tokens."""
     torch.manual_seed(seed)
     device = device or get_device()
     (
@@ -114,7 +104,6 @@ def _build_extend_inputs(
 
 
 class TestGluonSupports(CustomTestCase):
-    """Validate the ``_gluon_supports`` guard that gates Gluon vs Triton."""
 
     def _mktensor(self, shape, dtype=torch.bfloat16):
         return torch.empty(shape, dtype=dtype, device="meta")
@@ -139,7 +128,6 @@ class TestGluonSupports(CustomTestCase):
             )
 
     def test_mismatched_lq_lv_falls_back(self):
-        """MLA / mixed-dim shapes (Lq != Lv) route to Triton."""
         from sglang.srt.layers.attention.gluon_extend_attention import _gluon_supports
         q = self._mktensor((4, 8, 192))
         v = self._mktensor((4, 4, 128))
@@ -194,7 +182,6 @@ class TestGluonSupports(CustomTestCase):
         )
 
     def test_non_causal_supported(self):
-        """Non-causal symmetric-head extend is now covered by the Gluon kernel."""
         from sglang.srt.layers.attention.gluon_extend_attention import _gluon_supports
         q = self._mktensor((4, 8, 128))
         v = self._mktensor((4, 4, 128))
@@ -214,8 +201,6 @@ class TestGluonSupports(CustomTestCase):
             )
 
     def test_make_extend_attention_fwd_returns_fallback_on_import_failure(self):
-        """When Gluon fails to import, ``make_extend_attention_fwd`` must
-        return the Triton fallback unchanged."""
         import sglang.srt.layers.attention.gluon_extend_attention as mod
         saved_fn = mod._GLUON_FN
         saved_try = mod._try_import_gluon
@@ -305,8 +290,6 @@ class TestGluonSupports(CustomTestCase):
 
 @unittest.skipUnless(_GFX95, "Gluon extend attention requires gfx950")
 class TestGluonKernelParity(CustomTestCase):
-    """Kernel parity: Gluon output ~= Triton reference extend output.
-    Skipped unless we're on an MI350 / 355 card."""
 
     def setUp(self):
         random.seed(42)
@@ -352,7 +335,6 @@ class TestGluonKernelParity(CustomTestCase):
         inputs = _build_extend_inputs(B=B, H_Q=H_Q, H_KV=H_KV, D=D)
         o_gluon = self._run_gluon(inputs, **kwargs)
         o_triton = self._run_triton(inputs, **kwargs)
-        # Tolerance matches the existing Triton extend-attention test.
         torch.testing.assert_close(
             o_gluon, o_triton, rtol=2e-2, atol=2e-3,
             msg=f"D={D} H_Q={H_Q} H_KV={H_KV} kwargs={kwargs}",
@@ -392,17 +374,14 @@ class TestGluonKernelParity(CustomTestCase):
         )
 
     def test_parity_noncausal_d128(self):
-        """Bidirectional extend: Gluon dispatches to the non-causal branch."""
         self._check_parity(D=128, H_Q=32, H_KV=8, is_causal=False)
 
     def test_parity_with_logit_cap(self):
-        """Gemma-style logit cap: ``tanh(s/cap)*cap`` applied pre-softmax."""
         self._check_parity(
             D=128, H_Q=32, H_KV=8, is_causal=True, logit_cap=30.0,
         )
 
     def test_parity_with_sinks_d64(self):
-        """GPT-OSS / MiMO attention sinks (one learnable scalar per head)."""
         device = get_device()
         inputs = _build_extend_inputs(B=4, H_Q=64, H_KV=8, D=64)
         sinks = torch.empty(

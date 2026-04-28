@@ -58,9 +58,7 @@ class ForwardMetadata:
     window_kv_offsets: torch.Tensor
     # Separate attn_logits for SWA layers when v_head_dim differs
     swa_attn_logits: Optional[torch.Tensor] = None
-    # Gluon dispatch hints computed once in init_forward_metadata
-    # (O(B) CPU-side reduction, no GPU sync). Only forwarded to the
-    # Gluon wrapper; the Triton reference ignores them.
+    # Optional Gluon routing hints.
     total_prefix_len: Optional[int] = None
     total_extend_len: Optional[int] = None
     min_len_extend: Optional[int] = None
@@ -86,12 +84,7 @@ class TritonAttnBackend(AttentionBackend):
         super().__init__()
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
-        # Optional Gluon extend-attention kernel for gfx950 (MI350 / 355).
-        # Gated on --enable-gluon-extend-attention + hardware probe; the
-        # wrapper falls back to the Triton reference on any unsupported
-        # shape or runtime exception, so enabling is always safe.
-        # MLA models (Lq != Lv) skip the wrapper entirely — Gluon extend
-        # is symmetric-head only.
+        # Optional gfx950 Gluon extend attention.
         self._gluon_extend_enabled = False
         _extend_fwd = extend_attention_fwd
         _mla_model = (
@@ -485,9 +478,7 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
             num_kv_splits = None
 
-        # Compute Gluon dispatch hints once (O(B) CPU-side, no GPU sync).
-        # Input may be list[int] or a cpu tensor from the piecewise
-        # cuda-graph runner.
+        # Use CPU-side lengths when available; no GPU sync.
         _pfx_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
         _ext_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
         if _pfx_cpu is not None and _ext_cpu is not None:
@@ -1004,8 +995,7 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        # Dispatch hints are keyword-only on the Gluon wrapper; the
-        # Triton reference does not accept them.
+        # The Gluon wrapper accepts these keyword-only hints.
         _gluon_hints = (
             dict(
                 total_prefix_len=self.forward_metadata.total_prefix_len,
