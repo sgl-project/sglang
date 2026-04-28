@@ -11,7 +11,7 @@ RUN cd /tmp && rm -rf flash-mla && git clone https://github.com/deepseek-ai/Flas
 RUN pip install flashinfer-jit-cache==0.6.8 --index-url https://flashinfer.ai/whl/cu130
 RUN pip uninstall -y deep-gemm deep_gemm 2>/dev/null; \
     cd /tmp && rm -rf DeepGEMM && git clone https://github.com/sgl-project/DeepGEMM.git -b release && \
-    cd DeepGEMM && git checkout 7f2a70 && \
+    cd DeepGEMM && git checkout 5a57cd && \
     git submodule update --init --recursive && \
     ln -sf $(pwd)/third-party/cutlass/include/cutlass $(pwd)/deep_gemm/include/cutlass &&  \
     ln -sf $(pwd)/third-party/cutlass/include/cute $(pwd)/deep_gemm/include/cute && \

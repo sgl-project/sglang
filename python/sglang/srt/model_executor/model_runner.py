@@ -595,6 +595,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         else self.tp_group.cpu_group
                     ),
                 )
+                self.hisparse_coordinator.set_decode_producer_stream(
+                    self.forward_stream
+                )
             self.init_device_graphs()
         elif self.device in ["npu", "cpu"]:
             self.init_attention_backend()
