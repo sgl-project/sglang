@@ -72,6 +72,15 @@ class ForwardContext:
         self.moe_layers = None
         self.moe_fusions = None
         self.nsa_indexers = None
+        # 1-elem int32 device tensor holding the per-replay count of real (non-padded)
+        # extend tokens. Bound at a stable address via PrefillInputBuffers and refilled
+        # before each replay, so kernels reading via __ldg see the dynamic value.
+        self.extend_num_tokens_gpu: Optional[torch.Tensor] = None
+        # PCG metadata staging slots for the NSA indexer (see
+        # sglang.srt.layers.attention.nsa.metadata_staging). Stable addresses
+        # populated per-step from the live indexer metadata; read inside the
+        # compiled region as graph-input tensors.
+        self.nsa_metadata_buffers: Optional[Any] = None
 
     def set_forward_batch(self, forward_batch: ForwardBatch):
         self.forward_batch = forward_batch
@@ -91,6 +100,12 @@ class ForwardContext:
     def set_nsa_indexers(self, indexers: List[Any]):
         self.nsa_indexers = indexers
 
+    def set_extend_num_tokens_gpu(self, extend_num_tokens_gpu: torch.Tensor):
+        self.extend_num_tokens_gpu = extend_num_tokens_gpu
+
+    def set_nsa_metadata_buffers(self, buffers: Any):
+        self.nsa_metadata_buffers = buffers
+
 
 _forward_context: Optional[ForwardContext] = None
 
@@ -109,6 +124,8 @@ def set_forward_context(
     moe_layers: List[Any],
     moe_fusions: List[Any],
     nsa_indexers: Optional[List[Any]] = None,
+    extend_num_tokens_gpu: Optional[torch.Tensor] = None,
+    nsa_metadata_buffers: Optional[Any] = None,
 ):
     global _forward_context
     _forward_context = ForwardContext()
@@ -119,6 +136,10 @@ def set_forward_context(
     _forward_context.set_moe_fusions(moe_fusions)
     if nsa_indexers is not None:
         _forward_context.set_nsa_indexers(nsa_indexers)
+    if extend_num_tokens_gpu is not None:
+        _forward_context.set_extend_num_tokens_gpu(extend_num_tokens_gpu)
+    if nsa_metadata_buffers is not None:
+        _forward_context.set_nsa_metadata_buffers(nsa_metadata_buffers)
     try:
         yield
     finally:

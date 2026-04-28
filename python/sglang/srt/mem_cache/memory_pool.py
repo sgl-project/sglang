@@ -1920,10 +1920,25 @@ class NSATokenToKVPool(MLATokenToKVPool):
                 )
                 for _ in range(layer_num)
             ]
+            # Mark each slab's address as static for torch.compile / CUDA-graph
+            # capture: the slabs are pool-lifetime, so their data_ptr is invariant.
+            # Without this, Dynamo may re-specialize whenever it re-sees the slab
+            # tensor, defeating piecewise CUDA-graph reuse.
+            for buf in self.index_k_with_scale_buffer:
+                torch._dynamo.mark_static_address(buf)
         self._finalize_allocation_log(size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
-        if self.layer_transfer_counter is not None:
+        # Skip the layer-transfer wait under piecewise CUDA graph compile / capture.
+        # Dynamo cannot represent CPU-side waits; the wait either graph-breaks
+        # or, at capture time, runs once and is dropped from the captured graph
+        # (so the "wait" semantically only occurs at warmup). This is safe because
+        # PCG is not used together with disaggregated layer-transfer streaming.
+        from sglang.srt.compilation.piecewise_context_manager import (
+            is_in_piecewise_cuda_graph,
+        )
+
+        if self.layer_transfer_counter is not None and not is_in_piecewise_cuda_graph():
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
         return self.index_k_with_scale_buffer[layer_id - self.start_layer]
 

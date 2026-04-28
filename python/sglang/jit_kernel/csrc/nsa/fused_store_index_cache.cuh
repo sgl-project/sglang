@@ -20,6 +20,7 @@ struct FusedStoreCacheParam {
   const void* __restrict__ input;
   void* __restrict__ cache;
   const void* __restrict__ indices;
+  const int32_t* __restrict__ extend_num_tokens;
   uint32_t num_tokens;
 };
 
@@ -42,12 +43,16 @@ __global__ void fused_store_indexer_cache(const __grid_constant__ FusedStoreCach
   constexpr int64_t kPageBytes = 132 << kPageBits;
 
   // each warp handles 128 elements, each block handles multiple rows
-  const auto& [input, cache, indices, num_tokens] = param;
+  const auto& [input, cache, indices, extend_num_tokens, num_tokens] = param;
   const auto global_tid = blockIdx.x * blockDim.x + threadIdx.x;
   const auto global_wid = global_tid / 32;
   const auto lane_id = threadIdx.x % 32;
 
   if (global_wid >= num_tokens) return;
+  // Padding-aware bound: under piecewise CUDA graph, num_tokens is the bucket
+  // size baked at capture, while extend_num_tokens is the per-replay count of
+  // real tokens (read from device memory, varies per replay).
+  if (global_wid >= static_cast<uint32_t>(__ldg(extend_num_tokens))) return;
 
   PDLWaitPrimary<kUsePDL>();  // wait for primary kernel
 
@@ -89,7 +94,11 @@ struct FusedStoreCacheIndexerKernel {
   static_assert(std::has_single_bit(kPageSize), "kPageSize must be a power of 2");
   static_assert(1 << kLogSize == kPageSize);
 
-  static void run(tvm::ffi::TensorView input, tvm::ffi::TensorView cache, tvm::ffi::TensorView indices) {
+  static void run(
+      tvm::ffi::TensorView input,
+      tvm::ffi::TensorView cache,
+      tvm::ffi::TensorView indices,
+      tvm::ffi::TensorView extend_num_tokens) {
     using namespace host;
 
     auto N = SymbolicSize{"num_tokens"};
@@ -108,11 +117,16 @@ struct FusedStoreCacheIndexerKernel {
         .with_dtype<IndicesT>()
         .with_device(device_)
         .verify(indices);
+    TensorMatcher({1})  // extend_num_tokens (1-elem int32 device tensor)
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(extend_num_tokens);
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     const auto params = FusedStoreCacheParam{
         .input = input.data_ptr(),
         .cache = cache.data_ptr(),
         .indices = indices.data_ptr(),
+        .extend_num_tokens = static_cast<const int32_t*>(extend_num_tokens.data_ptr()),
         .num_tokens = num_tokens,
     };
     const auto kBlockSize = 128;
