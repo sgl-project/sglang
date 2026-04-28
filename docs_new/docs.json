@@ -1027,6 +1027,7 @@
                   {
                     "group": "InclusionAI",
                     "pages": [
+                      "cookbook/autoregressive/InclusionAI/Ling-2.6",
                       "cookbook/autoregressive/InclusionAI/Ling-2.5-1T",
                       "cookbook/autoregressive/InclusionAI/Ring-2.5-1T",
                       "cookbook/autoregressive/InclusionAI/LLaDA-2.1"
