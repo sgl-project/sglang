@@ -25,6 +25,7 @@ runtime_common = [
   "build",
   "compressed-tensors",
   "datasets",
+  "easydict",
   "einops",
   "fastapi",
   "gguf",
@@ -57,11 +58,11 @@ runtime_common = [
   "timm==1.0.16",
   "torchao==0.9.0",
   "tqdm",
-  "mistral_common>=1.9.0",
-  "transformers==5.3.0",
+  "mistral_common>=1.11.0",
+  "transformers==5.6.0",
   "uvicorn",
   "uvloop",
-  "xgrammar==0.1.27",
+  "xgrammar==0.1.32",
   "smg-grpc-servicer>=0.5.0",
 ]
 
@@ -98,6 +99,7 @@ srt_hip = [
 
 diffusion_hip = [
   "sglang[diffusion_common]",
+  "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "st_attn==0.0.7",
   "vsa==0.0.4",
   "runai_model_streamer>=0.15.5",
@@ -110,12 +112,15 @@ srt_hpu = ["sglang[runtime_common]"]
 
 # https://docs.sglang.io/platforms/mthreads_gpu.md
 srt_musa = [
-    "sglang[runtime_common]",
-    "torch",
-    "torch_musa",
-    "torchada>=0.1.25",
-    "mthreads-ml-py",
-    "numpy<2.0",
+  "sglang[runtime_common]",
+  "torch",
+  "torch_musa",
+  "torchada>=0.1.50",
+  "mthreads-ml-py",
+  "mate>=0.2.0",
+  "deep-gemm>=0.1.3",
+  "flash_attn_3>=0.1.4",
+  "numpy<2.0",
 ]
 
 diffusion_musa = [
@@ -133,6 +138,8 @@ srt_mps = [
     "torchao==0.9.0",
     "torchaudio==2.9.1",
     "torchvision",
+    "mlx",
+    "mlx-lm",
 ]
 
 diffusion_mps = [
@@ -142,6 +149,9 @@ diffusion_mps = [
   "cache-dit==1.2.3",
   "addict==2.4.0",
   "av==16.1.0",
+  "scikit-image==0.25.2",
+  "trimesh>=4.0.0",
+  "xatlas",
 ]
 
 test = [
@@ -151,7 +161,7 @@ test = [
   "jsonlines",
   "matplotlib",
   "pandas",
-  "peft>=0.18.0",
+  "peft>=0.18.0,<0.19.0", # Pin to <0.19.0 due to torchao incompatibility
   "pytest",
   "sentence_transformers",
   "tabulate",
@@ -205,4 +215,6 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["git", "describe", "--tags", "--long", "--match", "v*"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py"]
+# Allow editable installs even when .git metadata is not available.
+fallback_version = "0.0.0.dev0"

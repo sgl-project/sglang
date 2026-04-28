@@ -4,7 +4,6 @@ from collections.abc import Iterable
 from typing import Optional
 
 import torch
-from einops import rearrange
 from torch import nn
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
@@ -16,7 +15,6 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.attention.fla.fused_norm_gate import FusedRMSNormGated
-from sglang.srt.layers.attention.fla.kda import fused_kda_gate
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -383,11 +381,13 @@ class KimiDeltaAttention(nn.Module):
                 hidden_states
             )
 
-        # fused_kda_gate is fused to KimiLinearAttentionBackend with decode
+        # For prefill: raw gate is passed to chunk_kda_fwd, which fuses gate
+        # activation with chunk_local_cumsum (kda_gate_chunk_cumsum kernel).
+        # For decode: gate activation is handled inside fused_recurrent kernel.
         if not forward_batch.forward_mode.is_decode():
-            forget_gate = fused_kda_gate(
-                forget_gate, self.A_log, self.head_dim, g_bias=self.dt_bias
-            )
+            forget_gate = forget_gate.unflatten(
+                -1, (-1, self.head_dim)
+            )  # [T, H*K] -> [T, H, K]
             beta = beta.float().sigmoid()
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
@@ -399,9 +399,11 @@ class KimiDeltaAttention(nn.Module):
             b=beta,
         )
 
-        norm_gate = rearrange(g_proj_states, "... (h d) -> ... h d", d=self.head_dim)
+        norm_gate = g_proj_states.unflatten(
+            -1, (-1, self.head_dim)
+        )  # ... (h d) -> ... h d
         core_attn_out = self.o_norm(core_attn_out, norm_gate)
-        core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
+        core_attn_out = core_attn_out.squeeze(0).flatten(-2)  # 1 n h d -> n (h d)
 
         return self.o_proj(core_attn_out)[0]
 

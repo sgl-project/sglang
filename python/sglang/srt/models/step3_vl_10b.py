@@ -484,7 +484,7 @@ class StepVLForConditionalGeneration(nn.Module):
         assert len(items) == 1  # We only have images.
 
         item = items[0]
-        pixel_values = item.feature.type(self.vision_model.dtype).to(self.device)
+        pixel_values = item.feature.type(self.vision_model.dtype)
         num_patches = item.model_specific_data.get("num_patches")
         patch_pixel_values = item.model_specific_data.get("patch_pixel_values", None)
         if patch_pixel_values is not None:

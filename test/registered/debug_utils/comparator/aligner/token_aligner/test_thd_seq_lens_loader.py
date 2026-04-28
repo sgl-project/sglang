@@ -14,7 +14,7 @@ from sglang.srt.debug_utils.comparator.aligner.token_aligner.smart.aux_plugins i
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="default", nightly=True)
+register_cpu_ci(est_time=15, suite="stage-a-test-cpu", nightly=True)
 
 
 def _save_pt(

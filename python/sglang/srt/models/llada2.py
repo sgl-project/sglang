@@ -55,7 +55,11 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_deepep_mode, get_moe_a2a_backend
+from sglang.srt.layers.moe import (
+    get_deepep_mode,
+    get_moe_a2a_backend,
+    should_skip_post_experts_all_reduce,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
@@ -84,6 +88,7 @@ from sglang.srt.utils import (
     is_npu,
     make_layers,
 )
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -378,7 +383,10 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         if self.num_shared_experts > 0:
             final_hidden_states = final_hidden_states + shared_output
 
-        if self.tp_size > 1 and not use_reduce_scatter:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states.view(num_tokens, hidden_size)
 
@@ -486,12 +494,13 @@ class LLaDA2MoeAttention(nn.Module):
             self.rotary_dim = config.rotary_dim
         else:
             self.rotary_dim = self.head_dim
+        rope_theta, rope_scaling = get_rope_config(config)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.rotary_dim,
             max_position=config.max_position_embeddings,
-            base=config.rope_parameters["rope_theta"],
-            rope_scaling=config.rope_parameters,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
         )
 
         self.attn = RadixAttention(

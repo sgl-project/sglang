@@ -7,12 +7,15 @@ import triton
 
 from sglang.jit_kernel.benchmark.utils import get_benchmark_range, run_benchmark
 from sglang.jit_kernel.nvfp4 import cutlass_scaled_fp4_mm, scaled_fp4_quant
-from sglang.srt.utils import is_sm100_supported
+from sglang.srt.utils import is_sm100_supported, is_sm120_supported
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=5, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 FLOAT4_E2M1_MAX = 6.0
 FLOAT8_E4M3_MAX = torch.finfo(torch.float8_e4m3fn).max
 BLOCK_SIZE = 16
-_NVFP4_SUPPORTED = is_sm100_supported()
+_NVFP4_SUPPORTED = is_sm100_supported() or is_sm120_supported()
 
 K_E2M1_TO_FLOAT = [
     0.0,
@@ -175,7 +178,7 @@ def benchmark(m, n, k, provider):
 
 if __name__ == "__main__":
     if not _NVFP4_SUPPORTED:
-        print("[skip] NVFP4 scaled_mm benchmark requires sm100+ with CUDA 12.8+.")
+        print("[skip] NVFP4 scaled_mm benchmark requires sm100/sm120 with CUDA 12.8+.")
         sys.exit(0)
     if not _AOT_SCALED_MM_AVAILABLE:
         print(

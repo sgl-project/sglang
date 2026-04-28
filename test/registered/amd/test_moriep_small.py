@@ -4,7 +4,9 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.server_args import ZMQ_TCP_PORT_DELTA
 from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils.network import is_port_available
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
 from sglang.test.test_utils import (
@@ -14,6 +16,30 @@ from sglang.test.test_utils import (
     CustomTestCase,
     popen_launch_server,
 )
+
+
+def wait_all_ports_release(base_url, timeout_s=60):
+    """Wait until all derived ports are fully released."""
+    import time
+
+    port = int(base_url.split(":")[-1])
+
+    # See https://github.com/sgl-project/sglang/blob/495ef8ec64b6b937e59cd530ad3150172061a008/python/sglang/srt/server_args.py#L6958-L6969
+    offsets = [
+        0,  # no offset
+        ZMQ_TCP_PORT_DELTA,  # dist_init_port
+        ZMQ_TCP_PORT_DELTA + 1,  # detokenizer_port
+        ZMQ_TCP_PORT_DELTA + 2,  # rpc_port
+        ZMQ_TCP_PORT_DELTA + 3,  # metrics_port
+        ZMQ_TCP_PORT_DELTA + 4,  # scheduler_input_port
+    ]
+    for _ in range(timeout_s):
+        if all(is_port_available(port + off) for off in offsets):
+            return
+        time.sleep(1)
+    # Best-effort: log but don't raise so tearDown doesn't break the next class.
+    print(f"Warning: some ports still occupied after {timeout_s}s")
+
 
 register_amd_ci(est_time=1200, suite="stage-c-test-large-8-gpu-amd")
 
@@ -34,7 +60,7 @@ common_args = [
     "1",
     "--enable-dp-lm-head",
     "--mem-fraction-static",
-    "0.6",
+    "0.72",  # relax for mi300x
     "--chunked-prefill-size",
     "32768",
     "--max-running-requests",
@@ -69,7 +95,7 @@ class TestPureDP(CustomTestCase):
 
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
-        env["SGLANG_MORI_FP8_DISP"] = "False"
+        env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
 
@@ -84,6 +110,7 @@ class TestPureDP(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -113,7 +140,7 @@ class TestMTP(CustomTestCase):
 
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
-        env["SGLANG_MORI_FP8_DISP"] = "False"
+        env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
 
@@ -128,6 +155,7 @@ class TestMTP(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -145,7 +173,7 @@ class TestMTP(CustomTestCase):
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["accuracy"], 0.92)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -166,7 +194,7 @@ class TestNormal(CustomTestCase):
 
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
-        env["SGLANG_MORI_FP8_DISP"] = "False"
+        env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
 
@@ -181,6 +209,7 @@ class TestNormal(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -213,7 +242,7 @@ class TestLowLatency(CustomTestCase):
 
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
-        env["SGLANG_MORI_FP8_DISP"] = "False"
+        env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
         # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
@@ -230,6 +259,7 @@ class TestLowLatency(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -263,7 +293,7 @@ class TestTBOwithNormal(CustomTestCase):
 
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
-        env["SGLANG_MORI_FP8_DISP"] = "False"
+        env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
 
@@ -278,6 +308,7 @@ class TestTBOwithNormal(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -311,7 +342,7 @@ class TestTBOwithLowLatency(CustomTestCase):
 
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
-        env["SGLANG_MORI_FP8_DISP"] = "False"
+        env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
         # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
@@ -328,6 +359,7 @@ class TestTBOwithLowLatency(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -365,7 +397,7 @@ class TestMTPwithTBONormal(CustomTestCase):
 
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
-        env["SGLANG_MORI_FP8_DISP"] = "False"
+        env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
 
@@ -380,6 +412,7 @@ class TestMTPwithTBONormal(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -397,7 +430,7 @@ class TestMTPwithTBONormal(CustomTestCase):
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["accuracy"], 0.92)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
@@ -423,7 +456,7 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
 
         env = dict(os.environ)
         env["SGLANG_USE_AITER"] = "1"
-        env["SGLANG_MORI_FP8_DISP"] = "False"
+        env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
         # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
@@ -440,6 +473,7 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        wait_all_ports_release(cls.base_url)
 
     def test_gsm8k(
         self,
@@ -457,7 +491,7 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
         print(f"{metrics=}")
         self.assertGreaterEqual(metrics["accuracy"], 0.92)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]

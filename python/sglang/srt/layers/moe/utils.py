@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import contextmanager
 from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Optional
+
+import torch
 
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.layers.dp_attention import (
@@ -26,6 +29,7 @@ class MoeA2ABackend(Enum):
     MORI = "mori"
     ASCEND_FUSEEP = "ascend_fuseep"
     FLASHINFER = "flashinfer"
+    CUSTOMIZED = "customized"
 
     @classmethod
     def _missing_(cls, value):
@@ -56,6 +60,9 @@ class MoeA2ABackend(Enum):
 
     def is_mori(self):
         return self == MoeA2ABackend.MORI
+
+    def is_customized(self):
+        return self == MoeA2ABackend.CUSTOMIZED
 
 
 class MoeRunnerBackend(Enum):
@@ -141,6 +148,7 @@ MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
 MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_RUNNER_BACKEND: Optional[MoeRunnerBackend] = None
 SPECULATIVE_MOE_A2A_BACKEND: Optional[MoeA2ABackend] = None
+RECORD_NOLORA_GRAPH: bool = False
 DEEPEP_MODE: Optional[DeepEPMode] = None
 IS_TBO_ENABLED: Optional[bool] = None
 IS_SBO_ENABLED: Optional[bool] = None
@@ -155,6 +163,7 @@ def initialize_moe_config(server_args: ServerArgs):
     global MOE_RUNNER_BACKEND
     global SPECULATIVE_MOE_RUNNER_BACKEND
     global SPECULATIVE_MOE_A2A_BACKEND
+    global RECORD_NOLORA_GRAPH
     global DEEPEP_MODE
     global DEEPEP_CONFIG
     global IS_TBO_ENABLED
@@ -165,6 +174,25 @@ def initialize_moe_config(server_args: ServerArgs):
 
     MOE_A2A_BACKEND = MoeA2ABackend(server_args.moe_a2a_backend)
     MOE_RUNNER_BACKEND = MoeRunnerBackend(server_args.moe_runner_backend)
+    # Dual CUDA graphs only validated for triton MoE backends.
+    _triton_ok = MOE_RUNNER_BACKEND in (
+        MoeRunnerBackend.TRITON,
+        MoeRunnerBackend.TRITON_KERNELS,
+    )
+    if (
+        bool(server_args.record_nolora_graph)
+        and bool(server_args.enable_lora)
+        and not _triton_ok
+    ):
+        logger.warning(
+            f"record_nolora_graph only validated for triton MoE backend, "
+            f"but moe_runner_backend={server_args.moe_runner_backend}. Disabling."
+        )
+    RECORD_NOLORA_GRAPH = (
+        bool(server_args.record_nolora_graph)
+        and bool(server_args.enable_lora)
+        and _triton_ok
+    )
     SPECULATIVE_MOE_RUNNER_BACKEND = (
         MoeRunnerBackend(server_args.speculative_moe_runner_backend)
         if server_args.speculative_moe_runner_backend is not None
@@ -220,6 +248,10 @@ def get_speculative_moe_a2a_backend() -> MoeA2ABackend:
     return SPECULATIVE_MOE_A2A_BACKEND
 
 
+def should_record_nolora_graph() -> bool:
+    return RECORD_NOLORA_GRAPH
+
+
 def get_deepep_mode() -> DeepEPMode:
     global DEEPEP_MODE
     if DEEPEP_MODE is None:
@@ -248,6 +280,20 @@ def is_sbo_enabled() -> bool:
     if IS_SBO_ENABLED is None:
         IS_SBO_ENABLED = False
     return IS_SBO_ENABLED
+
+
+def is_deepep_class_backend() -> bool:
+    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
+    b = get_moe_a2a_backend()
+    return b.is_deepep() or b.is_mooncake() or b.is_mori()
+
+
+def is_flashinfer_cutedsl_v1_path() -> bool:
+    """CuteDSL v1 + DeepEP low-latency path (no MoeRunner, no autotune)."""
+    return (
+        get_moe_runner_backend().is_flashinfer_cutedsl()
+        and get_moe_a2a_backend().is_deepep()
+    )
 
 
 def get_tbo_token_distribution_threshold() -> float:
@@ -283,6 +329,54 @@ def should_use_flashinfer_cutlass_moe_fp4_allgather():
         and MOE_QUANTIZATION == "modelopt_fp4"
         and get_moe_expert_parallel_world_size() == get_attention_dp_size()
     )
+
+
+def should_use_dp_reduce_scatterv():
+    """
+    Use reduce_scatterv in the standard dispatcher's combine() for DP attention
+    with EP, replacing the default all-reduce + dp_scatter path.
+    Only changes the combine (post-kernel) communication; dispatch is unchanged.
+    """
+    return (
+        not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        and get_moe_a2a_backend().is_none()
+        and is_dp_attention_enabled()
+        and get_attention_dp_size() > 1
+        and get_moe_expert_parallel_world_size() == get_attention_dp_size()
+    )
+
+
+def should_skip_post_experts_all_reduce(
+    *,
+    is_tp_path: bool,
+    use_reduce_scatter: bool = False,
+    should_allreduce_fusion: bool = False,
+) -> bool:
+    """Whether to skip the post-experts all-reduce (EP or TP) because a
+    downstream component will fuse, replace, or absorb it.
+
+    Skip reasons, in order:
+      - ``should_allreduce_fusion``: LayerCommunicator will fuse the all-reduce
+        with the next layer's residual all-reduce.
+      - ``use_reduce_scatter``: LayerCommunicator's post-attention scatter will
+        do reduce-scatter, which would double-reduce on top of an all-reduce.
+      - ``should_use_dp_reduce_scatterv()``: the standard dispatcher's combine
+        path replaces the all-reduce with a reduce-scatterv.
+      - ``should_use_flashinfer_cutlass_moe_fp4_allgather()`` (TP path only):
+        the flashinfer cutlass FP4 kernel performs an all-gather that absorbs
+        the post-experts TP all-reduce. Not relevant to the EP all-reduce.
+
+    The first two args are layer-context flags from ``LayerCommunicator`` and
+    default to ``False`` for models that don't use it. Pass ``is_tp_path=True``
+    for the post-experts TP all-reduce, ``False`` for the EP all-reduce.
+    """
+    if should_allreduce_fusion or use_reduce_scatter:
+        return True
+    if should_use_dp_reduce_scatterv():
+        return True
+    if is_tp_path and should_use_flashinfer_cutlass_moe_fp4_allgather():
+        return True
+    return False
 
 
 @contextmanager
@@ -341,3 +435,51 @@ class RoutingMethodType(IntEnum):
     TopK = (5,)
     # Unspecified
     Unspecified = 6
+
+
+AITER_PADDING_SIZE = 128
+TRITON_PADDING_SIZE = 128
+
+
+# Unit of padding - context dependent
+def get_moe_padding_size(is_aiter_moe):
+    if is_aiter_moe:
+        return AITER_PADDING_SIZE
+    else:
+        return (
+            TRITON_PADDING_SIZE
+            if bool(int(os.getenv("SGLANG_MOE_PADDING", "0")))
+            else 0
+        )
+
+
+def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):
+    """
+    Calculate dimensions for MoE weight tensors.
+
+    Args:
+        inter_dim: Base intermediate dimension.
+        is_concat: If True, fusions W1 (gate) and W3 (up) projections.
+        is_packed: If True, uses 4-bit quantization (two FP4 elements per byte).
+        is_aiter_moe: If True, applies Aiter-specific kernel padding alignment.
+    """
+    # w2_down_dim is the packing rank, but w13_up_dim not (of matrix to matmul)
+    w13_up_dim = 2 * inter_dim if is_concat else inter_dim
+    w2_down_dim = inter_dim // 2 if is_packed else inter_dim
+
+    if is_aiter_moe:
+        padding_size = get_moe_padding_size(True)
+        align_aiter = lambda n: ((n + padding_size - 1) // padding_size) * padding_size
+        is_padded = (w2_down_dim % padding_size) > 0
+        if is_padded:
+            # w2_down_dim, padding & aligned, unit: parameter dtype
+            w2_down_dim = align_aiter(w2_down_dim)
+        # up proj + gate fusion : 2x
+        if is_concat:
+            w13_up_dim = w2_down_dim * 2
+        # packed
+        if hasattr(torch, "float4_e2m1fn_x2") and is_packed:
+            # w13_up_dim (row rank of matmul matrix) is not packing dim, *2 to recover
+            w13_up_dim *= 2
+
+    return (w13_up_dim, w2_down_dim, False if not is_aiter_moe else is_padded)

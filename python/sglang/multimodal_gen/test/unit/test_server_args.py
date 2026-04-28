@@ -65,11 +65,129 @@ class TestModelIdResolution(unittest.TestCase):
         info = _get_config_info(expanded, model_id="Qwen-Image")
         self.assertIsNotNone(info)
 
+    def test_hf_cache_snapshot_path_resolves_registered_nvfp4_model(self):
+        path = (
+            "/root/.cache/huggingface/hub/"
+            "models--black-forest-labs--FLUX.2-dev-NVFP4/"
+            "snapshots/142b87e70bc3006937b7093d89ff287b5f59f071"
+        )
+        info = _get_config_info(path)
+        self.assertIsNotNone(info)
+
     def test_model_id_unknown_falls_back_without_crash(self):
         # unrecognized model_id: should warn and fall back to path-based detection
         # with an unresolvable path, expect RuntimeError from the detector step
         with self.assertRaises((RuntimeError, Exception)):
             _get_config_info("/data/no-such-model", model_id="NonExistentModelXYZ")
+
+
+class TestPerRoleParallelism(unittest.TestCase):
+    """Test per-role parallelism args and get_role_parallelism helper."""
+
+    def _from_dict(self, kwargs):
+        with patch.object(
+            PipelineConfig, "from_kwargs", return_value=QwenImagePipelineConfig()
+        ):
+            return ServerArgs.from_dict(kwargs)
+
+    def test_defaults_are_none(self):
+        args = self._from_dict({"model_path": "/fake"})
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        for role in [RoleType.ENCODER, RoleType.DENOISER, RoleType.DECODER]:
+            par = args.get_role_parallelism(role)
+            self.assertIsNone(par["tp_size"])
+            self.assertIsNone(par["sp_degree"])
+            self.assertIsNone(par["ulysses_degree"])
+            self.assertIsNone(par["ring_degree"])
+
+    def test_encoder_overrides(self):
+        args = self._from_dict({"model_path": "/fake", "encoder_tp": 2})
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        par = args.get_role_parallelism(RoleType.ENCODER)
+        self.assertEqual(par["tp_size"], 2)
+        self.assertIsNone(par["sp_degree"])
+        self.assertIsNone(par["ulysses_degree"])
+        self.assertIsNone(par["ring_degree"])
+
+    def test_denoiser_overrides(self):
+        args = self._from_dict(
+            {
+                "model_path": "/fake",
+                "denoiser_tp": 1,
+                "denoiser_sp": 8,
+                "denoiser_ulysses": 4,
+                "denoiser_ring": 2,
+            }
+        )
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        par = args.get_role_parallelism(RoleType.DENOISER)
+        self.assertEqual(par["tp_size"], 1)
+        self.assertEqual(par["sp_degree"], 8)
+        self.assertEqual(par["ulysses_degree"], 4)
+        self.assertEqual(par["ring_degree"], 2)
+
+    def test_decoder_overrides(self):
+        args = self._from_dict({"model_path": "/fake", "decoder_tp": 2})
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        par = args.get_role_parallelism(RoleType.DECODER)
+        self.assertEqual(par["tp_size"], 2)
+        self.assertIsNone(par["sp_degree"])
+        self.assertIsNone(par["ulysses_degree"])
+        self.assertIsNone(par["ring_degree"])
+
+    def test_monolithic_returns_all_none(self):
+        args = self._from_dict({"model_path": "/fake", "encoder_tp": 2})
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        par = args.get_role_parallelism(RoleType.MONOLITHIC)
+        self.assertIsNone(par["tp_size"])
+        self.assertIsNone(par["sp_degree"])
+
+    def test_mixed_roles_independent(self):
+        """Per-role args don't interfere with each other."""
+        args = self._from_dict(
+            {
+                "model_path": "/fake",
+                "encoder_tp": 1,
+                "denoiser_tp": 2,
+                "decoder_tp": 4,
+            }
+        )
+        from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+        self.assertEqual(args.get_role_parallelism(RoleType.ENCODER)["tp_size"], 1)
+        self.assertEqual(args.get_role_parallelism(RoleType.DENOISER)["tp_size"], 2)
+        self.assertEqual(args.get_role_parallelism(RoleType.DECODER)["tp_size"], 4)
+
+    def test_cli_args_parsed(self):
+        """Per-role parallelism args are parsed from CLI."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "/fake",
+            "--denoiser-tp",
+            "2",
+            "--denoiser-sp",
+            "4",
+            "--denoiser-ulysses",
+            "2",
+            "--denoiser-ring",
+            "2",
+            "--encoder-tp",
+            "1",
+        ]
+        args, unknown = parser.parse_known_args(argv)
+        self.assertEqual(args.denoiser_tp, 2)
+        self.assertEqual(args.denoiser_sp, 4)
+        self.assertEqual(args.denoiser_ulysses, 2)
+        self.assertEqual(args.denoiser_ring, 2)
+        self.assertEqual(args.encoder_tp, 1)
+        self.assertIsNone(args.decoder_tp)
 
 
 class TestPipelineResolutionCliOverride(unittest.TestCase):

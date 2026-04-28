@@ -13,7 +13,9 @@ from sglang.test.ci.ci_utils import TestFile, run_unittest_files
 suites = {
     # quantization_test suite migrated to test/registered/quant/
     # All CUDA tests migrated to test/registered/
-    "__not_in_ci__": [],
+    "__not_in_ci__": [
+        TestFile("ascend/test_embed_interpolate_unittest.py"),
+    ],
 }
 
 # Add AMD tests
@@ -75,50 +77,15 @@ suite_xeon = {
 # NOTE: please sort the test cases alphabetically by the test file name
 suite_xpu = {
     "per-commit-xpu": [
-        TestFile("xpu/test_deepseek_ocr.py"),
+        TestFile("xpu/test_deepseek_ocr.py", 360),
+        TestFile("xpu/test_deepseek_ocr_triton.py", 360),
         # TestFile("xpu/test_internvl.py"),
         TestFile("xpu/test_intel_xpu_backend.py"),
     ],
 }
 
-# Add Ascend NPU tests
-# TODO: Set accurate estimate time
-# NOTE: please sort the test cases alphabetically by the test file name
-suite_ascend = {
-    "per-commit-1-npu-a2": [
-        TestFile("ascend/test_ascend_autoround_dense.py", 400),
-        TestFile("ascend/test_ascend_autoround_moe.py", 400),
-        TestFile("ascend/test_ascend_gptq_moe.py", 400),
-        TestFile("ascend/test_ascend_graph_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_piecewise_graph_prefill.py", 400),
-        TestFile("ascend/test_ascend_hicache_mha.py", 400),
-        TestFile("ascend/test_ascend_sampling_backend.py", 400),
-        TestFile("ascend/test_ascend_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_compile_graph_tp1_bf16.py", 400),
-        TestFile("ascend/test_ascend_w8a8_quantization.py", 400),
-        TestFile("test_embed_interpolate_unittest.py", 400),
-    ],
-    "per-commit-2-npu-a2": [
-        TestFile("ascend/test_ascend_graph_tp2_bf16.py", 400),
-        TestFile("ascend/test_ascend_mla_fia_w8a8int8.py", 400),
-        TestFile("ascend/test_ascend_tp2_bf16.py", 400),
-        TestFile("ascend/test_ascend_tp2_fia_bf16.py", 400),
-    ],
-    "per-commit-4-npu-a3": [
-        TestFile("ascend/test_ascend_mla_w8a8int8.py", 400),
-        TestFile("ascend/test_ascend_hicache_mla.py", 400),
-        TestFile("ascend/test_ascend_tp4_bf16.py", 400),
-        TestFile("ascend/test_ascend_w4a4_quantization.py", 600),
-        TestFile("ascend/test_llada2_mini_ascend.py", 800),
-    ],
-    "per-commit-16-npu-a3": [
-        TestFile("ascend/test_ascend_deepep.py", 3600),
-    ],
-}
-
 suites.update(suite_amd)
 suites.update(suite_xeon)
-suites.update(suite_ascend)
 suites.update(suite_xpu)
 
 
@@ -326,4 +293,9 @@ def main():
 
 
 if __name__ == "__main__":
+    print(
+        "DEPRECATION NOTICE: The folder `test/srt` should be deprecated as soon as possible. "
+        "Migrate tests to the new CI registry system described in `test/README.md`.",
+        flush=True,
+    )
     main()
