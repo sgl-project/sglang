@@ -53,8 +53,7 @@ class SGLangTrueOnPolicyContract:
         return self.schema.name
 
     def policy_for(self, server_args: Any) -> SGLangTrueOnPolicyRuntimePolicy:
-        target = getattr(server_args, "rl_on_policy_target", None)
-        uses_tp_invariant_rollout = target == "fsdp_tp"
+        uses_tp_invariant_rollout = getattr(server_args, "tp_size", 1) > 1
         return SGLangTrueOnPolicyRuntimePolicy(
             contract_name=self.name,
             enabled=True,
@@ -91,25 +90,13 @@ def get_true_on_policy_contract(contract_name: str) -> SGLangTrueOnPolicyContrac
 
 
 def _contract_name_for(server_args: Any) -> Optional[str]:
-    target = getattr(server_args, "rl_on_policy_target", None)
-    contract_name = getattr(server_args, "true_on_policy_contract", None)
-    if contract_name is not None:
-        return contract_name
-    if target is not None:
-        return QWEN3_DENSE_TRUE_ON_POLICY_V1
-    return None
+    return getattr(server_args, "true_on_policy_contract", None)
 
 
 def validate_true_on_policy_contract(server_args: Any) -> None:
     contract_name = getattr(server_args, "true_on_policy_contract", None)
-    target = getattr(server_args, "rl_on_policy_target", None)
     if contract_name is None:
         return
-    if target is None:
-        raise ValueError(
-            "--true-on-policy-contract requires --rl-on-policy-target so the "
-            "runtime policy cannot silently become a no-op."
-        )
     get_true_on_policy_contract(contract_name)
 
 

@@ -24,11 +24,13 @@ def get_rl_on_policy_target(server_args: Optional[Any] = None) -> Optional[str]:
 
 
 def is_true_on_policy_enabled(server_args: Optional[Any] = None) -> bool:
-    return get_rl_on_policy_target(server_args) is not None
+    return resolve_true_on_policy_runtime_policy(_get_server_args(server_args)).enabled
 
 
 def is_tp_invariant_target(server_args: Optional[Any] = None) -> bool:
-    return get_rl_on_policy_target(server_args) == "fsdp_tp"
+    return resolve_true_on_policy_runtime_policy(
+        _get_server_args(server_args)
+    ).tp_invariant_row_linear
 
 
 def should_disable_reduce_scatter_for_on_policy(

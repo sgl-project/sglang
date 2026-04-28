@@ -3471,14 +3471,18 @@ class ServerArgs:
 
         if self.rl_on_policy_target is not None:
             logger.warning(
-                "Enable deterministic inference because of rl_on_policy_target."
+                "Enable deterministic inference because of legacy rl_on_policy_target."
+            )
+            self.enable_deterministic_inference = True
+
+        if self.true_on_policy_contract is not None:
+            logger.warning(
+                "Enable deterministic inference because of true_on_policy_contract."
             )
             self.enable_deterministic_inference = True
 
             # For VLM
             os.environ["SGLANG_VLM_CACHE_SIZE_MB"] = "0"
-            # TODO remove this environment variable as a whole
-            os.environ["SGLANG_ENABLE_DETERMINISTIC_INFERENCE"] = "1"
 
             if (
                 should_disable_flashinfer_allreduce_fusion(self)
@@ -3487,8 +3491,11 @@ class ServerArgs:
                 self.enable_flashinfer_allreduce_fusion = False
                 logger.warning(
                     "Disable flashinfer allreduce fusion because of "
-                    "rl_on_policy_target=fsdp_tp."
+                    "true_on_policy_contract with TP rollout."
                 )
+
+        if self.enable_deterministic_inference:
+            envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set("1")
 
         if self.enable_deterministic_inference:
             if self.enable_aiter_allreduce_fusion:
@@ -5730,8 +5737,7 @@ class ServerArgs:
             default=ServerArgs.true_on_policy_contract,
             help=(
                 "Internal true-on-policy parity contract selected by the launcher. "
-                "Normal users should prefer --rl-on-policy-target or the Miles "
-                "true_on_policy switch."
+                "Normal users should prefer the Miles true_on_policy switch."
             ),
         )
         parser.add_argument(
