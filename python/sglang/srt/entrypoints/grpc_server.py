@@ -10,10 +10,10 @@ once the gRPC request manager is ready, regardless of whether --enable-metrics
 is set.
 """
 
+import asyncio
 import json
 import logging
 import time
-import asyncio
 
 from aiohttp import web
 
