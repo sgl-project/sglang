@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.true_on_policy import (
+    QWEN3_DENSE_TRUE_ON_POLICY_V1,
     get_on_policy_rms_norm_kwargs,
     should_force_bfloat16_dense_tensor_math,
     should_force_bfloat16_lm_head,
@@ -132,7 +133,10 @@ def _run_dense_math_script(script_body: str) -> dict[str, object]:
 
 class TestDenseOnPolicyHelpers(unittest.TestCase):
     def test_default_dense_math_helpers_are_inactive(self):
-        server_args = SimpleNamespace(rl_on_policy_target=None)
+        server_args = SimpleNamespace(
+            true_on_policy_contract=None,
+            tp_size=1,
+        )
 
         self.assertFalse(should_force_bfloat16_dense_tensor_math(server_args))
         self.assertFalse(
@@ -144,7 +148,10 @@ class TestDenseOnPolicyHelpers(unittest.TestCase):
         self.assertEqual(get_on_policy_rms_norm_kwargs(server_args), {})
 
     def test_on_policy_dense_math_helpers_enable_bfloat16_and_rms_norm_kwargs(self):
-        server_args = SimpleNamespace(rl_on_policy_target="fsdp")
+        server_args = SimpleNamespace(
+            true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+            tp_size=1,
+        )
 
         kwargs = get_on_policy_rms_norm_kwargs(
             server_args,
@@ -185,7 +192,12 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                 from sglang.srt.layers.layernorm import RMSNorm
                 from sglang.srt.true_on_policy import get_on_policy_rms_norm_kwargs
 
-                server_args = SimpleNamespace(rl_on_policy_target="fsdp")
+                from sglang.srt.true_on_policy import QWEN3_DENSE_TRUE_ON_POLICY_V1
+
+                server_args = SimpleNamespace(
+                    true_on_policy_contract=QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                    tp_size=1,
+                )
                 norm = RMSNorm(
                     4,
                     eps=1e-6,
@@ -230,10 +242,12 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                     get_global_server_args,
                     set_global_server_args_for_scheduler,
                 )
+                from sglang.srt.true_on_policy import QWEN3_DENSE_TRUE_ON_POLICY_V1
 
                 set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
                 server_args = get_global_server_args()
-                server_args.rl_on_policy_target = "fsdp"
+                server_args.true_on_policy_contract = QWEN3_DENSE_TRUE_ON_POLICY_V1
+                server_args.tp_size = 1
                 norm = RMSNorm(
                     4,
                     eps=1e-6,
@@ -277,6 +291,7 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                     get_global_server_args,
                     set_global_server_args_for_scheduler,
                 )
+                from sglang.srt.true_on_policy import QWEN3_DENSE_TRUE_ON_POLICY_V1
 
                 class DummyMeta:
                     gathered_buffer = None
@@ -293,7 +308,8 @@ class TestDenseOnPolicyContracts(unittest.TestCase):
                 set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
                 get_global_server_args().enable_dp_lm_head = False
                 get_global_server_args().enable_fp32_lm_head = False
-                get_global_server_args().rl_on_policy_target = "fsdp"
+                get_global_server_args().true_on_policy_contract = QWEN3_DENSE_TRUE_ON_POLICY_V1
+                get_global_server_args().tp_size = 1
 
                 processor = LogitsProcessor(
                     SimpleNamespace(vocab_size=8, final_logit_softcapping=None),

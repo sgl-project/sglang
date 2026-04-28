@@ -84,6 +84,7 @@ from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.server_args import get_global_server_args
+from sglang.srt.true_on_policy import get_on_policy_rms_norm_kwargs
 from sglang.srt.utils import (
     add_prefix,
     cpu_has_amx_support,
@@ -618,14 +619,7 @@ class Qwen2MoeModel(nn.Module):
             prefix=add_prefix("layers", prefix),
         )
         if self.pp_group.is_last_rank:
-            norm_kwargs = (
-                dict(
-                    cast_x_before_out_mul=True,
-                    fp32_residual=False,
-                )
-                if get_global_server_args().rl_on_policy_target is not None
-                else {}
-            )
+            norm_kwargs = get_on_policy_rms_norm_kwargs(fp32_residual=False)
             self.norm = RMSNorm(
                 config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
             )
