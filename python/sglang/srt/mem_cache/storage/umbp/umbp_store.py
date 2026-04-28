@@ -258,6 +258,22 @@ class UMBPStore(HiCacheStorage):
                 extra["spdk_proxy_reserved_shared_bytes"]
             )
 
+        # Operator-controlled escape hatch for hosts whose RDMA NIC cannot
+        # register a single memory region as large as the full host KV buffer
+        # (e.g. AINIC has a per-MR size cap).  When set, skip the one-shot
+        # register_memory() call in register_mem_pool_host() and stay on the
+        # staging-buffer fallback path (each transfer copies through a
+        # staging_buffer_size-bounded MR that the IO engine pre-registers).
+        disable_zero_copy_register = extra.get(
+            "disable_zero_copy_register",
+            _optional_env_str("UMBP_DISABLE_ZERO_COPY_REGISTER"),
+        )
+        self._disable_zero_copy_register = (
+            _bool_from_any(disable_zero_copy_register)
+            if disable_zero_copy_register is not None
+            else False
+        )
+
         master_address = extra.get("master_address", _optional_env_str("UMBP_MASTER_ADDRESS"))
         if master_address and UMBPDistributedConfig is not None:
             dist_cfg = UMBPDistributedConfig()
@@ -658,6 +674,14 @@ class UMBPStore(HiCacheStorage):
         if not is_distributed:
             return
         if not hasattr(self.client, "register_memory"):
+            return
+        if getattr(self, "_disable_zero_copy_register", False):
+            logger.info(
+                "UMBPStore: skipping host KV buffer RDMA registration because "
+                "disable_zero_copy_register=true (UMBP_DISABLE_ZERO_COPY_REGISTER). "
+                "Falling back to the staging-buffer transfer path; per-transfer "
+                "size is capped by distributed.staging_buffer_size."
+            )
             return
         try:
             kv_buffer = mem_pool_host.kv_buffer
