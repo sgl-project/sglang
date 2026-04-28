@@ -50,7 +50,12 @@ class TestDeepSeekOCR(CustomTestCase):
     def tearDownClass(cls):
         """Fixture that is run once after all tests in the class."""
         if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
+            cls.process.terminate()
+            try:
+                cls.process.wait(timeout=30)
+            except Exception:
+                # Force kill if it didn't exit cleanly in time
+                kill_process_tree(cls.process.pid)
 
     def get_request_json(self, max_new_tokens=32, n=1):
         response = requests.post(
