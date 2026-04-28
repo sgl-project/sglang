@@ -932,20 +932,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
 
             if self.is_fp4_expert:
+                layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
+                layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
+
                 if get_moe_runner_backend().is_marlin():
-                    layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
-                    layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
-                elif not get_moe_runner_backend().is_flashinfer_mxfp4():
-                    raise NotImplementedError(
-                        "DeepSeekV4 FP4 experts now require a native FP4 MoE backend. "
-                        "Use `--moe-runner-backend marlin` on Hopper or "
-                        "`--moe-runner-backend flashinfer_mxfp4` when available."
-                    )
-
+                    pass  # Hopper w4a16: int8 view is sufficient
                 else:
-                    layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
-                    layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
-
                     if envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
                         from sglang.srt.models.deepseek_v4 import (
                             build_mega_moe_experts_weights,
