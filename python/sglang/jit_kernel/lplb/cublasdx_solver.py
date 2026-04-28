@@ -175,6 +175,13 @@ def _build_kernel(nc: int, nv: int, block_dim: int, num_iters: int):
             mm.execute(float32(1.0), ta, tb, float32(0.0), tc)
             cuda.syncthreads()
 
+            # 1c: regularize ata diagonal by 1e-6 (col-major NC×NC, [i,i] = i*NC+i).
+            # Mirrors the torch IPM reference; keeps Cholesky stable when x[k]
+            # values shrink and `ata` becomes near-singular in float32 noise.
+            for i in range(tid, nc, block_dim):
+                buf_C[i * nc + i] = buf_C[i * nc + i] + float32(1e-6)
+            cuda.syncthreads()
+
             # 2: rhs[i] = sum_k A[i,k] * x[k]^2 * c[k]  (Numba, small)
             for i in range(tid, nc, block_dim):
                 s = float32(0.0)
@@ -266,12 +273,24 @@ def _build_kernel(nc: int, nv: int, block_dim: int, num_iters: int):
             and (max_res < float32(0.05))
         )
 
-        if ok:
-            for j in range(tid, nv, block_dim):
-                x_out[j] = x_s[j]
-        else:
-            for j in range(tid, nv, block_dim):
+        # Per-element output sanitization. Each thread independently checks its
+        # x_s[j] for NaN / Inf / out-of-range and writes 0.5 if bad — even when
+        # `ok` is True, individual elements can still be NaN because the
+        # d_max / max_res reductions silently drop NaN inputs. Using libdevice
+        # math.isnan/math.isinf (verified in a unit test) avoids any compiler
+        # fold-away of the bare ``v != v`` idiom.
+        for j in range(tid, nv, block_dim):
+            v = x_s[j]
+            if (
+                (not ok)
+                or math.isnan(v)
+                or math.isinf(v)
+                or (v < float32(-1e-3))
+                or (v > float32(1e6))
+            ):
                 x_out[j] = float32(0.5)
+            else:
+                x_out[j] = v
 
     _kernel_cache[key] = (ipm_kernel, mm, chol, TOTAL_DYN)
     return ipm_kernel, mm, chol, TOTAL_DYN
@@ -317,7 +336,14 @@ def solve_ipm(
         _optin_dynamic_shmem(spec, dyn_shmem_bytes, A.device.index or 0)
         _spec_cache[key] = (spec, dyn_shmem_bytes, True)
 
-    spec[1, block_dim, 0, dyn_shmem_bytes](A_cu, b_cu, c_cu, x_cu)
+    # Launch on PyTorch's current stream so subsequent torch ops on x_out are
+    # ordered after the kernel write. PyTorch (sglang) uses per-thread default
+    # streams; Numba's bare `0` arg means CUDA's legacy default stream — the
+    # two are NOT auto-synchronized, so without this the caller can read x_out
+    # before the kernel finishes (manifesting as NaN/Inf garbage).
+    torch_stream_handle = torch.cuda.current_stream(A.device).cuda_stream
+    numba_stream = cuda.external_stream(torch_stream_handle)
+    spec[1, block_dim, numba_stream, dyn_shmem_bytes](A_cu, b_cu, c_cu, x_cu)
     return x_out
 
 
