@@ -1,11 +1,11 @@
 ---
 name: add-jit-kernel
-description: Step-by-step tutorial for adding a new lightweight JIT CUDA kernel to sglang's jit_kernel module
+description: Step-by-step tutorial for adding a new lightweight JIT kernel (CUDA or SYCL/XPU) to sglang's jit_kernel module
 ---
 
-# Tutorial: Adding a New JIT Kernel to SGLang
+# Tutorial: Adding a New JIT Kernel to SGLang (CUDA & SYCL/XPU)
 
-This tutorial walks through adding a simple element-wise scale operation as a JIT kernel. We'll implement `scale(x, factor) = x * factor` to demonstrate the complete workflow.
+This tutorial walks through adding a simple element-wise scale operation as a JIT kernel. We'll implement `scale(x, factor) = x * factor` to demonstrate the complete workflow for both CUDA and SYCL/XPU backends.
 
 ## Goal
 
@@ -22,6 +22,288 @@ Add a new operation that scales each element of a tensor by a scalar factor:
 - **Exception**: kernels that depend on `flashinfer`, or on CUTLASS that is already provided through `flashinfer`, can still be implemented as `jit_kernel`.
 
 ---
+
+## SYCL/XPU JIT Kernel Development
+
+This section covers **Intel XPU (GPU) kernel development using SYCL**. If you're implementing CUDA kernels, skip to the next section.
+
+### When to Add SYCL Support
+
+- **New kernels**: Implement CUDA version first, then add SYCL variant if XPU support is needed
+- **Existing kernels**: Add SYCL support when adding XPU backend compatibility
+- **File organization**: SYCL kernels live in `python/sglang/jit_kernel/csrc_sycl/` (not `csrc/`)
+
+### Critical SYCL Namespace Rules
+
+**⚠️ ALWAYS use `::sycl::` namespace for math functions on host-side code:**
+
+```cpp
+// ❌ WRONG - conflicts with SYCL iostream proxy
+const float result = std::log(value) * std::exp(other);
+
+// ✅ CORRECT - use SYCL math functions
+const float result = ::sycl::log(value) * ::sycl::exp(other);
+```
+
+**Why**: SYCL includes `<sycl/sycl.hpp>` which defines iostream proxies like `std::clog`. This causes namespace collisions with standard library math functions like `std::log()`.
+
+**Affected functions** (use `::sycl::` prefix for all):
+- `log`, `exp`, `sqrt`, `rsqrt`
+- `sin`, `cos`, `tan`
+- `pow`, `abs`, `min`, `max`
+- Any other math function from `<cmath>`
+
+**Device-side code**: Use `::sycl::` prefix consistently in kernels:
+
+```cpp
+void operator()(::sycl::nd_item<1> item) const {
+    // ✅ CORRECT
+    float freq = scale * t_val * ::sycl::exp(neg_log * index);
+    float cos_val = ::sycl::cos(freq);
+    float sin_val = ::sycl::sin(freq);
+}
+```
+
+### SYCL Kernel Structure
+
+**Basic template for a SYCL kernel:**
+
+```cpp
+#pragma once
+#include <sycl/sycl.hpp>
+
+namespace sgl {
+namespace sycl_kernel {
+
+// Kernel functor class
+template<typename T, bool SomeFlag>
+class MyKernel {
+public:
+    MyKernel(const T* in_ptr, T* out_ptr, int size)
+        : in_ptr_(in_ptr), out_ptr_(out_ptr), size_(size) {}
+    
+    void operator()(::sycl::nd_item<1> item) const {
+        const size_t idx = item.get_global_id(0);
+        if (idx >= static_cast<size_t>(size_)) return;
+        
+        // Kernel logic here
+        T value = in_ptr_[idx];
+        out_ptr_[idx] = value * static_cast<T>(2.0f);
+    }
+
+private:
+    const T* in_ptr_;
+    T* out_ptr_;
+    int size_;
+};
+
+// Host launcher function
+template<typename T, bool SomeFlag = false>
+void launch_my_kernel(
+    ::sycl::queue& queue,
+    const void* input,
+    void* output,
+    int size
+) {
+    const T* in_ptr = static_cast<const T*>(input);
+    T* out_ptr = static_cast<T*>(output);
+    
+    const size_t threads_per_group = 256;
+    const size_t num_groups = (size + threads_per_group - 1) / threads_per_group;
+    
+    queue.submit([&](::sycl::handler& cgh) {
+        cgh.parallel_for(
+            ::sycl::nd_range<1>(
+                ::sycl::range<1>(num_groups * threads_per_group),
+                ::sycl::range<1>(threads_per_group)
+            ),
+            MyKernel<T, SomeFlag>(in_ptr, out_ptr, size)
+        );
+    }).wait();  // Remove .wait() if async execution is desired
+}
+
+// Export C API for TVM FFI
+extern "C" {
+
+void my_kernel_fp16(void* queue_ptr, const void* input, void* output, int size) {
+    auto& queue = *static_cast<::sycl::queue*>(queue_ptr);
+    using T = ::sycl::half;  // or sycl::ext::oneapi::bfloat16 for bf16
+    launch_my_kernel<T>(queue, input, output, size);
+}
+
+void my_kernel_fp32(void* queue_ptr, const void* input, void* output, int size) {
+    auto& queue = *static_cast<::sycl::queue*>(queue_ptr);
+    launch_my_kernel<float>(queue, input, output, size);
+}
+
+}  // extern "C"
+
+}  // namespace sycl_kernel
+}  // namespace sgl
+```
+
+### SYCL vs CUDA API Mapping
+
+| CUDA | SYCL | Notes |
+|------|------|-------|
+| `threadIdx.x` | `item.get_local_id(0)` | Thread index within work-group |
+| `blockIdx.x` | `item.get_group(0)` | Work-group index |
+| `blockDim.x` | `item.get_local_range(0)` | Work-group size |
+| `gridDim.x` | `item.get_group_range(0)` | Number of work-groups |
+| `__global__` | Class with `operator()` | Kernel functor |
+| `__device__` | Regular function | No special qualifier needed |
+| `__shared__` | `::sycl::local_accessor` | Requires handler setup |
+| `__syncthreads()` | `item.barrier()` | Work-group barrier |
+
+### Thread Indexing Utilities
+
+**Create a helper header** `python/sglang/jit_kernel/csrc_sycl/utils.hpp`:
+
+```cpp
+#pragma once
+#include <sycl/sycl.hpp>
+
+namespace sgl {
+namespace sycl_kernel {
+
+// Thread index helpers matching CUDA style
+template<int Dim = 0>
+inline size_t threadIdx(const ::sycl::nd_item<1>& item) {
+    static_assert(Dim == 0, "Only Dim=0 supported for 1D kernels");
+    return item.get_local_id(0);
+}
+
+template<int Dim = 0>
+inline size_t blockIdx(const ::sycl::nd_item<1>& item) {
+    static_assert(Dim == 0, "Only Dim=0 supported for 1D kernels");
+    return item.get_group(0);
+}
+
+template<int Dim = 0>
+inline size_t blockDim(const ::sycl::nd_item<1>& item) {
+    static_assert(Dim == 0, "Only Dim=0 supported for 1D kernels");
+    return item.get_local_range(0);
+}
+
+}  // namespace sycl_kernel
+}  // namespace sgl
+```
+
+### Python Integration (`utils_xpu.py`)
+
+**Load and cache SYCL modules:**
+
+```python
+from sglang.jit_kernel.utils_xpu import load_jit_sycl
+from sglang.jit_kernel.decorators import cache_once
+
+@cache_once
+def _jit_my_kernel_module_xpu(dtype: torch.dtype):
+    """JIT compile SYCL kernel for XPU"""
+    dtype_map = {
+        torch.float32: "fp32",
+        torch.float16: "fp16",
+        torch.bfloat16: "bf16",
+    }
+    
+    if dtype not in dtype_map:
+        raise ValueError(f"Unsupported dtype for XPU: {dtype}")
+    
+    dtype_str = dtype_map[dtype]
+    
+    # Load SYCL module - compiles on first call, cached on disk thereafter
+    module = load_jit_sycl(
+        "my_kernel",  # Unique module identifier
+        dtype_str,
+        sycl_files=["my_kernel.hpp"],  # Relative to csrc_sycl/
+    )
+    
+    # Return wrapper matching CUDA API
+    class XPUMyKernelWrapper:
+        def __init__(self, module, dtype_str):
+            self._module = module
+            self._func_name = f"my_kernel_{dtype_str}"
+        
+        def __call__(self, input, output, size):
+            # Get SYCL queue from tensor device
+            queue = torch.xpu.current_stream(input.device).sycl_queue
+            
+            # Call exported C function
+            func = getattr(self._module, self._func_name)
+            func(queue, input.data_ptr(), output.data_ptr(), size)
+    
+    return XPUMyKernelWrapper(module, dtype_str)
+```
+
+### Testing and Fallback
+
+**Always implement graceful fallback** to PyTorch when JIT fails:
+
+```python
+def my_kernel(input: torch.Tensor) -> torch.Tensor:
+    """My kernel with XPU support and PyTorch fallback"""
+    output = torch.empty_like(input)
+    
+    if input.device.type == "xpu":
+        try:
+            module = _jit_my_kernel_module_xpu(input.dtype)
+            module(input, output, input.numel())
+            return output
+        except Exception as e:
+            logger.warning(f"XPU JIT failed, falling back to PyTorch: {e}")
+            # Fall through to PyTorch implementation
+    
+    # PyTorch reference implementation
+    return input * 2.0
+```
+
+### Common SYCL Pitfalls
+
+1. **Host-side math namespace**: Always use `::sycl::log()` not `std::log()` (see above)
+2. **No `.wait()` in async code**: Remove `.wait()` from `queue.submit()` for async execution
+3. **Pointer casts**: Use explicit `static_cast<T*>()` for void pointers
+4. **Include guards**: Always use `#pragma once` in SYCL headers
+5. **Compilation cache**: SYCL kernels compile on first use and cache to `~/.cache/sglang/jit_sycl/`
+6. **ABI compatibility**: Ensure PyTorch XPU and oneAPI versions match for runtime loading
+
+### SYCL Compilation Process
+
+The JIT compilation flow:
+
+1. **Source files**: `python/sglang/jit_kernel/csrc_sycl/*.hpp`
+2. **Compiler**: `icpx` from Intel oneAPI toolkit (must be in PATH)
+3. **Compilation flags**: See `utils_xpu.py:DEFAULT_SYCL_CFLAGS`
+4. **Cache key**: Hash of (sources + flags + compiler version)
+5. **Output**: Shared library `.so` in `~/.cache/sglang/jit_sycl/`
+6. **Loading**: Python wrapper loads `.so` and calls exported C functions
+
+**Debugging compilation failures:**
+
+```python
+# Set environment variable to see full icpx command
+import os
+os.environ['SGLANG_JIT_VERBOSE'] = '1'
+
+# Check compilation errors in exception message
+try:
+    module = load_jit_sycl(...)
+except RuntimeError as e:
+    print(e)  # Shows full icpx stderr output
+```
+
+### XPU-Specific Considerations
+
+- **Lower precision tolerance**: XPU math functions may have slightly different precision than CUDA
+  - Use `atol=1e-2, rtol=1e-2` instead of `1e-3` in tests
+- **Device detection**: Check `torch.xpu.is_available()` and `torch.xpu.device_count()`
+- **Memory alignment**: Same 128-byte alignment as CUDA for optimal performance
+- **Compilation time**: First compile takes 60-120 seconds; subsequent runs use cached `.so`
+
+---
+
+## CUDA JIT Kernel Development
+
+This section covers CUDA kernel development. For SYCL/XPU kernels, see the section above.
 
 ## Common Abstractions in `python/sglang/jit_kernel/include/sgl_kernel/`
 
