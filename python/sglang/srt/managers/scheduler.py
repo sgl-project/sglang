@@ -892,12 +892,8 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            # Always allocate the spec hidden buffer at full size so the
-            # decode side aligns with prefill regardless of which side
-            # actually runs the spec module (asymmetric P/D). When neither
-            # side runs spec the buffer is unused but the allocation cost
-            # is bounded (~few MB) and the alternative would be a wire
-            # protocol mismatch in asymmetric configs.
+            # Full-size buffer on both sides so the wire layout aligns
+            # under asymmetric P/D where one side may not run spec.
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=model_config.spec_hidden_size,
@@ -944,11 +940,8 @@ class Scheduler(
             self.req_to_metadata_buffer_idx_allocator = ReqToMetadataIdxAllocator(
                 buffer_size
             )
-            # Always allocate the spec hidden buffer at full size; see the
-            # matching comment on the decode branch above. When prefill has
-            # no spec module of its own, the buffer stays zero-initialized
-            # and decode treats it as mock conditioning for the first draft
-            # step (verified spec keeps the output token correct).
+            # See decode branch above. Asymmetric P/D: prefill without a
+            # spec module ships zeros, decode mocks first-step conditioning.
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=model_config.spec_hidden_size,

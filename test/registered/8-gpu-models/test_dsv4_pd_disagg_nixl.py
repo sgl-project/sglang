@@ -1,24 +1,7 @@
-"""DSv4 Flash PD-disaggregation test with NIXL transfer backend.
-
-Asymmetric P/D config: prefill runs no spec module, decode runs EAGLE
-MTP. The metadata hidden-state buffer is allocated at full
-spec_hidden_size on both sides unconditionally; prefill has no draft
-model to populate it, so the wire data stays zero, and decode treats
-the zeros as mock conditioning for the first draft step. Verified
-spec decoding makes those bad drafts get rejected by target; from
-iteration 2 onward, real target hidden flows through normally.
-Amortized cost is ~1 wasted draft step per request, < 1% throughput
-hit on long generations.
-
-Topology (1 H200 node, 8 GPUs total):
-  - Prefill: GPU 0-3, tp=4 — pure TP, no EP (no deepep), no DP
-    attention, no draft model. Optimized for prompt-side throughput.
-  - Decode:  GPU 4-7, tp=4 dp=4 enable-dp-attention + deepep + EAGLE
-    MTP — optimized for low-latency decode.
-  - Mini load balancer fronting both.
-
-Both sides use DSv4 Flash FP8 weights. Transfer backend is NIXL.
-"""
+"""DSv4 Flash PD-disagg with NIXL backend, asymmetric: prefill is pure
+TP with no spec module, decode runs EAGLE MTP. Prefill ships a zero-
+init hidden buffer; decode mocks first-step conditioning, verify keeps
+the output correct."""
 
 import unittest
 from types import SimpleNamespace
@@ -40,9 +23,7 @@ DSV4_FLASH_MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
 
 DSV4_FLASH_ENV = {
     "SGLANG_DSV4_FP4_EXPERTS": "0",
-    # Decode side runs MTP with num_draft_tokens=4 → dispatch input scales
-    # by ~4x, so default 256 overflows once cuda-graph-max-bs * draft > 256.
-    # 1024 covers bs=128 * 4 with headroom (no-op on prefill which has no EP).
+    # MTP num_draft_tokens=4 scales dispatch by ~4x; 256 overflows at bs=128.
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
     "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
 }
@@ -67,10 +48,6 @@ class TestDSv4FlashPDDisaggNIXL(PDDisaggregationServerBase):
 
     @classmethod
     def start_prefill(cls):
-        # Prefill: TP=4, no EP, no DP attention, no spec module. The
-        # metadata hidden-state buffer is sized to spec_hidden_size on
-        # both sides automatically (see scheduler.py), so no flag tells
-        # prefill about the decode-side spec config.
         prefill_args = [
             "--trust-remote-code",
             "--disaggregation-mode",
@@ -102,7 +79,6 @@ class TestDSv4FlashPDDisaggNIXL(PDDisaggregationServerBase):
 
     @classmethod
     def start_decode(cls):
-        # Decode: TP=4 + DP=4 attention + deepep EP + EAGLE MTP.
         decode_args = [
             "--trust-remote-code",
             "--disaggregation-mode",
