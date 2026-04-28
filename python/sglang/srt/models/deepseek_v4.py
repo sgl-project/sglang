@@ -825,9 +825,6 @@ class MQALayer(nn.Module):
         debug_return_kv: bool = False,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
-            assert (
-                not self.wo_b.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
             return x
 
         attn_backend = forward_batch.attn_backend
