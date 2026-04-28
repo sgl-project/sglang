@@ -25,6 +25,7 @@ from transformers import (
 )
 
 from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
 from sglang.srt.layers.gemma4_fused_ops import gemma_rmsnorm_residual_scalar
@@ -1028,11 +1029,27 @@ class Gemma4ForCausalLM(PreTrainedModel):
                     logger.log(level, "%s: %s", msg, names)
         return loaded_params
 
+    def _shard_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        """Shard a full embedding/lm_head weight along vocab dim for the current TP rank.
+
+        Gemma4 uses nn.Embedding (unsharded) but the Eagle3 draft model uses
+        VocabParallelEmbedding (sharded). This method extracts the correct
+        shard so the weights can be shared.
+        """
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size <= 1:
+            return weight
+        tp_rank = get_tensor_model_parallel_rank()
+        shard_size = (weight.shape[0] + tp_size - 1) // tp_size
+        return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
+
     def get_embed(self):
-        return self.model.embed_tokens.weight
+        return self._shard_weight(self.model.embed_tokens.weight)
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        embed = self._shard_weight(self.model.embed_tokens.weight)
+        head = self._shard_weight(self.lm_head.weight)
+        return embed, head
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if layer_ids is None:

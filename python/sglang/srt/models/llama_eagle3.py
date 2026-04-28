@@ -47,16 +47,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        additional_fc: bool = False,
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
 
-        self.additional_fc = additional_fc
-
-        # override qkv input size based on additional_fc
-        qkv_input_size = self.hidden_size if additional_fc else 2 * self.hidden_size
         self.self_attn.qkv_proj = QKVParallelLinear(
-            qkv_input_size,
+            2 * self.hidden_size,
             self.self_attn.head_dim,
             self.self_attn.total_num_heads,
             self.self_attn.total_num_kv_heads,
@@ -76,9 +71,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        if additional_fc:
-            self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -92,11 +84,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.hidden_norm(hidden_states)
 
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
-
-        # Optional fc to project 2*H -> H before attention
-        if self.additional_fc:
-            hidden_states = self.fc(hidden_states)
-
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
@@ -168,13 +155,7 @@ class LlamaModel(nn.Module):
             bias=getattr(config, "bias", False),
         )
 
-        # Aquila-style additional_fc: project concatenated [emb, hidden] (2*H) -> H
-        # before attention, instead of feeding 2*H directly into QKV.
-        self.additional_fc = getattr(config, "additional_fc", False)
-
-        self.midlayer = LlamaDecoderLayer(
-            config, 0, quant_config, prefix, additional_fc=self.additional_fc
-        )
+        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -221,7 +202,7 @@ class LlamaModel(nn.Module):
             hidden_states = torch.cat((h_low, h_mid, h_high), dim=-1)
             hidden_states = self.fc(hidden_states)
         elif hidden_states.shape[-1] != embeds.shape[-1]:
-            # Fallback for other sizes (shouldn't happen in normal flow)
+            # Fallback for other sizes
             hidden_states = self.fc(hidden_states)
 
         # idle batch

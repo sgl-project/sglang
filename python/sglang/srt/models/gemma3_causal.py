@@ -24,7 +24,10 @@ from transformers import (
     PreTrainedModel,
 )
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
+from sglang.srt.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from sglang.srt.layers.activation import GeluAndMul
 from sglang.srt.layers.layernorm import Gemma3RMSNorm
 from sglang.srt.layers.linear import (
@@ -902,11 +905,27 @@ class Gemma3ForCausalLM(PreTrainedModel):
             # of the (i-1)th layer as aux hidden state
             self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def _shard_weight(self, weight: torch.Tensor) -> torch.Tensor:
+        """Shard a full embedding/lm_head weight along vocab dim for the current TP rank.
+
+        Gemma3 uses nn.Embedding (unsharded) but the Eagle3 draft model uses
+        VocabParallelEmbedding (sharded). This method extracts the correct
+        shard so the weights can be shared.
+        """
+        tp_size = get_tensor_model_parallel_world_size()
+        if tp_size <= 1:
+            return weight
+        tp_rank = get_tensor_model_parallel_rank()
+        shard_size = (weight.shape[0] + tp_size - 1) // tp_size
+        return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
+
     def get_embed(self):
-        return self.model.embed_tokens.weight
+        return self._shard_weight(self.model.embed_tokens.weight)
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        embed = self._shard_weight(self.model.embed_tokens.weight)
+        head = self._shard_weight(self.lm_head.weight)
+        return embed, head
 
 
 EntryClass = Gemma3ForCausalLM
