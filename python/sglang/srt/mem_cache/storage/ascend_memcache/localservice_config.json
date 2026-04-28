@@ -1,5 +1,5 @@
 {
-    "protocol": "device_rdma",
+    "protocol": "host_tcp",
     "dram_size": "10GB",
     "max_dram_size": "64GB",
     "device_id": 0,
