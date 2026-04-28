@@ -19,7 +19,10 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
+    fp8_native_block_mean_pooling_grouped_interface,
+    fp8_native_block_mean_pooling_interface,
     fp8_native_paged_mean_pooling_tail_only_v3_interface,
+    pool_mqa_attn_return_logits_fp8_interface,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
     batch_decode_pool_mqa_v3_triton,
@@ -217,24 +220,39 @@ def fp8_native_hierarchy_mqa_logits_triton(
         )
         k_scales = k_scales.squeeze(1)
 
-    # 1) Mean-pool ragged K → [num_pool, D] fp8 + [num_pool] f32 scale.
-    blocked_k_fp8, blocked_k_scale = block_mean_pooling_triton(
-        k_fp8=k_fp8, k_scale=k_scales, k_block_size=k_block_size,
-    )
+    # 1) Mean-pool ragged K → tilelang. Bench (test_grouped_mean_pool.py) shows
+    # tilelang stage 1 is 1.8x faster than the triton equivalent at all K
+    # (8..128) due to lower per-launch Python overhead (~9μs vs triton's
+    # ~24μs). The vanilla tilelang kernel has a boundary OOB at K<block_N=64,
+    # so we route those to the bounds-safe grouped variant.
+    if k_block_size < 64:
+        blocked_k_fp8, blocked_k_scale = fp8_native_block_mean_pooling_grouped_interface(
+            k_fp8, k_scales, k_block_size,
+        )
+    else:
+        blocked_k_fp8, blocked_k_scale = fp8_native_block_mean_pooling_interface(
+            k_fp8, k_scales, k_block_size,
+        )
 
-    # 2) Block-MQA on blocked_k → [seq, num_pool] f32 (with -inf/+inf masks).
-    # Pass raw token-space cu_seqlen + k_block_size; the kernel divides
-    # internally so we avoid 3-4 host-side PyTorch elementwise launches
-    # (floor_divide × 2, add, optional .to(int32)) that otherwise add
-    # ~30-50μs to the orchestrator at small sq.
-    block_k_indexer_score = ragged_pool_mqa_triton(
+    # 2) Block-MQA on blocked_k → tilelang. Per-stage A/B (test_stage2_ab.py)
+    # shows tilelang's pool_mqa_attn_return_logits_fp8 is 1.6x faster than
+    # ragged_pool_mqa_triton at all K (18.6μs vs 29.7μs wall-time): tilelang
+    # has lower launch overhead AND its [ks_min, ke_max] union skip + clean+
+    # maintain-as-separate-launch combination beats the triton fused mask
+    # approach end-to-end. Tilelang takes blocked cu_seqlen, so we have to
+    # add back 3 host-side PyTorch launches (~5-6μs cost) — net still ~7μs
+    # positive per orchestrator call. Refactor TODO: move ``// K`` into the
+    # tilelang kernel via a K_BLOCK_SIZE param to recover those.
+    cu_seqlen_blocked_ks = cu_seqlen_ks // k_block_size
+    cu_seqlen_blocked_ke = (cu_seqlen_ke + k_block_size - 1) // k_block_size
+    block_k_indexer_score = pool_mqa_attn_return_logits_fp8_interface(
         q_fp8=q_fp8,
-        blocked_k_fp8=blocked_k_fp8,
-        blocked_k_scale=blocked_k_scale,
-        weights=weights,
-        cu_seqlen_ks=cu_seqlen_ks,
-        cu_seqlen_ke=cu_seqlen_ke,
-        k_block_size=k_block_size,
+        blocked_kv_fp8=blocked_k_fp8,
+        blocked_kv_scale=blocked_k_scale,
+        kv_block_size=k_block_size,
+        weights_f32=weights,
+        cu_seqlen_blocked_ks=cu_seqlen_blocked_ks,
+        cu_seqlen_blocked_ke=cu_seqlen_blocked_ke,
     )
 
     # 3) Top-k over pool blocks. bf16 + sorted=False matches the tilelang

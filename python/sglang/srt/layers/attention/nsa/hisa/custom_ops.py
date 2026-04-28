@@ -613,6 +613,152 @@ def fp8_native_block_mean_pooling_interface(k, k_scale, k_block_size):
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
+def fp8_native_block_mean_pooling_grouped(
+    max_num_pooling_blocks: int,
+    pooling_block_size: int,   # K, must divide block_N
+    dim: int,
+    block_N: int = 64,
+    threads: int = 256,
+):
+    """Grouped variant of ``fp8_native_block_mean_pooling`` for K < block_N.
+
+    The non-grouped kernel does ``T.copy(K[s:s+block_N=64], ...)`` per pool
+    block, which over-reads ``block_N - K`` rows past each pool block end —
+    fine inside the K tensor body, but at the last few pool blocks it walks
+    off the end of ``seq_len_k`` and (under sustained load) eventually hits
+    an unmapped page → Xid 13 → silent crash.
+
+    This grouped variant flips the parallelism: one CTA per ``block_N``
+    tokens, producing ``G = block_N // K`` pool blocks. The ``T.copy``
+    reads exactly ``block_N`` rows that all live within seq_len_k except
+    possibly at the very last CTA, which we handle with a row-guard
+    (``T.Parallel`` + Python ``if``) instead of bulk T.copy.
+
+    Constraint: ``block_N % pooling_block_size == 0``. Use the non-grouped
+    variant when ``K >= block_N``.
+    """
+    assert block_N % pooling_block_size == 0, (
+        f"block_N ({block_N}) must be divisible by "
+        f"pooling_block_size ({pooling_block_size})"
+    )
+    G = block_N // pooling_block_size
+
+    dtype = T.float8_e4m3fn
+    accum_dtype = T.float32
+    seq_len_k = T.dynamic("seq_len_k")
+    FP8_MAX_INV = 1.0 / 448.0
+
+    @T.prim_func
+    def fp8_native_block_mean_pooling_grouped_kernel(
+        K: T.Tensor([seq_len_k, dim], dtype=dtype),                            # type: ignore
+        KScale: T.Tensor([seq_len_k], dtype=accum_dtype),                       # type: ignore
+        BlockedK: T.Tensor([max_num_pooling_blocks, dim], dtype=dtype),         # type: ignore
+        BlockedKScale: T.Tensor([max_num_pooling_blocks], dtype=accum_dtype),   # type: ignore
+    ):
+        # Grid: one CTA per block_N tokens (= G pool blocks).
+        with T.Kernel(T.ceildiv(seq_len_k, block_N), threads=threads) as bx:
+            index_k = T.alloc_fragment([block_N, dim], accum_dtype)
+            scale = T.alloc_fragment([block_N], accum_dtype)
+            acc_per_pool = T.alloc_fragment([G, dim], accum_dtype)
+            max_abs_per_pool = T.alloc_fragment([G], accum_dtype)
+
+            tl_block_s = bx * block_N
+            cur_block_size = T.min(tl_block_s + block_N, seq_len_k) - tl_block_s
+
+            # Bounds-safe row-by-row load. Avoids the OOB pattern of the
+            # non-grouped kernel's bulk ``T.copy``. Slightly slower per-CTA
+            # (no TMA), but only one CTA per block_N tokens vs one per pool
+            # block, so total launches drop by G.
+            T.fill(scale, 0.0)
+            T.fill(index_k, 0.0)
+            for bn_i in T.Parallel(block_N):
+                if bn_i < cur_block_size:
+                    scale[bn_i] = KScale[tl_block_s + bn_i]
+            for bn_i, d_i in T.Parallel(block_N, dim):
+                if bn_i < cur_block_size:
+                    index_k[bn_i, d_i] = (
+                        T.cast(K[tl_block_s + bn_i, d_i], accum_dtype)
+                        * scale[bn_i]
+                    )
+
+            # Per-pool sum: build a [G, K, dim] view of index_k and reduce
+            # along axis 1. The intermediate fragment costs an extra register
+            # tile but lets tilelang's IR pattern-match a clean reduction
+            # (avoiding the non-unit-stride / "k_i used before def" pitfalls
+            # of a manual nested-loop accumulator).
+            gk_view = T.alloc_fragment([G, pooling_block_size, dim], accum_dtype)
+            for g_i, k_inner, d_i in T.Parallel(G, pooling_block_size, dim):
+                gk_view[g_i, k_inner, d_i] = index_k[
+                    g_i * pooling_block_size + k_inner, d_i
+                ]
+            T.reduce_sum(gk_view, acc_per_pool, dim=1, clear=True)
+
+            # Per-pool mean: divide by actual valid token count (handles the
+            # partial trailing pool block when seq_len_k isn't a multiple of
+            # K). ``T.if_then_else`` guards the divide-by-zero case for pool
+            # blocks that fall entirely past seq_len_k (they will be masked
+            # out at store time anyway).
+            for g_i, d_i in T.Parallel(G, dim):
+                pool_start = tl_block_s + g_i * pooling_block_size
+                pool_end_c = T.min(pool_start + pooling_block_size, seq_len_k)
+                pc = pool_end_c - pool_start
+                inv_count = T.if_then_else(
+                    pc > 0,
+                    T.cast(1.0, accum_dtype) / T.cast(pc, accum_dtype),
+                    T.cast(0.0, accum_dtype),
+                )
+                acc_per_pool[g_i, d_i] = acc_per_pool[g_i, d_i] * inv_count
+
+            # Per-pool fp8 max-abs scale.
+            T.reduce_absmax(acc_per_pool, max_abs_per_pool, dim=1, clear=True)
+
+            # Quantize + masked store: skip pool blocks past num_pool_total
+            # (last CTA's trailing slots).
+            for g_i, d_i in T.Parallel(G, dim):
+                out_idx = bx * G + g_i
+                if out_idx < max_num_pooling_blocks:
+                    bs = T.max(
+                        max_abs_per_pool[g_i] * T.cast(FP8_MAX_INV, accum_dtype),
+                        T.cast(1e-10, accum_dtype),
+                    )
+                    BlockedK[out_idx, d_i] = T.cast(
+                        acc_per_pool[g_i, d_i] / bs, dtype,
+                    )
+            for g_i in T.Parallel(G):
+                out_idx = bx * G + g_i
+                if out_idx < max_num_pooling_blocks:
+                    bs = T.max(
+                        max_abs_per_pool[g_i] * T.cast(FP8_MAX_INV, accum_dtype),
+                        T.cast(1e-10, accum_dtype),
+                    )
+                    BlockedKScale[out_idx] = bs
+
+    return fp8_native_block_mean_pooling_grouped_kernel
+
+
+def fp8_native_block_mean_pooling_grouped_interface(k, k_scale, k_block_size, block_N=64):
+    """Tilelang grouped mean-pool for K < block_N. Same I/O contract as
+    ``fp8_native_block_mean_pooling_interface``."""
+    seq_len_k, d = k.shape
+    max_num_pooling_blocks = (seq_len_k + k_block_size - 1) // k_block_size
+
+    blocked_k = torch.empty((max_num_pooling_blocks, d), device=k.device, dtype=torch.float8_e4m3fn)
+    blocked_k_scale = torch.empty((max_num_pooling_blocks,), device=k.device, dtype=torch.float32)
+    kernel = fp8_native_block_mean_pooling_grouped(
+        max_num_pooling_blocks=max_num_pooling_blocks,
+        pooling_block_size=k_block_size,
+        dim=d,
+        block_N=block_N,
+    )
+    kernel(k, k_scale, blocked_k, blocked_k_scale)
+    return blocked_k, blocked_k_scale
+
+
+@tilelang.jit(
+    pass_configs={
+        tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+    },
+)
 def pool_mqa_attn_return_logits_fp8(
     heads,
     index_dim,
