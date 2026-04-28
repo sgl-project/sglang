@@ -40,8 +40,13 @@ Environment variables (override defaults):
   PREFILL_PORT              Prefill server port (default: 30000)
   DECODE_HOST               Decode server bind address (default: 0.0.0.0)
   DECODE_PORT               Decode server port (default: 30001)
-  PREFILL_URL               Full URL to prefill server (decode needs this,
-                            e.g. http://10.0.0.1:30000)
+  PREFILL_URLS              Space-separated prefill URLs for multi-prefill
+                            (xP1D), e.g.
+                            "http://10.0.0.1:30000 http://10.0.0.2:30000".
+                            Used by the decode node to fan out --prefill flags
+                            to sglang_router. MUST use spaces, not commas.
+  PREFILL_URL               [DEPRECATED] Single-prefill shortcut for 1P1D
+                            (back-compat). Folded into PREFILL_URLS if set.
 
   # Router (decode node only)
   ENABLE_ROUTER             Auto-start router on decode node (default: true)
@@ -71,8 +76,12 @@ Examples:
   # Prefill node with all cache tiers:
   ./run_pd_disagg_bench_dp8ep8.sh --role prefill
 
-  # Decode node, connecting to prefill at 10.0.0.1:
+  # Decode node (1P1D), connecting to prefill at 10.0.0.1:
   PREFILL_URL=http://10.0.0.1:30000 \\
+    ./run_pd_disagg_bench_dp8ep8.sh --role decode
+
+  # Decode node (2P1D), router fans out to two prefill servers:
+  PREFILL_URLS="http://10.0.0.1:30000 http://10.0.0.2:30000" \\
     ./run_pd_disagg_bench_dp8ep8.sh --role decode
 
   # Prefill node, HBM only (no tiered cache):
@@ -120,6 +129,14 @@ PREFILL_PORT="${PREFILL_PORT:-30000}"
 DECODE_HOST="${DECODE_HOST:-0.0.0.0}"
 DECODE_PORT="${DECODE_PORT:-30001}"
 PREFILL_URL="${PREFILL_URL:-}"
+# Multi-prefill (xP1D) endpoints. Space-separated list, used by the decode
+# node to fan out --prefill flags to sglang_router. PREFILL_URL is kept for
+# back-compat with single-prefill (1P1D) callers and is folded in here.
+# DEPRECATED: PREFILL_URL kept for back-compat, prefer PREFILL_URLS.
+# NOTE: do not call `read -a` at top-level; under `set -e`, an empty value
+# (the prefill-role normal case) can abort the script before role dispatch.
+# The array is parsed lazily inside the decode branch.
+PREFILL_URLS="${PREFILL_URLS:-${PREFILL_URL:-}}"
 
 # Router (decode node only)
 ENABLE_ROUTER="${ENABLE_ROUTER:-true}"
@@ -634,7 +651,17 @@ if [[ "$PD_ROLE" == "prefill" ]]; then
     log "  Bind:        ${PREFILL_HOST}:${PREFILL_PORT}"
 else
     log "  Bind:        ${DECODE_HOST}:${DECODE_PORT}"
-    log "  Prefill URL: ${PREFILL_URL:-<not set>}"
+    if [[ -z "$PREFILL_URLS" ]]; then
+        log "  Prefill URLs: <not set>"
+    else
+        # Word-split in a subshell so set -e / outer $@ are untouched.
+        _count=$(set -- $PREFILL_URLS; echo $#)
+        log "  Prefill URLs: ${_count} node(s)"
+        for url in $PREFILL_URLS; do
+            log "    - $url (bootstrap=${DISAGG_BOOTSTRAP_PORT})"
+        done
+        unset _count
+    fi
     log "  Router:      $(bool_is_true "$ENABLE_ROUTER" && echo "enabled (port $ROUTER_PORT)" || echo "disabled")"
     log "  Max running: $MAX_RUNNING_REQUESTS"
 fi
@@ -748,24 +775,58 @@ if [[ "$PD_ROLE" == "decode" ]]; then
     mkdir -p "$CASE_DIR"
     SERVER_LOG="${CASE_DIR}/server_decode.log"
 
-    # Validate PREFILL_URL
-    if [[ -z "$PREFILL_URL" ]]; then
-        log "ERROR: PREFILL_URL must be set for decode node (e.g. PREFILL_URL=http://10.0.0.1:30000)"
+    # Validate PREFILL_URLS (decode role only).
+    if [[ -z "$PREFILL_URLS" ]]; then
+        log "ERROR: PREFILL_URLS (or PREFILL_URL) must be set for decode node"
+        log "  e.g. PREFILL_URLS=\"http://10.0.0.1:30000 http://10.0.0.2:30000\""
+        exit 1
+    fi
+    # Reject comma-separated form up front; the router would otherwise see
+    # one bogus URL and fail with a confusing connection error.
+    if [[ "$PREFILL_URLS" == *","* ]]; then
+        log "ERROR: PREFILL_URLS must be SPACE-separated, got commas: '$PREFILL_URLS'"
+        log "  Correct form: PREFILL_URLS=\"http://p1:30000 http://p2:30000\""
+        exit 1
+    fi
+    # Parse into array. `|| true` shields `read`'s EOF non-zero from set -e.
+    read -r -a PREFILL_URLS_ARR <<< "$PREFILL_URLS" || true
+    if (( ${#PREFILL_URLS_ARR[@]} == 0 )); then
+        log "ERROR: PREFILL_URLS parsed to 0 entries: '$PREFILL_URLS'"
         exit 1
     fi
 
-    # Extract prefill host/port from URL for TCP check
-    PREFILL_CHECK_HOST="$(echo "$PREFILL_URL" | sed -E 's|https?://||; s|:[0-9]+$||; s|/.*||')"
-    PREFILL_CHECK_PORT="$(echo "$PREFILL_URL" | sed -E 's|.*:([0-9]+).*|\1|')"
+    # Probe all prefill servers in parallel so wall-clock is max(timeout)
+    # instead of sum(timeout). Failures are collected via tmp marker files
+    # because subshell exit codes are unreliable under set -e.
+    log "Probing ${#PREFILL_URLS_ARR[@]} prefill server(s) in parallel..."
+    _probe_dir="$(mktemp -d)"
+    declare -a _probe_pids=()
+    for url in "${PREFILL_URLS_ARR[@]}"; do
+        host="$(echo "$url" | sed -E 's|https?://||; s|:[0-9]+$||; s|/.*||')"
+        port="$(echo "$url" | sed -E 's|.*:([0-9]+).*|\1|')"
+        (
+            if wait_for_tcp "$host" "$port" "$PREFILL_WAIT_TIMEOUT" "Prefill ${url}"; then
+                :
+            else
+                # Sanitize url to a safe filename.
+                echo "$url" > "${_probe_dir}/$(echo "$url" | tr '/:' '__').fail"
+            fi
+        ) &
+        _probe_pids+=( "$!" )
+    done
+    for pid in "${_probe_pids[@]}"; do wait "$pid" || true; done
 
-    log "Waiting for prefill server at ${PREFILL_CHECK_HOST}:${PREFILL_CHECK_PORT}..."
-    if ! wait_for_tcp "$PREFILL_CHECK_HOST" "$PREFILL_CHECK_PORT" "$PREFILL_WAIT_TIMEOUT" "Prefill server"; then
-        log "FATAL: Prefill server not reachable. Start prefill node first."
-        echo "FAILED (prefill not reachable)" >> "$SUMMARY_FILE"
+    if compgen -G "${_probe_dir}/*.fail" > /dev/null; then
+        for f in "${_probe_dir}"/*.fail; do
+            log "FATAL: Prefill $(cat "$f") not reachable."
+            echo "FAILED (prefill $(cat "$f") not reachable)" >> "$SUMMARY_FILE"
+        done
+        rm -rf "$_probe_dir"
         kill_master
         exit 1
     fi
-    log "Prefill server is reachable."
+    rm -rf "$_probe_dir"
+    log "All ${#PREFILL_URLS_ARR[@]} prefill server(s) reachable."
 
     log "Launching decode server..."
     launch_pd_server decode "$DECODE_HOST" "$DECODE_PORT" \
@@ -793,16 +854,22 @@ if [[ "$PD_ROLE" == "decode" ]]; then
         # /generate (which is running 2048-token forwards).  Bump timeout to
         # 120s and failure threshold to 20 so legitimate slow health responses
         # aren't treated as the worker being dead.  Tunable via env.
-        python -m sglang_router.launch_router \
-            --pd-disaggregation \
-            --prefill "$PREFILL_URL" "$DISAGG_BOOTSTRAP_PORT" \
-            --decode "http://localhost:${DECODE_PORT}" \
-            --host "$ROUTER_HOST" \
-            --port "$ROUTER_PORT" \
-            --health-check-timeout-secs "${ROUTER_HEALTH_TIMEOUT_SECS:-120}" \
-            --health-check-interval-secs "${ROUTER_HEALTH_INTERVAL_SECS:-60}" \
-            --health-failure-threshold "${ROUTER_HEALTH_FAILURE_THRESHOLD:-20}" \
-            > "$ROUTER_LOG" 2>&1 &
+        # Build router command as an array so we can fan out one --prefill
+        # per entry of PREFILL_URLS_ARR (xP1D). All prefills share the same
+        # DISAGG_BOOTSTRAP_PORT (different hosts, no port collision).
+        router_cmd=( python -m sglang_router.launch_router --pd-disaggregation )
+        for url in "${PREFILL_URLS_ARR[@]}"; do
+            router_cmd+=( --prefill "$url" "$DISAGG_BOOTSTRAP_PORT" )
+        done
+        router_cmd+=(
+            --decode "http://localhost:${DECODE_PORT}"
+            --host "$ROUTER_HOST"
+            --port "$ROUTER_PORT"
+            --health-check-timeout-secs "${ROUTER_HEALTH_TIMEOUT_SECS:-120}"
+            --health-check-interval-secs "${ROUTER_HEALTH_INTERVAL_SECS:-60}"
+            --health-failure-threshold "${ROUTER_HEALTH_FAILURE_THRESHOLD:-20}"
+        )
+        "${router_cmd[@]}" > "$ROUTER_LOG" 2>&1 &
         ROUTER_PID=$!
         log "Router PID: $ROUTER_PID"
 
