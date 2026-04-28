@@ -58,9 +58,7 @@ class TestInitReturnLogprobContainers(unittest.TestCase):
         ]
 
         for attr in expected_attrs:
-            self.assertTrue(
-                hasattr(mixin, attr), f"Missing attribute: {attr}"
-            )
+            self.assertTrue(hasattr(mixin, attr), f"Missing attribute: {attr}")
             self.assertEqual(
                 getattr(mixin, attr), [], f"Attribute {attr} should be an empty list"
             )
@@ -107,7 +105,9 @@ class TestClearList(unittest.TestCase):
         ]
         for name in container_names:
             getattr(mixin, name).append("some_data")
-            self.assertEqual(len(getattr(mixin, name)), 1, f"{name} should have 1 item before clear")
+            self.assertEqual(
+                len(getattr(mixin, name)), 1, f"{name} should have 1 item before clear"
+            )
 
         mixin.clear_list()
 
@@ -137,14 +137,20 @@ class TestClearList(unittest.TestCase):
 
         # Verify attributes don't exist before clear_list
         for name in container_names:
-            self.assertFalse(hasattr(mixin, name), f"{name} should not exist before clear_list")
+            self.assertFalse(
+                hasattr(mixin, name), f"{name} should not exist before clear_list"
+            )
 
         mixin.clear_list()
 
         # Verify attributes are created as empty lists
         for name in container_names:
-            self.assertTrue(hasattr(mixin, name), f"{name} should exist after clear_list")
-            self.assertEqual(getattr(mixin, name), [], f"{name} should be an empty list")
+            self.assertTrue(
+                hasattr(mixin, name), f"{name} should exist after clear_list"
+            )
+            self.assertEqual(
+                getattr(mixin, name), [], f"{name} should be an empty list"
+            )
 
     def test_clear_list_after_partial_set_to_none(self):
         """Test clear_list behavior when containers are properly initialized.

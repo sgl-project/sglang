@@ -1007,7 +1007,7 @@ class SchedulerOutputProcessorMixin:
 
         time_stats = []
 
-        if self.input_token_logprobs_val != None:
+        if self.input_token_logprobs_val is not None:
             self.clear_list()
 
         if not return_logprob:

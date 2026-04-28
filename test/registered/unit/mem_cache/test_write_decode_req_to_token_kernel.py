@@ -66,13 +66,9 @@ class TestWriteDecodeReqToTokenKernel(unittest.TestCase):
         req_to_token = torch.zeros(
             (max_batch, max_context_len), dtype=torch.int32, device="cuda"
         )
-        req_pool_indices = torch.tensor(
-            [0, 2, 5, 7], dtype=torch.int64, device="cuda"
-        )
+        req_pool_indices = torch.tensor([0, 2, 5, 7], dtype=torch.int64, device="cuda")
         seq_lens = torch.tensor([3, 10, 1, 20], dtype=torch.int64, device="cuda")
-        out_cache_loc = torch.tensor(
-            [50, 60, 70, 80], dtype=torch.int64, device="cuda"
-        )
+        out_cache_loc = torch.tensor([50, 60, 70, 80], dtype=torch.int64, device="cuda")
 
         _write_decode_req_to_token_kernel[(bs,)](
             req_to_token,
@@ -176,9 +172,7 @@ class TestWriteDecodeReqToTokenKernel(unittest.TestCase):
         seq_lens = torch.randint(
             0, max_context_len, (bs,), dtype=torch.int64, device="cuda"
         )
-        out_cache_loc = torch.randint(
-            0, 10000, (bs,), dtype=torch.int64, device="cuda"
-        )
+        out_cache_loc = torch.randint(0, 10000, (bs,), dtype=torch.int64, device="cuda")
 
         # Triton kernel result
         req_to_token_triton = torch.zeros(
