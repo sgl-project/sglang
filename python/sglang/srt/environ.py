@@ -340,6 +340,8 @@ class Envs:
     SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM = EnvBool(False)
     # Delay all-gather after qlora for better performance for Deepseek v3.2
     SGLANG_USE_AG_AFTER_QLORA = EnvBool(False)
+    # Quantize x to int8 in the dispatch operator
+    DEEP_NORMAL_MODE_USE_INT8_QUANT = EnvBool(False)
     SGLANG_NPU_FUSED_MOE_MODE = EnvInt(1)
 
     # MTHREADS & MUSA
@@ -396,6 +398,7 @@ class Envs:
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
     SGLANG_DG_USE_NVRTC = EnvBool(False)
     SGLANG_USE_DEEPGEMM_BMM = EnvBool(False)
+    SGLANG_DEEPGEMM_SANITY_CHECK = EnvBool(False)
 
     # DeepSeek MHA Optimization
     SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD = EnvInt(8192)

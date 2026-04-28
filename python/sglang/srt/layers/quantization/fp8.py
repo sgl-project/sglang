@@ -50,7 +50,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    _use_aiter_gfx95,
+    _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
@@ -85,6 +85,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
@@ -103,6 +104,7 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -185,6 +187,9 @@ class Fp8Config(QuantizationConfig):
         return [torch.bfloat16, torch.half]
 
     def get_min_capability(self) -> int:
+        if _is_musa:
+            return 31
+
         return 100 if self.use_mxfp8 else 80
 
     @classmethod
@@ -510,7 +515,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight_scale_inv.data = weight_scale.data
 
         if (
-            _use_aiter_gfx95
+            _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
         ):
             n, k = layer.weight.shape
@@ -1821,7 +1826,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         if activation == "silu"
                         else ActivationType.Gelu
                     ),
-                    expert_mask=layer.expert_mask_gpu,
+                    expert_mask=layer.dispatcher.expert_mask_gpu,
                 )
             else:
                 return fused_moe(
@@ -1838,7 +1843,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         if activation == "silu"
                         else ActivationType.Gelu
                     ),
-                    expert_mask=layer.expert_mask_gpu,
+                    expert_mask=layer.dispatcher.expert_mask_gpu,
                 )
         return None
 
