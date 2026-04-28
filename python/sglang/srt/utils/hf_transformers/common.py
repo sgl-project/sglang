@@ -217,16 +217,13 @@ def get_hf_text_config(config: PretrainedConfig):
 
     # Some models (e.g. DeepSeek-OCR) store sub-configs as plain dicts.
     # Convert to PretrainedConfig early so hasattr() checks and asserts work.
-    parent_dtype = getattr(config, "torch_dtype", None)
+    parent_dtype = getattr(config, "dtype", None)
     for _attr in ("text_config", "llm_config", "language_config", "thinker_config"):
         _sub = getattr(config, _attr, None)
         if isinstance(_sub, dict):
             _converted = PretrainedConfig(**_sub)
-            if (
-                getattr(_converted, "torch_dtype", None) is None
-                and parent_dtype is not None
-            ):
-                _converted.torch_dtype = parent_dtype
+            if getattr(_converted, "dtype", None) is None and parent_dtype is not None:
+                _converted.dtype = parent_dtype
             setattr(config, _attr, _converted)
 
     # Priority: thinker_config > llm_config > language_config > text_config
@@ -236,8 +233,8 @@ def get_hf_text_config(config: PretrainedConfig):
         if hasattr(thinker_config, "text_config"):
             setattr(
                 thinker_config.text_config,
-                "torch_dtype",
-                getattr(thinker_config, "torch_dtype", None),
+                "dtype",
+                getattr(thinker_config, "dtype", None),
             )
             text_config = thinker_config.text_config
         else:
