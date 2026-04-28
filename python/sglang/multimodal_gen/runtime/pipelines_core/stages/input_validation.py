@@ -73,12 +73,25 @@ class InputValidationStage(PipelineStage):
         num_videos_per_prompt = batch.num_outputs_per_prompt
 
         assert seed is not None
-        seeds = [seed + i for i in range(num_videos_per_prompt)]
+        if isinstance(seed, list):
+            if len(seed) != num_videos_per_prompt:
+                raise ValueError(
+                    f"seed list length must match num_outputs_per_prompt "
+                    f"({num_videos_per_prompt}), got {len(seed)}"
+                )
+            seeds = [int(item) for item in seed]
+        else:
+            seeds = [int(seed) + i for i in range(num_videos_per_prompt)]
         batch.seeds = seeds
 
         # Create generators based on generator_device parameter
         # Note: This will overwrite any existing batch.generator
         generator_device = batch.generator_device
+        if generator_device is None:
+            generator_device = (
+                getattr(server_args.pipeline_config, "generator_device", None)
+                or current_platform.device_type
+            )
 
         if generator_device == "cpu":
             device_str = "cpu"
@@ -129,8 +142,13 @@ class InputValidationStage(PipelineStage):
             # adjust output image size
             if calculated_size is not None:
                 calculated_width, calculated_height = calculated_size
-                width = batch.width or calculated_width
-                height = batch.height or calculated_height
+                explicit_fields = set(batch.extra.get("explicit_fields", []))
+                width_is_explicit = "width" in explicit_fields
+                height_is_explicit = "height" in explicit_fields
+
+                width = batch.width if width_is_explicit else calculated_width
+                height = batch.height if height_is_explicit else calculated_height
+
                 multiple_of = (
                     server_args.pipeline_config.vae_config.get_vae_scale_factor() * 2
                 )
@@ -191,8 +209,30 @@ class InputValidationStage(PipelineStage):
                 server_args.pipeline_config.vae_config.arch_config.scale_factor_spatial
                 * server_args.pipeline_config.dit_config.arch_config.patch_size[1]
             )
+
+            # User-specified width/height controls the target area (scale),
+            # capped by max_area. Aspect ratio always comes from the
+            # condition image for I2V.
+            if batch.width is not None or batch.height is not None:
+                # If one dimension is provided, calculate the other based on the image's aspect ratio.
+                if batch.width is None:
+                    batch.width = round(batch.height / aspect_ratio)
+                elif batch.height is None:
+                    batch.height = round(batch.width * aspect_ratio)
+
+                target_area = min(batch.width * batch.height, max_area)
+                if batch.width * batch.height > max_area:
+                    logger.warning(
+                        "Requested resolution %dx%d exceeds max_area %d, "
+                        "clamping to max_area",
+                        batch.width,
+                        batch.height,
+                        max_area,
+                    )
+            else:
+                target_area = max_area
             width, height = self._calculate_dimensions_from_area(
-                max_area, aspect_ratio, mod_value
+                target_area, aspect_ratio, mod_value
             )
 
             batch.condition_image = batch.condition_image.resize((width, height))
@@ -281,6 +321,34 @@ class InputValidationStage(PipelineStage):
                 f"Guidance scale must be positive, but got {batch.guidance_scale}"
             )
 
+        # Reject requests that do not enable CFG on a server launched with
+        # --enable-cfg-parallel. CFG-parallel splits cond/uncond across ranks,
+        # so rank 1 has no work and returns None for noise_pred, which crashes
+        # scheduler.step() ~30 minutes later under a gloo broadcast timeout.
+        # Earlier, field-specific checks above (negative_prompt missing,
+        # guidance_scale < 0) fire first and produce better messages for those
+        # cases; this is the catch-all for any combination that still leaves
+        # do_classifier_free_guidance=False under cfg-parallel.
+        if server_args.enable_cfg_parallel and not batch.do_classifier_free_guidance:
+            neg_prompt_state = (
+                "not set"
+                if batch.negative_prompt is None
+                else "empty" if batch.negative_prompt == "" else "set"
+            )
+            raise ValueError(
+                f"Server was launched with --enable-cfg-parallel but this "
+                f"request does not use classifier-free guidance "
+                f"(do_classifier_free_guidance={batch.do_classifier_free_guidance}, "
+                f"guidance_scale={batch.guidance_scale}, "
+                f"true_cfg_scale={batch.true_cfg_scale}, "
+                f"negative_prompt={neg_prompt_state}). "
+                f"CFG-parallel splits cond/uncond across ranks and requires "
+                f"both to be active. Either disable --enable-cfg-parallel or "
+                f"ensure the request enables CFG (set guidance_scale > 1.0 or "
+                f"true_cfg_scale > 1.0, with a non-empty negative_prompt or "
+                f"negative_prompt_embeds)."
+            )
+
         # for i2v, get image from image_path
         # @TODO(Wei) hard-coded for wan2.2 5b ti2v for now. Should put this in image_encoding stage
         if batch.image_path is not None:
@@ -333,7 +401,18 @@ class InputValidationStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify input validation stage inputs."""
         result = VerificationResult()
-        result.add_check("seed", batch.seed, [V.not_none, V.non_negative_int])
+        result.add_check(
+            "seed",
+            batch.seed,
+            [
+                V.not_none,
+                lambda x: (
+                    V.non_negative_int(x)
+                    if not isinstance(x, list)
+                    else bool(x) and all(V.non_negative_int(item) for item in x)
+                ),
+            ],
+        )
         result.add_check(
             "num_videos_per_prompt", batch.num_outputs_per_prompt, V.positive_int
         )

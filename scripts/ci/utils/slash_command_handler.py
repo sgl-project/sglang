@@ -22,6 +22,7 @@ def find_workflow_run_url(
     dispatch_time,
     pr_head_sha=None,
     max_wait=30,
+    test_command=None,
 ):
     """
     Poll for the workflow run URL after dispatch.
@@ -43,12 +44,14 @@ def find_workflow_run_url(
     Returns:
         The workflow run URL if found, None otherwise.
     """
-    # Build expected display_title pattern based on workflow's run-name
-    # Format: "[stage-name] sha" for fork PRs, "[stage-name]" for non-fork
+    # Build expected display_title based on workflow's run-name.
+    # rerun-test includes test_command: "[rerun-test] <test_command> [<sha>]"
+    # Other workflows: "[stage-name] [<sha>]"
+    suffix = f" {test_command}" if test_command else ""
     if pr_head_sha:
-        expected_title = f"[{target_stage}] {pr_head_sha}"
+        expected_title = f"[{target_stage}]{suffix} {pr_head_sha}"
     else:
-        expected_title = f"[{target_stage}]"
+        expected_title = f"[{target_stage}]{suffix}"
 
     print(f"Looking for workflow run with display_title: {expected_title}")
 
@@ -177,46 +180,83 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
 
     print("Permission granted. Triggering rerun of failed or skipped workflows.")
 
-    # Check if PR has sgl-kernel changes - if so, we need full reruns
-    # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts
+    # Check if PR has sgl-kernel changes - if so, we may need full reruns
+    # to ensure sgl-kernel-build-wheels runs and produces fresh artifacts.
+    # However, if the wheel already built successfully for this commit,
+    # we can just rerun failed jobs — the artifact is already there.
     sgl_kernel_changes = has_sgl_kernel_changes(pr)
     if sgl_kernel_changes:
-        print("PR has sgl-kernel changes - will use full rerun to rebuild kernel")
+        print("PR has sgl-kernel changes - checking if kernel wheel already built")
 
     # Get the SHA of the latest commit in the PR
     head_sha = pr.head.sha
     print(f"Checking workflows for commit: {head_sha}")
 
-    # List all workflow runs for this commit
+    # If PR has sgl-kernel changes, check whether ALL wheel builds already
+    # succeeded for this commit (CUDA + ARM). If so, we can use
+    # rerun_failed_jobs and avoid retriggering all tests. If any wheel
+    # build is pending/failed, a dependent job could fail for missing
+    # artifacts, so fall back to full rerun.
+    # Check-runs display names: "Build Wheel (<python>, <cuda>)" (CUDA) and
+    # "Build Wheel Arm (<python>, <cuda>)" (ARM). The YAML job ids
+    # sgl-kernel-build-wheels{,-arm} are NOT what the check-runs API
+    # returns — it returns the job's `name:` field.
+    kernel_wheel_built = False
+    if sgl_kernel_changes:
+        try:
+            wheel_builds = [
+                cr
+                for cr in gh_repo.get_commit(head_sha).get_check_runs()
+                if cr.name.startswith("Build Wheel")
+            ]
+            kernel_wheel_built = bool(wheel_builds) and all(
+                cr.conclusion == "success" for cr in wheel_builds
+            )
+            print(
+                f"All {len(wheel_builds)} kernel wheel build(s) passed - using rerun_failed_jobs"
+                if kernel_wheel_built
+                else f"Kernel wheel not fully built "
+                f"({sum(1 for c in wheel_builds if c.conclusion == 'success')}"
+                f"/{len(wheel_builds)} success) - will use full rerun"
+            )
+        except Exception as e:
+            print(
+                f"Failed to check kernel wheel status: {e} - falling back to full rerun"
+            )
+
+    # Rerun workflows with conclusion=failure or conclusion=skipped.
+    #
+    # - failure: use rerun_failed_jobs() which reruns failed jobs *and their
+    #   dependent jobs* (GitHub API). Fast-fail cascades call
+    #   core.setFailed(...) so their conclusion is "failure" and are covered.
+    # - skipped: the entire run was skipped (no jobs ran), so there are no
+    #   failed jobs for rerun_failed_jobs() to target. Use run.rerun().
+    # - kernel wheel escape: if the PR touches sgl-kernel and not all wheel
+    #   builds are success yet, full-rerun failure runs too — Build Wheel
+    #   lives in pr-test-sgl-kernel.yml, consumers in pr-test.yml, and
+    #   rerun_failed_jobs() is scoped to a single workflow run.
     runs = gh_repo.get_workflow_runs(head_sha=head_sha)
 
     rerun_count = 0
     for run in runs:
         if run.status != "completed":
             continue
+        if run.conclusion not in ("failure", "skipped"):
+            continue
 
-        if run.conclusion == "failure":
-            print(f"Rerunning failed workflow: {run.name} (ID: {run.id})")
-            try:
-                if sgl_kernel_changes:
-                    # Full rerun to ensure sgl-kernel-build-wheels runs
-                    # and produces fresh artifacts for dependent jobs
-                    run.rerun()
-                else:
-                    # Use rerun_failed_jobs for efficiency on failures
-                    run.rerun_failed_jobs()
-                rerun_count += 1
-            except Exception as e:
-                print(f"Failed to rerun workflow {run.id}: {e}")
-
-        elif run.conclusion == "skipped":
-            print(f"Rerunning skipped workflow: {run.name} (ID: {run.id})")
-            try:
-                # Skipped workflows don't have 'failed jobs', so we use full rerun()
+        print(f"Processing {run.conclusion} workflow: {run.name} (ID: {run.id})")
+        try:
+            if run.conclusion == "skipped" or (
+                sgl_kernel_changes and not kernel_wheel_built
+            ):
+                print("  Full rerun")
                 run.rerun()
-                rerun_count += 1
-            except Exception as e:
-                print(f"Failed to rerun workflow {run.id}: {e}")
+            else:
+                print("  rerun_failed_jobs")
+                run.rerun_failed_jobs()
+            rerun_count += 1
+        except Exception as e:
+            print(f"Failed to rerun workflow {run.id}: {e}")
 
     if rerun_count > 0:
         print(f"Triggered rerun for {rerun_count} workflows.")
@@ -253,33 +293,38 @@ def handle_rerun_stage(
 
     # Valid NVIDIA stage names that support target_stage
     nvidia_stages = [
-        "stage-a-test-1",
-        "stage-a-cpu-only",
-        "stage-b-test-small-1-gpu",
-        "stage-b-test-large-1-gpu",
-        "stage-b-test-large-2-gpu",
+        "stage-a-test-1-gpu-small",
+        "stage-a-test-cpu",
+        "stage-b-test-1-gpu-small",
+        "stage-b-test-1-gpu-large",
+        "stage-b-test-2-gpu-large",
         "stage-b-test-4-gpu-b200",
         "stage-c-test-4-gpu-h100",
         "stage-c-test-8-gpu-h200",
         "stage-c-test-8-gpu-h20",
         "stage-c-test-4-gpu-b200",
+        "stage-c-test-4-gpu-b200-small",
         "stage-c-test-4-gpu-gb200",
-        "stage-c-test-deepep-4-gpu",
+        "stage-c-test-deepep-4-gpu-h100",
         "stage-c-test-deepep-8-gpu-h200",
         "multimodal-gen-test-1-gpu",
         "multimodal-gen-test-2-gpu",
+        "multimodal-gen-component-accuracy",
+        "multimodal-gen-component-accuracy-1-gpu",
+        "multimodal-gen-component-accuracy-2-gpu",
+        "multimodal-gen-test-1-b200",
     ]
 
     # Valid AMD stage names that support target_stage
     amd_stages = [
         "sgl-kernel-unit-test-amd",
         "sgl-kernel-unit-test-2-gpu-amd",
-        "stage-a-test-1-amd",
-        "stage-b-test-small-1-gpu-amd",
-        "stage-b-test-small-1-gpu-amd-nondeterministic",
-        "stage-b-test-small-1-gpu-amd-mi35x",
-        "stage-b-test-large-1-gpu-amd",
-        "stage-b-test-large-2-gpu-amd",
+        "stage-a-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd",
+        "stage-b-test-1-gpu-small-amd-nondeterministic",
+        "stage-b-test-1-gpu-small-amd-mi35x",
+        "stage-b-test-1-gpu-large-amd",
+        "stage-b-test-2-gpu-large-amd",
         "multimodal-gen-test-1-gpu-amd",
         "multimodal-gen-test-2-gpu-amd",
         "stage-c-test-large-8-gpu-amd",
@@ -322,6 +367,18 @@ def handle_rerun_stage(
         )
         print(f"PR is from fork: {is_fork}")
 
+        # If the PR modifies sgl-kernel/, the target stage would otherwise use the
+        # PyPI sgl-kernel wheel instead of the PR's changes (sgl-kernel-build-wheels
+        # skips in target_stage mode by default). Set include_wheel_build=true so the
+        # workflow runs sgl-kernel-build-wheels alongside the target stage; the target
+        # stage waits for the build via its needs list.
+        kernel_changes = has_sgl_kernel_changes(pr)
+        if kernel_changes:
+            print(
+                "PR modifies sgl-kernel/ - setting include_wheel_build=true so the "
+                "target stage gets the freshly-built wheel instead of the PyPI one."
+            )
+
         # pr_head_sha is used for fork PRs (passed to workflow and used for URL lookup)
         pr_head_sha = None
 
@@ -333,23 +390,29 @@ def handle_rerun_stage(
             print(
                 f"Triggering {workflow_name} workflow on ref: {ref}, PR head SHA: {pr_head_sha}"
             )
-            if is_amd_stage:
-                inputs = {"target_stage": stage_name, "pr_head_sha": pr_head_sha}
-            else:
-                inputs = {
-                    "version": "release",
-                    "target_stage": stage_name,
-                    "pr_head_sha": pr_head_sha,
-                }
+            inputs = {
+                "target_stage": stage_name,
+                "pr_head_sha": pr_head_sha,
+            }
         else:
             # For non-fork PRs: dispatch on the PR branch directly
             # This allows testing workflow changes before merge
             ref = pr.head.ref
             print(f"Triggering {workflow_name} workflow on branch: {ref}")
-            if is_amd_stage:
-                inputs = {"target_stage": stage_name}
-            else:
-                inputs = {"version": "release", "target_stage": stage_name}
+            inputs = {"target_stage": stage_name}
+
+        # For NVIDIA stages, honor the sgl-kernel / include_wheel_build flow. AMD is
+        # a separate workflow that doesn't share the same wheel-build pipeline.
+        if kernel_changes and not is_amd_stage:
+            inputs["include_wheel_build"] = "true"
+            # include_wheel_build relies on filter-api detecting kernel changes, which
+            # requires pr_head_sha. Ensure it's set even for non-fork PRs, and keep
+            # the local pr_head_sha in sync so find_workflow_run_url builds the
+            # expected display_title with the SHA suffix (the workflow's run-name
+            # includes the SHA whenever inputs.pr_head_sha is set).
+            if not is_fork:
+                inputs["pr_head_sha"] = pr.head.sha
+                pr_head_sha = pr.head.sha
 
         # Record dispatch time before triggering
         dispatch_time = time.time()
@@ -372,11 +435,7 @@ def handle_rerun_stage(
             print(f"Successfully triggered workflow for stage '{stage_name}'")
             if react_on_success:
                 comment.create_reaction("+1")
-                pr.create_issue_comment(
-                    f"✅ Triggered `{stage_name}` to run independently (skipping dependencies)."
-                )
 
-                # Poll for the workflow run URL and post follow-up comment
                 run_url = find_workflow_run_url(
                     gh_repo,
                     target_workflow.id,
@@ -388,9 +447,15 @@ def handle_rerun_stage(
                     max_wait=30,
                 )
                 if run_url:
-                    pr.create_issue_comment(f"🔗 [View workflow run]({run_url})")
+                    pr.create_issue_comment(
+                        f"✅ Triggered `{stage_name}` to run independently"
+                        f" (skipping dependencies)."
+                        f" [View workflow run]({run_url})"
+                    )
                 else:
                     pr.create_issue_comment(
+                        f"✅ Triggered `{stage_name}` to run independently"
+                        f" (skipping dependencies).\n"
                         f"⚠️ Could not retrieve workflow run URL. "
                         f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                     )
@@ -410,142 +475,208 @@ def handle_rerun_stage(
 
 
 CUDA_SUITE_TO_RUNNER = {
-    "stage-a-test-1": "1-gpu-runner",
-    "stage-a-cpu-only": "ubuntu-latest",
-    "stage-b-test-small-1-gpu": "1-gpu-5090",
-    "stage-b-test-large-1-gpu": "1-gpu-runner",
-    "stage-b-test-large-2-gpu": "2-gpu-runner",
+    # PR test suites
+    "stage-a-test-1-gpu-small": "1-gpu-5090",
+    "stage-a-test-cpu": "ubuntu-latest",
+    "stage-b-test-1-gpu-small": "1-gpu-5090",
+    "stage-b-test-1-gpu-large": "1-gpu-h100",
+    "stage-b-test-2-gpu-large": "2-gpu-h100",
     "stage-b-test-4-gpu-b200": "4-gpu-b200",
     "stage-c-test-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-8-gpu-h200": "8-gpu-h200",
     "stage-c-test-8-gpu-h20": "8-gpu-h20",
     "stage-c-test-4-gpu-b200": "4-gpu-b200",
-    "stage-c-test-deepep-4-gpu": "4-gpu-h100",
+    "stage-c-test-4-gpu-b200-small": "4-gpu-b200-low-disk",
+    "stage-c-test-deepep-4-gpu-h100": "4-gpu-h100",
     "stage-c-test-deepep-8-gpu-h200": "8-gpu-h200",
+    # Nightly test suites (NVIDIA)
+    "nightly-1-gpu": "1-gpu-h100",
+    "nightly-4-gpu": "4-gpu-h100",
+    "nightly-4-gpu-b200": "4-gpu-b200",
+    "nightly-8-gpu-common": "8-gpu-h200",
+    "nightly-8-gpu-h200": "8-gpu-h200",
+    "nightly-8-gpu-h20": "8-gpu-h20",
+    "nightly-8-gpu-b200": "8-gpu-b200",
+    "nightly-eval-text-2-gpu": "2-gpu-h100",
+    "nightly-eval-vlm-2-gpu": "2-gpu-h100",
+    "nightly-perf-text-2-gpu": "2-gpu-h100",
+    "nightly-perf-vlm-2-gpu": "2-gpu-h100",
+    "nightly-kernel-1-gpu": "1-gpu-h100",
+    "nightly-kernel-8-gpu-h200": "8-gpu-h200",
+    # Weekly test suites
+    "weekly-8-gpu-h200": "8-gpu-h200",
 }
 
 DEEPEP_SUITES = {
     "stage-c-test-8-gpu-h20",
-    "stage-c-test-deepep-4-gpu",
+    "stage-c-test-deepep-4-gpu-h100",
     "stage-c-test-deepep-8-gpu-h200",
 }
 
 
+MULTIMODAL_TEST_DIR = "python/sglang/multimodal_gen/test"
+
+MULTIMODAL_PATH_TO_RUNNER = {
+    "2_gpu": "2-gpu-h100",
+    "2-gpu": "2-gpu-h100",
+}
+MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
+
+
 def resolve_test_file(file_part):
     """
-    Resolve a user-provided file path to a path relative to test/.
+    Resolve a user-provided file path to a path relative to test/ or full path for multimodal.
 
     Supports:
     - Full path: test/registered/core/test_srt_endpoint.py
     - Relative to test/: registered/core/test_srt_endpoint.py
     - Bare filename: test_srt_endpoint.py (glob-matched, must be unique)
+    - Multimodal paths: python/sglang/multimodal_gen/test/server/test_server_a.py
 
-    Returns (resolved_path, error_message). On success error_message is None.
+    Returns (resolved_path, is_multimodal, error_message). On success error_message is None.
     """
+    # Check if it's explicitly a multimodal path
+    multimodal_prefixes = [
+        "python/sglang/multimodal_gen/test/",
+        "sglang/multimodal_gen/test/",
+        "multimodal_gen/test/",
+    ]
+    for prefix in multimodal_prefixes:
+        if file_part.startswith(prefix):
+            full_path = (
+                file_part
+                if file_part.startswith("python/")
+                else f"python/sglang/multimodal_gen/test/{file_part[len(prefix):]}"
+            )
+            if not os.path.isfile(full_path):
+                return None, False, f"File not found: `{full_path}`"
+            return full_path, True, None
+
+    # Existing logic for test/registered/ paths
     if file_part.startswith("test/"):
         file_part = file_part[len("test/") :]
 
     if "/" not in file_part:
+        # Try test/registered/ first
         matches = glob.glob(f"test/registered/**/{file_part}", recursive=True)
-        if len(matches) == 0:
+
+        # Try multimodal test directory
+        mm_matches = glob.glob(f"{MULTIMODAL_TEST_DIR}/**/{file_part}", recursive=True)
+        # Filter to only test files
+        mm_matches = [m for m in mm_matches if os.path.basename(m).startswith("test_")]
+
+        if len(matches) == 1 and len(mm_matches) == 0:
+            return matches[0][len("test/") :], False, None
+        if len(matches) == 0 and len(mm_matches) == 1:
+            return mm_matches[0], True, None
+
+        all_matches = matches + mm_matches
+        if len(all_matches) == 0:
             return (
                 None,
-                f"No test file found matching `{file_part}` under `test/registered/`.",
+                False,
+                f"No test file found matching `{file_part}` under `test/registered/` or `{MULTIMODAL_TEST_DIR}/`.",
             )
-        if len(matches) > 1:
-            match_list = "\n".join(f"- `{m}`" for m in sorted(matches))
-            return None, (
-                f"Ambiguous filename `{file_part}` — matched {len(matches)} files:\n\n"
-                f"{match_list}\n\n"
-                f"Please provide the full path, e.g. `/rerun-ut {matches[0]}`"
+        if len(all_matches) > 1:
+            match_list = "\n".join(f"- `{m}`" for m in sorted(all_matches))
+            return (
+                None,
+                False,
+                (
+                    f"Ambiguous filename `{file_part}` — matched {len(all_matches)} files:\n\n"
+                    f"{match_list}\n\n"
+                    f"Please provide the full path, e.g. `/rerun-test {all_matches[0]}`"
+                ),
             )
-        return matches[0][len("test/") :], None
+        # Shouldn't reach here, but handle gracefully
+        if mm_matches:
+            return mm_matches[0], True, None
+        return matches[0][len("test/") :], False, None
 
+    # Path with directory - check test/ location
     full_path = f"test/{file_part}"
-    if not os.path.isfile(full_path):
-        return None, f"File not found: `{full_path}`"
-    return file_part, None
+    if os.path.isfile(full_path):
+        return file_part, False, None
+
+    return None, False, f"File not found: `{full_path}`"
 
 
-def detect_cuda_suite(file_path_from_test):
+def detect_multimodal_suite(file_path):
     """
-    Read a test file and extract the suite from register_cuda_ci(suite="...").
+    Determine runner for a multimodal gen test file based on its path.
 
-    Returns (suite_name, runner_label, use_deepep, error_message).
+    Returns (runner_label, error_message).
+    """
+    # Check path components and basename for GPU count hints
+    for pattern, runner in MULTIMODAL_PATH_TO_RUNNER.items():
+        if pattern in file_path:
+            return runner, None
+    return MULTIMODAL_DEFAULT_RUNNER, None
+
+
+def detect_suite(file_path_from_test):
+    """
+    Read a test file and extract the suite from register_cuda_ci or register_cpu_ci.
+
+    Returns (suite_name, runner_label, use_deepep, is_cpu, error_message).
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
         content = f.read()
 
+    # Try CUDA first
     match = re.search(
-        r'register_cuda_ci\([^)]*suite\s*=\s*["\']([^"\']+)["\']', content
+        r'^[^#\n]*register_cuda_ci\([^)]*suite\s*=\s*["\']([^"\']+)["\']',
+        content,
+        re.MULTILINE,
     )
-    if not match:
-        return (
-            None,
-            None,
-            False,
-            (
-                f"No `register_cuda_ci()` found in `{full_path}`.\n\n"
-                f"This file may not be a registered CUDA CI test."
-            ),
-        )
+    if match:
+        suite = match.group(1)
+        runner = CUDA_SUITE_TO_RUNNER.get(suite)
+        if not runner:
+            known = ", ".join(f"`{s}`" for s in sorted(CUDA_SUITE_TO_RUNNER))
+            return (
+                suite,
+                None,
+                False,
+                False,
+                (
+                    f"Unknown CUDA suite `{suite}` in `{full_path}`.\n\n"
+                    f"Known suites: {known}"
+                ),
+            )
+        use_deepep = suite in DEEPEP_SUITES
+        return suite, runner, use_deepep, False, None
 
-    suite = match.group(1)
-    runner = CUDA_SUITE_TO_RUNNER.get(suite)
-    if not runner:
-        known = ", ".join(f"`{s}`" for s in sorted(CUDA_SUITE_TO_RUNNER))
-        return (
-            suite,
-            None,
-            False,
-            (
-                f"Unknown CUDA suite `{suite}` in `{full_path}`.\n\n"
-                f"Known suites: {known}"
-            ),
-        )
-    use_deepep = suite in DEEPEP_SUITES
-    return suite, runner, use_deepep, None
+    # Try CPU
+    match = re.search(
+        r'^[^#\n]*register_cpu_ci\([^)]*suite\s*=\s*["\']([^"\']+)["\']',
+        content,
+        re.MULTILINE,
+    )
+    if match:
+        suite = match.group(1)
+        return suite, "ubuntu-latest", False, True, None
+
+    return (
+        None,
+        None,
+        False,
+        False,
+        (
+            f"No `register_cuda_ci()` or `register_cpu_ci()` found in `{full_path}`.\n\n"
+            f"This file may not be a registered CI test."
+        ),
+    )
 
 
-def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
+def _resolve_test_spec(test_spec):
     """
-    Handles the /rerun-ut <file>::<TestClass.test_method> command.
-    Dispatches a lightweight workflow to run a single test on the correct CUDA runner.
+    Resolve a single test spec into its components without dispatching.
+
+    Returns a dict with keys: spec, resolved_path, test_command, suite,
+    runner_label, use_deepep, is_cpu, error.
     """
-    # SECURITY: Block /rerun-ut entirely for fork PRs. This command checks out and
-    # executes code from the PR branch on self-hosted GPU runners, which would bypass
-    # the run-ci label gate that requires maintainer review for fork PRs.
-    is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
-    if is_fork:
-        print("Permission denied: /rerun-ut is not allowed on fork PRs.")
-        comment.create_reaction("confused")
-        pr.create_issue_comment(
-            "❌ `/rerun-ut` is not available for fork PRs (security restriction).\n\n"
-            "Please ask a maintainer to add the `run-ci` label and use the normal CI flow, "
-            "or use `/rerun-failed-ci` to rerun workflows that have already passed the gate."
-        )
-        return False
-
-    if not (
-        user_perms.get("can_rerun_ut", False)
-        or user_perms.get("can_rerun_stage", False)
-    ):
-        print("Permission denied: neither can_rerun_ut nor can_rerun_stage is true.")
-        return False
-
-    if not test_spec:
-        comment.create_reaction("confused")
-        pr.create_issue_comment(
-            "❌ Please specify a test: `/rerun-ut <file>::<TestClass.test_method>`\n\n"
-            "Examples:\n"
-            "- `/rerun-ut test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
-            "- `/rerun-ut registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
-            "- `/rerun-ut test_srt_endpoint.py`"
-        )
-        return False
-
-    # Parse spec: split on :: to get file path and optional test selector
     if "::" in test_spec:
         file_part, test_selector = test_spec.split("::", 1)
     else:
@@ -556,32 +687,78 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
     if test_selector:
         test_selector = test_selector.strip()
 
-    # Resolve file path
-    resolved_path, err = resolve_test_file(file_part)
+    resolved_path, is_multimodal, err = resolve_test_file(file_part)
     if err:
-        comment.create_reaction("confused")
-        pr.create_issue_comment(f"❌ {err}")
-        return False
+        return {"spec": test_spec, "error": err}
 
-    # Detect suite and runner
-    suite, runner_label, use_deepep, err = detect_cuda_suite(resolved_path)
+    if is_multimodal:
+        runner_label, err = detect_multimodal_suite(resolved_path)
+        if err:
+            return {"spec": test_spec, "error": err}
+
+        # For multimodal pytest tests, use :: separator for test selection
+        test_command = resolved_path
+        if test_selector:
+            test_command = f"{resolved_path}::{test_selector}"
+
+        print(
+            f"Resolved (multimodal): file={resolved_path}, selector={test_selector}, "
+            f"runner={runner_label}, command='{test_command}'"
+        )
+        return {
+            "spec": test_spec,
+            "test_command": test_command,
+            "suite": "multimodal",
+            "runner_label": runner_label,
+            "use_deepep": False,
+            "is_cpu": False,
+            "install_diffusion": True,
+            "error": None,
+        }
+
+    suite, runner_label, use_deepep, is_cpu, err = detect_suite(resolved_path)
     if err:
-        comment.create_reaction("confused")
-        pr.create_issue_comment(f"❌ {err}")
-        return False
+        return {"spec": test_spec, "error": err}
 
-    # Build test_command: file path (+ optional test selector as unittest arg)
     test_command = resolved_path
     if test_selector:
         test_command = f"{resolved_path} {test_selector}"
 
     print(
         f"Resolved: file={resolved_path}, selector={test_selector}, "
-        f"suite={suite}, runner={runner_label}, deepep={use_deepep}, command='{test_command}'"
+        f"suite={suite}, runner={runner_label}, deepep={use_deepep}, "
+        f"cpu={is_cpu}, command='{test_command}'"
     )
+    return {
+        "spec": test_spec,
+        "test_command": test_command,
+        "suite": suite,
+        "runner_label": runner_label,
+        "use_deepep": use_deepep,
+        "is_cpu": is_cpu,
+        "install_diffusion": False,
+        "error": None,
+    }
+
+
+def _dispatch_batch(gh_repo, pr, batch, token):
+    """
+    Dispatch a single workflow run for a batch of resolved test specs
+    that share the same (runner_label, use_deepep, is_cpu).
+
+    Returns a dict with keys: specs, success, test_commands, runner_label, run_url, error.
+    """
+    test_commands = [r["test_command"] for r in batch]
+    runner_label = batch[0]["runner_label"]
+    use_deepep = batch[0]["use_deepep"]
+    is_cpu = batch[0]["is_cpu"]
+    install_diffusion = batch[0].get("install_diffusion", False)
+
+    # Join multiple commands with newlines for the workflow to iterate over
+    combined_command = "\n".join(test_commands)
 
     try:
-        workflow_name = "Rerun UT"
+        workflow_name = "Rerun Test"
         workflows = gh_repo.get_workflows()
         target_workflow = None
         for wf in workflows:
@@ -590,31 +767,30 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
                 break
 
         if not target_workflow:
-            print(f"Error: {workflow_name} workflow not found")
-            return False
+            return {
+                "specs": [r["spec"] for r in batch],
+                "success": False,
+                "error": f"{workflow_name} workflow not found",
+            }
 
         is_fork = (
             pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
         )
-        print(f"PR is from fork: {is_fork}")
 
         pr_head_sha = None
+        inputs = {
+            "test_command": combined_command,
+            "runner_label": runner_label,
+            "use_deepep": str(use_deepep).lower(),
+            "is_cpu": str(is_cpu).lower(),
+            "install_diffusion": str(install_diffusion).lower(),
+        }
         if is_fork:
             ref = "main"
             pr_head_sha = pr.head.sha
-            inputs = {
-                "test_command": test_command,
-                "runner_label": runner_label,
-                "pr_head_sha": pr_head_sha,
-                "use_deepep": str(use_deepep).lower(),
-            }
+            inputs["pr_head_sha"] = pr_head_sha
         else:
             ref = pr.head.ref
-            inputs = {
-                "test_command": test_command,
-                "runner_label": runner_label,
-                "use_deepep": str(use_deepep).lower(),
-            }
 
         dispatch_time = time.time()
 
@@ -630,45 +806,157 @@ def handle_rerun_ut(gh_repo, pr, comment, user_perms, test_spec, token):
         success = dispatch_resp.status_code in (200, 204)
         if not success:
             print(f"Dispatch failed: {dispatch_resp.status_code} {dispatch_resp.text}")
+            return {
+                "specs": [r["spec"] for r in batch],
+                "success": False,
+                "error": f"Dispatch failed: {dispatch_resp.status_code}",
+            }
 
-        if success:
-            print(f"Successfully triggered rerun-ut: {test_command}")
-            comment.create_reaction("+1")
+        print(f"Successfully triggered rerun-test: {combined_command}")
+
+        run_url = find_workflow_run_url(
+            gh_repo,
+            target_workflow.id,
+            ref,
+            "rerun-test",
+            token,
+            dispatch_time,
+            pr_head_sha=pr_head_sha,
+            max_wait=30,
+            test_command=combined_command,
+        )
+        return {
+            "specs": [r["spec"] for r in batch],
+            "success": True,
+            "test_commands": test_commands,
+            "runner_label": runner_label,
+            "run_url": run_url,
+        }
+
+    except Exception as e:
+        print(f"Error triggering rerun-test for batch: {e}")
+        return {
+            "specs": [r["spec"] for r in batch],
+            "success": False,
+            "error": str(e),
+        }
+
+
+def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
+    """
+    Handles the /rerun-test command. Resolves all test specs, groups them by
+    (runner_label, use_deepep, is_cpu), and dispatches one workflow per group.
+    """
+    # SECURITY: For fork PRs, only allow /rerun-test if the commenter has write+ permission.
+    # This command checks out and executes code from the PR branch on self-hosted GPU
+    # runners, so we must ensure the commenter is a trusted collaborator.
+    is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
+    if is_fork:
+        commenter = comment.user.login
+        perm = gh_repo.get_collaborator_permission(commenter)
+        if perm not in ("admin", "write"):
+            print(f"Permission denied: /rerun-test on fork PR by {commenter}.")
+            comment.create_reaction("confused")
             pr.create_issue_comment(
-                f"✅ Triggered `/rerun-ut` on `{runner_label}` runner:\n"
-                f"```\ncd test/ && python3 {test_command}\n```"
+                "❌ `/rerun-test` is not available for fork PRs unless the commenter "
+                "has write permission on the repo.\n\n"
+                "Please ask a maintainer to run this command, or use the normal CI flow."
             )
+            return False
+        print(f"Fork PR, but commenter {commenter} has write+ permission. Proceeding.")
 
-            run_url = find_workflow_run_url(
-                gh_repo,
-                target_workflow.id,
-                ref,
-                "rerun-ut",
-                token,
-                dispatch_time,
-                pr_head_sha=pr_head_sha,
-                max_wait=30,
+    if not (
+        user_perms.get("can_rerun_test", False)
+        or user_perms.get("can_rerun_stage", False)
+    ):
+        print("Permission denied: neither can_rerun_test nor can_rerun_stage is true.")
+        return False
+
+    if not test_specs:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "❌ Please specify a test: `/rerun-test <file>::<TestClass.test_method>`\n\n"
+            "Examples:\n"
+            "- `/rerun-test test/registered/core/test_srt_endpoint.py::TestSRTEndpoint.test_simple_decode`\n"
+            "- `/rerun-test registered/core/test_srt_endpoint.py::TestSRTEndpoint`\n"
+            "- `/rerun-test test_srt_endpoint.py`\n"
+            "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)"
+        )
+        return False
+
+    # Phase 1: Resolve all specs
+    resolved = []
+    resolve_failures = []
+    for spec in test_specs:
+        r = _resolve_test_spec(spec)
+        if r.get("error"):
+            resolve_failures.append(r)
+        else:
+            resolved.append(r)
+
+    # Phase 2: Group by (runner_label, use_deepep, is_cpu, install_diffusion)
+    groups = {}
+    for r in resolved:
+        key = (
+            r["runner_label"],
+            r["use_deepep"],
+            r["is_cpu"],
+            r.get("install_diffusion", False),
+        )
+        groups.setdefault(key, []).append(r)
+
+    # Phase 3: Dispatch one workflow per group
+    dispatch_results = []
+    for batch in groups.values():
+        dispatch_results.append(_dispatch_batch(gh_repo, pr, batch, token))
+
+    # Build consolidated comment
+    lines = []
+    for dr in dispatch_results:
+        if dr["success"]:
+            install_diff = any(
+                r.get("install_diffusion", False)
+                for r in resolved
+                if r["spec"] in dr["specs"]
             )
-            if run_url:
-                pr.create_issue_comment(f"🔗 [View workflow run]({run_url})")
+            if install_diff:
+                cmds = "\n".join(
+                    f"python3 -m pytest {cmd} -x" for cmd in dr["test_commands"]
+                )
             else:
-                pr.create_issue_comment(
+                cmds = "\n".join(
+                    f"cd test/ && python3 {cmd}" for cmd in dr["test_commands"]
+                )
+            if dr.get("run_url"):
+                lines.append(
+                    f"✅ `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}): "
+                    f"[View workflow run]({dr['run_url']})\n"
+                    f"```\n{cmds}\n```"
+                )
+            else:
+                lines.append(
+                    f"✅ `{dr['runner_label']}` ({len(dr['test_commands'])} test{'s' if len(dr['test_commands']) > 1 else ''}):\n"
+                    f"```\n{cmds}\n```\n"
                     f"⚠️ Could not retrieve workflow run URL. "
                     f"Check the [Actions tab](https://github.com/{gh_repo.full_name}/actions) for progress."
                 )
-            return True
         else:
-            print("Failed to trigger workflow_dispatch")
-            return False
+            specs_str = ", ".join(f"`{s}`" for s in dr["specs"])
+            lines.append(f"❌ {specs_str}: {dr['error']}")
 
-    except Exception as e:
-        print(f"Error triggering rerun-ut: {e}")
+    for r in resolve_failures:
+        lines.append(f"❌ `{r['spec']}`: {r['error']}")
+
+    body = "\n\n".join(lines)
+
+    successes = [dr for dr in dispatch_results if dr["success"]]
+    if successes:
+        comment.create_reaction("+1")
+    if not successes and (resolve_failures or dispatch_results):
         comment.create_reaction("confused")
-        pr.create_issue_comment(
-            f"❌ Failed to trigger rerun-ut: {str(e)}\n\n"
-            f"Please check the logs or contact maintainers."
-        )
-        return False
+
+    pr.create_issue_comment(body)
+    return len(successes) > 0
 
 
 def main():
@@ -694,7 +982,7 @@ def main():
     # PR authors can always rerun failed CI and rerun individual UTs on their own PRs,
     # even if they are not listed in CI_PERMISSIONS.json.
     # Note: /tag-run-ci-label and /rerun-stage still require CI_PERMISSIONS.json.
-    # Note: /rerun-ut is blocked entirely for fork PRs in handle_rerun_ut() itself.
+    # Note: /rerun-test is blocked entirely for fork PRs in handle_rerun_test() itself.
     if pr.user.login == user_login:
         if user_perms is None:
             print(
@@ -707,7 +995,7 @@ def main():
                 f"User {user_login} is the PR author and has existing CI permissions."
             )
         user_perms["can_rerun_failed_ci"] = True
-        user_perms["can_rerun_ut"] = True
+        user_perms["can_rerun_test"] = True
 
     if not user_perms:
         print(f"User {user_login} does not have any configured permissions. Exiting.")
@@ -752,10 +1040,9 @@ def main():
         stage_name = parts[1].strip() if len(parts) > 1 else None
         handle_rerun_stage(repo, pr, comment, user_perms, stage_name, token)
 
-    elif first_line.startswith("/rerun-ut"):
-        parts = first_line.split(maxsplit=1)
-        test_spec = parts[1].strip() if len(parts) > 1 else None
-        handle_rerun_ut(repo, pr, comment, user_perms, test_spec, token)
+    elif first_line.startswith("/rerun-test"):
+        test_specs = first_line.split()[1:]
+        handle_rerun_test(repo, pr, comment, user_perms, test_specs or None, token)
 
     else:
         print(f"Unknown or ignored command: {first_line}")

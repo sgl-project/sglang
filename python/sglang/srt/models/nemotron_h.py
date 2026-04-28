@@ -59,6 +59,12 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
+from sglang.srt.model_executor.breakable_cuda_graph.context import (
+    is_in_breakable_cuda_graph,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -429,6 +435,11 @@ class NemotronHMambaDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.norm(hidden_states, residual)
 
+        if is_in_breakable_cuda_graph():
+            output = torch.empty_like(hidden_states)
+            breakable_nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
+            return output, residual
+
         if is_in_piecewise_cuda_graph():
             output = torch.empty_like(hidden_states)
             nemotron_mamba2_with_output(hidden_states, output, self.layer_id)
@@ -774,12 +785,6 @@ class NemotronHForCausalLM(nn.Module):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False
     ) -> None:
-        updated_weights = []
-        for name, loaded_weight in weights:
-            name = replace_prefix(name, self.remap_prefix)
-            name = replace_substrings(name, self.remap_substr)
-            updated_weights.append((name, loaded_weight))
-
         # - FusedMoe.w1 (aka gate_proj) should be up_proj since that's
         #   what the activation is applied to
         # - FusedMoe.w3 (aka up_proj) should be ignored since we're
@@ -793,7 +798,13 @@ class NemotronHForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
 
-        for name, loaded_weight in updated_weights:
+        # Stream weights directly from the generator to avoid buffering
+        # the entire checkpoint (~75 GB) into a Python list. On unified-
+        # memory systems (e.g. DGX Spark, 119 GB) the old buffered path
+        # caused OOM: skeleton 81.6 GB + buffer 75 GB = 157 GB peak.
+        for name, loaded_weight in weights:
+            name = replace_prefix(name, self.remap_prefix)
+            name = replace_substrings(name, self.remap_substr)
             if is_mtp:
                 if "mtp" not in name:
                     continue
@@ -912,4 +923,8 @@ def nemotron_mamba2_with_output(
 
     # Copy result back; output may be larger (padded) so only fill actual tokens
     output[:num_actual_tokens].view(ret.shape).copy_(ret)
-    return
+
+
+breakable_nemotron_mamba2_with_output = eager_on_graph(True)(
+    nemotron_mamba2_with_output
+)

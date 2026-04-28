@@ -79,6 +79,8 @@ class SchedulerStats:
     # Basics
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
     num_used_tokens: int = 0
+    # FIXME: token_usage is actually max usage across all pools (KV, SWA, mamba),
+    # not just KV token usage. Rename requires API deprecation.
     token_usage: float = 0.0
     full_token_usage: float = 0.0
     pending_prealloc_token_usage: float = 0.0
@@ -92,6 +94,9 @@ class SchedulerStats:
     cache_hit_rate: float = 0.0
 
     max_total_num_tokens: int = 0
+    kv_available_tokens: int = 0
+    kv_evictable_tokens: int = 0
+    kv_used_tokens: int = 0
 
     # Speculative decoding
     spec_accept_length: float = 0.0
@@ -129,6 +134,10 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+
+    # Streaming session metrics
+    num_streaming_sessions: int = 0
+    streaming_session_held_tokens: int = 0
 
     # Routing key metrics
     num_unique_running_routing_keys: int = 0
@@ -174,6 +183,7 @@ class SchedulerMetricsCollector:
         labels: Dict[str, str],
         enable_lora: bool = False,
         enable_hierarchical_cache: bool = False,
+        enable_streaming_session: bool = False,
         server_args: Optional["ServerArgs"] = None,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
@@ -182,6 +192,7 @@ class SchedulerMetricsCollector:
         self.labels = labels
         self.enable_lora = enable_lora
         self.enable_hierarchical_cache = enable_hierarchical_cache
+        self.enable_streaming_session = enable_streaming_session
         self.last_log_time = time.perf_counter()
         self._known_priorities: Set[int] = set()
 
@@ -267,6 +278,25 @@ class SchedulerMetricsCollector:
         self.max_total_num_tokens = Gauge(
             name="sglang:max_total_num_tokens",
             documentation="Maximum total number of tokens in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+        self.kv_available_tokens = Gauge(
+            name="sglang:kv_available_tokens",
+            documentation="Number of free token slots in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_evictable_tokens = Gauge(
+            name="sglang:kv_evictable_tokens",
+            documentation="Number of evictable (radix-cached) token slots in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_used_tokens = Gauge(
+            name="sglang:kv_used_tokens",
+            documentation="Number of actively used token slots in the KV cache pool.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -652,6 +682,21 @@ class SchedulerMetricsCollector:
                 multiprocess_mode="mostrecent",
             )
 
+        # Streaming session metrics (only created when streaming sessions are enabled)
+        if self.enable_streaming_session:
+            self.num_streaming_sessions = Gauge(
+                name="sglang:num_streaming_sessions",
+                documentation="The number of streaming sessions.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.streaming_session_held_tokens = Gauge(
+                name="sglang:streaming_session_held_tokens",
+                documentation="The number of KV tokens currently held by streaming session slots.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+
         self.num_unique_running_routing_keys = Gauge(
             name="sglang:num_unique_running_routing_keys",
             documentation="Number of unique routing keys in running batch.",
@@ -701,6 +746,30 @@ class SchedulerMetricsCollector:
                 "the CPU schedule stream (overlap bubble)."
             ),
             labelnames=list(labels.keys()) + ["category"],
+        )
+        self.estimated_flops_per_gpu_total = Counter(
+            name="sglang:estimated_flops_per_gpu_total",
+            documentation=(
+                "Estimated number of floating point operations per GPU "
+                "(for Model FLOPs Utilization calculations)."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.estimated_read_bytes_per_gpu_total = Counter(
+            name="sglang:estimated_read_bytes_per_gpu_total",
+            documentation=(
+                "Estimated number of bytes read from memory per GPU "
+                "(for Model FLOPs Utilization calculations)."
+            ),
+            labelnames=labels.keys(),
+        )
+        self.estimated_write_bytes_per_gpu_total = Counter(
+            name="sglang:estimated_write_bytes_per_gpu_total",
+            documentation=(
+                "Estimated number of bytes written to memory per GPU "
+                "(for Model FLOPs Utilization calculations)."
+            ),
+            labelnames=labels.keys(),
         )
 
         self.dp_cooperation_realtime_tokens_total = Counter(
@@ -928,6 +997,25 @@ class SchedulerMetricsCollector:
                 **dp_cooperation_info.to_labels(),
             ).inc(t)
 
+    def increment_estimated_perf(
+        self,
+        num_flops_per_gpu: float = 0.0,
+        num_read_bytes_per_gpu: float = 0.0,
+        num_write_bytes_per_gpu: float = 0.0,
+    ) -> None:
+        if num_flops_per_gpu > 0:
+            self.estimated_flops_per_gpu_total.labels(**self.labels).inc(
+                num_flops_per_gpu
+            )
+        if num_read_bytes_per_gpu > 0:
+            self.estimated_read_bytes_per_gpu_total.labels(**self.labels).inc(
+                num_read_bytes_per_gpu
+            )
+        if num_write_bytes_per_gpu > 0:
+            self.estimated_write_bytes_per_gpu_total.labels(**self.labels).inc(
+                num_write_bytes_per_gpu
+            )
+
     def log_stats(self, stats: SchedulerStats) -> None:
         self._log_gauge_queue_count(self.num_running_reqs, stats.num_running_reqs)
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
@@ -948,6 +1036,9 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.cache_hit_rate, stats.cache_hit_rate)
 
         self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
+        self._log_gauge(self.kv_available_tokens, stats.kv_available_tokens)
+        self._log_gauge(self.kv_evictable_tokens, stats.kv_evictable_tokens)
+        self._log_gauge(self.kv_used_tokens, stats.kv_used_tokens)
 
         # Speculative decoding
         self._log_gauge(self.spec_accept_length, stats.spec_accept_length)
@@ -1004,6 +1095,13 @@ class SchedulerMetricsCollector:
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
 
+        # Streaming session metrics (only logged if streaming sessions are enabled)
+        if self.enable_streaming_session:
+            self._log_gauge(self.num_streaming_sessions, stats.num_streaming_sessions)
+            self._log_gauge(
+                self.streaming_session_held_tokens, stats.streaming_session_held_tokens
+            )
+
         self._log_gauge(
             self.num_unique_running_routing_keys, stats.num_unique_running_routing_keys
         )
@@ -1053,13 +1151,11 @@ class TokenizerMetricsCollector:
         bucket_time_to_first_token: Optional[List[float]] = None,
         bucket_inter_token_latency: Optional[List[float]] = None,
         bucket_e2e_request_latency: Optional[List[float]] = None,
-        collect_tokens_histogram: bool = False,
     ) -> None:
         # We need to import prometheus_client after setting the env variable `PROMETHEUS_MULTIPROC_DIR`
         from prometheus_client import Counter, Histogram
 
         self.labels = labels or {}
-        self.collect_tokens_histogram = collect_tokens_histogram
 
         self.prompt_tokens_total = Counter(
             name="sglang:prompt_tokens_total",
@@ -1073,56 +1169,55 @@ class TokenizerMetricsCollector:
             labelnames=labels.keys(),
         )
 
-        if collect_tokens_histogram:
-            default_bucket_prompt_tokens = [
-                100,
-                300,
-                500,
-                700,
-                1000,
-                1500,
-                2000,
-                3000,
-                4000,
-                5000,
-                6000,
-                7000,
-                8000,
-                9000,
-                10000,
-                12000,
-                15000,
-                20000,
-                22000,
-                25000,
-                30000,
-                35000,
-                40000,
-                66000,
-                99000,
-                132000,
-                300000,
-                600000,
-                900000,
-                1100000,
-            ]
-            self.prompt_tokens_histogram = Histogram(
-                name="sglang:prompt_tokens_histogram",
-                documentation="Histogram of prompt token length.",
-                labelnames=labels.keys(),
-                buckets=generate_buckets(
-                    server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
-                ),
-            )
-            self.generation_tokens_histogram = Histogram(
-                name="sglang:generation_tokens_histogram",
-                documentation="Histogram of generation token length.",
-                labelnames=labels.keys(),
-                buckets=generate_buckets(
-                    server_args.generation_tokens_buckets,
-                    default_bucket_prompt_tokens,
-                ),
-            )
+        default_bucket_prompt_tokens = [
+            100,
+            300,
+            500,
+            700,
+            1000,
+            1500,
+            2000,
+            3000,
+            4000,
+            5000,
+            6000,
+            7000,
+            8000,
+            9000,
+            10000,
+            12000,
+            15000,
+            20000,
+            22000,
+            25000,
+            30000,
+            35000,
+            40000,
+            66000,
+            99000,
+            132000,
+            300000,
+            600000,
+            900000,
+            1100000,
+        ]
+        self.prompt_tokens_histogram = Histogram(
+            name="sglang:prompt_tokens_histogram",
+            documentation="Histogram of prompt token length.",
+            labelnames=labels.keys(),
+            buckets=generate_buckets(
+                server_args.prompt_tokens_buckets, default_bucket_prompt_tokens
+            ),
+        )
+        self.generation_tokens_histogram = Histogram(
+            name="sglang:generation_tokens_histogram",
+            documentation="Histogram of generation token length.",
+            labelnames=labels.keys(),
+            buckets=generate_buckets(
+                server_args.generation_tokens_buckets,
+                default_bucket_prompt_tokens,
+            ),
+        )
 
         self.cached_tokens_total = Counter(
             name="sglang:cached_tokens_total",
@@ -1315,11 +1410,10 @@ class TokenizerMetricsCollector:
         if has_grammar:
             self.num_so_requests_total.labels(**labels).inc(1)
         self.histogram_e2e_request_latency.labels(**labels).observe(float(e2e_latency))
-        if self.collect_tokens_histogram:
-            self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
-            self.generation_tokens_histogram.labels(**labels).observe(
-                float(generation_tokens)
-            )
+        self.prompt_tokens_histogram.labels(**labels).observe(float(prompt_tokens))
+        self.generation_tokens_histogram.labels(**labels).observe(
+            float(generation_tokens)
+        )
         self.num_retractions.labels(**labels).observe(retraction_count)
 
     def observe_time_to_first_token(self, labels: Dict[str, str], value: float):

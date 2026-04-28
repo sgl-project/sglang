@@ -18,6 +18,9 @@ from sglang.srt.distributed import (
     get_attn_tensor_model_parallel_rank,
     get_attn_tensor_model_parallel_world_size,
     get_attn_tp_group,
+)
+from sglang.srt.distributed import get_moe_dp_group as _get_moe_dp_group
+from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
     get_tp_group,
@@ -64,13 +67,20 @@ class DpPaddingMode(IntEnum):
     def get_dp_padding_mode(
         cls, is_extend_in_batch, global_num_tokens: List[int]
     ) -> DpPaddingMode:
-        if is_extend_in_batch:
+        dp_size = get_attention_dp_size()
+
+        # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
+        # overhead from uneven token distribution.
+        # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
+        # to enable symmetric memory optimization (needed for NSA CP, etc.).
+        if is_extend_in_batch and dp_size > 1:
             return DpPaddingMode.SUM_LEN
 
         # we choose the mode that minimizes the communication cost
+        # prefer MAX_LEN when communication cost is equal to enable symmetric memory
         max_len = max(global_num_tokens)
         sum_len = sum(global_num_tokens)
-        if sum_len * 2 > max_len * get_attention_dp_size():
+        if sum_len * 2 >= max_len * dp_size:
             return cls.MAX_LEN
         else:
             return cls.SUM_LEN
@@ -571,6 +581,31 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_attention_cp_group().all_gather_into_tensor(output, input)
+
+
+def get_moe_cp_group() -> GroupCoordinator:
+    """Returns the MOE_DP group, which includes CP partners when attn_cp_size > moe_dp_size."""
+    return _get_moe_dp_group()
+
+
+def get_moe_cp_rank() -> int:
+    return _get_moe_dp_group().rank_in_group
+
+
+def get_moe_cp_size() -> int:
+    return _get_moe_dp_group().world_size
+
+
+def is_enable_moe_cp_allgather() -> bool:
+    """True when moe_dp_size < attn_cp_size, requiring allgather across CP ranks before MoE."""
+    from sglang.srt.server_args import get_global_server_args
+
+    sa = get_global_server_args()
+    return sa.attn_cp_size > sa.moe_dp_size
+
+
+def moe_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
+    return _get_moe_dp_group().all_gather_into_tensor(output, input)
 
 
 def attn_tp_all_gather(output_list: List[torch.Tensor], input: torch.Tensor):

@@ -15,6 +15,9 @@ import torch.nn.functional as F
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    get_or_create_request_scheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -57,17 +60,26 @@ def sample_block_noise(
     _, ph, pw = patch_size
     block_size = ph * pw
 
-    # Explicitly use CPU to avoid requiring MAGMA for cholesky on ROCm/CUDA
+    # Explicitly use CPU to avoid requiring MAGMA on ROCm/CUDA.
+    #
+    # For the default Helios stage-2 setting gamma=1/3 with a 2x2 block, the
+    # covariance has eigenvalues {0, 1+gamma, 1+gamma, 1+gamma} and is therefore
+    # only positive semidefinite. `MultivariateNormal(covariance_matrix=...)`
+    # requires a strictly positive-definite matrix and fails in the Cholesky
+    # factorization path, so sample from the PSD covariance via eigen-decomposition.
     cov = (
-        torch.eye(block_size, device="cpu") * (1 + gamma)
-        - torch.ones(block_size, block_size, device="cpu") * gamma
-    )
-    dist = torch.distributions.MultivariateNormal(
-        torch.zeros(block_size, device="cpu"), covariance_matrix=cov
+        torch.eye(block_size, device="cpu", dtype=torch.float64) * (1 + gamma)
+        - torch.ones(block_size, block_size, device="cpu", dtype=torch.float64) * gamma
     )
     block_number = batch_size * channel * num_frames * (height // ph) * (width // pw)
-
-    noise = dist.sample((block_number,))
+    cov = 0.5 * (cov + cov.T)
+    eigvals, eigvecs = torch.linalg.eigh(cov)
+    eigvals = eigvals.clamp_min(0.0)
+    transform = eigvecs @ torch.diag(torch.sqrt(eigvals))
+    base_noise = torch.randn(
+        block_number, block_size, device="cpu", dtype=torch.float64
+    )
+    noise = (base_noise @ transform.T).to(dtype=torch.float32)
     noise = noise.view(
         batch_size, channel, num_frames, height // ph, width // pw, ph, pw
     )
@@ -117,6 +129,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         batch=None,
         server_args=None,
         global_step_offset=0,
+        scheduler=None,
     ):
         """Denoise a single chunk with full timestep loop."""
         batch_size = latents.shape[0]
@@ -217,9 +230,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                             noise_pred - noise_uncond
                         )
 
-                latents = self.scheduler.step(
-                    noise_pred, t, latents, return_dict=False
-                )[0]
+                latents = scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
         return latents
 
@@ -249,6 +260,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
         batch=None,
         server_args=None,
         global_step_offset=0,
+        scheduler=None,
     ):
         """Denoise a single chunk using pyramid super-resolution (Stage 2)."""
         batch_size, num_channel, num_frames, height, width = latents.shape
@@ -283,14 +295,14 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             )
             mu = calculate_shift(image_seq_len)
 
-            self.scheduler.set_timesteps(
+            scheduler.set_timesteps(
                 pyramid_num_inference_steps_list[i_s],
                 i_s,
                 device=device,
                 mu=mu,
                 is_amplify_first_chunk=is_amplify_first_chunk,
             )
-            timesteps = self.scheduler.timesteps
+            timesteps = scheduler.timesteps
 
             if i_s > 0:
                 # Upsample 2x nearest-neighbor
@@ -308,7 +320,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                 ).permute(0, 2, 1, 3, 4)
 
                 # Renoise with correlated block noise
-                ori_sigma = 1 - self.scheduler.ori_start_sigmas[i_s]
+                ori_sigma = 1 - scheduler.ori_start_sigmas[i_s]
                 alpha = 1 / (math.sqrt(1 + (1 / gamma)) * (1 - ori_sigma) + ori_sigma)
                 beta = alpha * (1 - ori_sigma) / math.sqrt(gamma)
 
@@ -419,7 +431,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                                 noise_pred - noise_uncond
                             )
 
-                    latents = self.scheduler.step(
+                    latents = scheduler.step(
                         noise_pred,
                         t,
                         latents,
@@ -430,8 +442,8 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                             if start_point_list is not None
                             else None
                         ),
-                        dmd_sigmas=self.scheduler.sigmas,
-                        dmd_timesteps=self.scheduler.timesteps,
+                        dmd_sigmas=scheduler.sigmas,
+                        dmd_timesteps=scheduler.timesteps,
                         all_timesteps=timesteps,
                     )[0]
 
@@ -442,6 +454,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the Helios chunked denoising loop."""
         pipeline_config = server_args.pipeline_config
+        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
         device = (
             batch.latents.device
             if hasattr(batch, "latents") and batch.latents is not None
@@ -662,13 +675,14 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                     batch=batch,
                     server_args=server_args,
                     global_step_offset=global_step_offset,
+                    scheduler=scheduler,
                 )
             else:
                 # Stage 1: Standard flat denoising
-                self.scheduler.set_timesteps(
+                scheduler.set_timesteps(
                     num_inference_steps, device=device, sigmas=sigmas, mu=mu
                 )
-                timesteps = self.scheduler.timesteps
+                timesteps = scheduler.timesteps
 
                 latents = self._denoise_one_chunk(
                     latents=latents,
@@ -691,6 +705,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
                     batch=batch,
                     server_args=server_args,
                     global_step_offset=global_step_offset,
+                    scheduler=scheduler,
                 )
                 global_step_offset += num_inference_steps
 

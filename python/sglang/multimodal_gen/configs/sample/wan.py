@@ -4,7 +4,41 @@
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
-from sglang.multimodal_gen.configs.sample.teacache import WanTeaCacheParams
+from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+
+
+def _wan_1_3b_coefficients(p: TeaCacheParams) -> list[float]:
+    if p.use_ret_steps:
+        # from https://github.com/ali-vilab/TeaCache/blob/7c10efc4702c6b619f47805f7abe4a7a08085aa0/TeaCache4Wan2.1/teacache_generate.py#L883
+        return [
+            -5.21862437e04,
+            9.23041404e03,
+            -5.28275948e02,
+            1.36987616e01,
+            -4.99875664e-02,
+        ]
+    # from https://github.com/ali-vilab/TeaCache/blob/7c10efc4702c6b619f47805f7abe4a7a08085aa0/TeaCache4Wan2.1/teacache_generate.py#L890
+    return [
+        2.39676752e03,
+        -1.31110545e03,
+        2.01331979e02,
+        -8.29855975e00,
+        1.37887774e-01,
+    ]
+
+
+def _wan_14b_coefficients(p: TeaCacheParams) -> list[float]:
+    if p.use_ret_steps:
+        # from https://github.com/ali-vilab/TeaCache/blob/7c10efc4702c6b619f47805f7abe4a7a08085aa0/TeaCache4Wan2.1/teacache_generate.py#L885
+        return [
+            -3.03318725e05,
+            4.90537029e04,
+            -2.65530556e03,
+            5.87365115e01,
+            -3.15583525e-01,
+        ]
+    # from https://github.com/ali-vilab/TeaCache/blob/7c10efc4702c6b619f47805f7abe4a7a08085aa0/TeaCache4Wan2.1/teacache_generate.py#L892
+    return [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404]
 
 
 @dataclass
@@ -30,23 +64,13 @@ class WanT2V_1_3B_SamplingParams(SamplingParams):
         ]
     )
 
-    teacache_params: WanTeaCacheParams = field(
-        default_factory=lambda: WanTeaCacheParams(
+    teacache_params: TeaCacheParams = field(
+        default_factory=lambda: TeaCacheParams(
             teacache_thresh=0.08,
-            ret_steps_coeffs=[
-                -5.21862437e04,
-                9.23041404e03,
-                -5.28275948e02,
-                1.36987616e01,
-                -4.99875664e-02,
-            ],
-            non_ret_steps_coeffs=[
-                2.39676752e03,
-                -1.31110545e03,
-                2.01331979e02,
-                -8.29855975e00,
-                1.37887774e-01,
-            ],
+            use_ret_steps=True,
+            coefficients_callback=_wan_1_3b_coefficients,
+            start_skipping=5,
+            end_skipping=1.0,
         )
     )
 
@@ -76,24 +100,13 @@ class WanT2V_14B_SamplingParams(SamplingParams):
         ]
     )
 
-    teacache_params: WanTeaCacheParams = field(
-        default_factory=lambda: WanTeaCacheParams(
+    teacache_params: TeaCacheParams = field(
+        default_factory=lambda: TeaCacheParams(
             teacache_thresh=0.20,
             use_ret_steps=False,
-            ret_steps_coeffs=[
-                -3.03318725e05,
-                4.90537029e04,
-                -2.65530556e03,
-                5.87365115e01,
-                -3.15583525e-01,
-            ],
-            non_ret_steps_coeffs=[
-                -5784.54975374,
-                5449.50911966,
-                -1811.16591783,
-                256.27178429,
-                -13.02252404,
-            ],
+            coefficients_callback=_wan_14b_coefficients,
+            start_skipping=1,
+            end_skipping=-1,
         )
     )
 
@@ -113,23 +126,13 @@ class WanI2V_14B_480P_SamplingParam(WanT2V_1_3B_SamplingParams):
         ]
     )
 
-    teacache_params: WanTeaCacheParams = field(
-        default_factory=lambda: WanTeaCacheParams(
+    teacache_params: TeaCacheParams = field(
+        default_factory=lambda: TeaCacheParams(
             teacache_thresh=0.26,
-            ret_steps_coeffs=[
-                -3.03318725e05,
-                4.90537029e04,
-                -2.65530556e03,
-                5.87365115e01,
-                -3.15583525e-01,
-            ],
-            non_ret_steps_coeffs=[
-                -5784.54975374,
-                5449.50911966,
-                -1811.16591783,
-                256.27178429,
-                -13.02252404,
-            ],
+            use_ret_steps=True,
+            coefficients_callback=_wan_14b_coefficients,
+            start_skipping=5,
+            end_skipping=1.0,
         )
     )
 
@@ -151,23 +154,13 @@ class WanI2V_14B_720P_SamplingParam(WanT2V_14B_SamplingParams):
         ]
     )
 
-    teacache_params: WanTeaCacheParams = field(
-        default_factory=lambda: WanTeaCacheParams(
+    teacache_params: TeaCacheParams = field(
+        default_factory=lambda: TeaCacheParams(
             teacache_thresh=0.3,
-            ret_steps_coeffs=[
-                -3.03318725e05,
-                4.90537029e04,
-                -2.65530556e03,
-                5.87365115e01,
-                -3.15583525e-01,
-            ],
-            non_ret_steps_coeffs=[
-                -5784.54975374,
-                5449.50911966,
-                -1811.16591783,
-                256.27178429,
-                -13.02252404,
-            ],
+            use_ret_steps=True,
+            coefficients_callback=_wan_14b_coefficients,
+            start_skipping=5,
+            end_skipping=1.0,
         )
     )
 
@@ -211,6 +204,11 @@ class Wan2_2_Base_SamplingParams(SamplingParams):
     negative_prompt: str | None = (
         "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
     )
+
+    # TODO(Wan2.2): TeaCache coefficients need to be calibrated for Wan2.2 by
+    # profiling L1 distances across timesteps. Until then, teacache_params is None
+    # and enable_teacache will be accepted but silently no-op.
+    # Consider using Cache-DiT (SGLANG_CACHE_DIT_ENABLED=1) as an alternative.
 
 
 @dataclass
