@@ -261,8 +261,9 @@ class NativeSparseAttnBackendMTPPrecomputeMixin:
         cache_seqlens = seq_lens.to(torch.int32)
         cu_seqlens_k = compute_cu_seqlens(cache_seqlens)
 
-        # Extend seqlens from spec_info
-        extend_seq_lens = spec_info.num_accepted_drafts[:bs]
+        # Extend seqlens from spec_info. num_accepted_drafts is drafts-only;
+        # extend QO length per req is +1 (bonus token).
+        extend_seq_lens = spec_info.num_accepted_drafts[:bs] + 1
         extend_seq_lens_cpu = extend_seq_lens.tolist()
 
         # Page indices (repeated per accept length)
