@@ -593,7 +593,7 @@ export const DeepSeekV4Deployment = () => {
         // headroom for DeepEP buffer + mooncake KV recv + CG private pool.
         // Cookbook defaults (mem-frac 0.874, cg_max_bs 512, max-running 256)
         // OOM during CG capture. mem-frac sweep at 0.83 / 0.87 / 0.89 / 0.91
-        // all pass static smoke; 0.9 picked as the default — leaves
+        // all pass static validation; 0.9 picked as the default — leaves
         // ~14 GB / GPU post-CG headroom for mooncake transfer + activation
         // peaks while giving ~1M-token KV pool.
         if (isGB300 && modelSize === "big") {

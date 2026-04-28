@@ -183,9 +183,9 @@ jobs:
           cd sgl-kernel
           pytest tests/
 
-  # Adding a single CUDA13 smoke test to verify that the kernel builds and runs
+  # Adding a single CUDA13 build-and-run check for the kernel
   # TODO: Add back this test when it can pass on CI
-  # cuda13-kernel-smoke-test:
+  # cuda13-kernel-build-check:
   #   if: inputs.sgl_kernel == 'true'
   #   runs-on: x64-cu13-kernel-tests
   #   steps:
