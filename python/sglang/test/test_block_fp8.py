@@ -5,7 +5,7 @@ from functools import lru_cache
 import torch
 
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_moe
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
