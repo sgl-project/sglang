@@ -931,6 +931,16 @@ class Gemma3TextModel(nn.Module):
 
 
 class Gemma3ForConditionalGeneration(nn.Module):
+    # transformers 5.6.0 flattened SiglipVisionModel, dropping the
+    # `vision_model` intermediate wrapper. Our reimpl keeps it, so remap
+    # HF source keys back into our nested namespace when transferring weights.
+    param_names_mapping = {
+        r"^(vision_tower\.)(embeddings|encoder|post_layernorm|head)\.": r"\1vision_model.\2.",
+    }
+    reverse_param_names_mapping = {
+        r"^(vision_tower\.)vision_model\.(embeddings|encoder|post_layernorm|head)\.": r"\1\2.",
+    }
+
     def __init__(
         self,
         config: Gemma3Config,

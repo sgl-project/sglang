@@ -276,6 +276,7 @@ Large suites are split across matrix jobs using the **LPT (Longest Processing Ti
 | `stage-b-test-2-gpu-large` | 4 | `2-gpu-h100` | — |
 | `stage-b-test-4-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
 | `stage-b-kernel-unit-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
+| `stage-b-kernel-unit-1-gpu-b200` | 1 (no matrix) | `4-gpu-b200` | — |
 | `stage-b-kernel-unit-8-gpu-h200` | 1 (no matrix) | `8-gpu-h200` | — |
 | `stage-b-kernel-benchmark-1-gpu-large` | 1 (no matrix) | `1-gpu-h100` | — |
 | `stage-c-test-4-gpu-h100` | 3 | `4-gpu-h100` | — |
@@ -283,10 +284,12 @@ Large suites are split across matrix jobs using the **LPT (Longest Processing Ti
 | `stage-c-test-8-gpu-h20` | 2 | `8-gpu-h20` | — |
 | `stage-c-test-deepep-4-gpu-h100` | 1 (no matrix) | `4-gpu-h100` | — |
 | `stage-c-test-deepep-8-gpu-h200` | 1 (no matrix) | `8-gpu-h200` | — |
-| `stage-c-test-4-gpu-b200` | 4 | `4-gpu-b200` | — |
-| `stage-c-test-4-gpu-gb200` | 1 (no matrix) | `4-gpu-gb200` | — |
+| `stage-c-test-4-gpu-b200` | 3 | `4-gpu-b200` | — |
+| `stage-c-test-4-gpu-b200-small` | 3 | `4-gpu-b200-low-disk` | — |
+| `stage-c-test-8-gpu-b200` | registered only | `8-gpu-b200` | — |
+| `stage-c-test-4-gpu-gb200` | registered only | `4-gpu-gb200` | — |
 
-> **Note**: Kernel suites (`stage-b-kernel-*`) run via `pr-test-jit-kernel.yml` and `pr-test-sgl-kernel.yml`, not the main `pr-test.yml`. Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
+> **Note**: Kernel suites (`stage-b-kernel-*`) run via `pr-test-jit-kernel.yml` and `pr-test-sgl-kernel.yml`, not the main `pr-test.yml`. `stage-c-test-8-gpu-b200` is registered in `test/run_suite.py` but not wired to PR CI. The GB200 job is currently commented out in `pr-test.yml` until a company-owned runner is provisioned. Multimodal diffusion uses `python/sglang/multimodal_gen/test/run_suite.py`, not `test/run_suite.py`.
 
 **Workflow usage:**
 ```yaml
@@ -317,11 +320,11 @@ Determines which test suites to run based on file changes.
 | Output | Triggers |
 |--------|----------|
 | `main_package` | Stage A/B/C test suites |
-| `sgl_kernel` | Kernel wheel builds + kernel test suites |
+| `sgl_kernel` | Kernel wheel builds + kernel test suites; also switches B200 jobs to kernel-build runner labels outside `target_stage` mode |
 | `jit_kernel` | JIT kernel test workflow |
 | `multimodal_gen` | Multimodal-gen test workflow |
 
-> **Note**: `sgl_kernel` is forced to `false` when `target_stage` is set, because `sgl-kernel-build-wheels` won't run and wheel artifacts won't be available.
+> **Note**: In `target_stage` mode, `sgl_kernel` is only active when `include_wheel_build=true`. Without that opt-in, kernel-change reruns fail validation instead of running a target stage without freshly built wheels. Outside `target_stage`, `sgl_kernel=true` switches B200 jobs from `4-gpu-b200` / `4-gpu-b200-low-disk` to `4-gpu-b200-kernel` / `4-gpu-b200-kernel-low-disk`.
 
 ---
 

@@ -182,7 +182,9 @@ export const DeepSeekV4Deployment = () => {
     "gb300|small|low-latency",
     "gb300|big|low-latency",
     "gb300|small|balanced",
+    "gb300|big|balanced",
     "gb300|small|max-throughput",
+    "gb300|big|max-throughput",
     "h200|small|cp",
     "h200|small|pd-disagg",
     "h200|big|low-latency",
@@ -255,7 +257,6 @@ export const DeepSeekV4Deployment = () => {
 
     // ---- env ----
     // _LAUNCH_HEAD always prepends these:
-    const COMMON_ENV = ["SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
     // Per-hardware env (whitelist #1: NVSHMEM removed for B200).
     const HW_ENV = {
       h200:  ["SGLANG_DSV4_FP4_EXPERTS=0"],   // allinone _ENV_H200
@@ -365,6 +366,8 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --speculative-num-draft-tokens 2");
       if (hardware === "h200" && isBig) {
         flags.push("  --mem-fraction-static 0.88");
+      } else if (isBig && hardware === "gb300") {
+        flags.push("  --mem-fraction-static 0.9");
       } else if (isBig && hardware === "gb200") {
         flags.push("  --mem-fraction-static 0.78");
       } else if (isBig) {
@@ -401,6 +404,8 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --moe-a2a-backend deepep");
       if (hardware === "h200" && isBig) {
         flags.push("  --mem-fraction-static 0.88");
+      } else if (isBig && hardware === "gb300") {
+        flags.push("  --mem-fraction-static 0.9");
       } else if (isBig && hardware === "gb200") {
         flags.push("  --mem-fraction-static 0.78");
       } else if (isBig) {
@@ -461,8 +466,8 @@ export const DeepSeekV4Deployment = () => {
     flags.push("  --host 0.0.0.0");
     flags.push("  --port 30000");
 
-    // Assemble: [HW env] [recipe env] [common env] \ sglang serve \ flags...
-    const envAll = [...HW_ENV, ...recipeEnv, ...COMMON_ENV];
+    // Assemble: [HW env] [recipe env] \ sglang serve \ flags...
+    const envAll = [...HW_ENV, ...recipeEnv];
     const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
     const base = `${envBlock}sglang serve \\\n${flags.join(" \\\n")}`;
     // GB200 multinode may need machine-specific NVSHMEM / Gloo env vars;
@@ -521,7 +526,6 @@ export const DeepSeekV4Deployment = () => {
     // NCCL_MNNVL_ENABLE / NCCL_CUMEM_ENABLE may also be needed depending on the
     // GB300 cluster's NVLink/IB topology — see §3.2 "Configuration Tips" note.
     const MNNVL_ENV = isGB300 ? ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True"] : [];
-    const COMMON_ENV = ["SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
 
     const buildRole = (mode, port, distPort) => {
       const roleEnv = [];
@@ -546,7 +550,7 @@ export const DeepSeekV4Deployment = () => {
       if (hardware === "h200" && modelSize === "big") {
         roleEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128");
       }
-      const envAll = [...HW_ENV, ...roleEnv, ...MNNVL_ENV, ...COMMON_ENV];
+      const envAll = [...HW_ENV, ...roleEnv, ...MNNVL_ENV];
       const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
 
       const flags = [];
@@ -589,7 +593,7 @@ export const DeepSeekV4Deployment = () => {
         // headroom for DeepEP buffer + mooncake KV recv + CG private pool.
         // Cookbook defaults (mem-frac 0.874, cg_max_bs 512, max-running 256)
         // OOM during CG capture. mem-frac sweep at 0.83 / 0.87 / 0.89 / 0.91
-        // all pass static smoke; 0.9 picked as the default — leaves
+        // all pass static validation; 0.9 picked as the default — leaves
         // ~14 GB / GPU post-CG headroom for mooncake transfer + activation
         // peaks while giving ~1M-token KV pool.
         if (isGB300 && modelSize === "big") {
