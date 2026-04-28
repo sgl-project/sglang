@@ -26,6 +26,7 @@ from sglang.srt.ug.context import UGSessionHandle
 from sglang.srt.ug.runtime import (
     UGInterleavedMessage,
     UGLatentDecodeRequest,
+    UGLatentPrepareRequest,
     UGSegmentState,
     UGSessionRuntime,
     UGVelocityRequest,
@@ -263,8 +264,9 @@ def _fake_bagel_prepared() -> BAGELPreparedDenoise:
     generation_input = {
         "packed_text_ids": torch.tensor([1, 2]),
         "packed_text_indexes": torch.tensor([0, 3]),
+        "packed_init_noises": torch.zeros(8, 64),
         "packed_vae_token_indexes": torch.tensor([1, 2]),
-        "packed_vae_position_ids": torch.tensor([7, 8]),
+        "packed_vae_position_ids": torch.arange(8),
         "packed_seqlens": torch.tensor([4], dtype=torch.int),
         "packed_position_ids": torch.tensor([0, 0, 0, 0]),
         "packed_indexes": torch.tensor([0, 1, 2, 3]),
@@ -583,13 +585,27 @@ class TestBAGELInterleaveContextBackend(unittest.TestCase):
             cfg_renorm_min=0.1,
             cfg_renorm_type="channel",
         )
-        latents = torch.zeros(2, 3)
+        prepared_latents = runtime.prepare_latents(
+            UGLatentPrepareRequest(
+                session=handle,
+                sampling_params=sampling_params,
+                seed=123,
+            )
+        )
+        self.assertIsNotNone(prepared_latents)
+        self.assertEqual(tuple(prepared_latents.latent_tokens.shape), (8, 64))
+        self.assertTrue(
+            torch.equal(prepared_latents.latent_position_ids, torch.arange(8))
+        )
+        self.assertEqual(prepared_latents.latent_shape, (4, 2, 64))
+        latents = prepared_latents.latent_tokens
+
         response = runtime.predict_velocity(
             UGVelocityRequest(
                 session=handle,
                 latent_tokens=latents,
                 timestep=torch.tensor([0.5]),
-                latent_position_ids=torch.arange(3),
+                latent_position_ids=prepared_latents.latent_position_ids,
                 sampling_params=sampling_params,
             )
         )
@@ -598,7 +614,7 @@ class TestBAGELInterleaveContextBackend(unittest.TestCase):
                 session=response.session,
                 latent_tokens=latents,
                 timestep=torch.tensor([0.45]),
-                latent_position_ids=torch.arange(3),
+                latent_position_ids=prepared_latents.latent_position_ids,
                 sampling_params=sampling_params,
             )
         )

@@ -66,6 +66,20 @@ class UGVelocityResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class UGLatentPrepareRequest:
+    session: UGSessionHandle
+    sampling_params: Any
+    seed: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class UGLatentPrepareResult:
+    latent_tokens: torch.Tensor
+    latent_position_ids: torch.Tensor
+    latent_shape: tuple[int, int, int] | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class UGLatentDecodeRequest:
     session: UGSessionHandle
     latent_tokens: torch.Tensor
@@ -117,6 +131,10 @@ class UGModelRunnerProtocol(Protocol):
         self, *, request: UGVelocityRequest, record: UGSessionRecord
     ) -> torch.Tensor: ...
 
+    def prepare_latents_from_session(
+        self, *, request: UGLatentPrepareRequest, record: UGSessionRecord
+    ) -> UGLatentPrepareResult | None: ...
+
     def append_generated_image(
         self, *, record: UGSessionRecord, image: Any | None
     ) -> int: ...
@@ -159,6 +177,12 @@ class FakeUGModelRunner:
         return request.latent_tokens + scale * request.timestep.reshape(-1, 1, 1).to(
             request.latent_tokens
         )
+
+    def prepare_latents_from_session(
+        self, *, request: UGLatentPrepareRequest, record: UGSessionRecord
+    ) -> UGLatentPrepareResult | None:
+        del request, record
+        return None
 
     def append_generated_image(
         self, *, record: UGSessionRecord, image: Any | None
@@ -290,6 +314,20 @@ class UGSessionRuntime:
         )
         record.velocity_count += 1
         return UGVelocityResponse(session=record.handle(), velocity=velocity)
+
+    def prepare_latents(
+        self, request: UGLatentPrepareRequest
+    ) -> UGLatentPrepareResult | None:
+        record = self._record_for(request.session)
+        if record.state != UGSegmentState.G_DENOISE:
+            raise ValueError(
+                f"Cannot prepare UG latents from state {record.state} "
+                f"for UG session {request.session.session_id}"
+            )
+        return self.model_runner.prepare_latents_from_session(
+            request=request,
+            record=record,
+        )
 
     def decode_latents_to_image(self, request: UGLatentDecodeRequest) -> Any | None:
         record = self._record_for(request.session)

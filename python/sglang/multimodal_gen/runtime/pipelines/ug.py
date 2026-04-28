@@ -46,7 +46,7 @@ class UGPipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs):
         bridge = self.get_module("ug_bridge")
         self.add_stage(UGContextStage(bridge))
-        self.add_stage(UGLatentStage())
+        self.add_stage(UGLatentStage(bridge))
         self.add_stage(UGDenoiseStage(bridge))
         self.add_stage(UGDecodeStage(bridge))
 

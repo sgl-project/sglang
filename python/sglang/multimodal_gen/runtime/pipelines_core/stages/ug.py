@@ -61,12 +61,29 @@ class UGContextStage(PipelineStage):
 
 
 class UGLatentStage(PipelineStage):
+    def __init__(self, bridge: UGDenoiserBridge) -> None:
+        super().__init__()
+        self.bridge = bridge
+
     @property
     def role_affinity(self):
         return RoleType.DENOISER
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         cfg = server_args.pipeline_config
+        contexts = batch.extra.get("ug_contexts")
+        if contexts is not None:
+            prepared = self.bridge.prepare_latents(
+                contexts=contexts,
+                sampling_params=batch.sampling_params,
+                seed=batch.seed,
+            )
+            if prepared is not None:
+                batch.latents = prepared.latent_tokens
+                batch.extra["ug_latent_position_ids"] = prepared.latent_position_ids
+                batch.extra["ug_latent_shape"] = prepared.latent_shape
+                return batch
+
         height = int(batch.height)
         width = int(batch.width)
         latent_height = height // cfg.latent_downsample

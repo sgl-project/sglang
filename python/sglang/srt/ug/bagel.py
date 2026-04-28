@@ -5,7 +5,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,6 +22,8 @@ from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
     UGLatentDecodeRequest,
+    UGLatentPrepareRequest,
+    UGLatentPrepareResult,
     UGVelocityRequest,
 )
 
@@ -341,6 +343,41 @@ class BAGELInterleaveContextBackend:
             )
         return velocity.to(request.latent_tokens.device)
 
+    def prepare_latents_from_session(
+        self, *, session, request: UGLatentPrepareRequest
+    ) -> UGLatentPrepareResult | None:
+        state = self._state_for(session.handle.session_id)
+        if state.prepared_denoise is None:
+            state.prepared_denoise = self._prepare_denoise(
+                state,
+                request.sampling_params,
+                seed=request.seed,
+            )
+
+        generation_input = state.prepared_denoise.generation_input
+        latent_tokens = generation_input.get("packed_init_noises")
+        latent_position_ids = generation_input.get("packed_vae_position_ids")
+        if latent_tokens is None or latent_position_ids is None:
+            raise BAGELDenoiseStepError(
+                "BAGEL prepare_vae_latent did not return packed_init_noises "
+                "and packed_vae_position_ids"
+            )
+
+        image_shape = self._image_shape_from_params(
+            request.sampling_params,
+            state.image_shape,
+        )
+        latent_shape = _bagel_latent_shape(
+            self.inferencer.model,
+            image_shape,
+            latent_tokens,
+        )
+        return UGLatentPrepareResult(
+            latent_tokens=latent_tokens,
+            latent_position_ids=latent_position_ids,
+            latent_shape=latent_shape,
+        )
+
     def append_generated_image(
         self, *, session, image: Any | None
     ) -> UGModelAppendImageResult:
@@ -403,15 +440,18 @@ class BAGELInterleaveContextBackend:
         self,
         state: BAGELSessionContext,
         sampling_params: Any | None,
+        *,
+        seed: int | None = None,
     ) -> BAGELPreparedDenoise:
         image_shape = self._image_shape_from_params(sampling_params, state.image_shape)
         model = self.inferencer.model
-        generation_input = model.prepare_vae_latent(
-            curr_kvlens=state.gen_context["kv_lens"],
-            curr_rope=state.gen_context["ropes"],
-            image_sizes=[image_shape],
-            new_token_ids=self.inferencer.new_token_ids,
-        )
+        with _bagel_seed_context(seed):
+            generation_input = model.prepare_vae_latent(
+                curr_kvlens=state.gen_context["kv_lens"],
+                curr_rope=state.gen_context["ropes"],
+                image_sizes=[image_shape],
+                new_token_ids=self.inferencer.new_token_ids,
+            )
         cfg_text_generation_input = model.prepare_vae_latent_cfg(
             curr_kvlens=state.cfg_text_context["kv_lens"],
             curr_rope=state.cfg_text_context["ropes"],
@@ -477,6 +517,10 @@ class BAGELBackendProtocol(Protocol):
         self, *, session, request: UGVelocityRequest
     ) -> torch.Tensor: ...
 
+    def prepare_latents_from_session(
+        self, *, session, request: UGLatentPrepareRequest
+    ) -> UGLatentPrepareResult | None: ...
+
     def append_generated_image(
         self, *, session, image: Any | None
     ) -> UGModelAppendImageResult: ...
@@ -518,6 +562,14 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
         self, *, session, request: UGVelocityRequest
     ) -> torch.Tensor:
         return self.backend.predict_velocity_from_session(
+            session=session,
+            request=request,
+        )
+
+    def prepare_latents_from_session(
+        self, *, session, request: UGLatentPrepareRequest
+    ) -> UGLatentPrepareResult | None:
+        return self.backend.prepare_latents_from_session(
             session=session,
             request=request,
         )
@@ -617,6 +669,13 @@ class MockBAGELBackend:
             request.latent_tokens
         )
 
+    def prepare_latents_from_session(
+        self, *, session, request: UGLatentPrepareRequest
+    ) -> UGLatentPrepareResult | None:
+        del request
+        self._record("prepare_latents", session)
+        return None
+
     def append_generated_image(
         self, *, session, image: Any | None
     ) -> UGModelAppendImageResult:
@@ -671,6 +730,29 @@ def _bagel_runtime_dtype(model: Any) -> torch.dtype | None:
     except (AttributeError, StopIteration, TypeError):
         return None
     return parameter.dtype
+
+
+def _bagel_latent_shape(
+    model: Any,
+    image_shape: tuple[int, int],
+    latent_tokens: torch.Tensor,
+) -> tuple[int, int, int]:
+    height, width = image_shape
+    latent_downsample = int(getattr(model, "latent_downsample", 16))
+    latent_height = height // latent_downsample
+    latent_width = width // latent_downsample
+    latent_dim = int(latent_tokens.shape[-1])
+    return latent_height, latent_width, latent_dim
+
+
+@contextmanager
+def _bagel_seed_context(seed: int | None):
+    if seed is None:
+        yield
+        return
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(int(seed))
+        yield
 
 
 def _bagel_autocast(model: Any):

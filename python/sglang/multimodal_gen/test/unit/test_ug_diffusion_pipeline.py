@@ -16,7 +16,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle
-from sglang.srt.ug.runtime import UGDecodeResult
+from sglang.srt.ug.runtime import UGDecodeResult, UGLatentPrepareResult
 
 _GLOBAL_ARGS_PATCH = (
     "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args"
@@ -144,9 +144,49 @@ class TestUGDiffusionPipeline(unittest.TestCase):
         self.assertEqual(result.extra["ug_post_image_segment"].type, "text")
         self.assertEqual(result.extra["ug_post_image_segment"].text, "after_image")
 
+    def test_latent_stage_prefers_bridge_supplied_model_latents(self):
+        server_args = _make_server_args()
+        bridge = RecordingUGBridge(
+            prepared_latents=UGLatentPrepareResult(
+                latent_tokens=torch.ones(4, 64),
+                latent_position_ids=torch.arange(4),
+                latent_shape=(2, 2, 64),
+            )
+        )
+        with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
+            pipeline = UGPipeline(
+                "recording-ug",
+                server_args,
+                loaded_modules={"ug_bridge": bridge},
+                executor=SyncExecutor(server_args),
+            )
+
+        result = pipeline.forward(
+            Req(
+                sampling_params=UGSamplingParams(
+                    prompt="model-shaped latents",
+                    width=32,
+                    height=32,
+                    seed=321,
+                    num_inference_steps=2,
+                    suppress_logs=True,
+                )
+            ),
+            server_args,
+        )
+
+        self.assertEqual(bridge.prepare_latents_seed, 321)
+        self.assertEqual(result.latents.shape, (4, 64))
+        self.assertTrue(
+            torch.equal(result.extra["ug_latent_position_ids"], torch.arange(4))
+        )
+        self.assertEqual(result.extra["ug_latent_shape"], (2, 2, 64))
+
 
 class RecordingUGBridge:
-    def __init__(self):
+    def __init__(self, prepared_latents=None):
+        self.prepared_latents = prepared_latents
+        self.prepare_latents_seed = None
         self.appended_image = None
         self.velocity_calls = 0
 
@@ -173,6 +213,11 @@ class RecordingUGBridge:
 
     def release_contexts(self, contexts):
         del contexts
+
+    def prepare_latents(self, *, contexts, sampling_params, seed):
+        del contexts, sampling_params
+        self.prepare_latents_seed = seed
+        return self.prepared_latents
 
     def append_generated_image(self, *, contexts, image):
         del contexts

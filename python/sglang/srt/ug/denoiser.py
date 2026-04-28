@@ -11,6 +11,8 @@ from sglang.srt.ug.runtime import (
     FakeUGModelRunner,
     UGDecodeResult,
     UGLatentDecodeRequest,
+    UGLatentPrepareRequest,
+    UGLatentPrepareResult,
     UGSessionRuntime,
     UGVelocityRequest,
 )
@@ -32,6 +34,14 @@ class UGDenoiserBridge(Protocol):
     ) -> torch.Tensor: ...
 
     def release_contexts(self, contexts: UGContextBundle) -> None: ...
+
+    def prepare_latents(
+        self,
+        *,
+        contexts: UGContextBundle,
+        sampling_params: Any,
+        seed: int | None,
+    ) -> UGLatentPrepareResult | None: ...
 
     def append_generated_image(
         self, *, contexts: UGContextBundle, image: Any | None
@@ -76,6 +86,16 @@ class FakeUGDenoiserBridge:
 
     def release_contexts(self, contexts: UGContextBundle) -> None:
         del contexts
+
+    def prepare_latents(
+        self,
+        *,
+        contexts: UGContextBundle,
+        sampling_params: Any,
+        seed: int | None,
+    ) -> UGLatentPrepareResult | None:
+        del contexts, sampling_params, seed
+        return None
 
     def append_generated_image(
         self, *, contexts: UGContextBundle, image: Any | None
@@ -160,6 +180,23 @@ class SRTBackedUGDenoiserBridge:
         contexts.text_cfg.session = response.session
         contexts.image_cfg.session = response.session
         return response.velocity
+
+    def prepare_latents(
+        self,
+        *,
+        contexts: UGContextBundle,
+        sampling_params: Any,
+        seed: int | None,
+    ) -> UGLatentPrepareResult | None:
+        if contexts.full.session is None:
+            raise ValueError("SRT-backed UG contexts require a session handle")
+        return self.runtime.prepare_latents(
+            UGLatentPrepareRequest(
+                session=contexts.full.session,
+                sampling_params=sampling_params,
+                seed=seed,
+            )
+        )
 
     def release_contexts(self, contexts: UGContextBundle) -> None:
         if contexts.full.session is not None:

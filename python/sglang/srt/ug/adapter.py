@@ -12,6 +12,8 @@ from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
     UGLatentDecodeRequest,
+    UGLatentPrepareRequest,
+    UGLatentPrepareResult,
     UGSegmentState,
     UGSessionRecord,
     UGVelocityRequest,
@@ -60,6 +62,13 @@ class UGModelAdapterProtocol(Protocol):
         request: UGVelocityRequest,
     ) -> torch.Tensor: ...
 
+    def prepare_latents_from_session(
+        self,
+        *,
+        session: UGModelSessionView,
+        request: UGLatentPrepareRequest,
+    ) -> UGLatentPrepareResult | None: ...
+
     def append_generated_image(
         self,
         *,
@@ -99,6 +108,14 @@ class UGModelRunnerAdapter:
         self, *, request: UGVelocityRequest, record: UGSessionRecord
     ) -> torch.Tensor:
         return self.adapter.predict_velocity_from_session(
+            session=self._session_view(record),
+            request=request,
+        )
+
+    def prepare_latents_from_session(
+        self, *, request: UGLatentPrepareRequest, record: UGSessionRecord
+    ) -> UGLatentPrepareResult | None:
+        return self.adapter.prepare_latents_from_session(
             session=self._session_view(record),
             request=request,
         )
