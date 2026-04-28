@@ -469,9 +469,10 @@ def fill_new_verified_id(
     # NOTE: we cannot fuse any in-place operations of `accept_lens` inside this kernel
     # because this kernel reads accept_lens
     pid = tl.program_id(axis=0)
-    num_accepted_drafts = tl.load(accept_lens + pid)
+    # `accept_lens` includes the bonus token; the last accepted slot is at -1.
+    accept_len = tl.load(accept_lens + pid)
 
-    verified_id_idx = num_draft_tokens * pid + num_accepted_drafts - 1
+    verified_id_idx = num_draft_tokens * pid + accept_len - 1
     verified_id_data = tl.load(verified_id + verified_id_idx)
     tl.store(new_verified_id + pid, verified_id_data)
 

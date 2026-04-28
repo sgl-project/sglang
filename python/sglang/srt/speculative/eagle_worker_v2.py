@@ -840,10 +840,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
-            num_accepted_drafts,
+            accept_lens,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
-        new_seq_lens = batch.seq_lens + num_accepted_drafts
+        new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification
         if (
@@ -851,7 +851,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self.target_worker.model_runner.mamba2_config is not None
         ):
             self._mamba_verify_update(
-                batch, verify_input, num_accepted_drafts, accept_index, bs
+                batch, verify_input, accept_lens, accept_index, bs
             )
 
         verify_done = torch.get_device_module(self.device).Event()
@@ -859,10 +859,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(num_accepted_drafts, dtype=torch.int32)
+            verified_id = torch.empty_like(accept_lens, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
                 all_verified_id,
-                num_accepted_drafts,
+                accept_lens,
                 verified_id,
                 self.speculative_num_draft_tokens,
             )
@@ -886,7 +886,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_token_ids=predict,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            accept_lens=num_accepted_drafts,
+            accept_lens=accept_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
         )
 
@@ -894,14 +894,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         batch: ModelWorkerBatch,
         verify_input: EagleVerifyInput,
-        num_accepted_drafts: torch.Tensor,
+        accept_lens: torch.Tensor,
         accept_index: torch.Tensor,
         bs: int,
     ):
         """Update mamba state for hybrid GDN models after verification."""
-        # Calculate accepted_steps for mamba state update
-        # Include the bonus token (+1)
-        accepted_length_with_bonus = num_accepted_drafts
+        # `accept_lens` already includes the bonus token (drafts + 1 per req).
+        accepted_length_with_bonus = accept_lens
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
             if verify_input.topk != 1:
                 raise ValueError("Spec v2 currently only supports topk = 1.")
