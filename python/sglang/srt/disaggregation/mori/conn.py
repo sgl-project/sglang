@@ -7,6 +7,7 @@ import os
 import struct
 import threading
 import time
+import uuid
 from typing import Dict, List, Optional, Tuple
 
 import msgspec
@@ -211,7 +212,8 @@ class MoriKVManager(CommonKVManager):
         engine_key = (
             f"io-{self.disaggregation_mode.value}-"
             f"dp{self.system_dp_rank}-tp{self.attn_tp_rank}-"
-            f"pid{os.getpid()}-{self.local_ip}"
+            f"pid{os.getpid()}-{self.local_ip}-"
+            f"{uuid.uuid4().hex[:8]}"
         )
 
         engine = IOEngine(engine_key, config)
