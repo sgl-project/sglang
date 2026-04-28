@@ -24,7 +24,10 @@ from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
 from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
     batch_decode_pool_mqa_v3_triton,
     batch_pool_mqa_triton,
+    block_mean_pooling_triton,
+    block_sparse_mqa_triton,
     paged_mean_pooling_triton,
+    ragged_pool_mqa_triton,
     sparse_paged_mqa_triton,
     tail_only_v3_triton,
 )
@@ -167,3 +170,122 @@ def fp8_native_hierarchy_paged_mqa_logits_triton(
         block_tables=block_tables,
     )  # [B, 1, topk*k_block_size] f32
     return block_sparse_k_indexer_score, topk_block_indices
+
+
+def fp8_native_hierarchy_mqa_logits_triton(
+    q_fp8: torch.Tensor,                             # [seq, H, D] fp8
+    kv: tuple[torch.Tensor, torch.Tensor],           # (k_fp8 [N, D] fp8, k_scale [N, 4] uint8 OR [N] f32)
+    weights: torch.Tensor,                           # [seq, H] f32
+    cu_seqlen_ks: torch.Tensor,                      # [seq] i32
+    cu_seqlen_ke: torch.Tensor,                      # [seq] i32
+    k_block_size: int,
+    block_topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """All-triton ragged prefill hierarchy MQA. Mirrors
+    ``fp8_native_hierarchy_mqa_logits`` (tilelang) but uses triton kernels
+    that handle ``k_block_size in {8, 16, 32, 64, 128}`` correctly.
+
+    Used by ``_get_topk_ragged`` whenever ``k_block_size < 64``: tilelang's
+    ``fp8_native_block_mean_pooling`` does ``T.copy(K[s:s+block_N=64], ...)``
+    even when the pool block is K<64 wide, which OOB-reads up to ``block_N - K``
+    rows past the K tensor at boundary CTAs (last few pool blocks). Most of
+    the time those reads land in mapped pages, but under sustained prefill
+    (long contexts + chunked prefill at K=16) they eventually hit an
+    unmapped page → Xid 13 → silent server death.
+
+    Flow (matches v1 baseline, no cache):
+      1) ragged mean-pool — ``block_mean_pooling_triton`` (SK1/SK6 grouped
+         when K<64; legacy when K>=64). Loads block_N=64 tokens once and
+         reshapes to [G, K, D] for per-K mean — no over-read.
+      2) ragged block-MQA — ``ragged_pool_mqa_triton`` (new). Fuses
+         clean_logits + force_maintain into the GEMM post-process.
+      3) ``torch.topk`` on bf16 logits.
+      4) ragged sparse-MQA — ``block_sparse_mqa_triton`` (SK4/SK11 grouped
+         GEMM_TILE=256 when K<128).
+
+    Returns ``(block_sparse_logits[seq, topk*K], topk_block_indices[seq, topk] int64)``
+    matching the tilelang wrapper's shapes.
+    """
+    k_fp8, k_scales = kv
+    # k_scales arrives from get_index_k_scale_buffer as uint8 [N, 4] (= one
+    # f32 packed). Triton kernels want f32. Mirror the cast in custom_ops.py.
+    if k_scales.dtype == torch.uint8:
+        k_scales = k_scales.view(torch.float32)
+    if k_scales.ndim == 2:
+        assert k_scales.shape[1] == 1, (
+            f"k_scales should be [N] or [N, 1], got {k_scales.shape}"
+        )
+        k_scales = k_scales.squeeze(1)
+
+    # Pool-blocked cu_seqlen ranges: each token's [ks, ke) maps to the pool
+    # block range [floor(ks/K), ceil(ke/K)).
+    cu_seqlen_blocked_ks = cu_seqlen_ks // k_block_size
+    cu_seqlen_blocked_ke = (cu_seqlen_ke + k_block_size - 1) // k_block_size
+    cu_seqlen_blocked_ks = cu_seqlen_blocked_ks.to(torch.int32)
+    cu_seqlen_blocked_ke = cu_seqlen_blocked_ke.to(torch.int32)
+
+    # 1) Mean-pool ragged K → [num_pool, D] fp8 + [num_pool] f32 scale.
+    blocked_k_fp8, blocked_k_scale = block_mean_pooling_triton(
+        k_fp8=k_fp8, k_scale=k_scales, k_block_size=k_block_size,
+    )
+
+    # 2) Block-MQA on blocked_k → [seq, num_pool] f32 (with -inf/+inf masks).
+    block_k_indexer_score = ragged_pool_mqa_triton(
+        q_fp8=q_fp8,
+        blocked_k_fp8=blocked_k_fp8,
+        blocked_k_scale=blocked_k_scale,
+        weights=weights,
+        cu_seqlen_blocked_ks=cu_seqlen_blocked_ks,
+        cu_seqlen_blocked_ke=cu_seqlen_blocked_ke,
+    )
+
+    # 3) Top-k over pool blocks. bf16 + sorted=False matches the tilelang
+    # path (~40% faster than f32 on long row, ordering doesn't matter for
+    # downstream sparse-MQA).
+    topk_actual = min(block_topk, block_k_indexer_score.shape[-1])
+    topk_block_indices = torch.topk(
+        block_k_indexer_score.bfloat16(),
+        k=topk_actual,
+        dim=-1, sorted=False,
+    ).indices  # [seq, topk_actual] int64
+
+    # 4) Sparse-MQA on raw K. block_sparse_mqa_triton's grouped path (K<128)
+    # requires ``topk % (256 // K) == 0``. In production, block_topk=512
+    # and num_pool >= 512 → topk=512 satisfies the divisibility for all
+    # K in {8,16,32,64} (GROUP_SIZE ∈ {32,16,8,4}). On short warmup
+    # inputs num_pool < block_topk and topk = num_pool may not align;
+    # pad with -1 (kernel masks via k_rows < 0 → -inf logits) and slice
+    # back after the call.
+    group_size_sparse = 256 // k_block_size if k_block_size < 128 else 1
+    topk_padded = (
+        (topk_actual + group_size_sparse - 1) // group_size_sparse
+    ) * group_size_sparse
+    if topk_padded > topk_actual:
+        pad_n = topk_padded - topk_actual
+        pad = torch.full(
+            (topk_block_indices.shape[0], pad_n),
+            fill_value=-1,
+            device=topk_block_indices.device,
+            dtype=topk_block_indices.dtype,
+        )
+        topk_for_kernel = torch.cat([topk_block_indices, pad], dim=-1)
+    else:
+        topk_for_kernel = topk_block_indices
+
+    block_sparse_logits = block_sparse_mqa_triton(
+        q_fp8=q_fp8,
+        k_fp8=k_fp8,
+        k_scale=k_scales,
+        topk_block_index=topk_for_kernel,
+        kv_block_size=k_block_size,
+        weights=weights,
+        cu_seqlen_ks=cu_seqlen_ks,
+        cu_seqlen_ke=cu_seqlen_ke,
+    )  # [seq, topk_padded * k_block_size] f32
+
+    if topk_padded > topk_actual:
+        block_sparse_logits = block_sparse_logits[
+            ..., : topk_actual * k_block_size
+        ].contiguous()
+
+    return block_sparse_logits, topk_block_indices

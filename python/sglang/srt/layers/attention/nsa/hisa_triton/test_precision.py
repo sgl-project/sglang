@@ -34,7 +34,11 @@ from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
     block_mean_pooling_triton,
     block_sparse_mqa_triton,
     paged_mean_pooling_triton,
+    ragged_pool_mqa_triton,
     sparse_paged_mqa_triton,
+)
+from sglang.srt.layers.attention.nsa.hisa_triton.orchestrator import (
+    fp8_native_hierarchy_mqa_logits_triton,
 )
 
 
@@ -351,6 +355,33 @@ def _ref_block_sparse_mqa(q_fp8, k_fp8, k_scale, topk_idx, kv_block_size,
     return out
 
 
+def _ref_ragged_pool_mqa(q_fp8, blocked_k_fp8, blocked_k_scale,
+                          weights, cu_blocked_ks, cu_blocked_ke):
+    """Ragged prefill pool-MQA reference. Output [seq, num_pool] f32 with
+    per-row [ks, ke) mask + force_maintain on ks and ke-1."""
+    seq, H, D = q_fp8.shape
+    num_pool = blocked_k_fp8.shape[0]
+    out = torch.full((seq, num_pool), float("-inf"),
+                     dtype=torch.float32, device=q_fp8.device)
+    q_f32 = q_fp8.to(torch.float32)
+    bk_f32 = blocked_k_fp8.to(torch.float32)
+    for s_i in range(seq):
+        ks = int(cu_blocked_ks[s_i].item())
+        ke = int(cu_blocked_ke[s_i].item())
+        w = weights[s_i]
+        for n in range(ks, min(ke, num_pool)):
+            kv_vec = bk_f32[n] * blocked_k_scale[n].item()
+            s_vec = q_f32[s_i] @ kv_vec                    # [H]
+            s_vec = torch.clamp(s_vec, min=0)
+            out[s_i, n] = (s_vec * w).sum().item()
+        # force_maintain: +inf at ks and ke-1.
+        if 0 <= ks < num_pool:
+            out[s_i, ks] = float("inf")
+        if 0 <= ke - 1 < num_pool:
+            out[s_i, ke - 1] = float("inf")
+    return out
+
+
 def _ref_sparse_paged_mqa(q_fp8, kv, topk_idx, kv_block_size,
                            weights, ctx_lens, block_tables, paged_block_size):
     """Decode paged sparse MQA reference (SoA byte layout)."""
@@ -491,6 +522,67 @@ def test_cross_k_block_size():
         path_note = "k=128 cross-page" if k == 128 else f"G={64//k if k<64 else 1}"
         status = "OK" if inf_ok else "INF-MISMATCH"
         print(f"{'sparse_paged_mqa':>22} | {k:>4} | {cfg:>20} | {level:>22} | [{status}] [{path_note}] {diag}")
+
+    # --- 5. ragged_pool_mqa (prefill block-MQA on pooled K) ---
+    # Mirrors tilelang `pool_mqa_attn_return_logits_fp8`. Per-query [ks,ke)
+    # mask + force_maintain are fused into the kernel.
+    for k in K_VALS:
+        seq_q = 8
+        num_pool = 256
+        torch.manual_seed(0)
+        q = torch.randn(seq_q, H, D, device=DEVICE, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        bk = torch.randn(num_pool, D, device=DEVICE, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        bks = 0.05 + 0.02 * torch.rand(num_pool, device=DEVICE, dtype=torch.float32)
+        w = torch.randn(seq_q, H, device=DEVICE, dtype=torch.float32)
+        # Causal-ish [ks, ke) per query, monotonically growing.
+        cu_ks = torch.zeros(seq_q, device=DEVICE, dtype=torch.int32)
+        cu_ke = torch.tensor(
+            [num_pool - (seq_q - 1 - i) * 2 for i in range(seq_q)],
+            device=DEVICE, dtype=torch.int32,
+        )
+        out_t = ragged_pool_mqa_triton(q, bk, bks, w, cu_ks, cu_ke)
+        out_r = _ref_ragged_pool_mqa(q, bk, bks, w, cu_ks, cu_ke)
+        inf_ok, _ = _inf_match(out_t, out_r)
+        level, diag = _strictest_passing_tolerance(out_t, out_r)
+        cfg = f"sq={seq_q} np={num_pool}"
+        status = "OK" if inf_ok else "INF-MISMATCH"
+        print(f"{'ragged_pool_mqa':>22} | {k:>4} | {cfg:>20} | {level:>22} | [{status}] {diag}")
+
+    # --- 6. fp8_native_hierarchy_mqa_logits_triton (full ragged orchestrator) ---
+    # End-to-end smoke: realistic chunked-prefill shapes, K<64 must run cleanly
+    # (this is the path that replaces the buggy tilelang at K<64). At K>=64
+    # we still run it to sanity-check; production will use the tilelang.
+    print("-" * 130)
+    for k in K_VALS:
+        seq_q = 64
+        seq_kv = 8192   # not multiple of 64 below would also be fine — the
+                         # boundary OOB only affected tilelang
+        torch.manual_seed(0)
+        q = torch.randn(seq_q, H, D, device=DEVICE, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        k_fp8 = torch.randn(seq_kv, D, device=DEVICE, dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+        # Match production layout: scale arrives as uint8 [N, 4] (= packed f32).
+        scale_f32 = (0.05 + 0.02 * torch.rand(seq_kv, device=DEVICE, dtype=torch.float32))
+        scale_uint8 = scale_f32.view(torch.uint8).reshape(seq_kv, 4)
+        w = torch.randn(seq_q, H, device=DEVICE, dtype=torch.float32)
+        # Causal-ish ragged ranges.
+        cu_ks = torch.zeros(seq_q, device=DEVICE, dtype=torch.int32)
+        cu_ke = torch.linspace(seq_kv // 4, seq_kv, seq_q, device=DEVICE).to(torch.int32)
+        try:
+            block_sparse, topk_block = fp8_native_hierarchy_mqa_logits_triton(
+                q, (k_fp8, scale_uint8), w, cu_ks, cu_ke,
+                k_block_size=k, block_topk=64,
+            )
+            torch.cuda.synchronize()
+            ok = (
+                block_sparse.shape[0] == seq_q
+                and topk_block.shape[0] == seq_q
+                and torch.isfinite(block_sparse[block_sparse > -float('inf')]).all().item()
+            )
+            status = "OK" if ok else "FAIL"
+            cfg = f"sq={seq_q} skv={seq_kv} topk=64"
+            print(f"{'hierarchy_triton':>22} | {k:>4} | {cfg:>20} | {'smoke':>22} | [{status}] shape={tuple(block_sparse.shape)}")
+        except Exception as e:
+            print(f"{'hierarchy_triton':>22} | {k:>4} | smoke | FAIL | {type(e).__name__}: {e}")
 
 
 def main() -> int:

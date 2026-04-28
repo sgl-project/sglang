@@ -178,6 +178,162 @@ def batch_pool_mqa_triton(
 
 
 # ---------------------------------------------------------------------------
+# Kernel 1b: ragged prefill block-MQA on already-pooled blocked_k
+#   Mirrors: pool_mqa_attn_return_logits_fp8 (tilelang) — but ragged across
+#   the prefill sequence dimension (per-row [ks, ke) range in blocked space)
+#   instead of decode's (B, single-token) layout.
+#
+#   Shapes:
+#     Q:          [seq, H, D]               fp8
+#     BlockedK:   [num_pool, D]             fp8     (concatenated across batch)
+#     BlockedKS:  [num_pool]                f32     per-block fp8 scale
+#     Logits:     [seq, num_pool]           f32     OUT (full grid; outside
+#                                                       [ks, ke) → -inf)
+#     Weights:    [seq, H]                  f32
+#     CuKS/CuKE:  [seq]                     i32     per-query [ks, ke) range
+#                                                   in blocked space
+#
+#   Grid: (seq, ceildiv(num_pool, BLOCK_N)). Each CTA processes one query
+#   token + BLOCK_N pool blocks. clean_logits + force_maintain fused into
+#   the GEMM post-processing (D4 nested tl.where pattern).
+#
+#   This kernel exists because tilelang's fp8_native_block_mean_pooling has
+#   a boundary OOB read at K < block_N (T.copy reads block_N=64 rows from a
+#   K-row pool block). Routing the entire prefill stack through triton at
+#   K<64 sidesteps that bug. K>=64 still uses tilelang for both cache miss
+#   handling and bench parity.
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _ragged_pool_mqa_kernel(
+    Q_ptr,           # [seq, H, D] fp8
+    BK_ptr,          # [num_pool, D] fp8
+    BKS_ptr,         # [num_pool] f32
+    Logits_ptr,      # [seq, num_pool] f32 OUT
+    W_ptr,           # [seq, H] f32
+    CuKS_ptr,        # [seq] i32 — ks (in blocked space) per query
+    CuKE_ptr,        # [seq] i32 — ke (in blocked space, exclusive) per query
+    stride_q_s, stride_q_h, stride_q_d,
+    stride_bk_n, stride_bk_d,
+    stride_bks_n,
+    stride_logits_s, stride_logits_n,
+    stride_w_s, stride_w_h,
+    stride_ks_s, stride_ke_s,
+    num_pool,
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    seq_i = tl.program_id(0)
+    chunk_idx = tl.program_id(1)
+
+    n_start = chunk_idx * BLOCK_N
+    n_offs = n_start + tl.arange(0, BLOCK_N)         # [BLOCK_N]
+    n_mask = n_offs < num_pool                        # in-tensor bound
+    safe_n = tl.where(n_mask, n_offs, 0)
+
+    # Load Q[seq_i, :, :] fp8 and W[seq_i, :] f32.
+    h_offs = tl.arange(0, HEADS)
+    d_offs = tl.arange(0, DIM)
+    q = tl.load(
+        Q_ptr + seq_i * stride_q_s
+        + h_offs[:, None] * stride_q_h + d_offs[None, :] * stride_q_d
+    )                                                 # fp8 [H, D]
+    w = tl.load(W_ptr + seq_i * stride_w_s + h_offs * stride_w_h)  # f32 [H]
+
+    # Load BlockedK[n_offs, :] fp8 and BlockedKS[n_offs] f32. Safe pointer
+    # for the fp8 load (triton can't cast int→fp8 default), then use
+    # n_mask to mask the scale and the final logit.
+    bk = tl.load(
+        BK_ptr + safe_n[:, None] * stride_bk_n + d_offs[None, :] * stride_bk_d
+    )                                                 # fp8 [BLOCK_N, D]
+    bks = tl.load(
+        BKS_ptr + safe_n * stride_bks_n, mask=n_mask, other=0.0,
+    )                                                 # f32 [BLOCK_N]
+
+    # GEMM: [BLOCK_N, D] @ [D, H] = [BLOCK_N, H], then post-GEMM reduce.
+    s = tl.dot(bk, q.trans(1, 0), out_dtype=tl.float32)
+    s = s * bks[:, None]
+    s = tl.maximum(s, 0.0)
+    s = s * w[None, :]
+    logits = tl.sum(s, axis=1)                        # [BLOCK_N] f32
+
+    # Apply per-query [ks, ke) mask + force_maintain (matches tilelang's
+    # clean_and_maintain_logits_kernel semantics).
+    ks = tl.load(CuKS_ptr + seq_i * stride_ks_s)
+    ke = tl.load(CuKE_ptr + seq_i * stride_ke_s)
+    pos_valid = (n_offs >= ks) & (n_offs < ke) & n_mask
+    pos_maintain = ((n_offs == ks) | (n_offs == ke - 1)) & n_mask
+    out = tl.where(
+        pos_maintain, float("inf"),
+        tl.where(pos_valid, logits, float("-inf")),
+    )
+
+    tl.store(
+        Logits_ptr + seq_i * stride_logits_s + n_offs * stride_logits_n,
+        out, mask=n_mask,
+    )
+
+
+def ragged_pool_mqa_triton(
+    q_fp8: torch.Tensor,            # [seq, H, D] fp8
+    blocked_k_fp8: torch.Tensor,    # [num_pool, D] fp8
+    blocked_k_scale: torch.Tensor,  # [num_pool] f32
+    weights: torch.Tensor,          # [seq, H] f32
+    cu_seqlen_blocked_ks: torch.Tensor,   # [seq] i32
+    cu_seqlen_blocked_ke: torch.Tensor,   # [seq] i32
+    *,
+    BLOCK_N: int | None = None,
+) -> torch.Tensor:
+    """Triton equivalent of ``pool_mqa_attn_return_logits_fp8_interface``.
+
+    Returns logits ``[seq, num_pool]`` f32, with positions outside per-row
+    [ks, ke) set to -inf and ks / (ke-1) set to +inf (matches tilelang's
+    clean_and_maintain post-process). Output is suitable for direct
+    ``torch.topk`` consumption.
+    """
+    assert q_fp8.ndim == 3, f"q_fp8 should be [seq, H, D], got {q_fp8.shape}"
+    seq_len, H, D = q_fp8.shape
+    num_pool, D_ = blocked_k_fp8.shape
+    assert D_ == D
+    assert blocked_k_scale.shape == (num_pool,)
+    assert weights.shape == (seq_len, H)
+    assert cu_seqlen_blocked_ks.shape == (seq_len,)
+    assert cu_seqlen_blocked_ke.shape == (seq_len,)
+    assert cu_seqlen_blocked_ks.dtype == torch.int32
+    assert cu_seqlen_blocked_ke.dtype == torch.int32
+
+    logits = torch.empty(
+        (seq_len, num_pool), device=q_fp8.device, dtype=torch.float32,
+    )
+    if seq_len == 0 or num_pool == 0:
+        return logits
+
+    # BLOCK_N picks: same heuristic as batch_pool_mqa — 128 when nb is large
+    # (lifts WGMMA m=64→128 throughput) else 64 (small grid, prefer more
+    # CTAs across SMs). Conservative compared to tilelang's 256 (which has
+    # spill issues at small num_pool); can tune later.
+    if BLOCK_N is None:
+        BLOCK_N = 128 if num_pool >= 256 else 64
+
+    grid = (seq_len, triton.cdiv(num_pool, BLOCK_N))
+    _ragged_pool_mqa_kernel[grid](
+        q_fp8, blocked_k_fp8, blocked_k_scale, logits, weights,
+        cu_seqlen_blocked_ks, cu_seqlen_blocked_ke,
+        q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2),
+        blocked_k_fp8.stride(0), blocked_k_fp8.stride(1),
+        blocked_k_scale.stride(0),
+        logits.stride(0), logits.stride(1),
+        weights.stride(0), weights.stride(1),
+        cu_seqlen_blocked_ks.stride(0), cu_seqlen_blocked_ke.stride(0),
+        num_pool,
+        HEADS=H, DIM=D, BLOCK_N=BLOCK_N,
+    )
+    return logits
+
+
+# ---------------------------------------------------------------------------
 # Kernel 2: sparse paged block-MQA — THE 80% HOTSPOT
 #   Mirrors: fp8_native_paged_block_sparse_mqa_attn_return_logits (tilelang)
 #   Shapes:

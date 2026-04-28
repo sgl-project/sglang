@@ -30,6 +30,20 @@ Goal: 让 hisa 在 `k_block_size ∈ {8, 16, 32, 64, 128}` 全范围工作，cac
 - `[x]` 与 tilelang 对比：k=128 byte_diff=1（fp8 ULP）；与 torch ref：k<64 byte_diff≤3。
 - `[x]` 用户已 e2e 验证正确性（cache 默认开启路径）。
 
+**Done — ragged prefill K<64 triton 路由 (SK17, 2026-04-28)**
+
+针对前面讨论的 P0 问题（tilelang `fp8_native_block_mean_pooling` 在 K < block_N 时 boundary OOB），把整条 ragged prefill 也改走 triton。
+
+- `[x]` 新增 `_ragged_pool_mqa_kernel` + `ragged_pool_mqa_triton`（`hisa_triton/kernels.py`）：tilelang `pool_mqa_attn_return_logits_fp8` 的 triton 端口，clean_logits + force_maintain 融进 GEMM 后处理（D4 嵌套 `tl.where`）。
+- `[x]` 新增 `fp8_native_hierarchy_mqa_logits_triton`（`hisa_triton/orchestrator.py`）：mean-pool（SK1/SK6）+ ragged-pool-MQA（新）+ topk + sparse-MQA（SK4/SK11）。topk pad/unpad 逻辑（pad 到 GROUP_SIZE 倍数 + -1 → 内核自动 mask 成 -inf）处理 warmup 短输入边界。
+- `[x]` `_get_topk_ragged` 两个分支（chunked / non-chunked）都加上 `if hisa_k_block_size < 64: → triton orchestrator` dispatch。K>=64 仍走 tilelang，零回归。
+- `[x]` `test_precision.py::test_cross_k_block_size` 新增 `ragged_pool_mqa` 在 K∈{8,16,32,64,128} 的 fp8-strict torch ref 对比 + `hierarchy_triton` 全链路 smoke。
+- `[x]` 用户生产配置（K=16, block_topk=512, seq_kv∈{8192, 8208, 65536}）smoke 通过——包括 8208 这个**正是 tilelang 越界条件**的非对齐长度。
+
+**预期效果（待 e2e 验证）：**
+- K=16/8/32 prefill 不再 Xid 13。warmup 不再随机 silent crash。
+- prefill 速度提升 ~4×（grouped 设计消除了 tilelang 在 K<64 时的 4x 重复 K-load 浪费）。
+
 **Pending — bench**
 - `[ ]` **bench serving 性能验证（最重要的 next）**
     - `[ ]` k=128 默认路径 — 对齐 v4 baseline，无回归
@@ -39,6 +53,29 @@ Goal: 让 hisa 在 `k_block_size ∈ {8, 16, 32, 64, 128}` 全范围工作，cac
 - `[ ]` 若 bench 表现良好，再考虑把 `hisa_k_block_size` 默认值下调
 - `[ ]` 若 K≥64 也想统一走 SK15/SK16 triton（减少 tilelang 维护面），需要先确认无回归
 - `[?]` SK1–SK4 的 group 维度 G 当前是按 K 静态选；后续可以做更细的 auto-tune
+
+**Pending — kernel followup 实验（基于 2026-04-27 优化对照）**
+
+经过对所有 hisa_triton kernel 的小 K vs 大 K 优化对照，没有发现"大 K 已经验证有效但小 K 漏掉"的优化。但有两个**大 K 没试过、小 K 也没试过**的方向值得评估：
+
+- `[ ]` **SK17（暂编号）：`sparse_paged_mqa` K=64 路由到 grouped G=2 TILE=128**
+    - 现状：K=64 命中 `_sparse_paged_mqa_kernel` legacy，grid `(B, seq, topk)`，每 CTA 处理 1 个 topk index，1 次 m=64 WGMMA，输出 64 个 logits。
+    - 改动：路由到 `_sparse_paged_mqa_grouped_kernel`，`GROUP_SIZE=2, GEMM_TILE=128`。grid 变 `(B, seq, topk/2)`，每 CTA 用 per-row gather 取 2 个连续 topk index 跨的 2 个 paged page，1 次 m=128 WGMMA 输出 128 个 logits。
+    - 这是 SK12 在 K=128 上证明有效（B=1 −20~27%）的同一个套路，对象换成 K=64。
+    - 预期：B=1/2 small-batch −15~25%，B=10 steady-state neutral~small win，B=64 neutral。
+    - 风险：legacy K=64 的 K-load 是单 phys 连续 [64, D]，编译器可向量化；grouped 多一些 per-row gather 索引运算（但 SK12 在 K=128 上已证不慢）。
+    - 实现：`sparse_paged_mqa_triton` 里 dispatch 加一个 if 分支，~5 行；`test_cross_k_block_size` 已覆盖 K=64 byte-equal，加 microbench 即可。
+    - 实现成本：低（半天），收益**确定性中等偏高**（最值得先试）。
+
+- `[ ]` **SK18（暂编号）：grouped kernel `num_warps` sweep（K∈{8,16,32}）**
+    - 现状：SK1–SK4 四个 grouped kernel（`_block_mean_pooling_grouped`、`_paged_mean_pooling_grouped`、`_sparse_paged_mqa_grouped`、`_block_sparse_mqa_grouped`）launch 时**没显式给 `num_warps=`**，triton 按 BLOCK shape 默认（GEMM_TILE=64 时通常是 4 warps）。
+    - 改动：四个 kernel 各扫 `num_warps ∈ {4, 8}`，K∈{8,16,32}，看是否有命中。
+    - 8 warps 的 trade-off：能并行 2 个 WGMMA 或 hide mem latency，但寄存器/SM 占用翻倍 → 每 SM 驻留 CTA 减半。GEMM_TILE=64 的小 tile（mean_pooling、sparse_paged grouped）可能被反超；GEMM_TILE=256 的 block_sparse 默认大概率已是 8。
+    - `num_stages` 不用扫：这 4 个都是 single-tile-per-CTA 无 inner loop，num_stages 无效。
+    - 预期：命中 +5~10%，没命中 0%；每 kernel 命中点可能不同。
+    - 实现：launch 参数加 `num_warps`，`benchmark.py` 跑笛卡尔积。
+    - 实现成本：中（1 天 sweep + 整理结果），收益**不确定**。优先级低于 SK17。
+    - 前置条件：bench serving 跑完、SK17 有结论后再做。
 
 ---
 

@@ -47,6 +47,7 @@ from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
 )
 from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import HisaNSATokenToKVPool
 from sglang.srt.layers.attention.nsa.hisa_triton.orchestrator import (
+    fp8_native_hierarchy_mqa_logits_triton,
     fp8_native_hierarchy_paged_mqa_logits_triton,
     fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v4,
 )
@@ -870,17 +871,27 @@ class HisaIndexer(MultiPlatformOp):
         if not need_chunk:
             assert q_fp8[:q_offset].shape[0] != 0
             assert not _is_hip, "HisaIndexer is CUDA-only in Phase 1"
+            # K<64: route to all-triton orchestrator. tilelang's
+            # fp8_native_block_mean_pooling does T.copy(K[s:s+block_N=64], ...)
+            # even when K<64, which boundary-OOB reads up to (block_N-K) rows
+            # past seq_len_kv at the last few CTAs. Most reads land in mapped
+            # pages but under sustained prefill they eventually hit unmapped
+            # → Xid 13 → silent crash. Triton's grouped block_mean_pooling is
+            # bounds-safe.
+            mqa_logits_fn = (
+                fp8_native_hierarchy_mqa_logits_triton
+                if self.hisa_k_block_size < 64
+                else fp8_native_hierarchy_mqa_logits
+            )
             with self._with_real_sm_count():
-                block_sparse_logits, topk_block_indices = (
-                    fp8_native_hierarchy_mqa_logits(
-                        q_fp8[:q_offset],
-                        kv_fp8,
-                        weights[:q_offset],
-                        ks,
-                        ke,
-                        self.hisa_k_block_size,
-                        self.hisa_block_topk,
-                    )
+                block_sparse_logits, topk_block_indices = mqa_logits_fn(
+                    q_fp8[:q_offset],
+                    kv_fp8,
+                    weights[:q_offset],
+                    ks,
+                    ke,
+                    self.hisa_k_block_size,
+                    self.hisa_block_topk,
                 )
             # vLLM-patch-style conversion (indexers.py:435-458): topk via
             # fast_topk_v2 and the gather + ks-subtract + mask steps fused
@@ -921,21 +932,25 @@ class HisaIndexer(MultiPlatformOp):
         ), f"seq_lens_expanded length mismatch: {seq_lens_expanded.shape[0]} != {q_offset}"
 
         from sgl_kernel import fast_topk_v2
+        # Same K<64 dispatch as the non-chunked branch.
+        mqa_logits_fn = (
+            fp8_native_hierarchy_mqa_logits_triton
+            if self.hisa_k_block_size < 64
+            else fp8_native_hierarchy_mqa_logits
+        )
         start = 0
         while start < q_offset:
             end = min(start + max_rows, q_offset)
 
             with self._with_real_sm_count():
-                block_sparse_logits, topk_block_indices = (
-                    fp8_native_hierarchy_mqa_logits(
-                        q_fp8[start:end],
-                        kv_fp8,
-                        weights[start:end],
-                        ks[start:end],
-                        ke[start:end],
-                        self.hisa_k_block_size,
-                        self.hisa_block_topk,
-                    )
+                block_sparse_logits, topk_block_indices = mqa_logits_fn(
+                    q_fp8[start:end],
+                    kv_fp8,
+                    weights[start:end],
+                    ks[start:end],
+                    ke[start:end],
+                    self.hisa_k_block_size,
+                    self.hisa_block_topk,
                 )
             # Same conversion as the non-chunked branch, via the fused kernel.
             M_chunk, sparse_len = block_sparse_logits.shape
