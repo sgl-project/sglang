@@ -221,8 +221,6 @@ class FunctionCallParser:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
             or None if no constraint applies.
         """
-        # NOTE: structural_tag only supports JSON-compatible content between the begin and end.
-        # It cannot parse or validate function call Pythonic or XML-ish syntax.
         if self.detector.supports_structural_tag():
             # For "required"/named: always use structural_tag to preserve the
             # model's native tool call format. Schema is only included when
