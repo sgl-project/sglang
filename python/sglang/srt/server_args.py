@@ -1948,11 +1948,17 @@ class ServerArgs:
                     self.ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
-        elif "MiMoV2FlashForCausalLM" in model_arch:
+        elif any(
+            x in model_arch
+            for x in (
+                "MiMoV2ForCausalLM",
+                "MiMoV2FlashForCausalLM",
+            )
+        ):
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True
                 logger.info(
-                    "Enable multi-layer EAGLE speculative decoding for MiMoV2FlashForCausalLM model."
+                    "Enable multi-layer EAGLE speculative decoding for MiMoV2 model."
                 )
                 if not envs.SGLANG_ENABLE_SPEC_V2.get():
                     envs.SGLANG_ENABLE_SPEC_V2.set(True)
@@ -1963,11 +1969,11 @@ class ServerArgs:
             if self.enable_hierarchical_cache:
                 self.swa_full_tokens_ratio = 1.0
                 logger.warning(
-                    "Reset swa_full_tokens_ratio to 1.0 for MiMoV2FlashForCausalLM model with hierarchical cache"
+                    "Reset swa_full_tokens_ratio to 1.0 for MiMoV2 model with hierarchical cache"
                 )
                 self.disable_hybrid_swa_memory = True
                 logger.warning(
-                    "Disable hybrid SWA memory for MiMoV2FlashForCausalLM model with hierarchical cache"
+                    "Disable hybrid SWA memory for MiMoV2 model with hierarchical cache"
                 )
         elif "Step3p5ForCausalLM" in model_arch:
             if self.speculative_algorithm == "EAGLE":
@@ -6248,7 +6254,11 @@ class ServerArgs:
             "--debug-tensor-dump-output-folder",
             type=str,
             default=ServerArgs.debug_tensor_dump_output_folder,
-            help="The output folder for dumping tensors.",
+            help=(
+                "The output folder for dumping tensors. "
+                "In Eagle mode, tensor outputs from draft and target models "
+                "are stored in separate subdirectories ('draft' and 'target')."
+            ),
         )
         parser.add_argument(
             "--debug-tensor-dump-layers",
@@ -6618,6 +6628,13 @@ class ServerArgs:
         assert (
             self.tp_size * self.pp_size
         ) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        assert (
+            self.pp_max_micro_batch_size is None or self.pp_max_micro_batch_size >= 1
+        ), (
+            "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
+            f"Got: {self.pp_max_micro_batch_size}"
+        )
 
         if self.pp_size > 1:
             assert (
@@ -7311,6 +7328,7 @@ def auto_choose_speculative_params(self: ServerArgs):
         "BailingMoeV2_5ForCausalLM",
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
+        "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
     ]:
         return (3, 1, 4)

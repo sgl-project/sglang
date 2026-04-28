@@ -69,7 +69,7 @@ Validated documentation and CI coverage currently center on six ModelOpt diffusi
 Treat a new family, a new precision, or a new checkpoint layout as unsupported until it has a documented matrix row and a matching validation story.
 Before writing CLI examples, re-read the active branch's `docs/diffusion/quantization.md`: FLUX.2 NVFP4 is an official `black-forest-labs/*` repo rather than a `BBuf/*` converted repo, and its preferred flag depends on the current documented loader flow. Use `--transformer-path` for a component override directory with `config.json`; use `--transformer-weights-path` when the repo or path should be probed as raw weights.
 
-B200 CI coverage can include loose BF16-vs-quantized quality smoke checks. Inspect the active branch's `run_suite.py` before assuming they are part of the suite; mainline and feature branches may differ. Those checks are intended to catch blank, corrupted, or obviously divergent images, not exact image parity.
+B200 CI coverage can include loose BF16-vs-quantized quality checks. Inspect the active branch's `run_suite.py` before assuming they are part of the suite; mainline and feature branches may differ. Those checks are intended to catch blank, corrupted, or obviously divergent images, not exact image parity.
 
 ## Documentation Maintenance
 
