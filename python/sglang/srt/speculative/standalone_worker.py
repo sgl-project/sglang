@@ -9,6 +9,10 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+)
 from sglang.srt.speculative.eagle_worker import EAGLEWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import draft_tp_context, load_token_map
@@ -47,6 +51,13 @@ class StandaloneWorker(EAGLEWorker):
         self.speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
+
+        # Adaptive speculative
+        self.adaptive_controller: Optional[AdaptiveController] = None
+        if server_args.speculative_adaptive:
+            self.adaptive_controller = AdaptiveController(
+                self, config_path=server_args.speculative_adaptive_config
+            )
 
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
@@ -101,6 +112,21 @@ class StandaloneWorker(EAGLEWorker):
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
+
+            if self.adaptive_controller is not None:
+                self.adaptive_controller.register(
+                    SpecRuntimeState(
+                        speculative_num_steps=self.speculative_num_steps,
+                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                        draft_attn_backend=self.draft_attn_backend,
+                        cuda_graph_runner=self.cuda_graph_runner,
+                        target_attn_backend=self.target_worker.model_runner.attn_backend,
+                        target_graph_runner=self.target_worker.model_runner.graph_runner,
+                        draft_extend_attn_backend=self.draft_extend_attn_backend,
+                        cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
+                    )
+                )
+                self.adaptive_controller.init_states()
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(

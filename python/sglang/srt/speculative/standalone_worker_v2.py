@@ -5,9 +5,16 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.layers.moe.utils import speculative_moe_backend_context
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+)
 from sglang.srt.speculative.eagle_utils import TreeMaskMode
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker, EAGLEWorkerV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -176,6 +183,13 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
             target_worker,
         )
 
+        # Adaptive speculative
+        self.adaptive_controller: Optional[AdaptiveController] = None
+        if server_args.speculative_adaptive:
+            self.adaptive_controller = AdaptiveController(
+                self, config_path=server_args.speculative_adaptive_config
+            )
+
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
@@ -183,3 +197,22 @@ class StandaloneWorkerV2(EAGLEWorkerV2):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+        # Build adaptive runtime states (must be after draft worker is fully initialized)
+        if self.adaptive_controller is not None:
+            with self._draft_worker.draft_tp_context(
+                self._draft_worker.draft_runner.tp_group
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                self.adaptive_controller.register(
+                    SpecRuntimeState(
+                        speculative_num_steps=self.speculative_num_steps,
+                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
+                        draft_attn_backend=self._draft_worker.draft_attn_backend,
+                        cuda_graph_runner=self._draft_worker.cuda_graph_runner,
+                        target_attn_backend=self._target_worker.model_runner.attn_backend,
+                        target_graph_runner=self._target_worker.model_runner.graph_runner,
+                        draft_extend_attn_backend=self._draft_worker.draft_extend_attn_backend,
+                        cuda_graph_runner_for_draft_extend=self._draft_worker.cuda_graph_runner_for_draft_extend,
+                    )
+                )
+                self.adaptive_controller.init_states()

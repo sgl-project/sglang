@@ -17,10 +17,10 @@ logger = logging.getLogger(__name__)
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     """Return why adaptive spec cannot run under the given server args, or None if supported."""
-    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if server_args.speculative_algorithm not in ("EAGLE", "EAGLE3", "STANDALONE"):
         return (
             f"speculative_algorithm={server_args.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/STANDALONE are supported)"
         )
     if server_args.speculative_eagle_topk != 1:
         return (
@@ -31,11 +31,6 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
         return (
             "enable_dp_attention=True is not supported "
             "(adaptive tier decisions are not synchronized across DP ranks)"
-        )
-    if not server_args.disable_overlap_schedule:
-        return (
-            "the overlap scheduler (spec v2) is enabled "
-            "(adaptive is only implemented for EAGLEWorker v1)"
         )
     if server_args.enable_multi_layer_eagle:
         return (

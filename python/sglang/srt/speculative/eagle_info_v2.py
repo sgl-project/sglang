@@ -114,14 +114,18 @@ class EagleDraftInputV2Mixin:
                 output_ids
             )
 
+        current_kv_lens_cpu = batch.seq_lens.to(device="cpu")
         page_size = batch.token_to_kv_pool_allocator.page_size
         cur_kv_lens_cpu = []
         nxt_kv_lens_cpu = []
         num_needed_tokens = 0
         alloc_len_per_decode = get_alloc_len_per_decode()
-        for r in batch.reqs:
-            # Over-allocation happens here
-            x = r.kv_committed_len + 2 * alloc_len_per_decode - r.kv_allocated_len
+        for i, r in enumerate(batch.reqs):
+            cur_kv_len = current_kv_lens_cpu[i].item()
+            # In overlap mode, batch.seq_lens is the authoritative committed length.
+            # req.kv_committed_len can lag by one decode result and, after a downswitch
+            # in adaptive spec-v2, would make x negative and corrupt allocator state.
+            x = max(0, cur_kv_len + 2 * alloc_len_per_decode - r.kv_allocated_len)
             cur_kv_lens_cpu.append(r.kv_allocated_len)
             nxt_kv_lens_cpu.append(r.kv_allocated_len + x)
             num_needed_tokens += x
@@ -163,7 +167,7 @@ class EagleDraftInputV2Mixin:
         )
 
         # FIXME(lsyin): make this sync optional
-        batch.seq_lens_cpu = batch.seq_lens.cpu()
+        batch.seq_lens_cpu = current_kv_lens_cpu
         batch.seq_lens_sum = batch.seq_lens_cpu.sum().item()
 
     def prepare_for_v2_draft(

@@ -27,6 +27,7 @@ class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
     pp_hidden_states_proxy_tensors: Optional[PPProxyTensors] = None
     next_token_ids: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None
+    speculative_num_draft_tokens: Optional[int] = None
     num_accepted_tokens: int = 0
     accept_length_per_req_cpu: Optional[List[int]] = None
     can_run_cuda_graph: bool = False

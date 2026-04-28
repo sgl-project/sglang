@@ -786,6 +786,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=predict,
+            speculative_num_draft_tokens=self.speculative_num_draft_tokens,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
