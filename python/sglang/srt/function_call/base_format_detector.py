@@ -1,13 +1,14 @@
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Literal, Union
 
 import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
+from xgrammar import StructuralTag, get_model_structural_tag
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -361,3 +362,58 @@ class BaseFormatDetector(ABC):
             A function that takes a tool name (str) and returns StructureInfo
         """
         raise NotImplementedError()
+
+    def supports_builtin_structural_tag(self) -> bool:
+        """Return True if this detector supports builtin structural tag format."""
+        return False
+
+    def get_model_structural_tag_id(self) -> str:
+        """
+        Return the model ID for the builtin structural tag.
+        """
+        raise NotImplementedError()
+
+    def empty_thinking_as_non_thinking(self) -> bool:
+        """
+        It decides how to handle non-thinking mode. If True, non-thinking mode will force the
+        LLM output an empty thinking. If False, thinking tags like <think> or </think> are not
+        allowed and will not be output by the LLM.
+        """
+        return True
+
+    def get_xgrammar_model_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        thinking_mode: bool = True,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+    ) -> StructuralTag:
+        """
+        Return a XGrammar's model structural tag for the given tools and thinking mode.
+        """
+
+        model_id = self.get_model_structural_tag_id()
+        empty_thinking_as_non_thinking = self.empty_thinking_as_non_thinking()
+
+        if isinstance(tool_choice, ToolChoice):
+            # Handle forced tool choice.
+            required_tool = []
+            for tool in tools:
+                if tool.function.name == tool_choice.function.name:
+                    required_tool.append(tool)
+
+            if thinking_mode:
+                return get_model_structural_tag(
+                    model=model_id,
+                    tools=required_tool,
+                    tool_choice="required",
+                    reasoning=True,
+                    force_empty_reasoning=False,
+                )
+            else:
+                return get_model_structural_tag(
+                    model=model_id,
+                    tools=required_tool,
+                    tool_choice="required",
+                    reasoning=not empty_thinking_as_non_thinking,
+                    force_empty_reasoning=empty_thinking_as_non_thinking,
+                )

@@ -208,6 +208,7 @@ class FunctionCallParser:
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
         parallel_tool_calls: bool = True,
+        thinking_mode: bool = True,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -244,3 +245,20 @@ class FunctionCallParser:
                 self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
             )
             return ("json_schema", json_schema)
+        elif self.detector.supports_builtin_structural_tag():
+            is_required = tool_choice == "required" or isinstance(
+                tool_choice, ToolChoice
+            )
+            if is_required or (
+                tool_choice == "auto"
+                and (
+                    any(tool.function.strict for tool in self.tools)
+                    or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+                )
+            ):
+                structural_tag = self.detector.get_xgrammar_model_structural_tag(
+                    tools=self.tools,
+                    thinking_mode=thinking_mode,
+                    tool_choice=tool_choice,
+                )
+                return ("structural_tag", structural_tag)
