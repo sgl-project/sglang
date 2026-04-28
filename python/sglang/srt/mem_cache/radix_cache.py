@@ -21,7 +21,6 @@ limitations under the License.
 The radix tree data structure for managing the KV cache.
 """
 
-import hashlib
 import heapq
 import logging
 import sys
@@ -31,6 +30,7 @@ from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Iterator, List, Optional, Tuple, Union
 
 import torch
+import xxhash
 
 logger = logging.getLogger(__name__)
 
@@ -193,8 +193,8 @@ class RadixKey:
         return plain if self.extra_key is None else (self.extra_key, plain)
 
     def hash_page(self, start: int, end: int, prior_hash: Optional[str] = None) -> str:
-        """SHA256 for logical units [start, end); bigram mode feeds overlapping (t_i, t_{i+1}) byte pairs."""
-        hasher = hashlib.sha256()
+        """xxhash64 for logical units [start, end); bigram mode feeds overlapping (t_i, t_{i+1}) byte pairs."""
+        hasher = xxhash.xxh64()
         if prior_hash:
             hasher.update(bytes.fromhex(prior_hash))
         t = self.token_ids
@@ -272,7 +272,7 @@ class TreeNode:
 
 
 def compute_node_hash_values(node: "TreeNode", page_size: int) -> List[str]:
-    """Compute SHA256-based hash values for position-aware identification."""
+    """Compute xxhash64-based hash values for position-aware identification."""
     hash_values = []
 
     parent_hash = None

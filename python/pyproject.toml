@@ -77,6 +77,7 @@ dependencies = [
   "uvloop",
   "watchfiles",
   "xgrammar==0.1.32",
+  "xxhash>=3.0.0",
   "smg-grpc-servicer>=0.5.0",
   "kernels",
 ]
