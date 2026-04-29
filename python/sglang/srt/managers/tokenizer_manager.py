@@ -454,9 +454,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_metric_collector_watchdog(self):
         # Metrics
         if self.enable_metrics:
+            engine_type = DisaggregationMode.to_engine_type(
+                self.server_args.disaggregation_mode
+            )
+
             labels = {
                 "model_name": self.server_args.served_model_name,
-                # TODO: Add lora name/path in the future,
+                "engine_type": engine_type,
             }
             if self.enable_priority_scheduling:
                 labels["priority"] = ""

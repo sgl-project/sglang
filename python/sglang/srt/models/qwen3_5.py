@@ -464,7 +464,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
+        if (
+            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            and not _is_cpu
+            and not _is_npu
+        ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -488,6 +492,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 projected_states_qkvz, projected_states_ba
             )
+            b = b.contiguous()
+            a = a.contiguous()
 
             query, key, value = map(
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
