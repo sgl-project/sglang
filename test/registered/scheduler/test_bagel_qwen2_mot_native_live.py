@@ -456,9 +456,9 @@ class TestBAGELQwen2MoTNativeLive(CustomTestCase):
                 self.assertEqual(counters["velocity_count"], num_inference_steps - 1)
                 self.assertEqual(counters["append_image_count"], 1)
                 self.assertEqual(counters["decode_count"], 2)
-                self.assertEqual(counters["srt_request_count"], 4)
+                self.assertEqual(counters["srt_request_count"], 7)
                 self.assertEqual(counters["srt_u_decode_request_count"], 2)
-                self.assertEqual(counters["srt_executed_request_count"], 4)
+                self.assertEqual(counters["srt_executed_request_count"], 7)
                 self.assertEqual(
                     srt_executor.temp_g_forward_count,
                     num_inference_steps - 1,

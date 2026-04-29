@@ -14,6 +14,7 @@ from sglang.srt.ug.runtime import (
     UGLatentDecodeRequest,
     UGLatentPrepareRequest,
     UGLatentPrepareResult,
+    UGSRTPreparedInput,
     UGSegmentState,
     UGSessionRecord,
     UGVelocityRequest,
@@ -45,6 +46,14 @@ class UGModelAppendImageResult:
 
 class UGModelAdapterProtocol(Protocol):
     """Model-side UG entrypoints that BAGEL-like models need to implement."""
+
+    def prepare_srt_u_message_inputs(
+        self,
+        *,
+        session: UGModelSessionView,
+        message: UGInterleavedMessage,
+        state: UGSegmentState,
+    ) -> list[UGSRTPreparedInput] | None: ...
 
     def observe_srt_u_forward(
         self,
@@ -99,6 +108,22 @@ class UGModelRunnerAdapter:
 
     def __init__(self, adapter: UGModelAdapterProtocol) -> None:
         self.adapter = adapter
+
+    def prepare_srt_u_message_inputs(
+        self,
+        *,
+        record: UGSessionRecord,
+        message: UGInterleavedMessage,
+        state: UGSegmentState,
+    ) -> list[UGSRTPreparedInput] | None:
+        prepare = getattr(self.adapter, "prepare_srt_u_message_inputs", None)
+        if not callable(prepare):
+            return None
+        return prepare(
+            session=self._session_view(record),
+            message=message,
+            state=state,
+        )
 
     def prefill_interleaved(
         self, *, record: UGSessionRecord, messages: list[UGInterleavedMessage]
@@ -175,9 +200,7 @@ class UGModelRunnerAdapter:
             srt_mm_offsets=tuple(record.srt_mm_offsets),
             metadata={
                 "srt_u_decode_request_count": record.srt_u_decode_request_count,
-                "srt_last_u_decode_request_id": (
-                    record.srt_last_u_decode_request_id
-                ),
+                "srt_last_u_decode_request_id": (record.srt_last_u_decode_request_id),
                 "srt_last_u_decode_origin_input_len": (
                     record.srt_last_u_decode_origin_input_len
                 ),

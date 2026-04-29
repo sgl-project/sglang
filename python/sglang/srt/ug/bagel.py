@@ -26,6 +26,7 @@ from sglang.srt.ug.runtime import (
     UGLatentDecodeRequest,
     UGLatentPrepareRequest,
     UGLatentPrepareResult,
+    UGSRTPreparedInput,
     UGSegmentState,
     UGVelocityRequest,
 )
@@ -362,6 +363,7 @@ class BAGELSessionContext:
     srt_u_forward_results: dict[str, Any] = field(default_factory=dict)
     srt_u_forward_events: list[tuple[str, str]] = field(default_factory=list)
     srt_last_u_decode_output_ids: tuple[int, ...] = ()
+    native_srt_pending_added_tokens: int = 0
 
 
 class BAGELUForwardBridge:
@@ -447,6 +449,9 @@ class BAGELNativeSRTUForwardExecutor(BAGELSRTUForwardExecutor):
         backend._bind_srt_request_tokens(request)
 
         state = backend._state_for(session.handle.session_id)
+        added_tokens = int(request.metadata.get("ug_srt_added_token_count", 0))
+        state.native_srt_pending_added_tokens += max(0, added_tokens)
+        is_final_segment = bool(request.metadata.get("ug_srt_is_final_segment", True))
         if request.state == UGSegmentState.U_PREFILL.value:
             state.decode_count = 0
             state.prepared_denoise = None
@@ -455,18 +460,30 @@ class BAGELNativeSRTUForwardExecutor(BAGELSRTUForwardExecutor):
             state.native_srt_u_context_token_binding = request.metadata.get(
                 "srt_kv_token_binding"
             )
-            return UGModelPrefillResult(added_tokens=request.origin_input_len)
+            if is_final_segment:
+                total_added = state.native_srt_pending_added_tokens
+                state.native_srt_pending_added_tokens = 0
+                return UGModelPrefillResult(added_tokens=total_added)
+            return None
+
+        if request.state == UGSegmentState.APPEND_IMAGE.value:
+            state.prepared_denoise = None
+            state.native_srt_u_context = True
+            state.native_srt_u_context_request_id = request.request_id
+            state.native_srt_u_context_token_binding = request.metadata.get(
+                "srt_kv_token_binding"
+            )
+            if is_final_segment:
+                total_added = state.native_srt_pending_added_tokens
+                state.native_srt_pending_added_tokens = 0
+                state.append_image_count += 1
+                return UGModelAppendImageResult(added_tokens=total_added)
+            return None
 
         if request.state == UGSegmentState.U_DECODE.value:
             state.srt_last_u_decode_output_ids = request.output_ids
             return None
-
-        return super().execute(
-            backend,
-            session=session,
-            request=request,
-            messages=messages,
-        )
+        return None
 
 
 class BAGELInterleaveContextBackend:
@@ -502,6 +519,23 @@ class BAGELInterleaveContextBackend:
             session=session,
             request=request,
             messages=messages,
+        )
+
+    def prepare_srt_u_message_inputs(
+        self,
+        *,
+        session,
+        message: UGInterleavedMessage,
+        state: UGSegmentState,
+    ) -> list[UGSRTPreparedInput] | None:
+        if message.type != "image":
+            return None
+        if not self._uses_native_srt_u_forward():
+            return None
+        return self._prepare_native_srt_image_inputs(
+            session=session,
+            image=message.content,
+            state=state,
         )
 
     def prefill_interleaved(
@@ -564,6 +598,10 @@ class BAGELInterleaveContextBackend:
             return UGDecodeResult(type="image_marker")
         if state.append_image_count > 0 and state.decode_count == 1:
             state.decode_count += 1
+            if state.native_srt_u_context:
+                output_ids = state.srt_last_u_decode_output_ids
+                text = " ".join(str(token_id) for token_id in output_ids)
+                return UGDecodeResult(type="text", text=text)
             with _bagel_autocast(self.inferencer.model):
                 text = self.inferencer.gen_text(
                     state.gen_context,
@@ -864,6 +902,266 @@ class BAGELInterleaveContextBackend:
             cfg_renorm_type=getattr(sampling_params, "cfg_renorm_type", "global"),
         )
 
+    def _prepare_native_srt_image_inputs(
+        self,
+        *,
+        session,
+        image: Any | None,
+        state: UGSegmentState,
+    ) -> list[UGSRTPreparedInput]:
+        model = self.inferencer.model
+        if not hasattr(model, "prepare_vae_images") or not hasattr(
+            model, "prepare_vit_images"
+        ):
+            raise BAGELAdapterError(
+                "Native SRT BAGEL image U forward requires official BAGEL "
+                "prepare_vae_images/prepare_vit_images embedding builders"
+            )
+
+        session_state = self._state_for(session.handle.session_id)
+        image = self._prepare_image(image)
+        session_state.image_shape = self._image_shape(image)
+        curr_kvlens, curr_rope = self._native_srt_curr_lengths(session_state)
+
+        chunks: list[UGSRTPreparedInput] = []
+        with _bagel_autocast(model):
+            vae_input, curr_kvlens, curr_rope = model.prepare_vae_images(
+                curr_kvlens=curr_kvlens,
+                curr_rope=curr_rope,
+                images=[image],
+                transforms=self.inferencer.vae_transform,
+                new_token_ids=self.inferencer.new_token_ids,
+            )
+            chunks.append(
+                self._native_srt_prepared_input_from_packed_sequence(
+                    generation_input=vae_input,
+                    input_embeds=self._embed_native_srt_vae_image(vae_input),
+                    message_image=image,
+                    stage="vae",
+                    state=state,
+                    text_token_key="packed_text_indexes",
+                    vae_token_key="packed_vae_token_indexes",
+                    replace_token_key="packed_vae_token_indexes",
+                )
+            )
+
+            vit_input, curr_kvlens, curr_rope = model.prepare_vit_images(
+                curr_kvlens=curr_kvlens,
+                curr_rope=curr_rope,
+                images=[image],
+                transforms=self.inferencer.vit_transform,
+                new_token_ids=self.inferencer.new_token_ids,
+            )
+            chunks.append(
+                self._native_srt_prepared_input_from_packed_sequence(
+                    generation_input=vit_input,
+                    input_embeds=self._embed_native_srt_vit_image(vit_input),
+                    message_image=image,
+                    stage="vit",
+                    state=state,
+                    text_token_key="packed_text_indexes",
+                    vae_token_key=None,
+                    replace_token_key="packed_vit_token_indexes",
+                )
+            )
+
+        session_state.gen_context["kv_lens"] = curr_kvlens
+        session_state.gen_context["ropes"] = curr_rope
+        session_state.cfg_text_context = self._clone_context(
+            session_state.gen_context,
+            session_id=session.handle.session_id,
+            role="cfg_text",
+        )
+        session_state.prepared_denoise = None
+        return chunks
+
+    def _native_srt_prepared_input_from_packed_sequence(
+        self,
+        *,
+        generation_input: dict[str, Any],
+        input_embeds: torch.Tensor,
+        message_image: Any,
+        stage: str,
+        state: UGSegmentState,
+        text_token_key: str,
+        vae_token_key: str | None,
+        replace_token_key: str,
+    ) -> UGSRTPreparedInput:
+        input_embeds = input_embeds.detach().to(dtype=torch.float32, device="cpu")
+        seq_len = int(input_embeds.shape[0])
+        input_ids = [0] * seq_len
+        packed_text_ids = generation_input["packed_text_ids"].to("cpu").tolist()
+        packed_text_indexes = generation_input[text_token_key].to("cpu").tolist()
+        for token_id, index in zip(packed_text_ids, packed_text_indexes):
+            input_ids[int(index)] = int(token_id)
+
+        text_indices = [int(index) for index in packed_text_indexes]
+        vae_indices = (
+            [int(index) for index in generation_input[vae_token_key].to("cpu").tolist()]
+            if vae_token_key is not None
+            else None
+        )
+        replace_positions = [
+            int(index)
+            for index in generation_input[replace_token_key].to("cpu").tolist()
+        ]
+        replace_embeds = input_embeds[replace_positions].tolist()
+        metadata = {
+            "bagel_u_image_stage": stage,
+            "ug_srt_added_token_count": seq_len,
+        }
+        return UGSRTPreparedInput(
+            input_ids=input_ids,
+            input_text=f"<bagel:{stage}:image>",
+            messages=[UGInterleavedMessage(type="image", content=message_image)],
+            replace_embeds=replace_embeds,
+            replace_positions=replace_positions,
+            position_ids=[
+                int(position)
+                for position in generation_input["packed_position_ids"]
+                .to("cpu")
+                .tolist()
+            ],
+            non_causal_query_attention=True,
+            bagel_text_token_indices=text_indices,
+            bagel_vae_token_indices=vae_indices,
+            adapter_metadata=metadata,
+        )
+
+    def _embed_native_srt_vae_image(
+        self, generation_input: dict[str, Any]
+    ) -> torch.Tensor:
+        model = self.inferencer.model
+        packed_sequence = self._native_srt_base_text_sequence(generation_input)
+        vae_model = self.inferencer.vae_model
+        padded_images = generation_input["padded_images"]
+        runtime_device = _bagel_runtime_device(vae_model) or _bagel_runtime_device(
+            model
+        )
+        if runtime_device is not None:
+            padded_images = padded_images.to(runtime_device)
+        vae_dtype = _bagel_runtime_dtype(vae_model)
+        if vae_dtype is not None and padded_images.is_floating_point():
+            padded_images = padded_images.to(dtype=vae_dtype)
+
+        padded_latent = vae_model.encode(padded_images)
+        patch_size = int(getattr(model, "latent_patch_size", 2))
+        latent_channel = int(getattr(model, "latent_channel", 16))
+        packed_latents = []
+        for latent, (height, width) in zip(
+            padded_latent,
+            generation_input["patchified_vae_latent_shapes"],
+        ):
+            latent = latent[:, : height * patch_size, : width * patch_size].reshape(
+                latent_channel,
+                height,
+                patch_size,
+                width,
+                patch_size,
+            )
+            latent = torch.einsum("chpwq->hwpqc", latent).reshape(
+                -1,
+                patch_size * patch_size * latent_channel,
+            )
+            packed_latents.append(latent)
+        packed_latent = torch.cat(packed_latents, dim=0)
+        device = model.vae2llm.weight.device
+        packed_latent = packed_latent.to(
+            device=device, dtype=model.vae2llm.weight.dtype
+        )
+        packed_vae_position_ids = generation_input["packed_vae_position_ids"].to(
+            device=device,
+            dtype=torch.long,
+        )
+        packed_timesteps = generation_input["packed_timesteps"].to(device=device)
+        if packed_timesteps.numel() == 1:
+            packed_timesteps = packed_timesteps.reshape(1).expand(
+                packed_latent.shape[0]
+            )
+        packed_latent = (
+            model.vae2llm(packed_latent)
+            + model.time_embedder(packed_timesteps)
+            + model.latent_pos_embed(packed_vae_position_ids)
+        )
+        packed_sequence = packed_sequence.to(device=device)
+        packed_sequence[generation_input["packed_vae_token_indexes"].to(device)] = (
+            packed_latent.to(packed_sequence.dtype)
+        )
+        return packed_sequence
+
+    def _embed_native_srt_vit_image(
+        self, generation_input: dict[str, Any]
+    ) -> torch.Tensor:
+        model = self.inferencer.model
+        packed_sequence = self._native_srt_base_text_sequence(generation_input)
+        vit_tokens = generation_input["packed_vit_tokens"]
+        runtime_device = _bagel_runtime_device(getattr(model, "vit_model", None))
+        if runtime_device is not None:
+            vit_tokens = vit_tokens.to(runtime_device)
+        packed_vit_position_ids = generation_input["packed_vit_position_ids"]
+        if runtime_device is not None:
+            packed_vit_position_ids = packed_vit_position_ids.to(runtime_device)
+        vit_token_seqlens = generation_input["vit_token_seqlens"]
+        if runtime_device is not None:
+            vit_token_seqlens = vit_token_seqlens.to(runtime_device)
+        cu_seqlens = torch.nn.functional.pad(
+            torch.cumsum(vit_token_seqlens, dim=0),
+            (1, 0),
+        ).to(torch.int32)
+        max_seqlen = torch.max(vit_token_seqlens).item()
+        packed_vit_token_embed = model.vit_model(
+            packed_pixel_values=vit_tokens,
+            packed_flattened_position_ids=packed_vit_position_ids,
+            cu_seqlens=cu_seqlens,
+            max_seqlen=max_seqlen,
+        )
+        packed_vit_token_embed = model.connector(packed_vit_token_embed)
+        packed_vit_token_embed = packed_vit_token_embed + model.vit_pos_embed(
+            packed_vit_position_ids
+        )
+        device = packed_vit_token_embed.device
+        packed_sequence = packed_sequence.to(device=device)
+        packed_sequence[generation_input["packed_vit_token_indexes"].to(device)] = (
+            packed_vit_token_embed.to(packed_sequence.dtype)
+        )
+        return packed_sequence
+
+    def _native_srt_base_text_sequence(
+        self,
+        generation_input: dict[str, Any],
+    ) -> torch.Tensor:
+        model = self.inferencer.model
+        embed_tokens = model.language_model.model.embed_tokens
+        packed_text_ids = generation_input["packed_text_ids"].to(
+            device=embed_tokens.weight.device,
+            dtype=torch.long,
+        )
+        packed_text_embedding = embed_tokens(packed_text_ids)
+        seq_len = int(generation_input["packed_seqlens"].sum().item())
+        packed_sequence = packed_text_embedding.new_zeros((seq_len, model.hidden_size))
+        packed_sequence[
+            generation_input["packed_text_indexes"].to(packed_sequence.device)
+        ] = packed_text_embedding
+        return packed_sequence
+
+    def _native_srt_curr_lengths(
+        self,
+        state: BAGELSessionContext,
+    ) -> tuple[list[int], list[int]]:
+        binding = state.native_srt_u_context_token_binding
+        if binding is not None:
+            token_count = int(binding.token_count)
+            return [token_count], [token_count]
+        kv_lens = state.gen_context.get("kv_lens") or [0]
+        ropes = state.gen_context.get("ropes") or [0]
+        return [int(kv_lens[0])], [int(ropes[0])]
+
+    def _uses_native_srt_u_forward(self) -> bool:
+        return isinstance(
+            self.u_forward_bridge.srt_u_forward_executor,
+            BAGELNativeSRTUForwardExecutor,
+        )
+
     @staticmethod
     def _native_srt_token_binding(state: BAGELSessionContext) -> Any:
         binding = state.native_srt_u_context_token_binding
@@ -907,6 +1205,14 @@ class BAGELInterleaveContextBackend:
 
 
 class BAGELBackendProtocol(Protocol):
+    def prepare_srt_u_message_inputs(
+        self,
+        *,
+        session,
+        message: UGInterleavedMessage,
+        state: UGSegmentState,
+    ) -> list[UGSRTPreparedInput] | None: ...
+
     def observe_srt_u_forward(
         self,
         *,
@@ -943,10 +1249,10 @@ class BAGELBackendProtocol(Protocol):
 class BAGELUGModelAdapter(UGModelAdapterProtocol):
     """BAGEL-facing UG adapter shell.
 
-    The real BAGEL backend is intentionally not loaded here yet. Official BAGEL
-    exposes an interleaved inferencer whose image generation call owns the whole
-    denoising loop; SGLang UG needs a per-step velocity hook first. Until that
-    hook lands, tests and diffusion smoke use the mock backend below.
+    The adapter can use either a deterministic mock backend for smoke tests or
+    the official BAGEL modules behind the SRT-owned UG runtime. In the native
+    SRT path, official modules prepare embeddings/latents while SRT owns the
+    session requests, KV cache, and per-step G velocity execution.
     """
 
     def __init__(
@@ -970,6 +1276,18 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
         self, *, session, messages: list[UGInterleavedMessage]
     ) -> UGModelPrefillResult:
         return self.backend.prefill_interleaved(session=session, messages=messages)
+
+    def prepare_srt_u_message_inputs(
+        self,
+        *,
+        session,
+        message: UGInterleavedMessage,
+        state: UGSegmentState,
+    ) -> list[UGSRTPreparedInput] | None:
+        prepare = getattr(self.backend, "prepare_srt_u_message_inputs", None)
+        if not callable(prepare):
+            return None
+        return prepare(session=session, message=message, state=state)
 
     def observe_srt_u_forward(
         self,
@@ -1089,6 +1407,16 @@ class MockBAGELBackend:
             else:
                 raise ValueError(f"Unsupported BAGEL message type: {message.type}")
         return UGModelPrefillResult(added_tokens=token_count)
+
+    def prepare_srt_u_message_inputs(
+        self,
+        *,
+        session,
+        message: UGInterleavedMessage,
+        state: UGSegmentState,
+    ) -> list[UGSRTPreparedInput] | None:
+        del session, message, state
+        return None
 
     def observe_srt_u_forward(
         self,

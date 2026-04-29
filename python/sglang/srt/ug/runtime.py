@@ -55,6 +55,29 @@ class UGInterleavedMessage:
     content: Any
 
 
+@dataclass(slots=True)
+class UGSRTPreparedInput:
+    """One materialized SRT input chunk for a UG U-side segment.
+
+    `input_embeds` and `position_ids` are relative to `input_ids`. The runtime
+    shifts them to the full SRT session request after `Session.create_req`
+    prepends cached context and strips BOS for append requests.
+    """
+
+    input_ids: list[int]
+    input_text: str
+    messages: list[UGInterleavedMessage]
+    input_embeds: list[list[float]] | None = None
+    replace_embeds: list[list[float]] | None = None
+    replace_positions: list[int] | None = None
+    position_ids: list[int] | None = None
+    non_causal_query_attention: bool = False
+    bagel_text_token_indices: list[int] | None = None
+    bagel_vae_token_indices: list[int] | None = None
+    mm_inputs: Any | None = None
+    adapter_metadata: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(frozen=True, slots=True)
 class UGVelocityRequest:
     session: UGSessionHandle
@@ -134,6 +157,14 @@ class UGSessionRecord:
 
 
 class UGModelRunnerProtocol(Protocol):
+    def prepare_srt_u_message_inputs(
+        self,
+        *,
+        record: UGSessionRecord,
+        message: UGInterleavedMessage,
+        state: UGSegmentState,
+    ) -> list[UGSRTPreparedInput] | None: ...
+
     def observe_srt_u_forward(
         self,
         *,
@@ -181,6 +212,16 @@ class UGSRTRequestExecutorProtocol(Protocol):
 
 class FakeUGModelRunner:
     """Deterministic UG model shell used to prove session/KV ownership plumbing."""
+
+    def prepare_srt_u_message_inputs(
+        self,
+        *,
+        record: UGSessionRecord,
+        message: UGInterleavedMessage,
+        state: UGSegmentState,
+    ) -> list[UGSRTPreparedInput] | None:
+        del record, message, state
+        return None
 
     def prefill_interleaved(
         self, *, record: UGSessionRecord, messages: list[UGInterleavedMessage]
@@ -511,36 +552,196 @@ class UGSessionRuntime:
             return
         from sglang.srt.session.session_controller import SessionController
 
-        input_ids, input_text, mm_inputs = self._tokenize_interleaved_messages(messages)
-        req, recv_req = self._create_srt_session_req(
+        prepared_inputs = self._prepare_srt_u_inputs(
             record,
-            request_id=request_id,
-            input_ids=input_ids,
-            input_text=input_text,
-            mm_inputs=mm_inputs,
-            max_new_tokens=0,
-        )
-
-        if mm_inputs is not None:
-            SessionController.adjust_mm_offsets(recv_req, req, mm_inputs)
-            req.extend_image_inputs(mm_inputs)
-
-        self._record_srt_req(record, req, request_id=request_id)
-        self._attach_srt_u_forward_metadata(
-            record,
-            req,
+            messages,
             state=record.state,
-            input_text=input_text,
-            messages=messages,
         )
-        self._execute_srt_req(record, req, state=record.state)
-        self._notify_srt_u_forward(
-            record,
-            req,
-            state=record.state,
-            input_text=input_text,
-            messages=messages,
+        total_inputs = len(prepared_inputs)
+        for input_index, prepared in enumerate(prepared_inputs):
+            segment_request_id = (
+                request_id if total_inputs == 1 else f"{request_id}:s{input_index + 1}"
+            )
+            is_final_segment = input_index == total_inputs - 1
+            input_ids = prepared.input_ids
+            input_text = prepared.input_text
+            mm_inputs = prepared.mm_inputs
+            req, recv_req = self._create_srt_session_req(
+                record,
+                request_id=segment_request_id,
+                input_ids=input_ids,
+                input_text=input_text,
+                mm_inputs=mm_inputs,
+                max_new_tokens=0,
+            )
+
+            if mm_inputs is not None:
+                SessionController.adjust_mm_offsets(recv_req, req, mm_inputs)
+                req.extend_image_inputs(mm_inputs)
+
+            adapter_metadata = self._apply_prepared_srt_input(
+                req,
+                recv_req=recv_req,
+                prepared=prepared,
+                is_final_segment=is_final_segment,
+            )
+
+            self._record_srt_req(record, req, request_id=segment_request_id)
+            self._attach_srt_u_forward_metadata(
+                record,
+                req,
+                state=record.state,
+                input_text=input_text,
+                messages=prepared.messages,
+                adapter_metadata=adapter_metadata,
+            )
+            self._execute_srt_req(record, req, state=record.state)
+            self._notify_srt_u_forward(
+                record,
+                req,
+                state=record.state,
+                input_text=input_text,
+                messages=prepared.messages,
+            )
+
+    def _prepare_srt_u_inputs(
+        self,
+        record: UGSessionRecord,
+        messages: list[UGInterleavedMessage],
+        *,
+        state: UGSegmentState,
+    ) -> list[UGSRTPreparedInput]:
+        prepare_one = getattr(self.model_runner, "prepare_srt_u_message_inputs", None)
+        if not callable(prepare_one):
+            input_ids, input_text, mm_inputs = self._tokenize_interleaved_messages(
+                messages
+            )
+            return [
+                UGSRTPreparedInput(
+                    input_ids=input_ids,
+                    input_text=input_text,
+                    messages=messages,
+                    mm_inputs=mm_inputs,
+                )
+            ]
+
+        prepared_inputs: list[UGSRTPreparedInput] = []
+        default_messages: list[UGInterleavedMessage] = []
+        used_custom = False
+
+        def flush_default() -> None:
+            if not default_messages:
+                return
+            input_ids, input_text, mm_inputs = self._tokenize_interleaved_messages(
+                default_messages
+            )
+            prepared_inputs.append(
+                UGSRTPreparedInput(
+                    input_ids=input_ids,
+                    input_text=input_text,
+                    messages=list(default_messages),
+                    mm_inputs=mm_inputs,
+                )
+            )
+            default_messages.clear()
+
+        for message in messages:
+            custom = prepare_one(record=record, message=message, state=state)
+            if custom is None:
+                default_messages.append(message)
+                continue
+            used_custom = True
+            flush_default()
+            prepared_inputs.extend(custom)
+
+        if not used_custom:
+            input_ids, input_text, mm_inputs = self._tokenize_interleaved_messages(
+                messages
+            )
+            return [
+                UGSRTPreparedInput(
+                    input_ids=input_ids,
+                    input_text=input_text,
+                    messages=messages,
+                    mm_inputs=mm_inputs,
+                )
+            ]
+        flush_default()
+        return prepared_inputs
+
+    def _apply_prepared_srt_input(
+        self,
+        req: Any,
+        *,
+        recv_req: Any,
+        prepared: UGSRTPreparedInput,
+        is_final_segment: bool,
+    ) -> dict[str, Any]:
+        prefix_len, stripped = self._srt_prefix_and_strip_lengths(
+            req, recv_req, prepared
         )
+        new_token_count = len(recv_req.input_ids)
+
+        adapter_metadata = dict(prepared.adapter_metadata)
+        adapter_metadata.setdefault("ug_srt_added_token_count", new_token_count)
+        adapter_metadata["ug_srt_is_final_segment"] = bool(is_final_segment)
+
+        if prepared.input_embeds is not None:
+            suffix_embeds = prepared.input_embeds[stripped:]
+            hidden_size = len(suffix_embeds[0]) if suffix_embeds else 0
+            prefix_embeds = [[0.0] * hidden_size for _ in range(prefix_len)]
+            req.input_embeds = prefix_embeds + suffix_embeds
+
+        if prepared.replace_embeds is not None:
+            replace_positions = prepared.replace_positions
+            if replace_positions is None:
+                raise RuntimeError(
+                    "UG prepared SRT replace_embeds requires replace_positions"
+                )
+            shifted_embeds = []
+            shifted_positions = []
+            for embed, position in zip(prepared.replace_embeds, replace_positions):
+                if position < stripped:
+                    continue
+                shifted_embeds.append(embed)
+                shifted_positions.append(prefix_len + position - stripped)
+            req.ug_replace_embeds = shifted_embeds
+            req.ug_replace_positions = shifted_positions
+
+        if prepared.position_ids is not None:
+            suffix_positions = prepared.position_ids[stripped:]
+            req.ug_position_ids = list(range(prefix_len)) + list(suffix_positions)
+
+        if prepared.non_causal_query_attention:
+            req.ug_non_causal_query_attention = True
+
+        if prepared.bagel_text_token_indices is not None:
+            req.ug_bagel_text_token_indices = [
+                prefix_len + index - stripped
+                for index in prepared.bagel_text_token_indices
+                if index >= stripped
+            ]
+        if prepared.bagel_vae_token_indices is not None:
+            req.ug_bagel_vae_token_indices = [
+                prefix_len + index - stripped
+                for index in prepared.bagel_vae_token_indices
+                if index >= stripped
+            ]
+        return adapter_metadata
+
+    @staticmethod
+    def _srt_prefix_and_strip_lengths(
+        req: Any,
+        recv_req: Any,
+        prepared: UGSRTPreparedInput,
+    ) -> tuple[int, int]:
+        prefix_len = len(req.origin_input_ids) - len(recv_req.input_ids)
+        stripped = len(prepared.input_ids) - len(recv_req.input_ids)
+        if prefix_len < 0 or stripped < 0:
+            raise RuntimeError(
+                "UG prepared SRT input length is inconsistent with session request"
+            )
+        return prefix_len, stripped
 
     def _append_srt_u_decode_request(self, record: UGSessionRecord) -> None:
         request_id = f"{record.session_id}:d{record.decode_count + 1}"
@@ -559,6 +760,7 @@ class UGSessionRuntime:
             state=UGSegmentState.U_DECODE,
             input_text="",
             messages=[],
+            adapter_metadata={"ug_srt_added_token_count": 0},
         )
         self._execute_srt_req(record, req, state=UGSegmentState.U_DECODE)
         record.srt_u_decode_request_count += 1
@@ -635,6 +837,7 @@ class UGSessionRuntime:
         state: UGSegmentState,
         input_text: str,
         messages: list[UGInterleavedMessage],
+        adapter_metadata: dict[str, Any] | None = None,
     ) -> None:
         req.ug_u_forward_metadata = {
             "session": record.handle(),
@@ -649,6 +852,7 @@ class UGSessionRuntime:
                 UGSessionRuntime._collect_mm_offsets(req.multimodal_inputs)
             ),
             "messages": tuple(messages),
+            "adapter_metadata": dict(adapter_metadata or {}),
         }
 
     def _execute_srt_req(
@@ -746,10 +950,13 @@ class UGSessionRuntime:
         *,
         state: UGSegmentState,
     ) -> dict[str, Any]:
+        metadata = dict(
+            getattr(req, "ug_u_forward_metadata", {}).get("adapter_metadata", {})
+        )
         token_binding = self._srt_kv_token_binding(record, req, state=state)
-        if token_binding is None:
-            return {}
-        return {"srt_kv_token_binding": token_binding}
+        if token_binding is not None:
+            metadata["srt_kv_token_binding"] = token_binding
+        return metadata
 
     def _srt_kv_token_binding(
         self,

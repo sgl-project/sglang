@@ -3209,11 +3209,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 batch_index=batch_index,
                 metadata=metadata,
             )
-            view_metadata = (
-                {"srt_kv_token_binding": token_binding}
-                if token_binding is not None
-                else {}
-            )
+            view_metadata = dict(metadata.get("adapter_metadata", {}))
+            if token_binding is not None:
+                view_metadata["srt_kv_token_binding"] = token_binding
             request = UGSRTRequestView(
                 session=session,
                 state=metadata["state"],

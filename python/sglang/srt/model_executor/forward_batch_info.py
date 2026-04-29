@@ -362,6 +362,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For token embedding overrides (sparse replacement at specific positions)
     replace_embeds: Optional[torch.Tensor] = None
     replace_positions: Optional[torch.Tensor] = None
+    bagel_mot_text_token_indices: Optional[torch.Tensor] = None
+    bagel_mot_vae_token_indices: Optional[torch.Tensor] = None
 
     # For cross-encoder model
     token_type_ids: Optional[torch.Tensor] = None
@@ -487,6 +489,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             input_embeds=batch.input_embeds,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
+            bagel_mot_text_token_indices=batch.bagel_mot_text_token_indices,
+            bagel_mot_vae_token_indices=batch.bagel_mot_vae_token_indices,
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
@@ -551,6 +555,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ],
                 dtype=positions_dtype,
             ).to(device, non_blocking=True)
+        elif batch.custom_position_ids is not None:
+            ret.positions = batch.custom_position_ids.to(device, non_blocking=True)
         elif (
             ret.spec_info is not None
             and getattr(ret.spec_info, "positions", None) is not None
@@ -582,6 +588,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             ret.extend_prefix_lens_cpu = batch.extend_prefix_lens
             ret.extend_seq_lens_cpu = batch.extend_seq_lens
             ret.extend_logprob_start_lens_cpu = batch.extend_logprob_start_lens
+
+        if batch.ug_non_causal_query_attention:
+            ret.ug_g_non_causal_query_attention = True
+            ret.cross_attention_custom_mask = torch.ones(
+                ret.extend_num_tokens * ret.seq_lens_sum,
+                dtype=torch.bool,
+                device=device,
+            )
 
         if model_runner.use_ngram_embedding:
             ret._init_ngram_embedding_info(batch, model_runner, device)

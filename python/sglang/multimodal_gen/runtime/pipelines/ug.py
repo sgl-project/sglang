@@ -101,9 +101,7 @@ def _load_ug_bridge(
                 scheduler=scheduler,
                 srt_request_executor=srt_request_executor,
                 srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
-                srt_image_tokenization=(
-                    "text_placeholder" if native_srt_u_context else "multimodal"
-                ),
+                srt_image_tokenization="multimodal",
             )
         )
     raise ValueError(f"Unsupported UG model path: {model_path}")

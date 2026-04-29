@@ -514,6 +514,54 @@ class BAGELQwen2MoTForCausalLM(Qwen2ForCausalLM):
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         return super().load_weights(_iter_bagel_language_model_weights(weights))
 
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor = None,
+        get_embedding: bool = False,
+        pp_proxy_tensors=None,
+    ) -> torch.Tensor:
+        text_token_indices = getattr(
+            forward_batch,
+            "bagel_mot_text_token_indices",
+            None,
+        )
+        vae_token_indices = getattr(
+            forward_batch,
+            "bagel_mot_vae_token_indices",
+            None,
+        )
+        if text_token_indices is None or vae_token_indices is None:
+            return super().forward(
+                input_ids,
+                positions,
+                forward_batch,
+                input_embeds=input_embeds,
+                get_embedding=get_embedding,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        if input_embeds is None:
+            input_embeds = self.model.embed_tokens(input_ids)
+        hidden_states = self.model.forward_gen_embeds(
+            input_embeds=input_embeds,
+            positions=positions,
+            forward_batch=forward_batch,
+            text_token_indices=text_token_indices,
+            vae_token_indices=vae_token_indices,
+        )
+        if get_embedding:
+            return self.pooler(hidden_states, forward_batch)
+        return self.logits_processor(
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            None,
+        )
+
     def forward_gen_embeds(
         self,
         input_embeds: torch.Tensor,

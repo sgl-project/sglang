@@ -135,7 +135,7 @@ class TestBAGELUGModelAdapter(unittest.TestCase):
             bridge.runtime.srt_request_executor,
         )
         self.assertIs(bridge.runtime.session_controller, scheduler.session_controller)
-        self.assertEqual(bridge.runtime.srt_image_tokenization, "text_placeholder")
+        self.assertEqual(bridge.runtime.srt_image_tokenization, "multimodal")
 
     def test_mock_bagel_adapter_factory_runs_u_g_u_loop(self):
         adapter = create_bagel_ug_model_adapter("sglang-internal/mock-bagel")
@@ -217,6 +217,16 @@ class FakeContextBAGELModel(FakeOfficialBAGELModel):
         super().__init__()
         self.prepare_vae_latent_calls = []
         self.prepare_vae_latent_cfg_calls = []
+        self.hidden_size = 4
+        self.latent_patch_size = 1
+        self.latent_channel = 1
+        self.language_model.model.embed_tokens = torch.nn.Embedding(8, self.hidden_size)
+        self.vae2llm = torch.nn.Linear(1, self.hidden_size, bias=False)
+        self.time_embedder = FakeTimeEmbedder(self.hidden_size)
+        self.latent_pos_embed = torch.nn.Embedding(16, self.hidden_size)
+        self.vit_model = FakeVITModel(self.hidden_size)
+        self.connector = torch.nn.Identity()
+        self.vit_pos_embed = torch.nn.Embedding(16, self.hidden_size)
 
     def prepare_vae_latent(
         self,
@@ -249,6 +259,119 @@ class FakeContextBAGELModel(FakeOfficialBAGELModel):
         payload = dict(_fake_bagel_prepared().cfg_text_generation_input)
         payload["cfg_key_values_lens"] = torch.tensor(curr_kvlens, dtype=torch.int)
         return payload
+
+    def prepare_vae_images(
+        self,
+        *,
+        curr_kvlens,
+        curr_rope,
+        images,
+        transforms,
+        new_token_ids,
+        timestep=0,
+    ):
+        del images, transforms
+        self.prepare_vae_latent_calls.append(
+            {
+                "kind": "image",
+                "curr_kvlens": list(curr_kvlens),
+                "curr_rope": list(curr_rope),
+            }
+        )
+        position = int(curr_rope[0])
+        generation_input = {
+            "padded_images": torch.ones(1, 1, 2, 2),
+            "patchified_vae_latent_shapes": [(2, 2)],
+            "packed_vae_position_ids": torch.arange(4, dtype=torch.long),
+            "packed_timesteps": torch.tensor([timestep], dtype=torch.float32),
+            "packed_vae_token_indexes": torch.tensor([1, 2, 3, 4]),
+            "packed_text_ids": torch.tensor(
+                [new_token_ids["start_of_image"], new_token_ids["end_of_image"]],
+                dtype=torch.long,
+            ),
+            "packed_text_indexes": torch.tensor([0, 5], dtype=torch.long),
+            "packed_position_ids": torch.full((6,), position, dtype=torch.long),
+            "packed_seqlens": torch.tensor([6], dtype=torch.int32),
+            "packed_indexes": torch.arange(
+                int(curr_kvlens[0]),
+                int(curr_kvlens[0]) + 6,
+                dtype=torch.long,
+            ),
+            "packed_key_value_indexes": torch.arange(
+                int(curr_kvlens[0]),
+                dtype=torch.long,
+            ),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int32),
+        }
+        return generation_input, [int(curr_kvlens[0]) + 6], [position + 1]
+
+    def prepare_vit_images(
+        self,
+        *,
+        curr_kvlens,
+        curr_rope,
+        images,
+        transforms,
+        new_token_ids,
+    ):
+        del images, transforms
+        position = int(curr_rope[0])
+        generation_input = {
+            "packed_text_ids": torch.tensor(
+                [new_token_ids["start_of_image"], new_token_ids["end_of_image"]],
+                dtype=torch.long,
+            ),
+            "packed_text_indexes": torch.tensor([0, 3], dtype=torch.long),
+            "vit_token_seqlens": torch.tensor([2], dtype=torch.int32),
+            "packed_vit_tokens": torch.ones(2, self.hidden_size),
+            "packed_vit_position_ids": torch.arange(2, dtype=torch.long),
+            "packed_vit_token_indexes": torch.tensor([1, 2], dtype=torch.long),
+            "packed_position_ids": torch.full((4,), position, dtype=torch.long),
+            "packed_seqlens": torch.tensor([4], dtype=torch.int32),
+            "packed_indexes": torch.arange(
+                int(curr_kvlens[0]),
+                int(curr_kvlens[0]) + 4,
+                dtype=torch.long,
+            ),
+            "packed_key_value_indexes": torch.arange(
+                int(curr_kvlens[0]),
+                dtype=torch.long,
+            ),
+            "key_values_lens": torch.tensor(curr_kvlens, dtype=torch.int32),
+        }
+        return generation_input, [int(curr_kvlens[0]) + 4], [position + 1]
+
+
+class FakeVAEModel(torch.nn.Module):
+    def encode(self, padded_images):
+        return padded_images
+
+
+class FakeVITModel(torch.nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.hidden_size = hidden_size
+
+    def forward(
+        self,
+        *,
+        packed_pixel_values,
+        packed_flattened_position_ids,
+        cu_seqlens,
+        max_seqlen,
+    ):
+        del packed_flattened_position_ids, cu_seqlens, max_seqlen
+        return packed_pixel_values.to(torch.float32)
+
+
+class FakeTimeEmbedder(torch.nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.weight = torch.nn.Parameter(torch.ones(hidden_size))
+
+    def forward(self, timestep):
+        return timestep.reshape(-1, 1).to(torch.float32) * self.weight.reshape(1, -1)
 
 
 class FakeNativeSRTVelocityModel:
@@ -421,8 +544,10 @@ class FakeBAGELImageTransform:
 class FakeBAGELInferencer:
     def __init__(self):
         self.model = FakeContextBAGELModel()
-        self.new_token_ids = {"start_of_image": 1, "end_of_image": 2}
+        self.vae_model = FakeVAEModel()
+        self.new_token_ids = {"start_of_image": 3, "end_of_image": 4}
         self.vae_transform = FakeBAGELImageTransform()
+        self.vit_transform = FakeBAGELImageTransform()
         self.events = []
         self.decode_image_calls = []
 
@@ -486,8 +611,10 @@ class FakeNaiveBAGELCache:
 class FakeSRTCacheBAGELInferencer:
     def __init__(self):
         self.model = FakeContextBAGELModel()
-        self.new_token_ids = {"start_of_image": 1, "end_of_image": 2}
+        self.vae_model = FakeVAEModel()
+        self.new_token_ids = {"start_of_image": 3, "end_of_image": 4}
         self.vae_transform = FakeBAGELImageTransform()
+        self.vit_transform = FakeBAGELImageTransform()
         self.events = []
 
     def init_gen_context(self):
@@ -1295,6 +1422,54 @@ class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
         counters = runtime.get_debug_counters(response.session)
         self.assertEqual(counters["prefill_count"], 1)
         self.assertEqual(counters["velocity_count"], 1)
+
+    def test_native_srt_append_image_prepares_embeds_without_official_append(self):
+        inferencer = FakeBAGELInferencer()
+        backend = BAGELInterleaveContextBackend(
+            inferencer,
+            u_forward_bridge=BAGELUForwardBridge(
+                srt_u_forward_executor=BAGELNativeSRTUForwardExecutor()
+            ),
+            native_srt_denoise_executor=BAGELNativeSRTDenoiseExecutor(
+                FakeNativeSRTVelocityModel(),
+                forward_batch_provider=lambda **kwargs: SimpleNamespace(
+                    source="native-srt",
+                    kwargs=kwargs,
+                ),
+            ),
+            default_image_shape=(32, 32),
+        )
+        adapter = BAGELUGModelAdapter("already-loaded-bagel", backend=backend)
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=BindingSRTExecutor(start_index=9),
+            srt_u_decode_max_new_tokens=1,
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw")],
+            session_id="bagel-native-image-u",
+        )
+        runtime.decode_next_segment(handle)
+        handle = runtime.append_generated_image(handle, image=FakeImage(size=(8, 8)))
+        text = runtime.decode_next_segment(handle)
+
+        self.assertEqual(text.type, "text")
+        self.assertEqual(text.text, "123")
+        self.assertEqual(
+            [event for event in inferencer.events if event[0] == "image"],
+            [],
+        )
+        self.assertEqual(len(inferencer.vae_transform.resize_calls), 1)
+        state = backend.sessions["bagel-native-image-u"]
+        self.assertEqual(state.append_image_count, 1)
+        self.assertTrue(state.native_srt_u_context)
+        self.assertEqual(state.gen_context["kv_lens"], [12])
+        counters = runtime.get_debug_counters(handle)
+        self.assertEqual(counters["append_image_count"], 1)
+        self.assertEqual(counters["srt_request_count"], 5)
+        self.assertIn(":s2", state.native_srt_u_context_request_id)
 
     def test_scheduler_executor_builds_releasable_temp_g_forward_batch(self):
         native_model = FakeNativeSRTVelocityModel()
