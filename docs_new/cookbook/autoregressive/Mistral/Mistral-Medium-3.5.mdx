@@ -324,21 +324,16 @@ Latency: 13.594 s
 Output throughput: 1560.660 token/s
 ```
 
-#### MMMU (vision benchmark, 100 samples)
+#### MMMU
 
 ```bash Command
-python3 -m sglang.test.run_eval \
-  --eval-name mmmu \
-  --num-examples 100 \
-  --num-threads 16 \
-  --max-tokens 30 \
-  --base-url http://localhost:30000
+python3 benchmark/mmmu/bench_sglang.py --port 30000
 ```
 
 **Results:**
 
 ```text Output
-Score: 0.270
+Overall accuracy: 0.586
 ```
 
 ### 5.2 Speed Benchmarks
