@@ -46,26 +46,6 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         )
 
 
-class TestServerArgsCli(unittest.TestCase):
-    def test_transformer_fp8_cast_cli_arg_is_disabled_by_default(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        args, _ = parser.parse_known_args(["--model-path", "/fake"])
-
-        self.assertFalse(args.transformer_fp8_cast)
-
-    def test_transformer_fp8_cast_cli_arg_can_be_enabled(self):
-        parser = FlexibleArgumentParser()
-        ServerArgs.add_cli_args(parser)
-
-        args, _ = parser.parse_known_args(
-            ["--model-path", "/fake", "--transformer-fp8-cast"]
-        )
-
-        self.assertTrue(args.transformer_fp8_cast)
-
-
 class TestModelIdResolution(unittest.TestCase):
     def setUp(self):
         _get_config_info.cache_clear()

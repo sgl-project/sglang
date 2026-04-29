@@ -1212,23 +1212,6 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     param_names_mapping = LTX2ArchConfig().param_names_mapping
     reverse_param_names_mapping = LTX2ArchConfig().reverse_param_names_mapping
     lora_param_names_mapping = LTX2ArchConfig().lora_param_names_mapping
-    _fp8_cast_module_suffixes = (
-        ".to_q",
-        ".to_k",
-        ".to_v",
-        ".to_out.0",
-        "ff.proj_in",
-        "ff.proj_out",
-    )
-
-    @classmethod
-    def should_apply_fp8_cast_to_module(
-        cls, name: str, module: nn.Module
-    ) -> bool:
-        return name.startswith("transformer_blocks.") and name.endswith(
-            cls._fp8_cast_module_suffixes
-        )
-
     @staticmethod
     def _collapse_prompt_timestep(timestep: torch.Tensor) -> torch.Tensor:
         if timestep.ndim <= 1:

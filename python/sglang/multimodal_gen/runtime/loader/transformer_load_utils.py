@@ -259,68 +259,6 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
         )
 
 
-class _TransformerFp8CastAdapter(_TransformerQuantAdapter):
-    """Adapter for model-declared fp8-cast reference weight rounding."""
-
-    def __init__(
-        self,
-        *,
-        cls_name: str,
-        model_cls: type[nn.Module],
-        server_args: ServerArgs,
-    ) -> None:
-        self.cls_name = cls_name
-        self.model_cls = model_cls
-        self.server_args = server_args
-
-    def get_post_load_hooks(self) -> list[PostLoadHook]:
-        if not self.server_args.transformer_fp8_cast:
-            return []
-
-        should_round_module = getattr(
-            self.model_cls, "should_apply_fp8_cast_to_module", None
-        )
-        if should_round_module is None:
-            logger.warning(
-                "Skipping --transformer-fp8-cast for %s because it does not "
-                "define fp8-cast module rules.",
-                self.cls_name,
-            )
-            return []
-
-        return [
-            partial(
-                self._round_matching_modules_to_fp8,
-                cls_name=self.cls_name,
-                should_round_module=should_round_module,
-            )
-        ]
-
-    @staticmethod
-    def _round_matching_modules_to_fp8(
-        model: nn.Module,
-        *,
-        cls_name: str,
-        should_round_module: Callable[[str, nn.Module], bool],
-    ) -> None:
-        rounded_tensors = 0
-        for name, module in model.named_modules():
-            if not should_round_module(name, module):
-                continue
-            for attr in ("weight", "bias"):
-                param = getattr(module, attr, None)
-                if param is None:
-                    continue
-                dtype = param.data.dtype
-                param.data = param.data.to(torch.float8_e4m3fn).to(dtype)
-                rounded_tensors += 1
-        logger.info(
-            "Applied transformer fp8-cast weight rounding to %d tensors for %s.",
-            rounded_tensors,
-            cls_name,
-        )
-
-
 def resolve_transformer_safetensors_to_load(
     server_args: ServerArgs, component_model_path: str
 ) -> list[str]:
@@ -482,11 +420,6 @@ def _build_transformer_quant_adapters(
         _ModelOptFp8OffloadAdapter(
             server_args=server_args,
             quant_config=quant_config,
-        ),
-        _TransformerFp8CastAdapter(
-            cls_name=cls_name,
-            model_cls=model_cls,
-            server_args=server_args,
         ),
     ]
     if nunchaku_config is not None:

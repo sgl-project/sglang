@@ -34,17 +34,6 @@ directory directly as `--model-path`, but that is a compatibility path. If a
 repo contains multiple candidate checkpoints, pass
 `--transformer-weights-path` explicitly.
 
-## Transformer FP8-Cast
-
-`--transformer-fp8-cast` is a reference-compatibility mode for transformer
-components whose native implementation declares fp8-cast rules. It rounds the
-selected weights through `torch.float8_e4m3fn` at load time and restores the
-original dtype for inference.
-
-This is not FP8 GEMM and does not load an FP8 checkpoint. It is disabled by
-default because it changes model outputs and is intended only when a model's
-reference pipeline uses this fp8-cast policy.
-
 ## Quant Families
 
 Here, `quant_family` means a checkpoint and loading family with shared CLI
