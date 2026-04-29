@@ -33,6 +33,9 @@ from sglang.srt.mem_cache.memory_pool_host import HostKVCache
 from sglang.srt.observability.metrics_collector import StorageMetrics
 
 SETUP_TIMEOUT = 600  # seconds
+# Temporary bring-up mode: disable warmup probe to avoid startup failure on
+# environments where memcache put path is unstable during initialization.
+ENABLE_ASCEND_MEMCACHE_WARMUP = False
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +45,7 @@ _MEMCACHE_CTRL_KEYS = frozenset(
     {
         "device_id",
         "init_bm",
+        "conf_file_path",
         "check_server",
         "metrics_url",
         "memcache_metrics_url",
@@ -144,18 +148,19 @@ class AscendMemcacheStore(HiCacheStorage):
             )
             self._check_server_enabled = bool(ctrl.get("check_server", False))
             self.extra_backend_tag = ctrl.get("extra_backend_tag")
-            self._warmup_needed = init_bm
-            self._warmup_done = False
 
             if self._check_server_enabled:
                 self.check_server()
 
             # memcache_hybrid documents init_bm=False as pure client mode without
-            # data read/write capability. For init_bm=True, defer warmup until
-            # register_mem_pool_host(), after host buffers are registered.
+            # data read/write capability.
             if not init_bm:
                 logger.info(
                     "Memcache init_bm is False; skip warmup because read/write is unavailable in pure client mode."
+                )
+            elif not ENABLE_ASCEND_MEMCACHE_WARMUP:
+                logger.warning(
+                    "Ascend memcache warmup is temporarily disabled for bring-up."
                 )
             self._init_runtime_fields(storage_config)
 
@@ -256,28 +261,20 @@ class AscendMemcacheStore(HiCacheStorage):
         )
 
     def warmup(self):
-        # warmup_key = "sglang_ascend_memcache_store_warmup_key" + uuid.uuid4().hex
-        # warmup_value = bytes(4 * 1024)
-        # assert self.store.put(warmup_key, warmup_value) == 0
-        # assert self.store.is_exist(warmup_key) == 1
-        # assert self.store.get(warmup_key) == warmup_value
-
         warmup_key = "sglang_ascend_memcache_store_warmup_key" + uuid.uuid4().hex
+        # memcache_hybrid Python API examples use mutable bytearray in put().
+        warmup_value = bytearray(4 * 1024)
+        put_ret = self.store.put(warmup_key, warmup_value)
+        if put_ret != 0:
+            raise RuntimeError(f"warmup put failed: {put_ret}")
 
-        buf = torch.zeros(4096, dtype=torch.uint8)
-        ptr = buf.data_ptr()
-        size = buf.numel() * buf.element_size()
+        exist_ret = self.store.is_exist(warmup_key)
+        if exist_ret != 1:
+            raise RuntimeError(f"warmup is_exist failed: {exist_ret}")
 
-        put_ret = self.store.batch_put_from([warmup_key], [ptr], [size])
-        assert put_ret[0] == 0, f"warmup batch_put_from failed: {put_ret}"
-
-        exist_ret = self.store.batch_is_exist([warmup_key])
-        assert exist_ret[0] == 1, f"warmup batch_is_exist failed: {exist_ret}"
-
-        out = torch.empty_like(buf)
-        get_ret = self.store.batch_get_into([warmup_key], [out.data_ptr()], [size])
-        assert get_ret[0] == 0, f"warmup batch_get_into failed: {get_ret}"
-        
+        get_val = self.store.get(warmup_key)
+        if get_val != warmup_value:
+            raise RuntimeError("warmup get payload mismatch")
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
@@ -294,9 +291,8 @@ class AscendMemcacheStore(HiCacheStorage):
         buffer = self.mem_pool_host.kv_buffer
         self.register_buffer(buffer)
 
-        if self._warmup_needed and not self._warmup_done:
+        if ENABLE_ASCEND_MEMCACHE_WARMUP:
             self.warmup()
-            self._warmup_done = True
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
