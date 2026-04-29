@@ -48,6 +48,8 @@ class UGSRTSchedulerExecutor:
         self.max_sync_steps = max_sync_steps
         self.require_idle_scheduler = require_idle_scheduler
         self.events: list[tuple[str, str, int]] = []
+        self.token_bindings: list[UGSRTKVTokenBinding] = []
+        self._request_token_bindings: dict[str, UGSRTKVTokenBinding] = {}
         self.sync_step_count = 0
 
     @property
@@ -76,6 +78,9 @@ class UGSRTSchedulerExecutor:
         state,
     ) -> UGSRTKVTokenBinding | None:
         del state
+        binding = self._request_token_bindings.get(req.rid)
+        if binding is not None:
+            return binding
         token_indices = self._request_token_indices(record, req)
         if token_indices is None:
             return None
@@ -116,6 +121,7 @@ class UGSRTSchedulerExecutor:
             self.scheduler.cur_batch = batch
         if batch:
             result = self.scheduler.run_batch(batch)
+            self._capture_batch_token_bindings(batch)
             self.scheduler.process_batch_result(batch, result)
             self.sync_step_count += 1
         elif hasattr(self.scheduler, "on_idle"):
@@ -177,6 +183,36 @@ class UGSRTSchedulerExecutor:
 
         token_indices = req_to_token[pool_idx, :token_count].to(dtype=torch.int64)
         return token_indices.clone()
+
+    def _capture_batch_token_bindings(self, batch: Any) -> None:
+        for req in getattr(batch, "reqs", []) or []:
+            session = getattr(req, "session", None)
+            session_id = getattr(session, "session_id", None)
+            if session_id is None:
+                continue
+            token_indices = self._request_token_indices_for_active_req(req)
+            if token_indices is None:
+                continue
+            binding = UGSRTKVTokenBinding(
+                session_id=session_id,
+                request_id=req.rid,
+                token_count=int(token_indices.numel()),
+                token_indices=token_indices,
+            )
+            self._request_token_bindings[req.rid] = binding
+            self.token_bindings.append(binding)
+
+    def _request_token_indices_for_active_req(self, req: Any) -> torch.Tensor | None:
+        tree_cache = getattr(self.scheduler, "tree_cache", None)
+        if tree_cache is None:
+            return None
+        req_to_token_pool = getattr(tree_cache, "req_to_token_pool", None)
+        req_to_token = getattr(req_to_token_pool, "req_to_token", None)
+        pool_idx = getattr(req, "req_pool_idx", None)
+        token_count = int(getattr(req, "kv_committed_len", 0) or 0)
+        if req_to_token is None or pool_idx is None or token_count <= 0:
+            return None
+        return req_to_token[pool_idx, :token_count].to(dtype=torch.int64).clone()
 
     @staticmethod
     def _streaming_session_slot(tree_cache: Any, session_id: str) -> Any | None:
