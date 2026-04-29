@@ -17,6 +17,7 @@ from sglang.srt.ug.bagel import (
     BAGELDenoiseStepError,
     BAGELDenoiseStepRunner,
     BAGELInterleaveContextBackend,
+    BAGELNativeSRTUForwardExecutor,
     BAGELPreparedDenoise,
     BAGELSRTUForwardExecutor,
     BAGELUForwardBridge,
@@ -1007,6 +1008,62 @@ class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
         self.assertEqual(counters["append_image_count"], 1)
         self.assertEqual(counters["decode_count"], 2)
         self.assertEqual(counters["state"], "u_decode")
+
+    def test_native_srt_u_prefill_does_not_call_official_text_update(self):
+        inferencer = FakeBAGELInferencer()
+        backend = BAGELInterleaveContextBackend(
+            inferencer,
+            u_forward_bridge=BAGELUForwardBridge(
+                srt_u_forward_executor=BAGELNativeSRTUForwardExecutor()
+            ),
+            default_image_shape=(32, 32),
+        )
+        adapter = BAGELUGModelAdapter("already-loaded-bagel", backend=backend)
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=BindingSRTExecutor(start_index=9),
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a quiet river")],
+            session_id="bagel-native-srt-u-prefill",
+        )
+        state = backend.sessions["bagel-native-srt-u-prefill"]
+
+        self.assertTrue(state.native_srt_u_context)
+        self.assertEqual(
+            state.native_srt_u_context_request_id,
+            "bagel-native-srt-u-prefill:u1",
+        )
+        self.assertIsNotNone(state.native_srt_u_context_token_binding)
+        self.assertEqual(
+            state.native_srt_u_context_token_binding.request_id,
+            "bagel-native-srt-u-prefill:u1",
+        )
+        self.assertEqual(
+            [event for event in inferencer.events if event[0] == "text"],
+            [],
+        )
+        self.assertEqual(
+            state.srt_u_forward_events,
+            [("u_prefill", "bagel-native-srt-u-prefill:u1")],
+        )
+
+        marker = runtime.decode_next_segment(handle)
+        self.assertEqual(marker.type, "image_marker")
+        with self.assertRaisesRegex(BAGELAdapterError, "native SRT U context"):
+            runtime.prepare_latents(
+                UGLatentPrepareRequest(
+                    session=handle,
+                    sampling_params=SimpleNamespace(height=32, width=32),
+                    seed=123,
+                )
+            )
+
+        counters = runtime.get_debug_counters(handle)
+        self.assertEqual(counters["prefill_count"], 1)
+        self.assertEqual(counters["state"], "g_denoise")
 
 
 class TestBAGELInterleaveContextBackend(unittest.TestCase):

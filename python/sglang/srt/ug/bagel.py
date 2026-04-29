@@ -246,6 +246,9 @@ class BAGELSessionContext:
     prepared_denoise: BAGELPreparedDenoise | None = None
     decode_count: int = 0
     append_image_count: int = 0
+    native_srt_u_context: bool = False
+    native_srt_u_context_request_id: str | None = None
+    native_srt_u_context_token_binding: Any | None = None
     srt_u_forward_results: dict[str, Any] = field(default_factory=dict)
     srt_u_forward_events: list[tuple[str, str]] = field(default_factory=list)
     srt_last_u_decode_output_ids: tuple[int, ...] = ()
@@ -313,6 +316,47 @@ class BAGELSRTUForwardExecutor:
             state = backend._state_for(session.handle.session_id)
             state.srt_last_u_decode_output_ids = request.output_ids
         return None
+
+
+class BAGELNativeSRTUForwardExecutor(BAGELSRTUForwardExecutor):
+    """Consumes U-prefill views produced by native SRT BAGEL forward.
+
+    This executor deliberately does not call official BAGEL
+    `update_context_text`. It marks the session as SRT-owned and leaves G
+    denoise disabled until the native BAGEL generation branch is implemented.
+    """
+
+    def execute(
+        self,
+        backend: "BAGELInterleaveContextBackend",
+        *,
+        session,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> UGModelPrefillResult | UGModelAppendImageResult | None:
+        backend._bind_srt_request_tokens(request)
+
+        state = backend._state_for(session.handle.session_id)
+        if request.state == UGSegmentState.U_PREFILL.value:
+            state.decode_count = 0
+            state.prepared_denoise = None
+            state.native_srt_u_context = True
+            state.native_srt_u_context_request_id = request.request_id
+            state.native_srt_u_context_token_binding = request.metadata.get(
+                "srt_kv_token_binding"
+            )
+            return UGModelPrefillResult(added_tokens=request.origin_input_len)
+
+        if request.state == UGSegmentState.U_DECODE.value:
+            state.srt_last_u_decode_output_ids = request.output_ids
+            return None
+
+        return super().execute(
+            backend,
+            session=session,
+            request=request,
+            messages=messages,
+        )
 
 
 class BAGELInterleaveContextBackend:
@@ -625,6 +669,11 @@ class BAGELInterleaveContextBackend:
         *,
         seed: int | None = None,
     ) -> BAGELPreparedDenoise:
+        if state.native_srt_u_context:
+            raise BAGELAdapterError(
+                "BAGEL native SRT U context cannot prepare G denoise yet; "
+                "native BAGEL mode='gen' forward must be implemented first"
+            )
         image_shape = self._image_shape_from_params(sampling_params, state.image_shape)
         model = self.inferencer.model
         with _bagel_seed_context(seed):
