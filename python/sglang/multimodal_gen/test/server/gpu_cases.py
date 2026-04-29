@@ -331,6 +331,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             extras=[
                 "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode snapshot"
             ],
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
+            },
         ),
         T2I_sampling_params,
     ),
