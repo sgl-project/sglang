@@ -1,7 +1,7 @@
+import math
 from dataclasses import dataclass
 from typing import List, Tuple, Union
 
-import numpy as np
 import torch
 
 
@@ -118,7 +118,7 @@ class FlattenedTensorBucket:
             target_dtype = (
                 dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
             )
-            numel = np.prod(shape) * target_dtype.itemsize
+            numel = math.prod(shape) * target_dtype.itemsize
             metadata_obj = FlattenedTensorMetadata(
                 name=name,
                 shape=shape,
