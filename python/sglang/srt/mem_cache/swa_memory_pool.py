@@ -192,6 +192,34 @@ class SWAKVPool(KVCache):
         src_loc_swa = self.translate_loc_from_full_to_swa(src_loc)
         self.swa_kv_pool.move_kv_cache(tgt_loc_swa, src_loc_swa)
 
+    def _filter_swa_cpu_copy(self, swa_kv_cpu, row_mask: torch.Tensor):
+        if swa_kv_cpu is None:
+            return None
+        if row_mask is None or bool(torch.all(row_mask).item()):
+            return swa_kv_cpu
+
+        chunk_size = getattr(
+            self.swa_kv_pool, "cpu_offloading_chunk_size", len(row_mask)
+        )
+        filtered = []
+        for layer_chunks in swa_kv_cpu:
+            if len(layer_chunks) == 0:
+                filtered.append([])
+                continue
+
+            k_cpu = torch.cat([chunk[0] for chunk in layer_chunks], dim=0)
+            v_cpu = torch.cat([chunk[1] for chunk in layer_chunks], dim=0)
+            k_cpu = k_cpu[row_mask]
+            v_cpu = v_cpu[row_mask]
+
+            filtered_layer = []
+            for i in range(0, len(k_cpu), chunk_size):
+                filtered_layer.append(
+                    [k_cpu[i : i + chunk_size], v_cpu[i : i + chunk_size]]
+                )
+            filtered.append(filtered_layer)
+        return filtered
+
     def get_cpu_copy(self, indices):
         # For SWA, we need to copy KV cache from both full and SWA pools
         # The indices are for the full pool, and we use mapping to get SWA indices
@@ -226,9 +254,20 @@ class SWAKVPool(KVCache):
         # Load SWA KV cache if it exists
         if swa_kv_cpu is not None and self.full_to_swa_index_mapping is not None:
             swa_indices = self.full_to_swa_index_mapping[indices]
-            swa_mask = kv_cache_cpu.get("swa_mask")
-            if swa_mask is not None:
-                swa_indices = swa_indices[swa_mask.to(indices.device)]
+            new_swa_mask = swa_indices > 0
+            old_swa_mask = kv_cache_cpu.get("swa_mask")
+            if old_swa_mask is not None:
+                old_swa_mask = old_swa_mask.to(indices.device)
+                row_mask = new_swa_mask[old_swa_mask].cpu()
+                swa_indices = swa_indices[old_swa_mask][row_mask.to(indices.device)]
+            else:
+                row_mask = new_swa_mask.cpu()
+                swa_indices = swa_indices[new_swa_mask]
+
+            if swa_indices.numel() == 0:
+                return
+
+            swa_kv_cpu = self._filter_swa_cpu_copy(swa_kv_cpu, row_mask)
             self.swa_kv_pool.load_cpu_copy(swa_kv_cpu, swa_indices)
 
 

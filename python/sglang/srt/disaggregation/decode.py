@@ -402,6 +402,18 @@ class DecodePreallocQueue:
             prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
             self.scheduler.stream_output([req], req.return_logprob)
             return True
+        if self._uses_swa_tail_prealloc():
+            _, swa_required = self._prealloc_required_tokens(req)
+            swa_capacity = self.token_to_kv_pool_allocator.size_swa
+            if swa_required > swa_capacity:
+                message = (
+                    f"Request {req.rid} requires too many SWA KV tokens for "
+                    f"decode preallocation: {swa_required} > {swa_capacity}"
+                )
+                logger.error(message)
+                prepare_abort(req, message, status_code=HTTPStatus.BAD_REQUEST)
+                self.scheduler.stream_output([req], req.return_logprob)
+                return True
         return False
 
     def extend(self, reqs: List[Req], is_retracted: bool = False) -> None:
