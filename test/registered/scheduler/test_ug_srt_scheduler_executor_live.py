@@ -30,6 +30,37 @@ class _NoopSender:
         del args, kwargs
 
 
+class _RecordingUGModelRunner:
+    def __init__(self, inner):
+        self.inner = inner
+        self.srt_request_views = []
+
+    def observe_srt_u_forward(self, *, record, request, messages):
+        del record, messages
+        self.srt_request_views.append(request)
+
+    def prefill_interleaved(self, *, record, messages):
+        return self.inner.prefill_interleaved(record=record, messages=messages)
+
+    def decode_next_segment(self, *, record):
+        return self.inner.decode_next_segment(record=record)
+
+    def predict_velocity_from_session(self, *, request, record):
+        return self.inner.predict_velocity_from_session(request=request, record=record)
+
+    def prepare_latents_from_session(self, *, request, record):
+        return self.inner.prepare_latents_from_session(request=request, record=record)
+
+    def append_generated_image(self, *, record, image):
+        return self.inner.append_generated_image(record=record, image=image)
+
+    def decode_latents_to_image(self, *, request, record):
+        return self.inner.decode_latents_to_image(request=request, record=record)
+
+    def close_session(self, *, session_id):
+        self.inner.close_session(session_id=session_id)
+
+
 def _replace_sender_with_noop(scheduler, name: str) -> None:
     sender = getattr(scheduler, name, None)
     socket = getattr(sender, "socket", None)
@@ -101,8 +132,9 @@ class TestUGSRTSchedulerExecutorLive(CustomTestCase):
 
         try:
             executor = UGSRTSchedulerExecutor(scheduler, max_sync_steps=16)
+            model_runner = _RecordingUGModelRunner(FakeUGModelRunner())
             runtime = UGSessionRuntime(
-                model_runner=FakeUGModelRunner(),
+                model_runner=model_runner,
                 session_controller=scheduler.session_controller,
                 srt_request_executor=executor,
                 tokenizer=scheduler.tokenizer,
@@ -134,6 +166,19 @@ class TestUGSRTSchedulerExecutorLive(CustomTestCase):
             self.assertEqual(len(counters["srt_last_u_decode_output_ids"]), 1)
             self.assertEqual(executor.sync_step_count, 2)
             self.assertTrue(scheduler.is_fully_idle())
+            token_bindings = [
+                request.metadata.get("srt_kv_token_binding")
+                for request in model_runner.srt_request_views
+            ]
+            self.assertTrue(all(binding is not None for binding in token_bindings))
+            self.assertEqual(
+                [binding.request_id for binding in token_bindings],
+                [
+                    "ug-live-scheduler-prefill:u1",
+                    "ug-live-scheduler-prefill:d1",
+                ],
+            )
+            self.assertTrue(all(binding.token_count > 0 for binding in token_bindings))
 
             runtime.close_session(handle)
             self.assertNotIn(handle.session_id, scheduler.session_controller.sessions)
