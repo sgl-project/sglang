@@ -99,7 +99,9 @@ class OpenAIServingTokenize(OpenAIServingBase):
         )
 
         prompt_ids = processed_messages.prompt_ids
-        if isinstance(prompt_ids, list) and (prompt_ids or not processed_messages.prompt):
+        if isinstance(prompt_ids, list) and (
+            prompt_ids or not processed_messages.prompt
+        ):
             return prompt_ids
         if isinstance(prompt_ids, str):
             return self.tokenizer_manager.tokenizer.encode(
