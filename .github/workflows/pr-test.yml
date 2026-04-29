@@ -69,7 +69,7 @@ env:
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
-  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
 permissions:
@@ -138,7 +138,7 @@ jobs:
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
-              - "python/sglang/!(multimodal_gen|jit_kernel/diffusion|jit_kernel/tests/diffusion|jit_kernel/benchmark/diffusion|cli)/**/!(*.md)"
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
@@ -337,20 +337,20 @@ jobs:
           {
             echo "## Change Detection"
             echo ""
-            echo "| Component         | Changed |"
-            echo "|-------------------|---------|"
-            echo "| main_package      | ${{ steps.filter-api.outputs.main_package || steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }} |"
-            echo "| sgl_kernel (raw)  | ${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel }} |"
-            echo "| sgl_kernel (used) | ${{ (!inputs.target_stage || inputs.include_wheel_build) && (steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel) }} |"
-            echo "| jit_kernel        | ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }} |"
-            echo "| multimodal_gen    | ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
-            echo "| target_stage      | ${{ inputs.target_stage || '(none)' }} |"
-            echo "| detection_method  | ${{ inputs.target_stage && 'GitHub API' || 'dorny/paths-filter' }} |"
-            echo "| max_parallel      | ${{ steps.set-parallel.outputs.parallel_level }} (h100=${{ steps.set-parallel.outputs.max_parallel }}, 5090=${{ steps.set-parallel.outputs.max_parallel_small }}, 2gpu=${{ steps.set-parallel.outputs.max_parallel_2gpu }}) |"
-            echo "| b200_runner       | ${{ steps.set-runner.outputs.b200_runner }} |"
+            echo "| Component            | Changed |"
+            echo "|----------------------|---------|"
+            echo "| main_package         | ${{ steps.filter-api.outputs.main_package || steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }} |"
+            echo "| sgl_kernel (raw)     | ${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel }} |"
+            echo "| sgl_kernel (used)    | ${{ (!inputs.target_stage || inputs.include_wheel_build) && (steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel) }} |"
+            echo "| jit_kernel           | ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }} |"
+            echo "| multimodal_gen       | ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
+            echo "| target_stage         | ${{ inputs.target_stage || '(none)' }} |"
+            echo "| detection_method     | ${{ inputs.target_stage && 'GitHub API' || 'dorny/paths-filter' }} |"
+            echo "| max_parallel         | ${{ steps.set-parallel.outputs.parallel_level }} (h100=${{ steps.set-parallel.outputs.max_parallel }}, 5090=${{ steps.set-parallel.outputs.max_parallel_small }}, 2gpu=${{ steps.set-parallel.outputs.max_parallel_2gpu }}) |"
+            echo "| b200_runner          | ${{ steps.set-runner.outputs.b200_runner }} |"
             echo "| b200_low_disk_runner | ${{ steps.set-runner.outputs.b200_low_disk_runner }} |"
-            echo "| enable_retry      | ${{ steps.set-retry.outputs.enable_retry }} |"
-            echo "| continue_on_error | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"
+            echo "| enable_retry         | ${{ steps.set-retry.outputs.enable_retry }} |"
+            echo "| continue_on_error    | ${{ steps.set-continue-on-error.outputs.continue_on_error }} |"
           } >> $GITHUB_STEP_SUMMARY
 
   # =============================================== Wait Jobs for Sequential PR Execution ====================================================
@@ -479,6 +479,26 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Free Docker disk space
+        run: |
+          set -x
+          # build.sh retags sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}
+          # on every run, leaving the previous image as a dangling <none>:<none>
+          # entry (~16-23 GB each). Prune them before building so the runner
+          # doesn't fill up. The local buildx cache at ~/.cache/sgl-kernel/buildx
+          # and the tagged sgl-kernel-deps image are not affected.
+          # `until=12h` avoids racing with a sibling matrix cell (cuda 12.9 vs
+          # 13.0) that may have just orphaned an image seconds ago.
+          docker image prune -f --filter "until=12h"
+          # Drop orphaned buildx builder volumes from past `docker buildx create`
+          # invocations. The active `sgl-kernel-builder` volume is held open and
+          # would fail to remove anyway, but skip it explicitly for clarity.
+          for v in $(docker volume ls -q | grep '^buildx_buildkit_' | grep -v '^buildx_buildkit_sgl-kernel-builder' || true); do
+            echo "Removing orphan buildx volume: $v"
+            docker volume rm "$v" || true
+          done
+          df -h /
+
       - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
         run: |
           cd sgl-kernel
@@ -544,6 +564,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Free Docker disk space
+        run: |
+          set -x
+          # See sgl-kernel-build-wheels above for the rationale.
+          docker image prune -f --filter "until=12h"
+          for v in $(docker volume ls -q | grep '^buildx_buildkit_' | grep -v '^buildx_buildkit_sgl-kernel-builder' || true); do
+            echo "Removing orphan buildx volume: $v"
+            docker volume rm "$v" || true
+          done
+          df -h /
 
       - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
         run: |
@@ -757,7 +788,6 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          source /etc/profile.d/sglang-ci.sh
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
@@ -765,7 +795,6 @@ jobs:
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
-          source /etc/profile.d/sglang-ci.sh
           cd test/
           python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 

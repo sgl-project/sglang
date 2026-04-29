@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
+    expand_request_outputs,
     format_lora_message,
     save_outputs,
 )
@@ -33,6 +34,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_batch_completion,
     log_generation_timer,
 )
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
 
 # re-export LoRA protocol types for backward compatibility
 __all__ = [
@@ -324,8 +326,9 @@ async def process_generation_batch(
     batch,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
-    with log_generation_timer(logger, batch.prompt):
-        result = await scheduler_client.forward([batch])
+    requests = expand_request_outputs(batch)
+    with trace_req(batch.trace_ctx), log_generation_timer(logger, batch.prompt):
+        result = await scheduler_client.forward(requests)
 
         if result.output is None and result.output_file_paths is None:
             error_msg = result.error or "Unknown error"
@@ -335,14 +338,22 @@ async def process_generation_batch(
 
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
+            if len(save_file_path_list) < len(requests):
+                raise RuntimeError(
+                    f"Expected at least {len(requests)} output paths, "
+                    f"got {len(save_file_path_list)}"
+                )
         else:
-            num_outputs = len(result.output)
+            if len(result.output) != len(requests):
+                raise RuntimeError(
+                    f"Expected {len(requests)} outputs, got {len(result.output)}"
+                )
             save_file_path_list = save_outputs(
                 result.output,
                 batch.data_type,
                 batch.fps,
                 batch.save_output,
-                lambda idx: str(batch.output_file_path(num_outputs, idx)),
+                lambda idx: str(requests[idx].output_file_path(1, 0)),
                 audio=result.audio,
                 audio_sample_rate=result.audio_sample_rate,
                 output_compression=batch.output_compression,
@@ -356,7 +367,7 @@ async def process_generation_batch(
             )
 
     total_time = time.perf_counter() - total_start_time
-    log_batch_completion(logger, 1, total_time)
+    log_batch_completion(logger, len(save_file_path_list), total_time)
 
     if result.peak_memory_mb and result.peak_memory_mb > 0:
         logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
