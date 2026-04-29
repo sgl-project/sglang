@@ -67,7 +67,9 @@ def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
             else 16 * 1024
         )
         while next_m < max_prefill_bs:
-            _BUILTIN_M_LIST += list(range(next_m, min(2 * next_m, max_prefill_bs), sample_step))
+            _BUILTIN_M_LIST += list(
+                range(next_m, min(2 * next_m, max_prefill_bs), sample_step)
+            )
             next_m = next_m * 2
             sample_step = sample_step * 2
         _BUILTIN_M_LIST.append(max_prefill_bs)
@@ -297,7 +299,7 @@ class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
             (self.lhs_q[:m], self.lhs_s[:m]),
             (self.rhs_q, self.rhs_s),
             self.out[:m],
-            m_indices=self.m_indices[:m],
+            self.m_indices[:m],
         )
 
 
