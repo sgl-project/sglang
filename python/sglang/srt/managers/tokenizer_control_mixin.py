@@ -445,10 +445,9 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        # TODO: support DP
-        assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for init_weights_send_group_for_remote_instance"
+        # The communicator is created with fan_out=dp_size, so the request is
+        # broadcast to every dp replica and each tp_rank builds its own NCCL
+        # group on its own port (ports_list[self.tp_rank]).
         result = (
             await self.init_weights_send_group_for_remote_instance_communicator(obj)
         )[0]
@@ -460,10 +459,8 @@ class TokenizerControlMixin:
         request: Optional[fastapi.Request] = None,
     ) -> Tuple[bool, str]:
         self.auto_create_handle_loop()
-        # TODO: support DP
-        assert (
-            self.server_args.dp_size == 1
-        ), "dp_size must be 1 for send_weights_to_remote_instance"
+        # See init_weights_send_group_for_remote_instance: fan_out=dp_size
+        # broadcasts the request to every dp replica.
         result = (await self.send_weights_to_remote_instance_communicator(obj))[0]
         return result.success, result.message
 

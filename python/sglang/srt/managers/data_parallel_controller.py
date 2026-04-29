@@ -277,11 +277,20 @@ class DataParallelController:
         for sock in sockets:
             sock.close()
 
-        # Start all threads
-        for thread in threads:
+        # When loading weights from a remote seed instance the seed serves
+        # one client at a time (FanOutCommunicator is queueing, single
+        # in-flight request), so start DP replicas one by one and wait for
+        # each to finish weight loading before launching the next. For all
+        # other load formats keep the original parallel start.
+        sequential_load = server_args.load_format == "remote_instance"
+        for thread, event in zip(threads, ready_events):
             thread.start()
-        for event in ready_events:
-            event.wait()
+            if sequential_load:
+                event.wait()
+
+        if not sequential_load:
+            for event in ready_events:
+                event.wait()
 
     def launch_tensor_parallel_group_thread(
         self,
