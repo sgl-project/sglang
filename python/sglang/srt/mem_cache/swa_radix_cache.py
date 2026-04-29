@@ -983,8 +983,14 @@ class SWARadixCache(BasePrefixCache):
             ):
                 break
 
+            # Preserve is_bigram: main #23106 made bigram an O(1) flag on RadixKey;
+            # the constructor defaults to False, so concat without explicit flag
+            # silently demotes EAGLE/MTP bigram keys → match() returns 0 →
+            # _split_node assert.
             node.key = RadixKey(
-                node.key.token_ids + child.key.token_ids, node.key.extra_key
+                node.key.token_ids + child.key.token_ids,
+                node.key.extra_key,
+                is_bigram=node.key.is_bigram,
             )
             node.value = torch.cat([node.value, child.value])
             node.children = child.children
