@@ -601,10 +601,9 @@ def compute_initial_expert_location_metadata(
         logger.info(
             "init_expert_location from init_by_eplb using ServerArgs.init_expert_location"
         )
-        metadata = ExpertLocationMetadata.init_by_eplb(
+        return ExpertLocationMetadata.init_by_eplb(
             server_args, model_config, logical_count=data_dict["logical_count"]
         )
-        return metadata
     else:
         raise NotImplementedError(
             f"Unknown init_expert_location format ({list(data_dict.keys())=})"
