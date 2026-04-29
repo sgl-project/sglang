@@ -27,7 +27,7 @@ from typing import List, Optional
 import torch
 
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
-    fp8_native_paged_mean_pooling_completed_blocks_v3_interface,
+    fp8_native_paged_mean_pooling_completed_blocks_interface,
 )
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
@@ -402,7 +402,7 @@ class HisaNSATokenToKVPool(NSATokenToKVPool):
                 max_pool_per_req_grid=max_pool_per_req_grid,
             )
             return
-        fp8_native_paged_mean_pooling_completed_blocks_v3_interface(
+        fp8_native_paged_mean_pooling_completed_blocks_interface(
             kv_cache_flat=kv_cache_flat,
             req_to_token=req_to_token,
             pool_page_tables=self.req_to_pool_page.req_to_pool_page,

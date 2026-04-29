@@ -24,7 +24,7 @@ import torch
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
     fp8_native_block_mean_pooling_interface,
     fp8_native_block_sparse_mqa_attn_return_logits_interface,
-    fp8_native_hierarchy_mqa_logits,
+    fp8_native_hierarchy_mqa_logits_tilelang_legacy,
     pool_mqa_attn_return_logits_fp8_interface,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
     ragged_pool_mqa_triton,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.orchestrator import (
-    fp8_native_hierarchy_mqa_logits_triton,
+    fp8_native_hierarchy_mqa_logits,
 )
 
 
@@ -152,11 +152,11 @@ def profile_one_config(seq_q: int, seq_kv: int) -> list[tuple[str, float, float]
     # --- E2E: run the full orchestrators ---
     # Match the production input shape: kv = (k_fp8, k_scale_uint8 [N,4]).
     k_scale_u8 = k_scale.view(torch.uint8).reshape(seq_kv, 4)
-    t_e2e_triton = cuda_bench(lambda: fp8_native_hierarchy_mqa_logits_triton(
+    t_e2e_triton = cuda_bench(lambda: fp8_native_hierarchy_mqa_logits(
         q, (k_fp8, k_scale_u8), weights, cu_ks, cu_ke,
         k_block_size=K, block_topk=BLOCK_TOPK,
     ))
-    t_e2e_tilelang = cuda_bench(lambda: fp8_native_hierarchy_mqa_logits(
+    t_e2e_tilelang = cuda_bench(lambda: fp8_native_hierarchy_mqa_logits_tilelang_legacy(
         q, (k_fp8, k_scale_u8), weights, cu_ks, cu_ke,
         k_block_size=K, block_topk=BLOCK_TOPK,
     ))

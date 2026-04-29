@@ -1269,7 +1269,7 @@ def fp8_native_block_sparse_mqa_attn_return_logits_grouped_interface(
     return logits_padded
 
 
-def fp8_native_hierarchy_mqa_logits(
+def fp8_native_hierarchy_mqa_logits_tilelang_legacy(
     q: torch.Tensor,
     kv: tuple[torch.Tensor, torch.Tensor],
     weights: torch.Tensor,
@@ -1337,7 +1337,7 @@ def fp8_native_hierarchy_mqa_logits_with_pool_cache(
     new_k_end: int,                        # end   token index (exclusive) of the NEW K slice
     current_num_pool: int,                 # number of valid pool blocks in blocked_k_cache for this step
 ):
-    """Chunked-prefill variant of ``fp8_native_hierarchy_mqa_logits``.
+    """Chunked-prefill variant of ``fp8_native_hierarchy_mqa_logits_tilelang_legacy``.
 
     Caller maintains a persistent pool-K cache across chunks. Each call:
 
@@ -1575,7 +1575,7 @@ def batch_pool_mqa_attn_return_logits_interface(
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
-def batch_decode_pool_mqa_attn_return_logits_fp8(
+def batch_decode_pool_mqa_attn_return_logits_fp8_legacy(
     heads: int,
     index_dim: int,
     block_N: int = 64,
@@ -1663,7 +1663,7 @@ def batch_decode_pool_mqa_attn_return_logits_fp8(
     return kernel
 
 
-def batch_pool_mqa_attn_return_logits_fp8_interface(
+def batch_pool_mqa_attn_return_logits_fp8_legacy_interface(
     q_fp8: torch.Tensor,
     blocked_kv_fp8: torch.Tensor,
     blocked_kv_scale: torch.Tensor,
@@ -1688,7 +1688,7 @@ def batch_pool_mqa_attn_return_logits_fp8_interface(
     w_2d = weights_f32.view(B, H)            # [B, H] f32
 
     logits = torch.empty((B, seq_len_kv), device=q_fp8.device, dtype=torch.float32)
-    kernel = batch_decode_pool_mqa_attn_return_logits_fp8(
+    kernel = batch_decode_pool_mqa_attn_return_logits_fp8_legacy(
         heads=H, index_dim=D, block_N=block_N, block_H=H,
     )
     assert context_lens.dtype == torch.int32, f"context_lens must be int32, got {context_lens.dtype}"
@@ -2395,7 +2395,7 @@ def fp8_native_paged_mean_pooling_interface(
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
-def fp8_native_paged_mean_pooling_tail_only(
+def fp8_native_paged_mean_pooling_tail_only_legacy(
     paged_block_size: int,
     pooling_block_size: int,
     max_num_pooling_blocks: int,
@@ -2499,7 +2499,7 @@ def fp8_native_paged_mean_pooling_tail_only(
     return fp8_native_paged_mean_pooling_tail_only_kernel
 
 
-def fp8_native_paged_mean_pooling_tail_only_interface(
+def fp8_native_paged_mean_pooling_tail_only_legacy_interface(
     blocked_k: torch.Tensor,           # [B, max_num_pooling_blocks, D]  fp8   IN-OUT
     blocked_k_scale: torch.Tensor,     # [B, max_num_pooling_blocks]     f32   IN-OUT
     kv_cache: torch.Tensor,            # [num_blocks, paged_block_size, 1, D+4]
@@ -2519,7 +2519,7 @@ def fp8_native_paged_mean_pooling_tail_only_interface(
     assert blocked_k_scale.shape == (batch, max_num_pooling_blocks)
 
     kv_cache_flat = kv_cache.view(num_blocks, paged_block_size * (dim + 4))
-    kernel = fp8_native_paged_mean_pooling_tail_only(
+    kernel = fp8_native_paged_mean_pooling_tail_only_legacy(
         paged_block_size=paged_block_size,
         pooling_block_size=k_block_size,
         max_num_pooling_blocks=max_num_pooling_blocks,
@@ -2557,7 +2557,7 @@ def fp8_native_paged_mean_pooling_tail_only_interface(
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
-def fp8_native_paged_mean_pooling_tail_only_v3(
+def fp8_native_paged_mean_pooling_tail_only(
     paged_block_size: int,
     pooling_block_size: int,
     pool_page_size: int,
@@ -2678,7 +2678,7 @@ def fp8_native_paged_mean_pooling_tail_only_v3(
     return kernel
 
 
-def fp8_native_paged_mean_pooling_tail_only_v3_interface(
+def fp8_native_paged_mean_pooling_tail_only_interface(
     kv_cache: torch.Tensor,              # [num_blocks, paged_block_size, 1, D+4] uint8
     context_lens: torch.Tensor,          # [B] int32
     block_tables: torch.Tensor,          # [B, max_blocks] int32
@@ -2693,7 +2693,7 @@ def fp8_native_paged_mean_pooling_tail_only_v3_interface(
     kv_cache_flat = kv_cache.view(num_blocks, paged_block_size * DPlus4)
     assert pool_k_pages.shape[1] == pool_page_size * DPlus4
 
-    kernel = fp8_native_paged_mean_pooling_tail_only_v3(
+    kernel = fp8_native_paged_mean_pooling_tail_only(
         paged_block_size=paged_block_size,
         pooling_block_size=k_block_size,
         pool_page_size=pool_page_size,
@@ -2715,7 +2715,7 @@ def fp8_native_paged_mean_pooling_tail_only_v3_interface(
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
-def fp8_native_paged_mean_pooling_completed_blocks_v3(
+def fp8_native_paged_mean_pooling_completed_blocks(
     paged_block_size: int,
     pooling_block_size: int,
     pool_page_size: int,
@@ -2839,7 +2839,7 @@ def fp8_native_paged_mean_pooling_completed_blocks_v3(
     return kernel
 
 
-def fp8_native_paged_mean_pooling_completed_blocks_v3_interface(
+def fp8_native_paged_mean_pooling_completed_blocks_interface(
     kv_cache_flat: torch.Tensor,           # [num_pages, page_size * (D + 4)] uint8
     req_to_token: torch.Tensor,            # [R, T] int32
     pool_page_tables: torch.Tensor,        # [R, max_pool_pages] int32
@@ -2856,7 +2856,7 @@ def fp8_native_paged_mean_pooling_completed_blocks_v3_interface(
     D = DPlus4_times_P // paged_block_size - 4
     assert pool_k_pages.shape[1] == pool_page_size * (D + 4)
 
-    kernel = fp8_native_paged_mean_pooling_completed_blocks_v3(
+    kernel = fp8_native_paged_mean_pooling_completed_blocks(
         paged_block_size=paged_block_size,
         pooling_block_size=k_block_size,
         pool_page_size=pool_page_size,
@@ -2881,7 +2881,7 @@ def fp8_native_paged_mean_pooling_completed_blocks_v3_interface(
         tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
     },
 )
-def batch_decode_pool_mqa_attn_return_logits_fp8_v3(
+def batch_decode_pool_mqa_attn_return_logits_fp8(
     heads: int,
     index_dim: int,
     pool_page_size: int = 64,
@@ -2983,7 +2983,7 @@ def batch_decode_pool_mqa_attn_return_logits_fp8_v3(
     return kernel
 
 
-def batch_pool_mqa_attn_return_logits_fp8_v3_interface(
+def batch_pool_mqa_attn_return_logits_fp8_interface(
     q_fp8: torch.Tensor,                 # [B, 1, H, D] fp8
     pool_k_pages: torch.Tensor,          # [N_pool_pages, pool_page_size * (D+4)] uint8
     pool_page_tables: torch.Tensor,      # [B, max_pool_pages] int32
@@ -3013,7 +3013,7 @@ def batch_pool_mqa_attn_return_logits_fp8_v3_interface(
     logits = torch.empty(
         (B, max_pool_pages * pool_page_size), device=q_fp8.device, dtype=torch.float32,
     )
-    kernel = batch_decode_pool_mqa_attn_return_logits_fp8_v3(
+    kernel = batch_decode_pool_mqa_attn_return_logits_fp8(
         heads=H, index_dim=D, pool_page_size=pool_page_size, block_H=H,
     )
     assert context_lens_pool.dtype == torch.int32
@@ -3025,7 +3025,7 @@ def batch_pool_mqa_attn_return_logits_fp8_v3_interface(
     return logits.unsqueeze(1)  # [B, 1, max_pool_pages * pool_page_size]
 
 
-def fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3(
+def fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache(
     q_fp8: torch.Tensor,                # [B, 1, H, D] fp8
     kv_cache_fp8: torch.Tensor,         # [num_blocks, paged_block_size, 1, D+4] uint8
     pool_k_pages: torch.Tensor,         # [N_pool_pages, pool_page_size, D+4] uint8 (cached)
@@ -3044,7 +3044,7 @@ def fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3(
     Tail is refreshed in-place into pool_k_pages[phys_last, tail_slot, :].
     """
     # 1) Refresh tail pool block in place.
-    fp8_native_paged_mean_pooling_tail_only_v3_interface(
+    fp8_native_paged_mean_pooling_tail_only_interface(
         kv_cache=kv_cache_fp8, context_lens=context_lens,
         block_tables=block_tables,
         pool_page_tables=pool_page_tables,
@@ -3055,7 +3055,7 @@ def fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3(
 
     # 2) Block-MQA directly on pool_k_pages (paged, TMA-friendly).
     num_pool_blocks_per_req = (context_lens + k_block_size - 1) // k_block_size
-    block_k_indexer_score = batch_pool_mqa_attn_return_logits_fp8_v3_interface(
+    block_k_indexer_score = batch_pool_mqa_attn_return_logits_fp8_interface(
         q_fp8=q_fp8,
         pool_k_pages=pool_k_pages,
         pool_page_tables=pool_page_tables,
@@ -3342,7 +3342,7 @@ def fp8_native_paged_block_sparse_mqa_attn_return_logits_interface(
     )
     return logits
 
-def fp8_native_hierarchy_paged_mqa_logits(
+def fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
     weights: torch.Tensor,
@@ -3384,7 +3384,7 @@ def fp8_native_hierarchy_paged_mqa_logits(
     # them directly via fp8×fp8 GEMM (no Python dequant, no bf16 cast).
     blocked_k_fp8, blocked_k_scale, num_pooling_blocks = fp8_native_paged_mean_pooling_interface(max_num_pooling_blocks, kv_cache_fp8, context_lens, block_tables, k_block_size)
 
-    block_k_indexer_score = batch_pool_mqa_attn_return_logits_fp8_interface(
+    block_k_indexer_score = batch_pool_mqa_attn_return_logits_fp8_legacy_interface(
         q_fp8=q_fp8,
         blocked_kv_fp8=blocked_k_fp8,
         blocked_kv_scale=blocked_k_scale,
@@ -3413,7 +3413,7 @@ def fp8_native_hierarchy_paged_mqa_logits_with_pool_cache(
     k_block_size: int,
     block_topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Cache-based variant of ``fp8_native_hierarchy_paged_mqa_logits``.
+    """Cache-based variant of ``fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy``.
 
     Caller maintains ``blocked_k_cache`` + ``blocked_k_scale_cache`` across
     decode steps. On entry, positions ``[b, :num_pool[b]-1]`` must hold
@@ -3423,14 +3423,14 @@ def fp8_native_hierarchy_paged_mqa_logits_with_pool_cache(
     recomputed each decode step.
     """
     # 1) Refresh tail block from raw KV cache (in place).
-    fp8_native_paged_mean_pooling_tail_only_interface(
+    fp8_native_paged_mean_pooling_tail_only_legacy_interface(
         blocked_k_cache, blocked_k_scale_cache,
         kv_cache_fp8, context_lens, block_tables, k_block_size,
     )
     num_pooling_blocks = (context_lens + k_block_size - 1) // k_block_size
 
     # 2) block-MQA on the (now-fresh) cached pooled K.
-    block_k_indexer_score = batch_pool_mqa_attn_return_logits_fp8_interface(
+    block_k_indexer_score = batch_pool_mqa_attn_return_logits_fp8_legacy_interface(
         q_fp8=q_fp8,
         blocked_kv_fp8=blocked_k_cache,
         blocked_kv_scale=blocked_k_scale_cache,

@@ -25,7 +25,7 @@ from deep_gemm import get_paged_mqa_logits_metadata
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
     # decode stages
     fp8_native_paged_mean_pooling_interface,
-    batch_pool_mqa_attn_return_logits_fp8_interface,
+    batch_pool_mqa_attn_return_logits_fp8_legacy_interface,
     fp8_native_paged_block_sparse_mqa_attn_return_logits_interface,
     # prefill stages
     fp8_native_block_mean_pooling_interface,
@@ -152,7 +152,7 @@ def profile_decode(
 
             # ---- stage 2: pool_mqa (fp8; matches what hierarchy now uses) ----
             def s2():
-                return batch_pool_mqa_attn_return_logits_fp8_interface(
+                return batch_pool_mqa_attn_return_logits_fp8_legacy_interface(
                     q_fp8=q_fp8,
                     blocked_kv_fp8=blocked_k_fp8,
                     blocked_kv_scale=blocked_k_scale,

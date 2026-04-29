@@ -24,7 +24,7 @@ import torch
 import deep_gemm
 
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
-    fp8_native_hierarchy_mqa_logits,
+    fp8_native_hierarchy_mqa_logits_tilelang_legacy,
 )
 
 
@@ -71,7 +71,7 @@ def compare_logits(seq_len=8192, k_block_size=128, block_topk=64, H=64, D=128):
     assert dense_logits.shape == (M, K), f"unexpected dense shape {dense_logits.shape}"
 
     # ---- Hisa sparse logits + block indices ----
-    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits(
+    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits_tilelang_legacy(
         inp["q_fp8"], (inp["k_fp8"], inp["k_scale_uint8"]),
         inp["weights"], inp["ks"], inp["ke"],
         k_block_size, block_topk,

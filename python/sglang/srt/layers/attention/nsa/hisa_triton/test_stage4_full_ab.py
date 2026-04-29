@@ -35,8 +35,7 @@ def triton_grouped_forced_call(q_fp8, k_fp8, k_scale, topk_block_index, K, weigh
     seq_kv = k_fp8.shape[0]
     topk = int(topk_block_index.shape[-1])
     GROUP_SIZE = GEMM_TILE // K
-    assert topk % GROUP_SIZE == 0, f"topk={topk} must divide GROUP_SIZE={GROUP_SIZE}"
-    num_chunks = topk // GROUP_SIZE
+    num_chunks = (topk + GROUP_SIZE - 1) // GROUP_SIZE  # ceil — kernel handles tail
     logits = torch.empty(
         (seq_len, topk * K), device=q_fp8.device, dtype=torch.float32,
     )
@@ -51,6 +50,7 @@ def triton_grouped_forced_call(q_fp8, k_fp8, k_scale, topk_block_index, K, weigh
         logits.stride(0), logits.stride(1),
         weights.stride(0), weights.stride(1),
         seq_kv,
+        topk,
         HEADS=H_, DIM=D_,
         KV_BLOCK_SIZE=K,
         GROUP_SIZE=GROUP_SIZE,

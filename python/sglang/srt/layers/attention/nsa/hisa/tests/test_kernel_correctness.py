@@ -14,7 +14,7 @@ Layout
    same inputs and assert that they match (within tolerance appropriate to
    the mixed bf16/fp8/fp32 math).
 3. **End-to-end recall@k tests** — run the full hierarchical pipeline
-   (``fp8_native_hierarchy_mqa_logits`` / ``..._paged_mqa_logits``) alongside
+   (``fp8_native_hierarchy_mqa_logits_tilelang_legacy`` / ``..._paged_mqa_logits``) alongside
    the DeepGEMM baseline (``fp8_mqa_logits`` / ``fp8_paged_mqa_logits``) and
    verify that the hierarchical top-k recovers ≥95% of the baseline top-k.
 
@@ -46,8 +46,8 @@ from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
     pool_mqa_attn_return_logits_interface,
     fp8_native_block_mean_pooling_interface,
     fp8_native_block_sparse_mqa_attn_return_logits_interface,
-    fp8_native_hierarchy_mqa_logits,
-    fp8_native_hierarchy_paged_mqa_logits,
+    fp8_native_hierarchy_mqa_logits_tilelang_legacy,
+    fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy,
     fp8_native_paged_block_sparse_mqa_attn_return_logits_interface,
     fp8_native_paged_mean_pooling_interface,
 )
@@ -675,7 +675,7 @@ def test_e2e_prefill_recall():
         k = min(case.topk_tokens, baseline_logits.shape[-1])
         baseline_topk = torch.topk(baseline_logits, k=k, dim=-1).indices
 
-        block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits(
+        block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits_tilelang_legacy(
             q_fp8, (k_fp8, k_scale_uint8), weights_f32, cu_ks, cu_ke,
             case.k_block_size, case.block_topk,
         )
@@ -781,7 +781,7 @@ def test_e2e_decode_recall():
         k = min(case.topk_tokens, baseline_logits.shape[-1])
         baseline_topk = torch.topk(baseline_logits, k=k, dim=-1).indices
 
-        block_sparse_logits, topk_block_indices = fp8_native_hierarchy_paged_mqa_logits(
+        block_sparse_logits, topk_block_indices = fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
             q_fp8, kv_cache, weights_f32, context_lens, block_tables, sched,
             max_model_len=case.ctx_len, max_seq_len=case.ctx_len,
             k_block_size=case.k_block_size, block_topk=case.block_topk,
@@ -862,7 +862,7 @@ def test_e2e_prefill_recall_large():
     k = min(case.topk_tokens, baseline_logits.shape[-1])
     baseline_topk = torch.topk(baseline_logits, k=k, dim=-1).indices
 
-    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits(
+    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits_tilelang_legacy(
         q_fp8, (k_fp8, k_scale_uint8), weights_f32, cu_ks, cu_ke,
         case.k_block_size, case.block_topk,
     )
@@ -894,7 +894,7 @@ def test_e2e_decode_recall_large():
     k = min(case.topk_tokens, baseline_logits.shape[-1])
     baseline_topk = torch.topk(baseline_logits, k=k, dim=-1).indices
 
-    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_paged_mqa_logits(
+    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
         q_fp8, kv_cache, weights_f32, context_lens, block_tables, sched,
         max_model_len=case.ctx_len, max_seq_len=case.ctx_len,
         k_block_size=case.k_block_size, block_topk=case.block_topk,
@@ -925,12 +925,12 @@ def test_determinism():
     weights_f32 = _make_prefill_weights(case)
     cu_ks, cu_ke = _make_prefill_cu_seqlen(case)
 
-    logits1, idx1 = fp8_native_hierarchy_mqa_logits(
+    logits1, idx1 = fp8_native_hierarchy_mqa_logits_tilelang_legacy(
         q_fp8, (k_fp8, k_scale_uint8), weights_f32, cu_ks, cu_ke,
         case.k_block_size, case.block_topk,
     )
     torch.cuda.synchronize()
-    logits2, idx2 = fp8_native_hierarchy_mqa_logits(
+    logits2, idx2 = fp8_native_hierarchy_mqa_logits_tilelang_legacy(
         q_fp8, (k_fp8, k_scale_uint8), weights_f32, cu_ks, cu_ke,
         case.k_block_size, case.block_topk,
     )
@@ -951,13 +951,13 @@ def test_determinism():
         _make_decode_inputs_correlated(case_d, block_scale=1.0)
     sched = deep_gemm.get_paged_mqa_logits_metadata(context_lens, case_d.paged_block_size, num_sms)
 
-    logits1d, idx1d = fp8_native_hierarchy_paged_mqa_logits(
+    logits1d, idx1d = fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
         q_fp8_d, kv_cache, weights_f32_d, context_lens, block_tables, sched,
         max_model_len=case_d.ctx_len, max_seq_len=case_d.ctx_len,
         k_block_size=case_d.k_block_size, block_topk=case_d.block_topk,
     )
     torch.cuda.synchronize()
-    logits2d, idx2d = fp8_native_hierarchy_paged_mqa_logits(
+    logits2d, idx2d = fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
         q_fp8_d, kv_cache, weights_f32_d, context_lens, block_tables, sched,
         max_model_len=case_d.ctx_len, max_seq_len=case_d.ctx_len,
         k_block_size=case_d.k_block_size, block_topk=case_d.block_topk,
@@ -1011,7 +1011,7 @@ def test_chunked_prefill_consistency():
     cu_ks, cu_ke = _make_prefill_cu_seqlen(case)  # single-seq causal
 
     # One-shot.
-    _, ref_topk = fp8_native_hierarchy_mqa_logits(
+    _, ref_topk = fp8_native_hierarchy_mqa_logits_tilelang_legacy(
         q_fp8, (k_fp8, k_scale_uint8), weights_f32,
         cu_ks, cu_ke, case.k_block_size, case.block_topk,
     )
@@ -1022,7 +1022,7 @@ def test_chunked_prefill_consistency():
     for i in range(NUM_CHUNKS):
         qs, qe = i * CHUNK_Q, (i + 1) * CHUNK_Q
         k_end = qe  # K grows to end of current chunk
-        _, topk_c = fp8_native_hierarchy_mqa_logits(
+        _, topk_c = fp8_native_hierarchy_mqa_logits_tilelang_legacy(
             q_fp8[qs:qe],
             (k_fp8[:k_end], k_scale_uint8[:k_end]),
             weights_f32[qs:qe],

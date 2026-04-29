@@ -9,7 +9,7 @@ implementation differences (triton-vs-tilelang on stage 0/1).
 Stages timed (per layer, B configurable, ctx fixed):
   0. update_pool          — SK15 triton (K<64) / tilelang (K>=64)
   1. tail-refresh         — SK16 triton (K<64) / tilelang (K>=64)
-  2. block-MQA            — batch_decode_pool_mqa_v3_triton (both K)
+  2. block-MQA            — batch_decode_pool_mqa_triton (both K)
   3. torch.topk           — same kernel (compare grid only)
   4. sparse-paged-MQA     — sparse_paged_mqa_triton (grouped G=4 / G=1)
 
@@ -30,13 +30,13 @@ import statistics
 import torch
 
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
-    fp8_native_paged_mean_pooling_completed_blocks_v3_interface,
-    fp8_native_paged_mean_pooling_tail_only_v3_interface,
+    fp8_native_paged_mean_pooling_completed_blocks_interface,
+    fp8_native_paged_mean_pooling_tail_only_interface,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
-    batch_decode_pool_mqa_v3_triton,
+    batch_decode_pool_mqa_triton,
     sparse_paged_mqa_triton,
-    tail_only_v3_triton,
+    tail_only_triton,
     update_pool_for_completed_blocks_triton,
 )
 
@@ -132,7 +132,7 @@ def bench_stage_update_pool(K: int, x: dict, force: str = "auto") -> float:
             max_pool_per_req_grid=x["max_pool_blocks"],
         )
     else:
-        fn = lambda: fp8_native_paged_mean_pooling_completed_blocks_v3_interface(
+        fn = lambda: fp8_native_paged_mean_pooling_completed_blocks_interface(
             kv_cache_flat=kv_flat,
             req_to_token=x["req_to_token"],
             pool_page_tables=x["pool_page_tables_v3"],
@@ -152,7 +152,7 @@ def bench_stage_tail(K: int, x: dict, force: str = "auto") -> float:
     kv_flat = x["kv_cache"].view(x["kv_cache"].shape[0], -1)
     use_triton = (force == "triton") or (force == "auto" and K < PAGED)
     if use_triton:
-        fn = lambda: tail_only_v3_triton(
+        fn = lambda: tail_only_triton(
             kv_cache_flat=kv_flat,
             context_lens=x["context_lens"],
             block_tables=x["block_tables"],
@@ -161,7 +161,7 @@ def bench_stage_tail(K: int, x: dict, force: str = "auto") -> float:
             k_block_size=K, paged_block_size=PAGED, pool_page_size=PP,
         )
     else:
-        fn = lambda: fp8_native_paged_mean_pooling_tail_only_v3_interface(
+        fn = lambda: fp8_native_paged_mean_pooling_tail_only_interface(
             kv_cache=x["kv_cache"],
             context_lens=x["context_lens"],
             block_tables=x["block_tables"],
@@ -173,7 +173,7 @@ def bench_stage_tail(K: int, x: dict, force: str = "auto") -> float:
 
 
 def bench_stage_block_mqa(K: int, x: dict) -> float:
-    fn = lambda: batch_decode_pool_mqa_v3_triton(
+    fn = lambda: batch_decode_pool_mqa_triton(
         q_fp8=x["q_fp8"],
         pool_k_pages=x["pool_pages"],
         pool_page_tables=x["pool_page_tables"],

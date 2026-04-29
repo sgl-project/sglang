@@ -41,15 +41,15 @@ from sglang.srt.distributed import (
 from sglang.srt.distributed.parallel_state import get_pp_group
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
-    fp8_native_hierarchy_mqa_logits,
-    fp8_native_hierarchy_paged_mqa_logits,
-    fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3,
+    fp8_native_hierarchy_mqa_logits_tilelang_legacy,
+    fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy,
+    fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache,
 )
 from sglang.srt.layers.attention.nsa.hisa.pool_k_cache import HisaNSATokenToKVPool
 from sglang.srt.layers.attention.nsa.hisa_triton.orchestrator import (
-    fp8_native_hierarchy_mqa_logits_triton,
-    fp8_native_hierarchy_paged_mqa_logits_triton,
-    fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v4,
+    fp8_native_hierarchy_mqa_logits,
+    fp8_native_hierarchy_paged_mqa_logits_no_pool_cache,
+    fp8_native_hierarchy_paged_mqa_logits,
 )
 from sglang.srt.layers.attention.nsa.hisa.triton_kernel import hisa_coord_transform
 from sglang.srt.layers.attention.nsa.utils import (
@@ -478,19 +478,19 @@ class HisaIndexer(MultiPlatformOp):
 
         # ---- hisa kernel ----
         # Dispatch:
-        #   cache enabled (default) + DISABLE_TRITON=1 → v3 (tilelang hot)
-        #   cache enabled (default) + default          → v4 (triton hot)
-        #   cache disabled (DISABLE_POOL_CACHE=1) + k>=64 → v1 tilelang baseline
-        #   cache disabled (DISABLE_POOL_CACHE=1) + k<64  → all-triton no-cache (SK14)
-        # SK15+SK16 made the v4 path k<64 capable (tail_only and update_pool
-        # tilelang kernels can't handle k<64; their dispatch in this layer
-        # routes through the triton ports). So k<64 + cache enabled stays on v4.
+        #   cache enabled (default) + default          → fp8_native_hierarchy_paged_mqa_logits          (triton hot, default)
+        #   cache enabled (default) + DISABLE_TRITON=1 → ..._tilelang_with_pool_cache                   (tilelang fallback)
+        #   cache disabled (DISABLE_POOL_CACHE=1) + k>=64 → ..._tilelang_legacy                        (no-cache tilelang baseline)
+        #   cache disabled (DISABLE_POOL_CACHE=1) + k<64  → ..._no_pool_cache                         (no-cache all-triton, SK14)
+        # The default + cache path is k<64-capable too (tail_only + update_pool
+        # tilelang kernels can't handle k<64; routed through their triton ports
+        # in pool_k_cache.py and orchestrator.py).
         kv_pool = forward_batch.token_to_kv_pool
         use_pool_cache = isinstance(kv_pool, HisaNSATokenToKVPool)
         small_k_block = self.hisa_k_block_size < 64
         if small_k_block and not use_pool_cache:
             block_sparse_logits, topk_block_indices = (
-                fp8_native_hierarchy_paged_mqa_logits_triton(
+                fp8_native_hierarchy_paged_mqa_logits_no_pool_cache(
                     q_fp8=q_fp8[:q_offset],
                     kv_cache_fp8=kv_cache_fp8,
                     weights=weights[:q_offset],
@@ -508,9 +508,9 @@ class HisaIndexer(MultiPlatformOp):
                 forward_batch.req_pool_indices,
             )  # [B, max_pool_pages_per_req] int32 (full col cap)
             orch = (
-                fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v4
+                fp8_native_hierarchy_paged_mqa_logits
                 if use_triton
-                else fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3
+                else fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache
             )
             block_sparse_logits, topk_block_indices = orch(
                 q_fp8=q_fp8[:q_offset],
@@ -526,7 +526,7 @@ class HisaIndexer(MultiPlatformOp):
             )
         else:
             block_sparse_logits, topk_block_indices = (
-                fp8_native_hierarchy_paged_mqa_logits(
+                fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
                     q_fp8[:q_offset],
                     kv_cache_fp8,
                     weights[:q_offset],
@@ -637,7 +637,7 @@ class HisaIndexer(MultiPlatformOp):
         iou_th = float(os.environ.get("SGLANG_HISA_VERIFY_IOU", "0.95"))
 
         # --- v1 reference: fresh mean-pool + block_mqa + sparse_paged ---
-        v1_block_sparse, v1_topk_block = fp8_native_hierarchy_paged_mqa_logits(
+        v1_block_sparse, v1_topk_block = fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
             q_fp8[:q_offset],
             kv_cache_fp8,
             weights[:q_offset],
@@ -852,7 +852,7 @@ class HisaIndexer(MultiPlatformOp):
         else:
             k_fp8 = k_fp8.view(torch.float8_e4m3fn)
 
-        # Hisa's fp8_native_hierarchy_mqa_logits consumes k_scale as uint8
+        # Hisa's fp8_native_hierarchy_mqa_logits_tilelang_legacy consumes k_scale as uint8
         # [N, 4] — which is exactly what get_index_k_scale_buffer returns
         # ("k_scale: (seq_len, 4), uint8"). No conversion needed.
         # (Baseline Indexer does .view(torch.float32).squeeze(-1) because
@@ -889,9 +889,9 @@ class HisaIndexer(MultiPlatformOp):
             # var used by the decode path).
             use_triton = os.environ.get("SGLANG_HISA_DISABLE_TRITON") != "1"
             mqa_logits_fn = (
-                fp8_native_hierarchy_mqa_logits_triton
+                fp8_native_hierarchy_mqa_logits
                 if use_triton or self.hisa_k_block_size < 64
-                else fp8_native_hierarchy_mqa_logits
+                else fp8_native_hierarchy_mqa_logits_tilelang_legacy
             )
             with self._with_real_sm_count():
                 block_sparse_logits, topk_block_indices = mqa_logits_fn(
@@ -946,9 +946,9 @@ class HisaIndexer(MultiPlatformOp):
         # K; SGLANG_HISA_DISABLE_TRITON=1 falls back to tilelang).
         use_triton = os.environ.get("SGLANG_HISA_DISABLE_TRITON") != "1"
         mqa_logits_fn = (
-            fp8_native_hierarchy_mqa_logits_triton
+            fp8_native_hierarchy_mqa_logits
             if use_triton or self.hisa_k_block_size < 64
-            else fp8_native_hierarchy_mqa_logits
+            else fp8_native_hierarchy_mqa_logits_tilelang_legacy
         )
         start = 0
         while start < q_offset:

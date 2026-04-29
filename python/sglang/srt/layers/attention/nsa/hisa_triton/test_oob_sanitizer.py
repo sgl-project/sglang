@@ -32,10 +32,10 @@ import sys
 import torch
 
 from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
-    batch_decode_pool_mqa_v3_triton,
+    batch_decode_pool_mqa_triton,
     paged_mean_pooling_triton,
     sparse_paged_mqa_triton,
-    tail_only_v3_triton,
+    tail_only_triton,
     update_pool_for_completed_blocks_triton,
 )
 
@@ -151,7 +151,7 @@ def case_batch_decode_pool_mqa_v3(*, poison: bool):
     weights = torch.rand(B, H, device="cuda")
     ctx_pool = torch.tensor([PP * 3, PP * 5], dtype=torch.int32, device="cuda")
 
-    out = batch_decode_pool_mqa_v3_triton(
+    out = batch_decode_pool_mqa_triton(
         q, pool_pages, pool_page_tables, weights, ctx_pool, pool_page_size=PP,
     )
     torch.cuda.synchronize()
@@ -223,7 +223,7 @@ def case_tail_only_v3(K, *, poison: bool):
         _poison_int32(block_tables, num_phys)
         _poison_int32(pool_page_tables, num_pool_phys)
 
-    tail_only_v3_triton(
+    tail_only_triton(
         kv, context_lens, block_tables, pool_page_tables, pool_pages,
         K, P, PP,
     )

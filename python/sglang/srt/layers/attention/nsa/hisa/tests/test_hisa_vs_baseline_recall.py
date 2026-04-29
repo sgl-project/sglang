@@ -1,7 +1,7 @@
 """Smoke test: at seq_len=8192, how much of baseline's top-2048 does hisa recover?
 
 Runs both the baseline (``deep_gemm.fp8_mqa_logits`` + ``fast_topk_v2``) and
-the full hisa pipeline (``fp8_native_hierarchy_mqa_logits`` + ``fast_topk_v2``
+the full hisa pipeline (``fp8_native_hierarchy_mqa_logits_tilelang_legacy`` + ``fast_topk_v2``
 + ``hisa_coord_transform``) on identical inputs, and measures per-row set
 overlap ("recall@2048").
 
@@ -20,7 +20,7 @@ from sgl_kernel import fast_topk_v2
 import deep_gemm
 
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
-    fp8_native_hierarchy_mqa_logits,
+    fp8_native_hierarchy_mqa_logits_tilelang_legacy,
 )
 from sglang.srt.layers.attention.nsa.hisa.triton_kernel import hisa_coord_transform
 
@@ -65,7 +65,7 @@ def baseline_topk(inp, index_topk):
 
 
 def hisa_topk(inp, index_topk, k_block_size=128, block_topk=64):
-    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits(
+    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits_tilelang_legacy(
         inp["q_fp8"], (inp["k_fp8"], inp["k_scale_uint8"]),
         inp["weights"], inp["ks"], inp["ke"],
         k_block_size, block_topk,

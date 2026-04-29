@@ -21,8 +21,8 @@ import torch
 from sgl_kernel import fast_topk_v2
 
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
-    fp8_native_hierarchy_mqa_logits,
-    fp8_native_hierarchy_paged_mqa_logits,
+    fp8_native_hierarchy_mqa_logits_tilelang_legacy,
+    fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy,
 )
 
 
@@ -64,7 +64,7 @@ def test_ragged_prefill_pipeline() -> None:
     ke = torch.arange(1, M + 1, device=DEVICE, dtype=torch.int32)
 
     # ---- hisa kernel ----
-    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits(
+    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits_tilelang_legacy(
         q, (k, k_scale_uint8), weights, ks, ke, k_block_size, block_topk,
     )
     assert block_sparse_logits.shape == (M, expected_sparse_len), (
@@ -181,7 +181,7 @@ def test_paged_decode_pipeline() -> None:
     max_seq_len = block_tables.shape[1] * paged_block_size
 
     # ---- hisa kernel ----
-    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_paged_mqa_logits(
+    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
         q, kv_cache, weights, seqlens_32, block_tables, schedule_metadata,
         max_model_len=max_seq_len,
         max_seq_len=max_seq_len,

@@ -7,7 +7,7 @@ Three swap candidates (= the only places where K>=64 still calls tilelang
 in the hot path):
   1. update_pool_for_completed_blocks  (SK15 triton vs tilelang)
   2. tail_only_v3                      (SK16 triton vs tilelang)
-  3. fp8_native_hierarchy_mqa_logits   (ragged prefill orchestrator;
+  3. fp8_native_hierarchy_mqa_logits_tilelang_legacy   (ragged prefill orchestrator;
                                         triton vs tilelang)
 
 For each: identical input copies → run both → byte-equal compare →
@@ -27,16 +27,16 @@ import sys
 import torch
 
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
-    fp8_native_hierarchy_mqa_logits,
-    fp8_native_paged_mean_pooling_completed_blocks_v3_interface,
-    fp8_native_paged_mean_pooling_tail_only_v3_interface,
+    fp8_native_hierarchy_mqa_logits_tilelang_legacy,
+    fp8_native_paged_mean_pooling_completed_blocks_interface,
+    fp8_native_paged_mean_pooling_tail_only_interface,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
-    tail_only_v3_triton,
+    tail_only_triton,
     update_pool_for_completed_blocks_triton,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.orchestrator import (
-    fp8_native_hierarchy_mqa_logits_triton,
+    fp8_native_hierarchy_mqa_logits,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.benchmark import (
     _make_paged_kv_cache_soa,
@@ -130,7 +130,7 @@ def test_update_pool_K128(B: int, ctx_len: int):
         pool_page_size=PP,
         max_pool_per_req_grid=max_pool_blocks,
     )
-    fp8_native_paged_mean_pooling_completed_blocks_v3_interface(
+    fp8_native_paged_mean_pooling_completed_blocks_interface(
         kv_cache_flat=kv_flat,
         req_to_token=req_to_token,
         pool_page_tables=pool_page_tables,
@@ -203,7 +203,7 @@ def test_update_pool_K128(B: int, ctx_len: int):
         pool_k_pages=pool_a, k_block_size=K, paged_block_size=PAGED,
         pool_page_size=PP, max_pool_per_req_grid=max_pool_blocks,
     ))
-    t_tilelang = cuda_bench(lambda: fp8_native_paged_mean_pooling_completed_blocks_v3_interface(
+    t_tilelang = cuda_bench(lambda: fp8_native_paged_mean_pooling_completed_blocks_interface(
         kv_cache_flat=kv_flat, req_to_token=req_to_token,
         pool_page_tables=pool_page_tables, req_pool_indices=req_pool_indices,
         prev_seq_lens=prev_seq_lens, new_seq_lens=new_seq_lens,
@@ -247,13 +247,13 @@ def test_tail_only_K128(B: int, ctx_len: int):
     out_a = torch.zeros(num_pool_phys, PP * (D + 4), dtype=torch.uint8, device=DEVICE)
     out_b = out_a.clone()
 
-    tail_only_v3_triton(
+    tail_only_triton(
         kv_cache_flat=kv_flat, context_lens=context_lens,
         block_tables=block_tables, pool_page_tables=pool_page_tables,
         pool_k_pages=out_a, k_block_size=K, paged_block_size=PAGED, pool_page_size=PP,
     )
     # tilelang interface takes 4d kv_cache (not flat), let's check signature.
-    fp8_native_paged_mean_pooling_tail_only_v3_interface(
+    fp8_native_paged_mean_pooling_tail_only_interface(
         kv_cache=kv_cache, context_lens=context_lens,
         block_tables=block_tables, pool_page_tables=pool_page_tables,
         pool_k_pages=out_b, k_block_size=K, pool_page_size=PP,
@@ -306,12 +306,12 @@ def test_tail_only_K128(B: int, ctx_len: int):
     print(f"    {level:>20} | {diag}")
 
     pool_a = out_a.clone(); pool_b = out_b.clone()
-    t_triton = cuda_bench(lambda: tail_only_v3_triton(
+    t_triton = cuda_bench(lambda: tail_only_triton(
         kv_cache_flat=kv_flat, context_lens=context_lens,
         block_tables=block_tables, pool_page_tables=pool_page_tables,
         pool_k_pages=pool_a, k_block_size=K, paged_block_size=PAGED, pool_page_size=PP,
     ))
-    t_tilelang = cuda_bench(lambda: fp8_native_paged_mean_pooling_tail_only_v3_interface(
+    t_tilelang = cuda_bench(lambda: fp8_native_paged_mean_pooling_tail_only_interface(
         kv_cache=kv_cache, context_lens=context_lens,
         block_tables=block_tables, pool_page_tables=pool_page_tables,
         pool_k_pages=pool_b, k_block_size=K, pool_page_size=PP,
@@ -322,7 +322,7 @@ def test_tail_only_K128(B: int, ctx_len: int):
 
 
 # --------------------------------------------------------------------------
-# Test 3 — fp8_native_hierarchy_mqa_logits (ragged prefill orchestrator)
+# Test 3 — fp8_native_hierarchy_mqa_logits_tilelang_legacy (ragged prefill orchestrator)
 # --------------------------------------------------------------------------
 @torch.inference_mode()
 def test_ragged_orchestrator_K128(seq_q: int, seq_kv: int):
@@ -340,11 +340,11 @@ def test_ragged_orchestrator_K128(seq_q: int, seq_kv: int):
     cu_ks = torch.zeros(seq_q, device=DEVICE, dtype=torch.int32)
     cu_ke = torch.linspace(seq_kv // 4, seq_kv, seq_q, device=DEVICE).to(torch.int32)
 
-    bs_t, topk_t = fp8_native_hierarchy_mqa_logits_triton(
+    bs_t, topk_t = fp8_native_hierarchy_mqa_logits(
         q, (k_fp8, scale_uint8), w, cu_ks, cu_ke,
         k_block_size=K, block_topk=block_topk,
     )
-    bs_l, topk_l = fp8_native_hierarchy_mqa_logits(
+    bs_l, topk_l = fp8_native_hierarchy_mqa_logits_tilelang_legacy(
         q, (k_fp8, scale_uint8), w, cu_ks, cu_ke,
         k_block_size=K, block_topk=block_topk,
     )
@@ -374,11 +374,11 @@ def test_ragged_orchestrator_K128(seq_q: int, seq_kv: int):
     )
     print(f"  topk-set IoU (logits-induced): mean={iou_mean:.3f}  min={iou_min:.3f}")
 
-    t_triton = cuda_bench(lambda: fp8_native_hierarchy_mqa_logits_triton(
+    t_triton = cuda_bench(lambda: fp8_native_hierarchy_mqa_logits(
         q, (k_fp8, scale_uint8), w, cu_ks, cu_ke,
         k_block_size=K, block_topk=block_topk,
     ))
-    t_tilelang = cuda_bench(lambda: fp8_native_hierarchy_mqa_logits(
+    t_tilelang = cuda_bench(lambda: fp8_native_hierarchy_mqa_logits_tilelang_legacy(
         q, (k_fp8, scale_uint8), w, cu_ks, cu_ke,
         k_block_size=K, block_topk=block_topk,
     ))

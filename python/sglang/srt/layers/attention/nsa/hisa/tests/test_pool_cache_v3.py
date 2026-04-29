@@ -17,9 +17,9 @@ import torch
 
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
     fp8_native_paged_mean_pooling_interface,
-    fp8_native_paged_mean_pooling_tail_only_v3_interface,
-    fp8_native_hierarchy_paged_mqa_logits,
-    fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3,
+    fp8_native_paged_mean_pooling_tail_only_interface,
+    fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy,
+    fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache,
 )
 
 
@@ -131,7 +131,7 @@ def test_tail_only_v3_byte_equal():
     perm = torch.randperm(N_pool_pages, device=DEVICE, dtype=torch.int32)
     pool_page_tables = perm[: B * max_pool_pages].view(B, max_pool_pages).contiguous()
 
-    fp8_native_paged_mean_pooling_tail_only_v3_interface(
+    fp8_native_paged_mean_pooling_tail_only_interface(
         kv_cache=kv, context_lens=context_lens, block_tables=block_tables,
         pool_page_tables=pool_page_tables, pool_k_pages=pool_k_pages,
         k_block_size=k_block_size, pool_page_size=pool_page_size,
@@ -189,7 +189,7 @@ def test_orchestrator_v3_matches_v1():
     weights = torch.randn((B * 1, H), device=DEVICE, dtype=torch.float32)
 
     # v1 orchestrator (no cache).
-    sparse_v1, topk_v1 = fp8_native_hierarchy_paged_mqa_logits(
+    sparse_v1, topk_v1 = fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
         q_fp8=q_fp8, kv_cache_fp8=kv, weights=weights,
         context_lens=context_lens, block_tables=block_tables,
         schedule_metadata=None,
@@ -218,7 +218,7 @@ def test_orchestrator_v3_matches_v1():
     )
 
     # v3 orchestrator (tail is refreshed in place).
-    sparse_v3, topk_v3 = fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3(
+    sparse_v3, topk_v3 = fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache(
         q_fp8=q_fp8, kv_cache_fp8=kv,
         pool_k_pages=pool_k_pages, pool_page_tables=pool_page_tables,
         weights=weights, context_lens=context_lens, block_tables=block_tables,

@@ -19,15 +19,15 @@ from dataclasses import dataclass
 import torch
 
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
+    batch_pool_mqa_attn_return_logits_fp8_legacy_interface,
     batch_pool_mqa_attn_return_logits_fp8_interface,
-    batch_pool_mqa_attn_return_logits_fp8_v3_interface,
     fp8_native_block_mean_pooling_interface,
     fp8_native_block_sparse_mqa_attn_return_logits_interface,
     fp8_native_paged_block_sparse_mqa_attn_return_logits_interface,
     fp8_native_paged_mean_pooling_interface,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
-    batch_decode_pool_mqa_v3_triton,
+    batch_decode_pool_mqa_triton,
     batch_pool_mqa_triton,
     block_mean_pooling_triton,
     block_sparse_mqa_triton,
@@ -184,7 +184,7 @@ def bench_batch_pool_mqa(
             inp = _make_batch_pool_mqa_inputs(B, nb, dims)
 
             # Warm both and check correctness on warm-up output.
-            out_tl = batch_pool_mqa_attn_return_logits_fp8_interface(
+            out_tl = batch_pool_mqa_attn_return_logits_fp8_legacy_interface(
                 q_fp8=inp["q_fp8"],
                 blocked_kv_fp8=inp["blocked_k_fp8"],
                 blocked_kv_scale=inp["blocked_k_scale"],
@@ -203,7 +203,7 @@ def bench_batch_pool_mqa(
 
             # Time both.
             def fn_tl():
-                batch_pool_mqa_attn_return_logits_fp8_interface(
+                batch_pool_mqa_attn_return_logits_fp8_legacy_interface(
                     q_fp8=inp["q_fp8"],
                     blocked_kv_fp8=inp["blocked_k_fp8"],
                     blocked_kv_scale=inp["blocked_k_scale"],
@@ -566,14 +566,14 @@ def bench_batch_decode_pool_mqa_v3(
     for B in batch_sizes:
         for np_ in num_pools:
             inp = _make_batch_pool_mqa_v3_inputs(B, np_, dims)
-            out_tl = batch_pool_mqa_attn_return_logits_fp8_v3_interface(
+            out_tl = batch_pool_mqa_attn_return_logits_fp8_interface(
                 q_fp8=inp["q"], pool_k_pages=inp["pool_k_pages"],
                 pool_page_tables=inp["pool_page_tables"],
                 weights_f32=inp["weights"],
                 context_lens_pool=inp["context_lens_pool"],
                 pool_page_size=inp["pool_page_size"],
             )
-            out_tr = batch_decode_pool_mqa_v3_triton(
+            out_tr = batch_decode_pool_mqa_triton(
                 q_fp8=inp["q"], pool_k_pages=inp["pool_k_pages"],
                 pool_page_tables=inp["pool_page_tables"],
                 weights_f32=inp["weights"],
@@ -582,7 +582,7 @@ def bench_batch_decode_pool_mqa_v3(
             )
             ok, msg = _check_correctness(out_tl.squeeze(1), out_tr.squeeze(1))
             def fn_tl():
-                batch_pool_mqa_attn_return_logits_fp8_v3_interface(
+                batch_pool_mqa_attn_return_logits_fp8_interface(
                     q_fp8=inp["q"], pool_k_pages=inp["pool_k_pages"],
                     pool_page_tables=inp["pool_page_tables"],
                     weights_f32=inp["weights"],
@@ -590,7 +590,7 @@ def bench_batch_decode_pool_mqa_v3(
                     pool_page_size=inp["pool_page_size"],
                 )
             def fn_tr():
-                batch_decode_pool_mqa_v3_triton(
+                batch_decode_pool_mqa_triton(
                     q_fp8=inp["q"], pool_k_pages=inp["pool_k_pages"],
                     pool_page_tables=inp["pool_page_tables"],
                     weights_f32=inp["weights"],

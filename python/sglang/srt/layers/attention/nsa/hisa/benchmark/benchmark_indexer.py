@@ -13,11 +13,11 @@ Two paths are benchmarked:
 
 * Prefill:
     * Baseline:  ``fp8_mqa_logits`` + top-k
-    * Hierarchy: ``fp8_native_hierarchy_mqa_logits`` + top-k + gather
+    * Hierarchy: ``fp8_native_hierarchy_mqa_logits_tilelang_legacy`` + top-k + gather
 
 * Decode (paged):
     * Baseline:  ``fp8_paged_mqa_logits`` + top-k
-    * Hierarchy: ``fp8_native_hierarchy_paged_mqa_logits`` + top-k + gather
+    * Hierarchy: ``fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy`` + top-k + gather
 
 Note: the two kernels do NOT produce identical outputs - hierarchical indexer
 is an approximation. The comparison here is strictly about wall-clock speed
@@ -49,14 +49,14 @@ from deep_gemm import (
 
 # ---- hierarchical implementation (imported directly from source) --------------
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
+    batch_pool_mqa_attn_return_logits_fp8_legacy_interface,
     batch_pool_mqa_attn_return_logits_fp8_interface,
-    batch_pool_mqa_attn_return_logits_fp8_v3_interface,
-    fp8_native_hierarchy_mqa_logits,
-    fp8_native_hierarchy_paged_mqa_logits,
-    fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3,
-    fp8_native_paged_mean_pooling_completed_blocks_v3_interface,
+    fp8_native_hierarchy_mqa_logits_tilelang_legacy,
+    fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy,
+    fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache,
+    fp8_native_paged_mean_pooling_completed_blocks_interface,
     fp8_native_paged_mean_pooling_interface,
-    fp8_native_paged_mean_pooling_tail_only_v3_interface,
+    fp8_native_paged_mean_pooling_tail_only_interface,
     fp8_native_paged_block_sparse_mqa_attn_return_logits_interface,
 )
 
@@ -268,7 +268,7 @@ def _run_baseline_prefill(inputs: dict, topk_tokens: int) -> None:
 def _run_hierarchy_prefill(
     inputs: dict, topk_tokens: int, k_block_size: int, block_topk: int,
 ) -> None:
-    """Hisa = fp8_native_hierarchy_mqa_logits + fast_topk_v2 + fused triton coord_transform.
+    """Hisa = fp8_native_hierarchy_mqa_logits_tilelang_legacy + fast_topk_v2 + fused triton coord_transform.
 
     Mirrors HisaIndexer._get_topk_ragged end-to-end (production path).
     """
@@ -282,7 +282,7 @@ def _run_hierarchy_prefill(
     cu_seqlen_ke = inputs["cu_seqlen_ke"]
 
     # Kernel (1st stage: pool+pick top blocks, 2nd stage: block-sparse logits)
-    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits(
+    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_mqa_logits_tilelang_legacy(
         q_fp8, (k_fp8, k_scale), weights,
         cu_seqlen_ks, cu_seqlen_ke,
         k_block_size, block_topk,
@@ -429,7 +429,7 @@ def _run_hierarchy_decode_v3(
     block_tables = inputs["block_tables"]
 
     block_sparse_logits, topk_block_indices = (
-        fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3(
+        fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache(
             q_fp8=q_fp8,
             kv_cache_fp8=kv_cache,
             pool_k_pages=v3_extra["pool_k_pages"],
@@ -491,7 +491,7 @@ def bench_v3_stages(
     blocked_k, blocked_k_scale, n_pool = fp8_native_paged_mean_pooling_interface(
         max_num_pooling_blocks, kv_cache, seq_lens, block_tables, k_block_size,
     )
-    b_score = batch_pool_mqa_attn_return_logits_fp8_interface(
+    b_score = batch_pool_mqa_attn_return_logits_fp8_legacy_interface(
         q_fp8=q_fp8, blocked_kv_fp8=blocked_k, blocked_kv_scale=blocked_k_scale,
         weights_f32=weights, context_lens=n_pool, kv_block_size=k_block_size,
     )
@@ -508,14 +508,14 @@ def bench_v3_stages(
         )
 
     def v1_block_mqa_on_fresh():
-        batch_pool_mqa_attn_return_logits_fp8_interface(
+        batch_pool_mqa_attn_return_logits_fp8_legacy_interface(
             q_fp8=q_fp8, blocked_kv_fp8=blocked_k, blocked_kv_scale=blocked_k_scale,
             weights_f32=weights, context_lens=n_pool, kv_block_size=k_block_size,
         )
 
     # v3 stages
     def v3_tail_only():
-        fp8_native_paged_mean_pooling_tail_only_v3_interface(
+        fp8_native_paged_mean_pooling_tail_only_interface(
             kv_cache=kv_cache, context_lens=seq_lens, block_tables=block_tables,
             pool_page_tables=v3_extra["pool_page_tables"],
             pool_k_pages=v3_extra["pool_k_pages"],
@@ -524,7 +524,7 @@ def bench_v3_stages(
         )
 
     def v3_block_mqa_paged():
-        batch_pool_mqa_attn_return_logits_fp8_v3_interface(
+        batch_pool_mqa_attn_return_logits_fp8_interface(
             q_fp8=q_fp8,
             pool_k_pages=v3_extra["pool_k_pages"],
             pool_page_tables=v3_extra["pool_page_tables"],
@@ -557,7 +557,7 @@ def bench_v3_stages(
         )
 
     def upd_pool_stage():
-        fp8_native_paged_mean_pooling_completed_blocks_v3_interface(
+        fp8_native_paged_mean_pooling_completed_blocks_interface(
             kv_cache_flat=v3_extra["kv_cache_flat"],
             req_to_token=v3_extra["req_to_token"],
             pool_page_tables=v3_extra["pool_page_tables"],
@@ -643,7 +643,7 @@ def _run_hierarchy_decode(
     block_tables = inputs["block_tables"]
     schedule_metadata = inputs["schedule_metadata"]
 
-    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_paged_mqa_logits(
+    block_sparse_logits, topk_block_indices = fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
         q_fp8, kv_cache, weights, seq_lens, block_tables, schedule_metadata,
         max_model_len=max_model_len,
         max_seq_len=max_seq_len,
@@ -761,7 +761,7 @@ def bench_decode(
             v3_fn = lambda: _run_hierarchy_decode_v3(
                 inputs, v3_extra, topk_tokens, k_block_size, block_topk,
             )
-            upd_fn = lambda: fp8_native_paged_mean_pooling_completed_blocks_v3_interface(
+            upd_fn = lambda: fp8_native_paged_mean_pooling_completed_blocks_interface(
                 kv_cache_flat=v3_extra["kv_cache_flat"],
                 req_to_token=v3_extra["req_to_token"],
                 pool_page_tables=v3_extra["pool_page_tables"],

@@ -17,8 +17,8 @@ import sys
 import torch
 
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
+    batch_pool_mqa_attn_return_logits_fp8_legacy_interface,
     batch_pool_mqa_attn_return_logits_fp8_interface,
-    batch_pool_mqa_attn_return_logits_fp8_v3_interface,
     fp8_native_paged_block_sparse_mqa_attn_return_logits_interface,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.benchmark import (
@@ -29,7 +29,7 @@ from sglang.srt.layers.attention.nsa.hisa_triton.benchmark import (
     _make_sparse_paged_mqa_inputs,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
-    batch_decode_pool_mqa_v3_triton,
+    batch_decode_pool_mqa_triton,
     batch_pool_mqa_triton,
     block_mean_pooling_triton,
     block_sparse_mqa_triton,
@@ -38,7 +38,7 @@ from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
     sparse_paged_mqa_triton,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.orchestrator import (
-    fp8_native_hierarchy_mqa_logits_triton,
+    fp8_native_hierarchy_mqa_logits,
 )
 
 
@@ -153,7 +153,7 @@ def test_batch_pool_mqa():
     for B in [1, 8, 32, 64]:
         for nb in [128, 512, 1024]:
             inp = _make_batch_pool_mqa_inputs(B, nb, dims, seed=0)
-            out_tl = batch_pool_mqa_attn_return_logits_fp8_interface(
+            out_tl = batch_pool_mqa_attn_return_logits_fp8_legacy_interface(
                 q_fp8=inp["q_fp8"],
                 blocked_kv_fp8=inp["blocked_k_fp8"],
                 blocked_kv_scale=inp["blocked_k_scale"],
@@ -229,14 +229,14 @@ def test_batch_decode_pool_mqa_v3():
     for B in [1, 8, 32, 64]:
         for num_pool in [128, 512, 1024]:
             inp = _make_batch_pool_mqa_v3_inputs(B, num_pool, dims, seed=0)
-            out_tl = batch_pool_mqa_attn_return_logits_fp8_v3_interface(
+            out_tl = batch_pool_mqa_attn_return_logits_fp8_interface(
                 q_fp8=inp["q"], pool_k_pages=inp["pool_k_pages"],
                 pool_page_tables=inp["pool_page_tables"],
                 weights_f32=inp["weights"],
                 context_lens_pool=inp["context_lens_pool"],
                 pool_page_size=inp["pool_page_size"],
             )  # [B, 1, max_pool_pages * PP]
-            out_tr = batch_decode_pool_mqa_v3_triton(
+            out_tr = batch_decode_pool_mqa_triton(
                 q_fp8=inp["q"], pool_k_pages=inp["pool_k_pages"],
                 pool_page_tables=inp["pool_page_tables"],
                 weights_f32=inp["weights"],
@@ -548,7 +548,7 @@ def test_cross_k_block_size():
         status = "OK" if inf_ok else "INF-MISMATCH"
         print(f"{'ragged_pool_mqa':>22} | {k:>4} | {cfg:>20} | {level:>22} | [{status}] {diag}")
 
-    # --- 6. fp8_native_hierarchy_mqa_logits_triton (full ragged orchestrator) ---
+    # --- 6. fp8_native_hierarchy_mqa_logits (full ragged orchestrator) ---
     # End-to-end smoke: realistic chunked-prefill shapes, K<64 must run cleanly
     # (this is the path that replaces the buggy tilelang at K<64). At K>=64
     # we still run it to sanity-check; production will use the tilelang.
@@ -568,7 +568,7 @@ def test_cross_k_block_size():
         cu_ks = torch.zeros(seq_q, device=DEVICE, dtype=torch.int32)
         cu_ke = torch.linspace(seq_kv // 4, seq_kv, seq_q, device=DEVICE).to(torch.int32)
         try:
-            block_sparse, topk_block = fp8_native_hierarchy_mqa_logits_triton(
+            block_sparse, topk_block = fp8_native_hierarchy_mqa_logits(
                 q, (k_fp8, scale_uint8), w, cu_ks, cu_ke,
                 k_block_size=k, block_topk=64,
             )

@@ -1,17 +1,18 @@
-"""v4 orchestrator — paged pool-K cache (v3 layout) + triton hotspot kernels.
+"""Default decode/prefill orchestrators — paged pool-K cache + triton hotspots.
 
-Same control flow as ``fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v3``
-in ``hisa/custom_ops.py``:
+Same control flow as the tilelang fallback
+``fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache`` in
+``hisa/custom_ops.py``, but stages 2 and 4 swap to triton ports:
 
-    1) tail_only_v3   (tilelang, cheap, ~10 μs)
-    2) block-MQA      (→ triton batch_decode_pool_mqa_v3_triton,  1-3.5× faster)
-    3) torch.topk     (unchanged)
-    4) sparse-paged   (→ triton sparse_paged_mqa_triton,  6-15× faster)
+    1) tail_only       (tilelang for K>=paged_block, triton for K<paged_block)
+    2) block-MQA       (→ triton batch_decode_pool_mqa_triton, 1-3.5x faster)
+    3) torch.topk      (unchanged)
+    4) sparse-paged    (→ triton sparse_paged_mqa_triton, 6-15x faster)
 
-Per-step on decode (B=10, ctx=65K): v4 saves ~12 ms / step vs v3 at the
-indexer level (steady-state total ~5 ms vs v3's ~17 ms). Correctness: fp8
-ULP drift ≤ 2.6% rel, topk-2048 IoU ≥ 0.997 vs tilelang — within fp8
-accumulation noise, no e2e regression expected (verify via
+Per-step on decode (B=10, ctx=65K): ~12 ms / step vs the all-tilelang
+fallback at the indexer level (steady-state ~5 ms vs ~17 ms). Correctness:
+fp8 ULP drift <= 2.6% rel, topk-2048 IoU >= 0.997 vs tilelang — within fp8
+accumulation noise, no e2e regression expected (verify with
 ``SGLANG_HISA_VERIFY=1`` when flipping the default).
 """
 from __future__ import annotations
@@ -22,22 +23,20 @@ from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
     fp8_native_block_mean_pooling_grouped_interface,
     fp8_native_block_mean_pooling_interface,
     fp8_native_block_sparse_mqa_attn_return_logits_interface,
-    fp8_native_paged_mean_pooling_tail_only_v3_interface,
     pool_mqa_attn_return_logits_fp8_interface,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
-    batch_decode_pool_mqa_v3_triton,
+    batch_decode_pool_mqa_triton,
     batch_pool_mqa_triton,
     block_mean_pooling_triton,
     block_sparse_mqa_triton,
     paged_mean_pooling_triton,
     ragged_pool_mqa_triton,
     sparse_paged_mqa_triton,
-    tail_only_v3_triton,
 )
 
 
-def fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v4(
+def fp8_native_hierarchy_paged_mqa_logits(
     q_fp8: torch.Tensor,                # [B, 1, H, D] fp8
     kv_cache_fp8: torch.Tensor,         # [num_blocks, paged_block_size, 1, D+4] uint8
     pool_k_pages: torch.Tensor,         # [num_pool_pages_global, pool_page_size * (D+4)] uint8
@@ -49,36 +48,18 @@ def fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v4(
     pool_page_size: int,
     block_topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # 1) Refresh tail pool block in place. Dispatch: tilelang for k>=paged
-    # (the well-tested production path), SK16 triton for k<paged where
-    # tilelang would assert pooling%paged==0.
-    paged_block_size = kv_cache_fp8.shape[1]
-    if k_block_size < paged_block_size:
-        num_phys = kv_cache_fp8.shape[0]
-        kv_cache_flat = kv_cache_fp8.view(num_phys, -1)
-        tail_only_v3_triton(
-            kv_cache_flat=kv_cache_flat,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            pool_page_tables=pool_page_tables,
-            pool_k_pages=pool_k_pages,
-            k_block_size=k_block_size,
-            paged_block_size=paged_block_size,
-            pool_page_size=pool_page_size,
-        )
-    else:
-        fp8_native_paged_mean_pooling_tail_only_v3_interface(
-            kv_cache=kv_cache_fp8, context_lens=context_lens,
-            block_tables=block_tables,
-            pool_page_tables=pool_page_tables,
-            pool_k_pages=pool_k_pages,
-            k_block_size=k_block_size,
-            pool_page_size=pool_page_size,
-        )
+    # 1) Tail-pool refresh is *skipped*. Stage 2's force_maintain at
+    # ``pool_idx == k_e - 1`` (kernels.py: _batch_decode_pool_mqa_kernel)
+    # always assigns +inf to the tail block — so the tail's actual mean-pool
+    # value never affects topk selection. Stage 4 reads raw KV cache for the
+    # selected blocks, not pool_k_pages, so a stale tail in pool_k_pages
+    # also doesn't contaminate the final logits. Saves ~7-10 μs/layer per
+    # decode step. ``update_pool_for_completed_blocks_*`` (called from the
+    # store-side hook in pool_k_cache.py) still keeps non-tail blocks fresh.
 
     # 2) Block-MQA — triton port of paged pool_k_pages reader.
     num_pool_blocks_per_req = (context_lens + k_block_size - 1) // k_block_size
-    block_k_indexer_score = batch_decode_pool_mqa_v3_triton(
+    block_k_indexer_score = batch_decode_pool_mqa_triton(
         q_fp8=q_fp8,
         pool_k_pages=pool_k_pages,
         pool_page_tables=pool_page_tables,
@@ -107,7 +88,7 @@ def fp8_native_hierarchy_paged_mqa_logits_with_pool_cache_v4(
     return block_sparse_k_indexer_score, topk_block_indices
 
 
-def fp8_native_hierarchy_paged_mqa_logits_triton(
+def fp8_native_hierarchy_paged_mqa_logits_no_pool_cache(
     q_fp8: torch.Tensor,                # [B, 1, H, D] fp8
     kv_cache_fp8: torch.Tensor,         # [num_blocks, paged_block_size, 1, D+4] uint8
     weights: torch.Tensor,              # [B*1, H] f32
@@ -118,7 +99,7 @@ def fp8_native_hierarchy_paged_mqa_logits_triton(
     max_seq_len: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """All-triton fp8 hierarchy MQA, no pool cache. Mirrors
-    ``fp8_native_hierarchy_paged_mqa_logits`` (tilelang) but every kernel
+    ``fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy`` (tilelang) but every kernel
     is the SK1..SK12 triton variant, so it works for k_block_size in
     {8, 16, 32, 64, 128} (tilelang ones break for k<64).
 
@@ -176,7 +157,7 @@ def fp8_native_hierarchy_paged_mqa_logits_triton(
     return block_sparse_k_indexer_score, topk_block_indices
 
 
-def fp8_native_hierarchy_mqa_logits_triton(
+def fp8_native_hierarchy_mqa_logits(
     q_fp8: torch.Tensor,                             # [seq, H, D] fp8
     kv: tuple[torch.Tensor, torch.Tensor],           # (k_fp8 [N, D] fp8, k_scale [N, 4] uint8 OR [N] f32)
     weights: torch.Tensor,                           # [seq, H] f32
@@ -186,7 +167,7 @@ def fp8_native_hierarchy_mqa_logits_triton(
     block_topk: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Mixed-stage ragged prefill hierarchy MQA. Mirrors the tilelang
-    ``fp8_native_hierarchy_mqa_logits`` but routes around its K<64 OOB by
+    ``fp8_native_hierarchy_mqa_logits_tilelang_legacy`` but routes around its K<64 OOB by
     using bounds-safe stage-1 variants. Stages 1-2 are tilelang at all K
     (per A/B in test_grouped_mean_pool / test_stage2_ab); stage 4 is split
     by K (test_stage4_full_ab at sq=8192, skv∈{8K..64K}).

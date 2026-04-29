@@ -35,7 +35,7 @@ from sgl_kernel import fast_topk_v2
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
     # decode stages
     fp8_native_paged_mean_pooling_interface,
-    batch_pool_mqa_attn_return_logits_fp8_interface,
+    batch_pool_mqa_attn_return_logits_fp8_legacy_interface,
     fp8_native_paged_block_sparse_mqa_attn_return_logits_interface,
     # prefill stages
     fp8_native_block_mean_pooling_interface,
@@ -257,7 +257,7 @@ def bench_decode(B: int, ctx: int, warmups: int, iters: int) -> dict:
     t_mp, s_mp = cuda_bench(h_mean_pool, warmups, iters)
 
     def h_pool_mqa():
-        return batch_pool_mqa_attn_return_logits_fp8_interface(
+        return batch_pool_mqa_attn_return_logits_fp8_legacy_interface(
             q_fp8=q, blocked_kv_fp8=blocked_k, blocked_kv_scale=blocked_k_scale,
             weights_f32=weights, context_lens=num_pool, kv_block_size=K_BLOCK_SIZE,
         )
