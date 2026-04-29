@@ -13,15 +13,13 @@ Numba path (numba dispatcher chain + ``as_cuda_array`` per tensor).
 from __future__ import annotations
 
 import logging
-import pathlib
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Tuple
 
 import torch
 
 from sglang.jit_kernel.utils import (
     cache_once,
     get_jit_cuda_arch,
-    get_mathdx_root,
     load_jit,
     make_cpp_args,
 )
@@ -43,37 +41,20 @@ def _sm_ver() -> int:
     return arch.major * 100 + arch.minor * 10
 
 
-def _mathdx_lib_dir() -> Optional[pathlib.Path]:
-    root = get_mathdx_root()
-    if root is None:
-        return None
-    lib = root / "lib"
-    return lib if lib.exists() else None
-
-
 @cache_once
 def _ipm_module(nc: int, nv: int, block_dim: int, num_iters: int, sm_ver: int) -> "Module":
     """JIT-compile the IPM kernel for one shape. Cached for the process lifetime."""
     args = make_cpp_args(nc, nv, block_dim, sm_ver, num_iters)
-    extra_ldflags = []
-    lib_dir = _mathdx_lib_dir()
-    if lib_dir is not None:
-        # cuSolverDx ships a static device-side library; cuBLASDx is header-only.
-        # Math-DX 25.06 names the static lib `libcusolverdx.a` (no `_static`
-        # suffix). Older versions used `_static`.
-        extra_ldflags.append(f"-L{lib_dir}")
-        if (lib_dir / "libcusolverdx.a").exists():
-            extra_ldflags.append("-lcusolverdx")
-        elif (lib_dir / "libcusolverdx_static.a").exists():
-            extra_ldflags.append("-lcusolverdx_static")
+    # The kernel uses cuBLASDx (header-only) for the GEMMs and a hand-written
+    # block-level Cholesky for the POSV. No -rdc=true / static-lib linkage
+    # required, so sglang's tvm-ffi load_jit handles the build with the
+    # default flags.
     return load_jit(
         "lplb_ipm",
         *args,
         cuda_files=["lplb/ipm.cuh"],
         cuda_wrappers=[("ipm_solve", f"ipm_solve<{args}>")],
         extra_dependencies=["mathdx"],
-        extra_cuda_cflags=["-rdc=true"],
-        extra_ldflags=extra_ldflags,
     )
 
 
