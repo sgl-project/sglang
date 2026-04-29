@@ -309,7 +309,8 @@ def calculate_metrics(
         output_throughput=sum(output_lens) / dur_s,
         output_throughput_retokenized=sum(retokenized_output_lens) / dur_s,
         total_throughput=(total_input + sum(output_lens)) / dur_s,
-        total_throughput_retokenized=(total_input + sum(retokenized_output_lens)) / dur_s,
+        total_throughput_retokenized=(total_input + sum(retokenized_output_lens))
+        / dur_s,
         mean_ttft_ms=np.mean(ttfts or 0) * 1000,
         median_ttft_ms=np.median(ttfts or 0) * 1000,
         std_ttft_ms=np.std(ttfts or 0) * 1000,
@@ -501,7 +502,9 @@ async def benchmark_shared_prefix_pct(
 
     if prefix_len > 0:
         print(f"Warming shared prefix only ({prefix_len} tokens) ...")
-        await warm_shared_prefix(api_url=api_url, shared_prefix_ids=prompts[0]["input_ids"][:prefix_len])
+        await warm_shared_prefix(
+            api_url=api_url, shared_prefix_ids=prompts[0]["input_ids"][:prefix_len]
+        )
 
     print(f"Sending requests (max_concurrency={args.max_concurrency}) ...")
     benchmark_start_time = time.perf_counter()
@@ -634,7 +637,9 @@ async def main() -> None:
     global args
     args = parser.parse_args()
 
-    args.extra_request_body = json.loads(args.extra_request_body) if args.extra_request_body else {}
+    args.extra_request_body = (
+        json.loads(args.extra_request_body) if args.extra_request_body else {}
+    )
 
     base_url = args.base_url or f"http://{args.host}:{args.port}"
     api_url = f"{base_url}/generate"
