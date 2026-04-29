@@ -2761,6 +2761,7 @@ class Scheduler(
                         req_to_token_pool=self.req_to_token_pool,
                         request_pool_idx=req.req_pool_idx,
                         seq_len=seq_len,
+                        observed_token_count=getattr(req, "kv_committed_len", None),
                         cold_candidate_ranges=host_backup_estimate.host_backup_copy_target_ranges,
                     )
                     extra |= mapping_observation.to_log_dict()

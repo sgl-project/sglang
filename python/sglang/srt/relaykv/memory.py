@@ -92,6 +92,13 @@ RELAYKV_SHADOW_LOG_HOST_BACKUP_KEYS = {
     "cold_range_pool_indices_count",
     "cold_range_pool_mapping_supported",
     "cold_range_pool_mapping_reason",
+    "mapping_valid_count",
+    "mapping_zero_count",
+    "mapping_invalid_count",
+    "mapping_ready_for_copy",
+    "mapping_readiness_reason",
+    "prefill_pending_tokens",
+    "prefill_complete_for_request",
 }
 
 
@@ -152,6 +159,13 @@ class RelayKVPoolMappingObservation:
     cold_range_pool_indices_count: int
     cold_range_pool_mapping_supported: bool
     cold_range_pool_mapping_reason: str
+    mapping_valid_count: int
+    mapping_zero_count: int
+    mapping_invalid_count: int
+    mapping_ready_for_copy: bool
+    mapping_readiness_reason: str
+    prefill_pending_tokens: Optional[int]
+    prefill_complete_for_request: Optional[bool]
 
     def to_log_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -506,6 +520,7 @@ def observe_request_kv_pool_mapping(
     req_to_token_pool: Any,
     request_pool_idx: Optional[int],
     seq_len: int,
+    observed_token_count: Optional[int],
     cold_candidate_ranges: list[list[int]],
     preview_limit: int = 8,
 ) -> RelayKVPoolMappingObservation:
@@ -524,6 +539,13 @@ def observe_request_kv_pool_mapping(
             cold_range_pool_indices_count=0,
             cold_range_pool_mapping_supported=False,
             cold_range_pool_mapping_reason="req_to_token_pool_not_found",
+            mapping_valid_count=0,
+            mapping_zero_count=0,
+            mapping_invalid_count=0,
+            mapping_ready_for_copy=False,
+            mapping_readiness_reason="req_to_token_pool_not_found",
+            prefill_pending_tokens=None,
+            prefill_complete_for_request=None,
         )
     if request_pool_idx is None:
         return RelayKVPoolMappingObservation(
@@ -540,6 +562,13 @@ def observe_request_kv_pool_mapping(
             cold_range_pool_indices_count=0,
             cold_range_pool_mapping_supported=False,
             cold_range_pool_mapping_reason="request_pool_idx_missing",
+            mapping_valid_count=0,
+            mapping_zero_count=0,
+            mapping_invalid_count=0,
+            mapping_ready_for_copy=False,
+            mapping_readiness_reason="request_pool_idx_missing",
+            prefill_pending_tokens=None,
+            prefill_complete_for_request=None,
         )
     req_to_token = getattr(req_to_token_pool, "req_to_token", None)
     if req_to_token is None:
@@ -557,6 +586,13 @@ def observe_request_kv_pool_mapping(
             cold_range_pool_indices_count=0,
             cold_range_pool_mapping_supported=False,
             cold_range_pool_mapping_reason="req_to_token_tensor_not_found",
+            mapping_valid_count=0,
+            mapping_zero_count=0,
+            mapping_invalid_count=0,
+            mapping_ready_for_copy=False,
+            mapping_readiness_reason="req_to_token_tensor_not_found",
+            prefill_pending_tokens=None,
+            prefill_complete_for_request=None,
         )
 
     mapping_shape = _tensor_shape_list(req_to_token)
@@ -577,6 +613,13 @@ def observe_request_kv_pool_mapping(
             cold_range_pool_indices_count=0,
             cold_range_pool_mapping_supported=False,
             cold_range_pool_mapping_reason="req_to_token_tensor_rank_unsupported",
+            mapping_valid_count=0,
+            mapping_zero_count=0,
+            mapping_invalid_count=0,
+            mapping_ready_for_copy=False,
+            mapping_readiness_reason="req_to_token_tensor_rank_unsupported",
+            prefill_pending_tokens=None,
+            prefill_complete_for_request=None,
         )
     if request_pool_idx < 0 or request_pool_idx >= int(req_to_token.shape[0]):
         return RelayKVPoolMappingObservation(
@@ -593,10 +636,26 @@ def observe_request_kv_pool_mapping(
             cold_range_pool_indices_count=0,
             cold_range_pool_mapping_supported=False,
             cold_range_pool_mapping_reason="request_pool_idx_out_of_bounds",
+            mapping_valid_count=0,
+            mapping_zero_count=0,
+            mapping_invalid_count=0,
+            mapping_ready_for_copy=False,
+            mapping_readiness_reason="request_pool_idx_out_of_bounds",
+            prefill_pending_tokens=None,
+            prefill_complete_for_request=None,
         )
 
-    effective_seq_len = max(min(int(seq_len), int(req_to_token.shape[1])), 0)
-    request_pool_indices = req_to_token[request_pool_idx, :effective_seq_len]
+    total_seq_len = max(int(seq_len), 0)
+    if observed_token_count is None:
+        observed_count = min(total_seq_len, int(req_to_token.shape[1]))
+        pending_tokens = None
+        prefill_complete = None
+    else:
+        observed_count = max(min(int(observed_token_count), int(req_to_token.shape[1])), 0)
+        pending_tokens = max(total_seq_len - observed_count, 0)
+        prefill_complete = pending_tokens == 0
+
+    request_pool_indices = req_to_token[request_pool_idx, :observed_count]
     request_pool_indices_count = int(request_pool_indices.numel())
     request_pool_indices_preview_head = _preview_values(request_pool_indices, preview_limit)
     request_pool_indices_preview_tail = _preview_values(
@@ -606,6 +665,9 @@ def observe_request_kv_pool_mapping(
     cold_preview_segments = []
     cold_range_pool_indices_count = 0
     cold_range_mapping_supported = True
+    mapping_valid_count = 0
+    mapping_zero_count = 0
+    mapping_invalid_count = 0
     if not cold_candidate_ranges:
         cold_range_mapping_reason = "cold_candidate_ranges_empty"
         cold_range_mapping_supported = False
@@ -616,13 +678,25 @@ def observe_request_kv_pool_mapping(
                 cold_range_mapping_supported = False
                 cold_range_mapping_reason = "cold_candidate_range_invalid"
                 break
-            if end > effective_seq_len:
+            if end > total_seq_len:
                 cold_range_mapping_supported = False
                 cold_range_mapping_reason = "cold_candidate_range_exceeds_request_seqlen"
                 break
-            cold_range_pool_indices_count += max(end - start, 0)
+            range_total = max(end - start, 0)
+            cold_range_pool_indices_count += range_total
+            observed_start = min(start, observed_count)
+            observed_end = min(end, observed_count)
+            observed_range = request_pool_indices[observed_start:observed_end]
+            if observed_range.numel() > 0:
+                mapping_zero_count += int((observed_range == 0).sum().item())
+                mapping_invalid_count += int((observed_range < 0).sum().item())
+                mapping_valid_count += int((observed_range > 0).sum().item())
+            if end > observed_count:
+                mapping_invalid_count += end - max(start, observed_count)
+                cold_range_mapping_supported = False
+                cold_range_mapping_reason = "prefill_incomplete_for_cold_range"
             if len(cold_preview_segments) < preview_limit:
-                cold_preview_segments.append(request_pool_indices[start:end])
+                cold_preview_segments.append(observed_range)
         if cold_range_mapping_supported and cold_range_pool_indices_count <= 0:
             cold_range_mapping_supported = False
             cold_range_mapping_reason = "cold_candidate_ranges_empty_after_clip"
@@ -640,6 +714,22 @@ def observe_request_kv_pool_mapping(
     else:
         cold_range_pool_indices_preview = []
 
+    if mapping_zero_count > 0:
+        mapping_ready_for_copy = False
+        mapping_readiness_reason = "mapping_contains_zero_entries"
+    elif mapping_invalid_count > 0:
+        mapping_ready_for_copy = False
+        if pending_tokens and pending_tokens > 0:
+            mapping_readiness_reason = "prefill_incomplete_pending_tokens"
+        else:
+            mapping_readiness_reason = "mapping_contains_invalid_entries"
+    elif mapping_valid_count == cold_range_pool_indices_count and mapping_zero_count == 0:
+        mapping_ready_for_copy = True
+        mapping_readiness_reason = "ready_for_copy_metadata_only"
+    else:
+        mapping_ready_for_copy = False
+        mapping_readiness_reason = "mapping_count_mismatch"
+
     return RelayKVPoolMappingObservation(
         kv_pool_mapping_observed=True,
         kv_pool_mapping_reason="ok",
@@ -654,6 +744,13 @@ def observe_request_kv_pool_mapping(
         cold_range_pool_indices_count=cold_range_pool_indices_count,
         cold_range_pool_mapping_supported=cold_range_mapping_supported,
         cold_range_pool_mapping_reason=cold_range_mapping_reason,
+        mapping_valid_count=mapping_valid_count,
+        mapping_zero_count=mapping_zero_count,
+        mapping_invalid_count=mapping_invalid_count,
+        mapping_ready_for_copy=mapping_ready_for_copy,
+        mapping_readiness_reason=mapping_readiness_reason,
+        prefill_pending_tokens=pending_tokens,
+        prefill_complete_for_request=prefill_complete,
     )
 
 

@@ -138,6 +138,7 @@ def main() -> None:
         req_to_token_pool=_FakeReqToTokenPool(),
         request_pool_idx=1,
         seq_len=8,
+        observed_token_count=8,
         cold_candidate_ranges=[[2, 6]],
     )
     if mapping_observation.kv_pool_mapping_observed is not True:
@@ -153,6 +154,18 @@ def main() -> None:
     if mapping_observation.cold_range_pool_indices_count != 4:
         raise AssertionError(mapping_observation)
     if mapping_observation.cold_range_pool_mapping_supported is not True:
+        raise AssertionError(mapping_observation)
+    if mapping_observation.mapping_valid_count != 4:
+        raise AssertionError(mapping_observation)
+    if mapping_observation.mapping_zero_count != 0:
+        raise AssertionError(mapping_observation)
+    if mapping_observation.mapping_invalid_count != 0:
+        raise AssertionError(mapping_observation)
+    if mapping_observation.mapping_ready_for_copy is not True:
+        raise AssertionError(mapping_observation)
+    if mapping_observation.prefill_pending_tokens != 0:
+        raise AssertionError(mapping_observation)
+    if mapping_observation.prefill_complete_for_request is not True:
         raise AssertionError(mapping_observation)
     payload = plan.to_log_dict()
     payload.update(estimate_from_model.to_log_dict())
