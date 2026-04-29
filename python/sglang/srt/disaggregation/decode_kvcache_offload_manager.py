@@ -153,9 +153,11 @@ class DecodeKVCacheOffloadManager:
         incremental_tokens = all_tokens[start:end]
         incremental_indices = token_indices[start:end]
 
-        # Early free prefill-offloaded GPU memory
-        if state.prefill_len > 0 and state.inc_len == 0:
-            self.token_to_kv_pool_allocator.free(token_indices[: state.prefill_len])
+        # Prefill-aligned GPU slots are freed at request finish in
+        # _release_finished_req, NOT here. The decoding request
+        # continues to attend to those slots via req_to_token; freeing
+        # them mid-decode races with concurrent admission, which can
+        # reuse the slots and produce cross-pollinated KV reads.
 
         # Asynchronously offload incremental KV cache from device to host
         self.request_counter += 1
@@ -236,6 +238,18 @@ class DecodeKVCacheOffloadManager:
 
     def _release_finished_req(self, req: Req, start_offset: int):
         kv_committed_len = req.pop_committed_kv_cache()
+
+        # Free the prefill-aligned slots. Previously this was done
+        # eagerly in offload_kv_cache (mid-decode), which raced with
+        # concurrent admission. Now consolidated here at request
+        # finish, where the request is guaranteed to no longer attend
+        # to those slots.
+        state = self.offloaded_state.get(req.rid)
+        if state is not None and state.prefill_len > 0:
+            prefill_indices = self.req_to_token_pool.req_to_token[
+                req.req_pool_idx, : state.prefill_len
+            ]
+            self.token_to_kv_pool_allocator.free(prefill_indices)
         start = start_offset
         end = kv_committed_len
         # Free the incremental part of the request (NSA-aware)
@@ -305,13 +319,11 @@ class DecodeKVCacheOffloadManager:
         else:
             prefill_len = state.prefill_len
             inc_len = state.inc_len
-        # If no incremental offload ever happened, the prefill-aligned part was never freed.
-        # Free the prefill portion on request finish to avoid leaks.
-        if prefill_len > 0 and inc_len == 0:
-            token_indices = self.req_to_token_pool.req_to_token[req.req_pool_idx]
-            self.token_to_kv_pool_allocator.free(token_indices[:prefill_len])
-            logger.info(
-                f"Finalize release: freed prefill-aligned KV for req {req.rid}, len:{prefill_len}"
+        # Prefill-aligned slots are freed by _release_finished_req. Make
+        # sure state exists so it can find prefill_len.
+        if state is None:
+            self.offloaded_state[req.rid] = OffloadedState(
+                prefill_len=prefill_len, inc_len=0, last_hash=None
             )
         start_offset = prefill_len + inc_len
         self._release_finished_req(req, start_offset)

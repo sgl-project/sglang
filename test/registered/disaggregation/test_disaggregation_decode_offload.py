@@ -20,7 +20,6 @@ from sglang.test.test_utils import (
 register_cuda_ci(
     est_time=600,
     suite="stage-b-test-2-gpu-large",
-    disabled="Temporarily disable the flaky test.",
 )
 
 
