@@ -258,6 +258,10 @@ class TorchFlexAttnBackend(AttentionBackend):
         o_ = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
 
         causal = True
+        if getattr(forward_batch, "ug_g_non_causal_query_attention", False):
+            raise NotImplementedError(
+                "TorchFlexAttnBackend does not support UG G non-causal attention"
+            )
         if layer.is_cross_attention or layer.attn_type == AttentionType.ENCODER_ONLY:
             raise NotImplementedError(
                 "TorchFlexAttnBackend does not support non-causal attention for now."

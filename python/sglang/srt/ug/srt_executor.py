@@ -617,7 +617,15 @@ class UGSRTSchedulerExecutor:
             "request_id": binding.request_id,
             "prefix_len": prefix_len,
             "extend_num_tokens": extend_num_tokens,
+            "attention_mode": "non_causal_query",
+            "attention_mask_shape": (extend_num_tokens, seq_len),
         }
+        forward_batch.ug_g_non_causal_query_attention = True
+        forward_batch.cross_attention_custom_mask = torch.ones(
+            extend_num_tokens * seq_len,
+            dtype=torch.bool,
+            device=device,
+        )
         return forward_batch
 
     def _request_token_indices(self, record: Any, req: Any) -> torch.Tensor | None:

@@ -1344,7 +1344,16 @@ class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
                 "request_id": "bagel-temp-g:u1",
                 "prefix_len": 3,
                 "extend_num_tokens": 4,
+                "attention_mode": "non_causal_query",
+                "attention_mask_shape": (4, 7),
             },
+        )
+        self.assertTrue(forward_batch.ug_g_non_causal_query_attention)
+        self.assertTrue(
+            torch.equal(
+                forward_batch.cross_attention_custom_mask,
+                torch.ones(28, dtype=torch.bool),
+            )
         )
         self.assertEqual(
             model_runner.req_to_token_pool.req_to_token[0, :7].tolist(),
