@@ -422,6 +422,16 @@ class PiecewiseCudaGraphRunner:
         # TODO(yuwei): fix it
         if forward_batch.input_embeds is not None:
             return False
+        # PCG graphs are captured with ForwardMode.EXTEND and spec_info=None.
+        # TARGET_VERIFY has different spec_info and capture_hidden_mode,
+        # so it must not use PCG-captured graphs.
+        if forward_batch.forward_mode.is_target_verify():
+            return False
+        # PCG graphs are captured with the runner's capture_hidden_mode.
+        # If the batch needs a different mode (e.g. FULL for speculative
+        # decoding), PCG replay would return wrong/missing hidden_states.
+        if forward_batch.capture_hidden_mode != self.capture_hidden_mode:
+            return False
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
@@ -788,6 +798,18 @@ class PiecewiseCudaGraphRunner:
                     **kwargs,
                 )
                 if isinstance(output, LogitsProcessorOutput):
+                    # Preserve mm_input_embeds when speculative decoding is
+                    # enabled. The speculative draft's prefill path
+                    # (eagle_worker_v2._draft_extend_for_prefill) reads
+                    # mm_input_embeds off this LogitsProcessorOutput to reuse
+                    # the target's encoder embeddings instead of re-embedding
+                    # multimodal placeholder token ids.
+                    mm_input_embeds = None
+                    if (
+                        self.model_runner.spec_algorithm.is_speculative()
+                        and output.mm_input_embeds is not None
+                    ):
+                        mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
                     return LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[
                             : self.raw_num_tokens
@@ -797,6 +819,7 @@ class PiecewiseCudaGraphRunner:
                             if output.hidden_states is not None
                             else None
                         ),
+                        mm_input_embeds=mm_input_embeds,
                     )
                 elif isinstance(output, EmbeddingPoolerOutput):
                     return output
@@ -822,10 +845,10 @@ class PiecewiseCudaGraphRunner:
                     draft_token=None,
                     custom_mask=self.custom_mask,
                     positions=None,
-                    retrive_index=None,
-                    retrive_next_token=None,
-                    retrive_next_sibling=None,
-                    retrive_cum_len=None,
+                    retrieve_index=None,
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
+                    retrieve_cum_len=None,
                     spec_steps=self.model_runner.server_args.speculative_num_steps,
                     topk=self.model_runner.server_args.speculative_eagle_topk,
                     draft_token_num=self.model_runner.server_args.speculative_num_draft_tokens,

@@ -313,7 +313,9 @@ def load_model_from_full_model_state_dict(
 
     # map names from checkpoint to customized names
     custom_param_sd, reverse_param_names_mapping = hf_to_custom_state_dict(
-        full_sd_iterator, param_names_mapping
+        full_sd_iterator,
+        param_names_mapping,
+        valid_target_names=set(meta_sd.keys()),
     )  # type: ignore
 
     is_fsdp_model = isinstance(model, FSDPModule) or any(

@@ -34,7 +34,7 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.lora.lora_moe_runners import LoRAInfo
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=600, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=129, suite="stage-b-test-1-gpu-large")
 
 
 # ---------------------------------------------------------------------------
@@ -256,7 +256,7 @@ def test_marlin_vs_triton_lora_correctness(num_tokens, top_k):
         enable_deterministic_inference = False
 
     with patch(
-        "sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config.get_global_server_args",
+        "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config.get_global_server_args",
         return_value=MockServerArgs(),
     ):
         marlin_runner = MoeRunner(MoeRunnerBackend.MARLIN, config, lora_enabled=True)

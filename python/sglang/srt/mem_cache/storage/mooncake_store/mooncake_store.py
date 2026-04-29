@@ -389,13 +389,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             logger.info("Mooncake store setup successfully.")
 
+            self.local_rank = (
+                storage_config.tp_rank if storage_config is not None else 0
+            )
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
             self.enable_storage_metrics = False
             if storage_config is not None:
                 self.is_mla_backend = storage_config.is_mla_model
-                self.local_rank = storage_config.tp_rank
                 self.pp_rank = storage_config.pp_rank
                 self.pp_size = storage_config.pp_size
                 self.attn_cp_rank = storage_config.attn_cp_rank
@@ -410,12 +412,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.attn_cp_size = 1
 
             self.enable_pp = self.pp_size > 1
-            self.enable_cp = self.attn_cp_size > 1
-            if self.enable_pp or self.enable_cp:
-                self.mha_suffix = (
-                    f"{self.local_rank}_{self.pp_rank}_{self.attn_cp_rank}"
-                )
-                self.mla_suffix = f"{self.pp_rank}_{self.attn_cp_rank}"
+            if self.enable_pp:
+                self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
+                self.mla_suffix = f"{self.pp_rank}"
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
@@ -428,10 +427,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 base_rank = self.local_rank * self.split_factor
                 target_ranks = [base_rank + i for i in range(self.split_factor)]
-                if self.enable_pp or self.enable_cp:
+                if self.enable_pp:
                     self.mha_suffix = [
-                        f"{rank}_{self.pp_rank}_{self.attn_cp_rank}"
-                        for rank in target_ranks
+                        f"{rank}_{self.pp_rank}" for rank in target_ranks
                     ]
                 else:
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
@@ -487,7 +485,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
         warmup_value = bytes(4 * 1024)  # 4 KB
-        assert self.store.put(warmup_key, warmup_value) == 0
+
+        # Retry logic to handle Transfer Engine startup race condition
+        max_retries = 10
+        retry_delay = 1.0  # seconds
+
+        for attempt in range(max_retries):
+            ret = self.store.put(warmup_key, warmup_value)
+            if ret == 0:
+                break
+            logger.warning(
+                f"[TP{self.local_rank}] Warmup put failed (attempt {attempt + 1}/{max_retries}), "
+                f"ret={ret}, retrying in {retry_delay}s..."
+            )
+            time.sleep(retry_delay)
+        else:
+            raise RuntimeError(
+                f"[TP{self.local_rank}] Warmup put failed after {max_retries} attempts, "
+                "Transfer Engine might not be ready"
+            )
+
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
 

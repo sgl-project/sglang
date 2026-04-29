@@ -21,6 +21,7 @@ import threading
 from typing import Callable
 
 import ray
+from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from sglang.srt.entrypoints.engine import (
@@ -30,7 +31,7 @@ from sglang.srt.entrypoints.engine import (
     _compute_parallelism_ranks,
 )
 from sglang.srt.ray.scheduler_actor import SchedulerActor
-from sglang.srt.server_args import ZMQ_TCP_PORT_DELTA, PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,9 @@ class RaySchedulerInitResult(SchedulerInitResult):
     scheduler_actors: list = dataclasses.field(default_factory=list)
 
 
-def _find_engine_bundle(placement_group, nnodes: int) -> tuple[int, str]:
+def _find_engine_bundle(
+    placement_group: PlacementGroup, nnodes: int
+) -> tuple[int, str]:
     """Find which placement group bundle is on the same node as the Engine.
     Rank0 scheduler must be co-located with the Engine. Returns (bundle_index, engine_ip).
     """
@@ -146,7 +149,7 @@ class RayEngine(Engine):
                 f"Use {gpus_per_node} GPUs/node, world_size={world_size}"
             )
 
-            dist_init_addr = f"{rank0_node_ip}:{server_args.port + ZMQ_TCP_PORT_DELTA}"
+            dist_init_addr = f"{rank0_node_ip}:{port_args.nccl_port}"
             logger.info(f"dist_init_addr: {dist_init_addr}")
 
             scheduler_actors = []
@@ -172,7 +175,7 @@ class RayEngine(Engine):
                         actor = SchedulerActor.options(
                             num_cpus=0,
                             num_gpus=1,
-                            name=f"sglang_scheduler_rank0node={rank0_node_ip}_pp{pp_rank}_tp{tp_rank}",
+                            name=f"sglang_scheduler_node{rank0_node_ip}_pp{pp_rank}_tp{tp_rank}_pg{pg.id.hex()[:8]}_bundle{bundle_idx}",
                             scheduling_strategy=PlacementGroupSchedulingStrategy(
                                 placement_group=pg,
                                 placement_group_bundle_index=bundle_idx,
@@ -261,7 +264,7 @@ class RayEngine(Engine):
         # TCP addresses correctly (required for DP attention path).
         dp_server_args = dataclasses.replace(
             server_args,
-            dist_init_addr=f"{rank0_node_ip}:{server_args.port + ZMQ_TCP_PORT_DELTA}",
+            dist_init_addr=f"{rank0_node_ip}:{port_args.nccl_port}",
         )
 
         # Create the DP controller in-process. This blocks until all actors

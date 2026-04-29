@@ -53,6 +53,11 @@ from diffusion_skill_env import (
 REPO_ROOT = get_repo_root()
 ASSET_DIR = ensure_dir(get_assets_dir(REPO_ROOT))
 GATED_MODELS = {"flux", "flux2"}
+DIFFUSERS_FALLBACK_SIGNALS = (
+    "falling back to diffusers backend",
+    "using diffusers backend",
+    "loaded diffusers pipeline",
+)
 
 # ---------------------------------------------------------------------------
 # Model configs — kept in exact sync with benchmark-and-profile.md
@@ -326,6 +331,7 @@ def build_sglang_cmd(
         "generate",
         f"--model-path={cfg['path']}",
         f"--prompt={cfg['prompt']}",
+        "--backend=sglang",
         "--log-level=info",
     ]
 
@@ -358,6 +364,7 @@ def run_benchmark_once(
     label: str,
     output_dir: Path,
     warmup: bool = True,
+    torch_compile: bool = True,
 ) -> dict:
     """Run a single benchmark pass and return results dict."""
     perf_path = output_dir / f"{model_key}_{label}.json"
@@ -366,6 +373,7 @@ def run_benchmark_once(
         model_key,
         perf_dump_path=str(perf_path),
         warmup=warmup,
+        torch_compile=torch_compile,
     )
 
     env = os.environ.copy()
@@ -397,11 +405,32 @@ def run_benchmark_once(
     print()
 
     t0 = time.time()
-    result = subprocess.run(cmd, env=env, text=True)
+    process = subprocess.Popen(
+        cmd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=1,
+    )
+    fallback_detected = False
+    assert process.stdout is not None
+    for line in process.stdout:
+        print(line, end="")
+        if any(signal in line.lower() for signal in DIFFUSERS_FALLBACK_SIGNALS):
+            fallback_detected = True
+    returncode = process.wait()
     elapsed = time.time() - t0
 
-    if result.returncode != 0:
-        print(f"  ERROR: exit code {result.returncode}")
+    if fallback_detected:
+        print(
+            "  ERROR: model fell back to the diffusers backend. "
+            "Fix native SGLang diffusion backend selection before collecting perf data."
+        )
+        return {"model": model_key, "label": label, "error": True, "elapsed_s": elapsed}
+
+    if returncode != 0:
+        print(f"  ERROR: exit code {returncode}")
         return {"model": model_key, "label": label, "error": True, "elapsed_s": elapsed}
 
     metrics = {"model": model_key, "label": label, "elapsed_s": elapsed, "error": False}
@@ -528,6 +557,11 @@ def main():
         help="Directory for perf dump JSON files",
     )
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup")
+    parser.add_argument(
+        "--no-torch-compile",
+        action="store_true",
+        help="Keep torch.compile disabled for eager-mode comparisons.",
+    )
 
     args = parser.parse_args()
 
@@ -538,12 +572,21 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     warmup = not args.no_warmup
+    torch_compile = not args.no_torch_compile
 
     models_to_run = list(MODELS.keys()) if args.all else [args.model or "flux"]
     results = []
 
     for model_key in models_to_run:
-        results.append(run_benchmark_once(model_key, args.label, output_dir, warmup))
+        results.append(
+            run_benchmark_once(
+                model_key,
+                args.label,
+                output_dir,
+                warmup=warmup,
+                torch_compile=torch_compile,
+            )
+        )
 
     if results:
         print_results_table(results)

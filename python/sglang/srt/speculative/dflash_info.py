@@ -422,7 +422,7 @@ class DFlashVerifyInput(SpecInput):
             new_verified_list.append(new_verified_token)
             accept_length_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
-            req.spec_accepted_tokens += accept_length_per_req_cpu[-1]
+            req.spec_accepted_drafts += accept_length_per_req_cpu[-1]
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
         new_verified_id = torch.tensor(

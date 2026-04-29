@@ -10,7 +10,7 @@ from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 # GSM8k + MMMU evaluation
 
 
-register_cuda_ci(est_time=206, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=256, suite="stage-b-test-1-gpu-large")
 
 MODEL = "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16"
 
