@@ -144,15 +144,16 @@ class AscendMemcacheStore(HiCacheStorage):
             )
             self._check_server_enabled = bool(ctrl.get("check_server", False))
             self.extra_backend_tag = ctrl.get("extra_backend_tag")
+            self._warmup_needed = init_bm
+            self._warmup_done = False
 
             if self._check_server_enabled:
                 self.check_server()
 
             # memcache_hybrid documents init_bm=False as pure client mode without
-            # data read/write capability; skip warmup put/get in that mode.
-            if init_bm:
-                self.warmup()
-            else:
+            # data read/write capability. For init_bm=True, defer warmup until
+            # register_mem_pool_host(), after host buffers are registered.
+            if not init_bm:
                 logger.info(
                     "Memcache init_bm is False; skip warmup because read/write is unavailable in pure client mode."
                 )
@@ -292,6 +293,10 @@ class AscendMemcacheStore(HiCacheStorage):
         )
         buffer = self.mem_pool_host.kv_buffer
         self.register_buffer(buffer)
+
+        if self._warmup_needed and not self._warmup_done:
+            self.warmup()
+            self._warmup_done = True
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
