@@ -67,7 +67,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.NGRAM
 
     def supports_spec_v2(self) -> bool:
-        return self.is_eagle() or self.is_standalone()
+        return (self.is_eagle() and not self.is_frozen_kv_mtp()) or self.is_standalone()
 
     def create_worker(
         self, server_args: ServerArgs
@@ -89,11 +89,10 @@ class SpeculativeAlgorithm(Enum):
 
         if self.is_frozen_kv_mtp():
             if enable_overlap:
-                from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
-                    FrozenKVMTPWorkerV2,
+                raise ValueError(
+                    "FROZEN_KV_MTP does not support spec v2. Disable overlap "
+                    "scheduling to use FrozenKVMTPWorker."
                 )
-
-                return FrozenKVMTPWorkerV2
 
             from sglang.srt.speculative.frozen_kv_mtp_worker import (
                 FrozenKVMTPWorker,

@@ -528,14 +528,30 @@ class FrozenKVMTPWorker(TpModelWorker):
             return
 
         draft_input = batch.spec_info
-        last_token_ids, last_hidden = self._select_last_verified_seed(draft_input)
-        self._run_assistant_seed_step(
-            batch,
-            last_token_ids,
-            last_hidden,
-            seq_lens_cpu=draft_input.seq_lens_for_draft_extend_cpu,
-            draft_input=draft_input,
-        )
+        seq_lens_backup = batch.seq_lens.clone()
+        seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
+        req_pool_indices_backup = batch.req_pool_indices
+
+        try:
+            if draft_input.seq_lens_for_draft_extend is not None:
+                # Verify may leave finished requests in ScheduleBatch; seed only
+                # the unfinished requests carried by draft_input.
+                batch.seq_lens = draft_input.seq_lens_for_draft_extend
+                batch.seq_lens_cpu = draft_input.seq_lens_for_draft_extend_cpu
+                batch.req_pool_indices = draft_input.req_pool_indices_for_draft_extend
+
+            last_token_ids, last_hidden = self._select_last_verified_seed(draft_input)
+            self._run_assistant_seed_step(
+                batch,
+                last_token_ids,
+                last_hidden,
+                seq_lens_cpu=draft_input.seq_lens_for_draft_extend_cpu,
+                draft_input=draft_input,
+            )
+        finally:
+            batch.seq_lens = seq_lens_backup
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.req_pool_indices = req_pool_indices_backup
 
     def draft(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():

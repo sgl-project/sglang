@@ -138,7 +138,7 @@ class Gemma4MTPGSM8KMixin:
 
     @classmethod
     def _max_running_requests(cls) -> int:
-        return int(os.getenv(MAX_RUNNING_REQUESTS_ENV, "1"))
+        return int(os.getenv(MAX_RUNNING_REQUESTS_ENV, "16"))
 
     @classmethod
     def _max_total_tokens(cls) -> int:
