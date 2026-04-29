@@ -117,7 +117,6 @@ class Gemma4MTPGSM8KMixin:
     @classmethod
     def _server_env(cls) -> Optional[Dict[str, str]]:
         env: Dict[str, str] = dict(os.environ)
-        # This harness validates the non-overlap FrozenKVMTPWorker path.
         env["SGLANG_ENABLE_SPEC_V2"] = "0"
         cuda_visible = (
             os.environ.get(SERVER_CUDA_VISIBLE_DEVICES_ENV)
@@ -182,7 +181,6 @@ class Gemma4MTPGSM8KMixin:
             "1",
             "--speculative-num-draft-tokens",
             "6",
-            "--disable-overlap-schedule",
         ] + cls._common_server_args()
 
     @classmethod

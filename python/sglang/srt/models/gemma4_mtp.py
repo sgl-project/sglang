@@ -525,12 +525,7 @@ class Gemma4AssistantForCausalLM(PreTrainedModel):
             flat_hidden.unsqueeze(1) @ selected_embeddings.transpose(-1, -2)
         ).squeeze(1)
         mask_value = selected_logits.min() - 1.0
-        output = torch.full(
-            (flat_hidden.shape[0], self.vocab_size),
-            fill_value=mask_value.item(),
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
-        )
+        output = mask_value.expand(flat_hidden.shape[0], self.vocab_size).clone()
         output.scatter_(
             dim=-1,
             index=selected_canonical.view(flat_hidden.shape[0], -1),
