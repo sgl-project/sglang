@@ -363,6 +363,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
         self.relaykv_config = RelayKVConfig.from_server_args(server_args)
+        self.relaykv_model_profile = infer_model_profile(
+            self.model_config.hf_config, self.model_config.attention_arch
+        )
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -790,9 +793,15 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "tp_rank": self.tp_rank,
                 "pp_rank": self.pp_rank,
                 "is_draft_worker": self.is_draft_worker,
-                "model_profile": model_profile.__dict__,
+                "model_profile": model_profile.to_log_dict(),
             },
         )
+
+        if not model_profile.relaykv_profile_supported:
+            logger.warning(
+                "RelayKV shadow profile is conservative/unsupported for this model: %s",
+                model_profile.to_log_dict(),
+            )
 
         if self.is_draft_worker:
             return
@@ -809,6 +818,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 request_id=f"startup:tp{self.tp_rank}:pp{self.pp_rank}",
             ),
             prefix="relaykv_shadow_plan_startup",
+            extra=model_profile.to_log_dict(),
         )
 
     def init_routed_experts_capturer(self):
