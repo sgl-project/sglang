@@ -10,8 +10,8 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.platforms import _load_platform_class, _resolve_platform
+from sglang.srt.platforms.cuda import CudaDeviceMixin
 from sglang.srt.platforms.device_mixin import (
-    CudaDeviceMixin,
     CpuArchEnum,
     DeviceCapability,
     DeviceMixin,

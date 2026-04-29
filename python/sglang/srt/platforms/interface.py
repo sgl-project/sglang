@@ -10,7 +10,8 @@ Out-of-tree platforms register via setuptools entry_points under the
 "sglang.srt.platforms" group and should subclass SRTPlatform.
 """
 
-from sglang.srt.platforms.device_mixin import CudaDeviceMixin, DeviceMixin, PlatformEnum
+from sglang.srt.platforms.cuda import CudaDeviceMixin
+from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 # Re-export for convenience
 __all__ = ["CudaSRTPlatform", "SRTPlatform", "PlatformEnum"]
