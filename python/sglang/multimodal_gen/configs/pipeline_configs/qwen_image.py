@@ -247,6 +247,18 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
         # img_shapes: for global entire image
         img_freqs, txt_freqs = rotary_emb(img_shapes, txt_seq_lens, device=device)
 
+        max_txt_seq_len = max(txt_seq_lens) if txt_seq_lens else 0
+        txt_cache_len = int(txt_freqs.shape[0])
+        if max_txt_seq_len > txt_cache_len:
+            overflow = max_txt_seq_len - txt_cache_len
+            raise ValueError(
+                "QwenImage RoPE text cache overflow before denoising: "
+                f"required_txt_seq_len={max_txt_seq_len}, txt_cache_len={txt_cache_len}, "
+                f"overflow={overflow}. "
+                "Please reduce the number of input images, shorten the prompt, "
+                "or lower the requested resolution."
+            )
+
         # flashinfer RoPE expects a float32 cos/sin cache concatenated on the last dim
         img_cos_half = img_freqs.real.to(dtype=torch.float32).contiguous()
         img_sin_half = img_freqs.imag.to(dtype=torch.float32).contiguous()

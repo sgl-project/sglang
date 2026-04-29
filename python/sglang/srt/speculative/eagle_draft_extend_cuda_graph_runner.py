@@ -56,7 +56,13 @@ class EagleDraftExtendInputBuffers(ForwardInputBuffers):
 
 
 class EAGLEDraftExtendCudaGraphRunner:
-    def __init__(self, eagle_worker: EAGLEWorker):
+    def __init__(
+        self,
+        eagle_worker: EAGLEWorker,
+        *,
+        draft_extend_attn_backend=None,
+        speculative_num_steps: Optional[int] = None,
+    ):
         # Parse args
         self.eagle_worker = eagle_worker
         if not hasattr(eagle_worker, "model_runner"):
@@ -77,8 +83,15 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.speculative_num_steps = (
+            model_runner.server_args.speculative_num_steps
+            if speculative_num_steps is None
+            else speculative_num_steps
+        )
         self.topk = model_runner.server_args.speculative_eagle_topk
+        self.draft_extend_attn_backend = (
+            draft_extend_attn_backend or eagle_worker.draft_extend_attn_backend
+        )
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -93,11 +106,11 @@ class EAGLEDraftExtendCudaGraphRunner:
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
-        self.eagle_worker.draft_extend_attn_backend.init_cuda_graph_state(
+        self.draft_extend_attn_backend.init_cuda_graph_state(
             self.max_bs, self.max_num_token
         )
         self.seq_len_fill_value = (
-            self.eagle_worker.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
+            self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
         seq_lens_cpu = torch.full(
             (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
@@ -362,11 +375,11 @@ class EAGLEDraftExtendCudaGraphRunner:
             spec_algorithm=self.model_runner.spec_algorithm,
             spec_info=spec_info,
             capture_hidden_mode=CaptureHiddenMode.LAST,
-            attn_backend=self.eagle_worker.draft_extend_attn_backend,
+            attn_backend=self.draft_extend_attn_backend,
             padded_static_len=self.padded_static_len,
         )
 
-        self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
+        self.draft_extend_attn_backend.init_forward_metadata_capture_cuda_graph(
             bs=bs,
             num_tokens=num_tokens,
             req_pool_indices=req_pool_indices,
@@ -493,7 +506,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             forward_batch.spec_info.positions = buffers.positions[:num_tokens]
             forward_batch.spec_info.accept_length = buffers.accept_length[:bs]
 
-        self.eagle_worker.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
+        self.draft_extend_attn_backend.init_forward_metadata_replay_cuda_graph(
             bs=bs,
             req_pool_indices=buffers.req_pool_indices,
             seq_lens=buffers.seq_lens,

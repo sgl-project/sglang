@@ -33,6 +33,9 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_reduce,
 )
+from sglang.srt.distributed.parallel_state import (
+    get_attn_context_model_parallel_world_size,
+)
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
@@ -57,8 +60,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
-    should_use_dp_reduce_scatterv,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -464,12 +466,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
             # An out-of-place add would allocate a new tensor outside symm
             # memory, breaking subsequent symmetric collective operations.
             final_hidden_states += shared_output
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
-            and not should_use_dp_reduce_scatterv()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -709,12 +709,14 @@ class Qwen2MoeModel(nn.Module):
         self.pp_group = get_pp_group()
 
         self.moe_dp_size = get_moe_data_parallel_world_size()
+        self.attn_cp_size = get_attn_context_model_parallel_world_size()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
                 config.hidden_size,
                 use_attn_tp_group=is_dp_attention_enabled(),
+                quant_config=quant_config,
                 prefix=add_prefix("embed_tokens", prefix),
             )
         else:
@@ -830,7 +832,7 @@ class Qwen2MoeModel(nn.Module):
         ):
             hidden_states = cp_all_gather_rerange_output(
                 hidden_states,
-                self.moe_dp_size,
+                self.attn_cp_size,
                 forward_batch,
                 torch.cuda.current_stream(),
             )
