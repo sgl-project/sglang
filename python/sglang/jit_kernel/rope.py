@@ -104,7 +104,7 @@ if _HAS_XPU:
             """Apply RoPE inplace to q and k"""
             import ctypes
             
-            # Validate tensor dtypes and layout
+            # Validate tensor dtypes
             if positions.dtype not in (torch.int32, torch.int64):
                 raise ValueError(
                     f"positions must be int32 or int64, got {positions.dtype}"
@@ -113,12 +113,14 @@ if _HAS_XPU:
                 raise ValueError(
                     f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}"
                 )
-            if not q.is_contiguous() or not k.is_contiguous():
-                raise ValueError("q and k tensors must be contiguous")
             if q.shape[2] != self._rope_dim:
                 raise ValueError(
                     f"q head dimension {q.shape[2]} does not match rope_dim {self._rope_dim}"
                 )
+            
+            # Ensure tensors are contiguous (no-op if already contiguous)
+            q = q.contiguous()
+            k = k.contiguous()
             
             # Get XPU queue
             queue = torch.xpu.current_stream().sycl_queue
@@ -171,7 +173,7 @@ if _HAS_XPU:
             """Apply RoPE inplace and store K/V to cache"""
             import ctypes
             
-            # Validate tensor dtypes and layout
+            # Validate tensor dtypes
             if positions.dtype not in (torch.int32, torch.int64):
                 raise ValueError(
                     f"positions must be int32 or int64, got {positions.dtype}"
@@ -189,12 +191,15 @@ if _HAS_XPU:
                 raise ValueError(
                     f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}"
                 )
-            if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
-                raise ValueError("q, k, v tensors must be contiguous")
             if q.shape[2] != self._rope_dim:
                 raise ValueError(
                     f"q head dimension {q.shape[2]} does not match rope_dim {self._rope_dim}"
                 )
+            
+            # Ensure tensors are contiguous (no-op if already contiguous)
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
             
             # Get XPU queue
             queue = torch.xpu.current_stream().sycl_queue
