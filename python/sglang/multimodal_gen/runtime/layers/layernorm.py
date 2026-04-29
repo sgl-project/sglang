@@ -15,7 +15,6 @@ from sglang.jit_kernel.diffusion.qknorm_rope import (
     can_use_fused_inplace_qknorm_rope,
     fused_inplace_qknorm_rope,
 )
-from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
 from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
 from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
 from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
@@ -31,7 +30,10 @@ from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 _is_cuda = current_platform.is_cuda()
 _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
-if _is_cuda:
+_is_cpu = current_platform.is_cpu()
+_is_xpu = current_platform.is_xpu()
+
+if _is_cuda or _is_xpu:
     from sgl_kernel import fused_add_rmsnorm, rmsnorm
 
 if _is_npu:
@@ -39,6 +41,8 @@ if _is_npu:
 
 if _is_musa:
     from sgl_kernel import fused_add_rmsnorm
+if not _is_cpu:
+    from sglang.jit_kernel.diffusion.triton.norm import norm_infer, rms_norm_fn
 
 
 # Copied and adapted from sglang
@@ -209,6 +213,27 @@ class RMSNorm(CustomOp):
         else:
             weight = self._get_weight(x.dtype)
             out = F.rms_norm(x, (self.hidden_size,), weight, self.variance_epsilon)
+        out = out.view(shape)
+        return out
+
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        shape = x.shape
+        x = x.reshape(-1, shape[-1])
+        if residual is not None:
+            residual_shape = residual.shape
+            residual = residual.view(-1, shape[-1])
+
+        if self.variance_size_override is not None:
+            return self.forward_native(x, residual)
+        elif residual is not None:
+            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            return x.view(shape), residual.view(residual_shape)
+        else:
+            out = rmsnorm(x, self.weight.data, self.variance_epsilon)
         out = out.view(shape)
         return out
 
@@ -410,6 +435,11 @@ class _ScaleResidualNormScaleShift(CustomOp):
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 
+    def forward_xpu(self, *args, **kwargs):
+        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
     def forward_native(
         self,
         residual: torch.Tensor,
@@ -511,6 +541,11 @@ class _NormScaleShift(CustomOp):
 
     def forward_musa(self, *args, **kwargs):
         # MUSA does not support CUDA/CUTLASS-based fused kernels yet,
+        # so we fall back to the native PyTorch implementation.
+        return self.forward_native(*args, **kwargs)
+
+    def forward_xpu(self, *args, **kwargs):
+        # XPU does not support CUDA/CUTLASS-based fused kernels yet,
         # so we fall back to the native PyTorch implementation.
         return self.forward_native(*args, **kwargs)
 

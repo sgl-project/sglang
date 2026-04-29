@@ -34,7 +34,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--warmups`            | `None`      | Type: str                 |      A2, A3      |
 | `--nccl-port`          | `None`      | Type: int                 |      A2, A3      |
 | `--fastapi-root-path`  | `None`      | Type: str                 |      A2, A3      |
-| `--grpc-mode`          | `False`     | bool flag (set to enable) |      A2, A3      |
+| `--grpc-mode`          | `False`     | `False`                   |     Planned      |
 
 ## Quantization and data type
 
@@ -69,8 +69,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--priority-scheduling-`<br/>`preemption-threshold` | `10`     | Type: int                      |      A2, A3      |
 | `--schedule-conservativeness`                       | `1.0`    | Type: float                    |      A2, A3      |
 | `--page-size`                                       | `128`    | Type: int                      |      A2, A3      |
-| `--swa-full-tokens-ratio`                           | `0.8`    | Type: float                    |      A2, A3      |
-| `--disable-hybrid-swa-memory`                       | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--swa-full-tokens-ratio`                           | `0.8`    | Type: float                    |     Planned      |
+| `--disable-hybrid-swa-memory`                       | `False`  | bool flag<br/> (set to enable) |     Planned      |
 | `--radix-eviction-policy`                           | `lru`    | `lru`,<br/>`lfu`               |      A2, A3      |
 | `--enable-prefill-delayer`                          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--prefill-delayer-max-delay-passes`                | `30`     | Type: int                      |      A2, A3      |
@@ -78,32 +78,32 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--prefill-delayer-forward-passes-buckets`          | `None`   | List[float]                    |      A2, A3      |
 | `--prefill-delayer-wait-seconds-buckets`            | `None`   | List[float]                    |      A2, A3      |
 | `--abort-on-priority-`<br/>`when-disabled`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-dynamic-chunking`                         | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
+| `--enable-dynamic-chunking`                         | `False`  | bool flag<br/> (set to enable) |   Experimental   |
 
 ## Runtime options
 
-| Argument                                           | Defaults | Options                   | Server supported |
-|----------------------------------------------------|----------|---------------------------|:----------------:|
-| `--device`                                         | `None`   | Type: str                 |      A2, A3      |
-| `--tensor-parallel-size`<br/>`--tp-size`           | `1`      | Type: int                 |      A2, A3      |
-| `--pipeline-parallel-size`<br/>`--pp-size`         | `1`      | Type: int                 |      A2, A3      |
-| `--attention-context-parallel-size`<br/>`--attn-cp-size`  | `1` | Type: int               |      A2, A3      |
-| `--moe-data-parallel-size`<br/>`--moe-dp-size`     | `1`      | Type: int                 |      A2, A3      |
-| `--pp-max-micro-batch-size`                        | `None`   | Type: int                 |      A2, A3      |
-| `--pp-async-batch-depth`                           | `None`   | Type: int                 |      A2, A3      |
-| `--stream-interval`                                | `1`      | Type: int                 |      A2, A3      |
-| `--incremental-streaming-output`                   | `False`  | bool flag (set to enable) |      A2, A3      |
-| `--random-seed`                                    | `None`   | Type: int                 |      A2, A3      |
-| `--constrained-json-`<br/>`whitespace-pattern`     | `None`   | Type: str                 |      A2, A3      |
-| `--constrained-json-`<br/>`disable-any-whitespace` | `False`  | bool flag (set to enable) |      A2, A3      |
-| `--watchdog-timeout`                               | `300`    | Type: float               |      A2, A3      |
-| `--soft-watchdog-timeout`                          | `300`    | Type: float               |      A2, A3      |
-| `--dist-timeout`                                   | `None`   | Type: int                 |      A2, A3      |
-| `--download-dir`                                   | `None`   | Type: str                 |      A2, A3      |
-| `--model-checksum`                                 | `None`   | Type: str                 |      A2, A3      |
-| `--base-gpu-id`                                    | `0`      | Type: int                 |      A2, A3      |
-| `--gpu-id-step`                                    | `1`      | Type: int                 |      A2, A3      |
-| `--sleep-on-idle`                                  | `False`  | bool flag (set to enable) |      A2, A3      |
+| Argument                                                 | Defaults | Options                                | Server supported |
+|----------------------------------------------------------|----------|----------------------------------------|:----------------:|
+| `--device`                                               | `None`   | Type: str                              |      A2, A3      |
+| `--tensor-parallel-size`<br/>`--tp-size`                 | `1`      | Type: int                              |      A2, A3      |
+| `--pipeline-parallel-size`<br/>`--pp-size`               | `1`      | Type: int; Currently `2` not supported |   Experimental   |
+| `--attention-context-parallel-size`<br/>`--attn-cp-size` | `1`      | Type: int; must be equal to --tp-size  |      A2, A3      |
+| `--moe-data-parallel-size`<br/>`--moe-dp-size`           | `1`      | Type: int                              |     Planned      |
+| `--pp-max-micro-batch-size`                              | `None`   | Type: int                              |   Experimental   |
+| `--pp-async-batch-depth`                                 | `None`   | Type: int                              |   Experimental   |
+| `--stream-interval`                                      | `1`      | Type: int                              |      A2, A3      |
+| `--incremental-streaming-output`                         | `False`  | bool flag (set to enable)              |      A2, A3      |
+| `--random-seed`                                          | `None`   | Type: int                              |      A2, A3      |
+| `--constrained-json-`<br/>`whitespace-pattern`           | `None`   | Type: str                              |      A2, A3      |
+| `--constrained-json-`<br/>`disable-any-whitespace`       | `False`  | bool flag (set to enable)              |      A2, A3      |
+| `--watchdog-timeout`                                     | `300`    | Type: float                            |      A2, A3      |
+| `--soft-watchdog-timeout`                                | `300`    | Type: float                            |      A2, A3      |
+| `--dist-timeout`                                         | `None`   | Type: int                              |      A2, A3      |
+| `--download-dir`                                         | `None`   | Type: str                              |      A2, A3      |
+| `--model-checksum`                                       | `None`   | Type: str                              |     Planned      |
+| `--base-gpu-id`                                          | `0`      | Type: int                              |      A2, A3      |
+| `--gpu-id-step`                                          | `1`      | Type: int                              |      A2, A3      |
+| `--sleep-on-idle`                                        | `False`  | bool flag (set to enable)              |      A2, A3      |
 
 ## Logging
 
@@ -143,19 +143,19 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## API related
 
-| Argument                | Defaults  | Options                        | Server supported |
-|-------------------------|-----------|--------------------------------|:----------------:|
-| `--api-key`             | `None`    | Type: str                      |      A2, A3      |
-| `--admin-api-key`       | `None`    | Type: str                      |      A2, A3      |
-| `--served-model-name`   | `None`    | Type: str                      |      A2, A3      |
-| `--weight-version`      | `default` | Type: str                      |      A2, A3      |
-| `--chat-template`       | `None`    | Type: str                      |      A2, A3      |
-| `--hf-chat-template-name` | `None`  | Type: str                      |      A2, A3      |
-| `--completion-template` | `None`    | Type: str                      |      A2, A3      |
-| `--enable-cache-report` | `False`   | bool flag<br/> (set to enable) |      A2, A3      |
-| `--reasoning-parser`    | `None`    | `deepseek-r1`<br/>`deepseek-v3`<br/>`glm45`<br/>`gpt-oss`<br/>`kimi`<br/>`qwen3`<br/>`qwen3-thinking`<br/>`step3`                  |      A2, A3      |
-| `--tool-call-parser`    | `None`    | `deepseekv3`<br/>`deepseekv31`<br/>`glm`<br/>`glm45`<br/>`glm47`<br/>`gpt-oss`<br/>`kimi_k2`<br/>`llama3`<br/>`mistral`<br/>`pythonic`<br/>`qwen`<br/>`qwen25`<br/>`qwen3_coder`<br/>`step3`<br/>`gigachat3`            |      A2, A3      |
-| `--sampling-defaults`   | `model`   | `openai`, `model`              |      A2, A3      |
+| Argument                  | Defaults  | Options                                                                                                           | Server supported |
+|---------------------------|-----------|-------------------------------------------------------------------------------------------------------------------|:----------------:|
+| `--api-key`               | `None`    | Type: str                                                                                                         |      A2, A3      |
+| `--admin-api-key`         | `None`    | Type: str                                                                                                         |      A2, A3      |
+| `--served-model-name`     | `None`    | Type: str                                                                                                         |      A2, A3      |
+| `--weight-version`        | `default` | Type: str                                                                                                         |      A2, A3      |
+| `--chat-template`         | `None`    | Type: str                                                                                                         |      A2, A3      |
+| `--hf-chat-template-name` | `None`    | Type: str                                                                                                         |      A2, A3      |
+| `--completion-template`   | `None`    | Type: str                                                                                                         |      A2, A3      |
+| `--enable-cache-report`   | `False`   | bool flag<br/> (set to enable)                                                                                    |      A2, A3      |
+| `--reasoning-parser`      | `None`    | `deepseek-r1`<br/>`deepseek-v3`<br/>`glm45`<br/>`gpt-oss`<br/>`kimi`<br/>`qwen3`<br/>`qwen3-thinking`<br/>`step3` |      A2, A3      |
+| `--tool-call-parser`      | `None`    | `llama3`<br/> `pythonic`<br/> `qwen`<br/> `qwen3_coder`                                                           |      A2, A3      |
+| `--sampling-defaults`     | `model`   | `openai`, `model`                                                                                                 |      A2, A3      |
 
 ## Data parallelism
 
@@ -184,6 +184,7 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | Argument                 | Defaults | Options                             | Server supported |
 |--------------------------|----------|-------------------------------------|:----------------:|
 | `--enable-lora`          | `False`  | Bool flag <br/>(set to enable)      |      A2, A3      |
+| `--enable-lora-overlap-loading` | `False`  | Bool flag <br/>(set to enable)      |      A2, A3      |
 | `--max-lora-rank`        | `None`   | Type: int                           |      A2, A3      |
 | `--lora-target-modules`  | `None`   | `all`                               |      A2, A3      |
 | `--lora-paths`           | `None`   | Type: List[str] /<br/> JSON objects |      A2, A3      |
@@ -210,23 +211,23 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Speculative decoding
 
-| Argument                                                         | Defaults  | Options                  | Server supported |
-|------------------------------------------------------------------|-----------|--------------------------|:----------------:|
-| `--speculative-algorithm`                                        | `None`    | `EAGLE3`,<br/> `NEXTN`   |      A2, A3      |
-| `--speculative-draft-model-path`<br/>`--speculative-draft-model` | `None`    | Type: str                |      A2, A3      |
-| `--speculative-draft-model-`<br/>`revision`                      | `None`    | Type: str                |      A2, A3      |
-| `--speculative-draft-load-format`                                | `None`    | `auto`                   |      A2, A3      |
-| `--speculative-num-steps`                                        | `None`    | Type: int                |      A2, A3      |
-| `--speculative-eagle-topk`                                       | `None`    | Type: int                |      A2, A3      |
-| `--speculative-num-draft-tokens`                                 | `None`    | Type: int                |      A2, A3      |
-| `--speculative-accept-`<br/>`threshold-single`                   | `1.0`     | Type: float              | Special for GPU  |
-| `--speculative-accept-`<br/>`threshold-acc`                      | `1.0`     | Type: float              | Special for GPU  |
-| `--speculative-token-map`                                        | `None`    | Type: str                |      A2, A3      |
-| `--speculative-attention-`<br/>`mode`                            | `prefill` | `prefill`,<br/> `decode` |      A2, A3      |
-| `--speculative-moe-runner-`<br/>`backend`                        | `None`    | `auto`                   |      A2, A3      |
-| `--speculative-moe-a2a-`<br/>`backend`                           | `None`    | `ascend_fuseep`          |      A2, A3      |
-| `--speculative-draft-attention-backend`                          | `None`    | `ascend`                 |      A2, A3      |
-| `--speculative-draft-model-quantization`                         | `None`    | `unquant`                |      A2, A3      |
+| Argument                                                         | Defaults  | Options                                                          | Server supported |
+|------------------------------------------------------------------|-----------|------------------------------------------------------------------|:----------------:|
+| `--speculative-algorithm`                                        | `None`    | `EAGLE3`,<br/> `NEXTN`                                           |      A2, A3      |
+| `--speculative-draft-model-path`<br/>`--speculative-draft-model` | `None`    | Type: str                                                        |      A2, A3      |
+| `--speculative-draft-model-`<br/>`revision`                      | `None`    | Type: str,<br/> `branch name`,<br/> `tag name`,<br/> `commit id` |      A2, A3      |
+| `--speculative-draft-load-format`                                | `auto`    | `auto`,<br/> `dummy`                                             |      A2, A3      |
+| `--speculative-num-steps`                                        | `None`    | Type: int                                                        |      A2, A3      |
+| `--speculative-eagle-topk`                                       | `None`    | Type: int                                                        |      A2, A3      |
+| `--speculative-num-draft-tokens`                                 | `None`    | Type: int                                                        |      A2, A3      |
+| `--speculative-accept-`<br/>`threshold-single`                   | `1.0`     | Type: float                                                      | Special for GPU  |
+| `--speculative-accept-`<br/>`threshold-acc`                      | `1.0`     | Type: float                                                      | Special for GPU  |
+| `--speculative-token-map`                                        | `None`    | Type: str                                                        |      A2, A3      |
+| `--speculative-attention-`<br/>`mode`                            | `prefill` | `prefill`,<br/> `decode`                                         |      A2, A3      |
+| `--speculative-moe-runner-`<br/>`backend`                        | `None`    | `auto`                                                           |      A2, A3      |
+| `--speculative-moe-a2a-`<br/>`backend`                           | `None`    | `ascend_fuseep`                                                  |      A2, A3      |
+| `--speculative-draft-attention-backend`                          | `None`    | `ascend`                                                         |      A2, A3      |
+| `--speculative-draft-model-quantization`                         | `None`    | `unquant`                                                        |      A2, A3      |
 
 ## Ngram speculative decoding
 
@@ -242,28 +243,29 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Expert parallelism
 
-| Argument                                              | Defaults  | Options                                     | Server supported |
-|-------------------------------------------------------|-----------|---------------------------------------------|:----------------:|
-| `--expert-parallel-size`<br/>`--ep-size`<br/>`--ep`   | `1`       | Type: int                                   |      A2, A3      |
-| `--moe-a2a-backend`                                   | `none`    | `none`,<br/> `deepep`,<br/> `ascend_fuseep` |      A2, A3      |
-| `--moe-runner-backend`                                | `auto`    | `auto`, `triton`                            |      A2, A3      |
-| `--flashinfer-mxfp4-`<br/>`moe-precision`             | `default` | `default`,<br/> `bf16`                      | Special for GPU  |
-| `--enable-flashinfer-`<br/>`allreduce-fusion`         | `False`   | bool flag<br/> (set to enable)              | Special for GPU  |
-| `--deepep-mode`                                       | `auto`    | `normal`, <br/>`low_latency`,<br/> `auto`   |      A2, A3      |
-| `--deepep-config`                                     | `None`    | Type: str                                   | Special for GPU  |
-| `--ep-num-redundant-experts`                          | `0`       | Type: int                                   |      A2, A3      |
-| `--ep-dispatch-algorithm`                             | `None`    | Type: str                                   |      A2, A3      |
-| `--init-expert-location`                              | `trivial` | Type: str                                   |      A2, A3      |
-| `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)              |      A2, A3      |
-| `--eplb-algorithm`                                    | `auto`    | Type: str                                   |      A2, A3      |
-| `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                   |      A2, A3      |
-| `--eplb-min-rebalancing-`<br/>`utilization-threshold` | `1.0`     | Type: float                                 |      A2, A3      |
-| `--expert-distribution-`<br/>`recorder-mode`          | `None`    | Type: str                                   |      A2, A3      |
-| `--expert-distribution-`<br/>`recorder-buffer-size`   | `None`    | Type: int                                   |      A2, A3      |
-| `--enable-expert-distribution-`<br/>`metrics`         | `False`   | bool flag (set to enable)                   |      A2, A3      |
-| `--moe-dense-tp-size`                                 | `None`    | Type: int                                   |      A2, A3      |
-| `--elastic-ep-backend`                                | `None`    | `none`, `mooncake`                          | Special for GPU  |
-| `--mooncake-ib-device`                                | `None`    | Type: str                                   | Special for GPU  |
+| Argument                                              | Defaults  | Options                                                                   | Server supported |
+|-------------------------------------------------------|-----------|---------------------------------------------------------------------------|:----------------:|
+| `--expert-parallel-size`<br/>`--ep-size`<br/>`--ep`   | `1`       | Type: int                                                                 |      A2, A3      |
+| `--moe-a2a-backend`                                   | `none`    | `none`,<br/> `deepep`,<br/> `ascend_fuseep`(It is incompatible with eplb) |      A2, A3      |
+| `--moe-runner-backend`                                | `auto`    | `auto`, `triton`                                                          |      A2, A3      |
+| `--flashinfer-mxfp4-`<br/>`moe-precision`             | `default` | `default`,<br/> `bf16`                                                    | Special for GPU  |
+| `--enable-flashinfer-`<br/>`allreduce-fusion`         | `False`   | bool flag<br/> (set to enable)                                            | Special for GPU  |
+| `--deepep-mode`                                       | `auto`    | `normal`, <br/>`low_latency`,<br/> `auto`                                 |      A2, A3      |
+| `--deepep-config`                                     | `None`    | Type: str                                                                 | Special for GPU  |
+| `--ep-num-redundant-experts`                          | `0`       | Type: int                                                                 |      A2, A3      |
+| `--ep-dispatch-algorithm`                             | `None`    | `static`,<br/> `dynamic`,<br/> `fake`                                     |      A2, A3      |
+| `--init-expert-location`                              | `trivial` | `trivial`,<br/> `<path.pt>`,<br/> `<path.json>`,<br/> `<json_string>`     |      A2, A3      |
+| `--enable-eplb`                                       | `False`   | bool flag<br/> (set to enable)                                            |      A2, A3      |
+| `--eplb-algorithm`                                    | `deepseek`| `auto`,<br/> `deepseek`                                                   |      A2, A3      |
+| `--eplb-rebalance-num-iterations`                     | `1000`    | Type: int                                                                 |      A2, A3      |
+| `--eplb-rebalance-layers-`<br/>`per-chunk`            | `None`    | Type: int                                                                 |      A2, A3      |
+| `--eplb-min-rebalancing-`<br/>`utilization-threshold` | `1.0`     | Type: float                                                               |      A2, A3      |
+| `--expert-distribution-`<br/>`recorder-mode`          | `None`    | `stat`,<br/> `stat_approx`,<br/> `per_pass`,<br/> `per_token`             |      A2, A3      |
+| `--expert-distribution-`<br/>`recorder-buffer-size`   | `None`    | Type: int                                                                 |      A2, A3      |
+| `--enable-expert-distribution-`<br/>`metrics`         | `False`   | bool flag (set to enable)                                                 |      A2, A3      |
+| `--moe-dense-tp-size`                                 | `None`    | `1`                                                                       |      A2, A3      |
+| `--elastic-ep-backend`                                | `None`    | `none`, `mooncake`                                                        | Special for GPU  |
+| `--mooncake-ib-device`                                | `None`    | Type: str                                                                 | Special for GPU  |
 
 ## Mamba Cache
 
@@ -272,22 +274,22 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--max-mamba-cache-size`     | `None`    | Type: int                                     |      A2, A3      |
 | `--mamba-ssm-dtype`          | `float32` | `float32`,<br/>`bfloat16`,<br/>`float16`      |      A2, A3      |
 | `--mamba-full-memory-ratio`  | `0.9`     | Type: float                                   |      A2, A3      |
-| `--mamba-scheduler-strategy` | `auto`    | Only `auto`, `no_buffer` supported            |      A2, A3      |
+| `--mamba-scheduler-strategy` | `auto`    | `auto`,<br/>`no_buffer`,<br/>`extra_buffer`   |      A2, A3      |
 | `--mamba-track-interval`     | `256`     | Type: int                                     |      A2, A3      |
 
 ## Hierarchical cache
 
-| Argument                                        | Defaults        | Options                                                             | Server supported |
-|-------------------------------------------------|-----------------|---------------------------------------------------------------------|:----------------:|
-| `--enable-hierarchical-`<br/>`cache`            | `False`         | bool flag<br/> (set to enable)                                      |      A2, A3      |
-| `--hicache-ratio`                               | `2.0`           | Type: float                                                         |      A2, A3      |
-| `--hicache-size`                                | `0`             | Type: int                                                           |      A2, A3      |
-| `--hicache-write-policy`                        | `write_through` | Currently only `write_back` supported                               |      A2, A3      |
-| `--hicache-io-backend`                          | `kernel`        | `kernel_ascend`,<br/>                     `direct`                  |      A2, A3      |
-| `--hicache-mem-layout`                          | `layer_first`   | `page_first_direct`,<br/>                  `page_first_kv_split`    |      A2, A3      |
-| `--hicache-storage-`<br/>`backend`              | `None`          | `file`                                                              |      A2, A3      |
-| `--hicache-storage-`<br/>`prefetch-policy`      | `best_effort`   | `best_effort`,<br/> `wait_complete`,<br/>  `timeout`                | Special for GPU  |
-| `--hicache-storage-`<br/>`backend-extra-config` | `None`          | Type: str                                                           | Special for GPU  |
+| Argument                                        | Defaults        | Options                                                                       | Server supported |
+|-------------------------------------------------|-----------------|-------------------------------------------------------------------------------|:----------------:|
+| `--enable-hierarchical-`<br/>`cache`            | `False`         | bool flag<br/> (set to enable).<br/> Currently, mamba cache is not supported. |      A2, A3      |
+| `--hicache-ratio`                               | `2.0`           | Type: float                                                                   |      A2, A3      |
+| `--hicache-size`                                | `0`             | Type: int                                                                     |      A2, A3      |
+| `--hicache-write-policy`                        | `write_through` | Currently only `write_back` supported                                         |      A2, A3      |
+| `--hicache-io-backend`                          | `kernel`        | `kernel_ascend`,<br/>                     `direct`                            |      A2, A3      |
+| `--hicache-mem-layout`                          | `layer_first`   | `page_first_direct`,<br/>                  `page_first_kv_split`              |      A2, A3      |
+| `--hicache-storage-`<br/>`backend`              | `None`          | `file`                                                                        |      A2, A3      |
+| `--hicache-storage-`<br/>`prefetch-policy`      | `best_effort`   | `best_effort`,<br/> `wait_complete`,<br/>  `timeout`                          | Special for GPU  |
+| `--hicache-storage-`<br/>`backend-extra-config` | `None`          | Type: str                                                                     | Special for GPU  |
 
 ## LMCache
 
@@ -295,15 +297,15 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 |--------------------|----------|--------------------------------|:----------------:|
 | `--enable-lmcache` | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 
-## Offloading
+## Offloading (must be used with `--disable-cuda-graph`)
 
 | Argument                  | Defaults | Options   | Server supported |
 |---------------------------|----------|-----------|:----------------:|
 | `--cpu-offload-gb`        | `0`      | Type: int |      A2, A3      |
-| `--offload-group-size`    | `-1`     | Type: int |      Planned     |
-| `--offload-num-in-group`  | `1`      | Type: int |      Planned     |
-| `--offload-prefetch-step` | `1`      | Type: int |      Planned     |
-| `--offload-mode`          | `cpu`    | Type: str |      Planned     |
+| `--offload-group-size`    | `-1`     | Type: int (DeepSeek only)  |      A2, A3      |
+| `--offload-num-in-group`  | `1`      | Type: int (DeepSeek only)  |      A2, A3      |
+| `--offload-prefetch-step` | `1`      | Type: int (DeepSeek only)  |      A2, A3      |
+| `--offload-mode`          | `cpu`    | `cpu` (DeepSeek only) <br/>`meta` (DeepSeek only) <br/>`sharded_gpu` (DeepSeek only, only support tp=1 dp>1) |      A2, A3      |
 
 ## Args for multi-item scoring
 
@@ -313,64 +315,64 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 ## Optimization/debug options
 
-| Argument                                                | Defaults | Options                        | Server supported |
-|---------------------------------------------------------|----------|--------------------------------|:----------------:|
-| `--disable-radix-cache`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--cuda-graph-max-bs`                                   | `None`   | Type: int                      |      A2, A3      |
-| `--cuda-graph-bs`                                       | `None`   | List[int]                      |      A2, A3      |
-| `--disable-cuda-graph`                                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-cuda-graph-`<br/>`padding`                   | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-profile-`<br/>`cuda-graph`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-cudagraph-gc`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-nccl-nvls`                                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--enable-symm-mem`                                     | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--disable-flashinfer-`<br/>`cutlass-moe-fp4-allgather` | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--enable-tokenizer-`<br/>`batch-encode`                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-tokenizer-`<br/>`batch-decode`               | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-custom-`<br/>`all-reduce`                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--enable-mscclpp`                                      | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--enable-torch-`<br/>`symm-mem`                        | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--disable-overlap`<br/>`-schedule`                     | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-mixed-`<br/>`chunk`                           | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-dp-attention`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-dp-lm-head`                                   | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-two-`<br/>`batch-overlap`                     | `False`  | bool flag<br/> (set to enable) |     Planned      |
-| `--enable-single-`<br/>`batch-overlap`                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--tbo-token-`<br/>`distribution-threshold`             | `0.48`   | Type: float                    |     Planned      |
-| `--enable-torch-`<br/>`compile`                         | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-torch-`<br/>`compile-debug-mode`              | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-piecewise-`<br/>`cuda-graph`                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--piecewise-cuda-`<br/>`graph-tokens`                  | `None`   | Type: JSON<br/> list           |      A2, A3      |
-| `--piecewise-cuda-`<br/>`graph-compiler`                | `eager`  | ["eager", "inductor"]          |      A2, A3      |
-| `--torch-compile-max-bs`                                | `32`     | Type: int                      |      A2, A3      |
-| `--piecewise-cuda-`<br/>`graph-max-tokens`              | `None`   | Type: int                      |      A2, A3      |
-| `--torchao-config`                                      | ``       | Type: str                      | Special for GPU  |
-| `--enable-nan-detection`                                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-p2p-check`                                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--triton-attention-`<br/>`reduce-in-fp32`              | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--triton-attention-`<br/>`num-kv-splits`               | `8`      | Type: int                      | Special for GPU  |
-| `--triton-attention-`<br/>`split-tile-size`             | `None`   | Type: int                      | Special for GPU  |
-| `--delete-ckpt-`<br/>`after-loading`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-memory-saver`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-weights-`<br/>`cpu-backup`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-draft-weights-`<br/>`cpu-backup`              | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--allow-auto-truncate`                                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-custom-`<br/>`logit-processor`                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--flashinfer-mla-`<br/>`disable-ragged`                | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--disable-shared-`<br/>`experts-fusion`                | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-chunked-`<br/>`prefix-cache`                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--disable-fast-`<br/>`image-processor`                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--keep-mm-feature-`<br/>`on-device`                    | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-return-`<br/>`hidden-states`                  | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-return-`<br/>`routed-experts`                 | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--scheduler-recv-`<br/>`interval`                      | `1`      | Type: int                      |      A2, A3      |
-| `--numa-node`                                           | `None`   | List[int]                      |      A2, A3      |
-| `--enable-deterministic-`<br/>`inference`               | `False`  | bool flag<br/> (set to enable) |     Planned      |
-| `--rl-on-policy-target`                                 | `None`   | `fsdp`                         |     Planned      |
-| `--enable-layerwise-`<br/>`nvtx-marker`                 | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
-| `--enable-attn-tp-`<br/>`input-scattered`               | `False`  | bool flag<br/> (set to enable) |   Experimental   |
-| `--enable-nsa-prefill-`<br/>`context-parallel`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
-| `--enable-fused-qk-`<br/>`norm-rope`                    | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
+| Argument                                                | Defaults | Options                                                                                                              | Server supported |
+|---------------------------------------------------------|----------|----------------------------------------------------------------------------------------------------------------------|:----------------:|
+| `--disable-radix-cache`                                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--cuda-graph-max-bs`                                   | `None`   | Type: int                                                                                                            |      A2, A3      |
+| `--cuda-graph-bs`                                       | `None`   | List[int]                                                                                                            |      A2, A3      |
+| `--disable-cuda-graph`                                  | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--disable-cuda-graph-`<br/>`padding`                   | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-profile-`<br/>`cuda-graph`                    | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-cudagraph-gc`                                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-nccl-nvls`                                    | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--enable-symm-mem`                                     | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--disable-flashinfer-`<br/>`cutlass-moe-fp4-allgather` | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--enable-tokenizer-`<br/>`batch-encode`                | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--disable-tokenizer-`<br/>`batch-decode`               | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--disable-custom-`<br/>`all-reduce`                    | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--enable-mscclpp`                                      | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--enable-torch-`<br/>`symm-mem`                        | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--disable-overlap`<br/>`-schedule`                     | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-mixed-`<br/>`chunk`                           | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-dp-attention`                                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-dp-lm-head`                                   | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-two-`<br/>`batch-overlap`                     | `False`  | bool flag<br/> (set to enable)                                                                                       |     Planned      |
+| `--enable-single-`<br/>`batch-overlap`                  | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--tbo-token-`<br/>`distribution-threshold`             | `0.48`   | Type: float                                                                                                          |     Planned      |
+| `--enable-torch-`<br/>`compile`                         | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-torch-`<br/>`compile-debug-mode`              | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enforce-piecewise-`<br/>`cuda-graph`                 | `False`  | bool flag<br/> (set to enable); <br/> Currently, Llama-3.1-8B-Instruct and Qwen2.5-7B-Instruct models are supported. |      A2, A3      |
+| `--piecewise-cuda-`<br/>`graph-tokens`                  | `None`   | Type: JSON<br/> list                                                                                                 |      A2, A3      |
+| `--piecewise-cuda-`<br/>`graph-compiler`                | `eager`  | `eager`                                                                                                              |      A2, A3      |
+| `--torch-compile-max-bs`                                | `32`     | Type: int                                                                                                            |      A2, A3      |
+| `--piecewise-cuda-`<br/>`graph-max-tokens`              | `None`   | Type: int                                                                                                            |      A2, A3      |
+| `--torchao-config`                                      | ``       | Type: str                                                                                                            | Special for GPU  |
+| `--enable-nan-detection`                                | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-p2p-check`                                    | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--triton-attention-`<br/>`reduce-in-fp32`              | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--triton-attention-`<br/>`num-kv-splits`               | `8`      | Type: int                                                                                                            | Special for GPU  |
+| `--triton-attention-`<br/>`split-tile-size`             | `None`   | Type: int                                                                                                            | Special for GPU  |
+| `--delete-ckpt-`<br/>`after-loading`                    | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-memory-saver`                                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-weights-`<br/>`cpu-backup`                    | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-draft-weights-`<br/>`cpu-backup`              | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--allow-auto-truncate`                                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-custom-`<br/>`logit-processor`                | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--flashinfer-mla-`<br/>`disable-ragged`                | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--disable-shared-`<br/>`experts-fusion`                | `True`   | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--disable-chunked-`<br/>`prefix-cache`                 | `True`   | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--disable-fast-`<br/>`image-processor`                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--keep-mm-feature-`<br/>`on-device`                    | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-return-`<br/>`hidden-states`                  | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-return-`<br/>`routed-experts`                 | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--scheduler-recv-`<br/>`interval`                      | `1`      | Type: int                                                                                                            |      A2, A3      |
+| `--numa-node`                                           | `None`   | List[int]                                                                                                            |      A2, A3      |
+| `--enable-deterministic-`<br/>`inference`               | `False`  | bool flag<br/> (set to enable)                                                                                       |     Planned      |
+| `--rl-on-policy-target`                                 | `None`   | `fsdp`                                                                                                               |     Planned      |
+| `--enable-layerwise-`<br/>`nvtx-marker`                 | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
+| `--enable-attn-tp-`<br/>`input-scattered`               | `False`  | bool flag<br/> (set to enable)                                                                                       |   Experimental   |
+| `--enable-nsa-prefill-`<br/>`context-parallel`          | `False`  | bool flag<br/> (set to enable)                                                                                       |      A2, A3      |
+| `--enable-fused-qk-`<br/>`norm-rope`                    | `False`  | bool flag<br/> (set to enable)                                                                                       | Special for GPU  |
 
 ## Dynamic batch tokenizer
 
@@ -396,18 +398,19 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--disaggregation-transfer-backend`                     | `mooncake` | `ascend`                              |      A2, A3      |
 | `--disaggregation-bootstrap-port`                       | `8998`     | Type: int                             |      A2, A3      |
 | `--disaggregation-ib-device`                            | `None`     | Type: str                             | Special for GPU  |
-| `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | bool flag<br/> (set to enable)        |      A2, A3      |
+| `--disaggregation-decode-`<br/>`enable-offload-kvcache` | `False`    | `False`                               |      A2, A3      |
 | `--num-reserved-decode-tokens`                          | `512`      | Type: int                             |      A2, A3      |
 | `--disaggregation-decode-`<br/>`polling-interval`       | `1`        | Type: int                             |      A2, A3      |
 
 ## Encode prefill disaggregation
 
-| Argument                     | Defaults           | Options                                                        | Server supported |
-|------------------------------|--------------------|----------------------------------------------------------------|:----------------:|
-| `--encoder-only`             | `False`            | bool flag<br/> (set to enable)                                 |      A2, A3      |
-| `--language-only`            | `False`            | bool flag<br/> (set to enable)                                 |      A2, A3      |
-| `--encoder-transfer-backend` | `zmq_to_scheduler` | `zmq_to_scheduler`, <br/> `zmq_to_tokenizer`,<br/>  `mooncake` |      A2, A3      |
-| `--encoder-urls`             | `[]`               | List[str]                                                      |      A2, A3      |
+| Argument                                | Defaults           | Options                                                          | Server supported |
+| --------------------------------------- | ------------------ | ---------------------------------------------------------------- |:----------------:|
+| `--enable-adaptive-dispatch-to-encoder` | `False`            | bool flag<br/> (set to enable adaptively dispatch)               |      A2, A3      |
+| `--encoder-only`                        | `False`            | bool flag<br/> (set to launch an encoder-only server)            |      A2, A3      |
+| `--language-only`                       | `False`            | bool flag<br/> (set to load weights for the language model only) |      A2, A3      |
+| `--encoder-transfer-backend`            | `zmq_to_scheduler` | `zmq_to_scheduler`, <br/> `zmq_to_tokenizer`,<br/>  `mooncake`   |      A2, A3      |
+| `--encoder-urls`                        | `[]`               | List[str]<br/> (List of encoder server urls)                     |      A2, A3      |
 
 ## Custom weight loader
 
@@ -433,8 +436,6 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 
 | Argument                                      | Defaults | Options                        | Server supported |
 |-----------------------------------------------|----------|--------------------------------|:----------------:|
-| `--mm-max-concurrent-calls`                   | `32`     | Type: int                      |      A2, A3      |
-| `--mm-per-request-timeout`                    | `10.0`   | Type: float                    |      A2, A3      |
 | `--enable-broadcast-mm-`<br/>`inputs-process` | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
 | `--mm-process-config`                         | `None`   | Type: JSON / Dict              |      A2, A3      |
 | `--mm-enable-dp-encoder`                      | `False`  | bool flag<br/> (set to enable) |      A2, A3      |
@@ -479,10 +480,4 @@ The following parameters have some functional deficiencies on community
 
 | Argument                              | Defaults | Options                        |
 |---------------------------------------|----------|--------------------------------|
-| `--enable-double-sparsity`            | `False`  | bool flag<br/> (set to enable) |
-| `--ds-channel-config-path`            | `None`   | Type: str                      |
-| `--ds-heavy-channel-num`              | `32`     | Type: int                      |
-| `--ds-heavy-token-num`                | `256`    | Type: int                      |
-| `--ds-heavy-channel-type`             | `qk`     | Type: str                      |
-| `--ds-sparse-decode-`<br/>`threshold` | `4096`   | Type: int                      |
 | `--tool-server`                       | `None`   | Type: str                      |

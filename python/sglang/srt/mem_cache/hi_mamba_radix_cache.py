@@ -24,8 +24,10 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
-    HybridCacheController,
     PrefetchOperation,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    attach_hybrid_pool_to_mamba_cache,
 )
 from sglang.srt.mem_cache.mamba_radix_cache import (
     LRUList,
@@ -34,13 +36,6 @@ from sglang.srt.mem_cache.mamba_radix_cache import (
     get_last_access_time,
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
-from sglang.srt.mem_cache.memory_pool_host import (
-    HostPoolGroup,
-    MambaPoolHost,
-    MHATokenToKVPoolHost,
-    MLATokenToKVPoolHost,
-    PoolEntry,
-)
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     compute_node_hash_values,
@@ -115,66 +110,6 @@ class HiMambaRadixCache(MambaRadixCache):
             )
 
         self.kvcache = self.hybrid_kv_cache.full_kv_pool
-        kv_host_pool_cls = (
-            MLATokenToKVPoolHost
-            if self.hybrid_kv_cache.use_mla
-            else MHATokenToKVPoolHost
-        )
-        self.full_kv_pool_host = kv_host_pool_cls(
-            self.kvcache,
-            server_args.hicache_ratio,
-            server_args.hicache_size,
-            params.page_size,
-            server_args.hicache_mem_layout,
-            allocator_type=server_args.hicache_storage_backend,
-        )
-        self.mamba_pool_host = MambaPoolHost(
-            params.req_to_token_pool.mamba_pool,
-            server_args.hicache_ratio,
-            server_args.hicache_size,
-            allocator_type=server_args.hicache_storage_backend,
-            layout=server_args.hicache_mem_layout,
-        )
-
-        full_layer_ids = sorted(
-            self.hybrid_kv_cache.full_attention_layer_id_mapping.keys()
-        )
-        mamba_layer_ids = sorted(params.req_to_token_pool.mamba_map.keys())
-        self.transfer_layer_num = len(set(full_layer_ids) | set(mamba_layer_ids))
-
-        full_layer_mapping = dict(self.hybrid_kv_cache.full_attention_layer_id_mapping)
-        mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
-        transfer_layer_num = self.transfer_layer_num
-
-        def kv_layer_mapper(layer_id: int) -> Optional[int]:
-            if not 0 <= layer_id < transfer_layer_num:
-                return None
-            return full_layer_mapping.get(layer_id)
-
-        def mamba_layer_mapper(layer_id: int) -> Optional[int]:
-            if not 0 <= layer_id < transfer_layer_num:
-                return None
-            return mamba_layer_mapping.get(layer_id)
-
-        self.host_pool_group = HostPoolGroup(
-            [
-                PoolEntry(
-                    name=PoolName.KV,
-                    host_pool=self.full_kv_pool_host,
-                    device_pool=self.kvcache,
-                    layer_mapper=kv_layer_mapper,
-                    is_primary_index_anchor=True,
-                ),
-                PoolEntry(
-                    name=PoolName.MAMBA,
-                    host_pool=self.mamba_pool_host,
-                    device_pool=params.req_to_token_pool.mamba_pool,
-                    layer_mapper=mamba_layer_mapper,
-                    host_evict_fn=self.evict_mamba_host,
-                    device_evict_fn=self.evict_mamba,
-                ),
-            ]
-        )
 
         self.tp_group = params.tp_cache_group
         self.tp_world_size = (
@@ -200,27 +135,16 @@ class HiMambaRadixCache(MambaRadixCache):
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
         self.load_cache_event = threading.Event()
-        self.cache_controller = HybridCacheController(
-            params.token_to_kv_pool_allocator,
-            self.host_pool_group,
-            params.page_size,
-            self.tp_group,
-            load_cache_event=self.load_cache_event,
-            write_policy=server_args.hicache_write_policy,
-            io_backend=server_args.hicache_io_backend,
-            storage_backend=server_args.hicache_storage_backend,
+        attach_hybrid_pool_to_mamba_cache(
+            self,
+            params,
+            server_args,
+            extra_config=extra_config,
             prefetch_threshold=prefetch_threshold,
-            model_name=server_args.served_model_name,
-            storage_backend_extra_config=extra_config,
-            pp_rank=params.pp_rank,
-            pp_size=params.pp_size,
-            transfer_layer_num=self.transfer_layer_num,
-        )
-        params.req_to_token_pool.register_layer_transfer_counter(
-            self.cache_controller.layer_done_counter
-        )
-        self.hybrid_kv_cache.register_layer_transfer_counter(
-            self.cache_controller.layer_done_counter
+            load_cache_event=self.load_cache_event,
+            enable_storage_metrics=self.enable_storage_metrics,
+            attn_cp_group=params.attn_cp_cache_group,
+            attn_tp_group=params.attn_tp_cache_group,
         )
         self._apply_storage_runtime_config(
             storage_backend=server_args.hicache_storage_backend,
@@ -276,10 +200,14 @@ class HiMambaRadixCache(MambaRadixCache):
         )
         super().reset()
 
-    def write_backup(self, node: TreeNode, write_back=False):
-        # Backup invariant: parent must be backed up before child.
-        if node.parent != self.root_node and not node.parent.backuped:
-            return
+    def write_backup(self, node: TreeNode, write_back=False) -> int:
+        # Backup invariant (for write-through mode): backed-up nodes must form a
+        # contiguous prefix from root — no gaps.  Skip if parent isn't backed
+        # up yet;
+        if not write_back and (
+            node.parent != self.root_node and not node.parent.backuped
+        ):
+            return 0
 
         # If mamba host slot already exists, refresh its LRU position.
         if node.mamba_value is not None and node.mamba_host_value is not None:
@@ -558,13 +486,10 @@ class HiMambaRadixCache(MambaRadixCache):
             or node == self.root_node
             or node.host_ref_counter > 0
             or node.host_mamba_ref_counter > 0
+            or len(node.children) > 0
         ):
             self.evictable_full_host_leaves.discard(node)
             return
-        for child in node.children.values():
-            if child.evicted and child.backuped:
-                self.evictable_full_host_leaves.discard(node)
-                return
         self.evictable_full_host_leaves.add(node)
 
     def _free_device_mamba(self, node: TreeNode) -> int:
@@ -626,7 +551,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self._discard_from_leaf_sets(node)
 
         parent = node.parent
-        key = self.get_child_key_fn(node.key)
+        key = node.key.child_key(self.page_size)
         v = parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
@@ -662,7 +587,7 @@ class HiMambaRadixCache(MambaRadixCache):
 
         self._discard_from_leaf_sets(node)
         parent = node.parent
-        key = self.get_child_key_fn(node.key)
+        key = node.key.child_key(self.page_size)
         v = parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
@@ -676,7 +601,7 @@ class HiMambaRadixCache(MambaRadixCache):
         assert node.mamba_host_value is None, f"has mamba host value, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
         parent = node.parent
-        key = self.get_child_key_fn(node.key)
+        key = node.key.child_key(self.page_size)
         v = parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
@@ -902,7 +827,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if len(key) == 0:
             return 0, True
 
-        child_key = self.get_child_key_fn(key)
+        child_key = key.child_key(self.page_size)
 
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
@@ -914,7 +839,7 @@ class HiMambaRadixCache(MambaRadixCache):
             if node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
 
-            prefix_len = self.key_match_fn(node.key, key)
+            prefix_len = node.key.match(key, page_size=self.page_size)
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -933,7 +858,7 @@ class HiMambaRadixCache(MambaRadixCache):
             value = value[prefix_len:]
 
             if len(key):
-                child_key = self.get_child_key_fn(key)
+                child_key = key.child_key(self.page_size)
 
         mamba_value_exist = False
         if len(key):
@@ -962,7 +887,7 @@ class HiMambaRadixCache(MambaRadixCache):
         value: torch.Tensor,
         mamba_value: torch.Tensor,
     ) -> TreeNode:
-        child_key = self.get_child_key_fn(key)
+        child_key = key.child_key(self.page_size)
         new_node = TreeNode()
         new_node.parent = parent
         new_node.key = key
@@ -1002,7 +927,7 @@ class HiMambaRadixCache(MambaRadixCache):
     ) -> Tuple[List[torch.Tensor], TreeNode, int]:
         """Walk tree to find best_last_node (mamba boundary)."""
         node = self.root_node
-        child_key = self.get_child_key_fn(key)
+        child_key = key.child_key(self.page_size)
 
         value: List[torch.Tensor] = []
         best_value_len = 0
@@ -1018,7 +943,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 best_value_len = len(value)
                 best_last_node = node
 
-            prefix_len = self.key_match_fn(child.key, key)
+            prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 if not new_node.evicted:
@@ -1031,7 +956,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 node = child
                 key = key[prefix_len:]
                 if len(key):
-                    child_key = self.get_child_key_fn(key)
+                    child_key = key.child_key(self.page_size)
 
         if node.mamba_value is not None or node.mamba_backuped:
             best_value_len = len(value)
@@ -1152,7 +1077,7 @@ class HiMambaRadixCache(MambaRadixCache):
         self.evictable_full_host_leaves.discard(child)
 
         new_node = TreeNode()
-        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
+        new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.value = None
         new_node.mamba_value = None
@@ -1173,7 +1098,7 @@ class HiMambaRadixCache(MambaRadixCache):
             self.mamba_lru_list.remove_node(child)
         child.parent = new_node
         child.key = child.key[split_len:]
-        new_node.parent.children[self.get_child_key_fn(key)] = new_node
+        new_node.parent.children[key.child_key(self.page_size)] = new_node
         if child.mamba_value is not None:
             self.mamba_lru_list.insert_mru(child)
 
@@ -1914,7 +1839,7 @@ class HiMambaRadixCache(MambaRadixCache):
         if len(key) == 0:
             return 0
 
-        child_key = self.get_child_key_fn(key)
+        child_key = key.child_key(self.page_size)
 
         matched_length = 0
         while len(key) > 0 and child_key in node.children.keys():
@@ -1922,7 +1847,7 @@ class HiMambaRadixCache(MambaRadixCache):
             node.last_access_time = get_last_access_time()
             if node != self.root_node and node.mamba_value is not None:
                 self.mamba_lru_list.reset_node_mru(node)
-            prefix_len = self.key_match_fn(node.key, key)
+            prefix_len = node.key.match(key, page_size=self.page_size)
 
             key = key[prefix_len:]
             host_value = host_value[prefix_len:]
@@ -1934,7 +1859,7 @@ class HiMambaRadixCache(MambaRadixCache):
                 node = new_node
 
             if len(key):
-                child_key = self.get_child_key_fn(key)
+                child_key = key.child_key(self.page_size)
 
         leaf_node: Optional[TreeNode] = None
         if len(key):

@@ -1193,8 +1193,26 @@ class AiterAttnBackend(AttentionBackend):
         max_num_tokens: int,
         kv_indices_buf: Optional[torch.Tensor] = None,
     ):
+        # PR #20978 pads max_bs beyond pool_size for higher cuda-graph
+        # coverage. Reallocate indptr buffers so they fit the padded max_bs.
+        # See: https://github.com/sgl-project/sglang/pull/20978
+        if max_bs + 1 > self.kv_indptr.shape[0]:
+            self.kv_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
+            self.qo_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            )
+            self.mask_indptr = torch.zeros(
+                (max_bs + 1,), dtype=torch.int64, device=self.device
+            )
+            if hasattr(self, "qo_indptr_"):
+                self.qo_indptr_ = torch.zeros(
+                    (max_bs + 1,), dtype=torch.int32, device=self.device
+                )
+
         self.cuda_graph_kv_last_page_len = torch.ones(
-            max_bs, dtype=torch.int, device=self.device
+            max_bs, dtype=torch.int32, device=self.device
         )
         if kv_indices_buf is None:
             max_num_blocks_per_seq = (
@@ -2406,6 +2424,12 @@ class AiterAttnBackend(AttentionBackend):
                 v_descale=v_descale,
             )
 
+            # The fp8bf16 aiter prefill kernel returns bf16 even when the
+            # model computes in fp16. Cast back so the attention output keeps
+            # the same dtype as the rest of the model activations.
+            if o.dtype != self.input_dtype:
+                o = o.to(self.input_dtype)
+
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
     def forward_decode(
@@ -2453,6 +2477,23 @@ class AiterAttnBackend(AttentionBackend):
                     slot_mapping_swa.long() if layer.sliding_window_size > 0 else None,
                     k_scale=k_descale,
                     v_scale=v_descale,
+                )
+            elif self.use_triton_unified_attention and self.kv_cache_dtype == fp8_dtype:
+                # [PATCH] FP8 non-SWA: use launch_reshape_and_cache_flash to
+                # fuse bf16→fp8 cast + paged write in one Triton kernel,
+                # eliminating separate float8_copy + store_kvcache overhead.
+                token_to_kv_pool = forward_batch.token_to_kv_pool
+                k_cache, v_cache = token_to_kv_pool.get_kv_buffer(layer.layer_id)
+                launch_reshape_and_cache_flash(
+                    k.view(-1, layer.tp_k_head_num, layer.qk_head_dim),
+                    v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    k_cache.view(
+                        -1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim
+                    ),
+                    v_cache.view(
+                        -1, self.page_size, layer.tp_v_head_num, layer.v_head_dim
+                    ),
+                    forward_batch.out_cache_loc,
                 )
             else:
                 forward_batch.token_to_kv_pool.set_kv_buffer(

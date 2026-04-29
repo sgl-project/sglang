@@ -38,21 +38,9 @@ _is_xpu = is_xpu()
 if _is_cuda:
     from flashinfer.prefill import cudnn_batch_prefill_with_kv_cache
 
-    try:
-        from sgl_kernel.flash_attn import flash_attn_varlen_func
-
-        def flash_attn_func(*args, ver: int = 3, **kwargs):
-            if ver == 4:
-                from sglang.jit_kernel.flash_attention_v4 import (
-                    flash_attn_varlen_func as flash_attn_varlen_func_fa4,
-                )
-
-                return flash_attn_varlen_func_fa4(*args, **kwargs)
-            return flash_attn_varlen_func(*args, **kwargs)
-
-    except ImportError as e:
-        raise e
-
+    from sglang.jit_kernel.flash_attention import (
+        flash_attn_varlen_func,
+    )
 
 if _is_npu:
     import torch_npu
@@ -420,7 +408,7 @@ class VisionFlash3Attention(nn.Module):
         """
         if envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
             max_seqlen = cu_seqlens[1]
-            output = flash_attn_func(
+            output = flash_attn_varlen_func(
                 q,
                 k,
                 v,
@@ -436,7 +424,7 @@ class VisionFlash3Attention(nn.Module):
             seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
             max_seqlen = seq_lens.max().item()
 
-            output = flash_attn_func(
+            output = flash_attn_varlen_func(
                 q,
                 k,
                 v,
@@ -489,7 +477,7 @@ class VisionFlash4Attention(nn.Module):
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
 
-        output = flash_attn_func(
+        output = flash_attn_varlen_func(
             q,
             k,
             v,
@@ -761,6 +749,7 @@ class VisionAttention(nn.Module):
         num_heads: int,
         projection_size: int,
         use_qkv_parallel: bool,
+        head_size: Optional[int] = None,
         qkv_backend: Optional[str] = None,
         quant_config: Optional[QuantizationConfig] = None,
         dropout: float = 0.0,
@@ -787,7 +776,7 @@ class VisionAttention(nn.Module):
         self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
         self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
         self.dropout = dropout
-        self.head_size = embed_dim // num_heads
+        self.head_size = head_size if head_size is not None else embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )

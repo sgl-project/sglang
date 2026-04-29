@@ -15,7 +15,7 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=50, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=32, suite="stage-b-test-2-gpu-large")
 
 NUM_GPUS = 2
 

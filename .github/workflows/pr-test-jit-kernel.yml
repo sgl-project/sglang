@@ -6,6 +6,9 @@ on:
       jit_kernel:
         required: true
         type: string
+      b200_runner:
+        required: true
+        type: string
       pr_head_sha:
         required: false
         type: string
@@ -33,7 +36,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
 
 jobs:
@@ -115,3 +118,30 @@ jobs:
         run: |
           cd test/
           python3 run_suite.py --hw cuda --suite stage-b-kernel-benchmark-1-gpu-large
+
+  jit-kernel-b200-test:
+    if: |
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != 'true' &&
+      !inputs.target_stage
+    runs-on: ${{ inputs.b200_runner }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-stage-health
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+
+      - name: Run B200 diffusion test
+        timeout-minutes: 30
+        run: |
+          cd test/
+          python3 run_suite.py --hw cuda --suite stage-b-kernel-unit-1-gpu-b200

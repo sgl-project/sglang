@@ -38,7 +38,29 @@ class WanVideoArchConfig(DiTArchConfig):
         }
     )
 
-    reverse_param_names_mapping: dict = field(default_factory=lambda: {})
+    reverse_param_names_mapping: dict = field(
+        default_factory=lambda: {
+            r"^patch_embedding\.proj\.(.*)$": r"patch_embedding.\1",
+            r"^condition_embedder\.text_embedder\.fc_in\.(.*)$": r"condition_embedder.text_embedder.linear_1.\1",
+            r"^condition_embedder\.text_embedder\.fc_out\.(.*)$": r"condition_embedder.text_embedder.linear_2.\1",
+            r"^condition_embedder\.time_embedder\.mlp\.fc_in\.(.*)$": r"condition_embedder.time_embedder.linear_1.\1",
+            r"^condition_embedder\.time_embedder\.mlp\.fc_out\.(.*)$": r"condition_embedder.time_embedder.linear_2.\1",
+            r"^condition_embedder\.time_modulation\.linear\.(.*)$": r"condition_embedder.time_proj.\1",
+            r"^condition_embedder\.image_embedder\.ff\.fc_in\.(.*)$": r"condition_embedder.image_embedder.ff.net.0.proj.\1",
+            r"^condition_embedder\.image_embedder\.ff\.fc_out\.(.*)$": r"condition_embedder.image_embedder.ff.net.2.\1",
+            r"^blocks\.(\d+)\.to_q\.(.*)$": r"blocks.\1.attn1.to_q.\2",
+            r"^blocks\.(\d+)\.to_k\.(.*)$": r"blocks.\1.attn1.to_k.\2",
+            r"^blocks\.(\d+)\.to_v\.(.*)$": r"blocks.\1.attn1.to_v.\2",
+            r"^blocks\.(\d+)\.to_out\.(.*)$": r"blocks.\1.attn1.to_out.0.\2",
+            r"^blocks\.(\d+)\.norm_q\.(.*)$": r"blocks.\1.attn1.norm_q.\2",
+            r"^blocks\.(\d+)\.norm_k\.(.*)$": r"blocks.\1.attn1.norm_k.\2",
+            r"^blocks\.(\d+)\.attn1\.local_attn\.proj_l\.(.*)$": r"blocks.\1.attn1.attn_op.local_attn.proj_l.\2",
+            r"^blocks\.(\d+)\.attn2\.to_out\.(.*)$": r"blocks.\1.attn2.to_out.0.\2",
+            r"^blocks\.(\d+)\.ffn\.fc_in\.(.*)$": r"blocks.\1.ffn.net.0.proj.\2",
+            r"^blocks\.(\d+)\.ffn\.fc_out\.(.*)$": r"blocks.\1.ffn.net.2.\2",
+            r"^blocks\.(\d+)\.self_attn_residual_norm\.norm\.(.*)$": r"blocks.\1.norm2.\2",
+        }
+    )
 
     # Some LoRA adapters use the original official layer names instead of hf layer names,
     # so apply this before the param_names_mapping

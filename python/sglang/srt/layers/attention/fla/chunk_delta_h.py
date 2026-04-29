@@ -281,16 +281,14 @@ def chunk_gated_delta_rule_fwd_h(
     initial_state_indices: Optional[torch.Tensor] = None,
     save_new_value: bool = True,
     cu_seqlens: Optional[torch.LongTensor] = None,
+    chunk_indices: Optional[torch.LongTensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     B, T, Hg, K, V = *k.shape, u.shape[-1]
     H = u.shape[-2]
     BT = CHUNK_SIZE
 
-    chunk_indices = (
-        prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
-        if cu_seqlens is not None
-        else None
-    )
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
     # N: the actual number of sequences in the batch with either equal or variable lengths
     if cu_seqlens is None:
         N, NT, chunk_offsets = B, triton.cdiv(T, BT), None

@@ -11,6 +11,10 @@ on:
         description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-my-test, dev-cu13-my-test, etc."
         required: false
         default: ""
+      image_repo:
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        required: false
+        default: "lmsysorg/sglang"
   schedule:
     - cron: "0 0 * * *"
 
@@ -19,144 +23,32 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-dev:
-    if: ${{ github.repository == 'sgl-project/sglang' }}
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      matrix:
-        include:
-          - runner: x64-docker-build-node
-            platform: linux/amd64
-            build_type: all
-            grace_blackwell: 0
-            arch_tag: x86
-            version: 12.9.1
-          - runner: arm-docker-build-node
-            platform: linux/arm64
-            build_type: all
-            grace_blackwell: 1
-            arch_tag: arm64
-            version: 12.9.1
-          - runner: x64-docker-build-node
-            platform: linux/amd64
-            build_type: all
-            grace_blackwell: 0
-            arch_tag: x86-cu13
-            version: 13.0.1
-          - runner: arm-docker-build-node
-            platform: linux/arm64
-            build_type: all
-            grace_blackwell: 1
-            arch_tag: arm64-cu13
-            version: 13.0.1
+  prepare:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    outputs:
+      checkout_ref: ${{ steps.config.outputs.checkout_ref }}
+      extra_build_args: ${{ steps.config.outputs.extra_build_args }}
+      tag_config: ${{ steps.config.outputs.tag_config }}
     steps:
-      - name: Delete huge unnecessary tools folder
-        run: rm -rf /opt/hostedtoolcache
-
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || github.ref }}
-
-      - name: Free disk space
-        uses: jlumbroso/free-disk-space@main
-        with:
-          tool-cache: true
-          docker-images: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          swap-storage: true
-
-      - name: Prune Docker to reclaim disk space
+      - name: Compute build configuration
+        id: config
         run: |
-          docker buildx prune --filter "until=72h" -f
-          docker system prune -af --filter "until=72h"
-          docker volume prune -af
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Build and Push Dev Image
-        run: |
-          # Nightly (schedule) installs latest release; manual dispatch builds from checked-out source
-          if [ "${{ github.event_name }}" = "schedule" ]; then
-            SOURCE_ARG="--build-arg USE_LATEST_SGLANG=1"
+          # Determine checkout ref
+          if [ -n "${{ inputs.pr_number }}" ]; then
+            echo "checkout_ref=refs/pull/${{ inputs.pr_number }}/head" >> $GITHUB_OUTPUT
           else
-            SOURCE_ARG="--build-arg BRANCH_TYPE=local"
+            echo "checkout_ref=" >> $GITHUB_OUTPUT
           fi
 
-          docker buildx build \
-            --platform ${{ matrix.platform }} \
-            --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
-            --target framework \
-            -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=${{ matrix.version }} \
-            --build-arg BUILD_TYPE=${{ matrix.build_type }} \
-            --build-arg CMAKE_BUILD_PARALLEL_LEVEL=$(nproc) \
-            --build-arg GRACE_BLACKWELL=${{ matrix.grace_blackwell }} \
-            ${SOURCE_ARG} \
-            --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
-            --metadata-file /tmp/metadata.json \
-            --no-cache \
-            .
+          # Determine extra build args
+          if [ "${{ github.event_name }}" = "schedule" ]; then
+            echo "extra_build_args=--build-arg USE_LATEST_SGLANG=1 --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
+          else
+            echo "extra_build_args=--build-arg BRANCH_TYPE=local --build-arg CMAKE_BUILD_PARALLEL_LEVEL=\$(nproc)" >> $GITHUB_OUTPUT
+          fi
 
-          DIGEST=$(python3 -c "import json; print(json.load(open('/tmp/metadata.json'))['containerimage.digest'])")
-          echo "Pushed digest: ${DIGEST}"
-          echo "${DIGEST}" > /tmp/digest.txt
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: digest-${{ matrix.arch_tag }}
-          path: /tmp/digest.txt
-          retention-days: 1
-
-  create-manifests:
-    runs-on: ubuntu-22.04
-    needs: [build-dev]
-    if: ${{ github.repository == 'sgl-project/sglang' }}
-    strategy:
-      matrix:
-        variant:
-          - base: dev
-            x86: x86
-            arm64: arm64
-          - base: dev-cu13
-            x86: x86-cu13
-            arm64: arm64-cu13
-    steps:
-      - uses: docker/setup-buildx-action@v3
-
-      - uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Download x86 digest
-        uses: actions/download-artifact@v4
-        with:
-          name: digest-${{ matrix.variant.x86 }}
-          path: /tmp/digests/x86
-
-      - name: Download arm64 digest
-        uses: actions/download-artifact@v4
-        with:
-          name: digest-${{ matrix.variant.arm64 }}
-          path: /tmp/digests/arm64
-
-      - name: Create multi-arch manifest
-        run: |
-          X86_DIGEST=$(cat /tmp/digests/x86/digest.txt)
-          ARM64_DIGEST=$(cat /tmp/digests/arm64/digest.txt)
-
+          # Determine tag suffix
           SUFFIX=""
           if [ -n "${{ inputs.tag }}" ]; then
             SUFFIX="-${{ inputs.tag }}"
@@ -164,46 +56,31 @@ jobs:
             SUFFIX="-pr-${{ inputs.pr_number }}"
           fi
 
-          TAG="${{ matrix.variant.base }}${SUFFIX}"
-
-          # For nightly (no suffix), also stamp a dated tag
-          EXTRA_TAG=""
+          # Build tag config
           if [ -z "${SUFFIX}" ]; then
-            SHORT_SHA="${{ github.sha }}"
-            EXTRA_TAG="-t lmsysorg/sglang:nightly-${TAG}-$(date +%Y%m%d)-${SHORT_SHA:0:8}"
-          fi
-
-          docker buildx imagetools create \
-            -t lmsysorg/sglang:${TAG} \
-            ${EXTRA_TAG} \
-            lmsysorg/sglang@${X86_DIGEST} \
-            lmsysorg/sglang@${ARM64_DIGEST}
-
-          echo "✓ Published lmsysorg/sglang:${TAG}"
-
-      - name: Cleanup Old Nightly Builds
-        if: ${{ !inputs.tag && !inputs.pr_number }}
-        run: |
-          TOKEN=$(curl -s -H "Content-Type: application/json" \
-            -X POST -d '{"username": "${{ secrets.DOCKERHUB_USERNAME }}", "password": "${{ secrets.DOCKERHUB_TOKEN }}"}' \
-            https://hub.docker.com/v2/users/login/ | jq -r .token)
-
-          TAGS_RESPONSE=$(curl -s -H "Authorization: JWT $TOKEN" \
-            "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/?page_size=100")
-
-          TAGS=$(echo "$TAGS_RESPONSE" | jq -r \
-            '.results[] | select(.name | test("^nightly-${{ matrix.variant.base }}-[0-9]")) | "\(.last_updated)|\(.name)"' \
-            | sort -r | cut -d'|' -f2)
-
-          TAG_COUNT=$(echo "$TAGS" | wc -l)
-          if [ "$TAG_COUNT" -gt 14 ]; then
-            echo "Found $TAG_COUNT nightly builds, keeping only the 14 most recent"
-            TAGS_TO_DELETE=$(echo "$TAGS" | tail -n +15)
-            for tag in $TAGS_TO_DELETE; do
-              echo "Deleting tag: $tag"
-              curl -X DELETE -H "Authorization: JWT $TOKEN" \
-                "https://hub.docker.com/v2/repositories/lmsysorg/sglang/tags/$tag/"
-            done
+            # Nightly: include dated tags
+            TAG_CONFIG='[{"cuda":"cu129","tags":["dev","nightly-dev-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev-cu13","nightly-dev-cu13-{date}-{short_sha}"]}]'
           else
-            echo "Only $TAG_COUNT nightly builds found, no cleanup needed"
+            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev-cu13${SUFFIX}\"]}]"
           fi
+          echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
+
+  build-and-publish:
+    needs: prepare
+    uses: ./.github/workflows/_docker-build-and-publish.yml
+    with:
+      docker_target: framework_final
+      checkout_ref: ${{ needs.prepare.outputs.checkout_ref }}
+      extra_build_args: ${{ needs.prepare.outputs.extra_build_args }}
+      tag_config: ${{ needs.prepare.outputs.tag_config }}
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+    secrets: inherit
+
+  cleanup-nightly:
+    needs: build-and-publish
+    if: ${{ !inputs.tag && !inputs.pr_number }}
+    uses: ./.github/workflows/_docker-cleanup-nightly.yml
+    with:
+      tag_prefixes: '["nightly-dev", "nightly-dev-cu13"]'
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+    secrets: inherit
