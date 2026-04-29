@@ -119,7 +119,8 @@ class EAGLEWorker(TpModelWorker):
         self.adaptive_controller: Optional[AdaptiveController] = None
         if server_args.speculative_adaptive:
             self.adaptive_controller = AdaptiveController(
-                self, config_path=server_args.speculative_adaptive_config
+                self,
+                config_path=server_args.speculative_adaptive_config,
             )
 
         # Override the context length of the draft model to be the same as the target model.
@@ -476,6 +477,16 @@ class EAGLEWorker(TpModelWorker):
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
+            # Each BS range maintains its own optimal step count. The previous
+            # round may have served a different BS range, so we must switch to
+            # this batch's step before drafting. on_verify_complete (after verify)
+            # updates EMA and may change the step for the *current* BS range;
+            # this check handles cross-range switches between rounds.
+            if self.adaptive_controller is not None:
+                target_steps = self.adaptive_controller.get_steps_for_batch(batch.batch_size())
+                if target_steps != self.speculative_num_steps:
+                    self.adaptive_controller.activate(target_steps)
+
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
             with self.draft_tp_context(
@@ -530,7 +541,8 @@ class EAGLEWorker(TpModelWorker):
 
             if self.adaptive_controller is not None:
                 self.adaptive_controller.on_verify_complete(
-                    verify_output.num_correct_drafts_per_req_cpu
+                    verify_output.num_correct_drafts_per_req_cpu,
+                    batch_size=batch.batch_size(),
                 )
 
             return GenerationBatchResult(

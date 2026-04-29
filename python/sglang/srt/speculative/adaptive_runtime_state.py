@@ -1,10 +1,15 @@
+import bisect
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Dict, List, Optional, Protocol
 
 from sglang.srt.speculative.adaptive_spec_params import (
+    DEFAULT_BS_HYSTERESIS,
+    DEFAULT_BS_STEPS,
     AdaptiveSpeculativeParams,
+    get_default_hysteresis,
     load_adaptive_config,
+    load_bs_config,
 )
 
 if TYPE_CHECKING:
@@ -74,18 +79,69 @@ class AdaptiveController:
       2. Call ``on_verify_complete(num_correct_drafts_per_req)`` after each decode verify.
     """
 
-    def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
+    def __init__(
+        self,
+        worker: AdaptiveSpecWorker,
+        config_path: Optional[str] = None,
+    ):
         self.worker = worker
         cfg = load_adaptive_config(config_path)
-        self.params = AdaptiveSpeculativeParams(
-            initial_steps=worker.speculative_num_steps,
-            config=cfg,
+        bs_config = load_bs_config(cfg)
+
+        if bs_config is None:
+            bs_config = {
+                bs: {"steps": steps, **DEFAULT_BS_HYSTERESIS[bs]}
+                for bs, steps in DEFAULT_BS_STEPS.items()
+            }
+
+        self._init_per_bs(cfg, bs_config)
+        self._states: Dict[int, SpecRuntimeState] = {}
+
+        logger.info(
+            f"AdaptiveController initialized: bs_list={self._bs_list}, "
+            f"candidate_steps={self.candidate_steps}"
         )
-        self._states: dict[int, SpecRuntimeState] = {}
+
+    def _init_per_bs(self, cfg: dict, bs_config: Dict[int, dict]):
+        """Initialize per-BS adaptive params from *bs_config*."""
+        self._bs_list = sorted(bs_config.keys())
+        self._bs_params: Dict[int, AdaptiveSpeculativeParams] = {}
+
+        for bs, entry in sorted(bs_config.items()):
+            steps = entry.get("steps", DEFAULT_BS_STEPS.get(bs, [1, 3, 7]))
+            initial = steps[len(steps) // 2]
+
+            defaults = get_default_hysteresis(bs)
+            up_h = entry.get("up_hysteresis", defaults["up_hysteresis"])
+            down_h = entry.get("down_hysteresis", defaults["down_hysteresis"])
+            params_cfg = {
+                **cfg,
+                "candidate_steps": steps,
+                "up_hysteresis": up_h,
+                "down_hysteresis": down_h,
+            }
+            self._bs_params[bs] = AdaptiveSpeculativeParams(
+                initial_steps=initial,
+                config=params_cfg,
+            )
 
     @property
-    def candidate_steps(self) -> list[int]:
-        return self.params.candidate_steps
+    def candidate_steps(self) -> List[int]:
+        """Union of all BS slots' candidate steps."""
+        all_steps: set[int] = set()
+        for params in self._bs_params.values():
+            all_steps.update(params.candidate_steps)
+        return sorted(all_steps)
+
+    def _find_closest_bs(self, target: int) -> int:
+        """Find largest BS key <= target (lower-bound range match)."""
+        idx = bisect.bisect_right(self._bs_list, target) - 1
+        return self._bs_list[max(0, idx)]
+
+    def get_steps_for_batch(self, batch_size: int) -> int:
+        """Get the current optimal step count for a given batch size."""
+        bs = self._find_closest_bs(batch_size)
+        return self._bs_params[bs].current_steps
 
     def register(self, state: SpecRuntimeState, steps: int | None = None) -> None:
         """Register a pre-built runtime state.
@@ -97,7 +153,7 @@ class AdaptiveController:
 
     def init_states(self) -> None:
         """Build and register runtime states for all candidate steps."""
-        for steps in self.params.candidate_steps:
+        for steps in self.candidate_steps:
             if steps in self._states:
                 continue
             state = self.worker.build_adaptive_runtime_state(
@@ -105,14 +161,33 @@ class AdaptiveController:
                 speculative_num_draft_tokens=steps + 1,
             )
             self._states[steps] = state
-        self._activate(self.params.current_steps)
 
-    def on_verify_complete(self, num_correct_drafts_per_req: list[int]) -> None:
-        """Feed verify results; switch runtime state if EMA warrants it."""
-        if self.params.update(num_correct_drafts_per_req):
-            self._activate(self.params.current_steps)
+        initial_steps = self.get_steps_for_batch(1)
+        self.activate(initial_steps)
 
-    def _activate(self, speculative_num_steps: int) -> None:
+    def on_verify_complete(
+        self,
+        accept_lengths: list[int],
+        batch_size: int = 0,
+    ) -> None:
+        """Feed verify results to the matching BS slot's params."""
+        if batch_size <= 0:
+            return
+
+        bs = self._find_closest_bs(batch_size)
+        params = self._bs_params[bs]
+        old_steps = params.current_steps
+
+        changed = params.update(accept_lengths)
+
+        if changed:
+            logger.info(
+                f"AdaptiveController: BS slot {bs} (actual bs={batch_size}) "
+                f"steps {old_steps} -> {params.current_steps}"
+            )
+            self.activate(params.current_steps)
+
+    def activate(self, speculative_num_steps: int) -> None:
         state = self._states.get(speculative_num_steps)
         if state is None:
             raise ValueError(

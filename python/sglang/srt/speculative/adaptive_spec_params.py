@@ -5,9 +5,10 @@ Adjusts speculative_num_steps at runtime based on observed acceptance lengths.
 
 from __future__ import annotations
 
+import bisect
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Dict, Optional
 
 from sglang.srt.utils import log_info_on_rank0
 
@@ -15,6 +16,22 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Default per-BS hysteresis for Route 1 (accept_len + hysteresis)
+# Keys are lower bounds of BS ranges: 1 covers [1,64), 64 covers [64,128), etc.
+# ---------------------------------------------------------------------------
+DEFAULT_BS_HYSTERESIS: Dict[int, Dict[str, float]] = {
+    1: {"up_hysteresis": 0.0, "down_hysteresis": -0.25},
+    64: {"up_hysteresis": 1.75, "down_hysteresis": -0.25},
+    128: {"up_hysteresis": -0.1, "down_hysteresis": 0.25},
+}
+
+DEFAULT_BS_STEPS: Dict[int, list] = {
+    1: [1, 3, 7],
+    64: [1, 3, 5],
+    128: [1, 2, 6],
+}
 
 
 def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
@@ -52,12 +69,25 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
     return None
 
 
-def load_adaptive_config(path: str | None) -> dict[str, object]:
+def _bisect_lookup(table: Dict[int, dict], bs: int) -> dict:
+    """Find the entry in *table* whose key is the largest <= *bs*."""
+    keys = sorted(table.keys())
+    idx = bisect.bisect_right(keys, bs) - 1
+    idx = max(0, idx)
+    return table[keys[idx]]
+
+
+def get_default_hysteresis(bs: int) -> Dict[str, float]:
+    return _bisect_lookup(DEFAULT_BS_HYSTERESIS, bs)
+
+
+def load_adaptive_config(path: str | None) -> dict:
     """Load adaptive speculative config from a JSON file.
 
-    The file may contain any subset of the following keys:
-        ema_alpha, update_interval, warmup_batches,
-        down_hysteresis, up_hysteresis, candidate_steps
+    The file is a flat JSON object. Integer keys (``"1"``, ``"64"``, …) are
+    per-BS entries parsed by :func:`load_bs_config`.  All other keys
+    (``ema_alpha``, ``update_interval``, ``warmup_batches``, …) are global
+    overrides applied to every BS slot.
 
     Returns an empty dict when *path* is ``None``.
     """
@@ -73,6 +103,32 @@ def load_adaptive_config(path: str | None) -> dict[str, object]:
     return cfg
 
 
+def load_bs_config(config: dict) -> Optional[Dict[int, dict]]:
+    """Parse per-BS config from the loaded JSON.
+
+    The config is a flat dict whose keys are BS lower-bound strings::
+
+        {"1": {"steps": [1,3,7], ...}, "64": {"steps": [1,3,5], ...}}
+
+    Non-integer keys (e.g. ``ema_alpha``) are treated as global overrides
+    and ignored here — they are passed through in *config* directly.
+
+    Returns ``{bs_int: entry_dict}`` or ``None`` when no BS entries found.
+    """
+    result: Dict[int, dict] = {}
+    for key, entry in config.items():
+        try:
+            bs = int(key)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            result[bs] = {"steps": entry if isinstance(entry, list) else []}
+        else:
+            result[bs] = entry
+
+    return result if result else None
+
+
 class AdaptiveSpeculativeParams:
     """Tracks acceptance rate via EMA and adapts num_steps accordingly.
 
@@ -83,12 +139,13 @@ class AdaptiveSpeculativeParams:
     - Probes one step beyond observed acceptance
     - EMA smoothing prevents oscillation
     - Only updates every `update_interval` batches for stability
+    - num_steps can be selected from different candidate sets on different batch_sizes
     """
 
     def __init__(
         self,
         initial_steps: int,
-        config: dict[str, object] | None = None,
+        config: dict | None = None,
     ):
         cfg = config or {}
         # TODO: Wider range of candidate_steps (once lazy init is supported).
