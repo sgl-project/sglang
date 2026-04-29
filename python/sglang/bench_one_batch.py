@@ -103,6 +103,7 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
+from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.srt.utils.tensor_bridge import use_mlx
 
@@ -393,7 +394,7 @@ def load_model(server_args, port_args, gpu_id, tp_rank):
         from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 
         # Initialize with a reasonable cache size (100MB by default)
-        cache_size_mb = int(os.environ.get("SGLANG_VLM_CACHE_SIZE_MB", "100"))
+        cache_size_mb = envs.SGLANG_VLM_CACHE_SIZE_MB.get()
         init_mm_embedding_cache(max_size=cache_size_mb * 1024 * 1024)
         rank_print(
             f"Initialized multimodal embedding cache with size {cache_size_mb}MB"
@@ -431,6 +432,60 @@ def prepare_inputs_for_correctness_test(
             "Today is a sunny day and I like",
         ]
     )
+
+    # For multimodal, use image description prompt with image tokens
+    if bench_args.image_test and images:
+        image_token_str = bench_args.image_placeholder
+        image_placeholders = " ".join([image_token_str] * len(images))
+        prompts = [f"{image_placeholders} Describe the images in detail."]
+
+    input_ids = [tokenizer.encode(p) for p in prompts]
+    sampling_params = SamplingParams(
+        temperature=0,
+        max_new_tokens=BenchArgs.output_len,
+    )
+
+    reqs = []
+    for i in range(len(prompts)):
+        assert len(input_ids[i]) > bench_args.cut_len
+
+        tmp_input_ids = input_ids[i][: bench_args.cut_len]
+        req = Req(
+            rid=i,
+            origin_input_text=prompts[i],
+            origin_input_ids=tmp_input_ids,
+            sampling_params=sampling_params,
+        )
+        req.fill_ids = req.origin_input_ids
+        req.logprob_start_len = -1
+        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
+
+        # Add multimodal inputs if images are provided
+        if bench_args.image_test and images and model_runner:
+            req.multimodal_inputs = process_images_to_multimodal_inputs(
+                images,
+                model_runner,
+                tokenizer,
+                req.origin_input_ids,
+                image_placeholder=bench_args.image_placeholder,
+            )
+            # For multimodal correctness tests, pad input IDs so multimodal regions
+            # are represented by the model's pad_value (hash) instead of raw tokens.
+            model = getattr(model_runner, "model", None)
+            if model is not None and hasattr(model, "pad_input_ids"):
+                padded = model.pad_input_ids(
+                    req.origin_input_ids, req.multimodal_inputs
+                )
+                if isinstance(padded, torch.Tensor):
+                    padded_ids = padded.tolist()
+                else:
+                    padded_ids = list(padded)
+                req.origin_input_ids = padded_ids
+                req.fill_ids = padded_ids
+
+        reqs.append(req)
+
+    return input_ids, reqs
 
 
 def load_images_from_urls(image_urls, rank_print):
@@ -692,61 +747,6 @@ def process_images_to_multimodal_inputs(
             traceback.print_exc()
             local_rank_print("=" * 80)
         return None
-
-    # For multimodal, use image description prompt with image tokens
-    if bench_args.image_test and images:
-        # For multimodal models, we need to include image placeholder tokens in the prompt
-        image_token_str = bench_args.image_placeholder
-        image_placeholders = " ".join([image_token_str] * len(images))
-        prompts = [f"{image_placeholders} Describe the images in detail."]
-
-    input_ids = [tokenizer.encode(p) for p in prompts]
-    sampling_params = SamplingParams(
-        temperature=0,
-        max_new_tokens=BenchArgs.output_len,
-    )
-
-    reqs = []
-    for i in range(len(prompts)):
-        assert len(input_ids[i]) > bench_args.cut_len
-
-        tmp_input_ids = input_ids[i][: bench_args.cut_len]
-        req = Req(
-            rid=i,
-            origin_input_text=prompts[i],
-            origin_input_ids=tmp_input_ids,
-            sampling_params=sampling_params,
-        )
-        req.fill_ids = req.origin_input_ids
-        req.logprob_start_len = -1
-        req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
-
-        # Add multimodal inputs if images are provided
-        if bench_args.image_test and images and model_runner:
-            req.multimodal_inputs = process_images_to_multimodal_inputs(
-                images,
-                model_runner,
-                tokenizer,
-                req.origin_input_ids,
-                image_placeholder=bench_args.image_placeholder,
-            )
-            # For multimodal correctness tests, pad input IDs so multimodal regions
-            # are represented by the model's pad_value (hash) instead of raw tokens.
-            model = getattr(model_runner, "model", None)
-            if model is not None and hasattr(model, "pad_input_ids"):
-                padded = model.pad_input_ids(
-                    req.origin_input_ids, req.multimodal_inputs
-                )
-                if isinstance(padded, torch.Tensor):
-                    padded_ids = padded.tolist()
-                else:
-                    padded_ids = list(padded)
-                req.origin_input_ids = padded_ids
-                req.fill_ids = padded_ids
-
-        reqs.append(req)
-
-    return input_ids, reqs
 
 
 def prepare_extend_inputs_for_correctness_test(
@@ -1083,6 +1083,31 @@ def _save_profile_trace_results(profiler, filename):
     )
 
 
+def _load_or_generate_images(bench_args, rank_print):
+    """Load images from URLs/files or generate synthetic ones, based on bench_args."""
+    if not bench_args.image_test:
+        return None
+    if bench_args.image_urls:
+        rank_print(
+            f"Loading {len(bench_args.image_urls)} images for multimodal test..."
+        )
+        images = load_images_from_urls(bench_args.image_urls, rank_print)
+        rank_print(f"Loaded {len(images)} images successfully")
+    else:
+        width, height = resolve_image_size(bench_args)
+        rank_print(
+            f"Generating {bench_args.image_count} synthetic image(s) at {width}x{height}"
+        )
+        images = generate_random_images(
+            bench_args.image_count,
+            width,
+            height,
+            rank_print,
+            image_content=bench_args.image_content,
+        )
+    return images
+
+
 def correctness_test(
     server_args,
     port_args,
@@ -1098,27 +1123,7 @@ def correctness_test(
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Load or generate images if multimodal is enabled
-    images = None
-    if bench_args.image_test:
-        if bench_args.image_urls:
-            # Load real images from URLs/files for correctness test
-            rank_print(
-                f"Loading {len(bench_args.image_urls)} images for multimodal test..."
-            )
-            images = load_images_from_urls(bench_args.image_urls, rank_print)
-            rank_print(f"Loaded {len(images)} images successfully")
-        else:
-            width, height = resolve_image_size(bench_args)
-            rank_print(
-                f"Generating {bench_args.image_count} synthetic image(s) at {width}x{height}"
-            )
-            images = generate_random_images(
-                bench_args.image_count,
-                width,
-                height,
-                rank_print,
-                image_content=bench_args.image_content,
-            )
+    images = _load_or_generate_images(bench_args, rank_print)
 
     # Prepare inputs
     custom_prompts = _read_prompts_from_file(bench_args.prompt_filename, rank_print)
@@ -1332,27 +1337,7 @@ def latency_test(
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Load or generate images if multimodal is enabled
-    images = None
-    if bench_args.image_test:
-        if bench_args.image_urls:
-            # Load real images from URLs/files
-            rank_print(
-                f"Loading {len(bench_args.image_urls)} images for multimodal test..."
-            )
-            images = load_images_from_urls(bench_args.image_urls, rank_print)
-            rank_print(f"Loaded {len(images)} images successfully")
-        else:
-            width, height = resolve_image_size(bench_args)
-            rank_print(
-                f"Generating {bench_args.image_count} synthetic image(s) at {width}x{height} for latency test..."
-            )
-            images = generate_random_images(
-                bench_args.image_count,
-                width,
-                height,
-                rank_print,
-                image_content=bench_args.image_content,
-            )
+    images = _load_or_generate_images(bench_args, rank_print)
 
     # Prepare inputs for warm up
     reqs = prepare_synthetic_inputs_for_latency_test(
