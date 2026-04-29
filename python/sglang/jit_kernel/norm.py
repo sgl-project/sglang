@@ -90,6 +90,25 @@ def _jit_qknorm_across_heads_module(dtype: torch.dtype) -> Module:
 
 @torch.compiler.assume_constant_result
 @cache_once
+def can_use_fused_inplace_qknorm_across_heads(
+    hidden_size: int, dtype: torch.dtype
+) -> bool:
+    if dtype not in (torch.float16, torch.bfloat16):
+        return False
+    # The JIT kernel supports vectorized hidden sizes up to 8K on all CUDA archs
+    # and up to 12K on wider-vector builds. Keep the Python guard conservative.
+    if hidden_size <= 0 or hidden_size > 8192 or hidden_size % 16 != 0:
+        return False
+    try:
+        _jit_qknorm_across_heads_module(dtype)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load JIT QK-Norm across-heads kernel: {e}")
+        return False
+
+
+@torch.compiler.assume_constant_result
+@cache_once
 def can_use_fused_inplace_qknorm(head_dim: int, dtype: torch.dtype) -> bool:
     if head_dim not in [64, 128, 256, 512, 1024]:
         logger.warning(f"Unsupported head_dim={head_dim} for JIT QK-Norm kernel")

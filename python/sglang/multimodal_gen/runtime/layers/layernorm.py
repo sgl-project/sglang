@@ -17,7 +17,12 @@ from sglang.jit_kernel.diffusion.qknorm_rope import (
 )
 from sglang.jit_kernel.diffusion.triton.rmsnorm_onepass import triton_one_pass_rms_norm
 from sglang.jit_kernel.diffusion.triton.scale_shift import fuse_scale_shift_kernel
-from sglang.jit_kernel.norm import can_use_fused_inplace_qknorm, fused_inplace_qknorm
+from sglang.jit_kernel.norm import (
+    can_use_fused_inplace_qknorm,
+    can_use_fused_inplace_qknorm_across_heads,
+    fused_inplace_qknorm,
+    fused_inplace_qknorm_across_heads,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -680,6 +685,60 @@ def apply_qk_norm(
     q_out = q_norm(q.view(-1, head_dim)).view(q_shape)
     k_out = k_norm(k.view(-1, head_dim)).view(k_shape)
     return q_out, k_out
+
+
+def _get_norm_eps(norm: nn.Module) -> Optional[float]:
+    return getattr(norm, "variance_epsilon", getattr(norm, "eps", None))
+
+
+def apply_qk_norm_across_heads(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: nn.Module,
+    k_norm: nn.Module,
+    allow_inplace: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Apply QK normalization over the full hidden dim, fusing Q and K when possible."""
+
+    q_eps = _get_norm_eps(q_norm)
+    k_eps = _get_norm_eps(k_norm)
+    q_weight = getattr(q_norm, "weight", None)
+    k_weight = getattr(k_norm, "weight", None)
+    hidden_size = (
+        q_weight.shape[0]
+        if q_weight is not None and k_weight is not None and q_weight.ndim == 1
+        else None
+    )
+
+    if (
+        _is_cuda
+        and allow_inplace
+        and q.shape == k.shape
+        and hidden_size is not None
+        and q.shape[-1] == hidden_size
+        and k_weight.ndim == 1
+        and k_weight.shape[0] == hidden_size
+        and q_eps is not None
+        and q_eps == k_eps
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and q_weight is not None
+        and k_weight is not None
+        and q_weight.dtype == q.dtype
+        and k_weight.dtype == k.dtype
+        and q.is_contiguous()
+        and k.is_contiguous()
+        and can_use_fused_inplace_qknorm_across_heads(hidden_size, q.dtype)
+    ):
+        fused_inplace_qknorm_across_heads(
+            q=q.view(-1, hidden_size),
+            k=k.view(-1, hidden_size),
+            q_weight=q_weight,
+            k_weight=k_weight,
+            eps=q_eps,
+        )
+        return q, k
+
+    return q_norm(q), k_norm(k)
 
 
 def apply_qk_norm_with_optional_rope(

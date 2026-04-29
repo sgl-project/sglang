@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.models.adapter.ltx_2_connector import (
     LTX2ConnectorConfig,
 )
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
+from sglang.multimodal_gen.runtime.layers.layernorm import apply_qk_norm_across_heads
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
@@ -166,8 +167,12 @@ class LTX2Attention(torch.nn.Module):
         key = self.to_k(encoder_hidden_states)
         value = self.to_v(encoder_hidden_states)
 
-        query = self.norm_q(query)
-        key = self.norm_k(key)
+        query, key = apply_qk_norm_across_heads(
+            query,
+            key,
+            self.norm_q,
+            self.norm_k,
+        )
 
         if query_rotary_emb is not None:
             if self.rope_type == "interleaved":
