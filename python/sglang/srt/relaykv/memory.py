@@ -79,6 +79,19 @@ RELAYKV_SHADOW_LOG_HOST_BACKUP_KEYS = {
     "kv_layout_reason",
     "kv_layout_range_mapping_supported",
     "kv_layout_range_mapping_reason",
+    "kv_pool_mapping_observed",
+    "kv_pool_mapping_reason",
+    "kv_pool_mapping_object_type",
+    "kv_pool_mapping_shape",
+    "kv_pool_mapping_dtype",
+    "kv_pool_mapping_device",
+    "request_pool_indices_count",
+    "request_pool_indices_preview_head",
+    "request_pool_indices_preview_tail",
+    "cold_range_pool_indices_preview",
+    "cold_range_pool_indices_count",
+    "cold_range_pool_mapping_supported",
+    "cold_range_pool_mapping_reason",
 }
 
 
@@ -124,6 +137,26 @@ class RelayKVLayoutObservation:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class RelayKVPoolMappingObservation:
+    kv_pool_mapping_observed: bool
+    kv_pool_mapping_reason: str
+    kv_pool_mapping_object_type: Optional[str]
+    kv_pool_mapping_shape: Optional[list[int]]
+    kv_pool_mapping_dtype: Optional[str]
+    kv_pool_mapping_device: Optional[str]
+    request_pool_indices_count: int
+    request_pool_indices_preview_head: list[int]
+    request_pool_indices_preview_tail: list[int]
+    cold_range_pool_indices_preview: list[int]
+    cold_range_pool_indices_count: int
+    cold_range_pool_mapping_supported: bool
+    cold_range_pool_mapping_reason: str
+
+    def to_log_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _dtype_bytes(dtype: Any) -> Optional[int]:
     if dtype is None:
         return None
@@ -141,6 +174,14 @@ def _range_tokens(ranges: list[list[int]]) -> int:
     for start, end in ranges:
         total += max(end - start, 0)
     return total
+
+
+def _preview_values(tensor: Any, limit: int) -> list[int]:
+    if tensor is None:
+        return []
+    if getattr(tensor, "numel", lambda: 0)() == 0:
+        return []
+    return [int(x) for x in tensor[:limit].tolist()]
 
 
 def _tensor_shape_list(tensor: Any) -> Optional[list[int]]:
@@ -457,6 +498,162 @@ def observe_kv_layout_for_host_backup(
         kv_layout_reason=observe_reason,
         kv_layout_range_mapping_supported=range_mapping_supported,
         kv_layout_range_mapping_reason=range_mapping_reason,
+    )
+
+
+def observe_request_kv_pool_mapping(
+    *,
+    req_to_token_pool: Any,
+    request_pool_idx: Optional[int],
+    seq_len: int,
+    cold_candidate_ranges: list[list[int]],
+    preview_limit: int = 8,
+) -> RelayKVPoolMappingObservation:
+    if req_to_token_pool is None:
+        return RelayKVPoolMappingObservation(
+            kv_pool_mapping_observed=False,
+            kv_pool_mapping_reason="req_to_token_pool_not_found",
+            kv_pool_mapping_object_type=None,
+            kv_pool_mapping_shape=None,
+            kv_pool_mapping_dtype=None,
+            kv_pool_mapping_device=None,
+            request_pool_indices_count=0,
+            request_pool_indices_preview_head=[],
+            request_pool_indices_preview_tail=[],
+            cold_range_pool_indices_preview=[],
+            cold_range_pool_indices_count=0,
+            cold_range_pool_mapping_supported=False,
+            cold_range_pool_mapping_reason="req_to_token_pool_not_found",
+        )
+    if request_pool_idx is None:
+        return RelayKVPoolMappingObservation(
+            kv_pool_mapping_observed=False,
+            kv_pool_mapping_reason="request_pool_idx_missing",
+            kv_pool_mapping_object_type=type(req_to_token_pool).__name__,
+            kv_pool_mapping_shape=None,
+            kv_pool_mapping_dtype=None,
+            kv_pool_mapping_device=None,
+            request_pool_indices_count=0,
+            request_pool_indices_preview_head=[],
+            request_pool_indices_preview_tail=[],
+            cold_range_pool_indices_preview=[],
+            cold_range_pool_indices_count=0,
+            cold_range_pool_mapping_supported=False,
+            cold_range_pool_mapping_reason="request_pool_idx_missing",
+        )
+    req_to_token = getattr(req_to_token_pool, "req_to_token", None)
+    if req_to_token is None:
+        return RelayKVPoolMappingObservation(
+            kv_pool_mapping_observed=False,
+            kv_pool_mapping_reason="req_to_token_tensor_not_found",
+            kv_pool_mapping_object_type=type(req_to_token_pool).__name__,
+            kv_pool_mapping_shape=None,
+            kv_pool_mapping_dtype=None,
+            kv_pool_mapping_device=None,
+            request_pool_indices_count=0,
+            request_pool_indices_preview_head=[],
+            request_pool_indices_preview_tail=[],
+            cold_range_pool_indices_preview=[],
+            cold_range_pool_indices_count=0,
+            cold_range_pool_mapping_supported=False,
+            cold_range_pool_mapping_reason="req_to_token_tensor_not_found",
+        )
+
+    mapping_shape = _tensor_shape_list(req_to_token)
+    mapping_dtype = str(getattr(req_to_token, "dtype", None))
+    mapping_device = str(getattr(req_to_token, "device", None))
+    if len(req_to_token.shape) < 2:
+        return RelayKVPoolMappingObservation(
+            kv_pool_mapping_observed=False,
+            kv_pool_mapping_reason="req_to_token_tensor_rank_unsupported",
+            kv_pool_mapping_object_type=type(req_to_token_pool).__name__,
+            kv_pool_mapping_shape=mapping_shape,
+            kv_pool_mapping_dtype=mapping_dtype,
+            kv_pool_mapping_device=mapping_device,
+            request_pool_indices_count=0,
+            request_pool_indices_preview_head=[],
+            request_pool_indices_preview_tail=[],
+            cold_range_pool_indices_preview=[],
+            cold_range_pool_indices_count=0,
+            cold_range_pool_mapping_supported=False,
+            cold_range_pool_mapping_reason="req_to_token_tensor_rank_unsupported",
+        )
+    if request_pool_idx < 0 or request_pool_idx >= int(req_to_token.shape[0]):
+        return RelayKVPoolMappingObservation(
+            kv_pool_mapping_observed=False,
+            kv_pool_mapping_reason="request_pool_idx_out_of_bounds",
+            kv_pool_mapping_object_type=type(req_to_token_pool).__name__,
+            kv_pool_mapping_shape=mapping_shape,
+            kv_pool_mapping_dtype=mapping_dtype,
+            kv_pool_mapping_device=mapping_device,
+            request_pool_indices_count=0,
+            request_pool_indices_preview_head=[],
+            request_pool_indices_preview_tail=[],
+            cold_range_pool_indices_preview=[],
+            cold_range_pool_indices_count=0,
+            cold_range_pool_mapping_supported=False,
+            cold_range_pool_mapping_reason="request_pool_idx_out_of_bounds",
+        )
+
+    effective_seq_len = max(min(int(seq_len), int(req_to_token.shape[1])), 0)
+    request_pool_indices = req_to_token[request_pool_idx, :effective_seq_len]
+    request_pool_indices_count = int(request_pool_indices.numel())
+    request_pool_indices_preview_head = _preview_values(request_pool_indices, preview_limit)
+    request_pool_indices_preview_tail = _preview_values(
+        request_pool_indices[-preview_limit:], preview_limit
+    )
+
+    cold_preview_segments = []
+    cold_range_pool_indices_count = 0
+    cold_range_mapping_supported = True
+    if not cold_candidate_ranges:
+        cold_range_mapping_reason = "cold_candidate_ranges_empty"
+        cold_range_mapping_supported = False
+    else:
+        cold_range_mapping_reason = "ok"
+        for start, end in cold_candidate_ranges:
+            if start < 0 or end < start:
+                cold_range_mapping_supported = False
+                cold_range_mapping_reason = "cold_candidate_range_invalid"
+                break
+            if end > effective_seq_len:
+                cold_range_mapping_supported = False
+                cold_range_mapping_reason = "cold_candidate_range_exceeds_request_seqlen"
+                break
+            cold_range_pool_indices_count += max(end - start, 0)
+            if len(cold_preview_segments) < preview_limit:
+                cold_preview_segments.append(request_pool_indices[start:end])
+        if cold_range_mapping_supported and cold_range_pool_indices_count <= 0:
+            cold_range_mapping_supported = False
+            cold_range_mapping_reason = "cold_candidate_ranges_empty_after_clip"
+
+    if cold_preview_segments:
+        cold_preview_tensor = cold_preview_segments[0]
+        for segment in cold_preview_segments[1:]:
+            remaining = preview_limit - int(cold_preview_tensor.numel())
+            if remaining <= 0:
+                break
+            cold_preview_tensor = cold_preview_tensor.new_tensor(
+                cold_preview_tensor.tolist() + segment[:remaining].tolist()
+            )
+        cold_range_pool_indices_preview = _preview_values(cold_preview_tensor, preview_limit)
+    else:
+        cold_range_pool_indices_preview = []
+
+    return RelayKVPoolMappingObservation(
+        kv_pool_mapping_observed=True,
+        kv_pool_mapping_reason="ok",
+        kv_pool_mapping_object_type=type(req_to_token_pool).__name__,
+        kv_pool_mapping_shape=mapping_shape,
+        kv_pool_mapping_dtype=mapping_dtype,
+        kv_pool_mapping_device=mapping_device,
+        request_pool_indices_count=request_pool_indices_count,
+        request_pool_indices_preview_head=request_pool_indices_preview_head,
+        request_pool_indices_preview_tail=request_pool_indices_preview_tail,
+        cold_range_pool_indices_preview=cold_range_pool_indices_preview,
+        cold_range_pool_indices_count=cold_range_pool_indices_count,
+        cold_range_pool_mapping_supported=cold_range_mapping_supported,
+        cold_range_pool_mapping_reason=cold_range_mapping_reason,
     )
 
 

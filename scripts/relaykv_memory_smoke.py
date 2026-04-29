@@ -8,6 +8,7 @@ from sglang.srt.relaykv.memory import (
     estimate_kv_memory_for_plan,
     estimate_kv_memory_from_metadata,
     observe_kv_layout_for_host_backup,
+    observe_request_kv_pool_mapping,
     validate_shadow_log_schema,
 )
 
@@ -37,6 +38,11 @@ class _FakeAllocator:
 
     def get_kvcache(self):
         return self._kvcache
+
+
+class _FakeReqToTokenPool:
+    def __init__(self):
+        self.req_to_token = torch.arange(0, 32, dtype=torch.int32).view(4, 8)
 
 
 def _assert_close(actual: float, expected: float) -> None:
@@ -128,10 +134,31 @@ def main() -> None:
         raise AssertionError(layout_observation)
     if layout_observation.kv_layout_range_mapping_supported is not True:
         raise AssertionError(layout_observation)
+    mapping_observation = observe_request_kv_pool_mapping(
+        req_to_token_pool=_FakeReqToTokenPool(),
+        request_pool_idx=1,
+        seq_len=8,
+        cold_candidate_ranges=[[2, 6]],
+    )
+    if mapping_observation.kv_pool_mapping_observed is not True:
+        raise AssertionError(mapping_observation)
+    if mapping_observation.kv_pool_mapping_shape != [4, 8]:
+        raise AssertionError(mapping_observation)
+    if mapping_observation.request_pool_indices_count != 8:
+        raise AssertionError(mapping_observation)
+    if mapping_observation.request_pool_indices_preview_head != [8, 9, 10, 11, 12, 13, 14, 15]:
+        raise AssertionError(mapping_observation)
+    if mapping_observation.cold_range_pool_indices_preview != [10, 11, 12, 13]:
+        raise AssertionError(mapping_observation)
+    if mapping_observation.cold_range_pool_indices_count != 4:
+        raise AssertionError(mapping_observation)
+    if mapping_observation.cold_range_pool_mapping_supported is not True:
+        raise AssertionError(mapping_observation)
     payload = plan.to_log_dict()
     payload.update(estimate_from_model.to_log_dict())
     payload.update({"host_backup_planned": True, **host_backup_estimate.to_log_dict()})
     payload.update(layout_observation.to_log_dict())
+    payload.update(mapping_observation.to_log_dict())
     validate_shadow_log_schema(payload)
 
     print("relaykv_memory_smoke: ok")

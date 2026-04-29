@@ -172,6 +172,7 @@ from sglang.srt.relaykv.memory import (
     estimate_host_backup_shadow_for_plan,
     estimate_kv_memory_for_plan,
     observe_kv_layout_for_host_backup,
+    observe_request_kv_pool_mapping,
 )
 from sglang.srt.relaykv.metrics import log_shadow_plan, should_log
 from sglang.srt.relaykv.planner import make_shadow_plan
@@ -2755,6 +2756,14 @@ class Scheduler(
                     copy_target_ranges=host_backup_estimate.host_backup_copy_target_ranges,
                 )
                 extra |= layout_observation.to_log_dict()
+                if layout_observation.kv_layout_observed:
+                    mapping_observation = observe_request_kv_pool_mapping(
+                        req_to_token_pool=self.req_to_token_pool,
+                        request_pool_idx=req.req_pool_idx,
+                        seq_len=seq_len,
+                        cold_candidate_ranges=host_backup_estimate.host_backup_copy_target_ranges,
+                    )
+                    extra |= mapping_observation.to_log_dict()
             log_shadow_plan(
                 plan,
                 prefix=f"relaykv_shadow_plan_{phase}",
