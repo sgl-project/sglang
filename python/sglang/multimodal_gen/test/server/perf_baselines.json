@@ -639,28 +639,27 @@
         },
         "zimage_image_t2i_multi_lora": {
             "stages_ms": {
-                "TimestepPreparationStage": 40.51,
-                "DenoisingStage": 673.95,
-                "DecodingStage": 8.43,
-                "LatentPreparationStage": 0.11,
-                "TextEncodingStage": 175.95,
-                "InputValidationStage": 0.04
+                "InputValidationStage": 0.06,
+                "TextEncodingStage": 337.01,
+                "LatentPreparationStage": 0.3,
+                "TimestepPreparationStage": 51.98,
+                "DenoisingStage": 1495.36,
+                "DecodingStage": 12.84
             },
             "denoise_step_ms": {
-                "0": 25.08,
-                "1": 35.42,
-                "2": 82.08,
-                "3": 83.39,
-                "4": 82.18,
-                "5": 83.1,
-                "6": 82.39,
-                "7": 83.34,
-                "8": 85.82
+                "0": 65.79,
+                "1": 173.9,
+                "2": 176.37,
+                "3": 176.14,
+                "4": 176.27,
+                "5": 190.3,
+                "6": 178.87,
+                "7": 176.67,
+                "8": 175.2
             },
-            "expected_e2e_ms": 1047.82,
-            "expected_avg_denoise_ms": 74.33,
-            "expected_median_denoise_ms": 86.33,
-            "estimated_full_test_time_s": 121.1
+            "expected_e2e_ms": 2021.74,
+            "expected_avg_denoise_ms": 165.5,
+            "expected_median_denoise_ms": 176.27
         },
         "zimage_image_t2i_2_gpus": {
             "stages_ms": {

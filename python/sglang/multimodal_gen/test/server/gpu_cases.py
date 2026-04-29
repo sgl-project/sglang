@@ -115,7 +115,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
     ),
-    # Multi-LoRA test case for Z-Image-Turbo
     DiffusionTestCase(
         "zimage_image_t2i_multi_lora",
         DiffusionServerArgs(
@@ -123,7 +122,12 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             lora_path="reverentelusarca/elusarca-anime-style-lora-z-image-turbo",
             second_lora_path="tarn59/pixel_art_style_lora_z_image_turbo",
         ),
-        T2I_sampling_params,
+        DiffusionSamplingParams(
+            prompt=T2I_sampling_params.prompt,
+            output_size=T2I_sampling_params.output_size,
+            extras={"guidance_scale": 3.5},
+        ),
+        run_consistency_check=True,
         run_lora_basic_api_check=True,
         run_lora_dynamic_switch_check=True,
         run_multi_lora_api_check=True,

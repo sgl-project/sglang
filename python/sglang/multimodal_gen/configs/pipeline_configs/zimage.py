@@ -177,6 +177,12 @@ class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
             plan = self._build_zimage_sp_plan(batch)
         return plan
 
+    def get_classifier_free_guidance_scale(self, batch, guidance_scale: float) -> float:
+        # Diffusers Z-Image combines CFG as `-(pos + s*(pos - neg))`, while SGLD uses
+        # the standard `uncond + s*(cond - uncond)`. Combined with the Z-Image DiT's
+        # internal output sign inversion, bumping s by +1 makes the two equivalent.
+        return guidance_scale + 1.0
+
     def get_pos_prompt_embeds(self, batch):
         return batch.prompt_embeds
 
