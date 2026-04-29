@@ -878,7 +878,7 @@ class AiterAttnBackend(AttentionBackend):
                     self.indices_updater_prefill.max_kv_len,
                 )
         elif forward_batch.forward_mode.is_draft_extend():
-            # EAGLE V1: DRAFT_EXTEND mode - uses spec_info.accept_length
+            # EAGLE V1: DRAFT_EXTEND mode - uses spec_info.num_accepted_tokens
             if self.use_mla:
                 kv_indices, kv_indptr, qo_indptr, custom_mask = (
                     spec_info.generate_attn_arg_prefill(
@@ -946,7 +946,7 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 )
                 kv_indices = kv_indices.to(torch.int64)
-                draft_max_extend_len = torch.max(spec_info.accept_length).item()
+                draft_max_extend_len = torch.max(spec_info.num_accepted_tokens).item()
 
                 self.forward_metadata = ForwardMetadata(
                     kv_indptr,
@@ -1956,12 +1956,12 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
             )
         elif forward_mode.is_draft_extend():
-            # EAGLE V1: Uses spec_info.accept_length
+            # EAGLE V1: Uses spec_info.num_accepted_tokens
             num_tokens_per_bs = self.speculative_num_steps + 1
             seq_lens = seq_lens[:bs]
-            accept_lens = spec_info.accept_length[:bs]
+            extend_lens = spec_info.num_accepted_tokens[:bs]
             qo_indptr = self.qo_indptr[: bs + 1]
-            qo_indptr[1 : bs + 1] = torch.cumsum(accept_lens, dim=0)
+            qo_indptr[1 : bs + 1] = torch.cumsum(extend_lens, dim=0)
             kv_indptr = self.kv_indptr[: bs + 1]
             kv_indptr[1 : bs + 1] = torch.cumsum(seq_lens, dim=0)
             kv_indices = self.cuda_graph_kv_indices

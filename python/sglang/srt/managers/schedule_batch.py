@@ -839,13 +839,11 @@ class Req(ReqDllmMixin):
             False  # Track if breakdown was already computed
         )
 
-        # The number of verification forward passes in the speculative decoding.
-        # This is used to compute the average acceptance length per request.
+        # Per-request count of verification forward passes.
         self.spec_verify_ct = 0
 
-        # The number of accepted tokens in speculative decoding for this request.
-        # This is used to compute the acceptance rate and average acceptance length per request.
-        self.spec_accepted_tokens = 0
+        # Per-request count of accepted draft tokens (excludes the bonus token).
+        self.spec_accepted_drafts = 0
 
         # Acceptance histogram for speculative decoding.
         # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.

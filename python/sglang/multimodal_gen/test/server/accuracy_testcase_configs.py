@@ -66,7 +66,6 @@ ACCURACY_TWO_GPU_CASE_IDS = (
     "zimage_image_t2i_2_gpus_non_square",
     "flux_image_t2i_2_gpus",
     "flux_2_image_t2i_2_gpus",
-    "flux_2_klein_ti2i_2_gpus",
 )
 
 ACCURACY_ONE_GPU_CASES = _select_accuracy_cases(

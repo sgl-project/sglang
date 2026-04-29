@@ -514,8 +514,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             "page_first",
             "page_first_direct",
             "page_head",
-            "page_first_kv_spilt",
-        ], "mooncake store storage backend only support page first, page first direct, page head and  page_first_kv_spilt layout"
+            "page_first_kv_split",
+        ], "mooncake store storage backend only support page first, page first direct, page head and  page_first_kv_split layout"
         buffer = self.mem_pool_host.kv_buffer
         try:
             super().register_buffer(buffer)
