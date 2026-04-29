@@ -34,6 +34,9 @@ LOW_ACCEPT_PROMPT = (
 MAX_UPSHIFT_ATTEMPTS = 4
 MAX_DOWNSHIFT_ATTEMPTS = 6
 
+EXPECTED_UPSHIFT_STEPS = 3
+EXPECTED_DOWNSHIFT_STEPS = 1
+
 
 class TestAdaptiveSpeculativeServer(CustomTestCase):
     """Test adaptive speculative decoding with state switching and GSM8K accuracy."""
@@ -116,34 +119,40 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         self.assertEqual(response.status_code, 200, response.text)
         return response.json()
 
-    def _drive_upshift(self) -> dict:
-        """Send high-acceptance prompts until steps upshift to 3."""
+    def _drive_upshift(self, target: int = EXPECTED_UPSHIFT_STEPS) -> dict:
+        """Send high-acceptance prompts until steps upshift to *target*."""
         state = self._get_internal_state()
         for _ in range(MAX_UPSHIFT_ATTEMPTS):
             self._generate(HIGH_ACCEPT_PROMPT)
             state = self._get_internal_state()
-            if state["speculative_num_steps"] == 3:
+            if state["speculative_num_steps"] == target:
                 return state
         return state
 
-    def _drive_downshift(self) -> dict:
-        """Send low-acceptance prompts until steps downshift to 1."""
+    def _drive_downshift(self, target: int = EXPECTED_DOWNSHIFT_STEPS) -> dict:
+        """Send low-acceptance prompts until steps downshift to *target*."""
         state = self._get_internal_state()
         for _ in range(MAX_DOWNSHIFT_ATTEMPTS):
             self._generate(LOW_ACCEPT_PROMPT)
             state = self._get_internal_state()
-            if state["speculative_num_steps"] == 1:
+            if state["speculative_num_steps"] == target:
                 return state
         return state
 
     def test_gsm8k_after_adaptive_switches(self):
         """Exercise up/down/up adaptive switches, then verify GSM8K accuracy."""
         state = self._drive_upshift()
-        self.assertEqual(state["speculative_num_steps"], 3, f"Never upshifted: {state}")
+        self.assertEqual(
+            state["speculative_num_steps"],
+            EXPECTED_UPSHIFT_STEPS,
+            f"Never upshifted: {state}",
+        )
 
         state = self._drive_downshift()
         self.assertEqual(
-            state["speculative_num_steps"], 1, f"Never downshifted: {state}"
+            state["speculative_num_steps"],
+            EXPECTED_DOWNSHIFT_STEPS,
+            f"Never downshifted: {state}",
         )
 
         self._drive_upshift()
