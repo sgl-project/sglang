@@ -656,14 +656,6 @@ def npu_fused_experts_mxfp4(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    # hidden_states, hidden_states_scale = torch.ops.npu.npu_swiglu_mx_quant(
-    #     hidden_states,
-    #     axis=1,
-    #     round_mode="rint",
-    #     dst_type=torch_npu.float4_e2m1fn_x2,
-    #     block_size=32,
-    #     scale_alg=0,
-    # )
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = mxfp4_gmm_npu(
         input=hidden_states,
@@ -732,14 +724,6 @@ def npu_fused_experts_mxfp4_decode(
         group_list=expert_tokens,
         output_dtype=original_dtype,
     )
-    # hidden_states, hidden_states_scale = torch.ops.npu.npu_swiglu_mx_quant(
-    #     hidden_states,
-    #     axis=1,
-    #     round_mode="rint",
-    #     dst_type=torch_npu.float4_e2m1fn_x2,
-    #     block_size=32,
-    #     scale_alg=0,
-    # )
     hidden_states = torch.ops.npu.npu_swiglu(hidden_states)
     hidden_states = mxfp4_gmm_npu(
         input=hidden_states,
@@ -754,7 +738,7 @@ def npu_fused_experts_mxfp4_decode(
     assert original_shape is not None
     final_hidden_states = torch.ops.npu.npu_moe_token_unpermute(
         permuted_tokens=hidden_states,
-        sorted_indices=torch.abs(expanded_row_idx),
+        sorted_indices=expanded_row_idx,
         probs=topk_weights,
     )
 

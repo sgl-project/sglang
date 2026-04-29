@@ -935,6 +935,19 @@ class AscendAttnBackend(AttentionBackend):
         output, _ = torch_npu.npu_attention_update(tuple(lse_list), tuple(out_list), 0)
         output = output.reshape(-1, layer.tp_q_head_num, layer.v_head_dim)
 
+        if num_token_padding != forward_batch.num_token_non_padded_cpu:
+            output = torch.cat(
+                [
+                    output,
+                    output.new_zeros(
+                        num_token_padding - output.shape[0],
+                        *output.shape[1:],
+                    ),
+                ],
+                dim=0,
+            )
+        return output
+
     def forward_extend(
         self,
         q,
