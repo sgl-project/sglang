@@ -320,8 +320,11 @@ class AscendMemcacheStore(HiCacheStorage):
             "ascend_memcache storage backend only supports page_first, "
             "page_first_direct, page_head and page_first_kv_split layout"
         )
-        buffer = self.mem_pool_host.kv_buffer
-        self.register_buffer(buffer)
+        self.register_buffer(self.mem_pool_host.kv_buffer)
+        if self._mla_uses_kv_split():
+            self.register_buffer(self.mem_pool_host.v_buffer)
+            if getattr(self.mem_pool_host, "index_k_buffer", None) is not None:
+                self.register_buffer(self.mem_pool_host.index_k_buffer)
 
         if ENABLE_ASCEND_MEMCACHE_WARMUP:
             self.warmup()
@@ -341,6 +344,13 @@ class AscendMemcacheStore(HiCacheStorage):
         if self.extra_backend_tag is None:
             return keys
         return [f"{self.extra_backend_tag}_{key}" for key in keys]
+
+    def _mla_uses_kv_split(self) -> bool:
+        return (
+            self.is_mla_backend
+            and self.mem_pool_host is not None
+            and getattr(self.mem_pool_host, "layout", None) == "page_first_kv_split"
+        )
 
     def _get_hybrid_page_component_keys(
         self, page_keys: List[str], transfer: PoolTransfer
@@ -550,6 +560,8 @@ class AscendMemcacheStore(HiCacheStorage):
         key_list = []
         for key_ in keys:
             key_list.append(f"{key_}_{self.mla_suffix}_k")
+            if self._mla_uses_kv_split():
+                key_list.append(f"{key_}_{self.mla_suffix}_v")
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
@@ -567,7 +579,7 @@ class AscendMemcacheStore(HiCacheStorage):
     ):
         if key_multiplier is None:
             if self.is_mla_backend:
-                key_multiplier = 1
+                key_multiplier = 2 if self._mla_uses_kv_split() else 1
             else:
                 key_multiplier = 2
                 if self.storage_config and self.storage_config.should_split_heads:
@@ -800,7 +812,10 @@ class AscendMemcacheStore(HiCacheStorage):
             }
         )
 
-        key_multiplier = 1 if self.is_mla_backend else 2
+        if self.is_mla_backend:
+            key_multiplier = 2 if self._mla_uses_kv_split() else 1
+        else:
+            key_multiplier = 2
 
         if self.enable_storage_metrics and end_time > start_time:
             self.prefetch_pgs.append(len(keys))
@@ -823,8 +838,12 @@ class AscendMemcacheStore(HiCacheStorage):
         keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
-            query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
-            key_multiplier = 1
+            query_keys = []
+            for key in keys:
+                query_keys.append(f"{key}_{self.mla_suffix}_k")
+                if self._mla_uses_kv_split():
+                    query_keys.append(f"{key}_{self.mla_suffix}_v")
+            key_multiplier = 2 if self._mla_uses_kv_split() else 1
         else:
             query_keys = []
             if self.storage_config and self.storage_config.should_split_heads:
