@@ -15,6 +15,7 @@
 """Inference-only Qwen3_5 MTP model."""
 
 import logging
+from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -22,6 +23,7 @@ from torch import nn
 from transformers import PretrainedConfig
 
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
@@ -31,7 +33,8 @@ from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_5 import Qwen3_5ForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import add_prefix, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +55,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         # The MTP model is unquantized in the nvfp4 checkpoint.
         if quant_config and quant_config.get_name() == "modelopt_fp4":
+            quant_config = None
+        if (
+            is_npu()
+            and get_global_server_args().speculative_draft_model_quantization is None
+        ):
             quant_config = None
 
         self.config = config
@@ -118,6 +126,18 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ):
+        exit_stack = ExitStack()
+        if (
+            is_npu()
+            and self.quant_config is None
+            and get_global_server_args().quantization is not None
+        ):
+            # ascend mtp unquant
+            exit_stack.enter_context(envs.SGLANG_DEEPEP_BF16_DISPATCH.override(True))
+            exit_stack.enter_context(
+                envs.DEEP_NORMAL_MODE_USE_INT8_QUANT.override(False)
+            )
+
         assert input_embeds is None
         input_embeds = forward_batch.mm_input_embeds
         if (
@@ -149,6 +169,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
                 forward_batch,
                 hidden_states,
             )
+
+        exit_stack.close()
 
         return self.logits_processor(
             input_ids, hidden_states, self.lm_head, forward_batch

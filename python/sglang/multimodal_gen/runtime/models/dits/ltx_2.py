@@ -1775,12 +1775,13 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         skip_video_self_attn_blocks = set(skip_video_self_attn_blocks or ())
         skip_audio_self_attn_blocks = set(skip_audio_self_attn_blocks or ())
         for block in self.transformer_blocks:
+            block_idx = getattr(block, "idx", -1)
             video_self_attn_perturbation_mask = None
             audio_self_attn_perturbation_mask = None
             a2v_cross_attn_perturbation_mask = None
             v2a_cross_attn_perturbation_mask = None
-            skip_video_self_attn = block.idx in skip_video_self_attn_blocks
-            skip_audio_self_attn = block.idx in skip_audio_self_attn_blocks
+            skip_video_self_attn = block_idx in skip_video_self_attn_blocks
+            skip_audio_self_attn = block_idx in skip_audio_self_attn_blocks
             skip_a2v_cross_attn = disable_a2v_cross_attn
             skip_v2a_cross_attn = disable_v2a_cross_attn
             if perturbation_configs is not None:
@@ -1791,7 +1792,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     ) = _ltx2_batched_perturbation_mask(
                         perturbation_configs,
                         "skip_video_self_attn_blocks",
-                        block.idx,
+                        block_idx,
                         hidden_states,
                     )
                 if not skip_audio_self_attn:
@@ -1801,7 +1802,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     ) = _ltx2_batched_perturbation_mask(
                         perturbation_configs,
                         "skip_audio_self_attn_blocks",
-                        block.idx,
+                        block_idx,
                         audio_hidden_states,
                     )
                 if not skip_a2v_cross_attn:
@@ -1811,7 +1812,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     ) = _ltx2_batched_perturbation_mask(
                         perturbation_configs,
                         "skip_a2v_cross_attn",
-                        block.idx,
+                        block_idx,
                         hidden_states,
                     )
                 if not skip_v2a_cross_attn:
@@ -1821,7 +1822,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
                     ) = _ltx2_batched_perturbation_mask(
                         perturbation_configs,
                         "skip_v2a_cross_attn",
-                        block.idx,
+                        block_idx,
                         audio_hidden_states,
                     )
             hidden_states, audio_hidden_states = block(

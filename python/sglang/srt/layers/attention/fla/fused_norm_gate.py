@@ -375,14 +375,22 @@ class FusedRMSNormGated(nn.Module):
         prenorm: bool = False,
         residual_in_fp32: bool = False,
     ) -> torch.Tensor:
-        return rms_norm_gated(
-            x,
-            g,
-            self.weight,
-            self.bias,
-            self.activation,
-            residual=residual,
-            eps=self.eps,
-            prenorm=prenorm,
-            residual_in_fp32=residual_in_fp32,
-        )
+        if _use_cpu:
+            assert (
+                self.activation == "silu"
+            ), "CPU rmsnorm_gated currently only supports activation silu"
+            return torch.ops.sgl_kernel.fused_rmsnorm_gated_cpu(
+                x, self.weight, g, self.eps
+            )
+        else:
+            return rms_norm_gated(
+                x,
+                g,
+                self.weight,
+                self.bias,
+                self.activation,
+                residual=residual,
+                eps=self.eps,
+                prenorm=prenorm,
+                residual_in_fp32=residual_in_fp32,
+            )
