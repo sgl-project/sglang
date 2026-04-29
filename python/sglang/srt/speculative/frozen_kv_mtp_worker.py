@@ -11,29 +11,56 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Gemma 4 frozen-KV MTP draft worker. Assistant reads target KV only; verify
-reuses EAGLE's contract. Stubs until draft/verify are wired.
+"""Gemma 4 frozen-KV MTP draft worker.
+
+The assistant reads target KV only. It reuses EAGLE's verify input/output
+contract, but owns the seed and recurrent draft loop because there is no
+assistant-side KV extension.
 """
 
 from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import (
     speculative_moe_a2a_backend_context,
     speculative_moe_backend_context,
 )
+from sglang.srt.layers.utils.logprob import add_output_logprobs_for_spec_v1
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
+from sglang.srt.observability.req_time_stats import set_time_batch
+from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.eagle_info import (
+    EagleDraftInput,
+    EagleVerifyInput,
+    EagleVerifyOutput,
+)
+from sglang.srt.speculative.eagle_utils import (
+    build_tree_kernel_efficient,
+    organize_draft_results,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_utils import draft_tp_context
+from sglang.srt.speculative.spec_utils import (
+    draft_tp_context,
+    fast_topk,
+    generate_token_bitmask,
+    maybe_detect_nan,
+    maybe_detect_oob,
+    select_top_k_tokens,
+)
 from sglang.srt.utils import empty_context
 
 if TYPE_CHECKING:
@@ -138,6 +165,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
 
         self.cuda_graph_runner = None
+        self.draft_attn_backend = self.draft_model_runner.attn_backend
 
     @property
     def draft_model_runner(self):
@@ -184,6 +212,20 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.spec_info = saved_spec_info
             forward_batch.token_to_kv_pool = saved_kv_pool
 
+    @contextmanager
+    def _target_kv_pool_view(self, forward_batch: ForwardBatch):
+        if self.kv_context is None:
+            raise RuntimeError(
+                "FrozenKVMTPWorker._target_kv_pool_view called before "
+                "the model was bound; call _bind_kv_context() first."
+            )
+        saved_kv_pool = forward_batch.token_to_kv_pool
+        forward_batch.token_to_kv_pool = self.kv_context.target_token_to_kv_pool
+        try:
+            yield
+        finally:
+            forward_batch.token_to_kv_pool = saved_kv_pool
+
     def _set_positions(self, forward_batch: ForwardBatch) -> None:
         """Rope phase = last written target slot: ``clamp(seq_lens-1)``, not
         advanced per draft step.
@@ -198,14 +240,197 @@ class FrozenKVMTPWorker(TpModelWorker):
             else:
                 forward_batch.positions = positions
 
-    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
-        raise NotImplementedError(
-            "FrozenKVMTPWorker.forward_batch_generation is not yet implemented."
+    def _position_for_batch(self, batch: ScheduleBatch) -> torch.Tensor:
+        return torch.clamp(batch.seq_lens - 1, min=0).to(torch.int64)
+
+    @property
+    def _recurrent_hidden_size(self) -> int:
+        return int(self.draft_model_runner.model.backbone_hidden_size)
+
+    def _init_frozen_kv_metadata(self, forward_batch: ForwardBatch) -> None:
+        """Build decode metadata from target committed-prefix slots only."""
+        if forward_batch.forward_mode.is_idle():
+            return
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
+        else:
+            forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
+        with self._frozen_kv_target_view(forward_batch):
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.attn_backend = self.draft_attn_backend
+
+    def _select_last_extend_hidden(
+        self, batch: ScheduleBatch, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """Pick the final target hidden state for each request in an extend batch."""
+        if hidden_states.shape[0] == batch.batch_size():
+            return hidden_states
+        lens = torch.tensor(batch.extend_lens, device=hidden_states.device)
+        last_indices = torch.cumsum(lens, dim=0) - 1
+        return hidden_states[last_indices.to(torch.long)]
+
+    def _select_last_verified_seed(
+        self, draft_input: EagleDraftInput
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if draft_input.accept_length is None:
+            return draft_input.verified_id, draft_input.hidden_states
+
+        counts = draft_input.accept_length.to(torch.long) + 1
+        last_indices = torch.cumsum(counts, dim=0) - 1
+        return (
+            draft_input.verified_id[last_indices],
+            draft_input.hidden_states[last_indices],
         )
 
-    def forward_target_extend(self, batch: ScheduleBatch):
-        raise NotImplementedError(
-            "FrozenKVMTPWorker.forward_target_extend is not yet implemented."
+    def _capture_for_decode(
+        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
+    ) -> None:
+        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
+        draft_input.hidden_states = logits_output.hidden_states
+
+    def _run_assistant_seed_step(
+        self,
+        batch: ScheduleBatch,
+        last_token_ids: torch.Tensor,
+        last_hidden_states: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
+        mm_input_embeds: Optional[torch.Tensor] = None,
+        draft_input: Optional[EagleDraftInput] = None,
+    ) -> None:
+        """Run the one-token assistant seed step against frozen target KV."""
+        if batch.forward_mode.is_idle() or last_token_ids.numel() == 0:
+            batch.spec_info = EagleDraftInput.create_idle_input(
+                device=batch.device,
+                hidden_size=self._recurrent_hidden_size,
+                dtype=self.model_config.dtype,
+                topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
+            return
+
+        if draft_input is None:
+            draft_input = EagleDraftInput()
+
+        draft_input.verified_id = last_token_ids.to(torch.int64)
+        draft_input.hidden_states = last_hidden_states
+        draft_input.capture_hidden_mode = CaptureHiddenMode.LAST
+        draft_input.num_tokens_per_req = 1
+        draft_input.num_tokens_for_logprob_per_req = 1
+        draft_input.positions = self._position_for_batch(batch)
+
+        forward_mode_backup = batch.forward_mode
+        input_ids_backup = batch.input_ids
+        return_hidden_states_backup = batch.return_hidden_states
+        return_logprob_backup = batch.return_logprob
+        spec_info_backup = batch.spec_info
+
+        batch.forward_mode = ForwardMode.DECODE
+        batch.input_ids = draft_input.verified_id
+        batch.return_hidden_states = False
+        batch.return_logprob = False
+        batch.spec_info = draft_input
+
+        try:
+            model_worker_batch = batch.get_model_worker_batch(
+                seq_lens_cpu_cache=seq_lens_cpu
+            )
+            forward_batch = ForwardBatch.init_new(
+                model_worker_batch, self.draft_model_runner
+            )
+            forward_batch.return_logprob = False
+            if mm_input_embeds is not None:
+                forward_batch.mm_input_embeds = mm_input_embeds
+            self._set_positions(forward_batch)
+            self._init_frozen_kv_metadata(forward_batch)
+            with self._target_kv_pool_view(forward_batch):
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
+            maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_seed")
+            self._capture_for_decode(logits_output, draft_input)
+        finally:
+            batch.forward_mode = forward_mode_backup
+            batch.input_ids = input_ids_backup
+            batch.return_hidden_states = return_hidden_states_backup
+            batch.return_logprob = return_logprob_backup
+            # Keep the seeded draft state; only restore the old object on error paths
+            # before the assignment above could have happened.
+            if batch.spec_info is not draft_input:
+                batch.spec_info = spec_info_backup
+
+    def forward_batch_generation(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        if batch.forward_mode.is_extend() or batch.is_extend_in_batch:
+            (
+                logits_output,
+                next_token_ids,
+                seq_lens_cpu,
+                can_run_cuda_graph,
+            ) = self.forward_target_extend(batch)
+            with self.draft_tp_context(
+                self.draft_model_runner.tp_group
+            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                self.forward_draft_extend(
+                    batch,
+                    logits_output.hidden_states,
+                    next_token_ids,
+                    seq_lens_cpu,
+                    logits_output.mm_input_embeds,
+                )
+            return GenerationBatchResult(
+                logits_output=logits_output,
+                next_token_ids=next_token_ids,
+                num_accepted_tokens=0,
+                can_run_cuda_graph=can_run_cuda_graph,
+            )
+
+        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            spec_info = self.draft(batch)
+        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
+        set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
+
+        logits_output, verify_output, _, can_run_cuda_graph = self.verify(
+            batch, spec_info
+        )
+
+        if get_global_tracing_enabled():
+            for idx, req in enumerate(batch.reqs):
+                accepted = verify_output.accept_length_per_req_cpu[idx]
+                req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+
+        set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            if (
+                self.server_args.enable_dp_attention
+                or batch.spec_info.verified_id.numel()
+            ):
+                self.forward_draft_extend_after_decode(batch)
+        set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
+
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=verify_output.verified_id,
+            num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
+            accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    def forward_target_extend(
+        self, batch: ScheduleBatch
+    ) -> Tuple[LogitsProcessorOutput, torch.Tensor, Optional[torch.Tensor], bool]:
+        model_worker_batch = batch.get_model_worker_batch()
+        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+        batch_result = self.target_worker.forward_batch_generation(model_worker_batch)
+        return (
+            batch_result.logits_output,
+            batch_result.next_token_ids,
+            model_worker_batch.seq_lens_cpu,
+            batch_result.can_run_cuda_graph,
         )
 
     def forward_draft_extend(
@@ -216,17 +441,247 @@ class FrozenKVMTPWorker(TpModelWorker):
         seq_lens_cpu: Optional[torch.Tensor],
         mm_input_embeds: Optional[torch.Tensor] = None,
     ) -> None:
-        raise NotImplementedError(
-            "FrozenKVMTPWorker.forward_draft_extend is not yet implemented."
+        last_hidden = self._select_last_extend_hidden(batch, hidden_states)
+        self._run_assistant_seed_step(
+            batch,
+            next_token_ids,
+            last_hidden,
+            seq_lens_cpu=seq_lens_cpu,
+            mm_input_embeds=mm_input_embeds,
         )
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch) -> None:
-        raise NotImplementedError(
-            "FrozenKVMTPWorker.forward_draft_extend_after_decode is not yet implemented."
+        assert isinstance(batch.spec_info, EagleDraftInput)
+        input_is_idle = batch.forward_mode.is_idle()
+        if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
+            batch = batch.copy()
+            batch.prepare_for_idle()
+            batch.spec_info = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=self._recurrent_hidden_size,
+                dtype=self.model_config.dtype,
+                topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
+
+        if batch.forward_mode.is_idle():
+            return
+
+        draft_input = batch.spec_info
+        last_token_ids, last_hidden = self._select_last_verified_seed(draft_input)
+        self._run_assistant_seed_step(
+            batch,
+            last_token_ids,
+            last_hidden,
+            seq_lens_cpu=draft_input.seq_lens_for_draft_extend_cpu,
+            draft_input=draft_input,
         )
 
     def draft(self, batch: ScheduleBatch):
-        raise NotImplementedError("FrozenKVMTPWorker.draft is not yet implemented.")
+        if batch.forward_mode.is_idle():
+            return EagleVerifyInput.create_idle_input(
+                self.topk,
+                self.speculative_num_steps,
+                self.speculative_num_draft_tokens,
+            )
 
-    def verify(self, batch: ScheduleBatch, spec_info):
-        raise NotImplementedError("FrozenKVMTPWorker.verify is not yet implemented.")
+        batch.maybe_evict_swa()
+        for req in batch.reqs:
+            req.decode_batch_idx += 1
+
+        spec_info = batch.spec_info
+        assert isinstance(spec_info, EagleDraftInput)
+
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                spec_info.verified_id.to(torch.int64)
+            )
+
+        spec_info.capture_hidden_mode = CaptureHiddenMode.LAST
+        spec_info.num_tokens_per_req = self.topk
+        spec_info.num_tokens_for_logprob_per_req = self.topk
+        spec_info.positions = self._position_for_batch(batch)
+        batch.seq_lens_sum = torch.sum(batch.seq_lens).item()
+        batch.return_hidden_states = False
+
+        model_worker_batch = batch.get_model_worker_batch()
+        assert model_worker_batch.capture_hidden_mode == CaptureHiddenMode.LAST
+        forward_batch = ForwardBatch.init_new(
+            model_worker_batch, self.draft_model_runner
+        )
+        self._set_positions(forward_batch)
+        forward_batch.can_run_dp_cuda_graph = False
+
+        parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
+
+        (
+            tree_mask,
+            position,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            draft_tokens,
+        ) = build_tree_kernel_efficient(
+            spec_info.verified_id,
+            parent_list,
+            top_scores_index,
+            draft_tokens,
+            batch.seq_lens,
+            batch.seq_lens_sum,
+            self.topk,
+            self.speculative_num_steps,
+            self.speculative_num_draft_tokens,
+        )
+
+        return EagleVerifyInput(
+            draft_token=draft_tokens,
+            custom_mask=tree_mask,
+            positions=position,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
+            spec_steps=self.speculative_num_steps,
+            topk=self.topk,
+            draft_token_num=self.speculative_num_draft_tokens,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens_sum=forward_batch.seq_lens_sum,
+            seq_lens_cpu=forward_batch.seq_lens_cpu,
+        )
+
+    def draft_forward(self, forward_batch: ForwardBatch):
+        spec_info = forward_batch.spec_info
+        assert isinstance(spec_info, EagleDraftInput)
+        topk_p, topk_index, hidden_states = (
+            spec_info.topk_p,
+            spec_info.topk_index,
+            spec_info.hidden_states,
+        )
+        maybe_detect_nan(topk_p, "frozen_kv_mtp_draft: initial topk_p")
+
+        score_list: List[torch.Tensor] = []
+        token_list: List[torch.Tensor] = []
+        parents_list: List[torch.Tensor] = []
+
+        scores = None
+        for i in range(self.speculative_num_steps):
+            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                i, topk_p, topk_index, hidden_states, scores, self.topk
+            )
+            score_list.append(tree_info[0])
+            token_list.append(tree_info[1])
+            parents_list.append(tree_info[2])
+
+            if i == self.speculative_num_steps - 1:
+                break
+
+            forward_batch.input_ids = input_ids
+            forward_batch.spec_info.hidden_states = hidden_states
+            self._set_positions(forward_batch)
+            self._init_frozen_kv_metadata(forward_batch)
+
+            with self._target_kv_pool_view(forward_batch):
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
+
+            maybe_detect_nan(
+                logits_output.next_token_logits, f"frozen_kv_mtp_draft step {i}"
+            )
+            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            maybe_detect_oob(
+                topk_index,
+                0,
+                logits_output.next_token_logits.shape[-1],
+                "frozen_kv_mtp_draft: topk_index OOB",
+            )
+            hidden_states = logits_output.hidden_states
+
+        return organize_draft_results(
+            score_list, token_list, parents_list, self.speculative_num_draft_tokens
+        )
+
+    def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+        seq_lens_pre_verify = batch.seq_lens.clone()
+        spec_info.prepare_for_verify(batch, self.page_size)
+        spec_info.num_tokens_per_req = self.speculative_num_steps + 1
+        batch.return_hidden_states = False
+        batch.forward_mode = (
+            ForwardMode.TARGET_VERIFY
+            if not batch.forward_mode.is_idle()
+            else ForwardMode.IDLE
+        )
+        batch.spec_info = spec_info
+
+        model_worker_batch = batch.get_model_worker_batch(
+            seq_lens_cpu_cache=spec_info.seq_lens_cpu
+        )
+        assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
+
+        if batch.has_grammar:
+            retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
+            retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
+            draft_tokens_cpu = spec_info.draft_token.view(
+                spec_info.retrieve_next_token.shape
+            ).cpu()
+
+        batch_result = self.target_worker.forward_batch_generation(
+            model_worker_batch, is_verify=True
+        )
+        logits_output, can_run_cuda_graph = (
+            batch_result.logits_output,
+            batch_result.can_run_cuda_graph,
+        )
+
+        vocab_mask = None
+        if batch.has_grammar:
+            vocab_mask = generate_token_bitmask(
+                batch.reqs,
+                spec_info,
+                retrieve_next_token_cpu,
+                retrieve_next_sibling_cpu,
+                draft_tokens_cpu,
+                batch.sampling_info.vocab_size,
+            )
+            if vocab_mask is not None:
+                assert spec_info.grammar is not None
+                vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
+                batch.sampling_info.vocab_mask = None
+
+        maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_verify")
+
+        spec_info.hidden_states = logits_output.hidden_states
+        res: EagleVerifyOutput = spec_info.verify(
+            batch,
+            logits_output,
+            self.token_to_kv_pool_allocator,
+            self.page_size,
+            vocab_mask,
+        )
+
+        logits_output.next_token_logits = logits_output.next_token_logits[
+            res.accepted_indices
+        ]
+        logits_output.hidden_states = logits_output.hidden_states[res.accepted_indices]
+
+        if (
+            self.target_worker.model_runner.hybrid_gdn_config is not None
+            or self.target_worker.model_runner.mamba2_config is not None
+            or self.target_worker.model_runner.hybrid_lightning_config is not None
+        ):
+            logger.warning(
+                "Frozen-KV MTP does not implement mamba state updates; "
+                "Gemma 4 targets should not use this path."
+            )
+
+        if batch.return_logprob:
+            add_output_logprobs_for_spec_v1(batch, res, logits_output)
+
+        batch.forward_mode = (
+            ForwardMode.DECODE if not batch.forward_mode.is_idle() else ForwardMode.IDLE
+        )
+        batch.spec_info = res.draft_input
+
+        del seq_lens_pre_verify
+        return logits_output, res, model_worker_batch, can_run_cuda_graph

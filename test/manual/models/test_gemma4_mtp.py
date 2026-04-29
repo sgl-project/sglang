@@ -112,9 +112,8 @@ class Gemma4MTPGSM8KMixin:
     @classmethod
     def _server_env(cls) -> Optional[Dict[str, str]]:
         env: Dict[str, str] = dict(os.environ)
-        # Force spec v2 path on for MTP runs (NEXTN routes through the
-        # FrozenKVMTPWorker only via spec v2).
-        env["SGLANG_ENABLE_SPEC_V2"] = "1"
+        # This harness validates the non-overlap FrozenKVMTPWorker path.
+        env["SGLANG_ENABLE_SPEC_V2"] = "0"
         cuda_visible = (
             os.environ.get(SERVER_CUDA_VISIBLE_DEVICES_ENV)
             or cls.model_pair.server_cuda_visible_devices
@@ -164,9 +163,7 @@ class Gemma4MTPGSM8KMixin:
 
     @classmethod
     def _mtp_server_args(cls, cuda_graph: bool) -> List[str]:
-        # Frozen-KV MTP runs through the NEXTN spec-v2 routing in SGLang;
-        # the worker itself is selected by the assistant model_type
-        # (gemma4_assistant) once SGLANG_ENABLE_SPEC_V2 is on.
+        # NEXTN is resolved to Frozen-KV MTP for Gemma4 assistant drafts.
         args = [
             "--speculative-algorithm",
             "NEXTN",

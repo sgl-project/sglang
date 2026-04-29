@@ -95,7 +95,7 @@ def build_frozen_kv_context(
     """
     target_text = _get_text_config(target_model)
     assistant_text = _get_text_config(assistant_model)
-    layers = target_model.model.layers
+    layers = _resolve_target_text_model(target_model).layers
 
     def kv_owner(idx: int) -> int:
         attn = layers[idx].self_attn
@@ -437,6 +437,11 @@ class Gemma4AssistantForCausalLM(PreTrainedModel):
         self.target_embed_tokens.weight = embed
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def get_attention_sliding_window_size(self) -> int:
+        # Gemma 4 config treats the bound as inclusive; SGLang attention metadata
+        # uses an exclusive window size, matching the target Gemma 4 models.
+        return _get_text_config(self.config).sliding_window - 1
 
     @torch.no_grad()
     def forward(
