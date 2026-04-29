@@ -28,7 +28,6 @@ DSV4_FLASH_ENV = {
     "SGLANG_DSV4_FP4_EXPERTS": "0",
     # MTP num_draft_tokens=4 scales dispatch by ~4x; 256 overflows at bs=128.
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
-    "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
 }
 
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
