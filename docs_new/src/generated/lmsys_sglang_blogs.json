@@ -1,0 +1,59 @@
+{
+  "generatedAt": "2026-04-07T00:14:40.777335Z",
+  "sourceRepo": "https://github.com/lm-sys/lm-sys.github.io/tree/main/blog",
+  "keywords": [
+    "sglang",
+    "sgl-project/sglang",
+    "sgl-kernel",
+    "sglang-jax",
+    "sgl diffusion",
+    "sglang diffusion"
+  ],
+  "maxCards": 6,
+  "totalBlogFilesScanned": 80,
+  "cardsPublished": 6,
+  "posts": [
+    {
+      "slug": "2026-03-25-gtc2026",
+      "title": "Highlights of SGLang at NVIDIA GTC 2026",
+      "url": "https://lmsys.org/blog/2026-03-25-gtc2026/",
+      "image": "https://lmsys.org/images/blog/gtc2026/happyhour-crowd.jpg",
+      "date": "March 31, 2026"
+    },
+    {
+      "slug": "2026-03-25-eep-partial-failure-tolerance",
+      "title": "Elastic EP in SGLang: Achieving Partial Failure Tolerance for DeepSeek MoE Deployments",
+      "url": "https://lmsys.org/blog/2026-03-25-eep-partial-failure-tolerance/",
+      "image": "https://lmsys.org/images/blog/eep-partial-failure-tolerance/figure.png",
+      "date": "March 25, 2026"
+    },
+    {
+      "slug": "2026-03-17-rocm-miles-rl-amd",
+      "title": "ROCm Support for Miles: Large-Scale RL Post-Training on AMD Instinct\u2122 GPUs",
+      "url": "https://lmsys.org/blog/2026-03-17-rocm-miles-rl-amd/",
+      "image": "https://lmsys.org/images/blog/rocm_miles_rl/fig_1.png",
+      "date": "March 17, 2026"
+    },
+    {
+      "slug": "2026-03-11-run-nvidia-nemotron-3-super",
+      "title": "SGLang Adds Day-0 Support for NVIDIA Nemotron 3 Super for building High-Efficiency Multi-Agent Systems",
+      "url": "https://lmsys.org/blog/2026-03-11-run-nvidia-nemotron-3-super/",
+      "image": "https://lmsys.org/images/blog/nemotron-3-super/figure_1.svg",
+      "date": "March 11, 2026"
+    },
+    {
+      "slug": "2026-02-20-gb300-inferencex",
+      "title": "Unlocking 25x Inference Performance with SGLang on NVIDIA GB300 NVL72",
+      "url": "https://lmsys.org/blog/2026-02-20-gb300-inferencex/",
+      "image": "https://lmsys.org/images/blog/gb300_inferencex/img-1.png",
+      "date": "February 20, 2026"
+    },
+    {
+      "slug": "2026-02-19-gb300-longctx",
+      "title": "Deploying DeepSeek on GB300 NVL72: Big Wins in Long-Context Inference",
+      "url": "https://lmsys.org/blog/2026-02-19-gb300-longctx/",
+      "image": "https://lmsys.org/images/blog/gb300_longctx/cover.png",
+      "date": "February 19, 2026"
+    }
+  ]
+}

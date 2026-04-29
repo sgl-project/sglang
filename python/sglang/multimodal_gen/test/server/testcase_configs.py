@@ -5,12 +5,12 @@ Usage:
 
 pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py
 # for a single testcase, look for the name of the testcase in ONE_GPU_CASES,
-# ONE_GPU_CASES_C, or TWO_GPU_CASES
+# ONE_GPU_MODELOPT_CASES, or TWO_GPU_CASES
 pytest python/sglang/multimodal_gen/test/server/test_server_1_gpu.py -k qwen_image_t2i
 
 
 To add a new testcase:
-1. add your testcase with case-id: `my_new_test_case_id` to the appropriate `*_CASES_*` list
+1. add your testcase with case-id: `my_new_test_case_id` to `ONE_GPU_CASES`, `ONE_GPU_MODELOPT_CASES`, or `TWO_GPU_CASES`
 2. run `SGLANG_GEN_BASELINE=1 pytest -s python/sglang/multimodal_gen/test/server/ -k my_new_test_case_id`
 3. insert or override the corresponding scenario in `scenarios` section of perf_baselines.json with the output baseline of step-2
 
@@ -364,7 +364,7 @@ T2I_sampling_params = DiffusionSamplingParams(
 MODELOPT_T2I_CI_sampling_params = DiffusionSamplingParams(
     prompt="Doraemon is eating dorayaki",
     output_size="768x768",
-    extras={"num_inference_steps": 12},
+    extras={"num_inference_steps": 12, "seed": 0},
 )
 
 TI2I_sampling_params = DiffusionSamplingParams(
@@ -406,8 +406,9 @@ T2V_sampling_params = DiffusionSamplingParams(
 MODELOPT_T2V_CI_sampling_params = DiffusionSamplingParams(
     prompt=T2V_PROMPT,
     output_size="640x384",
+    seconds=5,
     num_frames=17,
-    extras={"num_inference_steps": 12},
+    extras={"num_inference_steps": 12, "seed": 0},
 )
 
 TI2V_sampling_params = DiffusionSamplingParams(
@@ -434,7 +435,7 @@ MODELOPT_FLUX1_FP8_TRANSFORMER = "BBuf/flux1-dev-modelopt-fp8-sglang-transformer
 MODELOPT_FLUX2_FP8_TRANSFORMER = "BBuf/flux2-dev-modelopt-fp8-sglang-transformer"
 MODELOPT_WAN22_FP8_TRANSFORMER = "BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer"
 MODELOPT_FLUX1_NVFP4_TRANSFORMER = "BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer"
-MODELOPT_FLUX2_NVFP4_MODEL = "black-forest-labs/FLUX.2-dev-NVFP4"
+MODELOPT_FLUX2_NVFP4_WEIGHTS = "black-forest-labs/FLUX.2-dev-NVFP4"
 MODELOPT_WAN22_NVFP4_TRANSFORMER = (
     "BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer"
 )
