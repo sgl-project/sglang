@@ -321,25 +321,18 @@ def _resolve_speculative_algorithm_alias(
     if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
         raise ValueError(
             "Gemma4AssistantForCausalLM draft requires "
-            "--speculative-algorithm NEXTN (FROZEN_KV_MTP); EAGLE3 is "
+            "--speculative-algorithm NEXTN or EAGLE; EAGLE3 is "
             "not supported for this draft architecture."
         )
 
-    if speculative_algorithm == "NEXTN":
+    if speculative_algorithm == "NEXTN" or speculative_algorithm == "EAGLE":
         if is_gemma4_draft:
             logger.info(
-                "speculative: detected Gemma4AssistantForCausalLM draft; "
-                "promoting --speculative-algorithm NEXTN to FROZEN_KV_MTP."
+                "Detected Gemma4AssistantForCausalLM draft; "
+                f"promoting --speculative-algorithm {speculative_algorithm} to FROZEN_KV_MTP."
             )
             return "FROZEN_KV_MTP"
         return "EAGLE"
-
-    if speculative_algorithm == "EAGLE" and is_gemma4_draft:
-        logger.info(
-            "speculative: detected Gemma4AssistantForCausalLM draft with "
-            "--speculative-algorithm EAGLE; promoting to FROZEN_KV_MTP."
-        )
-        return "FROZEN_KV_MTP"
 
     return speculative_algorithm
 
