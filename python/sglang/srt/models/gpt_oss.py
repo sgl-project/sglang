@@ -23,6 +23,7 @@ from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+from sglang.srt.platforms import current_platform
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -1185,8 +1186,8 @@ class GptOssForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if not self.pp_group.is_last_rank:

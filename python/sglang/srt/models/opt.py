@@ -19,6 +19,7 @@ from collections.abc import Iterable
 from typing import Optional, Union
 
 import torch
+from sglang.srt.platforms import current_platform
 from torch import nn
 from transformers import OPTConfig
 
@@ -613,8 +614,8 @@ class OPTForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def get_embed(self):
         return self.model.embed_tokens.weight
@@ -628,8 +629,8 @@ class OPTForCausalLM(nn.Module):
             return
         del self.model.embed_tokens.weight
         self.model.embed_tokens.weight = embed
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

@@ -23,6 +23,7 @@ import logging
 from typing import Iterable, Optional, Tuple, Union
 
 import torch
+from sglang.srt.platforms import current_platform
 import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
@@ -820,8 +821,8 @@ class LLaDA2MoeModelLM(nn.Module):
         del self.lm_head.weight
         self.model.word_embeddings.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     @torch.no_grad()
     def forward(

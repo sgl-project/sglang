@@ -22,6 +22,7 @@ from functools import lru_cache
 from typing import Iterable, List, Optional, Tuple
 
 import torch
+from sglang.srt.platforms import current_platform
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
@@ -813,8 +814,8 @@ class Glm4vForConditionalGeneration(nn.Module):
         else:
             del self.lm_head.weight
             self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
 
 EntryClass = [Glm4vForConditionalGeneration]
