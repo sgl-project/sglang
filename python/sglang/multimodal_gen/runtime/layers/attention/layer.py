@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
+    get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
@@ -538,10 +539,21 @@ class USPAttention(nn.Module):
             return out
 
         sp_size = get_ulysses_parallel_world_size()
+        ring_size = get_ring_parallel_world_size()
         if num_replicated_prefix > 0 and num_replicated_suffix > 0:
             raise ValueError(
                 "USPAttention does not support replicated prefix and suffix at the same time."
             )
+
+        # When ring > 1, convert replicated tokens to sharded so the
+        # standard ulysses + ring path can handle them.  The ulysses-only
+        # optimized paths below assume ring == 1.
+        num_rep = num_replicated_prefix or num_replicated_suffix
+        if ring_size > 1 and num_rep > 0:
+            return self._shard_replicated_and_forward(
+                q, k, v, num_replicated_prefix, num_replicated_suffix
+            )
+
         if sp_size > 1 and num_replicated_prefix > 0:
             return self._forward_with_replicated_prefix(
                 q, k, v, ctx_attn_metadata, num_replicated_prefix
@@ -559,7 +571,7 @@ class USPAttention(nn.Module):
             v = _usp_input_all_to_all(v, head_dim=2)
 
         # Ring Attention within subgroups or local attention
-        if get_ring_parallel_world_size() > 1:
+        if ring_size > 1:
             out = ring_attn(
                 q,
                 k,
@@ -597,9 +609,12 @@ class USPAttention(nn.Module):
         3. Locally slice the replicated prefix to the same head shard.
         4. Concatenate [prefix_h_local, gathered_suffix] and run attention.
         5. Split output, all-to-all back the suffix, all-gather prefix heads.
+
+        Note: this path is only used when ring == 1 (ulysses-only).
+        When ring > 1, forward() dispatches to _shard_replicated_and_forward().
         """
         sp_size = get_ulysses_parallel_world_size()
-        sp_rank = get_sp_parallel_rank()
+        sp_rank = get_ulysses_parallel_rank()
 
         q_rep, q_shard = q[:, :num_rep], q[:, num_rep:]
         k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
@@ -635,6 +650,76 @@ class USPAttention(nn.Module):
         )
         out_rep = torch.cat(gathered, dim=2)
 
+        return torch.cat([out_rep, out_shard], dim=1)
+
+    def _shard_replicated_and_forward(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        num_replicated_prefix: int,
+        num_replicated_suffix: int,
+    ) -> torch.Tensor:
+        """Convert replicated prefix/suffix into sharded tokens, run the
+        standard USPAttention path (ulysses + ring), then reconstruct.
+
+        Called when ring > 1 and replicated tokens are present.
+        """
+        sp_group = get_sp_group()
+        total_sp_size = sp_group.world_size
+        sp_rank = sp_group.rank_in_group
+        num_rep = num_replicated_prefix or num_replicated_suffix
+        is_suffix = num_replicated_suffix > 0
+
+        # For suffix, rotate to front so we can treat it as prefix.
+        if is_suffix:
+            q = torch.cat([q[:, -num_rep:], q[:, :-num_rep]], dim=1)
+            k = torch.cat([k[:, -num_rep:], k[:, :-num_rep]], dim=1)
+            v = torch.cat([v[:, -num_rep:], v[:, :-num_rep]], dim=1)
+
+        q_rep, q_shard = q[:, :num_rep], q[:, num_rep:]
+        k_rep, k_shard = k[:, :num_rep], k[:, num_rep:]
+        v_rep, v_shard = v[:, :num_rep], v[:, num_rep:]
+
+        # Pad to nearest multiple of total_sp_size if needed.
+        pad_len = (total_sp_size - num_rep % total_sp_size) % total_sp_size
+        if pad_len > 0:
+            pad_shape = (q_rep.shape[0], pad_len, *q_rep.shape[2:])
+            q_rep = torch.cat([q_rep, q_rep.new_zeros(pad_shape)], dim=1)
+            k_rep = torch.cat([k_rep, k_rep.new_zeros(pad_shape)], dim=1)
+            v_rep = torch.cat([v_rep, v_rep.new_zeros(pad_shape)], dim=1)
+        padded_rep = num_rep + pad_len
+
+        # Each rank keeps only its chunk of the replicated tokens.
+        rep_chunk = padded_rep // total_sp_size
+        rep_start = sp_rank * rep_chunk
+        rep_end = rep_start + rep_chunk
+
+        q_rep = q_rep[:, rep_start:rep_end].contiguous()
+        k_rep = k_rep[:, rep_start:rep_end].contiguous()
+        v_rep = v_rep[:, rep_start:rep_end].contiguous()
+
+        # Now fully SP-sharded — delegate to standard path.
+        out = self.forward(
+            torch.cat([q_rep, q_shard], dim=1),
+            torch.cat([k_rep, k_shard], dim=1),
+            torch.cat([v_rep, v_shard], dim=1),
+        )
+
+        out_rep = out[:, :rep_chunk]
+        out_shard = out[:, rep_chunk:]
+
+        # All-gather replicated tokens across full SP group.
+        gathered = [torch.empty_like(out_rep) for _ in range(total_sp_size)]
+        torch.distributed.all_gather(
+            gathered,
+            out_rep.contiguous(),
+            group=sp_group.device_group,
+        )
+        out_rep = torch.cat(gathered, dim=1)[:, :num_rep]
+
+        if is_suffix:
+            return torch.cat([out_shard, out_rep], dim=1)
         return torch.cat([out_rep, out_shard], dim=1)
 
     def _forward_with_replicated_suffix(

@@ -512,8 +512,9 @@ class ServerArgs(DisaggArgsMixin):
 
         if self.ring_degree > 1:
             ring_compatible_backends = ("fa", "sage_attn", "aiter")
-            if self.attention_backend is not None and self.attention_backend not in (
-                ring_compatible_backends
+            if (
+                self.attention_backend is not None
+                and self.attention_backend not in ring_compatible_backends
             ):
                 raise ValueError(
                     f"Ring Attention is only supported for {ring_compatible_backends} backends, "
