@@ -39,6 +39,20 @@ Find `T*(M_global)` — the optimal per-expert-load promotion threshold (or equi
 - Hierarchical-nearest tile lookup pulls from `bf16_sparse_configs.json`; pinned via `override_config(...)`.
 - Output: `results/bf16_table.csv` (312 rows).
 
+### 2026-04-29 — GPU clock state caveat (post-K=5 rerun)
+
+Investigating a 21% drift in the M=4096 INT4 baseline (2.51 ms → 3.03 ms) between runs led to discovering the A100 application graphics clock is capped at **1140 MHz** instead of the default 1410 MHz boost clock (`nvidia-smi -q -d CLOCK` shows `Applications Clocks Setting: Active`). Memory clock unchanged at 1593 MHz.
+
+- This was sysadmin-set; we don't have `nvidia-smi -ac` permissions to change it.
+- Effect: Marlin INT4 (compute-bound) slows ~21%; BF16 fused MoE (memory-bound on A100 with bf16 weight loads) slows only ~2%.
+- Consequence: the speedup column in `x_star_curve.md` is inflated by ~15–20% on rows where the INT4 baseline is compute-bound. Honest at-default-clock estimate of the heter-MoE win:
+  - M=1024: ~1.15–1.20× (reported 1.24×)
+  - M=3072: ~1.10–1.15× (reported 1.31×)
+  - M=4096: **~1.05–1.10×** (reported 1.27× — matches the earlier 2.51/2.33=1.08× measurement at full clock)
+- The general shape (wins start at M≥1024, peak in mid-prefill, taper at heavy prefill) IS robust to the clock state.
+
+If the cluster gets restored to default clocks, re-running Task 3 measure-all-x will give the production-clock numbers. Otherwise the current report reflects the constrained-clock reality of this hardware.
+
 ### 2026-04-29 — Task 3 (compose + find x* + validate) complete
 
 - 24 M_global values × 9 x candidates = 216 actual paired-kernel measurements (`fused_marlin_moe` + `outplace_fused_experts` with **pinned autotuned BF16 tile** via `override_config`).

@@ -1,0 +1,54 @@
+[09:23:05] WAIT: tune_bf16_sparse_sep procs
+[09:36:42] tune done. shards=192
+[09:36:42] MERGE shards into bf16_sparse_configs_sep.json
+merged 192 cells -> test/test_heter_moe/unittest/kernel_profile/results/bf16_sparse_configs_sep.json
+[09:36:43] TASK 3 run 1: launching shards
+run1 optimal_assignment: 11 rows
+run1 all_x: 187 rows
+[09:37:10] TASK 3 run 1: complete
+[09:37:10] COOLDOWN 90s
+[09:38:40] TASK 3 run 2: launching shards
+run2 optimal_assignment: 11 rows
+run2 all_x: 187 rows
+[09:39:07] TASK 3 run 2: complete
+[09:39:07] COOLDOWN 90s
+[09:40:37] TASK 3 run 3: launching shards
+run3 optimal_assignment: 11 rows
+run3 all_x: 187 rows
+[09:41:04] TASK 3 run 3: complete
+[09:41:04] AGGREGATE: median across 3 runs
+median across 3 runs: 187 (M,x) cells
+Per-M variance (max/min ratio across 3 runs):
+  M=   32 x=0  lat=[0.1618..0.1628] ratio=1.006
+  M=   64 x=0  lat=[0.2171..0.2447] ratio=1.127
+  M=   96 x=0  lat=[0.2458..0.2939] ratio=1.196
+  M=  128 x=0  lat=[0.3246..0.3246] ratio=1.000
+  M=  256 x=0  lat=[0.5038..0.5038] ratio=1.000
+  M=  512 x=0  lat=[0.7475..0.7475] ratio=1.000
+  M= 1024 x=0  lat=[1.1448..1.1448] ratio=1.000
+  M= 1536 x=0  lat=[1.4356..1.4367] ratio=1.001
+  M= 2048 x=0  lat=[1.7408..1.7469] ratio=1.004
+  M= 3072 x=0  lat=[1.9722..2.2886] ratio=1.160
+  M= 4096 x=0  lat=[2.5016..2.5078] ratio=1.002
+[09:41:05] MAKE REPORT (matrix)
+wrote test/test_heter_moe/unittest/kernel_profile/results/x_star_curve.csv
+wrote test/test_heter_moe/unittest/kernel_profile/results/x_star_curve.md
+
+====================================================================================================
+M_global   x*    T*  best speedup   t_int4(ms)  t_winner(ms) winner_tile   
+----------------------------------------------------------------------------------------------------
+      32    8     8        0.729x       0.1628        0.2232 n8_bse32      
+      64    8    16        0.895x       0.2437        0.2724 n8_bse32      
+      96    8    16        0.803x       0.2468        0.3072 n8_bse48      
+     128    4    48        0.800x       0.3246        0.4055 n4_bse96      
+     256   16    24        1.029x       0.5038        0.4895 n16_bse96     
+     512   16    48        1.146x       0.7475        0.6523 n16_bse192    
+    1024   28    48        1.241x       1.1448        0.9226 n28_bse256    
+    1536   24    80        1.252x       1.4356        1.1469 n24_bse384    
+    2048   32    80        1.293x       1.7469        1.3507 n32_bse384    
+    3072   40    96        1.072x       1.9743        1.8422 n40_bse512    
+    4096   56    88        1.051x       2.5057        2.3839 n56_bse512    
+====================================================================================================
+[09:41:19] DONE — final CSV at test/test_heter_moe/unittest/kernel_profile/results/x_star_curve.csv
+[09:41:19]          markdown at test/test_heter_moe/unittest/kernel_profile/results/x_star_curve.md
+[09:41:19]          all_x median at test/test_heter_moe/unittest/kernel_profile/results/optimal_assignment.all_x.csv
