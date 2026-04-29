@@ -708,7 +708,7 @@ class EAGLEWorker(TpModelWorker):
     def _draft_preprocess_idle(self, batch: ScheduleBatch):
         batch.spec_info = EagleDraftInput.create_idle_input(
             device=self.device,
-            hidden_size=self.model_config.hidden_size,
+            hidden_size=self.model_config.spec_hidden_size,
             dtype=self.model_config.dtype,
             topk=self.topk,
             capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -1113,7 +1113,7 @@ class EAGLEWorker(TpModelWorker):
                 self.model_config.hidden_size * 3
                 if self.speculative_algorithm.is_eagle3()
                 and self.eagle_use_aux_hidden_state
-                else self.model_config.hidden_size
+                else self.model_config.spec_hidden_size
             )
             batch.spec_info = EagleDraftInput.create_idle_input(
                 device=self.device,
