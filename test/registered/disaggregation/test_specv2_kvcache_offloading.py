@@ -15,6 +15,7 @@ import torch
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
+from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
@@ -175,6 +176,94 @@ class TestReleaseFinishedReq(unittest.TestCase):
         manager._release_finished_req(req, start_offset=0)
 
         self.assertEqual(manager.tree_cache.protected_size_, 5)
+
+    def test_release_finished_req_frees_prefill_when_state_present(self):
+        """
+        When offloaded_state[rid].prefill_len > 0, _release_finished_req must
+        free the prefill-aligned slots in addition to the committed range.
+
+        This is the consolidated free path that replaces the eager free that
+        previously happened in offload_kv_cache (which raced with concurrent
+        admission and produced cross-pollinated KV reads).
+        """
+        manager, freed = _make_manager(pool_size=32)
+        rid = "req-prefill-present"
+        req = _make_mock_req(
+            req_pool_idx=0,
+            kv_committed_len=20,
+            kv_allocated_len=20,
+            rid=rid,
+        )
+        manager.offloaded_state[rid] = OffloadedState(
+            prefill_len=8, inc_len=0, last_hash=None
+        )
+
+        manager._release_finished_req(req, start_offset=8)
+
+        # Two frees in order: prefill [0:8] then committed [8:20].
+        self.assertEqual(len(freed), 2)
+        expected_prefill = torch.arange(0, 8, dtype=torch.int64)
+        expected_committed = torch.arange(8, 20, dtype=torch.int64)
+        self.assertTrue(torch.equal(freed[0], expected_prefill))
+        self.assertTrue(torch.equal(freed[1], expected_committed))
+        # State entry is removed at the end of _release_finished_req.
+        self.assertNotIn(rid, manager.offloaded_state)
+
+    def test_release_finished_req_skips_prefill_free_when_prefill_len_zero(self):
+        """
+        When state exists but prefill_len == 0 (request shorter than page_size,
+        so no prefill chunk was ever offloaded), no prefill-aligned free is
+        emitted.
+        """
+        manager, freed = _make_manager(pool_size=32)
+        rid = "req-prefill-zero"
+        req = _make_mock_req(
+            req_pool_idx=0,
+            kv_committed_len=10,
+            kv_allocated_len=10,
+            rid=rid,
+        )
+        manager.offloaded_state[rid] = OffloadedState(
+            prefill_len=0, inc_len=0, last_hash=None
+        )
+
+        manager._release_finished_req(req, start_offset=0)
+
+        # Only the committed range [0:10] is freed.
+        self.assertEqual(len(freed), 1)
+        expected_committed = torch.arange(0, 10, dtype=torch.int64)
+        self.assertTrue(torch.equal(freed[0], expected_committed))
+
+    def test_finalize_release_creates_state_so_prefill_is_freed(self):
+        """
+        finalize_release_on_finish handles the case where no incremental
+        offload ever ran (offloaded_state is empty). It must materialize an
+        OffloadedState with the correct prefill_len so that the consolidated
+        free site in _release_finished_req can locate and free those slots.
+        """
+        page_size = 4
+        manager, freed = _make_manager(pool_size=32, page_size=page_size)
+        rid = "req-finalize-no-state"
+        req = _make_mock_req(
+            req_pool_idx=0,
+            kv_committed_len=13,
+            kv_allocated_len=13,
+            rid=rid,
+        )
+        # 12 input tokens => prefill_len = 12 // 4 * 4 = 12
+        req.origin_input_ids = list(range(12))
+
+        manager.finalize_release_on_finish(req)
+
+        # finalize creates state, then _release_finished_req frees:
+        #   prefill [0:12] then committed [12:13].
+        self.assertEqual(len(freed), 2)
+        expected_prefill = torch.arange(0, 12, dtype=torch.int64)
+        expected_committed = torch.arange(12, 13, dtype=torch.int64)
+        self.assertTrue(torch.equal(freed[0], expected_prefill))
+        self.assertTrue(torch.equal(freed[1], expected_committed))
+        # State is deleted by _release_finished_req on the way out.
+        self.assertNotIn(rid, manager.offloaded_state)
 
 
 if __name__ == "__main__":
