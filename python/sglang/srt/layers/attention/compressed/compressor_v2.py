@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Literal, NamedTuple, Optional, Union
+from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union
 
 import torch
 
-from sglang.jit_kernel.deepseek_v4 import (
+from sglang.jit_kernel.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
     compress_fused_norm_rope_inplace,
-    triton_create_paged_compress_data,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
@@ -27,17 +26,7 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v4 import Compressor, DeepseekRefRMSNorm
 
 
-class FusedCompressMetadata(NamedTuple):
-    write_loc: torch.Tensor
-    extra_data: Optional[torch.Tensor]
-    plan: Union[CompressorDecodePlan, CompressorPrefillPlan]
-
-    def copy_(self, other: FusedCompressMetadata) -> None:
-        from .metadata import maybe_copy_inplace
-
-        self.write_loc.copy_(other.write_loc)
-        maybe_copy_inplace(self.extra_data, src=other.extra_data)
-        self.plan.copy_(other.plan)
+CompressMetadata: TypeAlias = Union[CompressorDecodePlan, CompressorPrefillPlan]
 
 
 class CompressorBackend:
@@ -45,10 +34,10 @@ class CompressorBackend:
         super().__init__()
         self.forward_metadata: DeepseekV4Metadata
 
-    def get_paged_compress_metadata(self, compress_ratio: int) -> FusedCompressMetadata:
+    def get_paged_compress_metadata(self, compress_ratio: int) -> CompressMetadata:
         attr_name = f"c{compress_ratio}_compress_metadata"
         metadata = getattr(self.forward_metadata, attr_name)
-        assert isinstance(metadata, FusedCompressMetadata)
+        assert isinstance(metadata, (CompressorDecodePlan, CompressorPrefillPlan))
         return metadata
 
     def forward_compress(
@@ -68,29 +57,24 @@ class CompressorBackend:
         from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 
         assert compress_ratio == 4 or compress_ratio == 128
-        if is_paged:
-            metadata = self.get_paged_compress_metadata(compress_ratio)
-            coff = 2 if is_overlap_compress(compress_ratio) else 1
-            if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-                kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
-            else:
-                last_dim = 2 * head_dim * coff
-                assert kv_score_buffer.shape[-1] == last_dim
-                kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
+        assert is_paged, "Non-paged compress path is no longer supported."
+
+        plan = self.get_paged_compress_metadata(compress_ratio)
+        coff = 2 if is_overlap_compress(compress_ratio) else 1
+        if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
         else:
-            plan = make_compressor_plan(compress_ratio, forward_batch)
-            metadata = (forward_batch.req_pool_indices.to(torch.int32), None, plan)
-        indices, extra_data, plan = metadata
+            last_dim = 2 * head_dim * coff
+            assert kv_score_buffer.shape[-1] == last_dim
+            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
 
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score_input,
             ape=ape,
-            indices=indices,
             plan=plan,
             compress_ratio=compress_ratio,
             head_dim=head_dim,
-            extra_data=extra_data,
         )
         compress_fused_norm_rope_inplace(
             kv_compressed,
@@ -185,31 +169,6 @@ def is_overlap_compress(compress_ratio: int) -> bool:
     return compress_ratio == 4
 
 
-def make_compressor_plan(
-    compress_ratio: Literal[4, 128],
-    forward_batch: ForwardBatch,
-) -> Union[CompressorDecodePlan, CompressorPrefillPlan]:
-    if forward_batch.forward_mode.is_decode():
-        seq_lens_32 = forward_batch.seq_lens.to(torch.int32)
-        return CompressorDecodePlan(compress_ratio, seq_lens_32)
-    if forward_batch.forward_mode.is_prefill():
-        assert not forward_batch.forward_mode.is_target_verify()
-        extend_lens_list = forward_batch.extend_seq_lens_cpu
-        seq_lens_cpu = forward_batch.seq_lens_cpu
-        assert extend_lens_list is not None and seq_lens_cpu is not None
-        return CompressorPrefillPlan.generate(
-            compress_ratio=compress_ratio,
-            num_q_tokens=sum(extend_lens_list),
-            seq_lens=seq_lens_cpu,
-            extend_lens=torch.tensor(extend_lens_list),
-            device=forward_batch.seq_lens.device,
-        )
-    elif forward_batch.forward_mode.is_target_verify():
-        raise NotImplementedError("target verify mode to be implemented")
-    else:
-        raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
-
-
 def create_paged_compressor_data(
     compress_ratio: Literal[4, 128],
     *,
@@ -223,67 +182,57 @@ def create_paged_compressor_data(
     extend_lens_cpu: Optional[List[int]] = None,
     use_prefill_cuda_graph: bool = False,
     num_q_tokens: Optional[int] = None,
-) -> FusedCompressMetadata:
+) -> CompressMetadata:
+    """Build the paged compress metadata (= the plan).
+
+    State-pool slot translation is done inside the C++ planner; the
+    Python side just hands the relevant tensors over.
+    """
     swa_page_size = token_to_kv_pool.swa_page_size
     ring_size = token_to_kv_pool.get_ring_size(compress_ratio=compress_ratio)
-    # assert ring_size % compress_ratio == 0
+    # NOTE: This is actually a proxy, which encounter some bug with tvm-ffi.
+    # As a workaround, we use `.detach()` to get the real tensor.
+    full_to_swa = token_to_kv_pool.full_to_swa_index_mapping.detach()
 
-    def clip_down(positions: torch.Tensor) -> torch.Tensor:
-        return positions // compress_ratio * compress_ratio
-
-    def get_raw_loc(positions: torch.Tensor) -> torch.Tensor:
-        positions = positions.masked_fill(positions < 0, 0)
-        loc = req_to_token[req_pool_indices, positions]
-        swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(loc)
-        swa_pages = swa_loc // swa_page_size
-        state_loc = swa_pages * ring_size + swa_loc % ring_size
-        return (state_loc // compress_ratio).to(torch.int32)
-
-    is_overlap = is_overlap_compress(compress_ratio)
+    # The planner wants int64 across the board for the device tables (so they
+    # can be indexed by int64 multiplication inside the GPU finalize kernel).
+    req_pool_indices_i64 = req_pool_indices.to(torch.int64)
 
     if is_prefill:
         assert extend_lens is not None
-        write_loc, extra_data = triton_create_paged_compress_data(
+        # The CPU planner loop reads seq_lens / extend_lens; both must be
+        # CPU-resident (per c_plan.cuh's current implementation).
+        if seq_lens_cpu is not None:
+            assert extend_lens_cpu is not None
+            seq_lens_planner = torch.tensor(seq_lens_cpu, dtype=torch.int64)
+            extend_lens_planner = torch.tensor(extend_lens_cpu, dtype=torch.int64)
+            num_q_tokens = sum(extend_lens_cpu)
+        else:
+            assert num_q_tokens is not None
+            assert False, "Not supported yet"
+
+        return CompressorPrefillPlan.generate(
             compress_ratio=compress_ratio,
-            is_overlap=is_overlap,
+            req_pool_indices=req_pool_indices_i64,
+            seq_lens=seq_lens_planner,
+            extend_lens=extend_lens_planner,
+            req_to_token=req_to_token,
+            full_to_swa=full_to_swa,
             swa_page_size=swa_page_size,
             ring_size=ring_size,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            extend_seq_lens=extend_lens,
-            req_to_token=req_to_token,
-            full_to_swa_index_mapping=token_to_kv_pool.full_to_swa_index_mapping,
-        )
-
-        plan_kwargs: dict
-        if seq_lens_cpu is None:
-            assert num_q_tokens is not None
-            plan_kwargs = dict(
-                num_q_tokens=num_q_tokens,
-                seq_lens=seq_lens,
-                extend_lens=extend_lens,
-            )
-        else:
-            assert extend_lens_cpu is not None
-            plan_kwargs = dict(
-                num_q_tokens=sum(extend_lens_cpu),
-                seq_lens=torch.tensor(seq_lens_cpu),
-                extend_lens=torch.tensor(extend_lens_cpu),
-            )
-        plan = CompressorPrefillPlan.generate(
-            compress_ratio=compress_ratio,
+            num_q_tokens=num_q_tokens,
             device=seq_lens.device,
             use_cuda_graph=use_prefill_cuda_graph,
-            **plan_kwargs,
         )
     else:
-        write_positions = clip_down(seq_lens - 1)
-        write_loc = get_raw_loc(write_positions)
-        if is_overlap:
-            write_overlap_loc = get_raw_loc(write_positions - compress_ratio)
-            extra_data = write_overlap_loc.view(-1, 1)
-        else:
-            extra_data = None
-        plan = CompressorDecodePlan(compress_ratio, seq_lens.to(torch.int32))
-
-    return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
+        # Decode plan: seq_lens lives on the same device as the input tables
+        # (the c_plan.cuh decode kernel reads everything on GPU).
+        return CompressorDecodePlan.generate(
+            compress_ratio=compress_ratio,
+            req_pool_indices=req_pool_indices_i64,
+            req_to_token=req_to_token,
+            full_to_swa=full_to_swa,
+            seq_lens=seq_lens.to(torch.int64),
+            swa_page_size=int(swa_page_size),
+            ring_size=int(ring_size),
+        )

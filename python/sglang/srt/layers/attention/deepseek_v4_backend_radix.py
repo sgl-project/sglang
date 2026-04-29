@@ -22,11 +22,22 @@ import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.layers.attention.compressed.compressor import (
-    CompressorBackend,
-    FusedCompressMetadata,
-    create_paged_compressor_data,
-)
+
+if envs.SGLANG_OPT_USE_COMPRESSOR_V2.get():
+    from sglang.srt.layers.attention.compressed.compressor_v2 import (
+        CompressMetadata as FusedCompressMetadata,
+    )
+    from sglang.srt.layers.attention.compressed.compressor_v2 import (
+        CompressorBackend,
+        create_paged_compressor_data,
+    )
+else:
+    from sglang.srt.layers.attention.compressed.compressor import (
+        CompressorBackend,
+        FusedCompressMetadata,
+        create_paged_compressor_data,
+    )
+
 from sglang.srt.layers.attention.compressed.indexer import C4IndexerBackend
 from sglang.srt.layers.attention.compressed.metadata import (
     PagedIndexerMetadata,
