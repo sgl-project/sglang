@@ -213,11 +213,6 @@ class SchedulerRuntimeCheckerMixin:
         swa_num_used = self.swa_tokens_per_layer - (
             swa_available_size + swa_evictable_size
         )
-        # HiSparse host-backup makes the device pool counter transiently
-        # over-released; clamp to 0 to keep token_usage / leak checks sane.
-        if self.enable_hisparse:
-            full_num_used = max(0, full_num_used)
-            swa_num_used = max(0, swa_num_used)
         full_token_usage = full_num_used / self.full_tokens_per_layer
         swa_token_usage = swa_num_used / self.swa_tokens_per_layer
 
@@ -382,14 +377,8 @@ class SchedulerRuntimeCheckerMixin:
         else:
             req_total_size = self.req_to_token_pool.size
 
-        # dsv4: non-DECODE reserves slot 0 (free_slots = range(1, size)),
-        # so the expected-free count is one less than total in those modes.
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            expected_free = req_total_size
-        else:
-            expected_free = req_total_size - 1
         session_req_count = self._session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != expected_free:
+        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
@@ -483,13 +472,11 @@ class SchedulerRuntimeCheckerMixin:
         if not self.is_fully_idle():
             return
 
-        # memory leak check (skipped for hisparse — pool counters intentionally
-        # diverge during host-backup/decode-offload, see _get_swa_token_info clamp).
-        if not self.enable_hisparse:
-            has_leak, messages = self._check_all_pools(self.get_pool_stats())
-            if has_leak:
-                self._report_leak("pool", "\n".join(messages))
-            self._check_req_pool()
+        # memory leak check
+        has_leak, messages = self._check_all_pools(self.get_pool_stats())
+        if has_leak:
+            self._report_leak("pool", "\n".join(messages))
+        self._check_req_pool()
 
         # tree cache sanity check
         self._check_tree_cache()
