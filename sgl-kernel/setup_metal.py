@@ -122,6 +122,14 @@ class BuildMetalExtension(build_ext):
         ext_path = Path(self.get_ext_fullpath(ext.name))
         ext_path.parent.mkdir(parents=True, exist_ok=True)
 
+        # Use ccache for the C++ compiles when it is on PATH. ccache does not
+        # support `.metal` sources (unsupported source language), so the Metal
+        # shader compile is left untouched.
+        ccache = shutil.which("ccache")
+        cxx_cmd = [ccache, "c++"] if ccache else ["c++"]
+        if ccache:
+            print(f"[sgl-kernel:metal] using ccache at {ccache}", flush=True)
+
         python_exe = Path(sys.executable)
         python_include = Path(sysconfig.get_paths()["include"])
         python_lib = Path(sysconfig.get_config_var("LIBDIR"))
@@ -227,7 +235,7 @@ class BuildMetalExtension(build_ext):
             src_path = Path(src)
             obj_path = generated_dir / (src_path.stem + ".o")
             compile_cmd = [
-                "c++",
+                *cxx_cmd,
                 *cflags,
                 "-c",
                 str(src_path),
@@ -240,7 +248,7 @@ class BuildMetalExtension(build_ext):
         nanobind_src = nanobind_dir / "src" / "nb_combined.cpp"
         nanobind_obj = generated_dir / "nb_combined.o"
         nanobind_cmd = [
-            "c++",
+            *cxx_cmd,
             *cflags,
             "-DNB_COMPACT_ASSERTIONS",
             "-DNB_BUILD",
