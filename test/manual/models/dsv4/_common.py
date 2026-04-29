@@ -1,20 +1,24 @@
 """Shared fixture for DeepSeek-V4 cookbook launch-command tests.
 
-Each sibling test_*.py declares one launch combination from the
-"Basic Configuration" chapter of:
+Each sibling ``test_<hardware>_<model_size>.py`` declares ONE
+``hardware x model_size`` cell from the cookbook (e.g. B200 x Flash)
+and contains one ``CustomTestCase`` subclass per recipe
+(Low-Latency / Balanced / Max-Throughput / CP, where supported).
+
+Each subclass launches the server with the cookbook's exact flags,
+runs the AIME25 evaluation by invoking the corresponding subcommands
+of ``scripts/bench_gpqa_aime.py`` (``run-aime25`` then
+``regrade-aime25``), and asserts the recovered metrics file appeared.
+
+Cookbook reference:
     https://docs.sglang.io/cookbook/autoregressive/DeepSeek/DeepSeek-V4
 
-It launches the server with that exact config, runs the AIME25
-evaluation by invoking the corresponding subcommands of
-``scripts/bench_gpqa_aime.py`` (run-aime25 + regrade-aime25), and
-asserts the recovered metrics file appeared.
-
 These are MANUAL tests (not CI). They expect the documented
-container layout: nemo-skills venv at /sgl-workspace/ns-venv and
-log dir at /sgl-workspace/logs. ``setup-ns`` is invoked once per
+container layout: nemo-skills venv at ``/sgl-workspace/ns-venv`` and
+log dir at ``/sgl-workspace/logs``. ``setup-ns`` is invoked once per
 process if the venv is missing.
 
-Knobs (env vars):
+AIME25 knobs (env vars):
     DSV4_AIME25_NUM_REPEATS       (default 16)
     DSV4_AIME25_TEMPERATURE       (default 1.0)
     DSV4_AIME25_MAX_TOKENS        (default 400000)
@@ -23,6 +27,11 @@ Knobs (env vars):
     DSV4_AIME25_SCORE_THRESHOLD   (default 0.0; >0 to enforce)
     DSV4_AIME25_SKIP_SETUP_NS     (default 0; 1 to skip setup-ns even if venv is missing)
     DSV4_BENCH_SCRIPT             (override path to bench_gpqa_aime.py)
+
+Multi-node knobs (only consumed by multi-node test classes; if either
+is unset, those classes ``SkipTest``):
+    DSV4_NODE_RANK                (per-node rank for --node-rank)
+    DSV4_DIST_INIT_ADDR           (e.g. 10.0.0.1:20000 for --dist-init-addr)
 """
 
 import glob
@@ -56,6 +65,35 @@ AIME25_MAX_CONCURRENCY = int(os.environ.get("DSV4_AIME25_MAX_CONCURRENCY", "512"
 AIME25_TIMEOUT_SEC = int(os.environ.get("DSV4_AIME25_TIMEOUT_SEC", "21600"))
 AIME25_SCORE_THRESHOLD = float(os.environ.get("DSV4_AIME25_SCORE_THRESHOLD", "0.0"))
 AIME25_SKIP_SETUP_NS = os.environ.get("DSV4_AIME25_SKIP_SETUP_NS", "0") == "1"
+
+# DeepEP "large SMS" config — appears as `--deepep-config '{...}'` in every
+# DeepEP recipe except multi-node ones (where it is gated off in the JSX).
+DEEPEP_LARGE_SMS_CONFIG = (
+    '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
+)
+
+
+def multinode_args(nnodes: int) -> List[str]:
+    """Return CLI args for a multi-node launch, or skip the test.
+
+    Reads DSV4_NODE_RANK and DSV4_DIST_INIT_ADDR from the env. Raises
+    ``unittest.SkipTest`` when either is missing — call from inside
+    ``setUpClass`` so the whole class skips cleanly.
+    """
+    rank = os.environ.get("DSV4_NODE_RANK")
+    addr = os.environ.get("DSV4_DIST_INIT_ADDR")
+    if rank is None or addr is None:
+        raise unittest.SkipTest(
+            "multi-node test requires DSV4_NODE_RANK and DSV4_DIST_INIT_ADDR"
+        )
+    return [
+        "--nnodes",
+        str(nnodes),
+        "--node-rank",
+        rank,
+        "--dist-init-addr",
+        addr,
+    ]
 
 
 class Dsv4Aime25TestBase(CustomTestCase):
