@@ -561,6 +561,12 @@ class BAGELInterleaveContextBackend:
     def _apply_prefill_interleaved(
         self, *, session, messages: list[UGInterleavedMessage]
     ) -> UGModelPrefillResult:
+        if self._uses_native_srt_u_forward():
+            raise BAGELAdapterError(
+                "BAGEL native SRT U forward requires an SRT-executed prefill "
+                "result; refusing to fall back to official BAGEL "
+                "update_context_text/update_context_image"
+            )
         state = self._state_for(session.handle.session_id)
         state.decode_count = 0
         added_tokens = 0
@@ -719,6 +725,11 @@ class BAGELInterleaveContextBackend:
     def _apply_append_generated_image(
         self, *, session, image: Any | None
     ) -> UGModelAppendImageResult:
+        if self._uses_native_srt_u_forward():
+            raise BAGELAdapterError(
+                "BAGEL native SRT U forward requires an SRT-executed append-image "
+                "result; refusing to fall back to official BAGEL update_context_image"
+            )
         state = self._state_for(session.handle.session_id)
         image = self._prepare_image(image)
         with _bagel_autocast(self.inferencer.model):

@@ -80,6 +80,24 @@ def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
         required=False,
         help="Convenience alias that sets both --output-path and --output-file-name.",
     )
+    parser.add_argument(
+        "--ug-interleaved-input",
+        type=str,
+        default=None,
+        required=False,
+        help=(
+            "Experimental UG interleaved JSON payload or path. "
+            "Accepts {'messages': [...], 'sampling_params': {...}} or "
+            "{'requests': [...]}."
+        ),
+    )
+    parser.add_argument(
+        "--ug-interleaved-output",
+        type=str,
+        default=None,
+        required=False,
+        help="Optional path to write the experimental UG interleaved JSON result.",
+    )
 
     parser = ServerArgs.add_cli_args(parser)
     parser = SamplingParams.add_cli_args(parser)
@@ -198,10 +216,30 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
         model_path=server_args.model_path, server_args=server_args, local_mode=True
     )
 
+    if args.ug_interleaved_input is not None:
+        result = generator.generate_interleaved_serializable(
+            _load_ug_interleaved_payload(args.ug_interleaved_input)
+        )
+        payload = json.dumps(result, ensure_ascii=False)
+        if args.ug_interleaved_output:
+            with open(args.ug_interleaved_output, "w", encoding="utf-8") as f:
+                f.write(payload)
+                f.write("\n")
+        else:
+            print(payload)
+        return
+
     results = generator.generate(sampling_params_kwargs=sampling_params_kwargs)
 
     prompt = sampling_params_kwargs.get("prompt")
     maybe_dump_performance(args, server_args, prompt, results)
+
+
+def _load_ug_interleaved_payload(value: str):
+    if os.path.exists(value):
+        with open(value, encoding="utf-8") as f:
+            return json.load(f)
+    return json.loads(value)
 
 
 class GenerateSubcommand(CLISubcommand):

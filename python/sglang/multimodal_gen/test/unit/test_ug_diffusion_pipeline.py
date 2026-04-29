@@ -10,11 +10,18 @@ from PIL import Image
 from sglang.multimodal_gen.configs.pipeline_configs.ug import UGPipelineConfig
 from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    UGInterleavedGenerateReq,
+    build_ug_interleaved_generate_reqs,
+    serialize_ug_interleaved_output,
+)
+from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines.ug import UGPipeline
 from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
     SyncExecutor,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle
 from sglang.srt.ug.interleaved import UGInputSegment, UGInterleavedRequest
@@ -304,6 +311,143 @@ class TestUGDiffusionPipeline(unittest.TestCase):
             [first.stats.session_id, second.stats.session_id],
         )
 
+    def test_experimental_interleaved_batch_api_isolates_sessions(self):
+        server_args = _make_server_args()
+        with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
+            pipeline = UGPipeline(
+                "sglang-internal/fake-ug",
+                server_args,
+                executor=SyncExecutor(server_args),
+            )
+
+        requests = [
+            UGInterleavedRequest.from_segments(
+                [
+                    {"type": "image", "image": Image.new("RGB", (16, 16), color)},
+                    {"type": "text", "text": text},
+                ],
+                sampling_params={
+                    "width": 32,
+                    "height": 32,
+                    "seed": seed,
+                    "num_inference_steps": 2,
+                    "suppress_logs": True,
+                },
+            )
+            for color, text, seed in (
+                ("white", "draw a red kite", 123),
+                ("black", "draw a blue boat", 456),
+            )
+        ]
+
+        responses = pipeline.forward_interleaved_batch(requests, server_args)
+
+        self.assertEqual(len(responses), 2)
+        self.assertNotEqual(
+            responses[0].stats.session_id, responses[1].stats.session_id
+        )
+        self.assertEqual(
+            [response.stats.prefill_count for response in responses], [1, 1]
+        )
+        self.assertEqual(
+            [response.stats.velocity_count for response in responses], [1, 1]
+        )
+
+    def test_ug_interleaved_worker_executes_batched_transport_requests(self):
+        server_args = _make_server_args()
+        with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
+            pipeline = UGPipeline(
+                "sglang-internal/fake-ug",
+                server_args,
+                executor=SyncExecutor(server_args),
+            )
+        worker = GPUWorker.__new__(GPUWorker)
+        worker.pipeline = pipeline
+        worker.server_args = server_args
+
+        reqs = build_ug_interleaved_generate_reqs(
+            {
+                "requests": [
+                    {
+                        "messages": [
+                            {
+                                "type": "image",
+                                "image": Image.new("RGB", (16, 16), "white"),
+                            },
+                            {"type": "text", "text": "draw a red kite"},
+                        ],
+                        "sampling_params": {
+                            "width": 32,
+                            "height": 32,
+                            "seed": 123,
+                            "num_inference_steps": 2,
+                            "suppress_logs": True,
+                        },
+                    },
+                    {
+                        "messages": [
+                            {
+                                "type": "image",
+                                "image": Image.new("RGB", (16, 16), "black"),
+                            },
+                            {"type": "text", "text": "draw a blue boat"},
+                        ],
+                        "sampling_params": {
+                            "width": 32,
+                            "height": 32,
+                            "seed": 456,
+                            "num_inference_steps": 2,
+                            "suppress_logs": True,
+                        },
+                    },
+                ]
+            }
+        )
+
+        output = worker.execute_ug_interleaved(reqs)
+
+        self.assertIsNone(output.error)
+        self.assertEqual(len(output.output), 2)
+        self.assertIsInstance(
+            serialize_ug_interleaved_output(output.output[0])["segments"][0]["image"],
+            str,
+        )
+        self.assertNotEqual(
+            output.output[0].stats.session_id, output.output[1].stats.session_id
+        )
+
+    def test_scheduler_routes_ug_interleaved_list_to_worker(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.worker = RecordingUGWorker()
+        reqs = [
+            UGInterleavedGenerateReq(
+                UGInterleavedRequest.from_segments(
+                    [{"type": "text", "text": "draw"}],
+                    sampling_params={
+                        "width": 32,
+                        "height": 32,
+                        "num_inference_steps": 2,
+                    },
+                )
+            ),
+            UGInterleavedGenerateReq(
+                UGInterleavedRequest.from_segments(
+                    [{"type": "text", "text": "describe"}],
+                    sampling_params={
+                        "width": 32,
+                        "height": 32,
+                        "num_inference_steps": 2,
+                    },
+                )
+            ),
+        ]
+
+        output = scheduler._handle_list_request([reqs])
+
+        self.assertIsNone(output.error)
+        self.assertEqual(scheduler.worker.executed, reqs)
+        self.assertEqual(output.output, ["ug-ok"])
+
     def test_experimental_interleaved_api_rejects_kwargs_with_params_object(self):
         server_args = _make_server_args()
         with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
@@ -564,6 +708,15 @@ class RecordingUGBridge:
     def decode_next_segment(self, *, contexts):
         del contexts
         return UGDecodeResult(type="text", text="after_image")
+
+
+class RecordingUGWorker:
+    def __init__(self):
+        self.executed = None
+
+    def execute_ug_interleaved(self, reqs):
+        self.executed = reqs
+        return OutputBatch(output="ug-ok")
 
 
 class FakeTreeCache:

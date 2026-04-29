@@ -21,8 +21,10 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training import (
     weights_api,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    build_ug_interleaved_generate_reqs,
     prepare_request,
     save_outputs,
+    serialize_ug_interleaved_output,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
@@ -259,6 +261,7 @@ async def forward_to_scheduler(
 
 
 vertex_router = APIRouter()
+ug_router = APIRouter(prefix="/v1/ug", tags=["ug"])
 
 
 @vertex_router.post(VERTEX_ROUTE)
@@ -295,6 +298,27 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
     return orjson_response({"predictions": results})
 
 
+@ug_router.post("/interleaved")
+async def ug_interleaved(raw_request: Request):
+    """Experimental UG interleaved endpoint.
+
+    Payload shape:
+    {"messages": [...], "sampling_params": {...}, "metadata": {...}}
+    or {"requests": [...]} for sequential multi-session batch execution.
+    """
+
+    try:
+        payload = await raw_request.json()
+        scheduler_req = build_ug_interleaved_generate_reqs(payload)
+        result = await async_scheduler_client.forward(scheduler_req)
+        if result.error:
+            return orjson_response({"error": result.error}, status_code=400)
+        return orjson_response(serialize_ug_interleaved_output(result.output))
+    except Exception as e:
+        logger.error("Error during UG interleaved generation: %s", e, exc_info=True)
+        return orjson_response({"error": str(e)}, status_code=400)
+
+
 def create_app(server_args: ServerArgs):
     """
     Create and configure the FastAPI application instance.
@@ -303,6 +327,7 @@ def create_app(server_args: ServerArgs):
 
     app.include_router(health_router)
     app.include_router(vertex_router)
+    app.include_router(ug_router)
 
     from sglang.multimodal_gen.runtime.entrypoints.openai import common_api, mesh_api
 

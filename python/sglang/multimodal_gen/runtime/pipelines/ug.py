@@ -184,6 +184,24 @@ class UGPipeline(ComposedPipelineBase):
             if contexts is not None:
                 self.get_module("ug_bridge").release_contexts(contexts)
 
+    def forward_interleaved_batch(
+        self,
+        requests: list[UGInterleavedRequest],
+        server_args: ServerArgs | None = None,
+    ) -> list[UGInterleavedResponse]:
+        """Run multiple UG sessions through the experimental interleaved API.
+
+        This intentionally provides session isolation before throughput
+        batching. Each request gets its own SRT-owned UG session and release
+        path, so it is safe for the server/API surface while the native batch
+        optimizer remains a future step.
+        """
+
+        return [
+            self.forward_interleaved(request, server_args=server_args)
+            for request in requests
+        ]
+
 
 EntryClass = UGPipeline
 

@@ -1672,6 +1672,45 @@ class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
 
 
 class TestBAGELInterleaveContextBackend(unittest.TestCase):
+    def test_native_srt_u_prefill_refuses_official_fallback_without_srt_result(self):
+        backend = BAGELInterleaveContextBackend(
+            FakeBAGELInferencer(),
+            u_forward_bridge=BAGELUForwardBridge(
+                srt_u_forward_executor=BAGELNativeSRTUForwardExecutor()
+            ),
+        )
+        session = SimpleNamespace(
+            handle=SimpleNamespace(session_id="native-missing-prefill"),
+            srt_last_request_id="missing-u-prefill-result",
+        )
+
+        with self.assertRaisesRegex(
+            BAGELAdapterError, "requires an SRT-executed prefill"
+        ):
+            backend.prefill_interleaved(
+                session=session,
+                messages=[UGInterleavedMessage(type="text", content="draw")],
+            )
+
+    def test_native_srt_u_append_refuses_official_fallback_without_srt_result(self):
+        backend = BAGELInterleaveContextBackend(
+            FakeBAGELInferencer(),
+            u_forward_bridge=BAGELUForwardBridge(
+                srt_u_forward_executor=BAGELNativeSRTUForwardExecutor()
+            ),
+        )
+        session = SimpleNamespace(
+            handle=SimpleNamespace(session_id="native-missing-append"),
+            srt_last_request_id="missing-append-result",
+        )
+
+        with self.assertRaisesRegex(
+            BAGELAdapterError, "requires an SRT-executed append-image"
+        ):
+            backend.append_generated_image(
+                session=session, image=FakeImage(size=(8, 8))
+            )
+
     def test_context_backend_consumes_prefill_and_append_from_srt_forward_view(self):
         inferencer = FakeBAGELInferencer()
         backend = BAGELInterleaveContextBackend(

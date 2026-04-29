@@ -31,7 +31,10 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
+from sglang.multimodal_gen.runtime.entrypoints.utils import (
+    UGInterleavedGenerateReq,
+    save_outputs,
+)
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
     WeightsUpdater,
@@ -256,6 +259,37 @@ class GPUWorker:
             ),
             error_context=f"request {req.request_id}",
         )
+
+    def execute_ug_interleaved(
+        self,
+        reqs: list[UGInterleavedGenerateReq],
+    ) -> OutputBatch:
+        """Execute experimental UG interleaved requests with session isolation."""
+        try:
+            assert self.pipeline is not None
+            forward_batch = getattr(self.pipeline, "forward_interleaved_batch", None)
+            if callable(forward_batch):
+                responses = forward_batch(
+                    [req.request for req in reqs],
+                    server_args=self.server_args,
+                )
+            else:
+                forward_one = getattr(self.pipeline, "forward_interleaved", None)
+                if not callable(forward_one):
+                    raise RuntimeError(
+                        f"{self.pipeline.__class__.__name__} does not support "
+                        "UG interleaved generation"
+                    )
+                responses = [
+                    forward_one(req.request, server_args=self.server_args)
+                    for req in reqs
+                ]
+            return OutputBatch(
+                output=responses[0] if len(responses) == 1 else responses
+            )
+        except Exception as e:
+            logger.error("Error executing UG interleaved request: %s", e, exc_info=True)
+            return OutputBatch(error=f"Error executing UG interleaved request: {e}")
 
     def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch:
         """Execute expanded multi-output requests as one grouped forward."""

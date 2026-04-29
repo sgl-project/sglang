@@ -8,6 +8,9 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
+import base64
+import dataclasses
+import io
 import os
 import shutil
 import subprocess
@@ -34,10 +37,15 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
+from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.srt.observability.trace import TraceReqContext
+from sglang.srt.ug.interleaved import (
+    UGInterleavedRequest,
+    UGInterleavedResponse,
+)
 
 logger = init_logger(__name__)
 
@@ -76,6 +84,13 @@ class GetDisaggStatsReq:
     """Request to get disagg pipeline metrics from the scheduler."""
 
     pass
+
+
+@dataclass
+class UGInterleavedGenerateReq:
+    """Scheduler transport request for the experimental UG interleaved API."""
+
+    request: UGInterleavedRequest
 
 
 def format_lora_message(
@@ -121,6 +136,99 @@ class GenerationResult:
     trajectory_decoded: Any = None
     prompt_index: int = 0
     output_file_path: str | None = None
+
+
+def build_ug_interleaved_generate_req(
+    payload: dict[str, Any] | UGInterleavedRequest,
+) -> UGInterleavedGenerateReq:
+    """Build a scheduler request from the public experimental UG payload."""
+    if isinstance(payload, UGInterleavedRequest):
+        return UGInterleavedGenerateReq(payload)
+    if not isinstance(payload, dict):
+        raise TypeError(f"UG interleaved request payload must be a dict: {payload!r}")
+
+    messages = payload.get("messages")
+    if messages is None:
+        raise ValueError("UG interleaved request is missing messages")
+    sampling_params = _build_ug_sampling_params(payload.get("sampling_params"))
+    metadata = dict(payload.get("metadata") or {})
+    return UGInterleavedGenerateReq(
+        UGInterleavedRequest.from_segments(
+            messages,
+            sampling_params=sampling_params,
+            metadata=metadata,
+        )
+    )
+
+
+def build_ug_interleaved_generate_reqs(
+    payload: dict[str, Any] | list[Any] | UGInterleavedRequest,
+) -> UGInterleavedGenerateReq | list[UGInterleavedGenerateReq]:
+    """Normalize a single or batched UG interleaved payload."""
+    if isinstance(payload, UGInterleavedRequest):
+        return build_ug_interleaved_generate_req(payload)
+    if isinstance(payload, list):
+        return [build_ug_interleaved_generate_req(item) for item in payload]
+    if isinstance(payload, dict) and "requests" in payload:
+        requests = payload["requests"]
+        if not isinstance(requests, list):
+            raise TypeError("UG interleaved batch payload requests must be a list")
+        return [build_ug_interleaved_generate_req(item) for item in requests]
+    return build_ug_interleaved_generate_req(payload)
+
+
+def _build_ug_sampling_params(
+    payload: dict[str, Any] | UGSamplingParams | None,
+) -> UGSamplingParams:
+    if payload is None:
+        return UGSamplingParams()
+    if isinstance(payload, UGSamplingParams):
+        return payload
+    if not isinstance(payload, dict):
+        raise TypeError(f"UG interleaved sampling_params must be a dict: {payload!r}")
+    return UGSamplingParams(**payload)
+
+
+def serialize_ug_interleaved_output(output: Any) -> Any:
+    """Convert UG interleaved scheduler output into a JSON-friendly payload."""
+    if isinstance(output, UGInterleavedResponse):
+        return _serialize_ug_interleaved_response(output)
+    if isinstance(output, list):
+        return [serialize_ug_interleaved_output(item) for item in output]
+    return output
+
+
+def _serialize_ug_interleaved_response(
+    response: UGInterleavedResponse,
+) -> dict[str, Any]:
+    return {
+        "segments": [
+            _serialize_ug_segment(segment) for segment in response.to_legacy_segments()
+        ],
+        "stats": dataclasses.asdict(response.stats) if response.stats else None,
+        "metadata": dict(response.metadata),
+    }
+
+
+def _serialize_ug_segment(segment: dict[str, Any]) -> dict[str, Any]:
+    serialized = dict(segment)
+    if serialized.get("type") == "image" and "image" in serialized:
+        serialized["image"] = _serialize_ug_image(serialized["image"])
+    return serialized
+
+
+def _serialize_ug_image(image: Any) -> Any:
+    if isinstance(image, str) or image is None:
+        return image
+
+    save = getattr(image, "save", None)
+    if callable(save):
+        buffer = io.BytesIO()
+        save(buffer, format="PNG")
+        encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
+        return f"data:image/png;base64,{encoded}"
+
+    return None
 
 
 def normalize_output_seeds(
