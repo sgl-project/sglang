@@ -291,7 +291,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,
-                num_accepted_drafts=sum(verify_output.accept_length_per_req_cpu),
+                num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
@@ -544,7 +544,7 @@ class MultiLayerEagleWorker(TpModelWorker):
         if self.target_worker.model_runner.hybrid_gdn_config is not None:
             accepted_length = (
                 torch.tensor(
-                    res.accept_length_per_req_cpu,
+                    res.num_accepted_drafts_per_req_cpu,
                     device=logits_output.hidden_states.device,
                     dtype=torch.int64,
                 )
@@ -658,7 +658,8 @@ class MultiLayerEagleWorker(TpModelWorker):
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
-        accept_length_backup = batch.spec_info.accept_length
+        num_accepted_drafts_backup = batch.spec_info.num_accepted_drafts
+        num_accepted_tokens_backup = batch.spec_info.num_accepted_tokens
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
@@ -755,5 +756,6 @@ class MultiLayerEagleWorker(TpModelWorker):
         batch.seq_lens = seq_lens_backup
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
-        batch.spec_info.accept_length = accept_length_backup
+        batch.spec_info.num_accepted_drafts = num_accepted_drafts_backup
+        batch.spec_info.num_accepted_tokens = num_accepted_tokens_backup
         batch.return_logprob = return_logprob_backup

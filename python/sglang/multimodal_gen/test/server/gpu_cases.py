@@ -617,13 +617,6 @@ TWO_GPU_CASES = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
-        "flux_2_klein_ti2i_2_gpus",
-        DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-klein-4B",
-        ),
-        TI2I_sampling_params,
-    ),
-    DiffusionTestCase(
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",

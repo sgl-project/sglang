@@ -483,7 +483,7 @@ class EAGLEWorker(TpModelWorker):
 
             if get_global_tracing_enabled():
                 for idx, req in enumerate(batch.reqs):
-                    accepted = verify_output.accept_length_per_req_cpu[idx]
+                    accepted = verify_output.num_accepted_drafts_per_req_cpu[idx]
                     req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
 
             set_time_batch(
@@ -508,13 +508,15 @@ class EAGLEWorker(TpModelWorker):
 
             controller = getattr(self, "adaptive_controller", None)
             if controller is not None:
-                controller.on_verify_complete(verify_output.accept_length_per_req_cpu)
+                controller.on_verify_complete(
+                    verify_output.num_accepted_drafts_per_req_cpu
+                )
 
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,
-                num_accepted_drafts=sum(verify_output.accept_length_per_req_cpu),
-                accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+                num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
+                num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
@@ -987,7 +989,7 @@ class EAGLEWorker(TpModelWorker):
 
         accepted_length = (
             torch.tensor(
-                res.accept_length_per_req_cpu,
+                res.num_accepted_drafts_per_req_cpu,
                 device=logits_output.hidden_states.device,
                 dtype=torch.int64,
             )
@@ -1101,7 +1103,8 @@ class EAGLEWorker(TpModelWorker):
         seq_lens_backup = batch.seq_lens.clone()
         seq_lens_cpu_backup = batch.seq_lens_cpu.clone()
         req_pool_indices_backup = batch.req_pool_indices
-        accept_length_backup = batch.spec_info.accept_length.clone()
+        num_accepted_drafts_backup = batch.spec_info.num_accepted_drafts.clone()
+        num_accepted_tokens_backup = batch.spec_info.num_accepted_tokens.clone()
         return_logprob_backup = batch.return_logprob
 
         input_is_idle = batch.forward_mode.is_idle()
@@ -1187,7 +1190,8 @@ class EAGLEWorker(TpModelWorker):
         batch.seq_lens = seq_lens_backup
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.req_pool_indices = req_pool_indices_backup
-        batch.spec_info.accept_length = accept_length_backup
+        batch.spec_info.num_accepted_drafts = num_accepted_drafts_backup
+        batch.spec_info.num_accepted_tokens = num_accepted_tokens_backup
         batch.return_logprob = return_logprob_backup
 
     def capture_for_decode(
