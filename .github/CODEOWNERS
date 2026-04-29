@@ -49,7 +49,7 @@
 /python/sglang/srt/multimodal @mickqian @JustinTong0323 @yhyang201 @yuan-luo
 /python/sglang/srt/observability @merrymercy @fzyzcjy @sufeng-buaa
 /python/sglang/srt/ray @Qiaolin-Yu @xyuzh
-/python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002
+/python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002 @Qiaolin-Yu
 /sgl-kernel @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /sgl-model-gateway @slin1237 @CatherineSue
 /sgl-model-gateway/benches @slin1237

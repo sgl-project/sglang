@@ -483,13 +483,10 @@ class HiMambaRadixCache(MambaRadixCache):
             or node == self.root_node
             or node.host_ref_counter > 0
             or node.host_mamba_ref_counter > 0
+            or len(node.children) > 0
         ):
             self.evictable_full_host_leaves.discard(node)
             return
-        for child in node.children.values():
-            if child.evicted and child.backuped:
-                self.evictable_full_host_leaves.discard(node)
-                return
         self.evictable_full_host_leaves.add(node)
 
     def _free_device_mamba(self, node: TreeNode) -> int:

@@ -218,9 +218,6 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                     device=batch.audio_latents.device, dtype=torch.float32
                 )
 
-        batch.image_latent = None
-        batch.ltx2_num_image_tokens = 0
-
         original_scheduler = self.scheduler
         original_batch_timesteps = batch.timesteps
         original_batch_num_inference_steps = batch.num_inference_steps

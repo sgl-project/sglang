@@ -190,6 +190,21 @@ class RequestStage:
         metrics_is_observed=True,
     )
 
+    # speculative decode
+    SPEC_DRAFT = RequestStageConfig(
+        "spec_draft",
+        level=2,
+    )
+
+    SPEC_VERIFY = RequestStageConfig(
+        "spec_verify",
+        level=2,
+    )
+
+    SPEC_DRAFT_EXTEND = RequestStageConfig(
+        "spec_draft_extend",
+        level=3,
+    )
     # other
     ANONYMOUS = RequestStageConfig("")
 
@@ -551,6 +566,11 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     last_forward_entry_time: float = 0.0
     last_prefill_finished_time: float = 0.0
 
+    # speculative decoding
+    spec_draft_start_time: float = 0.0
+    spec_verify_start_time: float = 0.0
+    spec_draft_extend_start_time: float = 0.0
+
     # other
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
@@ -576,6 +596,42 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
         calibrate_time_diff()
         ts = ts or time.perf_counter()
         self.scheduler_recv_time = ts
+
+    def set_spec_draft_start_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        self.spec_draft_start_time = ts
+
+    def set_spec_draft_end_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+
+        stage = RequestStage.SPEC_DRAFT
+        self.trace_slice(stage, self.spec_draft_start_time, ts)
+
+    def set_spec_verify_start_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        self.spec_verify_start_time = ts
+
+    def set_spec_verify_end_time(self, ts=None, accepted_tokens: int = 0):
+        if ts is None:
+            ts = time.perf_counter()
+        stage = RequestStage.SPEC_VERIFY
+        self.trace_slice(
+            stage, self.spec_verify_start_time, ts, {"accepted_tokens": accepted_tokens}
+        )
+
+    def set_spec_draft_extend_start_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        self.spec_draft_extend_start_time = ts
+
+    def set_spec_draft_extend_end_time(self, ts=None):
+        if ts is None:
+            ts = time.perf_counter()
+        stage = RequestStage.SPEC_DRAFT_EXTEND
+        self.trace_slice(stage, self.spec_draft_extend_start_time, ts)
 
     def set_retract_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -1049,8 +1105,10 @@ def set_schedule_time_batch(batch: ScheduleBatch):
         req.time_stats.set_last_scheduled_time(batch.forward_mode, ts, _attrs)
 
 
-def set_time_batch(reqs: List[Any], set_func: str):
+def set_time_batch(reqs: List[Any], set_func: str, trace_only: bool = False):
     if reqs is None or len(reqs) == 0:
+        return
+    if trace_only and not get_global_tracing_enabled():
         return
 
     ts = time.perf_counter()

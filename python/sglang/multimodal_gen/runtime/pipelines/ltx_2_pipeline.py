@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages import (
     LTX2AVDenoisingStage,
     LTX2AVLatentPreparationStage,
     LTX2HalveResolutionStage,
+    LTX2ImageEncodingStage,
     LTX2LoRASwitchStage,
     LTX2RefinementStage,
     LTX2TextConnectorStage,
@@ -174,6 +175,9 @@ def _add_ltx2_stage1_generation_stages(pipeline: ComposedPipelineBase):
                 scheduler=pipeline.get_module("scheduler"),
                 transformer=pipeline.get_module("transformer"),
                 audio_vae=pipeline.get_module("audio_vae"),
+            ),
+            LTX2ImageEncodingStage(
+                vae=pipeline.get_module("vae"),
             ),
             LTX2AVDenoisingStage(
                 transformer=pipeline.get_module("transformer"),
@@ -373,6 +377,12 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 (
                     LTX2LoRASwitchStage(pipeline=self, phase="stage2"),
                     "ltx2_lora_switch_stage2",
+                ),
+                (
+                    LTX2ImageEncodingStage(
+                        vae=self.get_module("vae"),
+                    ),
+                    "ltx2_image_encoding_stage2",
                 ),
                 LTX2RefinementStage(
                     transformer=self.get_module("transformer"),

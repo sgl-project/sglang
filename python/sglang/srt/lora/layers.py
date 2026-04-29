@@ -70,6 +70,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.weight = base_layer.weight
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
+        self.num_embeddings = base_layer.num_embeddings
 
         # Embedding LoRA with TP > 1 keeps weights fully replicated
         # (unsharded) on every rank.  This works correctly because the

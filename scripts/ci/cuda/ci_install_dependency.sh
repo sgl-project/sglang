@@ -149,7 +149,12 @@ fi
 # Install protoc
 bash "${SCRIPT_DIR}/../utils/install_protoc.sh"
 
-mark_step_done "Python package site hygiene & install protoc"
+# Install Rust toolchain (needed by crates built via setuptools-rust, e.g. the
+# native gRPC extension bundled into the sglang wheel).
+bash "${SCRIPT_DIR}/../utils/install_rustup.sh"
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
+
+mark_step_done "Python package site hygiene & install protoc + rust"
 
 # ------------------------------------------------------------------------------
 # Pip / uv toolchain & stale package cleanup

@@ -23,6 +23,12 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.quantization.nunchaku import NunchakuSVDQuantArgs
+from sglang.multimodal_gen.runtime.disaggregation.disagg_args import (
+    DisaggArgsMixin,
+    add_disagg_cli_args,
+    convert_disagg_role_string,
+)
+from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
     NunchakuConfig,
 )
@@ -94,7 +100,7 @@ class Backend(str, Enum):
 
 
 @dataclasses.dataclass
-class ServerArgs:
+class ServerArgs(DisaggArgsMixin):
     # Model and path configuration (for convenience)
     model_path: str
 
@@ -230,9 +236,34 @@ class ServerArgs:
     # MoE parameters used by Wan2.2
     boundary_ratio: float | None = None
 
+    # Disaggregation — fields defined here, methods in DisaggArgsMixin,
+    # CLI registration in disagg_args.add_disagg_cli_args().
+    base_gpu_id: int = 0
+    disagg_role: RoleType = RoleType.MONOLITHIC
+    disagg_timeout: int = 600
+    disagg_dispatch_policy: str = "round_robin"
+    disagg_mode: bool = False
+    disagg_server_addr: str | None = None
+    encoder_urls: str | None = None
+    denoiser_urls: str | None = None
+    decoder_urls: str | None = None
+    encoder_tp: int | None = None
+    denoiser_tp: int | None = None
+    denoiser_sp: int | None = None
+    denoiser_ulysses: int | None = None
+    denoiser_ring: int | None = None
+    decoder_tp: int | None = None
+    disagg_transfer_pool_size: int = 256 * 1024 * 1024
+    disagg_p2p_hostname: str = "127.0.0.1"
+    disagg_ib_device: str | None = None
+    pool_work_endpoint: str | None = None
+    pool_result_endpoint: str | None = None
+
     # Logging
     log_level: str = "info"
     uvicorn_access_log_exclude_prefixes: list[str] = field(default_factory=list)
+
+    # get_role_parallelism, derive_pool_*_endpoint — from DisaggArgsMixin
 
     @property
     def broker_port(self) -> int:
@@ -411,12 +442,22 @@ class ServerArgs:
             )
 
     def _adjust_network_ports(self):
+        # Disagg role instances (encoder/denoiser/decoder) don't serve HTTP,
+        # so skip settling the HTTP port to avoid unnecessary port collisions.
+        needs_http = self.disagg_role in (
+            RoleType.MONOLITHIC,
+            RoleType.SERVER,
+        )
+
         if self.strict_ports:
-            self._require_port(self.port, "HTTP")
+            if needs_http:
+                self._require_port(self.port, "HTTP")
             self._require_port(self.scheduler_port, "Scheduler")
-            self._require_port(self.master_port, "Master")
+            if self.master_port is not None:
+                self._require_port(self.master_port, "Master")
         else:
-            self.port = self.settle_port(self.port)
+            if needs_http:
+                self.port = self.settle_port(self.port)
             initial_scheduler_port = self.scheduler_port + (
                 random.randint(0, 100) if self.scheduler_port == 5555 else 0
             )
@@ -611,6 +652,9 @@ class ServerArgs:
         # configure logger before use
         configure_logger(server_args=self)
 
+        # Convert string disagg_role to enum (from CLI/config)
+        convert_disagg_role_string(self.__dict__)
+
         # 1. adjust parameters
         self._adjust_parameters()
 
@@ -699,6 +743,7 @@ class ServerArgs:
             default=ServerArgs.num_gpus,
             help="The number of GPUs to use.",
         )
+
         parser.add_argument(
             "--tp-size",
             type=int,
@@ -757,6 +802,9 @@ class ServerArgs:
             help="Timeout for torch.distributed operations in seconds. "
             "Increase this value if you encounter 'Connection closed by peer' errors after the service is idle. ",
         )
+
+        # Disaggregated diffusion args (defined in disagg_args.py)
+        add_disagg_cli_args(parser)
 
         # Prompt text file for batch processing
         parser.add_argument(
@@ -1138,6 +1186,9 @@ class ServerArgs:
         # Convert backend string to enum if necessary
         if "backend" in kwargs and isinstance(kwargs["backend"], str):
             kwargs["backend"] = Backend.from_string(kwargs["backend"])
+
+        # Convert disagg_role string to enum if necessary
+        convert_disagg_role_string(kwargs)
 
         kwargs["pipeline_config"] = PipelineConfig.from_kwargs(kwargs)
         return cls(**kwargs)
