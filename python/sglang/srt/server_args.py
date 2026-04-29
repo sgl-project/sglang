@@ -178,6 +178,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_cutlass",
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
+    "flashinfer_b12x",
     "cutlass",
 ]
 
@@ -2920,6 +2921,14 @@ class ServerArgs:
                 1,
                 self.tp_size,
             ], "The expert parallel size must be 1 or the same as the tensor parallel size"
+
+        if self.moe_runner_backend == "flashinfer_b12x":
+            assert self.quantization in [
+                "modelopt_fp4"
+            ], f"Invalid quantization '{self.quantization}'. \nFlashInfer B12x MOE supports only: 'modelopt_fp4'."
+            assert (
+                is_sm120_supported()
+            ), "FlashInfer B12x MOE is only supported on SM120."
 
         if self.moe_runner_backend == "flashinfer_cutedsl":
             assert self.quantization in [
@@ -7109,7 +7118,10 @@ class ServerArgs:
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
         # ModelExpress source mode needs TransferEngine init only if transport is transfer_engine.
-        if self.modelexpress_source and self.modelexpress_transport == "transfer_engine":
+        if (
+            self.modelexpress_source
+            and self.modelexpress_transport == "transfer_engine"
+        ):
             return True
         # Use TransferEngine as client backend.
         elif (

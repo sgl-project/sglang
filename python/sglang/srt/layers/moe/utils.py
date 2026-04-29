@@ -76,6 +76,7 @@ class MoeRunnerBackend(Enum):
     FLASHINFER_CUTLASS = "flashinfer_cutlass"
     FLASHINFER_MXFP4 = "flashinfer_mxfp4"
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
+    FLASHINFER_B12X = "flashinfer_b12x"
     CUTLASS = "cutlass"
     MARLIN = "marlin"
 
@@ -105,6 +106,9 @@ class MoeRunnerBackend(Enum):
 
     def is_flashinfer_mxfp4(self):
         return self == MoeRunnerBackend.FLASHINFER_MXFP4
+
+    def is_flashinfer_b12x(self):
+        return self == MoeRunnerBackend.FLASHINFER_B12X
 
     def is_cutlass(self):
         return self == MoeRunnerBackend.CUTLASS

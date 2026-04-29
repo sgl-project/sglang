@@ -57,6 +57,8 @@ class MoeRunner:
             self.runner_core = None  # FlashInfer TRT-LLM only supports fused path
         elif runner_backend.is_flashinfer_cutedsl():
             self.runner_core = None  # FlashInfer CuteDSL only supports fused path
+        elif runner_backend.is_flashinfer_b12x():
+            self.runner_core = None  # FlashInfer B12x only supports fused path
         else:
             raise NotImplementedError(f"Unsupported runner backend: {runner_backend}")
 
