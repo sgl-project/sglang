@@ -70,6 +70,7 @@ class DmdDenoisingStage(DenoisingStage):
         num_warmup_steps = prepared_vars["num_warmup_steps"]
         latents = prepared_vars["latents"]
         video_raw_latent_shape = latents.shape
+        scheduler = self.scheduler
 
         timesteps = torch.tensor(
             server_args.pipeline_config.dmd_denoising_steps,
@@ -112,7 +113,7 @@ class DmdDenoisingStage(DenoisingStage):
                             self._select_and_manage_model(
                                 t_int=t_int,
                                 boundary_timestep=self._handle_boundary_ratio(
-                                    server_args, batch
+                                    server_args, batch, scheduler
                                 ),
                                 server_args=server_args,
                                 batch=batch,
@@ -173,7 +174,7 @@ class DmdDenoisingStage(DenoisingStage):
                             pred_noise=pred_noise.flatten(0, 1),
                             noise_input_latent=noise_latents.flatten(0, 1),
                             timestep=t_expand,
-                            scheduler=self.scheduler,
+                            scheduler=scheduler,
                         ).unflatten(0, pred_noise.shape[:2])
 
                         if i < len(timesteps) - 1:
@@ -186,7 +187,7 @@ class DmdDenoisingStage(DenoisingStage):
                                 generator=batch.generator[0],
                                 device=self.device,
                             )
-                            latents = self.scheduler.add_noise(
+                            latents = scheduler.add_noise(
                                 pred_video.flatten(0, 1),
                                 noise.flatten(0, 1),
                                 next_timestep,
@@ -197,7 +198,7 @@ class DmdDenoisingStage(DenoisingStage):
                         # Update progress bar
                         if i == len(timesteps) - 1 or (
                             (i + 1) > num_warmup_steps
-                            and (i + 1) % self.scheduler.order == 0
+                            and (i + 1) % scheduler.order == 0
                             and progress_bar is not None
                         ):
                             progress_bar.update()
@@ -274,6 +275,7 @@ class DmdDenoisingStage(DenoisingStage):
         self,
         server_args,
         batch,
+        scheduler,
     ):
         """
         (Wan2.2) Calculate timestep to switch from high noise expert to low noise expert
@@ -288,7 +290,10 @@ class DmdDenoisingStage(DenoisingStage):
             boundary_ratio = batch.boundary_ratio
 
         if boundary_ratio is not None:
-            boundary_timestep = boundary_ratio * self.scheduler.num_train_timesteps
+            num_train_timesteps = getattr(scheduler, "num_train_timesteps", None)
+            if num_train_timesteps is None:
+                num_train_timesteps = scheduler.config.num_train_timesteps
+            boundary_timestep = boundary_ratio * num_train_timesteps
         else:
             boundary_timestep = None
 

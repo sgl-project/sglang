@@ -11,7 +11,7 @@ ARG GRACE_BLACKWELL_DEEPEP_BRANCH=gb200_blog_part_2
 ARG HOPPER_SBO_DEEPEP_COMMIT=9f2fc4b3182a51044ae7ecb6610f7c9c3258c4d6
 ARG DEEPEP_COMMIT=9af0e0d0e74f3577af1979c9b9e1ac2cad0104ee
 ARG BUILD_AND_DOWNLOAD_PARALLEL=8
-ARG SGL_KERNEL_VERSION=0.4.1
+ARG SGL_KERNEL_VERSION=0.4.1.post1
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
@@ -19,8 +19,8 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.6.7.post3
-ARG MOONCAKE_VERSION=0.3.9
+ARG FLASHINFER_VERSION=0.6.8.post1
+ARG MOONCAKE_VERSION=0.3.10.post2
 #if need other arg please add in MOONCAKE_COMPILE_ARG
 ARG MOONCAKE_COMPILE_ARG="-DUSE_HTTP=ON -DUSE_MNNVL=ON -DUSE_CUDA=ON -DWITH_EP=ON"
 
@@ -181,6 +181,13 @@ ARG GITHUB_ARTIFACTORY
 
 WORKDIR /sgl-workspace
 
+# Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
+# Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal \
+    && rustc --version && cargo --version
+
 # Install sgl-kernel (from pre-built wheel)
 RUN --mount=type=cache,target=/root/.cache/pip \
     python3 -m pip install --upgrade pip setuptools wheel html5lib six \
@@ -205,13 +212,18 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     ; \
     fi
 
-# Copy ONLY dependency specification file (for better caching)
+# Copy dep spec + Rust crate source + proto files. setuptools-rust compiles the
+# Rust extension during the stub wheel build; the crate's build.rs references
+# ../../proto for tonic_build. Split from the pip install so source changes to
+# these paths invalidate the dep-install layer, but Python source changes don't.
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
+COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
+COPY proto                 /tmp/sglang_deps/proto
 
 # Install sglang dependencies (torch, transformers, etc.)
-# This layer is cached unless pyproject.toml changes
 # Generate constraints.txt to prevent reinstalling these deps in later stages
 RUN --mount=type=cache,target=/root/.cache/pip \
+    --mount=type=cache,target=/root/.cargo/registry \
     case "$CUDA_VERSION" in \
         12.6.1) CUINDEX=126 ;; \
         12.8.1) CUINDEX=128 ;; \
@@ -428,8 +440,7 @@ COPY --from=deepep_builder /build/DeepEP /sgl-workspace/DeepEP
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install /tmp/wheels/deepep/*.whl && rm -rf /tmp/wheels/deepep
 
-# Copy flashinfer cache and jit-cache package (if installed)
-COPY --from=flashinfer_cache /root/.cache/flashinfer /root/.cache/flashinfer
+# Copy flashinfer jit-cache package (if installed)
 COPY --from=flashinfer_cache /flashinfer_jit_output/ /usr/local/lib/python3.12/dist-packages/
 
 # Copy dev tools
@@ -491,17 +502,8 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 RUN --mount=type=cache,target=/root/.cache/pip \
     CUDA_MAJOR="${CUDA_VERSION%%.*}" && \
     if [ "$CUDA_MAJOR" -ge 13 ]; then \
-        echo "CUDA >= 13, installing mooncake-transfer-engine from source code"; \
-        git clone --branch v${MOONCAKE_VERSION} --depth 1 https://github.com/kvcache-ai/Mooncake.git && \
-        cd Mooncake && \
-        bash dependencies.sh && \
-        mkdir -p build && \
-        cd build && \
-        cmake .. ${MOONCAKE_COMPILE_ARG} && \
-        make -j$(nproc) && \
-        make install; \
+        python3 -m pip install mooncake-transfer-engine-cuda13==${MOONCAKE_VERSION}; \
     else \
-        echo "CUDA < 13, installing mooncake-transfer-engine from pip"; \
         python3 -m pip install mooncake-transfer-engine==${MOONCAKE_VERSION}; \
     fi
 
@@ -524,7 +526,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pandas \
     matplotlib \
     tabulate \
-    termplotlib
+    termplotlib \
+    "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
 RUN --mount=type=cache,target=/root/.cache/pip \
    python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps;
@@ -616,15 +619,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
     && kernels lock python \
     && ( success=0; for i in 1 2 3; do \
-        echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
-        kernels download python && \
-        success=1 && break; \
-        echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
+    echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
+    kernels download python && \
+    success=1 && break; \
+    echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
     done; [ "$success" = "1" ] ) \
-    && mv python/kernels.lock /root/.cache/sglang \
-    && find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true \
-    && find /usr/local/lib/python3.12/dist-packages -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true \
-    && find /usr/local/lib/python3.12/dist-packages -name "*.pyc" -delete 2>/dev/null || true
+    && mkdir -p /root/.cache/sglang \
+    && mv python/kernels.lock /root/.cache/sglang/ \
+    && find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
 
 # Install pre-built gateway artifacts from parallel builder
 COPY --from=gateway_builder /build/sgl-model-gateway-bin /usr/local/bin/sgl-model-gateway

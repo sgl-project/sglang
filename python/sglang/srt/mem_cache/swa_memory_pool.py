@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocator import (
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.utils import is_npu
+from sglang.srt.utils.common import get_num_new_pages
 
 _is_npu = is_npu()
 
@@ -376,10 +377,13 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         extend_num_tokens: int,
     ):
         assert self.page_size > 1
-        num_tokens = extend_num_tokens + len(seq_lens) * self.page_size
-        if num_tokens > self.full_attn_allocator.available_size():
+
+        num_new_pages = get_num_new_pages(
+            seq_lens=seq_lens_cpu, page_size=self.page_size, prefix_lens=prefix_lens_cpu
+        )
+        if num_new_pages > self.full_attn_allocator.available_size() // self.page_size:
             return None
-        if num_tokens > self.swa_attn_allocator.available_size():
+        if num_new_pages > self.swa_attn_allocator.available_size() // self.page_size:
             return None
 
         swa_last_loc = self.translate_loc_from_full_to_swa(last_loc)

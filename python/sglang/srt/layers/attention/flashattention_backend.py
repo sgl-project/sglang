@@ -214,6 +214,16 @@ class FlashAttentionBackend(AttentionBackend):
             else 0
         )
 
+        # In embedding mode with no chunked prefill and radix cache disabled,
+        # skip KV cache write and use flash_attn_varlen_func with raw K/V
+        # instead of flash_attn_with_kvcache, bypassing paged KV cache entirely.
+        server_args = model_runner.server_args
+        self.fa_skip_kv_cache = (
+            server_args.is_embedding
+            and server_args.chunked_prefill_size == -1
+            and server_args.disable_radix_cache
+        )
+
     def _compute_scheduler_metadata(
         self, batch_size, max_seq_len_k, cache_seqlens, cu_seqlens_q
     ):
@@ -606,7 +616,7 @@ class FlashAttentionBackend(AttentionBackend):
                 and self.attn_cp_size > 1
             )
 
-            if save_kv_cache and not is_cp_mode:
+            if save_kv_cache and not is_cp_mode and not self.fa_skip_kv_cache:
                 cache_loc = (
                     forward_batch.out_cache_loc
                     if not layer.is_cross_attention
@@ -680,6 +690,12 @@ class FlashAttentionBackend(AttentionBackend):
         kwargs = {}
         if sinks is not None:
             kwargs["sinks"] = sinks
+
+        _fa_out = (
+            forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if getattr(forward_batch, "_attn_output", None) is not None
+            else None
+        )
 
         # Get the appropriate page table based on whether we're using local attention
         if use_local_attn:
@@ -764,6 +780,32 @@ class FlashAttentionBackend(AttentionBackend):
                     self.device,
                     _fa_cp_attn,
                 )
+            elif self.fa_skip_kv_cache:
+                # Embedding mode: skip KV cache read and use raw K/V tensors
+                # directly via flash_attn_varlen_func. The KV cache write is
+                # also skipped (guarded above). This eliminates store_kvcache
+                # and prepare_varlen_num_blocks overhead per layer.
+                assert k is not None, "fa_skip_kv_cache requires k to be provided"
+                assert k_descale is None and v_descale is None, (
+                    "fa_skip_kv_cache uses raw K/V tensors, "
+                    "FP8 KV cache descaling is not supported in this mode"
+                )
+                result = flash_attn_varlen_func(
+                    q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
+                    k=k.view(-1, layer.tp_k_head_num, layer.head_dim),
+                    v=v.view(-1, layer.tp_v_head_num, layer.v_head_dim),
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_q,
+                    softmax_scale=layer.scaling,
+                    causal=causal,
+                    window_size=window_size,
+                    softcap=layer.logit_cap,
+                    num_splits=self.num_splits,
+                    out=_fa_out,
+                    **kwargs,
+                )
             else:
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -782,6 +824,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    out=_fa_out,
                     ver=self.fa_impl_ver,
                     **kwargs,
                 )
@@ -850,6 +893,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=False,
                         return_softmax_lse=True,
+                        out=_fa_out,
                         ver=self.fa_impl_ver,
                         **kwargs,
                     )
@@ -876,6 +920,7 @@ class FlashAttentionBackend(AttentionBackend):
                         softmax_scale=layer.scaling,
                         causal=True,
                         return_softmax_lse=forward_batch.mha_return_lse,
+                        out=_fa_out,
                         ver=self.fa_impl_ver,
                         **kwargs,
                     )
@@ -1029,6 +1074,12 @@ class FlashAttentionBackend(AttentionBackend):
         if sinks is not None:
             kwargs["sinks"] = sinks
 
+        _fa_out = (
+            forward_batch._attn_output.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            if getattr(forward_batch, "_attn_output", None) is not None
+            else None
+        )
+
         k_descale, v_descale = None, None
         # only use kv scaling if: 1) fp8 kv is explicitly enabled, 2) RadixAttention
         # has corresponding quantization method so that layer.k_scale is not None,
@@ -1140,6 +1191,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    out=_fa_out,
                     ver=self.fa_impl_ver,
                     scheduler_metadata=sched_meta,
                     **kwargs,
@@ -2092,14 +2144,14 @@ class FlashAttentionBackend(AttentionBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            accept_length = spec_info.accept_length[:bs]
-            if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
+            extend_lens = spec_info.num_accepted_tokens[:bs]
+            if spec_info.num_accepted_tokens_cpu:
+                metadata.max_seq_len_q = max(spec_info.num_accepted_tokens_cpu)
             else:
                 metadata.max_seq_len_q = 1
 
             metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
             )
 
             max_seq_pages = (

@@ -12,6 +12,7 @@ import dataclasses
 import multiprocessing as mp
 import os
 import time
+from contextlib import ExitStack
 from typing import Any, List, Union
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -25,6 +26,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
+    expand_request_outputs,
     format_lora_message,
     prepare_request,
     save_outputs,
@@ -41,6 +43,8 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     log_batch_completion,
     log_generation_timer,
 )
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import trace_req
+from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 
 logger = init_logger(__name__)
 
@@ -119,6 +123,10 @@ class DiffGenerator:
         instance = cls(
             server_args=server_args,
         )
+        if server_args.enable_trace:
+            process_tracing_init(server_args.otlp_traces_endpoint, "sglang-diffusion")
+            trace_set_thread_info("DiffGenerator")
+
         logger.info(f"Local mode: {local_mode}")
         if local_mode:
             instance.local_scheduler_process = instance._start_local_server_if_needed()
@@ -176,6 +184,7 @@ class DiffGenerator:
     def generate(
         self,
         sampling_params_kwargs: dict | None = None,
+        external_trace_header: dict[str, str] | None = None,
     ) -> GenerationResult | list[GenerationResult] | None:
         """Generate image(s)/video(s) based on the given prompt(s).
 
@@ -201,7 +210,7 @@ class DiffGenerator:
             **sampling_params_kwargs,
         )
 
-        requests: list[Req] = []
+        request_groups: list[list[Req]] = []
         image_paths_per_prompt = self._resolve_image_paths_per_prompt(
             prompts, sampling_params_orig.image_path
         )
@@ -217,20 +226,33 @@ class DiffGenerator:
             req = prepare_request(
                 server_args=self.server_args,
                 sampling_params=sampling_params,
+                external_trace_header=external_trace_header,
             )
-            requests.append(req)
+            request_groups.append(
+                expand_request_outputs(
+                    req,
+                    num_prompts=len(prompts),
+                    prompt_index=i,
+                )
+            )
 
         results: list[GenerationResult] = []
         total_start_time = time.perf_counter()
+        global_output_index = 0
 
-        # 2. send requests to scheduler one at a time
-        # TODO: send batch when supported
-        for request_idx, req in enumerate(requests):
+        for requests in request_groups:
             try:
-                with log_generation_timer(
-                    logger, req.prompt, request_idx + 1, len(requests)
-                ) as timer:
-                    output_batch = self._send_to_scheduler_and_wait_for_response([req])
+                timer_prompt = [req.prompt for req in requests]
+                logger.info("Processing %d grouped request(s)", len(requests))
+                with ExitStack() as stack:
+                    for req in requests:
+                        stack.enter_context(trace_req(req.trace_ctx))
+                    timer = stack.enter_context(
+                        log_generation_timer(logger, timer_prompt)
+                    )
+                    output_batch = self._send_to_scheduler_and_wait_for_response(
+                        requests
+                    )
                     if output_batch.error:
                         raise Exception(f"{output_batch.error}")
 
@@ -238,97 +260,93 @@ class DiffGenerator:
                         output_batch.output is None
                         and output_batch.output_file_paths is None
                     ):
-                        logger.error(
-                            "Received empty output from scheduler for prompt %d",
-                            request_idx + 1,
-                        )
+                        logger.error("Received empty output from scheduler")
                         continue
 
-                    common = dict(
-                        prompt=req.prompt,
-                        size=(req.height, req.width, req.num_frames),
-                        generation_time=timer.duration,
-                        peak_memory_mb=output_batch.peak_memory_mb,
-                        metrics=(
-                            output_batch.metrics.to_dict()
-                            if output_batch.metrics
-                            else {}
-                        ),
-                        trajectory_latents=output_batch.trajectory_latents,
-                        trajectory_timesteps=output_batch.trajectory_timesteps,
-                        rollout_trajectory_data=output_batch.rollout_trajectory_data,
-                        trajectory_decoded=output_batch.trajectory_decoded,
-                    )
-
-                    if req.save_output and req.return_file_paths_only:
-                        for idx, path in enumerate(output_batch.output_file_paths):
+                    if requests[0].save_output and requests[0].return_file_paths_only:
+                        output_file_paths = output_batch.output_file_paths or []
+                        self._validate_output_count(
+                            len(output_file_paths), len(requests)
+                        )
+                        for idx, path in enumerate(output_file_paths):
+                            req = requests[idx]
                             results.append(
                                 GenerationResult(
-                                    **common,
-                                    prompt_index=idx,
+                                    **self._result_common(
+                                        req, output_batch, timer.duration, idx
+                                    ),
+                                    prompt_index=global_output_index + idx,
                                     output_file_path=path,
                                 )
                             )
-                        continue
-
-                    if req.data_type == DataType.MESH:
-                        for output_idx, sample in enumerate(
-                            output_batch.output_file_paths
-                        ):
+                    elif requests[0].data_type == DataType.MESH:
+                        output_file_paths = output_batch.output_file_paths or []
+                        self._validate_output_count(
+                            len(output_file_paths), len(requests)
+                        )
+                        for idx, sample in enumerate(output_file_paths):
+                            req = requests[idx]
                             results.append(
                                 GenerationResult(
-                                    **common,
-                                    prompt_index=output_idx,
+                                    **self._result_common(
+                                        req, output_batch, timer.duration, idx
+                                    ),
+                                    prompt_index=global_output_index + idx,
                                     output_file_path=sample,
                                 )
                             )
-                        continue
-
-                    samples_out: list[Any] = []
-                    audios_out: list[Any] = []
-                    frames_out: list[Any] = []
-                    num_outputs = len(output_batch.output)
-                    save_outputs(
-                        output_batch.output,
-                        req.data_type,
-                        req.fps,
-                        req.save_output,
-                        lambda idx: req.output_file_path(num_outputs, idx),
-                        audio=output_batch.audio,
-                        audio_sample_rate=output_batch.audio_sample_rate,
-                        samples_out=samples_out,
-                        audios_out=audios_out,
-                        frames_out=frames_out,
-                        output_compression=req.output_compression,
-                        enable_frame_interpolation=req.enable_frame_interpolation,
-                        frame_interpolation_exp=req.frame_interpolation_exp,
-                        frame_interpolation_scale=req.frame_interpolation_scale,
-                        frame_interpolation_model_path=req.frame_interpolation_model_path,
-                        enable_upscaling=req.enable_upscaling,
-                        upscaling_model_path=req.upscaling_model_path,
-                        upscaling_scale=req.upscaling_scale,
-                    )
-
-                    for idx in range(len(samples_out)):
-                        results.append(
-                            GenerationResult(
-                                **common,
-                                samples=samples_out[idx],
-                                frames=frames_out[idx],
-                                audio=audios_out[idx],
-                                prompt_index=idx,
-                                output_file_path=req.output_file_path(num_outputs, idx),
-                            )
+                    else:
+                        self._validate_output_count(
+                            len(output_batch.output), len(requests)
                         )
+                        samples_out: list[Any] = []
+                        audios_out: list[Any] = []
+                        frames_out: list[Any] = []
+                        save_outputs(
+                            output_batch.output,
+                            requests[0].data_type,
+                            requests[0].fps,
+                            requests[0].save_output,
+                            lambda idx: requests[idx].output_file_path(1, 0),
+                            audio=output_batch.audio,
+                            audio_sample_rate=output_batch.audio_sample_rate,
+                            samples_out=samples_out,
+                            audios_out=audios_out,
+                            frames_out=frames_out,
+                            output_compression=requests[0].output_compression,
+                            enable_frame_interpolation=requests[
+                                0
+                            ].enable_frame_interpolation,
+                            frame_interpolation_exp=requests[0].frame_interpolation_exp,
+                            frame_interpolation_scale=requests[
+                                0
+                            ].frame_interpolation_scale,
+                            frame_interpolation_model_path=requests[
+                                0
+                            ].frame_interpolation_model_path,
+                            enable_upscaling=requests[0].enable_upscaling,
+                            upscaling_model_path=requests[0].upscaling_model_path,
+                            upscaling_scale=requests[0].upscaling_scale,
+                        )
+
+                        for idx in range(len(samples_out)):
+                            req = requests[idx]
+                            results.append(
+                                GenerationResult(
+                                    **self._result_common(
+                                        req, output_batch, timer.duration, idx
+                                    ),
+                                    samples=samples_out[idx],
+                                    frames=frames_out[idx],
+                                    audio=audios_out[idx],
+                                    prompt_index=global_output_index + idx,
+                                    output_file_path=req.output_file_path(1, 0),
+                                )
+                            )
             except Exception as e:
-                logger.error(
-                    "Generation failed for prompt %d/%d: %s",
-                    request_idx + 1,
-                    len(requests),
-                    e,
-                    exc_info=True,
-                )
-                continue
+                logger.error("Generation failed: %s", e, exc_info=True)
+            finally:
+                global_output_index += len(requests)
 
         total_gen_time = time.perf_counter() - total_start_time
         log_batch_completion(logger, len(results), total_gen_time)
@@ -376,6 +394,39 @@ class DiffGenerator:
             logger.info(
                 f"Memory usage - Max peak: {max(peak_memories):.2f} MB, "
                 f"Avg peak: {sum(peak_memories) / len(peak_memories):.2f} MB"
+            )
+
+    @staticmethod
+    def _result_common(
+        req: Req,
+        output_batch: OutputBatch,
+        generation_time: float,
+        output_index: int | None = None,
+    ) -> dict[str, Any]:
+        metrics = output_batch.metrics
+        if (
+            output_index is not None
+            and output_batch.metrics_list is not None
+            and output_index < len(output_batch.metrics_list)
+        ):
+            metrics = output_batch.metrics_list[output_index]
+        return dict(
+            prompt=req.prompt,
+            size=(req.height, req.width, req.num_frames),
+            generation_time=generation_time,
+            peak_memory_mb=output_batch.peak_memory_mb,
+            metrics=metrics.to_dict() if metrics else {},
+            trajectory_latents=output_batch.trajectory_latents,
+            trajectory_timesteps=output_batch.trajectory_timesteps,
+            rollout_trajectory_data=output_batch.rollout_trajectory_data,
+            trajectory_decoded=output_batch.trajectory_decoded,
+        )
+
+    @staticmethod
+    def _validate_output_count(output_count: int, request_count: int) -> None:
+        if output_count != request_count:
+            raise RuntimeError(
+                f"Expected {request_count} outputs, got {output_count} from scheduler"
             )
 
     def _send_to_scheduler_and_wait_for_response(self, batch: list[Req]) -> OutputBatch:

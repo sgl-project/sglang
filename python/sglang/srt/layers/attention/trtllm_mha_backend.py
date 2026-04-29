@@ -524,14 +524,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            accept_length = spec_info.accept_length[:bs]
-            if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
+            extend_lens = spec_info.num_accepted_tokens[:bs]
+            if spec_info.num_accepted_tokens_cpu:
+                metadata.max_seq_len_q = max(spec_info.num_accepted_tokens_cpu)
             else:
                 metadata.max_seq_len_q = 1
 
             metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
             )
 
             max_seq_pages = (
@@ -728,7 +728,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         # For XQA, q_dtype should be bf16
         if self.data_type == torch.float8_e4m3fn and (not self.is_xqa_impl):
             q = q.to(torch.float8_e4m3fn)
-        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         # shape conversion:
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
@@ -813,7 +813,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         if self.data_type == torch.float8_e4m3fn:
             q = q.to(torch.float8_e4m3fn)
-        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
         # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
         k_cache = k_cache.view(

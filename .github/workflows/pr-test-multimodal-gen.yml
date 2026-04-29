@@ -46,7 +46,7 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
-  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == 'true' }}
 
 jobs:
@@ -80,7 +80,7 @@ jobs:
       - name: Compute partitions
         id: compute
         run: |
-          python scripts/ci/utils/diffusion/compute_diffusion_partitions.py --min-time 1200 --target-time 1800 --max-time 2400 --max-partitions 10
+          python scripts/ci/utils/diffusion/compute_diffusion_partitions.py --min-time 1200 --target-time 1800 --max-time 2400 --max-partitions 10 --parametrized-only
 
   multimodal-gen-test-1-gpu:
     needs: compute-diffusion-partitions
@@ -117,7 +117,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -186,7 +186,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -221,64 +221,13 @@ jobs:
         with:
           artifact-suffix: ${{ matrix.part }}
 
-  multimodal-gen-component-accuracy-1-gpu:
+  multimodal-gen-component-accuracy:
     if: |
-      (inputs.target_stage == 'multimodal-gen-component-accuracy-1-gpu') ||
       (
-        !inputs.target_stage &&
-        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-        inputs.multimodal_gen == 'true'
-      )
-    runs-on: 1-gpu-h100
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
-
-      - uses: ./.github/actions/check-stage-health
-
-      - uses: ./.github/actions/check-maintenance
-
-      - name: Download artifacts
-        if: inputs.sgl_kernel == 'true'
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
-
-      - name: Install dependencies
-        timeout-minutes: 20
-        run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
-
-      - name: Run diffusion component accuracy tests (1-GPU)
-        timeout-minutes: 240
-        env:
-          RUNAI_STREAMER_MEMORY_LIMIT: 0
-          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
-        run: |
-          cd python
-          python3 sglang/multimodal_gen/test/run_suite.py \
-            --suite component-accuracy-1-gpu \
-            --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
-            $CONTINUE_ON_ERROR_FLAG
-
-      - uses: ./.github/actions/upload-cuda-coredumps
-        if: always()
-        with:
-          artifact-suffix: ${{ matrix.part }}
-
-  multimodal-gen-component-accuracy-2-gpu:
-    if: |
-      (inputs.target_stage == 'multimodal-gen-component-accuracy-2-gpu') ||
+        inputs.target_stage == 'multimodal-gen-component-accuracy' ||
+        inputs.target_stage == 'multimodal-gen-component-accuracy-1-gpu' ||
+        inputs.target_stage == 'multimodal-gen-component-accuracy-2-gpu'
+      ) ||
       (
         !inputs.target_stage &&
         ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
@@ -286,10 +235,6 @@ jobs:
       )
     runs-on: 2-gpu-h100
     timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -306,14 +251,14 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
 
-      - name: Run diffusion component accuracy tests (2-GPU)
+      - name: Run diffusion component accuracy tests
         timeout-minutes: 240
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
@@ -321,15 +266,13 @@ jobs:
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
-            --suite component-accuracy-2-gpu \
-            --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
+            --suite component-accuracy \
             $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: always()
         with:
-          artifact-suffix: ${{ matrix.part }}
+          artifact-suffix: component-accuracy
 
   multimodal-gen-test-1-b200:
     if: |
@@ -357,7 +300,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -369,11 +312,20 @@ jobs:
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-artifacts
         run: |
           cd python
           python3 sglang/multimodal_gen/test/run_suite.py \
             --suite 1-gpu-b200 \
             $CONTINUE_ON_ERROR_FLAG
+
+      - name: Upload diffusion artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-artifacts-${{ github.job }}-${{ github.run_attempt }}
+          path: diffusion-artifacts/
+          if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -404,7 +356,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda12.9
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20

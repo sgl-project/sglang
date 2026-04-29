@@ -34,6 +34,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
 )
@@ -41,6 +42,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
+_is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -48,7 +50,7 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _flashinfer_layernorm_available = False
 
-if _is_cuda or _is_xpu:
+if _is_cuda or _is_xpu or _is_musa:
     if _is_flashinfer_available:
         try:
             from flashinfer.norm import layernorm
@@ -83,10 +85,32 @@ elif _is_hip:
         # Fallback: vllm not available, will use forward_native
         _has_vllm_rms_norm = False
 
+if _is_cuda:
+    # HF-semantics RMSNorm kernel (JIT-compiled).  Used when `cast_x_before_out_mul=True`
+    # (the transformers backend path) to produce outputs that are numerically identical
+    # to HuggingFace `LlamaRMSNorm`: the cast from fp32 to the activation dtype happens
+    # BEFORE the weight multiply, so the multiply is done in the narrow dtype.
+    _jit_rmsnorm_hf_available = False
+    try:
+        from sglang.jit_kernel.rmsnorm_hf import (
+            is_supported_rmsnorm_hf_hidden_size,
+        )
+        from sglang.jit_kernel.rmsnorm_hf import rmsnorm_hf as _jit_rmsnorm_hf
+
+        _jit_rmsnorm_hf_available = True
+    except ImportError:
+
+        def is_supported_rmsnorm_hf_hidden_size(d: int) -> bool:
+            return False
+
+        _jit_rmsnorm_hf = None
+
+
 logger = logging.getLogger(__name__)
 
 if _is_npu:
     import torch_npu
+    from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
 
 
 def _forward_with_allreduce_fusion(
@@ -199,6 +223,7 @@ class RMSNorm(MultiPlatformOp):
         if is_batch_invariant_mode_enabled():
             if (
                 residual is not None
+                or self.cast_x_before_out_mul
                 or get_global_server_args().rl_on_policy_target == "fsdp"
             ):
                 return self.forward_native(x, residual, post_residual_addition)
@@ -207,6 +232,23 @@ class RMSNorm(MultiPlatformOp):
                 self.weight.data,
                 self.variance_epsilon,
             )
+        if self.cast_x_before_out_mul and residual is None:
+            # Use HF-semantics kernel (cast to dtype before weight multiply).
+            if (
+                _jit_rmsnorm_hf_available
+                and x.dtype in (torch.float16, torch.bfloat16)
+                and self.weight.data.dtype == x.dtype
+                and is_supported_rmsnorm_hf_hidden_size(x.shape[-1])
+            ):
+                out = _jit_rmsnorm_hf(
+                    x.contiguous(), self.weight.data, self.variance_epsilon
+                )
+            else:
+                # Fallback: pure-Python HF semantics (already implemented in forward_native).
+                out = self.forward_native(x, None, None)
+            if needs_reshape:
+                out = out.reshape(original_shape)
+            return out
         if residual is not None:
             # TODO: Ideally we want to have (hidden_states+residual)+post_residual_addition.
             # but right now we can only have hidden_states+(residual+post_residual_addition).
@@ -242,6 +284,15 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        # Aiter's RMSNorm kernels expect 2D contiguous inputs. Keep the
+        # already-safe layout as a zero-copy path, and only normalize strided or
+        # higher-rank views such as Q/K slices from packed QKV projections.
+        needs_reshape = x.dim() != 2 and residual is None
+        if needs_reshape:
+            original_shape = x.shape
+            x = x.contiguous().reshape(-1, original_shape[-1])
+        elif not x.is_contiguous():
+            x = x.contiguous()
         if residual is not None:
             residual_out = torch.empty_like(x)
             output = torch.empty_like(x)
@@ -256,7 +307,10 @@ class RMSNorm(MultiPlatformOp):
                 self.variance_epsilon,
             )
             return output, residual_out
-        return rms_norm(x, self.weight.data, self.variance_epsilon)
+        output = rms_norm(x, self.weight.data, self.variance_epsilon)
+        if needs_reshape:
+            output = output.reshape(original_shape)
+        return output
 
     def forward_hip(
         self,
@@ -282,6 +336,29 @@ class RMSNorm(MultiPlatformOp):
             return out, residual_out
         out = torch.empty_like(x)
         rms_norm(out, x, self.weight.data, self.variance_epsilon)
+        return out
+
+    def forward_musa(
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if not get_global_server_args().disable_piecewise_cuda_graph:
+            return self.forward_native(x, residual, post_residual_addition)
+
+        if not x.is_contiguous():
+            x = x.contiguous()
+
+        if residual is not None:
+            if post_residual_addition is not None:
+                residual = residual + post_residual_addition
+            fused_add_rmsnorm(x, residual, self.weight.data, self.variance_epsilon)
+            return x, residual
+
+        out = nn.functional.rms_norm(
+            x, (self.hidden_size,), self.weight.data, self.variance_epsilon
+        )
         return out
 
     def forward_native(
@@ -476,6 +553,16 @@ class GemmaRMSNorm(MultiPlatformOp):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(hidden_size))
         self.variance_epsilon = eps
+        self.register_buffer("gemma_weight", self.weight.data + 1.0, persistent=False)
+        # (Chen-0210) Gemma weight = standard_weight + 1. Precompute once.
+        # If TRTLLM allreduce fusion ever provides gemma-style norm
+        # natively, this can be removed.
+        self.weight.weight_loader = self._weight_loader
+
+    def _weight_loader(self, param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+        assert param.size() == loaded_weight.size()
+        param.data.copy_(loaded_weight)
+        self.gemma_weight = param.data + 1.0
 
     def _forward_impl(
         self,
@@ -536,7 +623,7 @@ class GemmaRMSNorm(MultiPlatformOp):
         if not _has_vllm_rms_norm:
             return self.forward_native(x, residual, post_residual_addition)
 
-        w = self.weight.data + 1.0
+        w = self.gemma_weight
         if _use_aiter:
             # aiter API: rms_norm(input, weight, eps) -> output
             #            fused_add_rms_norm(output, input, residual, residual_out, weight, eps)
@@ -598,11 +685,13 @@ class GemmaRMSNorm(MultiPlatformOp):
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
-            x = x + residual
-            residual = x
+            norm_out, residual = add_gemma_rms_norm(
+                x, self.weight, residual, self.variance_epsilon
+            )
+            return norm_out, residual
 
         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
-        return x if residual is None else (x, residual)
+        return x
 
     def forward_xpu(
         self,
@@ -620,13 +709,12 @@ class GemmaRMSNorm(MultiPlatformOp):
         use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
-        # TODO(brayden): we can see if TRTLLM allreduce fusion can provide gemma-style norm
         return _forward_with_allreduce_fusion(
             self,
             x,
             residual,
             post_residual_addition,
-            self.weight + 1.0,
+            self.gemma_weight,
             use_attn_tp_group=True,
         )
 
@@ -699,6 +787,13 @@ class Gemma4RMSNorm(MultiPlatformOp):
         if self.with_scale:
             normed_output = normed_output * (self.weight.float() + self.scale_shift)
         return normed_output.type_as(x)
+
+    def forward_cpu(self, x: torch.Tensor) -> torch.Tensor:
+        if _is_cpu_amx_available:
+            return torch.ops.sgl_kernel.gemma4_rmsnorm_cpu(
+                x, self.weight.data, self.eps, self.scale_shift, self.with_scale
+            )
+        return self.forward_native(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
         if x.numel() == 0:
