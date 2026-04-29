@@ -24,11 +24,6 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
             f"speculative_algorithm={server_args.speculative_algorithm} "
             "(only EAGLE/EAGLE3 are supported)"
         )
-    if server_args.speculative_eagle_topk != 1:
-        return (
-            f"speculative_eagle_topk={server_args.speculative_eagle_topk} "
-            "(only topk=1 is supported)"
-        )
     if server_args.enable_dp_attention:
         return (
             "enable_dp_attention=True is not supported "
