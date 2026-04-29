@@ -597,6 +597,10 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
+ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_PIPELINE=local
+ARG SGLANG_BUILD_URL=
+ARG SGLANG_IMAGE_TAG=local/sglang:dev
 
 WORKDIR /sgl-workspace
 
@@ -639,6 +643,20 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
+# Keep build provenance at the end so metadata changes do not invalidate build layers.
+ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_PIPELINE=${SGLANG_BUILD_PIPELINE:-local} \
+    SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
+LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
+      org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.pipeline="${SGLANG_BUILD_PIPELINE}" \
+      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
+
 ########################################################
 ########## Runtime Image ##############################
 ########################################################
@@ -662,6 +680,10 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
 ARG CUDA_VERSION
 ARG TARGETARCH
 ARG GDRCOPY_VERSION=2.5.1
+ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_PIPELINE=local
+ARG SGLANG_BUILD_URL=
+ARG SGLANG_IMAGE_TAG=local/sglang:dev
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -781,6 +803,20 @@ COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
 WORKDIR /sgl-workspace/sglang
+
+# Keep build provenance at the end so metadata changes do not invalidate build layers.
+ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_PIPELINE=${SGLANG_BUILD_PIPELINE:-local} \
+    SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
+LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
+      org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.pipeline="${SGLANG_BUILD_PIPELINE}" \
+      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
 # Default command
 CMD ["/bin/bash"]
