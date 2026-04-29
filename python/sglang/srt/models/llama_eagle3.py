@@ -47,16 +47,12 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
-        additional_fc: bool = False,
     ) -> None:
         super().__init__(config, layer_id, quant_config, prefix)
 
-        self.additional_fc = additional_fc
-
-        # override qkv input size based on additional_fc
-        qkv_input_size = self.hidden_size if additional_fc else 2 * self.hidden_size
+        # override qkv
         self.self_attn.qkv_proj = QKVParallelLinear(
-            qkv_input_size,
+            2 * self.hidden_size,
             self.self_attn.head_dim,
             self.self_attn.total_num_heads,
             self.self_attn.total_num_kv_heads,
@@ -76,9 +72,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        if additional_fc:
-            self.fc = nn.Linear(config.hidden_size * 2, config.hidden_size)
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -92,11 +85,6 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         hidden_states = self.hidden_norm(hidden_states)
 
         hidden_states = torch.cat([embeds, hidden_states], dim=-1)
-
-        # Optional fc to project 2*H -> H before attention
-        if self.additional_fc:
-            hidden_states = self.fc(hidden_states)
-
         # Self Attention
         hidden_states = self.self_attn(
             positions=positions,
@@ -156,11 +144,14 @@ class LlamaModel(nn.Module):
         else:
             self.hidden_size_in = config.hidden_size
 
-        # Per-layer RMSNorm applied to each aux hidden state before concatenation,
-        # so that all three layers contribute equally regardless of their raw scale.
-        self.aux_norm_low = RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
-        self.aux_norm_mid = RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
-        self.aux_norm_high = RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+        # Optional per-layer RMSNorm applied to each aux hidden state before
+        # concatenation, so that all three layers contribute equally regardless
+        # of their raw scale. Enabled via config "use_aux_norm": true.
+        self.use_aux_norm = getattr(config, "use_aux_norm", False)
+        if self.use_aux_norm:
+            self.aux_norm_low = RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+            self.aux_norm_mid = RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
+            self.aux_norm_high = RMSNorm(self.hidden_size_in, eps=config.rms_norm_eps)
 
         self.fc = torch.nn.Linear(
             self.hidden_size_in * 3,
@@ -168,13 +159,7 @@ class LlamaModel(nn.Module):
             bias=getattr(config, "bias", False),
         )
 
-        # Aquila-style additional_fc: project concatenated [emb, hidden] (2*H) -> H
-        # before attention, instead of feeding 2*H directly into QKV.
-        self.additional_fc = getattr(config, "additional_fc", False)
-
-        self.midlayer = LlamaDecoderLayer(
-            config, 0, quant_config, prefix, additional_fc=self.additional_fc
-        )
+        self.midlayer = LlamaDecoderLayer(config, 0, quant_config, prefix)
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -211,17 +196,14 @@ class LlamaModel(nn.Module):
             positions = forward_batch.mrope_positions
 
         hidden_states = forward_batch.spec_info.hidden_states
-        if hidden_states.shape[-1] == self.hidden_size_in * 3:
-            # First step: aux hidden states from 3 target layers (3*H).
-            # Normalize each layer independently before fc projection.
-            h_low, h_mid, h_high = hidden_states.split(self.hidden_size_in, dim=-1)
-            h_low = self.aux_norm_low(h_low)
-            h_mid = self.aux_norm_mid(h_mid)
-            h_high = self.aux_norm_high(h_high)
-            hidden_states = torch.cat((h_low, h_mid, h_high), dim=-1)
-            hidden_states = self.fc(hidden_states)
-        elif hidden_states.shape[-1] != embeds.shape[-1]:
-            # Fallback for other sizes (shouldn't happen in normal flow)
+        if hidden_states.shape[-1] != embeds.shape[-1]:
+            if self.use_aux_norm and hidden_states.shape[-1] == self.hidden_size_in * 3:
+                # Normalize each aux layer independently before fc projection.
+                h_low, h_mid, h_high = hidden_states.split(self.hidden_size_in, dim=-1)
+                h_low = self.aux_norm_low(h_low)
+                h_mid = self.aux_norm_mid(h_mid)
+                h_high = self.aux_norm_high(h_high)
+                hidden_states = torch.cat((h_low, h_mid, h_high), dim=-1)
             hidden_states = self.fc(hidden_states)
 
         # idle batch
