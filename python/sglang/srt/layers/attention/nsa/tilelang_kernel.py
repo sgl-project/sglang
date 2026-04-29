@@ -48,7 +48,7 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 BF16 = "bfloat16"
-FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3"
+FP8 = "float8_e4m3fnuz" if _is_fp8_fnuz else "float8_e4m3fn"
 FP8_DTYPE = torch.float8_e4m3fnuz if _is_fp8_fnuz else torch.float8_e4m3fn
 FP32 = "float32"
 INT32 = "int32"
