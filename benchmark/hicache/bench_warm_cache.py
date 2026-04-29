@@ -19,7 +19,6 @@ length at the token-id level.
 
 import argparse
 import asyncio
-import csv
 import json
 import random
 import time
@@ -621,12 +620,6 @@ async def main() -> None:
         help="Disable ignoring EOS.",
     )
     parser.add_argument(
-        "--csv-out",
-        type=str,
-        default="warm_cache_results.csv",
-        help="CSV file to store one summary row per shared-prefix percentage.",
-    )
-    parser.add_argument(
         "--output-file",
         type=str,
         default=None,
@@ -656,43 +649,8 @@ async def main() -> None:
     print(f"Loading tokenizer from {tokenizer_id} ...")
     print(f"Tokenizer loaded (vocab_size={len(vocab_ids)})")
 
-    csv_fields = [
-        "shared_prefix_pct",
-        "prefix_len",
-        "suffix_len",
-        "num_prompts",
-        "successful_requests",
-        "benchmark_duration_s",
-        "total_input_tokens",
-        "total_generated_tokens",
-        "total_generated_tokens_retokenized",
-        "request_throughput_req_s",
-        "input_token_throughput_tok_s",
-        "output_token_throughput_tok_s",
-        "total_token_throughput_tok_s",
-        "concurrency",
-        "mean_e2e_latency_ms",
-        "median_e2e_latency_ms",
-        "mean_ttft_ms",
-        "median_ttft_ms",
-        "p90_ttft_ms",
-        "p99_ttft_ms",
-        "mean_tpot_ms",
-        "median_tpot_ms",
-        "p90_tpot_ms",
-        "p99_tpot_ms",
-        "mean_itl_ms",
-        "median_itl_ms",
-        "p90_itl_ms",
-        "p99_itl_ms",
-    ]
-
-    with open(args.csv_out, "w", newline="", encoding="utf-8") as fout:
-        writer = csv.DictWriter(fout, fieldnames=csv_fields)
-        writer.writeheader()
-
     for pct in pcts:
-        metrics, benchmark_duration, prefix_len, suffix_len, num_prompts = await benchmark_shared_prefix_pct(
+        await benchmark_shared_prefix_pct(
             api_url=api_url,
             base_url=base_url,
             tokenizer=tokenizer,
@@ -701,42 +659,6 @@ async def main() -> None:
             pct=pct,
         )
 
-        row = {
-            "shared_prefix_pct": pct,
-            "prefix_len": prefix_len,
-            "suffix_len": suffix_len,
-            "num_prompts": num_prompts,
-            "successful_requests": metrics.completed,
-            "benchmark_duration_s": f"{benchmark_duration:.2f}",
-            "total_input_tokens": metrics.total_input,
-            "total_generated_tokens": metrics.total_output,
-            "total_generated_tokens_retokenized": metrics.total_output_retokenized,
-            "request_throughput_req_s": f"{metrics.request_throughput:.2f}",
-            "input_token_throughput_tok_s": f"{metrics.input_throughput:.2f}",
-            "output_token_throughput_tok_s": f"{metrics.output_throughput:.2f}",
-            "total_token_throughput_tok_s": f"{metrics.total_throughput:.2f}",
-            "concurrency": f"{metrics.concurrency:.2f}",
-            "mean_e2e_latency_ms": f"{metrics.mean_e2e_latency_ms:.2f}",
-            "median_e2e_latency_ms": f"{metrics.median_e2e_latency_ms:.2f}",
-            "mean_ttft_ms": f"{metrics.mean_ttft_ms:.2f}",
-            "median_ttft_ms": f"{metrics.median_ttft_ms:.2f}",
-            "p90_ttft_ms": f"{metrics.p90_ttft_ms:.2f}",
-            "p99_ttft_ms": f"{metrics.p99_ttft_ms:.2f}",
-            "mean_tpot_ms": f"{metrics.mean_tpot_ms:.2f}",
-            "median_tpot_ms": f"{metrics.median_tpot_ms:.2f}",
-            "p90_tpot_ms": f"{metrics.p90_tpot_ms:.2f}",
-            "p99_tpot_ms": f"{metrics.p99_tpot_ms:.2f}",
-            "mean_itl_ms": f"{metrics.mean_itl_ms:.2f}",
-            "median_itl_ms": f"{metrics.median_itl_ms:.2f}",
-            "p90_itl_ms": f"{metrics.p90_itl_ms:.2f}",
-            "p99_itl_ms": f"{metrics.p99_itl_ms:.2f}",
-        }
-
-        with open(args.csv_out, "a", newline="", encoding="utf-8") as fout:
-            writer = csv.DictWriter(fout, fieldnames=csv_fields)
-            writer.writerow(row)
-
-    print(f"\nResults saved to {args.csv_out}")
     if args.output_file:
         print(f"JSONL results saved to {args.output_file}")
 
@@ -744,4 +666,3 @@ async def main() -> None:
 if __name__ == "__main__":
     set_ulimit()
     asyncio.run(main())
-
