@@ -209,4 +209,5 @@ def calculate_low_confidence_score(
         transfer_index,
         num_transfers_dev,
         block_size,
+        num_warps=1,
     )

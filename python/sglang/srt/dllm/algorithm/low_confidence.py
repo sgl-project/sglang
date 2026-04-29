@@ -87,6 +87,7 @@ class LowConfidence(DllmAlgorithm):
                         self.threshold,
                     )
                 else:
+                    # Customized PyTorch Algorithm Implementation
                     block_mask_index = block_input_ids == self.mask_id
                     if torch.sum(block_mask_index).item() == 0:
                         continue
