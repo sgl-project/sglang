@@ -64,7 +64,7 @@ on:
         type: string
         default: ''
       custom_image_suffix:
-        description: 'Use AMD CI Docker images with this tag suffix, e.g. 20260429-preview (optional)'
+        description: 'Append this suffix to AMD CI daily image tags, e.g. -test-pr-21839 (optional)'
         required: false
         type: string
         default: ''
@@ -91,7 +91,7 @@ on:
         type: string
         default: ''
       custom_image_suffix:
-        description: 'Use AMD CI Docker images with this tag suffix, e.g. 20260429-preview (optional)'
+        description: 'Append this suffix to AMD CI daily image tags, e.g. -test-pr-21839 (optional)'
         required: false
         type: string
         default: ''

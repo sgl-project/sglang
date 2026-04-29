@@ -43,7 +43,7 @@ while [[ $# -gt 0 ]]; do
       shift 2;;
     -h|--help)
       echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--custom-image-suffix SFX] [--rocm-version VERSION]"
-      echo "  --custom-image-suffix SFX  Use arch-specific image tags with this suffix"
+      echo "  --custom-image-suffix SFX  Append suffix to arch-specific daily image tags"
       echo "                              Can also be set with AMD_CI_CUSTOM_IMAGE_SUFFIX"
       exit 0
       ;;
@@ -207,8 +207,12 @@ find_latest_image() {
 
 image_from_suffix() {
   local gpu_arch=$1
-  local suffix=${2#-}
-  local base_tag
+  local suffix=$2
+  local base_tag days_back image_tag image_id
+
+  if [[ "${suffix}" != -* ]]; then
+    suffix="-${suffix}"
+  fi
 
   case "${gpu_arch}" in
       mi30x) base_tag="${MI30X_BASE_TAG}" ;;
@@ -216,7 +220,29 @@ image_from_suffix() {
       *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
   esac
 
-  echo "rocm/sgl-dev:${base_tag}-${suffix}"
+  for days_back in {0..6}; do
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)${suffix}"
+    image_id=$(docker images -q "rocm/sgl-dev:${image_tag}")
+    if [[ -n "$image_id" ]]; then
+      echo "Found cached custom image locally: rocm/sgl-dev:${image_tag}" >&2
+      echo "rocm/sgl-dev:${image_tag}"
+      return 0
+    fi
+  done
+
+  for days_back in {0..6}; do
+    image_tag="${base_tag}-$(date -d "${days_back} days ago" +%Y%m%d)${suffix}"
+    echo "Checking for custom image: rocm/sgl-dev:${image_tag}" >&2
+    if docker manifest inspect "rocm/sgl-dev:${image_tag}" >/dev/null 2>&1; then
+      echo "Found available custom image: rocm/sgl-dev:${image_tag}" >&2
+      echo "rocm/sgl-dev:${image_tag}"
+      return 0
+    fi
+  done
+
+  image_tag="${base_tag}-$(date +%Y%m%d)${suffix}"
+  echo "No public custom image found for suffix '${suffix}'. Trying today's tag: rocm/sgl-dev:${image_tag}" >&2
+  echo "rocm/sgl-dev:${image_tag}"
 }
 
 # Pull and run the selected image
