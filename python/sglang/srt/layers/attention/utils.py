@@ -12,7 +12,7 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import concat_mla_absorb_q
 
-from sgl_kernel.utils import is_arch_support_pdl
+from sglang.jit_kernel.utils import is_arch_support_pdl
 
 
 @triton.jit

@@ -19,8 +19,8 @@ from typing import Any, List, Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-from sgl_kernel.utils import is_arch_support_pdl
 
+from sglang.jit_kernel.utils import is_arch_support_pdl
 from sglang.srt.environ import envs
 
 
