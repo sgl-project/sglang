@@ -221,6 +221,7 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
     window_start = window_end - timedelta(hours=hours)
 
     # Per-host window-clamped busy time (each physical machine counted once).
+    # This is the source of truth for how loaded each host actually is.
     host_busy_seconds = {}
     for host, jobs in host_jobs.items():
         busy = 0.0
@@ -231,73 +232,64 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
                 busy += (ce - cs).total_seconds()
         host_busy_seconds[host] = busy
 
-    # Group labels into pools: labels that map to an identical host set
-    # (e.g. `4-gpu-b200`, `4-gpu-b200-kernel`, `4-gpu-b200-low-disk`,
-    # `4-gpu-b200-kernel-low-disk` all map to the same 3 b200 hosts and
-    # collapse into one row).
-    label_to_hosts = {}
-    for label in all_labels:
-        if label in api_label_runners and api_label_runners[label]:
-            label_to_hosts[label] = frozenset(api_label_runners[label])
-        elif label in job_label_runners:
-            label_to_hosts[label] = frozenset(job_label_runners[label])
-
-    pools = defaultdict(list)
-    for label, hosts in label_to_hosts.items():
-        if hosts:
-            pools[hosts].append(label)
-
     results = []
-    for hosts, labels in pools.items():
-        # Pool busy time: sum of window-clamped busy time across hosts.
-        # Any job that ran on these hosts (regardless of which label
-        # triggered it) consumed shared capacity.
-        busy_seconds = sum(host_busy_seconds.get(h, 0.0) for h in hosts)
-        # Job count and queue stats are restricted to jobs that actually
-        # ran under one of the labels in this pool (otherwise queue stats
-        # for `4-gpu-b200` would mix in stats from `1-gpu-h100`).
-        pool_jobs = []
-        seen_jobs = set()
-        for label in labels:
-            for j in label_jobs.get(label, []):
-                key = (j["runner_name"], j["start"], j["job_name"])
-                if key in seen_jobs:
-                    continue
-                seen_jobs.add(key)
-                pool_jobs.append(j)
-        queue_times = [j["queue_time"] for j in pool_jobs if j["queue_time"] > 0]
+    for label in sorted(all_labels):
+        # Hosts that advertise this label (from API if available, else
+        # observed in job data).
+        if label in api_label_runners and api_label_runners[label]:
+            hosts = api_label_runners[label]
+        elif label in job_label_runners:
+            hosts = job_label_runners[label]
+        else:
+            hosts = set()
+        num_runners = len(hosts) if hosts else 1
+
+        # Pool busy time: sum of busy time across the hosts that could
+        # serve this label, regardless of which sibling label actually
+        # dispatched the job. This is the right denominator/numerator for
+        # asking "how saturated is the underlying hardware that this
+        # label depends on?" — sibling labels (e.g. `4-gpu-b200` and
+        # `4-gpu-b200-low-disk`) compete for the same physical machines,
+        # so their busy time should not be double-counted into separate
+        # capacity buckets.
+        active_seconds = sum(host_busy_seconds.get(h, 0.0) for h in hosts)
+        capacity_seconds = num_runners * window_seconds
+        utilization = (
+            (active_seconds / capacity_seconds * 100) if capacity_seconds > 0 else 0
+        )
+
+        # Job count + queue stats stay label-specific (only jobs that
+        # were dispatched under THIS label).
+        jobs = label_jobs.get(label, [])
+        queue_times = [j["queue_time"] for j in jobs if j["queue_time"] > 0]
         avg_queue = sum(queue_times) / len(queue_times) if queue_times else 0
         max_queue = max(queue_times) if queue_times else 0
 
-        capacity = len(hosts) * window_seconds
-        utilization = busy_seconds / capacity * 100 if capacity > 0 else 0
-
         results.append(
             {
-                "labels": sorted(labels),
-                "num_hosts": len(hosts),
-                "num_jobs": len(pool_jobs),
-                "busy_hours": busy_seconds / 3600,
+                "label": label,
+                "num_runners": num_runners,
+                "num_jobs": len(jobs),
+                "total_active_hours": active_seconds / 3600,
                 "utilization_pct": utilization,
                 "avg_queue_min": avg_queue / 60,
                 "max_queue_min": max_queue / 60,
             }
         )
-    results.sort(key=lambda r: -r["utilization_pct"])
 
     return results
 
 
 def format_report(results: list[dict], hours: int) -> str:
-    """Format results as a single compact markdown table.
+    """One compact summary table — original schema, fixed columns.
 
-    One row per host pool — labels that share an identical host set are
-    collapsed (e.g. `4-gpu-b200` + `4-gpu-b200-kernel` + `4-gpu-b200-low-disk`
-    + `4-gpu-b200-kernel-low-disk` → one row, since they all live on the
-    same 3 hosts). Utilization is computed against the pool's actual hosts
-    × window, and the busy-time numerator counts every job that ran on
-    those hosts (any label) — so the percentage reflects real hardware
-    occupancy regardless of which label dispatched the job.
+    Active (hrs) and Utilization now reflect the actual host pool's
+    busy time (sum across all jobs on the hosts that advertise this
+    label, regardless of which sibling label dispatched them). This
+    makes the column meaningful for shared host pools — e.g.
+    `4-gpu-b200` and `4-gpu-b200-low-disk` both consume the same
+    physical hosts, so their utilization now reflects real hardware
+    saturation instead of being divided across labels.
     """
     lines = [
         "# Runner Utilization Report",
@@ -305,21 +297,16 @@ def format_report(results: list[dict], hours: int) -> str:
         f"**Time window:** Last {hours} hours · "
         f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         "",
-        "Utilization = busy time of all jobs on the pool's hosts ÷ "
-        "(host count × window). Labels sharing the same host set are "
-        "collapsed into one row.",
-        "",
-        "| Label(s) | Hosts | Jobs | Busy (hrs) | Utilization | Avg Queue | Max Queue |",
-        "|----------|-------|------|------------|-------------|-----------|-----------|",
+        "| Label | Runners | Jobs | Active (hrs) | Utilization | Avg Queue | Max Queue |",
+        "|-------|---------|------|--------------|-------------|-----------|-----------|",
     ]
     for r in results:
         bar = "█" * int(r["utilization_pct"] / 10) + "░" * (
             10 - int(r["utilization_pct"] / 10)
         )
-        labels_str = ", ".join(r["labels"])
         lines.append(
-            f"| {labels_str} | {r['num_hosts']} | {r['num_jobs']} | "
-            f"{r['busy_hours']:.1f} | "
+            f"| {r['label']} | {r['num_runners']} | {r['num_jobs']} | "
+            f"{r['total_active_hours']:.1f} | "
             f"{r['utilization_pct']:.1f}% {bar} | "
             f"{r['avg_queue_min']:.1f}m | {r['max_queue_min']:.1f}m |"
         )
