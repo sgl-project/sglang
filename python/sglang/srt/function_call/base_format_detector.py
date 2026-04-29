@@ -1,7 +1,7 @@
 import json
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Literal, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
@@ -363,21 +363,13 @@ class BaseFormatDetector(ABC):
         """
         raise NotImplementedError()
 
-    def supports_model_structural_tag(self) -> bool:
-        """Return True if this detector supports builtin structural tag format."""
-        return False
-
     def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
         thinking_mode: bool = True,
-    ) -> StructuralTag:
+    ) -> Optional[StructuralTag]:
         """
         Return a XGrammar's model structural tag for the given tools and thinking mode.
         """
-
-        raise NotImplementedError(
-            "Detectors with supports_model_structural_tag() == True must "
-            "override get_xgrammar_model_structural_tag()."
-        )
+        return None

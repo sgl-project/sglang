@@ -1639,32 +1639,32 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         params = json.loads(tool_calls_by_index[0]["parameters"])
         self.assertEqual(params, {})
 
-    def test_supports_model_structural_tag(self):
-        self.assertTrue(self.detector.supports_model_structural_tag())
+    def test_get_structural_tag_method_exists(self):
+        self.assertIsNotNone(self.detector.get_structural_tag)
 
     def test_get_model_structural_tag(self):
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+        structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=True
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+        structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=False
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+        structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=True, tool_choice="required"
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+        structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=False, tool_choice="required"
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
@@ -1673,14 +1673,14 @@ class TestDeepSeekV32Detector(unittest.TestCase):
 
         tool_choice_name = ToolChoiceFuncName(name="search")
         tool_choice = ToolChoice(function=tool_choice_name)
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+        structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=True, tool_choice=tool_choice
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+        structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=False, tool_choice=tool_choice
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
@@ -2046,32 +2046,32 @@ class TestQwen3CoderDetector(unittest.TestCase):
     def test_supports_structural_tag(self):
         self.assertFalse(self.detector.supports_structural_tag())
 
-    def test_supports_model_structural_tag(self):
-        self.assertTrue(self.detector.supports_model_structural_tag())
+    def test_get_structural_tag_method_exists(self):
+        self.assertIsNotNone(self.detector.get_structural_tag)
 
     def test_get_model_structural_tag(self):
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+        structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=True
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+        structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=False
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+        structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=True, tool_choice="required"
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+        structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=False, tool_choice="required"
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
@@ -2080,14 +2080,14 @@ class TestQwen3CoderDetector(unittest.TestCase):
 
         tool_choice_name = ToolChoiceFuncName(name="get_current_weather")
         tool_choice = ToolChoice(function=tool_choice_name)
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+        structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=True, tool_choice=tool_choice
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+        structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=False, tool_choice=tool_choice
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)

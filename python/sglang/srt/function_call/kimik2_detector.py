@@ -256,9 +256,6 @@ class KimiK2Detector(BaseFormatDetector):
 
         return get_info
 
-    def supports_model_structural_tag(self) -> bool:
-        return True
-
     def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,

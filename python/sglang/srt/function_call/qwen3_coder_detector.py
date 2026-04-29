@@ -475,9 +475,6 @@ class Qwen3CoderDetector(BaseFormatDetector):
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
 
-    def supports_model_structural_tag(self) -> bool:
-        return True
-
     def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,

@@ -227,14 +227,14 @@ class FunctionCallParser:
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
 
-        # Highest priority: detectors that implement model-native structural tag.
-        if self.detector.supports_model_structural_tag():
-            if is_required or should_constrain_auto:
-                structural_tag = self.detector.get_structural_tag(
-                    tools=self.tools,
-                    thinking_mode=thinking_mode,
-                    tool_choice=tool_choice,
-                )
+        # Highest priority: model-native structural_tag when available.
+        if is_required or should_constrain_auto:
+            structural_tag = self.detector.get_structural_tag(
+                tools=self.tools,
+                thinking_mode=thinking_mode,
+                tool_choice=tool_choice,
+            )
+            if structural_tag is not None:
                 return ("structural_tag", structural_tag)
 
         if self.detector.supports_structural_tag():

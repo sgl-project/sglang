@@ -354,9 +354,6 @@ class DeepSeekV32Detector(BaseFormatDetector):
             trigger="<｜DSML｜invoke",
         )
 
-    def supports_model_structural_tag(self) -> bool:
-        return True
-
     def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,
