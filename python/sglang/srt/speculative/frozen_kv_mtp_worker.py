@@ -332,10 +332,10 @@ class FrozenKVMTPWorker(TpModelWorker):
     def _select_last_verified_seed(
         self, draft_input: EagleDraftInput
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if draft_input.accept_length is None:
+        if draft_input.num_accepted_tokens is None:
             return draft_input.verified_id, draft_input.hidden_states
 
-        counts = draft_input.accept_length.to(torch.long) + 1
+        counts = draft_input.num_accepted_tokens.to(torch.long)
         last_indices = torch.cumsum(counts, dim=0) - 1
         return (
             draft_input.verified_id[last_indices],
@@ -440,7 +440,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
+                num_accepted_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 
@@ -458,7 +458,7 @@ class FrozenKVMTPWorker(TpModelWorker):
 
         if get_global_tracing_enabled():
             for idx, req in enumerate(batch.reqs):
-                accepted = verify_output.accept_length_per_req_cpu[idx]
+                accepted = verify_output.num_accepted_drafts_per_req_cpu[idx]
                 req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
 
         set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
@@ -475,8 +475,8 @@ class FrozenKVMTPWorker(TpModelWorker):
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=verify_output.verified_id,
-            num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
-            accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+            num_accepted_drafts=sum(verify_output.num_accepted_drafts_per_req_cpu),
+            num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
