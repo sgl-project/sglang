@@ -12,8 +12,9 @@ Usage:
 
 import logging
 import pkgutil
-from importlib import import_module
 from importlib.metadata import entry_points
+
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.platforms.interface import CudaSRTPlatform, SRTPlatform
@@ -25,7 +26,6 @@ _current_platform: SRTPlatform | None = None
 
 
 def _is_cuda_available() -> bool:
-    torch = import_module("torch")
     return bool(torch.cuda.is_available() and torch.version.hip is None)
 
 

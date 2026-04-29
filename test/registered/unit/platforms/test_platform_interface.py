@@ -398,13 +398,11 @@ class TestResolvePlatformWithEnv(CustomTestCase):
 class TestResolvePlatformAutoDiscover(CustomTestCase):
     """Tests for _resolve_platform auto-discovery when SGLANG_PLATFORM is not set."""
 
-    @patch("sglang.srt.platforms.import_module")
-    def test_is_cuda_available_excludes_rocm(self, mock_import_module):
+    @patch("sglang.srt.platforms.torch")
+    def test_is_cuda_available_excludes_rocm(self, mock_torch):
         """ROCm exposes torch.cuda, but should not use the CUDA platform identity."""
-        mock_torch = MagicMock()
         mock_torch.cuda.is_available.return_value = True
         mock_torch.version.hip = "6.0"
-        mock_import_module.return_value = mock_torch
 
         import sglang.srt.platforms as plat_mod
 
