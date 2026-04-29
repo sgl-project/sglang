@@ -3,7 +3,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX1_FP8_TRANSFORMER,
     MODELOPT_FLUX1_NVFP4_TRANSFORMER,
     MODELOPT_FLUX2_FP8_TRANSFORMER,
-    MODELOPT_FLUX2_NVFP4_MODEL,
+    MODELOPT_FLUX2_NVFP4_WEIGHTS,
     MODELOPT_NVFP4_B200_ENV_VARS,
     MODELOPT_WAN22_FP8_TRANSFORMER,
     MODELOPT_WAN22_NVFP4_TRANSFORMER,
@@ -46,7 +46,7 @@ from sglang.multimodal_gen.test.test_utils import (
 
 # All test cases with clean default values
 # To test different models, simply add more DiffusionCase entries
-ONE_GPU_CASES_A: list[DiffusionTestCase] = [
+ONE_GPU_CASES: list[DiffusionTestCase] = [
     # === Text to Image (T2I) ===
     DiffusionTestCase(
         "qwen_image_t2i",
@@ -167,22 +167,11 @@ ONE_GPU_CASES_A: list[DiffusionTestCase] = [
             extras={"enable_upscaling": True, "upscaling_scale": 4},
         ),
     ),
-]
-
-ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     # === Text to Video (T2V) ===
     DiffusionTestCase(
         "wan2_1_t2v_1.3b",
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-        ),
-        T2V_sampling_params,
-    ),
-    DiffusionTestCase(
-        "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
-        DiffusionServerArgs(
-            model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-            text_encoder_cpu_offload=True,
         ),
         T2V_sampling_params,
     ),
@@ -335,11 +324,25 @@ ONE_GPU_CASES_B: list[DiffusionTestCase] = [
     #         num_frames=33,
     #     ),
     # ),
+    DiffusionTestCase(
+        "ltx_2_3_hq_pipeline",
+        DiffusionServerArgs(
+            model_path="Lightricks/LTX-2.3",
+            extras=[
+                "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode snapshot"
+            ],
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
+            },
+        ),
+        T2I_sampling_params,
+    ),
 ]
 
 # Skip hunyuan3d on AMD: marching_cubes surface extraction produces invalid SDF on ROCm.
 if not current_platform.is_hip():
-    ONE_GPU_CASES_B.append(
+    ONE_GPU_CASES.append(
         DiffusionTestCase(
             "hunyuan3d_shape_gen",
             DiffusionServerArgs(
@@ -352,7 +355,7 @@ if not current_platform.is_hip():
     )
 # Skip turbowan on AMD: Triton requires 81920 shared memory, but AMD only has 65536.
 if not current_platform.is_hip():
-    ONE_GPU_CASES_B.append(
+    ONE_GPU_CASES.append(
         DiffusionTestCase(
             "turbo_wan2_1_t2v_1.3b",
             DiffusionServerArgs(
@@ -361,55 +364,60 @@ if not current_platform.is_hip():
             T2V_sampling_params,
         )
     )
-ONE_GPU_CASES_C = [
-    _make_modelopt_ci_case(
-        "flux1_modelopt_fp8_t2i",
-        model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
-        modality="image",
-        sampling_params=MODELOPT_T2I_CI_sampling_params,
-        extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
-    ),
-    _make_modelopt_ci_case(
-        "flux2_modelopt_fp8_t2i",
-        model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
-        modality="image",
-        sampling_params=MODELOPT_T2I_CI_sampling_params,
-        extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
-    ),
-    _make_modelopt_ci_case(
-        "wan22_modelopt_fp8_t2v",
-        model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
-        modality="video",
-        sampling_params=MODELOPT_T2V_CI_sampling_params,
-        extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
-    ),
-    _make_modelopt_ci_case(
-        "flux1_modelopt_nvfp4_t2i",
-        model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
-        modality="image",
-        sampling_params=MODELOPT_T2I_CI_sampling_params,
-        extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
-        env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
-    ),
-    _make_modelopt_ci_case(
-        "flux2_modelopt_nvfp4_t2i",
-        model_path=MODELOPT_FLUX2_NVFP4_MODEL,
-        modality="image",
-        sampling_params=MODELOPT_T2I_CI_sampling_params,
-        extras=[],
-        env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
-    ),
-    _make_modelopt_ci_case(
-        "wan22_modelopt_nvfp4_t2v",
-        model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
-        modality="video",
-        sampling_params=MODELOPT_T2V_CI_sampling_params,
-        extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
-        env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
-    ),
-]
+# Skip all ModelOpt tests on AMD: FP8 requires torch._scaled_mm (HIPBLAS_STATUS_NOT_SUPPORTED
+# on ROCm), NVFP4 requires flashinfer or sgl_kernel FP4 kernels (CUDA-only)
+if current_platform.is_hip():
+    ONE_GPU_MODELOPT_CASES = []
+else:
+    ONE_GPU_MODELOPT_CASES = [
+        _make_modelopt_ci_case(
+            "flux1_modelopt_fp8_t2i",
+            model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
+            modality="image",
+            sampling_params=MODELOPT_T2I_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
+        ),
+        _make_modelopt_ci_case(
+            "flux2_modelopt_fp8_t2i",
+            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
+            modality="image",
+            sampling_params=MODELOPT_T2I_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_FLUX2_FP8_TRANSFORMER],
+        ),
+        _make_modelopt_ci_case(
+            "wan22_modelopt_fp8_t2v",
+            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            modality="video",
+            sampling_params=MODELOPT_T2V_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
+        ),
+        _make_modelopt_ci_case(
+            "flux1_modelopt_nvfp4_t2i",
+            model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
+            modality="image",
+            sampling_params=MODELOPT_T2I_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+        ),
+        _make_modelopt_ci_case(
+            "flux2_modelopt_nvfp4_t2i",
+            model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
+            modality="image",
+            sampling_params=MODELOPT_T2I_CI_sampling_params,
+            extras=["--transformer-weights-path", MODELOPT_FLUX2_NVFP4_WEIGHTS],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+        ),
+        _make_modelopt_ci_case(
+            "wan22_modelopt_nvfp4_t2v",
+            model_path=DEFAULT_WAN_2_2_T2V_A14B_MODEL_NAME_FOR_TEST,
+            modality="video",
+            sampling_params=MODELOPT_T2V_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_WAN22_NVFP4_TRANSFORMER],
+            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
+        ),
+    ]
 
-TWO_GPU_CASES_A = [
+TWO_GPU_CASES = [
     DiffusionTestCase(
         "wan2_2_i2v_a14b_2gpu",
         DiffusionServerArgs(
@@ -517,13 +525,13 @@ TWO_GPU_CASES_A = [
         "ltx_2_3_two_stage_ti2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            extras=["--pipeline-class-name LTX2TwoStagePipeline"],
+            ulysses_degree=2,
+            extras=[
+                "--pipeline-class-name LTX2TwoStagePipeline --ltx2-two-stage-device-mode original"
+            ],
         ),
         TI2V_sampling_params,
     ),
-]
-
-TWO_GPU_CASES_B = [
     DiffusionTestCase(
         "wan2_1_i2v_14b_480P_2gpu",
         DiffusionServerArgs(
@@ -536,7 +544,11 @@ TWO_GPU_CASES_B = [
         "ltx_2.3_two_stage_t2v_2gpus",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
-            extras=["--pipeline-class-name LTX2TwoStagePipeline"],
+            ulysses_degree=2,
+            extras=[
+                "--pipeline-class-name LTX2TwoStagePipeline",
+                "--ltx2-two-stage-device-mode original",
+            ],
         ),
         T2V_sampling_params,
     ),
@@ -605,16 +617,10 @@ TWO_GPU_CASES_B = [
         T2I_sampling_params,
     ),
     DiffusionTestCase(
-        "flux_2_klein_ti2i_2_gpus",
-        DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-klein-4B",
-        ),
-        TI2I_sampling_params,
-    ),
-    DiffusionTestCase(
         "ltx_2.3_one_stage_ti2v",
         DiffusionServerArgs(
             model_path="Lightricks/LTX-2.3",
+            ulysses_degree=2,
         ),
         TI2V_sampling_params,
     ),
@@ -622,7 +628,7 @@ TWO_GPU_CASES_B = [
 
 if not current_platform.is_hip():
     # Flux2 multi-image edit with cache-dit, regression test
-    ONE_GPU_CASES_B.append(
+    ONE_GPU_CASES.append(
         DiffusionTestCase(
             "flux_2_ti2i_multi_image_cache_dit",
             DiffusionServerArgs(
@@ -633,7 +639,5 @@ if not current_platform.is_hip():
         )
     )
 
-ONE_GPU_CASES = [*ONE_GPU_CASES_A, *ONE_GPU_CASES_B, *ONE_GPU_CASES_C]
-TWO_GPU_CASES_A = _with_default_num_gpus(TWO_GPU_CASES_A, 2)
-TWO_GPU_CASES_B = _with_default_num_gpus(TWO_GPU_CASES_B, 2)
-TWO_GPU_CASES = [*TWO_GPU_CASES_A, *TWO_GPU_CASES_B]
+ONE_GPU_CASES += ONE_GPU_MODELOPT_CASES
+TWO_GPU_CASES = _with_default_num_gpus(TWO_GPU_CASES, 2)

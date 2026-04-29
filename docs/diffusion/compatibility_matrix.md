@@ -33,19 +33,29 @@ default parameters when initializing and generating videos.
 | TurboWan2.1 T2V 14B          | `IPostYellow/TurboWan2.1-T2V-14B-Diffusers`       | 480p                 |    ✅     |         ❌         |     ❌     |              ❌               |               ✅               |                   ✅                    |             ⭕             |
 | TurboWan2.1 T2V 14B 720P     | `IPostYellow/TurboWan2.1-T2V-14B-720P-Diffusers`  | 720p                 |    ✅     |         ❌         |     ❌     |              ❌               |               ✅               |                   ✅                    |             ⭕             |
 | TurboWan2.2 I2V A14B         | `IPostYellow/TurboWan2.2-I2V-A14B-Diffusers`      | 720p                 |    ✅     |         ❌         |     ❌     |              ❌               |               ✅               |                   ✅                    |             ⭕             |
-| Wan2.1 Fun 1.3B InP           | `weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers`          | 480p                 |    ✅     |         ✅         |     ✅     |              ⭕               |               ❌               |                   ❌                    |             ✅             |
-| Helios Base                   | `BestWishYsh/Helios-Base`                          | 720p                 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
-| Helios Mid                    | `BestWishYsh/Helios-Mid`                           | 720p                 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
-| Helios Distilled              | `BestWishYsh/Helios-Distilled`                     | 720p                 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
-| LTX-2 (one and two stages)   | `Lightricks/LTX-2`                                | 768×512<br>1536×1024 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
-| LTX-2.3 (one and two stages) | `Lightricks/LTX-2.3`                              | 768×512<br>1536×1024 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
+| Wan2.1 Fun 1.3B InP          | `weizhou03/Wan2.1-Fun-1.3B-InP-Diffusers`          | 480p                 |    ✅     |         ✅         |     ✅     |              ⭕               |               ❌               |                   ❌                    |             ✅             |
+| Helios Base                  | `BestWishYsh/Helios-Base`                          | 720p                 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
+| Helios Mid                   | `BestWishYsh/Helios-Mid`                           | 720p                 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
+| Helios Distilled             | `BestWishYsh/Helios-Distilled`                     | 720p                 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
+| LTX-2 (one/two-stage/TI2V)   | `Lightricks/LTX-2`                                | 768×512<br>1536×1024 |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
+| LTX-2.3 (one/two-stage/TI2V/HQ) | `Lightricks/LTX-2.3`                           | 768×512<br>1536×1024<br>1920×1088 (HQ default) |    ❌     |         ❌         |     ❌     |              ❌               |               ❌               |                   ❌                    |             ❌             |
 
 **Note**:
 
 1. Wan2.2 TI2V 5B has some quality issues when performing I2V generation. We are working on fixing this issue.
 2. SageSLA is based on SpargeAttn. Install it first with `pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation`
-3. LTX-2 and LTX-2.3 two-stage generation uses `--pipeline-class-name LTX2TwoStagePipeline`. The spatial upsampler and distilled LoRA are auto-resolved from the model snapshot by default, and can still be overridden with `--spatial-upsampler-path` and `--distilled-lora-path`.
-  - For LTX models, the `Resolutions` column uses output video `width×height` semantics, matching `sglang generate --width ... --height ...`.
+3. LTX pipeline selection:
+   - One-stage: `--pipeline-class-name LTX2Pipeline`
+   - Two-stage: `--pipeline-class-name LTX2TwoStagePipeline`
+   - Two-stage HQ: `--pipeline-class-name LTX2TwoStageHQPipeline` (HQ defaults to 1920×1088; you can still override `--width/--height`)
+   - LTX-2 and LTX-2.3 support both T2V and TI2V (`--image-path`) on one-stage and two-stage pipelines (including HQ).
+   - The spatial upsampler and distilled LoRA are auto-resolved from the model snapshot by default, and can still be overridden with `--spatial-upsampler-path` and `--distilled-lora-path`.
+   - For LTX models, the `Resolutions` column uses output video `width×height` semantics, matching `sglang generate --width ... --height ...`.
+4. LTX-2 / LTX-2.3 two-stage also supports `--ltx2-two-stage-device-mode {original,snapshot,resident}`:
+   - `snapshot` is the default and recommended mode.
+   - `resident` usually provides the best latency/throughput but uses much more VRAM.
+   - `original` keeps official two-stage semantics without the premerged stage-2 transformer path.
+   - Example (one prior run): `original` `154.67s`, `snapshot` `114.05s`, `resident` `75.71s`; peak VRAM trend is `original < snapshot < resident`.
 
 ### Image Generation Models
 

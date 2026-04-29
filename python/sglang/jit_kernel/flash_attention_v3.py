@@ -7,12 +7,24 @@ import torch
 from sglang.jit_kernel.utils import cache_once
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
+from sglang.srt.utils import get_device_capability, is_musa
 
 logger = logging.getLogger(__name__)
 
 SGL_FA3_KERNEL_REPO = "kernels-community/sgl-flash-attn3"
 SGL_FA3_KERNEL_REVISION = "v1"
 DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
+
+
+def _call_fa3_kernel(kernel, *args, out=None):
+    if out is None:
+        return kernel(*args)
+    try:
+        return kernel(*args, out=out)
+    except TypeError as exc:
+        if "unexpected keyword argument 'out'" not in str(exc):
+            raise
+        return kernel(*args)
 
 
 @cache_once
@@ -78,12 +90,12 @@ def _is_fa3_supported(device=None) -> bool:
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
     #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
-    if torch.version.cuda is None:
-        return False
-    return (torch.version.cuda >= "12.3") and (
-        torch.cuda.get_device_capability(device)[0] == 9
-        or torch.cuda.get_device_capability(device)[0] == 8
-    )
+    major, minor = get_device_capability()
+    if is_musa():
+        return major >= 3
+    if torch.version.cuda is not None and torch.version.cuda >= "12.3":
+        return major == 9 or major == 8
+    return False
 
 
 @debug_kernel_api
@@ -119,6 +131,7 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
+    out=None,
 ):
     if not _is_fa3_supported():
         raise NotImplementedError(
@@ -128,7 +141,8 @@ def flash_attn_with_kvcache(
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
 
-    return _load_fa3_kernels()["flash_attn_with_kvcache"](
+    return _call_fa3_kernel(
+        _load_fa3_kernels()["flash_attn_with_kvcache"],
         q,
         k_cache,
         v_cache,
@@ -160,6 +174,7 @@ def flash_attn_with_kvcache(
         sm_margin,
         return_softmax_lse,
         sinks,
+        out=out,
     )
 
 
@@ -189,6 +204,7 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
+    out=None,
 ):
 
     if not _is_fa3_supported():
@@ -197,28 +213,29 @@ def flash_attn_varlen_func(
         )
 
     return _load_fa3_kernels()["flash_attn_varlen_func"](
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        seqused_q,
-        seqused_k,
-        page_table,
-        softmax_scale,
-        causal,
-        qv,
-        q_descale,
-        k_descale,
-        v_descale,
-        window_size,
-        attention_chunk,
-        softcap,
-        num_splits,
-        pack_gqa,
-        sm_margin,
-        return_softmax_lse,
-        sinks,
+        q=q,
+        k=k,
+        v=v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        qv=qv,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        window_size=window_size,
+        attention_chunk=attention_chunk,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        sm_margin=sm_margin,
+        return_softmax_lse=return_softmax_lse,
+        sinks=sinks,
+        out=out,
     )
