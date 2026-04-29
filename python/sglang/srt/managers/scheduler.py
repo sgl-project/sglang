@@ -748,6 +748,7 @@ class Scheduler(
             )
 
         self.relaykv_config = self.tp_worker.model_runner.relaykv_config
+        self.relaykv_model_profile = self.tp_worker.model_runner.relaykv_model_profile
         self._relaykv_logged_prefill_rids: set[str] = set()
         self._relaykv_logged_prefill_rid_order: Deque[str] = deque()
         self._relaykv_logged_prefill_rid_limit = 4096
@@ -2718,6 +2719,7 @@ class Scheduler(
                     request_id=req.rid,
                 ),
                 prefix=f"relaykv_shadow_plan_{phase}",
+                extra=self.relaykv_model_profile.to_log_dict(),
             )
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
