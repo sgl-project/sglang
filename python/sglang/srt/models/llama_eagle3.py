@@ -80,6 +80,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+
         residual = hidden_states
         embeds = self.input_layernorm(embeds)
         hidden_states = self.hidden_norm(hidden_states)
@@ -129,16 +130,6 @@ class LlamaModel(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        # Embedding scale factor for target models that use scaled embeddings
-        # (e.g., Gemma3/Gemma4 multiply embeddings by hidden_size**0.5).
-        target_type = getattr(config, "target_model_type", None) or ""
-        if getattr(config, "embed_scale", None) is not None:
-            self.embed_scale = config.embed_scale
-        elif "gemma" in target_type:
-            self.embed_scale = config.hidden_size**0.5
-        else:
-            self.embed_scale = 1.0
-
         if hasattr(config, "target_hidden_size"):
             self.hidden_size_in = config.target_hidden_size
         else:
@@ -180,13 +171,8 @@ class LlamaModel(nn.Module):
             ):
                 assert embeds is not None
                 embeds = torch.cat(
-                    [
-                        embeds[:-1],
-                        self.embed_tokens(input_ids[-1].unsqueeze(0))
-                        * self.embed_scale,
-                    ]
+                    [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
                 )
-
             if embeds is None:
                 embeds = self.embed_tokens(input_ids) * self.embed_scale
         else:
