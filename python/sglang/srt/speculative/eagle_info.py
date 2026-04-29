@@ -61,10 +61,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
     custom_mask: torch.Tensor
     positions: torch.Tensor
-    retrive_index: torch.Tensor
-    retrive_next_token: torch.Tensor
-    retrive_next_sibling: torch.Tensor
-    retrive_cum_len: torch.Tensor
+    retrieve_index: torch.Tensor
+    retrieve_next_token: torch.Tensor
+    retrieve_next_sibling: torch.Tensor
+    retrieve_cum_len: torch.Tensor
     spec_steps: int
     topk: int
     draft_token_num: int
@@ -88,16 +88,16 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
             draft_token=torch.empty((0,), dtype=torch.long, device="cuda"),
             custom_mask=torch.full((0,), True, dtype=torch.bool, device="cuda"),
             positions=torch.empty((0,), dtype=torch.int64, device="cuda"),
-            retrive_index=torch.full(
+            retrieve_index=torch.full(
                 (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
-            retrive_next_token=torch.full(
+            retrieve_next_token=torch.full(
                 (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
-            retrive_next_sibling=torch.full(
+            retrieve_next_sibling=torch.full(
                 (0, num_verify_tokens), -1, dtype=torch.long, device="cuda"
             ),
-            retrive_cum_len=None,
+            retrieve_cum_len=None,
             topk=topk,
             draft_token_num=num_verify_tokens,
             spec_steps=spec_steps,
@@ -258,7 +258,7 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 ),
             )
 
-        bs = self.retrive_index.shape[0]
+        bs = self.retrieve_index.shape[0]
         candidates = self.draft_token.reshape(bs, self.draft_token_num)
         sampling_info = batch.sampling_info
 
@@ -272,8 +272,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
 
         if bs != len(sampling_info):
             sampling_info = copy.deepcopy(sampling_info)
-            # NOTE: retrive_index are the indices of the requests that are kept.
-            sampling_info.filter_batch(self.retrive_index.tolist(), self.retrive_index)
+            # NOTE: retrieve_index are the indices of the requests that are kept.
+            sampling_info.filter_batch(
+                self.retrieve_index.tolist(), self.retrieve_index
+            )
 
         # Apply the custom logit processors if registered in the sampling info.
         if sampling_info.has_custom_logit_processor:
@@ -322,9 +324,9 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
                 candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
+                retrieve_index=self.retrieve_index,
+                retrieve_next_token=self.retrieve_next_token,
+                retrieve_next_sibling=self.retrieve_next_sibling,
                 target_predict=target_predict,
                 topk=self.topk,
             )
@@ -370,9 +372,10 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
                 accept_index=accept_index,  # mutable
                 accept_token_num=accept_length,  # mutable
                 candidates=candidates,
-                retrive_index=self.retrive_index,
-                retrive_next_token=self.retrive_next_token,
-                retrive_next_sibling=self.retrive_next_sibling,
+                # kwarg LHS retained as `retrive_*` to match sgl_kernel op schema.
+                retrive_index=self.retrieve_index,
+                retrive_next_token=self.retrieve_next_token,
+                retrive_next_sibling=self.retrieve_next_sibling,
                 uniform_samples=coins,
                 uniform_samples_for_final_sampling=coins_for_final_sampling,
                 target_probs=target_probs,

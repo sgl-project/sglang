@@ -71,12 +71,14 @@ from sglang.srt.utils import (
     empty_context,
     get_available_gpu_memory,
     is_cuda,
+    is_musa,
     is_npu,
     next_power_of_2,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
+_is_musa = is_musa()
 
 if is_cuda():
     from sgl_kernel import segment_packbits  # noqa: F401
@@ -763,9 +765,9 @@ class EAGLEWorker(TpModelWorker):
         (
             tree_mask,
             position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
             spec_info.verified_id,
@@ -783,10 +785,10 @@ class EAGLEWorker(TpModelWorker):
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
@@ -897,10 +899,10 @@ class EAGLEWorker(TpModelWorker):
         assert model_worker_batch.capture_hidden_mode == spec_info.capture_hidden_mode
 
         if batch.has_grammar:
-            retrieve_next_token_cpu = spec_info.retrive_next_token.cpu()
-            retrieve_next_sibling_cpu = spec_info.retrive_next_sibling.cpu()
+            retrieve_next_token_cpu = spec_info.retrieve_next_token.cpu()
+            retrieve_next_sibling_cpu = spec_info.retrieve_next_sibling.cpu()
             draft_tokens_cpu = spec_info.draft_token.view(
-                spec_info.retrive_next_token.shape
+                spec_info.retrieve_next_token.shape
             ).cpu()
 
         # Forward
@@ -927,7 +929,7 @@ class EAGLEWorker(TpModelWorker):
 
             if vocab_mask is not None:
                 assert spec_info.grammar is not None
-                vocab_mask = vocab_mask.to(spec_info.retrive_next_token.device)
+                vocab_mask = vocab_mask.to(spec_info.retrieve_next_token.device)
                 # NOTE (sk): otherwise, this vocab mask will be the one from the previous extend stage
                 # and will be applied to produce wrong results
                 batch.sampling_info.vocab_mask = None
@@ -1214,7 +1216,7 @@ class EAGLEWorker(TpModelWorker):
         return success, message
 
 
-@torch.compile(dynamic=True, disable=_is_npu)
+@torch.compile(dynamic=True, disable=(_is_npu or _is_musa))
 def get_last_loc_large_page_size_top_k_1(
     req_to_token: torch.Tensor,
     req_pool_indices: torch.Tensor,

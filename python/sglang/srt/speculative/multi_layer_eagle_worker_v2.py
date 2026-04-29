@@ -248,9 +248,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         (
             tree_mask,
             position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
             draft_input.verified_id,
@@ -271,10 +271,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
@@ -781,6 +781,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
             accept_lens=accept_length,
+            routed_experts_output=forward_batch_output.routed_experts_output,
         )
 
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
