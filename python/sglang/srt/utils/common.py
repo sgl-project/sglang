@@ -589,6 +589,18 @@ def get_available_gpu_memory(
         free_gpu_memory, total_gpu_memory = torch.musa.mem_get_info()
     elif device == "mps":
         free_gpu_memory = psutil.virtual_memory().available
+    else:
+        from sglang.srt.platforms import current_platform
+
+        if not current_platform.is_out_of_tree():
+            raise ValueError(
+                f"Unsupported device type: {device!r}. "
+                "If this is an OOT platform, ensure it is properly registered "
+                "via the 'sglang.platform_plugins' entry point."
+            )
+        total_mem = current_platform.get_device_total_memory(gpu_id)
+        used_mem = current_platform.get_current_memory_usage()
+        free_gpu_memory = total_mem - used_mem
 
     if distributed:
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32)
@@ -1034,8 +1046,48 @@ def check_pkg_version_at_least(pkg: str, min_version: str) -> bool:
         return False
 
 
-def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = None):
-    """Kill the process and all its child processes."""
+def _wait_for_reap_or_raise(procs, wait_timeout: float) -> None:
+    """Wait for `procs` to exit; warn at ~10s, raise on `wait_timeout`.
+
+    SIGKILL is asynchronous -- children hold GPU context, pinned memory and
+    fds until the kernel reaps them. Raise on timeout so a stuck process
+    surfaces instead of leaving a latent race.
+    """
+    warn_at = min(10.0, wait_timeout / 2)
+    gone, alive = psutil.wait_procs(procs, timeout=warn_at)
+    if not alive:
+        return
+    logger.warning(
+        "kill_process_tree: %d process(es) still alive after %.1fs SIGKILL; "
+        "continuing to wait up to %.1fs total. pids=%s",
+        len(alive),
+        warn_at,
+        wait_timeout,
+        [p.pid for p in alive],
+    )
+    remaining = wait_timeout - warn_at
+    if remaining > 0:
+        _, alive = psutil.wait_procs(alive, timeout=remaining)
+    if alive:
+        raise RuntimeError(
+            f"kill_process_tree: {len(alive)} process(es) not reaped within "
+            f"{wait_timeout}s after SIGKILL; pids={[p.pid for p in alive]}"
+        )
+
+
+def kill_process_tree(
+    parent_pid,
+    include_parent: bool = True,
+    skip_pid: int = None,
+    wait_timeout: Optional[float] = None,
+):
+    """Kill the process and all its child processes.
+
+    `wait_timeout` (seconds) blocks until every killed process is reaped and
+    raises `RuntimeError` on timeout; `None` is fire-and-forget. The
+    `parent_pid == os.getpid()` branch calls `sys.exit(0)` and cannot wait
+    for itself -- use `include_parent=False` if child reap must finish first.
+    """
     if parent_pid is None:
         parent_pid = os.getpid()
         include_parent = False
@@ -1046,11 +1098,13 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
         return
 
     children = itself.children(recursive=True)
+    killed = []
     for child in children:
         if child.pid == skip_pid:
             continue
         try:
             child.kill()
+            killed.append(child)
         except psutil.NoSuchProcess:
             pass
 
@@ -1065,8 +1119,12 @@ def kill_process_tree(parent_pid, include_parent: bool = True, skip_pid: int = N
             # Sometime processes cannot be killed with SIGKILL (e.g, PID=1 launched by kubernetes),
             # so we send an additional signal to kill them.
             itself.send_signal(signal.SIGQUIT)
+            killed.append(itself)
         except psutil.NoSuchProcess:
             pass
+
+    if wait_timeout is not None and killed:
+        _wait_for_reap_or_raise(killed, wait_timeout)
 
 
 def monkey_patch_p2p_access_check():
@@ -1670,6 +1728,14 @@ def get_mtgpu_memory_capacity():
 
 
 def get_device_memory_capacity(device: str = None):
+    # OOT platforms provide their own memory query via the platform class.
+    from sglang.srt.platforms import current_platform
+
+    if current_platform.is_out_of_tree():
+        mem_bytes = current_platform.get_device_total_memory()
+        if mem_bytes:
+            return mem_bytes / (1 << 20)  # bytes -> MiB
+        return None
     if is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
@@ -1912,6 +1978,12 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
 
 
 def get_compiler_backend(mode=None) -> str:
+    # OOT platforms provide their own compile backend.
+    from sglang.srt.platforms import current_platform
+
+    if current_platform.is_out_of_tree():
+        return current_platform.get_compile_backend(mode)
+
     if hasattr(torch, "hpu") and torch.hpu.is_available():
         return "hpu_backend"
 

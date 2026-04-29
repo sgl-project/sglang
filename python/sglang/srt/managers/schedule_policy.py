@@ -636,8 +636,7 @@ class PrefillAdder:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
                 # alloc_extend needs extend_num_tokens + page_size per request,
-                # so reserve one page here to avoid OOM (matches main #23174,
-                # cherry-picked into fork before this merge target).
+                # so reserve one page here to avoid OOM
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
@@ -645,7 +644,6 @@ class PrefillAdder:
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 if self.is_hybrid_swa:
-                    # skip to avoid alloc_extend OOM
                     return req
                 _rem_tokens = self.rem_chunk_tokens
 

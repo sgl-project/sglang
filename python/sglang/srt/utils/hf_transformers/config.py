@@ -23,6 +23,7 @@ from sglang.srt.connector import create_remote_connector
 from sglang.srt.utils import is_remote_url, logger, lru_cache_frozenset
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
+from ..hf_transformers_patches import _ensure_gguf_version
 from .common import (
     _CONFIG_REGISTRY,
     AutoConfig,
@@ -34,7 +35,6 @@ from .common import (
     check_gguf_file,
     get_hf_text_config,
 )
-from .compat import _ensure_gguf_version
 from .mistral_utils import is_mistral_model, load_mistral_config
 
 
