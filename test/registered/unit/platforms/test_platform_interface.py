@@ -7,14 +7,17 @@ and the platform discovery / lazy initialization mechanism.
 
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.platforms import _load_platform_class, _resolve_platform
 from sglang.srt.platforms.device_mixin import (
+    CudaDeviceMixin,
     CpuArchEnum,
     DeviceCapability,
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import CudaSRTPlatform, SRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -222,6 +225,81 @@ class TestSRTPlatform(CustomTestCase):
         base = SRTPlatform()
         self.assertEqual(base.get_compile_backend(mode="npugraph_ex"), "inductor")
 
+    def test_base_device_identity_stays_unspecified(self):
+        """The abstract SRT base should not claim any concrete in-tree device."""
+        base = SRTPlatform()
+        self.assertFalse(base.is_cuda())
+        self.assertFalse(base.is_cuda_alike())
+
+
+class TestCudaDeviceMixin(CustomTestCase):
+    """Tests for CUDA device operation defaults."""
+
+    def test_default_get_device_returns_cuda_device(self):
+        base = CudaSRTPlatform()
+        self.assertEqual(base.get_device(2), torch.device("cuda", 2))
+
+    def test_cuda_platform_identity(self):
+        base = CudaSRTPlatform()
+        self.assertTrue(base.is_cuda())
+        self.assertTrue(base.is_cuda_alike())
+        self.assertIsInstance(base, CudaDeviceMixin)
+
+    @patch("torch.cuda.get_device_properties")
+    def test_default_get_device_total_memory_uses_cuda(self, mock_get_device_properties):
+        mock_get_device_properties.return_value.total_memory = 123
+        base = CudaSRTPlatform()
+        self.assertEqual(base.get_device_total_memory(1), 123)
+        mock_get_device_properties.assert_called_once_with(1)
+
+    @patch("torch.cuda.max_memory_allocated", return_value=456)
+    def test_default_get_current_memory_usage_uses_cuda(self, mock_max_memory_allocated):
+        base = CudaSRTPlatform()
+        device = torch.device("cuda", 1)
+        self.assertEqual(base.get_current_memory_usage(device), 456.0)
+        mock_max_memory_allocated.assert_called_once_with(device)
+
+    @patch("torch.cuda.set_device")
+    def test_default_set_device_uses_cuda(self, mock_set_device):
+        base = CudaSRTPlatform()
+        device = torch.device("cuda", 1)
+        base.set_device(device)
+        mock_set_device.assert_called_once_with(device)
+
+    @patch("torch.cuda.get_device_name", return_value="NVIDIA H100")
+    def test_default_get_device_name_uses_cuda(self, mock_get_device_name):
+        base = CudaSRTPlatform()
+        self.assertEqual(base.get_device_name(1), "NVIDIA H100")
+        mock_get_device_name.assert_called_once_with(1)
+
+    @patch("torch.cuda.get_device_capability", return_value=(9, 0))
+    def test_default_get_device_capability_uses_cuda(self, mock_get_device_capability):
+        base = CudaSRTPlatform()
+        self.assertEqual(base.get_device_capability(1), DeviceCapability(9, 0))
+        mock_get_device_capability.assert_called_once_with(1)
+
+    @patch("torch.cuda.empty_cache")
+    def test_default_empty_cache_uses_cuda(self, mock_empty_cache):
+        base = CudaSRTPlatform()
+        base.empty_cache()
+        mock_empty_cache.assert_called_once_with()
+
+    @patch("torch.cuda.synchronize")
+    def test_default_synchronize_uses_cuda(self, mock_synchronize):
+        base = CudaSRTPlatform()
+        base.synchronize()
+        mock_synchronize.assert_called_once_with()
+
+    @patch("torch.cuda.mem_get_info", return_value=(123, 456), create=True)
+    def test_default_get_available_memory_uses_cuda(self, mock_mem_get_info):
+        base = CudaSRTPlatform()
+        self.assertEqual(base.get_available_memory(1), (123, 456))
+        mock_mem_get_info.assert_called_once_with(1)
+
+    def test_default_distributed_backend_is_nccl(self):
+        base = CudaSRTPlatform()
+        self.assertEqual(base.get_torch_distributed_backend_str(), "nccl")
+
 
 class TestSRTPlatformOverrides(CustomTestCase):
     """Tests for SRTPlatform method overrides via plugins."""
@@ -335,13 +413,31 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
             self.assertEqual(result, mock_instance)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_cuda_available")
     @patch("sglang.srt.platforms.envs")
-    def test_no_plugin_activates_fallback(self, mock_envs, mock_load):
-        """When no plugin activates, return base SRTPlatform with warning."""
+    def test_no_plugin_activates_cuda_fallback(
+        self, mock_envs, mock_is_cuda_available, mock_load
+    ):
+        """When CUDA is available and no plugin activates, return CUDA defaults."""
         mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_is_cuda_available.return_value = True
+        mock_load.return_value = {}
+        result = _resolve_platform()
+        self.assertIsInstance(result, CudaSRTPlatform)
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms._is_cuda_available")
+    @patch("sglang.srt.platforms.envs")
+    def test_no_plugin_no_cuda_activates_base_fallback(
+        self, mock_envs, mock_is_cuda_available, mock_load
+    ):
+        """When no plugin or CUDA is available, return the abstract base platform."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_is_cuda_available.return_value = False
         mock_load.return_value = {}
         result = _resolve_platform()
         self.assertIsInstance(result, SRTPlatform)
+        self.assertNotIsInstance(result, CudaSRTPlatform)
 
     @patch("sglang.srt.platforms.load_plugins_by_group")
     @patch("sglang.srt.platforms.envs")

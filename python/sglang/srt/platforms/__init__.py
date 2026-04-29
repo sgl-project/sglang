@@ -12,15 +12,21 @@ Usage:
 
 import logging
 import pkgutil
+from importlib import import_module
 from importlib.metadata import entry_points
 
 from sglang.srt.environ import envs
-from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.interface import CudaSRTPlatform, SRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 
 logger = logging.getLogger(__name__)
 
 _current_platform: SRTPlatform | None = None
+
+
+def _is_cuda_available() -> bool:
+    torch = import_module("torch")
+    return bool(torch.cuda.is_available())
 
 
 def _resolve_platform() -> SRTPlatform:
@@ -90,7 +96,10 @@ def _resolve_platform() -> SRTPlatform:
             logger.exception("Failed to activate platform plugin: %s", name)
 
     if len(activated) == 0:
-        logger.debug("No platform detected. Using base SRTPlatform with defaults.")
+        if _is_cuda_available():
+            logger.debug("No platform plugin detected. Using CUDA SRTPlatform defaults.")
+            return CudaSRTPlatform()
+        logger.debug("No platform detected. Using base SRTPlatform.")
         return SRTPlatform()
 
     if len(activated) == 1:
