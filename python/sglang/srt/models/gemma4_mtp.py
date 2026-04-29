@@ -13,35 +13,26 @@
 # ==============================================================================
 from __future__ import annotations
 
+import copy
 import logging
 from dataclasses import dataclass
-from typing import Dict, Iterable, Optional, Set, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import PretrainedConfig, PreTrainedModel
 
-from sglang.srt.distributed import get_tensor_model_parallel_world_size
-from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
-from sglang.srt.layers.linear import (
-    ColumnParallelLinear,
-    ReplicatedLinear,
-    RowParallelLinear,
-)
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import (
     LogitsMetadata,
     LogitsProcessor,
     LogitsProcessorOutput,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.gemma3_causal import Gemma3MLP
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.models.gemma4_causal import Gemma4ForCausalLM, Gemma4TextModel
+from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
@@ -131,229 +122,22 @@ def build_frozen_kv_context(
     )
 
 
-class Gemma4MTPAttention(nn.Module):
-    """Q-only path; K/V read from the target pool at the bound ``layer_id``."""
-
-    def __init__(
-        self,
-        layer_id: int,
-        config: PretrainedConfig,
-        head_dim: int,
-        max_position_embeddings: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.layer_id = layer_id
-        self.head_dim = head_dim
-
-        tp_size = get_tensor_model_parallel_world_size()
-        layer_type = config.layer_types[layer_id]
-        is_swa = layer_type == "sliding_attention"
-
-        total_num_heads = config.num_attention_heads
-        total_num_kv_heads = (
-            getattr(config, "swa_num_key_value_heads", config.num_key_value_heads)
-            if is_swa
-            else config.num_key_value_heads
-        )
-        assert total_num_heads % tp_size == 0
-        assert max(total_num_kv_heads, tp_size) % min(total_num_kv_heads, tp_size) == 0
-        self.num_heads = total_num_heads // tp_size
-        self.num_kv_heads = max(1, total_num_kv_heads // tp_size)
-
-        hidden_size = config.hidden_size
-        self.q_proj = ColumnParallelLinear(
-            hidden_size,
-            total_num_heads * head_dim,
-            bias=config.attention_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("q_proj", prefix),
-        )
-        self.o_proj = RowParallelLinear(
-            total_num_heads * head_dim,
-            hidden_size,
-            bias=config.attention_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("o_proj", prefix),
-        )
-        self.q_norm = Gemma4RMSNorm(head_dim, eps=config.rms_norm_eps)
-
-        rope = config.rope_parameters.get(
-            layer_type, {"rope_type": "default", "rope_theta": 10000.0}
-        )
-        self.rotary_emb = get_rope(
-            head_dim,
-            rotary_dim=head_dim,
-            max_position=max_position_embeddings,
-            base=rope.get("rope_theta", 10000.0),
-            rope_scaling={"rope_type": rope.get("rope_type", "default")},
-            partial_rotary_factor=rope.get("partial_rotary_factor", 1.0),
-            is_neox_style=True,
-        )
-
-        self.attn = RadixAttention(
-            self.num_heads,
-            head_dim,
-            scaling=1.0,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            logit_cap=0.0,
-            sliding_window_size=config.sliding_window if is_swa else None,
-            quant_config=quant_config,
-            prefix=add_prefix("attn", prefix),
-        )
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        **kwargs,
-    ) -> torch.Tensor:
-        q, _ = self.q_proj(hidden_states)
-        q = self.q_norm(q.unflatten(-1, (self.num_heads, self.head_dim))).flatten(
-            -2, -1
-        )
-        kv_size = self.num_kv_heads * self.head_dim
-        q, _ = self.rotary_emb(positions, q, torch.zeros_like(q[..., :kv_size]))
-        q = q.unflatten(-1, (self.num_heads, self.head_dim))
-
-        attn_output = self.attn(
-            q, None, None, forward_batch=forward_batch, save_kv_cache=False
-        )
-        if attn_output.dim() == 3:
-            attn_output = attn_output.flatten(-2, -1)
-        output, _ = self.o_proj(attn_output)
-        return output
-
-
-class Gemma4MTPDecoderLayer(nn.Module):
-    """Gemma 4 MTP decoder layer (Q-only attention; no MoE/PLE per HF assistant config)."""
-
-    def __init__(
-        self,
-        layer_id: int,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        layer_type = config.layer_types[layer_id]
-        head_dim = (
-            config.head_dim
-            if layer_type == "full_attention"
-            else getattr(config, "swa_head_dim", config.head_dim)
-        )
-
-        self.self_attn = Gemma4MTPAttention(
-            layer_id=layer_id,
-            config=config,
-            head_dim=head_dim,
-            max_position_embeddings=config.max_position_embeddings,
-            quant_config=quant_config,
-            prefix=add_prefix("self_attn", prefix),
-        )
-        self.mlp = Gemma3MLP(
-            hidden_size=config.hidden_size,
-            intermediate_size=config.intermediate_size,
-            hidden_activation=config.hidden_activation,
-            quant_config=quant_config,
-            prefix=add_prefix("mlp", prefix),
-        )
-        for name in (
-            "input_layernorm",
-            "post_attention_layernorm",
-            "pre_feedforward_layernorm",
-            "post_feedforward_layernorm",
-        ):
-            setattr(self, name, RMSNorm(config.hidden_size, eps=config.rms_norm_eps))
-        self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        **kwargs,
-    ) -> torch.Tensor:
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(
-            self.self_attn(
-                positions=positions,
-                hidden_states=self.input_layernorm(hidden_states),
-                forward_batch=forward_batch,
-            )
-        )
-        hidden_states, residual = self.pre_feedforward_layernorm(
-            hidden_states, residual
-        )
-        hidden_states = self.post_feedforward_layernorm(self.mlp(hidden_states))
-        return (hidden_states + residual) * self.layer_scalar
-
-
-class Gemma4MTPTextModel(nn.Module):
-    """Trunk over ``input_embeds``; no embed table (the assistant owns it)."""
-
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> None:
-        super().__init__()
-        self.layers = make_layers(
-            config.num_hidden_layers,
-            lambda idx, prefix: Gemma4MTPDecoderLayer(
-                layer_id=idx,
-                config=config,
-                quant_config=quant_config,
-                prefix=prefix,
-            ),
-            prefix=add_prefix("layers", prefix),
-        )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        input_embeds: torch.Tensor,
-        **kwargs,
-    ) -> torch.Tensor:
-        hidden_states = input_embeds
-        for layer in self.layers:
-            hidden_states = layer(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
-                **kwargs,
-            )
-        return self.norm(hidden_states)
-
-
-class Gemma4AssistantForCausalLM(PreTrainedModel):
+class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
     """Gemma 4 MTP assistant: target embed + recurrent hidden through pre/post projection; own ``lm_head``."""
 
     base_model_prefix = "model"
 
-    packed_modules_mapping: Dict[str, list] = {
-        "gate_up_proj": ["gate_proj", "up_proj"],
-    }
-
-    embedding_modules: Dict[str, str] = {}
-    embedding_padding_modules: list = []
-    supports_lora = False
-
     def __init__(
         self,
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        super().__init__(config=config)
-        text_config = _get_text_config(config)
-        self.config = config
+        text_config = copy.deepcopy(_get_text_config(config))
+        text_config.num_kv_shared_layers = 0
+        PreTrainedModel.__init__(self, config=text_config)
+        self.assistant_config = config
+        self.config = text_config
         self.quant_config = quant_config
 
         self.vocab_size = text_config.vocab_size
@@ -367,11 +151,7 @@ class Gemma4AssistantForCausalLM(PreTrainedModel):
             getattr(config, "centroid_intermediate_top_k", 32)
         )
 
-        self.target_embed_tokens = VocabParallelEmbedding(
-            self.vocab_size,
-            self.backbone_hidden_size,
-            prefix=add_prefix("target_embed_tokens", prefix),
-        )
+        self.target_embed_weight: Optional[torch.Tensor] = None
         self.pre_projection = ReplicatedLinear(
             2 * self.backbone_hidden_size,
             self.hidden_size,
@@ -379,7 +159,7 @@ class Gemma4AssistantForCausalLM(PreTrainedModel):
             quant_config=None,
             prefix=add_prefix("pre_projection", prefix),
         )
-        self.model = Gemma4MTPTextModel(
+        self.model = Gemma4TextModel(
             config=text_config,
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
@@ -393,7 +173,10 @@ class Gemma4AssistantForCausalLM(PreTrainedModel):
         )
 
         # Full-vocab logits per rank → ``skip_all_gather=True`` for both heads.
-        self.lm_head = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
+        if text_config.tie_word_embeddings:
+            self.lm_head = self.model.embed_tokens
+        else:
+            self.lm_head = nn.Linear(self.hidden_size, self.vocab_size, bias=False)
         self.logits_processor = LogitsProcessor(text_config, skip_all_gather=True)
 
         if self.use_ordered_embeddings:
@@ -421,28 +204,33 @@ class Gemma4AssistantForCausalLM(PreTrainedModel):
         self.post_init()
 
     def bind_frozen_kv_context(self, ctx: FrozenKVMTPContext) -> None:
-        """Set each layer's ``RadixAttention.layer_id`` to the target physical id."""
+        """Bind assistant attention to target-owned KV and suppress assistant KV writes."""
         for assistant_logical, layer in enumerate(self.model.layers):
             target_phys = ctx.get_physical_layer_id(assistant_logical)
+            layer.self_attn.is_kv_shared_layer = True
+            layer.self_attn.kv_shared_layer_index = target_phys
             layer.self_attn.attn.layer_id = target_phys
             layer.self_attn.layer_id = assistant_logical
         self.kv_context = ctx
 
     def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self.target_embed_tokens.weight, self.lm_head.weight
+        if self.target_embed_weight is None:
+            raise RuntimeError(
+                "Gemma4AssistantForCausalLM target embedding is not bound yet."
+            )
+        return self.target_embed_weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed: torch.Tensor, head: torch.Tensor) -> None:
         """Rebind target embedding; ``head`` ignored (assistant keeps ``lm_head``)."""
         del head
-        del self.target_embed_tokens.weight
-        self.target_embed_tokens.weight = embed
+        self.target_embed_weight = embed
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     def get_attention_sliding_window_size(self) -> int:
         # Gemma 4 config treats the bound as inclusive; SGLang attention metadata
         # uses an exclusive window size, matching the target Gemma 4 models.
-        return _get_text_config(self.config).sliding_window - 1
+        return self.config.sliding_window - 1
 
     @torch.no_grad()
     def forward(
@@ -453,11 +241,18 @@ class Gemma4AssistantForCausalLM(PreTrainedModel):
         input_embeds: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> LogitsProcessorOutput:
-        token_embed = (
-            self.target_embed_tokens(input_ids) * self.target_embed_scale
-            if input_embeds is None
-            else input_embeds
-        )
+        if input_embeds is None:
+            if self.target_embed_weight is None:
+                raise RuntimeError(
+                    "Gemma4AssistantForCausalLM requires set_embed_and_head() "
+                    "before token-id forward."
+                )
+            token_embed = (
+                torch.nn.functional.embedding(input_ids, self.target_embed_weight)
+                * self.target_embed_scale
+            )
+        else:
+            token_embed = input_embeds
 
         if forward_batch.spec_info is None or not hasattr(
             forward_batch.spec_info, "hidden_states"
@@ -477,9 +272,11 @@ class Gemma4AssistantForCausalLM(PreTrainedModel):
 
         z, _ = self.pre_projection(torch.cat([token_embed, prev_hidden], dim=-1))
         hidden_states = self.model(
+            input_ids=None,
             positions=positions,
             forward_batch=forward_batch,
             input_embeds=z,
+            per_layer_inputs=None,
             **kwargs,
         )
         projected_states, _ = self.post_projection(hidden_states)
@@ -577,55 +374,14 @@ class Gemma4AssistantForCausalLM(PreTrainedModel):
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
-        # The HF assistant checkpoint loads by exact name except for two transforms:
-        # (1) ``model.embed_tokens.weight`` (tied via ``tie_word_embeddings``) is the
-        #     only source of ``lm_head.weight`` since this model has no embed table
-        #     of its own (``target_embed_tokens`` is rebound from the target at
-        #     runtime, so it is expected to be missing from any checkpoint),
-        # (2) per-layer ``mlp.{gate,up}_proj.weight`` are fused into ``gate_up_proj``.
-        gate_up_mapping = (("gate_proj", 0), ("up_proj", 1))
-        params_dict = dict(self.named_parameters())
-        params_dict.update(dict(self.named_buffers()))
-        loaded_params: Set[str] = set()
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        def remap_assistant_weights():
+            for name, weight in weights:
+                if name.startswith("masked_embedding."):
+                    name = name.removeprefix("masked_embedding.")
+                yield name, weight
 
-        for name, loaded_weight in weights:
-            if name == "model.embed_tokens.weight" and getattr(
-                self.config, "tie_word_embeddings", False
-            ):
-                default_weight_loader(self.lm_head.weight, loaded_weight)
-                loaded_params.add("lm_head.weight")
-                continue
-
-            for shard_name, shard_id in gate_up_mapping:
-                if shard_name not in name:
-                    continue
-                mapped = name.replace(shard_name, "gate_up_proj")
-                if mapped not in params_dict:
-                    continue
-                param = params_dict[mapped]
-                param.weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(mapped)
-                break
-            else:
-                if name not in params_dict:
-                    continue
-                param = params_dict[name]
-                getattr(param, "weight_loader", default_weight_loader)(
-                    param, loaded_weight
-                )
-                loaded_params.add(name)
-
-        missing = sorted(
-            n
-            for n, _ in self.named_parameters()
-            if n not in loaded_params and not n.startswith("target_embed_tokens.")
-        )
-        if missing:
-            logger.warning(
-                "Some weights are not initialized from checkpoints: %s", missing
-            )
-        return loaded_params
+        return super().load_weights(remap_assistant_weights())
 
 
 EntryClass = Gemma4AssistantForCausalLM
