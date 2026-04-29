@@ -37,7 +37,9 @@ class DraftBackendFactory:
         return backend_map[backend_type]()
 
     def create_decode_backend(self):
-        if self.speculative_num_steps == 1:
+        # No draft multi-step backend is needed when drafting is disabled
+        # (steps=0) or collapses to a single step.
+        if self.speculative_num_steps <= 1:
             return None
 
         backend_map = {

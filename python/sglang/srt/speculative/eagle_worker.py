@@ -466,6 +466,8 @@ class EAGLEWorker(TpModelWorker):
                 num_accepted_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
+        elif self.speculative_num_steps == 0:
+            return self._forward_decode_no_spec(batch)
         else:
             set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
 
@@ -519,6 +521,112 @@ class EAGLEWorker(TpModelWorker):
                 num_accepted_drafts_per_req_cpu=verify_output.num_accepted_drafts_per_req_cpu,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
+
+    def _forward_decode_no_spec(self, batch: ScheduleBatch) -> GenerationBatchResult:
+        """Decode path when speculative_num_steps == 0.
+
+        Instead of drafting, we build a trivial 1-node verify tree whose root
+        is the previous iteration's bonus token. This degenerates to a plain
+        decode — verify always accepts the root and samples one new token from
+        its target logits — but routes through TARGET_VERIFY so the captured
+        cuda graph (num_tokens_per_bs=1) is reusable. draft_extend still runs
+        afterwards so the draft model's KV cache stays in sync, allowing the
+        adaptive controller to re-enable drafting at any time.
+        """
+        # Bookkeeping normally done at the top of _draft_preprocess_decode.
+        batch.maybe_evict_swa()
+        for req in batch.reqs:
+            req.decode_batch_idx += 1
+
+        draft_spec_info = batch.spec_info
+        assert isinstance(draft_spec_info, EagleDraftInput)
+
+        if batch.sampling_info.penalizer_orchestrator.is_required:
+            batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
+                draft_spec_info.verified_id.to(torch.int64)
+            )
+
+        batch.return_hidden_states = False
+        batch.seq_lens_sum = int(torch.sum(batch.seq_lens).item())
+
+        set_time_batch(batch.reqs, "set_spec_draft_start_time", trace_only=True)
+        verify_input = self._build_trivial_verify_input(batch, draft_spec_info)
+        set_time_batch(batch.reqs, "set_spec_draft_end_time", trace_only=True)
+        set_time_batch(batch.reqs, "set_spec_verify_start_time", trace_only=True)
+
+        logits_output, verify_output, _model_worker_batch, can_run_cuda_graph = (
+            self.verify(batch, verify_input)
+        )
+
+        if get_global_tracing_enabled():
+            for idx, req in enumerate(batch.reqs):
+                accepted = verify_output.accept_length_per_req_cpu[idx]
+                req.time_stats.set_spec_verify_end_time(accepted_tokens=accepted)
+
+        set_time_batch(batch.reqs, "set_spec_draft_extend_start_time", trace_only=True)
+
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            if (
+                self.server_args.enable_dp_attention
+                or batch.spec_info.verified_id.shape[0] > 0
+            ):
+                self.forward_draft_extend_after_decode(batch)
+
+        set_time_batch(batch.reqs, "set_spec_draft_extend_end_time", trace_only=True)
+
+        controller = getattr(self, "adaptive_controller", None)
+        if controller is not None:
+            controller.on_verify_complete(verify_output.accept_length_per_req_cpu)
+
+        return GenerationBatchResult(
+            logits_output=logits_output,
+            next_token_ids=verify_output.verified_id,
+            num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
+            accept_length_per_req_cpu=verify_output.accept_length_per_req_cpu,
+            can_run_cuda_graph=can_run_cuda_graph,
+        )
+
+    def _build_trivial_verify_input(
+        self, batch: ScheduleBatch, draft_spec_info: EagleDraftInput
+    ) -> EagleVerifyInput:
+        """Build a 1-node EagleVerifyInput whose root is the previous bonus token.
+
+        With ``draft_token_num=1`` and no children, the verify kernel always
+        accepts exactly the root and samples one new bonus token from target
+        logits — functionally a plain decode but shape-compatible with the
+        step=0 TARGET_VERIFY cuda graph.
+        """
+        bs = batch.seq_lens.shape[0]
+        device = self.device
+
+        # Tree metadata: one flat token per request, no children / siblings.
+        retrive_index = torch.arange(bs, dtype=torch.long, device=device).unsqueeze(1)
+        retrive_next_token = torch.full((bs, 1), -1, dtype=torch.long, device=device)
+        retrive_next_sibling = torch.full((bs, 1), -1, dtype=torch.long, device=device)
+        # FULL_MASK layout: seq_lens_sum * num_verify + num_verify^2 * bs.
+        # num_verify == 1 collapses this to seq_lens_sum + bs, all True.
+        custom_mask = torch.ones(
+            batch.seq_lens_sum + bs, dtype=torch.bool, device=device
+        )
+        positions = batch.seq_lens.to(torch.int64)
+
+        return EagleVerifyInput(
+            draft_token=draft_spec_info.verified_id.to(torch.long),
+            custom_mask=custom_mask,
+            positions=positions,
+            retrive_index=retrive_index,
+            retrive_next_token=retrive_next_token,
+            retrive_next_sibling=retrive_next_sibling,
+            retrive_cum_len=None,
+            spec_steps=0,
+            topk=self.topk,
+            draft_token_num=1,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_cpu=batch.seq_lens_cpu,
+        )
 
     def check_forward_draft_extend_after_decode(self, batch: ScheduleBatch):
         local_need_forward = batch.spec_info.verified_id.shape[0] > 0

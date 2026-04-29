@@ -166,5 +166,149 @@ class TestAdaptiveSpeculativeServer(CustomTestCase):
         print(f"avg_spec_accept_length={avg_accept_len:.4f}")
 
 
+class TestAdaptiveZeroStepServer(CustomTestCase):
+    """Test the steps=0 fallback path: drafting is disabled but draft_extend
+    still runs so the draft model's KV cache stays in sync, letting the
+    controller re-enable spec decoding at any time."""
+
+    model = DEFAULT_TARGET_MODEL_EAGLE
+    draft_model = DEFAULT_DRAFT_MODEL_EAGLE
+    base_url = DEFAULT_URL_FOR_TEST
+
+    @classmethod
+    def setUpClass(cls):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(
+                {
+                    "candidate_steps": [0, 3],
+                    "ema_alpha": 1.0,
+                    "warmup_batches": 0,
+                    "update_interval": 1,
+                    # drop threshold to steps=0 = prev - 0.5 + down_hysteresis = 0.2.
+                    "down_hysteresis": 0.7,
+                    # Prevent immediate bounce-back out of steps=0: rise threshold
+                    # = 0 - 0.5 + 0.51 = 0.01, and reported accept is always 0
+                    # while drafting is disabled.
+                    "up_hysteresis": 0.51,
+                    # Force periodic upshift so the controller can re-observe
+                    # acceptance (otherwise steps=0 is absorbing).
+                    "zero_step_probe_interval": 5,
+                },
+                f,
+            )
+            cls.adaptive_config_path = f.name
+
+        try:
+            cls.process = popen_launch_server(
+                cls.model,
+                cls.base_url,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                other_args=[
+                    "--trust-remote-code",
+                    "--attention-backend",
+                    "triton",
+                    "--speculative-algorithm",
+                    "EAGLE",
+                    "--speculative-draft-model-path",
+                    cls.draft_model,
+                    "--speculative-num-steps",
+                    "3",
+                    "--speculative-eagle-topk",
+                    "1",
+                    "--speculative-num-draft-tokens",
+                    "4",
+                    "--speculative-adaptive",
+                    "--speculative-adaptive-config",
+                    cls.adaptive_config_path,
+                    "--skip-server-warmup",
+                    "--mem-fraction-static",
+                    "0.7",
+                    "--disable-cuda-graph",
+                ],
+            )
+        except Exception:
+            os.unlink(cls.adaptive_config_path)
+            raise
+
+    @classmethod
+    def tearDownClass(cls):
+        if hasattr(cls, "process"):
+            kill_process_tree(cls.process.pid)
+        if os.path.exists(cls.adaptive_config_path):
+            os.unlink(cls.adaptive_config_path)
+
+    def _state(self) -> int:
+        r = requests.get(self.base_url + "/server_info", timeout=30)
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()["internal_states"][0]["speculative_num_steps"]
+
+    def _generate(self, prompt: str, max_new_tokens: int = 32) -> dict:
+        r = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": prompt,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": max_new_tokens,
+                    "ignore_eos": True,
+                },
+            },
+            timeout=180,
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        return r.json()
+
+    def test_downshift_to_zero_and_generation(self):
+        """Low-accept prompts push the controller into steps=0; generation at
+        steps=0 must still produce coherent, non-empty output."""
+        self.assertEqual(self._state(), 3, "expected initial steps=3")
+
+        for _ in range(3):
+            self._generate(LOW_ACCEPT_PROMPT, max_new_tokens=32)
+
+        self.assertEqual(
+            self._state(),
+            0,
+            "controller did not downshift to steps=0 after low-accept prompts",
+        )
+
+        output = self._generate("The capital of France is", max_new_tokens=16)
+        text = output["text"].strip()
+        self.assertGreater(len(text), 0, "empty output at steps=0")
+        self.assertIn("Paris", text, f"incoherent output at steps=0: {text!r}")
+        # No drafts are produced at steps=0, so only the accept=0 bucket
+        # should be populated.
+        hist = output["meta_info"]["spec_accept_histogram"]
+        self.assertEqual(
+            len(hist),
+            1,
+            f"expected single-bucket histogram at steps=0, got {hist}",
+        )
+
+    def test_probe_upshift_warms_draft_kv(self):
+        """After entering steps=0, a probe upshift must see non-trivial draft
+        acceptance — if draft_extend during steps=0 didn't keep the draft KV
+        cache in sync, the upshifted batches would show 0 acceptance."""
+        for _ in range(3):
+            self._generate(LOW_ACCEPT_PROMPT, max_new_tokens=32)
+        self.assertEqual(self._state(), 0, "precondition: should be at steps=0")
+
+        # Enough tokens to trigger at least one probe upshift
+        # (zero_step_probe_interval=5).
+        output = self._generate("The capital of France is", max_new_tokens=48)
+        hist = output["meta_info"]["spec_accept_histogram"]
+        self.assertGreater(
+            len(hist),
+            1,
+            f"probe upshift did not execute any drafting; hist={hist}",
+        )
+        self.assertGreater(
+            sum(hist[1:]),
+            0,
+            f"upshifted batches saw 0 draft acceptance → draft KV likely stale "
+            f"(hist={hist})",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

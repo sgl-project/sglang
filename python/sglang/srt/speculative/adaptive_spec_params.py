@@ -117,6 +117,14 @@ class AdaptiveSpeculativeParams:
         self.ema_accept_len = float(self.current_steps - 1)
         self._batch_count = 0
 
+        # Periodic probe upshift out of steps=0: drafting is disabled so we can
+        # no longer observe acceptance, meaning EMA is stuck and the natural
+        # upshift path is closed. After this many consecutive steps=0 batches,
+        # force a one-batch upshift to the next candidate to probe whether
+        # drafting is profitable again. 0 disables the probe.
+        self.zero_step_probe_interval = int(cfg.get("zero_step_probe_interval", 0))
+        self._zero_step_batch_count = 0
+
         logger.info(
             f"AdaptiveSpeculativeParams initialized: "
             f"steps={self.current_steps}, candidate_steps={self.candidate_steps}"
@@ -137,6 +145,25 @@ class AdaptiveSpeculativeParams:
         ) * self.ema_accept_len + self.ema_alpha * batch_avg
 
         self._batch_count += 1
+
+        # When stuck at steps=0, reported accept_lengths are all zero (no
+        # drafting happens). Probe by forcing a one-shot upshift so the
+        # controller can re-evaluate draft acceptance.
+        if self.current_steps == 0 and self.zero_step_probe_interval > 0:
+            self._zero_step_batch_count += 1
+            if self._zero_step_batch_count >= self.zero_step_probe_interval:
+                self._zero_step_batch_count = 0
+                next_idx = self.candidate_steps.index(0) + 1
+                if next_idx < len(self.candidate_steps):
+                    target = self.candidate_steps[next_idx]
+                    logger.info(
+                        f"Adaptive spec params probe upshift: steps 0 -> {target}"
+                    )
+                    self.current_steps = target
+                    return True
+        else:
+            self._zero_step_batch_count = 0
+
         if self._batch_count <= self.warmup_batches:
             return False
 
