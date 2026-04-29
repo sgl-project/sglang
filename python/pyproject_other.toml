@@ -167,7 +167,7 @@ test = [
   "tabulate",
 ]
 
-all_hip = ["sglang[srt_hip]", "sglang[diffusion_hip]"]
+all_hip = ["sglang[srt_hip]", "sglang[diffusion_hip]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
 all_mps = ["sglang[srt_mps]", "sglang[diffusion_mps]"]

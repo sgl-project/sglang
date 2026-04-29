@@ -884,7 +884,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def _publish_modelexpress_metadata(self):
-        """Publish TransferEngine metadata to ModelExpress server (seed mode)."""
+        """Publish metadata to ModelExpress server (seed mode).
+
+        Supports two transport backends:
+        - transfer_engine: publishes TransferEngine session_id (Mooncake)
+        - nixl: creates NIXL agent, registers tensors, publishes nixl_metadata
+        """
         try:
             from modelexpress import p2p_pb2
             from modelexpress.client import MxClient
@@ -898,15 +903,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.modelexpress_model_name or self.server_args.model_path
         )
         mx_url = self.server_args.modelexpress_url
-        session_id = self.remote_instance_transfer_engine_session_id
-        weight_info = self.remote_instance_transfer_engine_weight_info
-
-        if not session_id or weight_info is None:
-            logger.warning(
-                "ModelExpress source: skipping publish -- "
-                "TransferEngine not initialized or no weight info"
-            )
-            return
+        transport = self.server_args.modelexpress_transport
 
         # Build SourceIdentity for this instance
         identity = p2p_pb2.SourceIdentity(
@@ -919,23 +916,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             quantization=self.server_args.quantization or "",
         )
 
-        # Build tensor descriptors from weight_info dict
-        tensors = []
-        for name, (addr, numel, element_size) in weight_info.items():
-            tensors.append(
-                p2p_pb2.TensorDescriptor(
-                    name=name,
-                    addr=addr,
-                    size=numel * element_size,
-                    device_id=self.gpu_id,
-                )
-            )
-
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=self.tp_rank,
-            transfer_engine_session_id=session_id,
-            tensors=tensors,
-        )
+        if transport == "nixl":
+            worker, tensor_count = self._build_nixl_worker_metadata(p2p_pb2)
+        else:
+            worker, tensor_count = self._build_transfer_engine_worker_metadata(p2p_pb2)
+            if worker is None:
+                return
 
         # Generate a unique worker_id for this running instance
         worker_id = str(uuid.uuid4())
@@ -943,12 +929,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         mx_client = MxClient(server_url=mx_url)
         try:
             logger.info(
-                "ModelExpress source: publishing metadata for model=%s, "
-                "tp_rank=%d, session=%s, %d tensors, worker_id=%s",
+                "ModelExpress source [%s]: publishing metadata for model=%s, "
+                "tp_rank=%d, %d tensors, worker_id=%s",
+                transport,
                 model_name,
                 self.tp_rank,
-                session_id,
-                len(tensors),
+                tensor_count,
                 worker_id,
             )
             mx_source_id = mx_client.publish_metadata(identity, worker, worker_id)
@@ -967,6 +953,86 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         finally:
             mx_client.close()
+
+    def _build_transfer_engine_worker_metadata(self, p2p_pb2):
+        """Build WorkerMetadata using TransferEngine session_id."""
+        session_id = self.remote_instance_transfer_engine_session_id
+        weight_info = self.remote_instance_transfer_engine_weight_info
+
+        if not session_id or weight_info is None:
+            logger.warning(
+                "ModelExpress source: skipping publish -- "
+                "TransferEngine not initialized or no weight info"
+            )
+            return None, 0
+
+        tensors = []
+        for name, (addr, numel, element_size) in weight_info.items():
+            tensors.append(
+                p2p_pb2.TensorDescriptor(
+                    name=name,
+                    addr=addr,
+                    size=numel * element_size,
+                    device_id=self.gpu_id,
+                )
+            )
+
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.tp_rank,
+            transfer_engine_session_id=session_id,
+            tensors=tensors,
+        )
+        return worker, len(tensors)
+
+    def _build_nixl_worker_metadata(self, p2p_pb2):
+        """Build WorkerMetadata using NIXL agent for RDMA transfers."""
+        from modelexpress.nixl_transfer import NixlTransferManager
+
+        agent_name = f"sglang-seed-rank{self.tp_rank}-{uuid.uuid4().hex[:8]}"
+        nixl_mgr = NixlTransferManager(agent_name, self.gpu_id)
+        nixl_mgr.initialize()
+
+        # Collect model tensors for NIXL registration
+        model_tensors = {}
+        for name, param in self.model.named_parameters():
+            t = param.data
+            if t.is_contiguous():
+                model_tensors[name] = t
+            else:
+                # Non-contiguous tensors: register underlying storage as byte view
+                sv = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
+                    t.untyped_storage()
+                )
+                if sv.data_ptr() not in {
+                    v.data_ptr() for v in model_tensors.values()
+                }:
+                    model_tensors[f"{name}.__storage"] = sv
+
+        nixl_metadata = nixl_mgr.register_tensors(model_tensors)
+
+        # Build tensor descriptors from registered tensors
+        tensors = []
+        for td in nixl_mgr.tensor_descriptors:
+            tensors.append(
+                p2p_pb2.TensorDescriptor(
+                    name=td.name,
+                    addr=td.addr,
+                    size=td.size,
+                    device_id=td.device_id,
+                    dtype=td.dtype,
+                )
+            )
+
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.tp_rank,
+            nixl_metadata=nixl_metadata,
+            tensors=tensors,
+        )
+
+        # Keep reference alive so NIXL agent isn't garbage collected
+        self._nixl_manager = nixl_mgr
+
+        return worker, len(tensors)
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -1261,6 +1327,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             modelexpress_ep_size=self.server_args.ep_size,
             modelexpress_dtype=self.server_args.dtype,
             modelexpress_quantization=self.server_args.quantization or "",
+            modelexpress_transport=self.server_args.modelexpress_transport,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
