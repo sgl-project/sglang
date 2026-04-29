@@ -15,6 +15,7 @@
 
 import importlib
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -26,13 +27,13 @@ root = Path(__file__).parent.resolve()
 
 _BUILD_REQUIRES = [
     ("setuptools", "setuptools"),
-    ("mlx", "mlx==0.31.1"),
+    ("mlx", "mlx"),
     ("nanobind", "nanobind"),
 ]
 
 
 def _ensure_toolchain():
-    if sys.platform != "darwin":
+    if sys.platform != "darwin" or platform.machine() != "arm64":
         raise SystemExit("setup_metal.py only supports macOS (Apple Silicon).")
     if shutil.which("c++") is None or shutil.which("xcrun") is None:
         raise SystemExit(
@@ -115,8 +116,8 @@ libraries = ["mlx"]
 
 class BuildMetalExtension(build_ext):
     def build_extension(self, ext):
-        if sys.platform != "darwin":
-            raise RuntimeError("setup_metal.py only supports macOS")
+        if sys.platform != "darwin" or platform.machine() != "arm64":
+            raise RuntimeError("setup_metal.py only supports macOS (Apple Silicon).")
 
         ext_path = Path(self.get_ext_fullpath(ext.name))
         ext_path.parent.mkdir(parents=True, exist_ok=True)
