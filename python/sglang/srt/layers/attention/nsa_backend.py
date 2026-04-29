@@ -46,6 +46,13 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 
+
+def _deep_gemm_paged_mqa_context_lens(deep_gemm_module, seqlens: torch.Tensor):
+    if hasattr(deep_gemm_module, "fp8_fp4_paged_mqa_logits") and seqlens.dim() == 1:
+        return seqlens.view(-1, 1)
+    return seqlens
+
+
 if _is_hip:
     from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
 
@@ -648,7 +655,9 @@ class NativeSparseAttnBackend(
                     else cache_seqlens_int32
                 )
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    _deep_gemm_paged_mqa_context_lens(deep_gemm, seqlens_32),
+                    64,
+                    deep_gemm.get_num_sms(),
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -933,7 +942,9 @@ class NativeSparseAttnBackend(
                     else cache_seqlens_int32
                 )
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    _deep_gemm_paged_mqa_context_lens(deep_gemm, seqlens_32),
+                    64,
+                    deep_gemm.get_num_sms(),
                 )
             except (ImportError, ModuleNotFoundError):
                 paged_mqa_schedule_metadata = None
@@ -1082,7 +1093,9 @@ class NativeSparseAttnBackend(
                     else metadata.cache_seqlens_int32
                 )
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, 64, deep_gemm.get_num_sms()
+                    _deep_gemm_paged_mqa_context_lens(deep_gemm, seqlens_32),
+                    64,
+                    deep_gemm.get_num_sms(),
                 )
                 if metadata.paged_mqa_schedule_metadata is None:
                     metadata.paged_mqa_schedule_metadata = new_schedule
@@ -1359,7 +1372,6 @@ class NativeSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1411,6 +1423,53 @@ class NativeSparseAttnBackend(
                     page_table_1
                 )
             )
+
+        if (
+            forward_batch.forward_mode.is_target_verify()
+            and nsa_impl == "flashmla_kv"
+            and getattr(
+                forward_batch.token_to_kv_pool,
+                "turboquant_execution_mode",
+                None,
+            )
+            == "fused_decode"
+            and getattr(
+                forward_batch.token_to_kv_pool,
+                "turboquant_dense_kv_preset",
+                None,
+            )
+            == "latent_2p5bit_nc"
+            and topk_transform_method == TopkTransformMethod.PAGED
+            and page_table_1.is_cuda
+            and page_table_1.dtype == torch.int32
+        ):
+            return forward_batch.token_to_kv_pool.forward_turboquant_dense_mla_decode(
+                layer.layer_id,
+                q_nope,
+                q_rope,
+                page_table_1,
+                layer.scaling,
+            )
+
+        if (
+            nsa_impl in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang")
+            and getattr(
+                forward_batch.token_to_kv_pool,
+                "turboquant_execution_mode",
+                None,
+            )
+            == "fused_decode"
+            and topk_transform_method == TopkTransformMethod.PAGED
+        ):
+            kv_cache, page_table_1 = (
+                forward_batch.token_to_kv_pool.get_turboquant_selected_kv_buffer(
+                    layer.layer_id,
+                    page_table_1,
+                    fp8_layout=nsa_impl == "flashmla_kv",
+                )
+            )
+        else:
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if nsa_impl == "tilelang":
             if q_rope is not None:
@@ -1541,8 +1600,6 @@ class NativeSparseAttnBackend(
                     k_rope,
                 )
 
-        # Do absorbed multi-latent attention
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -1572,6 +1629,51 @@ class NativeSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
+
+        if (
+            self.nsa_decode_impl == "flashmla_kv"
+            and getattr(
+                forward_batch.token_to_kv_pool,
+                "turboquant_execution_mode",
+                None,
+            )
+            == "fused_decode"
+            and getattr(
+                forward_batch.token_to_kv_pool,
+                "turboquant_dense_kv_preset",
+                None,
+            )
+            == "latent_2p5bit_nc"
+            and q_rope is not None
+            and page_table_1.is_cuda
+            and page_table_1.dtype == torch.int32
+        ):
+            return forward_batch.token_to_kv_pool.forward_turboquant_dense_mla_decode(
+                layer.layer_id,
+                q_nope,
+                q_rope,
+                page_table_1,
+                layer.scaling,
+            )
+
+        if (
+            self.nsa_decode_impl in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang")
+            and getattr(
+                forward_batch.token_to_kv_pool,
+                "turboquant_execution_mode",
+                None,
+            )
+            == "fused_decode"
+        ):
+            kv_cache, page_table_1 = (
+                forward_batch.token_to_kv_pool.get_turboquant_selected_kv_buffer(
+                    layer.layer_id,
+                    page_table_1,
+                    fp8_layout=self.nsa_decode_impl == "flashmla_kv",
+                )
+            )
+        else:
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if self.nsa_decode_impl == "flashmla_sparse":
             if q_rope is not None:
@@ -1751,11 +1853,12 @@ class NativeSparseAttnBackend(
         else:
             q_input = q_all
 
-        kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
+        prequantized_fp8 = kv_cache.dtype == torch.float8_e4m3fn
+        kv_cache_dim = kv_cache.shape[-1] if prequantized_fp8 else self.kv_cache_dim
+        kv_cache = kv_cache.view(-1, self.real_page_size, 1, kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"
 
-        if not self.nsa_kv_cache_store_fp8:
-            # inefficiently quantize the whole cache
+        if not self.nsa_kv_cache_store_fp8 and not prequantized_fp8:
             kv_cache = quantize_k_cache(kv_cache)
 
         indices = page_table_1.unsqueeze(1)
@@ -2214,17 +2317,22 @@ class NativeSparseAttnBackend(
 
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
-    ) -> NSAIndexerMetadata:
+    ) -> Optional[NSAIndexerMetadata]:
+        if forward_batch.forward_mode.is_idle() and not hasattr(
+            self, "forward_metadata"
+        ):
+            return None
+        metadata = self.forward_metadata
         force_unfused = (
             forward_batch.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode_or_idle()
         )
         return NSAIndexerMetadata(
-            attn_metadata=self.forward_metadata,
+            attn_metadata=metadata,
             topk_transform_method=self.get_topk_transform_method(
                 forward_batch.forward_mode
             ),
-            paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
+            paged_mqa_schedule_metadata=metadata.paged_mqa_schedule_metadata,
             force_unfused_topk=force_unfused,
         )
 

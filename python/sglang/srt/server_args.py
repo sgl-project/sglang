@@ -225,6 +225,15 @@ NSA_INDEXER_MODE_CHOICES = ["vanilla", "indexcache", "hisa", "indexcache-hisa"]
 
 HISA_EXECUTION_MODE_CHOICES = ["oracle", "optimized"]
 
+TURBOQUANT_DENSE_KV_PRESET_CHOICES = [
+    "latent_k8",
+    "latent_4bit_nc",
+    "latent_k3_nc",
+    "latent_2p5bit_nc",
+]
+
+TURBOQUANT_EXECUTION_MODE_CHOICES = ["materialize", "fused_decode"]
+
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
 NSA_CHOICES = [
@@ -508,6 +517,11 @@ class ServerArgs:
     hisa_block_topk: int = 64
     hisa_min_seq_len: int = 65536
     hisa_execution_mode: str = "optimized"
+    enable_turboquant_dense_kv_cache: bool = False
+    turboquant_dense_kv_preset: str = "latent_2p5bit_nc"
+    turboquant_residual_window_size: int = 128
+    turboquant_skip_layers: Optional[str] = None
+    turboquant_execution_mode: str = "fused_decode"
     disable_flashinfer_autotune: bool = False
     mamba_backend: str = "triton"
 
@@ -1600,7 +1614,12 @@ class ServerArgs:
                 "DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
             )
 
-        if self.kv_cache_dtype == "auto":
+        if self.enable_turboquant_dense_kv_cache and self.kv_cache_dtype == "auto":
+            self.kv_cache_dtype = "bfloat16"
+            logger.warning(
+                "Setting KV cache dtype to bfloat16 for TurboQuant dense MLA KV."
+            )
+        elif self.kv_cache_dtype == "auto":
             if major >= 10:
                 self.kv_cache_dtype = "fp8_e4m3"
             else:
@@ -1610,6 +1629,13 @@ class ServerArgs:
             )
         if self.kv_cache_dtype == "bf16":
             self.kv_cache_dtype = "bfloat16"
+        if (
+            self.enable_turboquant_dense_kv_cache
+            and self.kv_cache_dtype != "bfloat16"
+        ):
+            raise ValueError(
+                "TurboQuant dense MLA KV currently requires --kv-cache-dtype=bfloat16."
+            )
         assert self.kv_cache_dtype in [
             "bfloat16",
             "fp8_e4m3",
@@ -1634,6 +1660,14 @@ class ServerArgs:
         if not user_set_prefill and not user_set_decode and is_hip():
             self.nsa_prefill_backend = "tilelang"
             self.nsa_decode_backend = "tilelang"
+        elif (
+            self.enable_turboquant_dense_kv_cache
+            and self.turboquant_execution_mode == "fused_decode"
+        ):
+            if not user_set_prefill:
+                self.nsa_prefill_backend = "flashmla_kv"
+            if not user_set_decode:
+                self.nsa_decode_backend = "flashmla_kv"
         elif kv_cache_dtype == "fp8_e4m3":
             if major >= 10:
                 if not user_set_prefill:
@@ -5279,6 +5313,37 @@ class ServerArgs:
             help="HISA execution path.",
         )
         parser.add_argument(
+            "--enable-turboquant-dense-kv-cache",
+            action="store_true",
+            help="Enable TurboQuant compression for DeepSeek NSA dense MLA KV cache.",
+        )
+        parser.add_argument(
+            "--turboquant-dense-kv-preset",
+            default=ServerArgs.turboquant_dense_kv_preset,
+            type=str,
+            choices=TURBOQUANT_DENSE_KV_PRESET_CHOICES,
+            help="TurboQuant dense MLA KV compression preset.",
+        )
+        parser.add_argument(
+            "--turboquant-residual-window-size",
+            default=ServerArgs.turboquant_residual_window_size,
+            type=int,
+            help="Recent-token BF16 residual window for TurboQuant dense KV.",
+        )
+        parser.add_argument(
+            "--turboquant-skip-layers",
+            default=ServerArgs.turboquant_skip_layers,
+            type=str,
+            help="Comma-separated layer IDs that keep dense MLA KV in BF16.",
+        )
+        parser.add_argument(
+            "--turboquant-execution-mode",
+            default=ServerArgs.turboquant_execution_mode,
+            type=str,
+            choices=TURBOQUANT_EXECUTION_MODE_CHOICES,
+            help="TurboQuant dense MLA KV execution path.",
+        )
+        parser.add_argument(
             "--fp8-gemm-backend",
             type=str,
             choices=FP8_GEMM_RUNNER_BACKEND_CHOICES,
@@ -6842,10 +6907,6 @@ class ServerArgs:
                 )
             if self.enable_hisparse:
                 raise ValueError("--nsa-indexer-mode is not compatible with HiSparse.")
-            if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "--nsa-indexer-mode is not compatible with speculative decoding."
-                )
             if self.hisa_block_size * self.hisa_block_topk < hf_config.index_topk:
                 raise ValueError(
                     "--hisa-block-size * --hisa-block-topk must be at least index_topk."
@@ -6853,6 +6914,48 @@ class ServerArgs:
             validate_indexcache_pattern(
                 self.nsa_indexcache_pattern, hf_config.num_hidden_layers
             )
+
+        if self.enable_turboquant_dense_kv_cache:
+            from sglang.srt.configs.model_config import is_deepseek_nsa
+            from sglang.srt.layers.quantization.turboquant_dense_kv import (
+                validate_turboquant_dense_kv_preset,
+            )
+
+            hf_config = self.get_model_config().hf_config
+            if not is_deepseek_nsa(hf_config):
+                raise ValueError(
+                    "--enable-turboquant-dense-kv-cache is only supported for DeepSeek Sparse Attention models."
+                )
+            if self.enable_hisparse:
+                raise ValueError(
+                    "--enable-turboquant-dense-kv-cache is not compatible with HiSparse."
+                )
+            if self.disaggregation_mode != "null":
+                raise ValueError(
+                    "--enable-turboquant-dense-kv-cache is not compatible with PD disaggregation."
+                )
+            if self.turboquant_execution_mode == "fused_decode" and (
+                self.nsa_decode_backend
+                not in ("fa3", "flashmla_kv", "flashmla_sparse", "tilelang")
+            ):
+                raise ValueError(
+                    "--turboquant-execution-mode=fused_decode requires "
+                    "--nsa-decode-backend=fa3, flashmla_kv, flashmla_sparse, "
+                    "or tilelang."
+                )
+            if not is_cuda():
+                raise ValueError(
+                    "--enable-turboquant-dense-kv-cache currently requires CUDA."
+                )
+            if self.turboquant_residual_window_size <= 0:
+                raise ValueError("--turboquant-residual-window-size must be positive.")
+            validate_turboquant_dense_kv_preset(self.turboquant_dense_kv_preset)
+            if self.turboquant_skip_layers:
+                for layer_id in self.turboquant_skip_layers.split(","):
+                    if layer_id and not layer_id.isdigit():
+                        raise ValueError(
+                            "--turboquant-skip-layers must be a comma-separated list of layer IDs."
+                        )
 
         assert (
             self.schedule_conservativeness >= 0

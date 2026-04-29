@@ -37,6 +37,18 @@ import triton
 import triton.language as tl
 
 from sglang.jit_kernel.kvcache import can_use_store_cache, store_cache
+from sglang.jit_kernel.turboquant_dense_kv import (
+    dequantize_page_table_selected_2p5,
+    dequantize_page_table_selected_2p5_fp8,
+    dequantize_page_table_selected_2p5_fp8_reuse,
+    dequantize_selected_2p5,
+    dequantize_selected_4bit,
+    store_2p5,
+)
+from sglang.jit_kernel.turboquant_dense_mla_decode import (
+    turboquant_dense_mla_decode_2p5_split_rotated,
+    turboquant_dense_mla_rotate_query,
+)
 from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
@@ -46,6 +58,10 @@ from sglang.srt.layers.attention.nsa.quant_k_cache import (
     quantize_k_cache_separate,
 )
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.layers.quantization.turboquant_dense_kv import (
+    TurboQuantDenseKVCodec,
+    TurboQuantDenseKVConfig,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
@@ -2013,6 +2029,495 @@ class NSATokenToKVPool(MLATokenToKVPool):
         for index_k_cache in self.index_k_with_scale_buffer:
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
+
+
+class TurboQuantNSATokenToKVPool(NSATokenToKVPool):
+    def __init__(
+        self,
+        *args,
+        turboquant_dense_kv_preset: str,
+        turboquant_execution_mode: str,
+        turboquant_skip_layers: Optional[set[int]] = None,
+        **kwargs,
+    ):
+        self.turboquant_dense_kv_preset = turboquant_dense_kv_preset
+        self.turboquant_execution_mode = turboquant_execution_mode
+        self.turboquant_skip_layers = turboquant_skip_layers or set()
+        super().__init__(*args, **kwargs)
+
+    def _create_buffers(self):
+        self.store_dtype = torch.uint8
+        self.turboquant_codec = TurboQuantDenseKVCodec(
+            TurboQuantDenseKVConfig(
+                latent_dim=self.kv_lora_rank,
+                rope_dim=self.qk_rope_head_dim,
+                preset=self.turboquant_dense_kv_preset,
+            ),
+            torch.device(self.device),
+        )
+        self.turboquant_slot_bytes = self.turboquant_codec.slot_bytes
+        dtype_bytes = torch.tensor([], dtype=self.dtype).element_size()
+        self.turboquant_flashmla_fp8_slot_bytes = (
+            self.kv_lora_rank
+            + (self.kv_lora_rank // 128) * 4
+            + self.qk_rope_head_dim * dtype_bytes
+        )
+
+        with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                m = self.size + self.page_size
+                self.kv_buffer = []
+                for local_layer_idx in range(self.layer_num):
+                    layer_id = self.start_layer + local_layer_idx
+                    if layer_id in self.turboquant_skip_layers:
+                        self.kv_buffer.append(
+                            torch.zeros(
+                                (m, 1, self.kv_cache_dim),
+                                dtype=self.dtype,
+                                device=self.device,
+                            )
+                        )
+                    else:
+                        self.kv_buffer.append(
+                            torch.zeros(
+                                (m, 1, self.turboquant_slot_bytes),
+                                dtype=torch.uint8,
+                                device=self.device,
+                            )
+                        )
+                self._deq_buffer = (
+                    torch.zeros(
+                        (m, 1, self.kv_cache_dim),
+                        dtype=self.dtype,
+                        device=self.device,
+                    )
+                    if self.turboquant_execution_mode == "materialize"
+                    else None
+                )
+
+        self._tq_active = [0] * self.layer_num
+        self._tq_dirty = [True] * self.layer_num
+        self._tq_deq_layer_idx: Optional[int] = None
+        self._tq_selected_buffer: Optional[torch.Tensor] = None
+        self._tq_selected_fp8_buffer: Optional[torch.Tensor] = None
+        self._tq_compact_page_table: Optional[torch.Tensor] = None
+        self._tq_full_page_table: Optional[torch.Tensor] = None
+        self._tq_full_compact_page_table: Optional[torch.Tensor] = None
+        self._tq_full_page_table_filled = 0
+        self._tq_mla_decode_mid: Optional[torch.Tensor] = None
+        self._tq_mla_q_rotated: Optional[torch.Tensor] = None
+        fp16_bytes = (self.kv_lora_rank + self.qk_rope_head_dim) * dtype_bytes
+        logger.info(
+            "TurboQuant dense MLA KV cache enabled: preset=%s, %d bytes/token "
+            "(baseline dense=%d bytes/token)",
+            self.turboquant_dense_kv_preset,
+            self.turboquant_slot_bytes,
+            fp16_bytes,
+        )
+
+    def _clear_buffers(self):
+        del self.kv_buffer
+        if self._deq_buffer is not None:
+            del self._deq_buffer
+
+    def _uses_turboquant_layer(self, layer_id: int) -> bool:
+        return layer_id not in self.turboquant_skip_layers
+
+    def get_key_buffer(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+
+        layer_idx = layer_id - self.start_layer
+        if not self._uses_turboquant_layer(layer_id):
+            return self.kv_buffer[layer_idx]
+
+        if self._deq_buffer is None:
+            raise RuntimeError(
+                "TurboQuant fused_decode does not materialize the full dense KV cache."
+            )
+        if self._tq_dirty[layer_idx] or self._tq_deq_layer_idx != layer_idx:
+            n = self._tq_active[layer_idx]
+            if n > 0:
+                self._deq_buffer[:n] = self.turboquant_codec.decompress(
+                    self.kv_buffer[layer_idx][:n],
+                    self.dtype,
+                )
+            self._tq_dirty[layer_idx] = False
+            self._tq_deq_layer_idx = layer_idx
+        return self._deq_buffer
+
+    def get_value_buffer(self, layer_id: int):
+        key_buf = self.get_key_buffer(layer_id)
+        return key_buf[..., : self.kv_lora_rank]
+
+    def get_turboquant_selected_kv_buffer(
+        self,
+        layer_id: int,
+        page_table: torch.Tensor,
+        fp8_layout: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        layer_idx = layer_id - self.start_layer
+        if not self._uses_turboquant_layer(layer_id):
+            return self.kv_buffer[layer_idx], page_table
+
+        if (
+            fp8_layout
+            and self.turboquant_codec.bits == 2.5
+            and self.dtype == torch.bfloat16
+            and page_table.is_cuda
+            and page_table.dtype == torch.int32
+            and page_table.is_contiguous()
+        ):
+            active_rows = 0
+            full_rows = 0
+            if page_table.shape[0] > 8:
+                active_rows = self._tq_active[layer_idx]
+                if active_rows == 0:
+                    active_rows = int(page_table.max().item()) + 1
+                full_rows = triton.cdiv(active_rows, self.page_size) * self.page_size
+            if full_rows > 0 and full_rows * 4 < page_table.numel():
+                if (
+                    self._tq_selected_fp8_buffer is None
+                    or self._tq_selected_fp8_buffer.shape[0] < full_rows
+                ):
+                    self._tq_selected_fp8_buffer = torch.empty(
+                        (
+                            full_rows,
+                            1,
+                            self.turboquant_flashmla_fp8_slot_bytes,
+                        ),
+                        dtype=torch.float8_e4m3fn,
+                        device=self.device,
+                    )
+                if (
+                    self._tq_full_page_table is None
+                    or self._tq_full_page_table.numel() < full_rows
+                ):
+                    self._tq_full_page_table = torch.empty(
+                        (1, full_rows), dtype=torch.int32, device=self.device
+                    )
+                    self._tq_full_compact_page_table = torch.empty_like(
+                        self._tq_full_page_table
+                    )
+                    self._tq_full_page_table_filled = 0
+                full_page_table = self._tq_full_page_table[:, :full_rows]
+                if self._tq_full_page_table_filled < full_rows:
+                    torch.arange(
+                        self._tq_full_page_table_filled,
+                        full_rows,
+                        dtype=torch.int32,
+                        device=self.device,
+                        out=self._tq_full_page_table[
+                            0, self._tq_full_page_table_filled : full_rows
+                        ],
+                    )
+                    self._tq_full_page_table_filled = full_rows
+                full_compact_page_table = self._tq_full_compact_page_table[
+                    :, :full_rows
+                ]
+                kv_cache = self._tq_selected_fp8_buffer[:full_rows]
+                dequantize_page_table_selected_2p5_fp8(
+                    self.kv_buffer[layer_idx],
+                    full_page_table,
+                    kv_cache.view(torch.uint8),
+                    full_compact_page_table,
+                    self.turboquant_codec.centroids_high,
+                    self.turboquant_codec.centroids_low,
+                    self.turboquant_codec.signs1,
+                    self.turboquant_codec.signs2,
+                )
+                return kv_cache, page_table
+            if (
+                self._tq_selected_fp8_buffer is None
+                or self._tq_selected_fp8_buffer.shape[0] < page_table.numel()
+            ):
+                self._tq_selected_fp8_buffer = torch.empty(
+                    (
+                        page_table.numel(),
+                        1,
+                        self.turboquant_flashmla_fp8_slot_bytes,
+                    ),
+                    dtype=torch.float8_e4m3fn,
+                    device=self.device,
+                )
+            if (
+                self._tq_compact_page_table is None
+                or self._tq_compact_page_table.shape != page_table.shape
+            ):
+                self._tq_compact_page_table = torch.empty_like(page_table)
+            kv_cache = self._tq_selected_fp8_buffer[: page_table.numel()]
+            fp8_dequant_fn = (
+                dequantize_page_table_selected_2p5_fp8_reuse
+                if page_table.shape[0] <= 8
+                else dequantize_page_table_selected_2p5_fp8
+            )
+            fp8_dequant_fn(
+                self.kv_buffer[layer_idx],
+                page_table,
+                kv_cache.view(torch.uint8),
+                self._tq_compact_page_table,
+                self.turboquant_codec.centroids_high,
+                self.turboquant_codec.centroids_low,
+                self.turboquant_codec.signs1,
+                self.turboquant_codec.signs2,
+            )
+            return kv_cache, self._tq_compact_page_table
+
+        if (
+            self.turboquant_codec.bits == 2.5
+            and self.dtype == torch.bfloat16
+            and page_table.is_cuda
+            and page_table.dtype == torch.int32
+            and page_table.is_contiguous()
+        ):
+            if (
+                self._tq_selected_buffer is None
+                or self._tq_selected_buffer.shape[0] < page_table.numel()
+            ):
+                self._tq_selected_buffer = torch.empty(
+                    (page_table.numel(), 1, self.kv_cache_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            if (
+                self._tq_compact_page_table is None
+                or self._tq_compact_page_table.shape != page_table.shape
+            ):
+                self._tq_compact_page_table = torch.empty_like(page_table)
+            kv_cache = self._tq_selected_buffer[: page_table.numel()]
+            dequantize_page_table_selected_2p5(
+                self.kv_buffer[layer_idx],
+                page_table,
+                kv_cache,
+                self._tq_compact_page_table,
+                self.turboquant_codec.centroids_high,
+                self.turboquant_codec.centroids_low,
+                self.turboquant_codec.signs1,
+                self.turboquant_codec.signs2,
+            )
+            return kv_cache, self._tq_compact_page_table
+
+        mask = page_table >= 0
+        flat_loc = page_table.clamp_min(0).reshape(-1).long()
+        if (
+            self.turboquant_codec.bits == 4
+            and self.dtype == torch.bfloat16
+            and flat_loc.is_cuda
+        ):
+            if (
+                self._tq_selected_buffer is None
+                or self._tq_selected_buffer.shape[0] < flat_loc.numel()
+            ):
+                self._tq_selected_buffer = torch.empty(
+                    (flat_loc.numel(), 1, self.kv_cache_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            kv_cache = self._tq_selected_buffer[: flat_loc.numel()]
+            dequantize_selected_4bit(
+                self.kv_buffer[layer_idx],
+                flat_loc,
+                kv_cache,
+                self.turboquant_codec.centroids,
+                self.turboquant_codec.signs1,
+                self.turboquant_codec.signs2,
+            )
+        elif (
+            self.turboquant_codec.bits == 2.5
+            and self.dtype == torch.bfloat16
+            and flat_loc.is_cuda
+        ):
+            if (
+                self._tq_selected_buffer is None
+                or self._tq_selected_buffer.shape[0] < flat_loc.numel()
+            ):
+                self._tq_selected_buffer = torch.empty(
+                    (flat_loc.numel(), 1, self.kv_cache_dim),
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+            kv_cache = self._tq_selected_buffer[: flat_loc.numel()]
+            dequantize_selected_2p5(
+                self.kv_buffer[layer_idx],
+                flat_loc,
+                kv_cache,
+                self.turboquant_codec.centroids_high,
+                self.turboquant_codec.centroids_low,
+                self.turboquant_codec.signs1,
+                self.turboquant_codec.signs2,
+            )
+        else:
+            kv_cache = self.turboquant_codec.decompress(
+                self.kv_buffer[layer_idx][flat_loc],
+                self.dtype,
+            )
+        compact_page_table = torch.arange(
+            page_table.numel(),
+            dtype=page_table.dtype,
+            device=page_table.device,
+        ).reshape(page_table.shape)
+        compact_page_table = compact_page_table.masked_fill(~mask, -1)
+        return kv_cache, compact_page_table
+
+    def forward_turboquant_dense_mla_decode(
+        self,
+        layer_id: int,
+        q_nope: torch.Tensor,
+        q_rope: torch.Tensor,
+        page_table: torch.Tensor,
+        sm_scale: float,
+    ) -> torch.Tensor:
+        layer_idx = layer_id - self.start_layer
+        out = torch.empty(
+            (q_nope.shape[0], q_nope.shape[1], self.kv_lora_rank),
+            dtype=self.dtype,
+            device=q_nope.device,
+        )
+        num_splits = 16
+        mid_shape = (
+            q_nope.shape[0],
+            q_nope.shape[1],
+            num_splits,
+            self.kv_lora_rank + 2,
+        )
+        if (
+            self._tq_mla_decode_mid is None
+            or self._tq_mla_decode_mid.shape != mid_shape
+        ):
+            self._tq_mla_decode_mid = torch.empty(
+                mid_shape,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+        q_rotated_shape = q_nope.shape
+        if (
+            self._tq_mla_q_rotated is None
+            or self._tq_mla_q_rotated.shape != q_rotated_shape
+        ):
+            self._tq_mla_q_rotated = torch.empty(
+                q_rotated_shape,
+                dtype=torch.float32,
+                device=q_nope.device,
+            )
+        turboquant_dense_mla_rotate_query(
+            q_nope,
+            self._tq_mla_q_rotated,
+            self.turboquant_codec.signs1,
+            self.turboquant_codec.signs2,
+        )
+        turboquant_dense_mla_decode_2p5_split_rotated(
+            self._tq_mla_q_rotated,
+            q_rope,
+            self.kv_buffer[layer_idx],
+            page_table,
+            self._tq_mla_decode_mid,
+            out,
+            self.turboquant_codec.centroids_high,
+            self.turboquant_codec.centroids_low,
+            self.turboquant_codec.signs1,
+            self.turboquant_codec.signs2,
+            sm_scale,
+        )
+        return out
+
+    def get_kv_size_bytes(self):
+        kv_size_bytes = super().get_kv_size_bytes()
+        if self.turboquant_execution_mode == "materialize":
+            kv_size_bytes += get_tensor_size_bytes(self._deq_buffer)
+        return kv_size_bytes
+
+    def set_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k: torch.Tensor,
+        cache_v: torch.Tensor,
+    ):
+        self.set_mla_kv_buffer(
+            layer,
+            loc,
+            cache_k[..., : self.kv_lora_rank],
+            cache_k[..., self.kv_lora_rank :],
+        )
+
+    def set_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        cache_k_nope: torch.Tensor,
+        cache_k_rope: torch.Tensor,
+    ):
+        layer_id = layer.layer_id
+        layer_idx = layer_id - self.start_layer
+
+        if not self._uses_turboquant_layer(layer_id):
+            if cache_k_nope.dtype != self.dtype:
+                cache_k_nope = cache_k_nope.to(self.dtype)
+                cache_k_rope = cache_k_rope.to(self.dtype)
+            set_mla_kv_buffer_triton(
+                self.kv_buffer[layer_idx],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+            )
+            return
+
+        if (
+            self.turboquant_codec.bits == 2.5
+            and self.dtype == torch.bfloat16
+            and loc.is_cuda
+            and loc.dtype == torch.int64
+            and cache_k_nope.is_cuda
+            and cache_k_rope.is_cuda
+            and cache_k_nope.dtype == torch.bfloat16
+            and cache_k_rope.dtype == torch.bfloat16
+        ):
+            if cache_k_nope.dim() == 2:
+                cache_k_nope = cache_k_nope.unsqueeze(1)
+            if cache_k_rope.dim() == 2:
+                cache_k_rope = cache_k_rope.unsqueeze(1)
+            store_2p5(
+                self.kv_buffer[layer_idx],
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                self.turboquant_codec.boundaries_high,
+                self.turboquant_codec.boundaries_low,
+                self.turboquant_codec.centroids_high,
+                self.turboquant_codec.centroids_low,
+                self.turboquant_codec.signs1,
+                self.turboquant_codec.signs2,
+            )
+        else:
+            self.kv_buffer[layer_idx][loc] = self.turboquant_codec.compress(
+                cache_k_nope,
+                cache_k_rope,
+            )
+        self._tq_dirty[layer_idx] = True
+        if self.turboquant_execution_mode == "materialize" and loc.numel() > 0:
+            self._tq_active[layer_idx] = max(
+                self._tq_active[layer_idx],
+                int(loc.max().item()) + 1,
+            )
+
+    def get_mla_kv_buffer(
+        self,
+        layer: RadixAttention,
+        loc: torch.Tensor,
+        dst_dtype: Optional[torch.dtype] = None,
+    ):
+        layer_id = layer.layer_id
+        if not self._uses_turboquant_layer(layer_id):
+            return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+
+        layer_idx = layer_id - self.start_layer
+        dst_dtype = dst_dtype or self.dtype
+        kv = self.turboquant_codec.decompress(self.kv_buffer[layer_idx][loc], dst_dtype)
+        return kv[..., : self.kv_lora_rank], kv[..., self.kv_lora_rank :]
 
 
 def move_kv_cache_native(

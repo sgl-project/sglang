@@ -26,6 +26,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPoolFP4,
     NSATokenToKVPool,
     ReqToTokenPool,
+    TurboQuantNSATokenToKVPool,
 )
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.utils.common import (
@@ -434,6 +435,28 @@ class ModelRunnerKVCacheMixin:
                     hisparse_cfg.host_to_device_ratio
                 )
                 self.token_to_kv_pool = HiSparseNSATokenToKVPool(**nsa_pool_kwargs)
+            elif self.server_args.enable_turboquant_dense_kv_cache:
+                skip_layers = (
+                    {
+                        int(layer_id)
+                        for layer_id in self.server_args.turboquant_skip_layers.split(
+                            ","
+                        )
+                        if layer_id
+                    }
+                    if self.server_args.turboquant_skip_layers
+                    else set()
+                )
+                self.token_to_kv_pool = TurboQuantNSATokenToKVPool(
+                    **nsa_pool_kwargs,
+                    turboquant_dense_kv_preset=(
+                        self.server_args.turboquant_dense_kv_preset
+                    ),
+                    turboquant_execution_mode=(
+                        self.server_args.turboquant_execution_mode
+                    ),
+                    turboquant_skip_layers=skip_layers,
+                )
             else:
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
         elif self.use_mla_backend and not self.mambaish_config:

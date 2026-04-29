@@ -21,6 +21,7 @@ import torch
 
 from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.quantization.turboquant_dense_kv import TurboQuantDenseKVConfig
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
 
@@ -120,34 +121,25 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         tp_size = get_attention_tp_size()
 
         if mr.use_mla_backend:
-            cell_size = (
-                (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                * num_layers
-                * kv_size
-            )
-            if is_float4_e2m1fn_x2(kv_cache_dtype):
-                # kv_scale_buffer
-                scale_block_size = 16
-                cell_size = (cell_size // 2) + (
-                    (
-                        (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
-                        // scale_block_size
-                    )
+            if is_deepseek_nsa(model_config.hf_config):
+                cell_size = self._compute_nsa_cell_size(mr, num_layers, kv_size)
+            else:
+                cell_size = (
+                    (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
                     * num_layers
                     * kv_size
                 )
-
-            # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
-            if is_deepseek_nsa(model_config.hf_config):
-                index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
-                indexer_size_per_token = (
-                    index_head_dim
-                    + index_head_dim // NSATokenToKVPool.quant_block_size * 4
-                )
-                element_size = torch._utils._element_size(
-                    NSATokenToKVPool.index_k_with_scale_buffer_dtype
-                )
-                cell_size += indexer_size_per_token * num_layers * element_size
+                if is_float4_e2m1fn_x2(kv_cache_dtype):
+                    # kv_scale_buffer
+                    scale_block_size = 16
+                    cell_size = (cell_size // 2) + (
+                        (
+                            (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                            // scale_block_size
+                        )
+                        * num_layers
+                        * kv_size
+                    )
         else:
             cell_size = (
                 model_config.get_num_kv_heads(tp_size)
@@ -166,6 +158,60 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
 
         return cell_size
+
+    def _compute_nsa_cell_size(
+        self, mr: ModelRunner, num_layers: int, kv_size: int
+    ) -> int:
+        model_config = mr.model_config
+        index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
+        indexer_size_per_token = (
+            index_head_dim + index_head_dim // NSATokenToKVPool.quant_block_size * 4
+        )
+        indexer_element_size = torch._utils._element_size(
+            NSATokenToKVPool.index_k_with_scale_buffer_dtype
+        )
+        indexer_cell_size = indexer_size_per_token * num_layers * indexer_element_size
+
+        if not mr.server_args.enable_turboquant_dense_kv_cache:
+            dense_cell_size = mr.calculate_mla_kv_cache_dim() * num_layers * kv_size
+            if is_float4_e2m1fn_x2(mr.kv_cache_dtype):
+                scale_block_size = 16
+                dense_cell_size = (dense_cell_size // 2) + (
+                    (
+                        (model_config.kv_lora_rank + model_config.qk_rope_head_dim)
+                        // scale_block_size
+                    )
+                    * num_layers
+                    * kv_size
+                )
+            return dense_cell_size + indexer_cell_size
+
+        skipped_layers = (
+            {
+                int(layer_id)
+                for layer_id in mr.server_args.turboquant_skip_layers.split(",")
+                if layer_id
+            }
+            if mr.server_args.turboquant_skip_layers
+            else set()
+        )
+        turboquant_slot_bytes = TurboQuantDenseKVConfig(
+            latent_dim=model_config.kv_lora_rank,
+            rope_dim=model_config.qk_rope_head_dim,
+            preset=mr.server_args.turboquant_dense_kv_preset,
+        ).slot_bytes
+        dense_cache_bytes = mr.calculate_mla_kv_cache_dim() * kv_size
+        dense_cell_size = 0
+        for layer_id in range(mr.start_layer, mr.end_layer):
+            dense_cell_size += (
+                dense_cache_bytes
+                if layer_id in skipped_layers
+                else turboquant_slot_bytes
+            )
+        if mr.server_args.turboquant_execution_mode == "materialize":
+            dense_cell_size += dense_cache_bytes
+
+        return dense_cell_size + indexer_cell_size
 
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int

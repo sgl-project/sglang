@@ -39,6 +39,13 @@ if _is_cuda:
     except ImportError as e:
         deep_gemm = e
 
+
+def _deep_gemm_paged_mqa_context_lens(deep_gemm_module, seqlens: torch.Tensor):
+    if hasattr(deep_gemm_module, "fp8_fp4_paged_mqa_logits") and seqlens.dim() == 1:
+        return seqlens.view(-1, 1)
+    return seqlens
+
+
 if _use_aiter:
     from aiter.ops.cache import indexer_k_quant_and_cache
 
@@ -467,7 +474,9 @@ class Indexer(MultiPlatformOp):
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, blocksize, self.sm_count
+                    _deep_gemm_paged_mqa_context_lens(deep_gemm, seqlens_32),
+                    blocksize,
+                    self.sm_count,
                 )
 
         assert len(q_fp8.shape) == 3
@@ -516,7 +525,7 @@ class Indexer(MultiPlatformOp):
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
-                seqlens_32,
+                _deep_gemm_paged_mqa_context_lens(deep_gemm, seqlens_32),
                 block_tables,
                 schedule_metadata,
                 max_seq_len,
