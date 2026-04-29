@@ -18,6 +18,8 @@ from sglang.srt.ug.bagel import (
     BAGELDenoiseStepRunner,
     BAGELInterleaveContextBackend,
     BAGELPreparedDenoise,
+    BAGELSRTUForwardExecutor,
+    BAGELUForwardBridge,
     BAGELUGModelAdapter,
     MockBAGELBackend,
     _build_official_bagel_inferencer,
@@ -239,6 +241,26 @@ class BindingSRTExecutor(OutputAppendingSRTExecutor):
                 self.start_index + token_count,
                 dtype=torch.long,
             ),
+        )
+
+
+class RecordingBAGELSRTUForwardExecutor(BAGELSRTUForwardExecutor):
+    def __init__(self):
+        self.events = []
+
+    def execute(self, backend, *, session, request, messages):
+        self.events.append(
+            (
+                request.state,
+                request.request_id,
+                "srt_kv_token_binding" in request.metadata,
+            )
+        )
+        return super().execute(
+            backend,
+            session=session,
+            request=request,
+            messages=messages,
         )
 
 
@@ -890,6 +912,101 @@ class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
             runtime.get_debug_counters(handle)["srt_last_request_id"],
             "bagel-bound-srt-view:u1",
         )
+
+    def test_srt_bound_u_g_u_uses_u_forward_executor(self):
+        allocator = FakePagedAllocator(page_size=4)
+        u_forward_executor = RecordingBAGELSRTUForwardExecutor()
+        backend = BAGELInterleaveContextBackend(
+            FakeSRTCacheBAGELInferencer(),
+            u_forward_bridge=BAGELUForwardBridge(
+                srt_u_forward_executor=u_forward_executor
+            ),
+            srt_kv_cache_factory=BAGELSRTKVCacheFactory(
+                BAGELPagedKVCacheBacking(allocator)
+            ),
+            default_image_shape=(32, 32),
+        )
+        adapter = BAGELUGModelAdapter("already-loaded-bagel", backend=backend)
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=BindingSRTExecutor(token_id=88, start_index=6),
+            srt_u_decode_max_new_tokens=1,
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="red kite")],
+            session_id="bagel-strict-srt-u-g-u",
+        )
+        self.assertEqual(allocator.alloc_sizes, [])
+        marker = runtime.decode_next_segment(handle)
+        self.assertEqual(marker.type, "image_marker")
+
+        sampling_params = SimpleNamespace(
+            height=32,
+            width=32,
+            cfg_text_scale=5.0,
+            cfg_img_scale=2.0,
+            cfg_interval=(0.4, 1.0),
+            cfg_renorm_min=0.0,
+            cfg_renorm_type="global",
+        )
+        prepared_latents = runtime.prepare_latents(
+            UGLatentPrepareRequest(
+                session=handle,
+                sampling_params=sampling_params,
+                seed=123,
+            )
+        )
+        response = runtime.predict_velocity(
+            UGVelocityRequest(
+                session=handle,
+                latent_tokens=prepared_latents.latent_tokens,
+                timestep=torch.tensor([0.5]),
+                latent_position_ids=prepared_latents.latent_position_ids,
+                sampling_params=sampling_params,
+            )
+        )
+        generated_image = runtime.decode_latents_to_image(
+            UGLatentDecodeRequest(
+                session=response.session,
+                latent_tokens=response.velocity,
+                sampling_params=sampling_params,
+            )
+        )
+        handle = runtime.append_generated_image(response.session, image=generated_image)
+        text = runtime.decode_next_segment(handle)
+
+        self.assertEqual(text.type, "text")
+        self.assertEqual(text.text, "srt_cache_text_4")
+        self.assertEqual(
+            u_forward_executor.events,
+            [
+                ("u_prefill", "bagel-strict-srt-u-g-u:u1", True),
+                ("u_decode", "bagel-strict-srt-u-g-u:d1", True),
+                ("append_image", "bagel-strict-srt-u-g-u:u2", True),
+                ("u_decode", "bagel-strict-srt-u-g-u:d2", True),
+            ],
+        )
+        self.assertTrue(
+            torch.equal(
+                allocator.kv_cache.get_key_buffer(0)[7:9],
+                torch.full((2, 1, 2), 1.0),
+            )
+        )
+        self.assertEqual(
+            backend.sessions["bagel-strict-srt-u-g-u"].append_image_count, 1
+        )
+        self.assertEqual(
+            backend.sessions["bagel-strict-srt-u-g-u"].srt_last_u_decode_output_ids,
+            (88,),
+        )
+        counters = runtime.get_debug_counters(handle)
+        self.assertEqual(counters["prefill_count"], 1)
+        self.assertEqual(counters["velocity_count"], 1)
+        self.assertEqual(counters["append_image_count"], 1)
+        self.assertEqual(counters["decode_count"], 2)
+        self.assertEqual(counters["state"], "u_decode")
 
 
 class TestBAGELInterleaveContextBackend(unittest.TestCase):

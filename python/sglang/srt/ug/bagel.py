@@ -254,6 +254,15 @@ class BAGELSessionContext:
 class BAGELUForwardBridge:
     """Maps safe SRT request views onto official BAGEL U context updates."""
 
+    def __init__(
+        self,
+        *,
+        srt_u_forward_executor: "BAGELSRTUForwardExecutor | None" = None,
+    ) -> None:
+        self.srt_u_forward_executor = (
+            srt_u_forward_executor or BAGELSRTUForwardExecutor()
+        )
+
     def observe(
         self,
         backend: "BAGELInterleaveContextBackend",
@@ -264,23 +273,46 @@ class BAGELUForwardBridge:
     ) -> None:
         state = backend._state_for(session.handle.session_id)
         state.srt_u_forward_events.append((request.state, request.request_id))
+        result = self.srt_u_forward_executor.execute(
+            backend,
+            session=session,
+            request=request,
+            messages=messages,
+        )
+        if result is not None:
+            state.srt_u_forward_results[request.request_id] = result
+
+
+class BAGELSRTUForwardExecutor:
+    """Executes BAGEL U context updates from SRT request views."""
+
+    def execute(
+        self,
+        backend: "BAGELInterleaveContextBackend",
+        *,
+        session,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> UGModelPrefillResult | UGModelAppendImageResult | None:
         backend._bind_srt_request_tokens(request)
 
         if request.state == UGSegmentState.U_PREFILL.value:
-            state.srt_u_forward_results[request.request_id] = (
-                backend._apply_prefill_interleaved(session=session, messages=messages)
+            return backend._apply_prefill_interleaved(
+                session=session,
+                messages=messages,
             )
-            return
 
         if request.state == UGSegmentState.APPEND_IMAGE.value:
             image = messages[0].content if messages else None
-            state.srt_u_forward_results[request.request_id] = (
-                backend._apply_append_generated_image(session=session, image=image)
+            return backend._apply_append_generated_image(
+                session=session,
+                image=image,
             )
-            return
 
         if request.state == UGSegmentState.U_DECODE.value:
+            state = backend._state_for(session.handle.session_id)
             state.srt_last_u_decode_output_ids = request.output_ids
+        return None
 
 
 class BAGELInterleaveContextBackend:
