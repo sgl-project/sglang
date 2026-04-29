@@ -239,7 +239,7 @@ export const MiMoV25Deployment = () => {
       flags.push("  --trust-remote-code");
       flags.push(`  --tp-size ${tp}`);
       if (useEp) flags.push(`  --ep-size ${tp}`);
-      if (useDpAttn) flags.push(`  --dp-size ${dpSize}`, "  --enable-dp-attention");
+      if (useDpAttn) flags.push(`  --dp-size ${dpSize}`);
       flags.push("  --moe-backend fused");
       if (!isV7x) flags.push("  --attention-backend fa");
       flags.push("  --host 0.0.0.0");
