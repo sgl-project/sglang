@@ -621,6 +621,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
+                "encoder_hidden_states_mask": batch.prompt_attention_mask,
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
@@ -641,6 +642,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
+                    "encoder_hidden_states_mask": batch.negative_attention_mask,
                 }
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,

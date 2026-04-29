@@ -322,7 +322,7 @@ class DFlashVerifyInput(SpecInput):
             new_verified_id: int64 tensor [bs] (the new current token per request)
             commit_lens: int32 tensor [bs] (how many verify-input tokens are committed)
             next_target_hidden: tensor [sum(commit_lens), feature_dim]
-            accept_length_per_req_cpu: list[int] (accepted draft tokens per request)
+            num_accepted_drafts_per_req_cpu: list[int] (accepted draft tokens per request)
         """
         if batch.forward_mode.is_idle():
             empty = torch.empty((0,), dtype=torch.int64, device=batch.device)
@@ -387,7 +387,7 @@ class DFlashVerifyInput(SpecInput):
         ).cpu()
 
         max_acc = self.draft_token_num - 1
-        accept_length_per_req_cpu: List[int] = []
+        num_accepted_drafts_per_req_cpu: List[int] = []
         commit_lens_cpu: List[int] = []
         new_verified_list: List[int] = []
 
@@ -420,9 +420,9 @@ class DFlashVerifyInput(SpecInput):
 
             commit_lens_cpu.append(appended)
             new_verified_list.append(new_verified_token)
-            accept_length_per_req_cpu.append(max(0, appended - 1))
+            num_accepted_drafts_per_req_cpu.append(max(0, appended - 1))
             req.spec_verify_ct += 1
-            req.spec_accepted_drafts += accept_length_per_req_cpu[-1]
+            req.spec_accepted_drafts += num_accepted_drafts_per_req_cpu[-1]
 
         commit_lens = torch.tensor(commit_lens_cpu, dtype=torch.int32, device=device)
         new_verified_id = torch.tensor(
@@ -497,5 +497,5 @@ class DFlashVerifyInput(SpecInput):
             new_verified_id,
             commit_lens,
             next_target_hidden,
-            accept_length_per_req_cpu,
+            num_accepted_drafts_per_req_cpu,
         )
