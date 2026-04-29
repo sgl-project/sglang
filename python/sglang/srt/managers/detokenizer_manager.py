@@ -108,6 +108,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
                 tokenizer_mode=server_args.tokenizer_mode,
                 trust_remote_code=server_args.trust_remote_code,
                 revision=server_args.revision,
+                tokenizer_backend=server_args.tokenizer_backend,
             )
 
     def init_running_status(self, server_args: ServerArgs):
@@ -338,7 +339,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             cached_tokens=recv_obj.cached_tokens,
             cached_tokens_details=recv_obj.cached_tokens_details,
             spec_verify_ct=recv_obj.spec_verify_ct,
-            spec_accepted_tokens=recv_obj.spec_accepted_tokens,
+            spec_accepted_drafts=recv_obj.spec_accepted_drafts,
             spec_acceptance_histogram=recv_obj.spec_acceptance_histogram,
             input_token_logprobs_val=recv_obj.input_token_logprobs_val,
             input_token_logprobs_idx=recv_obj.input_token_logprobs_idx,

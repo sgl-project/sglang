@@ -192,7 +192,7 @@ class NgramVerifyInput(SpecInput):
                             raise e
             req.spec_verify_ct += 1
             accepted_draft_tokens = sum(1 for idx in accept_index_row if idx != -1) - 1
-            req.spec_accepted_tokens += accepted_draft_tokens
+            req.spec_accepted_drafts += accepted_draft_tokens
             req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         if has_finished:
@@ -446,14 +446,14 @@ class NgramVerifyInput(SpecInput):
         self._fill_requests(batch, logits_output)
 
         accept_length_cpu = self.accept_length.cpu()
-        num_accepted_tokens = accept_length_cpu.sum().item()
+        num_accepted_drafts = accept_length_cpu.sum().item()
 
         self._free_cache(batch, page_size, accept_length_cpu)
 
         batch.seq_lens.add_(self.accept_length + 1)
         batch.seq_lens_cpu.add_(accept_length_cpu + 1)
 
-        return logits_output, self.verified_id, num_accepted_tokens
+        return logits_output, self.verified_id, num_accepted_drafts
 
     def filter_batch(self, new_indices: torch.Tensor, has_been_filtered: bool = True):
         pass

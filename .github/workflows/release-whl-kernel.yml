@@ -50,6 +50,15 @@ jobs:
             runner: arm-kernel-build-node
     runs-on: ${{ matrix.runner }}
     steps:
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
+      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
+      # container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
@@ -69,11 +78,42 @@ jobs:
           BUILD_JOBS: 64
           NVCC_THREADS: 8
 
+      # rename_wheels.sh tags the cu129 wheel's METADATA Version with +cu129
+      # (needed elsewhere — e.g. local install discrimination — see PR #23587),
+      # but PyPI rejects PEP 440 local version labels with HTTP 400. Repack a
+      # PyPI-clean copy with the +cu129 segment stripped into dist-pypi/, and
+      # upload that copy. dist/ is left untouched so the +cu129 wheel still
+      # flows through the upload-artifact -> sgl-project/whl index path below.
+      - name: Strip +cu129 local version for PyPI upload
+        working-directory: sgl-kernel
+        run: |
+          set -eux
+          pip install wheel
+          mkdir -p dist-pypi
+          for w in dist/*.whl; do
+            tmp=$(mktemp -d)
+            python3 -m wheel unpack "$w" --dest "$tmp"
+            unpacked=$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -1)
+            info=$(find "$unpacked" -maxdepth 1 -type d -name "*.dist-info" | head -1)
+            meta="$info/METADATA"
+            orig=$(grep '^Version:' "$meta" | head -1 | sed 's/^Version:[[:space:]]*//')
+            new=$(echo "$orig" | sed 's/+cu[0-9]\+$//')
+            if [ "$orig" != "$new" ]; then
+              sed -i "s/^Version:.*/Version: ${new}/" "$meta"
+              old_base=$(basename "$info")
+              new_base="${old_base/${orig}/${new}}"
+              mv "$info" "$(dirname "$info")/${new_base}"
+            fi
+            python3 -m wheel pack "$unpacked" --dest-dir dist-pypi
+            rm -rf "$tmp"
+          done
+          ls -lh dist-pypi/
+
       - name: Upload to PyPI
         working-directory: sgl-kernel
         run: |
           pip install twine
-          python3 -m twine upload --skip-existing dist/* -u __token__ -p ${{ secrets.PYPI_TOKEN_SGLANG_KERNEL }}
+          python3 -m twine upload --skip-existing dist-pypi/* -u __token__ -p ${{ secrets.PYPI_TOKEN_SGLANG_KERNEL }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -149,6 +189,15 @@ jobs:
             runner: arm-kernel-build-node
     runs-on: ${{ matrix.runner }}
     steps:
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
+      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
+      # container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
@@ -235,6 +284,15 @@ jobs:
         python-version: ["3.10"]
         rocm-version: ["700", "720"]
     steps:
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
+      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
+      # container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
@@ -370,6 +428,15 @@ jobs:
         python-version: ["3.10"]
         musa-version: ["43"]
     steps:
+      # Self-hosted build nodes retain the workspace across jobs. Prior builds
+      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
+      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
+      # container before checkout recreates the workspace.
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
       - uses: actions/checkout@v4
         with:
           submodules: "recursive"
