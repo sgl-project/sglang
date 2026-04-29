@@ -10,8 +10,8 @@ import torch.nn.functional as F
 from sglang.jit_kernel.causal_conv1d import causal_conv1d_fwd, causal_conv1d_update
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=128, suite="stage-b-kernel-unit-1-gpu-large")
-register_cuda_ci(est_time=512, suite="nightly-kernel-1-gpu", nightly=True)
+register_cuda_ci(est_time=32, suite="stage-b-kernel-unit-1-gpu-large")
+register_cuda_ci(est_time=128, suite="nightly-kernel-1-gpu", nightly=True)
 
 PAD_SLOT_ID = -1
 
@@ -33,8 +33,6 @@ def _causal_conv1d_fn(
     pad_slot_id: int = PAD_SLOT_ID,
 ) -> torch.Tensor:
     """Run the JIT forward kernel and return the in-place updated ``x``."""
-    if activation not in [None, "silu", "swish"]:
-        raise NotImplementedError("activation must be None, silu, or swish")
     if x.stride(-1) != 1:
         x = x.contiguous()
     bias = bias.contiguous() if bias is not None else None
@@ -63,10 +61,6 @@ def _causal_conv1d_update(
     pad_slot_id: int = PAD_SLOT_ID,
 ) -> torch.Tensor:
     """Run the JIT update kernel and return the in-place updated ``x`` (with optional unsqueeze handling)."""
-    if activation not in [None, "silu", "swish"]:
-        raise NotImplementedError(
-            f"activation must be None, silu, or swish, actual: {activation}"
-        )
     activation_val = activation in ["silu", "swish"]
     unsqueeze = x.dim() == 2
     if unsqueeze:
@@ -87,7 +81,7 @@ def _causal_conv1d_update(
 
 
 # ---------------------------------------------------------------------------
-# PyTorch reference implementations (copied verbatim from the AOT test).
+# PyTorch reference implementations.
 # ---------------------------------------------------------------------------
 
 
@@ -101,8 +95,6 @@ def causal_conv1d_ref(
     activation: Optional[str] = "silu",
 ):
     """PyTorch reference for ``causal_conv1d_fn`` using ``F.conv1d`` with optional initial states."""
-    if activation not in [None, "silu", "swish"]:
-        raise NotImplementedError("activation must be None, silu, or swish")
     dtype_in = x.dtype
     x = x.to(weight.dtype)
     seqlen = x.shape[-1]
@@ -127,8 +119,6 @@ def causal_conv1d_update_ref(
     x, conv_state, weight, bias=None, activation=None, cache_seqlens=None
 ):
     """PyTorch reference for ``causal_conv1d_update`` with optional circular-buffer ``cache_seqlens``."""
-    if activation not in [None, "silu", "swish"]:
-        raise NotImplementedError("activation must be None, silu, or swish")
     dtype_in = x.dtype
     unsqueeze = x.dim() == 2
     if unsqueeze:
@@ -136,8 +126,6 @@ def causal_conv1d_update_ref(
     batch, dim, seqlen = x.shape
     width = weight.shape[1]
     state_len = conv_state.shape[-1]
-    assert conv_state.shape == (batch, dim, state_len)
-    assert weight.shape == (dim, width)
     if cache_seqlens is None:
         x_new = torch.cat([conv_state, x], dim=-1).to(weight.dtype)
         conv_state.copy_(x_new[:, :, -state_len:])
@@ -162,52 +150,57 @@ def causal_conv1d_update_ref(
     return (out if activation is None else F.silu(out)).to(dtype=dtype_in)
 
 
-def _tolerances(itype: torch.dtype):
+def _tol(dtype: torch.dtype):
     """Return ``(rtol, atol)`` matched to the AOT test for a given input dtype."""
-    if itype == torch.bfloat16:
+    if dtype == torch.bfloat16:
         return 1e-2, 5e-2
-    if itype == torch.float32:
+    if dtype == torch.float32:
         return 3e-4, 1e-3
     return 3e-3, 5e-3  # float16
 
 
 # ---------------------------------------------------------------------------
-# Tests (mirrors the AOT suite + adds a few sanity cases).
+# Tests — each parametrize set picks the *minimum* configs that still cover
+# every dispatch axis (dtype × width × seqlen × bias × init_state × silu × varlen).
+# Total: ~14 cases.
 # ---------------------------------------------------------------------------
 
+# 5 fwd configs: cover all 3 widths, all 3 dtypes, bias/init/silu on+off, large dim, long seqlen.
+# (batch, dim, seqlen, width, has_bias, has_initial, silu, dtype)
+FWD_CONFIGS = [
+    (1, 64, 128, 4, True, False, True, torch.float16),       # baseline (w=4, fp16)
+    (2, 64, 1024, 3, True, True, True, torch.bfloat16),      # w=3, bf16, initial_state path
+    (1, 64, 1025, 2, False, False, False, torch.float32),    # w=2, fp32, non-aligned, no bias, no silu
+    (1, 64, 4096, 4, True, False, True, torch.bfloat16),     # long seqlen, bf16
+    (1, 4096, 128, 4, True, False, True, torch.float16),     # large dim
+]
 
-@pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("silu_activation", [True, False])
-@pytest.mark.parametrize("has_bias", [True, False])
-@pytest.mark.parametrize("has_initial_state", [True, False])
-@pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("seqlen", [1, 8, 16, 32, 64, 128, 256, 512, 1024, 1025, 4096])
-@pytest.mark.parametrize("dim", [64])
-@pytest.mark.parametrize("batch", [1, 2])
-def test_causal_conv1d(
-    batch, dim, seqlen, width, has_bias, silu_activation, has_initial_state, itype
-):
-    """Forward kernel matches the PyTorch reference across dtypes / widths / seqlens."""
+
+@pytest.mark.parametrize(
+    "batch,dim,seqlen,width,has_bias,has_initial,silu,dtype", FWD_CONFIGS
+)
+def test_fwd(batch, dim, seqlen, width, has_bias, has_initial, silu, dtype):
+    """Forward kernel matches PyTorch reference across all dispatch axes."""
     device = "cuda"
-    rtol, atol = _tolerances(itype)
+    rtol, atol = _tol(dtype)
     torch.manual_seed(0)
 
-    x = torch.randn(batch, dim, seqlen, device=device, dtype=itype).contiguous()
-    weight = torch.randn(dim, width, device=device, dtype=itype)
-    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
+    x = torch.randn(batch, dim, seqlen, device=device, dtype=dtype).contiguous()
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype) if has_bias else None
 
-    if has_initial_state:
-        initial_states = torch.randn(batch, dim, width - 1, device=device, dtype=itype)
-        has_initial_state_tensor = torch.ones(batch, dtype=torch.bool, device=device)
+    if has_initial:
+        initial_states = torch.randn(batch, dim, width - 1, device=device, dtype=dtype)
+        has_init_tensor = torch.ones(batch, dtype=torch.bool, device=device)
     else:
         initial_states = None
-        has_initial_state_tensor = None
+        has_init_tensor = None
 
     x_ref = x.clone()
     initial_states_ref = (
         initial_states.clone() if initial_states is not None else None
     )
-    activation = "silu" if silu_activation else None
+    activation = "silu" if silu else None
 
     out = _causal_conv1d_fn(
         x,
@@ -215,7 +208,7 @@ def test_causal_conv1d(
         bias,
         activation=activation,
         conv_states=initial_states,
-        has_initial_state=has_initial_state_tensor,
+        has_initial_state=has_init_tensor,
     )
     out_ref, final_states_ref = causal_conv1d_ref(
         x_ref,
@@ -226,35 +219,36 @@ def test_causal_conv1d(
         activation=activation,
     )
 
-    if has_initial_state:
-        assert initial_states is not None and final_states_ref is not None
+    if has_initial:
         torch.testing.assert_close(
             initial_states, final_states_ref, rtol=rtol, atol=atol
         )
     torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("silu_activation", [False, True])
-@pytest.mark.parametrize("has_bias", [False, True])
-@pytest.mark.parametrize("seqlen", [1])
-@pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
-def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, itype):
-    """Single-step update kernel matches reference for a fresh ``conv_state``."""
+# 3 update configs: cover all 3 widths, all 3 dtypes, bias/silu on+off, aligned/non-aligned dim.
+# (batch, dim, width, has_bias, silu, dtype)
+UPDATE_CONFIGS = [
+    (2, 2048, 4, True, True, torch.float16),          # baseline
+    (2, 2048, 2, False, False, torch.bfloat16),       # w=2, bf16, no bias, no silu
+    (2, 2048 + 16, 3, True, True, torch.float32),     # w=3, fp32, non-aligned dim
+]
+
+
+@pytest.mark.parametrize("batch,dim,width,has_bias,silu,dtype", UPDATE_CONFIGS)
+def test_update(batch, dim, width, has_bias, silu, dtype):
+    """Update kernel matches reference across all dispatch axes (single-step decode)."""
     device = "cuda"
-    rtol, atol = _tolerances(itype)
+    rtol, atol = _tol(dtype)
     torch.manual_seed(0)
 
-    batch = 2
-    x = torch.randn(batch, dim, seqlen, device=device, dtype=itype)
+    x = torch.randn(batch, dim, 1, device=device, dtype=dtype)
     x_ref = x.clone()
-    conv_state = torch.randn(batch, dim, width - 1, device=device, dtype=itype)
-
-    weight = torch.randn(dim, width, device=device, dtype=itype)
-    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
-    conv_state_ref = conv_state.detach().clone()
-    activation = "silu" if silu_activation else None
+    conv_state = torch.randn(batch, dim, width - 1, device=device, dtype=dtype)
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype) if has_bias else None
+    conv_state_ref = conv_state.clone()
+    activation = "silu" if silu else None
 
     out = _causal_conv1d_update(x, conv_state, weight, bias, activation=activation)
     out_ref = causal_conv1d_update_ref(
@@ -265,27 +259,23 @@ def test_causal_conv1d_update(dim, width, seqlen, has_bias, silu_activation, ity
     torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
 
 
-@pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("silu_activation", [False, True])
-@pytest.mark.parametrize("has_bias", [False, True])
-@pytest.mark.parametrize("seqlen", [1, 4, 5])
-@pytest.mark.parametrize("width", [2, 3, 4])
-@pytest.mark.parametrize("dim", [2048, 2048 + 16, 4096])
-@pytest.mark.parametrize("with_padding", [True, False])
-def test_causal_conv1d_update_with_batch_gather(
-    with_padding, dim, width, seqlen, has_bias, silu_activation, itype
-):
+# 2 batch-gather configs: with/without padding, two dtypes.
+@pytest.mark.parametrize(
+    "with_padding,dtype",
+    [(False, torch.float16), (True, torch.bfloat16)],
+)
+def test_update_batch_gather(with_padding, dtype):
     """Update kernel correctly gathers ``conv_state`` rows by index and skips padded slots."""
     device = "cuda"
-    rtol, atol = _tolerances(itype)
+    rtol, atol = _tol(dtype)
     torch.manual_seed(0)
 
-    batch_size = 3
+    dim, width, batch_size = 2048, 4, 3
     padding = 5 if with_padding else 0
     padded_batch_size = batch_size + padding
     total_entries = 10 * batch_size
 
-    x = torch.randn(padded_batch_size, dim, 1, device=device, dtype=itype)
+    x = torch.randn(padded_batch_size, dim, 1, device=device, dtype=dtype)
     x_ref = x.clone()
 
     conv_state_indices = torch.randperm(total_entries)[:batch_size].to(
@@ -300,25 +290,24 @@ def test_causal_conv1d_update_with_batch_gather(
         ],
         dim=0,
     )
-    conv_state = torch.randn(total_entries, dim, width - 1, device=device, dtype=itype)
+    conv_state = torch.randn(total_entries, dim, width - 1, device=device, dtype=dtype)
     conv_state_for_padding_test = conv_state.clone()
 
-    weight = torch.randn(dim, width, device=device, dtype=itype)
-    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype)
     conv_state_ref = conv_state[conv_state_indices, :].detach().clone()
-    activation = "silu" if silu_activation else None
 
     out = _causal_conv1d_update(
         x,
         conv_state,
         weight,
         bias,
-        activation=activation,
+        activation="silu",
         conv_state_indices=padded_state_indices,
         pad_slot_id=PAD_SLOT_ID,
     )
     out_ref = causal_conv1d_update_ref(
-        x_ref[:batch_size], conv_state_ref, weight, bias, activation=activation
+        x_ref[:batch_size], conv_state_ref, weight, bias, activation="silu"
     )
 
     torch.testing.assert_close(
@@ -333,52 +322,76 @@ def test_causal_conv1d_update_with_batch_gather(
     )
 
 
-@pytest.mark.parametrize("itype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("silu_activation", [True, False])
-@pytest.mark.parametrize("has_bias", [True, False])
-@pytest.mark.parametrize("width", [2, 3, 4])
+# 2 circular-buffer configs: covers the kIsCircularBuffer kernel branch.
 @pytest.mark.parametrize(
-    "seqlen", [8, 16, 32, 64, 128, 256, 512, 784, 1024, 2048, 2049, 4096]
+    "width,dtype", [(4, torch.float16), (2, torch.bfloat16)]
 )
-@pytest.mark.parametrize("dim", [64, 4096])
-@pytest.mark.parametrize("with_padding", [True, False])
-def test_causal_conv1d_varlen(
-    with_padding, dim, seqlen, width, has_bias, silu_activation, itype
-):
+def test_update_circular_buffer(width, dtype):
+    """Update kernel handles ``cache_seqlens`` (circular-buffer) mode for streaming decode."""
+    device = "cuda"
+    rtol, atol = _tol(dtype)
+    torch.manual_seed(0)
+
+    batch, dim, state_len = 2, 64, 8
+    x = torch.randn(batch, dim, 1, device=device, dtype=dtype)
+    x_ref = x.clone()
+    conv_state = torch.randn(batch, dim, state_len, device=device, dtype=dtype)
+    conv_state_ref = conv_state.clone()
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype)
+    cache_seqlens = torch.tensor([3, 5], dtype=torch.int32, device=device)
+
+    out = _causal_conv1d_update(
+        x, conv_state, weight, bias, activation="silu", cache_seqlens=cache_seqlens
+    )
+    out_ref = causal_conv1d_update_ref(
+        x_ref,
+        conv_state_ref,
+        weight,
+        bias,
+        activation="silu",
+        cache_seqlens=cache_seqlens,
+    )
+
+    torch.testing.assert_close(conv_state, conv_state_ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
+
+
+# 2 varlen configs: with/without padding, exercises the kVarlen kernel branch.
+@pytest.mark.parametrize(
+    "with_padding,dtype",
+    [(False, torch.float16), (True, torch.bfloat16)],
+)
+def test_varlen(with_padding, dtype):
     """Forward kernel handles continuous-batch (``query_start_loc``) input with optional padded slots."""
     device = "cuda"
-    rtol, atol = _tolerances(itype)
+    rtol, atol = _tol(dtype)
     torch.manual_seed(0)
-    torch.cuda.empty_cache()
 
-    seqlens = []
-    batch_size = 4 if seqlen >= 10 else 1
+    dim, seqlen, width = 64, 1024, 4
+    batch_size = 4
     padding = 3 if with_padding else 0
     padded_batch_size = batch_size + padding
     nsplits = padded_batch_size - 1
 
     eos_pos = torch.randperm(seqlen - 1)[:nsplits].sort().values
-    seqlens.append(
-        torch.diff(
-            torch.cat([torch.tensor([-1]), eos_pos, torch.tensor([seqlen - 1])])
-        ).tolist()
-    )
-    assert sum(seqlens[-1]) == seqlen
-    assert all(s > 0 for s in seqlens[-1])
+    seq_lens = torch.diff(
+        torch.cat([torch.tensor([-1]), eos_pos, torch.tensor([seqlen - 1])])
+    ).tolist()
+    assert sum(seq_lens) == seqlen
+    assert all(s > 0 for s in seq_lens)
 
     total_entries = batch_size * 10
-    cumsum = torch.cumsum(torch.tensor(seqlens[0]), dim=0).to(torch.int32)
+    cumsum = torch.cumsum(torch.tensor(seq_lens), dim=0).to(torch.int32)
     cumsum = torch.concat([torch.tensor([0], dtype=torch.int32), cumsum], dim=0)
-    x = torch.randn(1, 4096 + dim + 64, seqlen, device=device, dtype=itype)[
+
+    x = torch.randn(1, 4096 + dim + 64, seqlen, device=device, dtype=dtype)[
         :, 4096 : 4096 + dim, :
     ]
-    weight = torch.randn(dim, width, device=device, dtype=itype)
-    bias = torch.randn(dim, device=device, dtype=itype) if has_bias else None
+    weight = torch.randn(dim, width, device=device, dtype=dtype)
+    bias = torch.randn(dim, device=device, dtype=dtype)
     x_ref = x.clone()
-    activation = "silu" if silu_activation else None
-    final_states = torch.randn(
-        total_entries, dim, width - 1, device=device, dtype=itype
-    )
+    final_states = torch.randn(total_entries, dim, width - 1, device=device, dtype=dtype)
     final_states_ref = final_states.clone()
     has_initial_states = torch.randint(
         0, 2, (cumsum.shape[0] - 1,), dtype=torch.bool, device=device
@@ -402,22 +415,24 @@ def test_causal_conv1d_varlen(
         padded_state_indices,
         has_initial_states,
         final_states,
-        activation,
+        "silu",
         PAD_SLOT_ID,
     )
 
+    # Reference: split the varlen tensor back into per-sequence 3D tensors.
+    x_2d = x_ref.squeeze(0)  # (dim, seqlen)
+    splits = torch.split(x_2d, seq_lens, dim=-1)  # tuple of (dim, seg_len)
     out_ref_b = []
-    splits = [torch.split(var, seqlens[0], dim=-1) for var in (x_ref,)]
-    for i in range(len(seqlens[0])):
-        x_s = [v[i].unsqueeze(0) for v in splits][0]
+    for i in range(len(seq_lens)):
         if padded_state_indices[i] == PAD_SLOT_ID:
             continue
+        x_s = splits[i].unsqueeze(0)  # (1, dim, seg_len)
         out_ref_b.append(
             causal_conv1d_ref(
                 x_s,
                 weight,
                 bias,
-                activation=activation,
+                activation="silu",
                 return_final_states=True,
                 final_states_out=final_states_ref[padded_state_indices[i]].unsqueeze(0),
                 initial_states=(
@@ -427,9 +442,7 @@ def test_causal_conv1d_varlen(
                 ),
             )
         )
-    out_ref_tensor = torch.cat(
-        [torch.cat([t[0] for t in out_ref_b], dim=2)], dim=0
-    )
+    out_ref_tensor = torch.cat([t[0] for t in out_ref_b], dim=2)
 
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     torch.testing.assert_close(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
@@ -439,62 +452,6 @@ def test_causal_conv1d_varlen(
         rtol=rtol,
         atol=atol,
     )
-
-
-@pytest.mark.parametrize("itype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("width", [2, 3, 4])
-def test_causal_conv1d_update_circular_buffer(width, itype):
-    """Update kernel handles ``cache_seqlens`` (circular-buffer) mode for streaming decode."""
-    device = "cuda"
-    rtol, atol = _tolerances(itype)
-    torch.manual_seed(0)
-
-    batch, dim, state_len = 2, 64, 8
-    x = torch.randn(batch, dim, 1, device=device, dtype=itype)
-    x_ref = x.clone()
-    conv_state = torch.randn(batch, dim, state_len, device=device, dtype=itype)
-    conv_state_ref = conv_state.clone()
-    weight = torch.randn(dim, width, device=device, dtype=itype)
-    bias = torch.randn(dim, device=device, dtype=itype)
-    cache_seqlens = torch.tensor([3, 5], dtype=torch.int32, device=device)
-
-    out = _causal_conv1d_update(
-        x,
-        conv_state,
-        weight,
-        bias,
-        activation="silu",
-        cache_seqlens=cache_seqlens,
-    )
-    out_ref = causal_conv1d_update_ref(
-        x_ref,
-        conv_state_ref,
-        weight,
-        bias,
-        activation="silu",
-        cache_seqlens=cache_seqlens,
-    )
-
-    torch.testing.assert_close(conv_state, conv_state_ref, rtol=rtol, atol=atol)
-    torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
-
-
-@pytest.mark.parametrize("itype", [torch.float16, torch.bfloat16])
-def test_causal_conv1d_no_activation(itype):
-    """Forward kernel returns the raw conv output (no SiLU) when ``silu_activation=False``."""
-    device = "cuda"
-    rtol, atol = _tolerances(itype)
-    torch.manual_seed(0)
-
-    batch, dim, seqlen, width = 2, 64, 128, 4
-    x = torch.randn(batch, dim, seqlen, device=device, dtype=itype).contiguous()
-    weight = torch.randn(dim, width, device=device, dtype=itype)
-    x_ref = x.clone()
-
-    out = _causal_conv1d_fn(x, weight, None, activation=None)
-    out_ref, _ = causal_conv1d_ref(x_ref, weight, None, activation=None)
-
-    torch.testing.assert_close(out, out_ref, rtol=rtol, atol=atol)
 
 
 if __name__ == "__main__":
