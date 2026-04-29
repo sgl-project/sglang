@@ -1,9 +1,10 @@
-import copy
-
 import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native_variant
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    clone_scheduler_runtime,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ltx_2_denoising import (
     LTX2DenoisingStage,
@@ -217,6 +218,14 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         """Run the distilled refinement schedule on top of the shared AV denoiser."""
         batch.extra["ltx2_phase"] = "stage2"
+        pipeline = self.pipeline() if self.pipeline else None
+        ensure_phase_ready = (
+            getattr(pipeline, "ensure_ltx2_phase_ready", None)
+            if pipeline is not None
+            else None
+        )
+        if callable(ensure_phase_ready):
+            ensure_phase_ready("stage2")
         original_clean_latent_background = getattr(
             batch, "ltx2_ti2v_clean_latent_background", None
         )
@@ -234,13 +243,10 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         if self._should_reset_stage2_generators(server_args):
             self._reset_stage2_generators(batch)
         noise_scale = float(self.distilled_sigmas[0].item())
-        # HQ pipeline uses a dedicated, deterministic renoise generator seeded
-        # from the request seed and advanced by stage-1 packed shapes to match
-        # official LTX-2.3 HQ output. Legacy two-stage paths were baselined
-        # against `batch.generator`'s natural advance through stage-1, so keep
-        # them on the original `_randn_like_with_batch_generators` sampling.
-        is_hq_pipeline = server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
-        if is_hq_pipeline:
+        is_ltx23 = is_ltx23_native_variant(
+            server_args.pipeline_config.vae_config.arch_config
+        )
+        if is_ltx23:
             video_reference_for_gen = (
                 batch.latents if isinstance(batch.latents, torch.Tensor) else None
             )
@@ -253,13 +259,14 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             renoise_generator = None
         if is_native_ti2v:
             prepared_latents, denoise_mask, _ = self._prepare_ltx2_ti2v_clean_state(
+                batch=batch,
                 latents=batch.latents,
                 image_latent=batch.image_latent,
                 num_img_tokens=int(getattr(batch, "ltx2_num_image_tokens", 0)),
                 zero_clean_latent=True,
                 clean_latent_background=batch.ltx2_ti2v_clean_latent_background,
             )
-            if is_hq_pipeline:
+            if is_ltx23:
                 video_noise = self._ltx2_renoise_like(
                     prepared_latents, renoise_generator
                 )
@@ -271,7 +278,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                 denoise_mask.to(device=prepared_latents.device, dtype=torch.float32)
                 * noise_scale
             )
-            if is_hq_pipeline:
+            if is_ltx23:
                 batch.latents = (
                     video_noise.float() * scaled_mask
                     + prepared_latents.float() * (1.0 - scaled_mask)
@@ -281,7 +288,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                     video_noise * scaled_mask + prepared_latents * (1 - scaled_mask)
                 ).to(prepared_latents.dtype)
         else:
-            if is_hq_pipeline:
+            if is_ltx23:
                 video_noise = self._ltx2_renoise_like(batch.latents, renoise_generator)
                 batch.latents = (
                     video_noise.float() * noise_scale
@@ -296,7 +303,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                 ).to(batch.latents.dtype)
 
         if isinstance(batch.audio_latents, torch.Tensor):
-            if is_hq_pipeline:
+            if is_ltx23:
                 audio_noise = self._ltx2_renoise_like(
                     batch.audio_latents, renoise_generator
                 )
@@ -316,9 +323,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                     audio_noise * audio_scaled_mask
                     + batch.audio_latents * (1 - audio_scaled_mask)
                 ).to(batch.audio_latents.dtype)
-        if not is_ltx23_native_variant(
-            server_args.pipeline_config.vae_config.arch_config
-        ):
+        if not is_ltx23:
             batch.latents = batch.latents.to(
                 device=batch.latents.device, dtype=torch.float32
             )
@@ -327,21 +332,19 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
                     device=batch.audio_latents.device, dtype=torch.float32
                 )
 
-        original_scheduler = self.scheduler
+        original_batch_scheduler = batch.scheduler
         original_batch_timesteps = batch.timesteps
         original_batch_num_inference_steps = batch.num_inference_steps
 
-        self.scheduler = copy.deepcopy(original_scheduler)
-        distilled_device = self.scheduler.sigmas.device
-        num_steps = len(self.distilled_sigmas) - 1
-        # HQ pipeline extends the sigma schedule so the final step targets a
-        # small non-zero sigma (0.0011) instead of 0.0, matching official
-        # LTX-2.3 HQ's last-step behavior. Legacy two-stage baselines used the
-        # un-extended schedule (final step goes to 0.0).
-        if (
-            server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
-            and self.distilled_sigmas[-1].item() == 0.0
-        ):
+        scheduler = clone_scheduler_runtime(original_batch_scheduler or self.scheduler)
+        distilled_device = scheduler.sigmas.device
+        # Inject `0.0011` before the terminal `0.0` to avoid the
+        # `sigma_next==0` singularity in res2s' `(sample - denoised) /
+        # (sigma - sigma_next)`. Official `res2s_denoising_loop` does this
+        # exact injection (samplers.py:262); official `euler_denoising_loop`
+        # does NOT — it uses `sigma_next` directly. So gate on the active
+        # sampler, not on the model variant.
+        if self.sampler_name == "res2s" and self.distilled_sigmas[-1].item() == 0.0:
             scheduler_sigmas = torch.cat(
                 [
                     self.distilled_sigmas[:-1],
@@ -351,15 +354,18 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             )
         else:
             scheduler_sigmas = self.distilled_sigmas
-        self.scheduler.sigmas = scheduler_sigmas.to(distilled_device)
-        self.scheduler.num_inference_steps = num_steps
-        self.scheduler.timesteps = (self.distilled_sigmas[:num_steps] * 1000).to(
+
+        scheduler.sigmas = scheduler_sigmas
+        num_steps = len(self.distilled_sigmas) - 1
+        scheduler.num_inference_steps = num_steps
+        scheduler.timesteps = (self.distilled_sigmas[:num_steps] * 1000).to(
             distilled_device
         )
-        self.scheduler._step_index = None
-        self.scheduler._begin_index = None
+        scheduler._step_index = None
+        scheduler._begin_index = None
 
-        batch.timesteps = self.scheduler.timesteps
+        batch.scheduler = scheduler
+        batch.timesteps = scheduler.timesteps
         batch.num_inference_steps = num_steps
         original_do_cfg = batch.do_classifier_free_guidance
         batch.do_classifier_free_guidance = False
@@ -367,7 +373,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
         try:
             batch = super().forward(batch, server_args)
         finally:
-            self.scheduler = original_scheduler
+            batch.scheduler = original_batch_scheduler
             batch.timesteps = original_batch_timesteps
             batch.num_inference_steps = original_batch_num_inference_steps
             batch.do_classifier_free_guidance = original_do_cfg

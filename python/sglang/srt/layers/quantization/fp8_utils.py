@@ -18,6 +18,7 @@ if TYPE_CHECKING:
 from sglang.srt.layers.quantization.fp8_kernel import (
     fp8_dtype,
     fp8_max,
+    fp8_min,
     is_fp8_fnuz,
     mxfp8_block_scaled_matmul_triton,
     per_token_group_quant_fp8,
@@ -28,12 +29,14 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     ceil_align,
     ceil_div,
     get_bool_env_var,
     get_cuda_version,
     get_device_capability,
+    get_hip_version,
     is_blackwell_supported,
     is_cuda,
     is_flashinfer_available,
@@ -59,6 +62,8 @@ _is_musa = is_musa()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+# ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
+_use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
 
 
 def use_aiter_triton_gemm_w8a8_tuned_gfx950(n: int, k: int) -> bool:
@@ -761,7 +766,7 @@ def aiter_w8a8_block_fp8_linear(
 
     n, k = weight.shape
 
-    if _use_aiter_gfx95:
+    if _use_aiter_bpreshuffle_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
     else:
         use_triton = True
@@ -1464,12 +1469,32 @@ def apply_fp8_linear(
         num_token_padding = output_padding
         if cutlass_fp8_supported and weight_scale.numel() == weight.shape[1]:
             num_token_padding = None
-        qinput, x_scale = scaled_fp8_quant(
-            input_2d,
-            input_scale,
-            num_token_padding=num_token_padding,
-            use_per_token_if_dynamic=use_per_token_if_dynamic,
-        )
+        # For static per-tensor activation scales when using inductor compiler,
+        # use pure PyTorch ops instead of the opaque sgl_kernel quant kernel.
+        # Inductor fuses these with surrounding ops (RMSNorm, residual add),
+        # eliminating a separate kernel launch per linear layer.
+        # weight_scale shape does not matter here -- it is only used in the
+        # GEMM epilogue, not in the activation quant fusion. Only activates when
+        # piecewise_cuda_graph_compiler=inductor; eager PCG and decode both
+        # use the faster custom kernel.
+        if (
+            input_scale is not None
+            and input_scale.numel() == 1
+            and get_global_server_args().piecewise_cuda_graph_compiler == "inductor"
+        ):
+            qinput = (
+                (input_2d * input_scale.reciprocal())
+                .clamp(min=fp8_min, max=fp8_max)
+                .to(fp8_dtype)
+            )
+            x_scale = input_scale
+        else:
+            qinput, x_scale = scaled_fp8_quant(
+                input_2d,
+                input_scale,
+                num_token_padding=num_token_padding,
+                use_per_token_if_dynamic=use_per_token_if_dynamic,
+            )
     else:
         # cutlass w8a8 fp8 sgl-kernel only supports per-token scale
         if input_scale is not None:

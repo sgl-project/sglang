@@ -482,6 +482,31 @@ class MistralDetector(BaseReasoningFormatDetector):
         )
 
 
+class HunyuanDetector(BaseReasoningFormatDetector):
+    """
+    Detector for Hunyuan models (e.g., tencent/Hunyuan-A13B-Instruct).
+
+    Like Glm45Detector but uses ``<tool_calls>`` (plural) as the tool start token.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+    ):
+        super().__init__(
+            "<think>",
+            "</think>",
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<tool_calls>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+        )
+
+
 class Gemma4Detector(BaseReasoningFormatDetector):
     """Gemma4 reasoning detector."""
 
@@ -518,6 +543,7 @@ class ReasoningParser:
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": Qwen3Detector,
         "glm45": Glm45Detector,
+        "hunyuan": HunyuanDetector,
         "gpt-oss": GptOssDetector,
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,

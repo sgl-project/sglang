@@ -157,11 +157,20 @@ class LTX2SigmaPreparationStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         batch.extra["ltx2_phase"] = "stage1"
         if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
-            # Resolution-aware sigma shift is only required for the HQ pipeline
-            # (which targets 1080p+ resolutions and was aligned against official
-            # LTX-2.3 HQ sigmas). Legacy one-stage and two-stage LTX-2.3 paths
-            # were baselined against the constant-anchor schedule.
+            # Gate on pipeline class to mirror the three official entry points:
+            # - HQ (`ti2vid_two_stages_hq.py:164`) calls
+            #   `LTX2Scheduler.execute(latent=empty_latent, ...)` where
+            #   `empty_latent` is built from the **half-resolution** stage-1
+            #   shape → resolution-aware sigma shift.
+            # - Non-HQ two-stage (`ti2vid_two_stages.py:145`) and
+            #   one-stage (`ti2vid_one_stage.py:138`) call
+            #   `LTX2Scheduler.execute(steps=...)` with no `latent` →
+            #   falls back to `default_number_of_tokens = MAX_SHIFT_ANCHOR
+            #   = 4096` → constant-anchor sigma shift.
             if server_args.pipeline_class_name == "LTX2TwoStageHQPipeline":
+                # batch.height/width have already been halved by
+                # LTX2HalveResolutionStage, so these latents are the
+                # half-resolution stage-1 shape (matches `empty_latent`).
                 latent_num_frames = (int(batch.num_frames) - 1) // int(
                     server_args.pipeline_config.vae_temporal_compression
                 ) + 1
@@ -485,18 +494,24 @@ class LTX2TwoStageDeviceManager:
         if "stage2" in self._phase_ready_events:
             return
         if self._snapshot_low_vram_mode:
-            stage1_module = self.pipeline.get_module("transformer")
-            stage1_param = (
-                next(stage1_module.parameters(), None)
-                if stage1_module is not None
-                else None
-            )
-            if stage1_param is not None and stage1_param.device.type == "cuda":
-                self._release_module_to_cpu_snapshot("transformer")
+            self._release_stage1_for_low_vram()
 
         self._schedule_phase_prefetch(
             "stage2", self.pipeline.get_module("transformer_2")
         )
+
+    def prepare_upsample_after_stage1(self) -> bool:
+        if (
+            not self.should_use_premerged
+            or self.mode != "snapshot"
+            or not self.server_args.dit_cpu_offload
+            or not self._snapshot_low_vram_mode
+        ):
+            return False
+        if "stage2" in self._phase_ready_events:
+            return False
+        self._release_stage1_for_low_vram()
+        return True
 
     def ensure_phase_ready(self, phase: str | None) -> None:
         if not self.should_use_premerged or phase not in ("stage1", "stage2"):
@@ -606,6 +621,16 @@ class LTX2TwoStageDeviceManager:
 
         phase = "stage2" if module_name == "transformer_2" else "stage1"
         self._phase_ready_events.pop(phase, None)
+
+    def _release_stage1_for_low_vram(self) -> None:
+        stage1_module = self.pipeline.get_module("transformer")
+        stage1_param = (
+            next(stage1_module.parameters(), None)
+            if stage1_module is not None
+            else None
+        )
+        if stage1_param is not None and stage1_param.device.type == "cuda":
+            self._release_module_to_cpu_snapshot("transformer")
 
     def _ensure_on_gpu(self, module_name: str) -> None:
         module = self.pipeline.get_module(module_name)
@@ -797,6 +822,9 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
 
     def prefetch_ltx2_stage2_after_stage1(self) -> None:
         self._device_manager.prefetch_stage2_after_stage1()
+
+    def prepare_ltx2_upsample_after_stage1(self) -> bool:
+        return self._device_manager.prepare_upsample_after_stage1()
 
     def should_skip_ltx2_lora_switch_stage(self) -> bool:
         return self._use_premerged_stage2_transformer and self._device_manager.mode in (

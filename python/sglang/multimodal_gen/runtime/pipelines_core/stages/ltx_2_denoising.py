@@ -1,4 +1,3 @@
-import copy
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 
@@ -10,6 +9,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
 )
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    clone_scheduler_runtime,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingContext,
@@ -516,24 +518,111 @@ class LTX2DenoisingStage(DenoisingStage):
         return next_video, next_audio
 
     @staticmethod
-    def _prepare_ltx2_ti2v_clean_state(
+    def _normalize_ltx2_condition_latents(
+        image_latent: torch.Tensor | list[torch.Tensor] | None,
+    ) -> list[torch.Tensor]:
+        if image_latent is None:
+            return []
+        return image_latent if isinstance(image_latent, list) else [image_latent]
+
+    @classmethod
+    def _get_ltx2_condition_spans(
+        cls,
+        batch: Req,
         latents: torch.Tensor,
-        image_latent: torch.Tensor,
+        image_latent: torch.Tensor | list[torch.Tensor] | None,
+        num_img_tokens: int,
+    ) -> list[tuple[int, torch.Tensor]]:
+        if num_img_tokens <= 0:
+            return []
+        if not (isinstance(latents, torch.Tensor) and latents.ndim == 3):
+            raise ValueError("LTX-2 TI2V expects packed token latents [B, S, D].")
+
+        condition_latents = cls._normalize_ltx2_condition_latents(image_latent)
+        if not condition_latents:
+            return []
+        if len(condition_latents) > 2:
+            raise ValueError(
+                "LTX-2 TI2V currently supports at most two conditioning images."
+            )
+
+        for cond in condition_latents:
+            if not (isinstance(cond, torch.Tensor) and cond.ndim == 3):
+                raise ValueError(
+                    "Expected LTX-2 conditioning latents to be packed tensors [B, S, D]."
+                )
+            if int(cond.shape[1]) < int(num_img_tokens):
+                raise ValueError(
+                    "LTX-2 conditioning latent is shorter than one frame token span."
+                )
+
+        did_sp_shard = bool(getattr(batch, "did_sp_shard_latents", False))
+        if not did_sp_shard:
+            if int(latents.shape[1]) < int(num_img_tokens):
+                raise ValueError(
+                    "LTX-2 latent sequence is shorter than one conditioning frame."
+                )
+            if len(condition_latents) == 1:
+                return [(0, condition_latents[0])]
+            return [
+                (0, condition_latents[0]),
+                (int(latents.shape[1]) - int(num_img_tokens), condition_latents[1]),
+            ]
+
+        tokens_per_frame = int(getattr(batch, "sp_video_tokens_per_frame", 0))
+        if tokens_per_frame <= 0:
+            raise ValueError(
+                "SP-sharded LTX-2 TI2V requires batch.sp_video_tokens_per_frame."
+            )
+        if int(num_img_tokens) != int(tokens_per_frame):
+            raise ValueError(
+                "LTX-2 conditioning token count must match one latent frame when using SP."
+            )
+
+        raw_shape = getattr(batch, "raw_latent_shape", None)
+        if raw_shape is None:
+            raise ValueError("SP-sharded LTX-2 TI2V requires batch.raw_latent_shape.")
+        global_seq_len = int(raw_shape[1])
+        if global_seq_len % tokens_per_frame != 0:
+            raise ValueError(
+                "SP-sharded LTX-2 TI2V expected raw seq_len divisible by tokens_per_frame."
+            )
+
+        global_num_frames = global_seq_len // tokens_per_frame
+        local_start_frame = int(getattr(batch, "sp_video_start_frame", 0))
+        local_num_frames = int(getattr(batch, "sp_video_latent_num_frames", 0))
+        local_end_frame = local_start_frame + local_num_frames
+
+        spans: list[tuple[int, torch.Tensor]] = []
+        if local_start_frame == 0:
+            spans.append((0, condition_latents[0]))
+
+        if len(condition_latents) == 2:
+            last_global_frame = global_num_frames - 1
+            if local_start_frame <= last_global_frame < local_end_frame:
+                local_last_frame = last_global_frame - local_start_frame
+                spans.append(
+                    (local_last_frame * tokens_per_frame, condition_latents[1])
+                )
+
+        return spans
+
+    @classmethod
+    def _prepare_ltx2_ti2v_clean_state(
+        cls,
+        batch: Req,
+        latents: torch.Tensor,
+        image_latent: torch.Tensor | list[torch.Tensor] | None,
         num_img_tokens: int,
         zero_clean_latent: bool,
         clean_latent_background: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         latents = latents.clone()
-        conditioned = image_latent[:, :num_img_tokens, :].to(
-            device=latents.device, dtype=latents.dtype
-        )
-        latents[:, :num_img_tokens, :] = conditioned
         denoise_mask = torch.ones(
             (latents.shape[0], latents.shape[1], 1),
             device=latents.device,
             dtype=torch.float32,
         )
-        denoise_mask[:, :num_img_tokens, :] = 0.0
         if clean_latent_background is not None:
             clean_latent = (
                 clean_latent_background.detach()
@@ -544,7 +633,24 @@ class LTX2DenoisingStage(DenoisingStage):
             clean_latent = torch.zeros_like(latents)
         else:
             clean_latent = latents.detach().clone()
-        clean_latent[:, :num_img_tokens, :] = conditioned
+
+        spans = cls._get_ltx2_condition_spans(
+            batch=batch,
+            latents=latents,
+            image_latent=image_latent,
+            num_img_tokens=num_img_tokens,
+        )
+        for start, cond in spans:
+            stop = int(start) + int(num_img_tokens)
+            conditioned = cls._repeat_batch_dim(
+                cond[:, :num_img_tokens, :].to(
+                    device=latents.device, dtype=latents.dtype
+                ),
+                int(latents.shape[0]),
+            )
+            latents[:, start:stop, :] = conditioned
+            denoise_mask[:, start:stop, :] = 0.0
+            clean_latent[:, start:stop, :] = conditioned
         return latents, denoise_mask, clean_latent
 
     @staticmethod
@@ -916,23 +1022,6 @@ class LTX2DenoisingStage(DenoisingStage):
         batch.image_latent = saved
 
     @staticmethod
-    def _should_apply_ltx2_ti2v(batch: Req) -> bool:
-        """True if we have an image-latent token prefix to condition with.
-
-        SP note: when token latents are time-sharded, only the rank that owns the
-        *global* first latent frame should apply TI2V conditioning (rank with start_frame==0).
-        """
-        if (
-            batch.image_latent is None
-            or int(getattr(batch, "ltx2_num_image_tokens", 0)) <= 0
-        ):
-            return False
-        did_sp_shard = bool(getattr(batch, "did_sp_shard_latents", False))
-        if not did_sp_shard:
-            return True
-        return int(getattr(batch, "sp_video_start_frame", 0)) == 0
-
-    @staticmethod
     def _should_use_native_hq_res2s_sde_noise(server_args: ServerArgs) -> bool:
         return server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
 
@@ -996,9 +1085,7 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         ctx.audio_latents = batch.audio_latents
         # Video and audio keep separate scheduler state throughout the denoising loop.
-        ctx.audio_scheduler = copy.deepcopy(self.scheduler)
-
-        do_ti2v = self._should_apply_ltx2_ti2v(batch)
+        ctx.audio_scheduler = clone_scheduler_runtime(ctx.scheduler)
 
         if ctx.use_ltx23_legacy_one_stage:
             batch.ltx23_audio_replicated_for_sp = False
@@ -1038,6 +1125,13 @@ class LTX2DenoisingStage(DenoisingStage):
             batch.width
             // server_args.pipeline_config.vae_config.arch_config.spatial_compression_ratio
         )
+        ti2v_spans = self._get_ltx2_condition_spans(
+            batch=batch,
+            latents=ctx.latents,
+            image_latent=batch.image_latent,
+            num_img_tokens=int(getattr(batch, "ltx2_num_image_tokens", 0)),
+        )
+        do_ti2v = bool(ti2v_spans)
         if do_ti2v:
             if not (isinstance(ctx.latents, torch.Tensor) and ctx.latents.ndim == 3):
                 raise ValueError("LTX-2 TI2V expects packed token latents [B, S, D].")
@@ -1052,6 +1146,7 @@ class LTX2DenoisingStage(DenoisingStage):
             # Keep conditioned tokens clean and reuse the mask during every step update.
             ctx.latents, ctx.denoise_mask, ctx.clean_latent = (
                 self._prepare_ltx2_ti2v_clean_state(
+                    batch=batch,
                     latents=ctx.latents,
                     image_latent=batch.image_latent,
                     num_img_tokens=int(getattr(batch, "ltx2_num_image_tokens", 0)),
@@ -1116,7 +1211,7 @@ class LTX2DenoisingStage(DenoisingStage):
             raise ValueError("LTX-2 audio scheduler was not prepared.")
 
         # 1. Read the scheduler sigma pair and derive the Euler delta.
-        sigmas = getattr(self.scheduler, "sigmas", None)
+        sigmas = getattr(ctx.scheduler, "sigmas", None)
         if sigmas is None or not isinstance(sigmas, torch.Tensor):
             raise ValueError("Expected scheduler.sigmas to be a tensor for LTX-2.")
         sigma = sigmas[step.step_index].to(
@@ -1298,7 +1393,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     midpoint_model_call=_stage2_midpoint_model_call,
                 )
             else:
-                ctx.latents = self.scheduler.step(
+                ctx.latents = ctx.scheduler.step(
                     model_video, step.t_device, ctx.latents, return_dict=False
                 )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(

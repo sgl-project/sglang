@@ -46,7 +46,7 @@ on:
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
-  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == 'true' }}
 
 jobs:
@@ -80,7 +80,7 @@ jobs:
       - name: Compute partitions
         id: compute
         run: |
-          python scripts/ci/utils/diffusion/compute_diffusion_partitions.py --min-time 1200 --target-time 1800 --max-time 2400 --max-partitions 10
+          python scripts/ci/utils/diffusion/compute_diffusion_partitions.py --min-time 1200 --target-time 1800 --max-time 2400 --max-partitions 10 --parametrized-only
 
   multimodal-gen-test-1-gpu:
     needs: compute-diffusion-partitions

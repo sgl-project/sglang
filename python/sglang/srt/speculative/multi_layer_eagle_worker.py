@@ -264,7 +264,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=next_token_ids,
-                num_accepted_tokens=0,
+                num_accepted_drafts=0,
                 can_run_cuda_graph=can_run_cuda_graph,
             )
         else:
@@ -291,7 +291,7 @@ class MultiLayerEagleWorker(TpModelWorker):
             return GenerationBatchResult(
                 logits_output=logits_output,
                 next_token_ids=verify_output.verified_id,
-                num_accepted_tokens=sum(verify_output.accept_length_per_req_cpu),
+                num_accepted_drafts=sum(verify_output.accept_length_per_req_cpu),
                 can_run_cuda_graph=can_run_cuda_graph,
             )
 

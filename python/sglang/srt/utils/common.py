@@ -365,7 +365,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx", "ascend"]
+    return backend not in ["torch_native", "intel_amx"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -2838,6 +2838,7 @@ def is_fa3_default_architecture(hf_config):
         "GlmOcrForConditionalGeneration",
         "Step3VLForConditionalGeneration",
         "StepVLForConditionalGeneration",
+        "MiMoV2ForCausalLM",
         "MiMoV2FlashForCausalLM",
     }
     return architectures[0] in default_archs
@@ -2862,8 +2863,30 @@ def log_info_on_rank0(logger, msg):
     try:
         if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
             logger.info(msg)
-    except:
-        logger.info(msg)
+    except Exception as e:
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == 0:
+                logger.info(f"{msg} (rank-check failed: {e})")
+        else:
+            logger.info(f"{msg} (rank-check failed: {e})")
+
+
+def log_debug_on_rank0(logger, msg):
+    """
+    Log a debug message only on tensor model parallel rank 0.
+    Falls back to logging if distributed is not initialized or error occurs.
+    """
+    from sglang.srt.distributed import get_tensor_model_parallel_rank
+
+    try:
+        if torch.distributed.is_initialized() and get_tensor_model_parallel_rank() == 0:
+            logger.debug(msg)
+    except Exception as e:
+        if torch.distributed.is_initialized():
+            if torch.distributed.get_rank() == 0:
+                logger.debug(f"{msg} (rank-check failed: {e})")
+        else:
+            logger.debug(f"{msg} (rank-check failed: {e})")
 
 
 def load_json_config(data: str):
@@ -3440,6 +3463,12 @@ def is_gfx95_supported():
         return any(gfx in gcn_arch for gfx in ["gfx95"])
     else:
         return False
+
+
+def get_hip_version():
+    if torch.version.hip:
+        return tuple(map(int, torch.version.hip.split("-")[0].split(".")))
+    return (0, 0, 0)
 
 
 # LoRA-related constants and utilities
