@@ -43,7 +43,6 @@ DSV4_FLASH_ENV = {
     # plain server) overflows once cuda-graph-max-bs * num_draft_tokens
     # > 256. 1024 covers bs=128 * 4 draft tokens with headroom.
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
-    "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
 }
 
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
