@@ -87,6 +87,12 @@ LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "LLM-Research/Llama-3.2-1B-Instruct"
 )
 LLAMA_3_2_1B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "LLM-Research/Llama-3.2-1B")
+LLAMA_3_8B_EAGLE_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "lmsys/sglang-EAGLE-LLaMA3-Instruct-8B"
+)
+LLAMA_3_8B_INSTRUCT_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "LLM-Research/Meta-Llama-3-8B-Instruct"
+)
 LLAMA_4_SCOUT_17B_16E_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "meta-llama/Llama-4-Scout-17B-16E-Instruct"
 )
@@ -213,7 +219,12 @@ QWEN3_30B_A3B_W8A8_WEIGHTS_PATH = os.path.join(
 DEEPSEEK_R1_DISTILL_QWEN_7B_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
 )
-
+DEEPSEEK_R1_0528_W4A8_PER_CHANNEL_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "DeepSeek-R1-0528-w4a8-per-channel"
+)
+DEEPSEEK_R1_0528_W8A8_WEIGHTS_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "vllm-ascend/DeepSeek-R1-0528-W8A8"
+)
 QWEN3_30B_MODELSLIM_INT4_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Eco-Tech/Qwen3-30B-A3B-w4a4-LAOS"
 )
@@ -262,7 +273,7 @@ SKYWORK_REWARD_LLAMA_3_1_8B_V0_2_WEIGHTS_PATH = os.path.join(
 
 # Other
 DEEPSEEK_CODER_JSON_PATH = "/__w/sglang/sglang/test/registered/ascend/basic_function/parameter/deepseek_coder.json"
-
+FR_SPEC_TOKEN_MAP_PATH = "/root/.cache/sglang/FR-Spec/freq_32768.pt"
 
 class ModelTestConfig(NamedTuple):
     """
