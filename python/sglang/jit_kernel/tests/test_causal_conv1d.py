@@ -169,13 +169,40 @@ def _tol(dtype: torch.dtype):
 # long seqlen, batch=2 + non-aligned, seqlen < width edge case.
 # (batch, dim, seqlen, width, has_bias, has_initial, silu, dtype)
 FWD_CONFIGS = [
-    (1, 64, 128, 4, True, False, True, torch.float16),       # baseline (w=4, fp16)
-    (2, 64, 1024, 3, True, True, True, torch.bfloat16),      # w=3, bf16, initial_state path
-    (1, 64, 1025, 2, False, False, False, torch.float32),    # w=2, fp32, non-aligned, no bias, no silu
-    (1, 64, 4096, 4, True, False, True, torch.bfloat16),     # long seqlen, bf16
-    (1, 4096, 128, 4, True, False, True, torch.float16),     # large dim
-    (2, 64, 1025, 4, True, False, True, torch.float16),      # batch=2 + non-aligned (kIsVecLoad=false)
-    (1, 64, 2, 4, True, True, True, torch.float16),          # seqlen < width-1 (state pad edge case)
+    (1, 64, 128, 4, True, False, True, torch.float16),  # baseline (w=4, fp16)
+    (2, 64, 1024, 3, True, True, True, torch.bfloat16),  # w=3, bf16, initial_state path
+    (
+        1,
+        64,
+        1025,
+        2,
+        False,
+        False,
+        False,
+        torch.float32,
+    ),  # w=2, fp32, non-aligned, no bias, no silu
+    (1, 64, 4096, 4, True, False, True, torch.bfloat16),  # long seqlen, bf16
+    (1, 4096, 128, 4, True, False, True, torch.float16),  # large dim
+    (
+        2,
+        64,
+        1025,
+        4,
+        True,
+        False,
+        True,
+        torch.float16,
+    ),  # batch=2 + non-aligned (kIsVecLoad=false)
+    (
+        1,
+        64,
+        2,
+        4,
+        True,
+        True,
+        True,
+        torch.float16,
+    ),  # seqlen < width-1 (state pad edge case)
 ]
 
 
@@ -200,9 +227,7 @@ def test_fwd(batch, dim, seqlen, width, has_bias, has_initial, silu, dtype):
         has_init_tensor = None
 
     x_ref = x.clone()
-    initial_states_ref = (
-        initial_states.clone() if initial_states is not None else None
-    )
+    initial_states_ref = initial_states.clone() if initial_states is not None else None
     activation = "silu" if silu else None
 
     out = _causal_conv1d_fn(
@@ -232,9 +257,9 @@ def test_fwd(batch, dim, seqlen, width, has_bias, has_initial, silu, dtype):
 # 3 update configs: cover all 3 widths, all 3 dtypes, bias/silu on+off, aligned/non-aligned dim.
 # (batch, dim, width, has_bias, silu, dtype)
 UPDATE_CONFIGS = [
-    (2, 2048, 4, True, True, torch.float16),          # baseline
-    (2, 2048, 2, False, False, torch.bfloat16),       # w=2, bf16, no bias, no silu
-    (2, 2048 + 16, 3, True, True, torch.float32),     # w=3, fp32, non-aligned dim
+    (2, 2048, 4, True, True, torch.float16),  # baseline
+    (2, 2048, 2, False, False, torch.bfloat16),  # w=2, bf16, no bias, no silu
+    (2, 2048 + 16, 3, True, True, torch.float32),  # w=3, fp32, non-aligned dim
 ]
 
 
@@ -326,9 +351,7 @@ def test_update_batch_gather(with_padding, dtype):
 
 
 # 2 circular-buffer configs: covers the kIsCircularBuffer kernel branch.
-@pytest.mark.parametrize(
-    "width,dtype", [(4, torch.float16), (2, torch.bfloat16)]
-)
+@pytest.mark.parametrize("width,dtype", [(4, torch.float16), (2, torch.bfloat16)])
 def test_update_circular_buffer(width, dtype):
     """Update kernel handles ``cache_seqlens`` (circular-buffer) mode for streaming decode."""
     device = "cuda"
@@ -394,7 +417,9 @@ def test_varlen(with_padding, dtype):
     weight = torch.randn(dim, width, device=device, dtype=dtype)
     bias = torch.randn(dim, device=device, dtype=dtype)
     x_ref = x.clone()
-    final_states = torch.randn(total_entries, dim, width - 1, device=device, dtype=dtype)
+    final_states = torch.randn(
+        total_entries, dim, width - 1, device=device, dtype=dtype
+    )
     final_states_ref = final_states.clone()
     has_initial_states = torch.randint(
         0, 2, (cumsum.shape[0] - 1,), dtype=torch.bool, device=device

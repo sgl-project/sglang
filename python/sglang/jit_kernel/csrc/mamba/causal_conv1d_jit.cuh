@@ -8,9 +8,10 @@
 
 #pragma once
 
-#include <sgl_kernel/tensor.h>
-#include <sgl_kernel/utils.h>
-#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
+#include <sgl_kernel/utils.h>   // For RuntimeCheck
+
+#include <sgl_kernel/utils.cuh>  // For LaunchKernel, RuntimeDeviceCheck
 
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/optional.h>
@@ -29,7 +30,7 @@ namespace {
 // ---------------------------------------------------------------------------
 
 template <int kNThreads_, int kWidth_, bool kIsVecLoad_, typename input_t_, typename weight_t_>
-struct Causal_conv1d_fwd_kernel_traits {
+struct CausalConv1dFwdKernelTraits {
   using input_t = input_t_;
   using weight_t = weight_t_;
   static constexpr int kNThreads = kNThreads_;
@@ -39,7 +40,7 @@ struct Causal_conv1d_fwd_kernel_traits {
   static constexpr int kNElts = kNBytes == 4 ? 4 : 8;
   static_assert(kWidth <= kNElts);
   static constexpr bool kIsVecLoad = kIsVecLoad_;
-  using vec_t = typename ConvBytesToType<kNBytes * kNElts>::Type;
+  using vec_t = typename BytesToType<kNBytes * kNElts>::Type;
   using BlockLoadT = cub::BlockLoad<input_t, kNThreads, kNElts, cub::BLOCK_LOAD_WARP_TRANSPOSE>;
   using BlockLoadVecT = cub::BlockLoad<vec_t, kNThreads, 1, cub::BLOCK_LOAD_DIRECT>;
   using BlockStoreT = cub::BlockStore<input_t, kNThreads, kNElts, cub::BLOCK_STORE_WARP_TRANSPOSE>;
@@ -241,7 +242,7 @@ inline void causal_conv1d_fwd_launch(ConvParamsBase& params, cudaStream_t stream
   static constexpr int kNElts = sizeof(input_t) == 4 ? 4 : 8;
   const bool kVarlen = params.query_start_loc_ptr != nullptr;
   CONV_BOOL_SWITCH(params.seqlen % kNElts == 0 && !kVarlen, kIsVecLoad, [&] {
-    using Ktraits = Causal_conv1d_fwd_kernel_traits<kNThreads, kWidth, kIsVecLoad, input_t, weight_t>;
+    using Ktraits = CausalConv1dFwdKernelTraits<kNThreads, kWidth, kIsVecLoad, input_t, weight_t>;
     constexpr int kSmemSize = Ktraits::kSmemSize;
     dim3 grid(params.batch, params.dim);
 
@@ -256,7 +257,7 @@ inline void causal_conv1d_fwd_launch(ConvParamsBase& params, cudaStream_t stream
           ::cudaFuncSetAttribute((void*)kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
 #endif
     }
-    kernel<<<grid, Ktraits::kNThreads, kSmemSize, stream>>>(params);
+    host::LaunchKernel(grid, dim3(Ktraits::kNThreads), stream, kSmemSize)(kernel, params);
     host::RuntimeDeviceCheck();
   });
 }
@@ -278,7 +279,7 @@ inline void causal_conv1d_fwd_cuda(ConvParamsBase& params, cudaStream_t stream) 
 // ---------------------------------------------------------------------------
 
 template <int kNThreads_, int kWidth_, typename input_t_, typename weight_t_>
-struct Causal_conv1d_update_kernel_traits {
+struct CausalConv1dUpdateKernelTraits {
   using input_t = input_t_;
   using weight_t = weight_t_;
   static constexpr int kNThreads = kNThreads_;
@@ -382,12 +383,12 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void causal_conv1d_update_kerne
 
 template <int kNThreads, int kWidth, typename input_t, typename weight_t>
 inline void causal_conv1d_update_launch(ConvParamsBase& params, cudaStream_t stream) {
-  using Ktraits = Causal_conv1d_update_kernel_traits<kNThreads, kWidth, input_t, weight_t>;
+  using Ktraits = CausalConv1dUpdateKernelTraits<kNThreads, kWidth, input_t, weight_t>;
   dim3 grid(params.batch, (params.dim + kNThreads - 1) / kNThreads);
   auto kernel = params.cache_seqlens == nullptr
       ? &causal_conv1d_update_kernel<Ktraits, false>
       : &causal_conv1d_update_kernel<Ktraits, true>;
-  kernel<<<grid, Ktraits::kNThreads, 0, stream>>>(params);
+  host::LaunchKernel(grid, dim3(Ktraits::kNThreads), stream)(kernel, params);
   host::RuntimeDeviceCheck();
 }
 

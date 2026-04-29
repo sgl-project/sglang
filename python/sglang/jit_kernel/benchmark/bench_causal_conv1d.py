@@ -53,7 +53,9 @@ def _make_fwd_inputs(batch, dim, seqlen, dtype):
     splits it into ``batch`` equal-length sequences.
     """
     total_tokens = batch * seqlen
-    x_varlen = torch.randn(dim, total_tokens, device=DEFAULT_DEVICE, dtype=dtype).contiguous()
+    x_varlen = torch.randn(
+        dim, total_tokens, device=DEFAULT_DEVICE, dtype=dtype
+    ).contiguous()
     weight = torch.randn(dim, WIDTH, device=DEFAULT_DEVICE, dtype=dtype)
     bias = torch.randn(dim, device=DEFAULT_DEVICE, dtype=dtype)
     conv_states = torch.zeros(batch, dim, WIDTH - 1, device=DEFAULT_DEVICE, dtype=dtype)
@@ -98,9 +100,7 @@ def benchmark_fwd(batch_size, dim, seqlen, provider):
         def fn():
             xx = x.clone()
             cs = conv_states.clone()
-            causal_conv1d_fwd(
-                xx, weight, bias, cs, qsl, None, None, True, PAD_SLOT_ID
-            )
+            causal_conv1d_fwd(xx, weight, bias, cs, qsl, None, None, True, PAD_SLOT_ID)
 
     elif provider == "triton":
 
@@ -149,9 +149,7 @@ def benchmark_update(batch_size, dim, provider):
         def fn():
             xx = x.clone()
             cs = conv_state.clone()
-            causal_conv1d_update(
-                xx, cs, weight, bias, True, None, None, PAD_SLOT_ID
-            )
+            causal_conv1d_update(xx, cs, weight, bias, True, None, None, PAD_SLOT_ID)
 
     elif provider == "triton":
 

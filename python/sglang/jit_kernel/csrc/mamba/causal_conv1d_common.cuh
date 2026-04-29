@@ -79,29 +79,29 @@ constexpr inline size_t conv_custom_max(std::initializer_list<size_t> ilist) {
 }
 
 // Map a byte count to a corresponding integer-vector type for vectorized loads/stores.
-template <int BYTES>
-struct ConvBytesToType {};
+template <int kBytes>
+struct BytesToType {};
 
 template <>
-struct ConvBytesToType<16> {
+struct BytesToType<16> {
   using Type = uint4;
   static_assert(sizeof(Type) == 16);
 };
 
 template <>
-struct ConvBytesToType<8> {
+struct BytesToType<8> {
   using Type = uint64_t;
   static_assert(sizeof(Type) == 8);
 };
 
 template <>
-struct ConvBytesToType<4> {
+struct BytesToType<4> {
   using Type = uint32_t;
   static_assert(sizeof(Type) == 4);
 };
 
 template <>
-struct ConvBytesToType<2> {
+struct BytesToType<2> {
   using Type = uint16_t;
   static_assert(sizeof(Type) == 2);
 };
