@@ -241,12 +241,51 @@ class DecodePreallocQueue:
         self.prefill_pp_size = prefill_pp_size
         self.kv_manager = self._init_kv_manager()
 
-        if self.scheduler.tp_worker.is_hybrid_swa:
-            # FIXME: current SWA allocation allocate full kv cache size in prefill
+        if self.scheduler.tp_worker.is_hybrid_swa and not self._uses_swa_tail_prealloc():
+            # Fallback for SWA allocators that still allocate the SWA pool at
+            # full prompt length.
             self.max_total_num_tokens = min(
                 self.max_total_num_tokens,
                 self.scheduler.tp_worker.model_runner.swa_max_total_num_tokens,
             )
+
+    def _uses_swa_tail_prealloc(self) -> bool:
+        return isinstance(
+            self.token_to_kv_pool, (SWAKVPool, DeepSeekV4TokenToKVPool)
+        ) and self.token_to_kv_pool_allocator.page_size > 1 and hasattr(
+            self.token_to_kv_pool_allocator, "alloc_extend_swa_tail"
+        )
+
+    def _swa_tail_len(self, seq_len: int) -> int:
+        if not self._uses_swa_tail_prealloc() or seq_len <= 0:
+            return max(seq_len, 0)
+
+        window_size = self.scheduler.sliding_window_size
+        if window_size is None or window_size <= 0:
+            return seq_len
+
+        page_size = self.token_to_kv_pool_allocator.page_size
+        window_start = max(0, seq_len - window_size)
+        window_start = (window_start // page_size) * page_size
+        return seq_len - window_start
+
+    def _swa_retractable_len(self, req: Req) -> int:
+        if not self._uses_swa_tail_prealloc():
+            return len(req.origin_input_ids) + len(req.output_ids)
+        return self._swa_tail_len(len(req.origin_input_ids)) + len(req.output_ids)
+
+    def _prealloc_kv_lens(self, req: Req) -> Tuple[int, int]:
+        allocated_kv_len = len(req.origin_input_ids) + max(len(req.output_ids) - 1, 0)
+        if self._uses_swa_tail_prealloc():
+            return allocated_kv_len, self._swa_tail_len(allocated_kv_len)
+        return allocated_kv_len, allocated_kv_len
+
+    def _prealloc_required_tokens(self, req: Req) -> Tuple[int, int]:
+        full_len, swa_len = self._prealloc_kv_lens(req)
+        return (
+            full_len + self.num_reserved_decode_tokens,
+            swa_len + self.num_reserved_decode_tokens,
+        )
 
     def _init_kv_manager(self) -> BaseKVManager:
         kv_args_class = get_kv_class(self.transfer_backend, KVClassType.KVARGS)
@@ -378,7 +417,9 @@ class DecodePreallocQueue:
         # allocate memory
         resumed_reqs = []
         indices_to_remove = set()
-        allocatable_tokens = self._allocatable_tokens(count_retracted=False)
+        full_allocatable_tokens, swa_allocatable_tokens = (
+            self._allocatable_token_budgets(count_retracted=False)
+        )
 
         for i, req in enumerate(self.retracted_queue):
             if rids_to_check is not None and req.rid not in rids_to_check:
@@ -387,19 +428,19 @@ class DecodePreallocQueue:
             if self.req_to_token_pool.available_size() <= 0:
                 break
 
-            required_tokens_for_request = (
-                len(req.origin_input_ids)
-                + len(req.output_ids)
-                + self.num_reserved_decode_tokens
-            )
-            if required_tokens_for_request > allocatable_tokens:
+            full_required, swa_required = self._prealloc_required_tokens(req)
+            if (
+                full_required > full_allocatable_tokens
+                or swa_required > swa_allocatable_tokens
+            ):
                 break
 
             resumed_reqs.append(req)
             indices_to_remove.add(i)
             req.is_retracted = False
             self._pre_alloc(req)
-            allocatable_tokens -= required_tokens_for_request
+            full_allocatable_tokens -= full_required
+            swa_allocatable_tokens -= swa_required
 
             # load from cpu, release the cpu copy
             req.load_kv_cache(self.req_to_token_pool, self.token_to_kv_pool_allocator)
@@ -466,9 +507,17 @@ class DecodePreallocQueue:
             len(r.origin_input_ids) + len(r.output_ids)
             for r in self.scheduler.running_batch.reqs
         )
-        allocatable_tokens = self._allocatable_tokens(
-            retractable_tokens=retractable_tokens, count_retracted=True
+        retractable_swa_tokens = sum(
+            self._swa_retractable_len(r) for r in self.scheduler.running_batch.reqs
         )
+        full_allocatable_tokens, swa_allocatable_tokens = (
+            self._allocatable_token_budgets(
+                retractable_tokens=retractable_tokens,
+                retractable_swa_tokens=retractable_swa_tokens,
+                count_retracted=True,
+            )
+        )
+
         # First, remove all failed requests from the queue
         for i, decode_req in enumerate(self.queue):
             if rids_to_check is not None and decode_req.req.rid not in rids_to_check:
@@ -497,30 +546,22 @@ class DecodePreallocQueue:
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
                 break
 
-            # Memory estimation: don't add if the projected memory cannot be met
-            # TODO: add new_token ratio
-            origin_input_len = len(decode_req.req.origin_input_ids)
-            required_tokens_for_request = (
-                origin_input_len + self.num_reserved_decode_tokens
+            full_len, swa_len = self._prealloc_kv_lens(decode_req.req)
+            full_required, swa_required = self._prealloc_required_tokens(decode_req.req)
+            max_new_tokens = min(
+                decode_req.req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN
             )
 
             if (
-                max(
-                    required_tokens_for_request,
-                    origin_input_len
-                    + min(
-                        decode_req.req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKEN,
-                    )
-                    - retractable_tokens,
-                )
-                > allocatable_tokens
+                max(full_required, full_len + max_new_tokens - retractable_tokens)
+                > full_allocatable_tokens
+                or max(swa_required, swa_len + max_new_tokens - retractable_swa_tokens)
+                > swa_allocatable_tokens
             ):
                 break
-            if required_tokens_for_request > allocatable_tokens:
-                break
 
-            allocatable_tokens -= required_tokens_for_request
+            full_allocatable_tokens -= full_required
+            swa_allocatable_tokens -= swa_required
             self._pre_alloc(decode_req.req)
 
             kv_indices = (
@@ -602,9 +643,12 @@ class DecodePreallocQueue:
             len(decode_req.req.fill_ids) for decode_req in self.transfer_queue.queue
         )
 
-    def _allocatable_tokens(
-        self, retractable_tokens: Optional[int] = None, count_retracted: bool = True
-    ) -> int:
+    def _allocatable_token_budgets(
+        self,
+        retractable_tokens: Optional[int] = None,
+        retractable_swa_tokens: Optional[int] = None,
+        count_retracted: bool = True,
+    ) -> Tuple[int, int]:
         need_space_for_single_req = (
             max(
                 [
@@ -618,18 +662,40 @@ class DecodePreallocQueue:
             and len(self.scheduler.running_batch.reqs) > 0
             else 0
         )
-        available_size = self.token_to_kv_pool_allocator.available_size()
-        allocatable_tokens = available_size - max(
-            # preserve some space for future decode
-            self.num_reserved_decode_tokens
-            * (
-                len(self.scheduler.running_batch.reqs)
-                + len(self.transfer_queue.queue)
-                + len(self.scheduler.waiting_queue)
-            ),
-            # make sure each request can finish if reach max_tokens with all other requests retracted
-            need_space_for_single_req,
+
+        need_swa_space_for_single_req = need_space_for_single_req
+        if (
+            self._uses_swa_tail_prealloc()
+            and retractable_swa_tokens is not None
+            and len(self.scheduler.running_batch.reqs) > 0
+        ):
+            need_swa_space_for_single_req = max(
+                self._swa_tail_len(len(x.origin_input_ids))
+                + min(x.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN)
+                - retractable_swa_tokens
+                for x in self.scheduler.running_batch.reqs
+            )
+
+        reserved_tokens = self.num_reserved_decode_tokens * (
+            len(self.scheduler.running_batch.reqs)
+            + len(self.transfer_queue.queue)
+            + len(self.scheduler.waiting_queue)
         )
+        if self._uses_swa_tail_prealloc():
+            full_allocatable_tokens = (
+                self.token_to_kv_pool_allocator.full_available_size()
+                - max(reserved_tokens, need_space_for_single_req)
+            )
+            swa_allocatable_tokens = (
+                self.token_to_kv_pool_allocator.swa_available_size()
+                - max(reserved_tokens, need_swa_space_for_single_req)
+            )
+        else:
+            allocatable_tokens = self.token_to_kv_pool_allocator.available_size() - max(
+                reserved_tokens, need_space_for_single_req
+            )
+            full_allocatable_tokens = allocatable_tokens
+            swa_allocatable_tokens = allocatable_tokens
 
         # Note: if the last prebuilt extend just finishes, and we enter `pop_preallocated` immediately in the next iteration
         #       the extend batch is not in any queue, so we need to explicitly add the tokens slots here
@@ -637,20 +703,19 @@ class DecodePreallocQueue:
             self.scheduler.last_batch
             and self.scheduler.last_batch.forward_mode.is_prebuilt()
         ):
-            allocatable_tokens -= self.num_reserved_decode_tokens * len(
+            prebuilt_reserved_tokens = self.num_reserved_decode_tokens * len(
                 self.scheduler.last_batch.reqs
             )
+            full_allocatable_tokens -= prebuilt_reserved_tokens
+            swa_allocatable_tokens -= prebuilt_reserved_tokens
 
         if count_retracted:
-            allocatable_tokens -= sum(
-                [
-                    len(req.origin_input_ids)
-                    + len(req.output_ids)
-                    + self.num_reserved_decode_tokens
-                    for req in self.retracted_queue
-                ]
-            )
-        return allocatable_tokens
+            for req in self.retracted_queue:
+                full_required, swa_required = self._prealloc_required_tokens(req)
+                full_allocatable_tokens -= full_required
+                swa_allocatable_tokens -= swa_required
+
+        return full_allocatable_tokens, swa_allocatable_tokens
 
     def _pre_alloc(self, req: Req) -> torch.Tensor:
         """Pre-allocate the memory for req_to_token and token_kv_pool"""
@@ -673,14 +738,30 @@ class DecodePreallocQueue:
             kv_loc = self.token_to_kv_pool_allocator.alloc(fill_len)
         else:
             device = self.token_to_kv_pool_allocator.device
-            kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
-                prefix_lens=torch.tensor([0], dtype=torch.int64, device=device),
-                prefix_lens_cpu=torch.tensor([0], dtype=torch.int64),
-                seq_lens=torch.tensor([fill_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=torch.tensor([fill_len], dtype=torch.int64),
-                last_loc=torch.tensor([-1], dtype=torch.int64, device=device),
-                extend_num_tokens=fill_len,
-            )
+            prefix_lens = torch.tensor([0], dtype=torch.int64, device=device)
+            prefix_lens_cpu = torch.tensor([0], dtype=torch.int64)
+            seq_lens = torch.tensor([fill_len], dtype=torch.int64, device=device)
+            seq_lens_cpu = torch.tensor([fill_len], dtype=torch.int64)
+            last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+            if self._uses_swa_tail_prealloc():
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend_swa_tail(
+                    prefix_lens=prefix_lens,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    last_loc=last_loc,
+                    extend_num_tokens=fill_len,
+                    swa_tail_len=self._swa_tail_len(fill_len),
+                )
+            else:
+                kv_loc = self.token_to_kv_pool_allocator.alloc_extend(
+                    prefix_lens=prefix_lens,
+                    prefix_lens_cpu=prefix_lens_cpu,
+                    seq_lens=seq_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    last_loc=last_loc,
+                    extend_num_tokens=fill_len,
+                )
 
         assert (
             kv_loc is not None
