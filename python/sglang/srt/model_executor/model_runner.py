@@ -156,6 +156,9 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.relaykv import RelayKVConfig, make_shadow_plan
+from sglang.srt.relaykv.metrics import log_shadow_plan
+from sglang.srt.relaykv.profile import infer_model_profile
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import (
     ServerArgs,
@@ -359,6 +362,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
         self.enable_hisparse = server_args.enable_hisparse
+        self.relaykv_config = RelayKVConfig.from_server_args(server_args)
 
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
@@ -708,6 +712,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
+        self._maybe_log_relaykv_startup()
+
         # Init hisparse coordinator (must happen before CUDA graph capture)
         if self.enable_hisparse:
             from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -764,6 +770,46 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.init_piecewise_cuda_graphs()
 
         self.prealloc_symmetric_memory_pool()
+
+    def _maybe_log_relaykv_startup(self) -> None:
+        config = self.relaykv_config
+        if not config.enabled or config.mode != "shadow":
+            return
+
+        model_profile = infer_model_profile(self.model_config.hf_config)
+        logger.info(
+            "relaykv_shadow_config=%s",
+            {
+                "enabled": config.enabled,
+                "mode": config.mode,
+                "resident_budget_tokens": config.resident_budget_tokens,
+                "recent_window": config.recent_window,
+                "anchor_pages": config.anchor_pages,
+                "log_interval": config.log_interval,
+                "page_size": self.page_size,
+                "tp_rank": self.tp_rank,
+                "pp_rank": self.pp_rank,
+                "is_draft_worker": self.is_draft_worker,
+                "model_profile": model_profile.__dict__,
+            },
+        )
+
+        if self.is_draft_worker:
+            return
+
+        seq_len = int(getattr(self.model_config, "context_len", 0) or 0)
+        if seq_len <= 0:
+            return
+
+        log_shadow_plan(
+            make_shadow_plan(
+                seq_len=seq_len,
+                config=config,
+                page_size=1,
+                request_id=f"startup:tp{self.tp_rank}:pp{self.pp_rank}",
+            ),
+            prefix="relaykv_shadow_plan_startup",
+        )
 
     def init_routed_experts_capturer(self):
         if not self.server_args.disable_shared_experts_fusion and hasattr(

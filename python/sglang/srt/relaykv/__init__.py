@@ -5,6 +5,6 @@ but it must not move KV tensors or alter attention behavior.
 """
 
 from .config import RelayKVConfig
-from .planner import RelayKVPlan, build_shadow_plan
+from .planner import RelayKVPlan, build_shadow_plan, make_shadow_plan
 
-__all__ = ["RelayKVConfig", "RelayKVPlan", "build_shadow_plan"]
+__all__ = ["RelayKVConfig", "RelayKVPlan", "build_shadow_plan", "make_shadow_plan"]

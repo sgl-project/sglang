@@ -21,7 +21,12 @@ class RelayKVPlan:
     estimated_resident_ratio: float
 
     def to_log_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        payload = asdict(self)
+        payload["recent_page_range"] = list(self.recent_page_range)
+        return payload
+
+    def to_dict(self) -> Dict[str, Any]:
+        return self.to_log_dict()
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -94,4 +99,18 @@ def build_shadow_plan(
         anchor_pages=anchors,
         recent_page_range=(recent_start, recent_end),
         estimated_resident_ratio=ratio,
+    )
+
+
+def make_shadow_plan(
+    seq_len: int,
+    config: RelayKVConfig,
+    page_size: int = 1,
+    request_id: Optional[str] = None,
+) -> RelayKVPlan:
+    return build_shadow_plan(
+        config=config,
+        seq_len=seq_len,
+        page_size=page_size,
+        request_id=request_id,
     )
