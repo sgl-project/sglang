@@ -417,3 +417,20 @@ class BaseFormatDetector(ABC):
                     reasoning=not empty_thinking_as_non_thinking,
                     force_empty_reasoning=empty_thinking_as_non_thinking,
                 )
+        else:
+            if thinking_mode:
+                return get_model_structural_tag(
+                    model=model_id,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    reasoning=True,
+                    force_empty_reasoning=False,
+                )
+            else:
+                return get_model_structural_tag(
+                    model=model_id,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    reasoning=not empty_thinking_as_non_thinking,
+                    force_empty_reasoning=empty_thinking_as_non_thinking,
+                )

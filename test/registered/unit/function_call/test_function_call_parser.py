@@ -3,7 +3,12 @@ import unittest
 
 import xgrammar as xgr
 
-from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.entrypoints.openai.protocol import (
+    Function,
+    Tool,
+    ToolChoice,
+    ToolChoiceFuncName,
+)
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
@@ -1167,30 +1172,6 @@ class TestKimiK2Detector(unittest.TestCase):
         self.assertEqual(tool_calls[0]["name"], "get_weather")
         self.assertEqual(tool_calls[0]["parameters"], '{"city": "Paris"')
 
-    # ==================== Structural tag (xgrammar builtin) ====================
-    # Kimi K2 uses the new builtin structural tag path, not the legacy one.
-
-    def test_supports_structural_tag(self):
-        self.assertFalse(self.detector.supports_structural_tag())
-
-    def test_supports_model_structural_tag(self):
-        self.assertTrue(self.detector.supports_model_structural_tag())
-
-    def test_get_model_structural_tag(self):
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
-            self.tools, thinking_mode=True
-        )
-        self.assertIsInstance(structural_tag, xgr.StructuralTag)
-        grammar = xgr.Grammar.from_structural_tag(structural_tag)
-        self.assertIsInstance(grammar, xgr.Grammar)
-
-        structural_tag = self.detector.get_xgrammar_model_structural_tag(
-            self.tools, thinking_mode=False
-        )
-        self.assertIsInstance(structural_tag, xgr.StructuralTag)
-        grammar = xgr.Grammar.from_structural_tag(structural_tag)
-        self.assertIsInstance(grammar, xgr.Grammar)
-
 
 class TestDeepSeekV3Detector(unittest.TestCase):
     def setUp(self):
@@ -1682,6 +1663,36 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=True, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=False, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        tool_choice_name = ToolChoiceFuncName(name="get_current_weather")
+        tool_choice = ToolChoice(function=tool_choice_name)
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=True, tool_choice=tool_choice
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=False, tool_choice=tool_choice
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
 
 class TestQwen3CoderDetector(unittest.TestCase):
     """Test suite for Qwen3CoderDetector."""
@@ -2054,6 +2065,36 @@ class TestQwen3CoderDetector(unittest.TestCase):
 
         structural_tag = self.detector.get_xgrammar_model_structural_tag(
             self.tools, thinking_mode=False
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=True, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=False, tool_choice="required"
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        tool_choice_name = ToolChoiceFuncName(name="get_current_weather")
+        tool_choice = ToolChoice(function=tool_choice_name)
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=True, tool_choice=tool_choice
+        )
+        self.assertIsInstance(structural_tag, xgr.StructuralTag)
+        grammar = xgr.Grammar.from_structural_tag(structural_tag)
+        self.assertIsInstance(grammar, xgr.Grammar)
+
+        structural_tag = self.detector.get_xgrammar_model_structural_tag(
+            self.tools, thinking_mode=False, tool_choice=tool_choice
         )
         self.assertIsInstance(structural_tag, xgr.StructuralTag)
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
