@@ -19,7 +19,7 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import Dsv4Aime25TestBase, multinode_args
+from _common import Dsv4ProAime25TestBase, multinode_args
 
 MODEL = "sgl-project/DeepSeek-V4-Pro-FP8"
 H200_FP8_PRO_ENV = {
@@ -28,7 +28,7 @@ H200_FP8_PRO_ENV = {
 }
 
 
-class TestH200Fp8ProLowLatency(Dsv4Aime25TestBase):
+class TestH200Fp8ProLowLatency(Dsv4ProAime25TestBase):
     MODEL = MODEL
     EXTRA_ENV = dict(H200_FP8_PRO_ENV)
 
@@ -62,7 +62,7 @@ class TestH200Fp8ProLowLatency(Dsv4Aime25TestBase):
         super().setUpClass()
 
 
-class TestH200Fp8ProBalanced(Dsv4Aime25TestBase):
+class TestH200Fp8ProBalanced(Dsv4ProAime25TestBase):
     MODEL = MODEL
     EXTRA_ENV = dict(H200_FP8_PRO_ENV)
 
@@ -96,7 +96,7 @@ class TestH200Fp8ProBalanced(Dsv4Aime25TestBase):
         super().setUpClass()
 
 
-class TestH200Fp8ProMaxThroughput(Dsv4Aime25TestBase):
+class TestH200Fp8ProMaxThroughput(Dsv4ProAime25TestBase):
     MODEL = MODEL
     EXTRA_ENV = dict(H200_FP8_PRO_ENV)
 

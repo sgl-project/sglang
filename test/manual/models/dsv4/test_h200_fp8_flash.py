@@ -10,13 +10,13 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import DEEPEP_LARGE_SMS_CONFIG, Dsv4Aime25TestBase
+from _common import DEEPEP_LARGE_SMS_CONFIG, Dsv4FlashAime25TestBase
 
 MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
 H200_FP8_ENV = {"SGLANG_DSV4_FP4_EXPERTS": "0"}
 
 
-class TestH200Fp8FlashLowLatency(Dsv4Aime25TestBase):
+class TestH200Fp8FlashLowLatency(Dsv4FlashAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",
@@ -34,7 +34,7 @@ class TestH200Fp8FlashLowLatency(Dsv4Aime25TestBase):
     EXTRA_ENV = dict(H200_FP8_ENV)
 
 
-class TestH200Fp8FlashBalanced(Dsv4Aime25TestBase):
+class TestH200Fp8FlashBalanced(Dsv4FlashAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",
@@ -66,7 +66,7 @@ class TestH200Fp8FlashBalanced(Dsv4Aime25TestBase):
     }
 
 
-class TestH200Fp8FlashMaxThroughput(Dsv4Aime25TestBase):
+class TestH200Fp8FlashMaxThroughput(Dsv4FlashAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",
@@ -90,7 +90,7 @@ class TestH200Fp8FlashMaxThroughput(Dsv4Aime25TestBase):
     }
 
 
-class TestH200Fp8FlashCP(Dsv4Aime25TestBase):
+class TestH200Fp8FlashCP(Dsv4FlashAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",

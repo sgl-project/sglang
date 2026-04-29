@@ -11,12 +11,12 @@ import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from _common import DEEPEP_LARGE_SMS_CONFIG, Dsv4Aime25TestBase
+from _common import DEEPEP_LARGE_SMS_CONFIG, Dsv4ProAime25TestBase
 
 MODEL = "deepseek-ai/DeepSeek-V4-Pro"
 
 
-class TestGB300ProLowLatency(Dsv4Aime25TestBase):
+class TestGB300ProLowLatency(Dsv4ProAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",
@@ -41,7 +41,7 @@ class TestGB300ProLowLatency(Dsv4Aime25TestBase):
     EXTRA_ENV = {}
 
 
-class TestGB300ProBalanced(Dsv4Aime25TestBase):
+class TestGB300ProBalanced(Dsv4ProAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",
@@ -72,7 +72,7 @@ class TestGB300ProBalanced(Dsv4Aime25TestBase):
     EXTRA_ENV = {"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256"}
 
 
-class TestGB300ProMaxThroughput(Dsv4Aime25TestBase):
+class TestGB300ProMaxThroughput(Dsv4ProAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",
@@ -95,7 +95,7 @@ class TestGB300ProMaxThroughput(Dsv4Aime25TestBase):
     EXTRA_ENV = {"SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256"}
 
 
-class TestGB300ProCP(Dsv4Aime25TestBase):
+class TestGB300ProCP(Dsv4ProAime25TestBase):
     MODEL = MODEL
     OTHER_ARGS = [
         "--trust-remote-code",

@@ -18,13 +18,20 @@ container layout: nemo-skills venv at ``/sgl-workspace/ns-venv`` and
 log dir at ``/sgl-workspace/logs``. ``setup-ns`` is invoked once per
 process if the venv is missing.
 
+Per-variant defaults (set on the Flash/Pro intermediate base classes):
+    Flash recipes -> AIME25 score threshold 0.93, no regrade
+    Pro   recipes -> AIME25 score threshold 0.95, regrade enabled
+                    (the bench script's ``regrade-aime25`` step reruns a
+                    relaxed extractor for Pro generations that finish with
+                    prose like "**Answer:** 336" instead of ``\\boxed{}``)
+
 AIME25 knobs (env vars):
     DSV4_AIME25_NUM_REPEATS       (default 16)
     DSV4_AIME25_TEMPERATURE       (default 1.0)
     DSV4_AIME25_MAX_TOKENS        (default 400000)
     DSV4_AIME25_MAX_CONCURRENCY   (default 512)
     DSV4_AIME25_TIMEOUT_SEC       (default 21600)
-    DSV4_AIME25_SCORE_THRESHOLD   (default 0.0; >0 to enforce)
+    DSV4_AIME25_SCORE_THRESHOLD   (default 0; >0 overrides the per-variant default)
     DSV4_AIME25_SKIP_SETUP_NS     (default 0; 1 to skip setup-ns even if venv is missing)
     DSV4_BENCH_SCRIPT             (override path to bench_gpqa_aime.py)
 
@@ -97,15 +104,31 @@ def multinode_args(nnodes: int) -> List[str]:
 
 
 class Dsv4Aime25TestBase(CustomTestCase):
-    """Subclass and set MODEL / OTHER_ARGS / EXTRA_ENV per cookbook cell."""
+    """Subclass via ``Dsv4FlashAime25TestBase`` or ``Dsv4ProAime25TestBase``,
+    not directly. Per-recipe subclasses set MODEL / OTHER_ARGS / EXTRA_ENV.
+
+    Subclasses also set ``SCORE_THRESHOLD`` and ``REGRADE`` via the Flash/Pro
+    intermediate base classes:
+    - Flash: threshold 0.93, no regrade (``\\boxed{}`` extractor is enough)
+    - Pro:   threshold 0.95, regrade (Pro generations sometimes finish with
+             prose like "**Answer:** 336" instead of ``\\boxed{}``; the
+             ``regrade-aime25`` step in scripts/bench_gpqa_aime.py reruns a
+             relaxed extractor so those don't get scored as no-answer)
+    """
 
     MODEL: ClassVar[str] = ""
     OTHER_ARGS: ClassVar[List[str]] = []
     EXTRA_ENV: ClassVar[Dict[str, str]] = {}
 
+    # Set by Flash/Pro intermediate bases below.
+    SCORE_THRESHOLD: ClassVar[float] = 0.0
+    REGRADE: ClassVar[bool] = False
+
+    _BASE_CLASSES: ClassVar[set] = set()
+
     @classmethod
     def setUpClass(cls):
-        if cls is Dsv4Aime25TestBase:
+        if cls in cls._BASE_CLASSES:
             raise unittest.SkipTest("base class; subclass to run")
         if not cls.MODEL or not cls.OTHER_ARGS:
             raise unittest.SkipTest(f"{cls.__name__}: MODEL and OTHER_ARGS must be set")
@@ -150,7 +173,8 @@ class Dsv4Aime25TestBase(CustomTestCase):
         print(f"[{type(self).__name__}] AIME25 log folder: {log_folder}", flush=True)
 
         metrics_path = self._wait_for_metrics(log_folder)
-        self._run_bench(["regrade-aime25", log_folder], bench_env)
+        if self.REGRADE:
+            self._run_bench(["regrade-aime25", log_folder], bench_env)
 
         with open(metrics_path) as f:
             metrics = json.load(f)
@@ -161,8 +185,14 @@ class Dsv4Aime25TestBase(CustomTestCase):
         )
 
         score = self._extract_score(metrics)
-        if AIME25_SCORE_THRESHOLD > 0:
-            self.assertGreater(score, AIME25_SCORE_THRESHOLD)
+        # DSV4_AIME25_SCORE_THRESHOLD env override wins when > 0.
+        threshold = (
+            AIME25_SCORE_THRESHOLD
+            if AIME25_SCORE_THRESHOLD > 0
+            else self.SCORE_THRESHOLD
+        )
+        if threshold > 0:
+            self.assertGreaterEqual(score, threshold)
 
     def _bench_env(self):
         _, host, port = self.base_url.split(":")
@@ -220,3 +250,24 @@ class Dsv4Aime25TestBase(CustomTestCase):
             return None
 
         return walk(metrics) or 0.0
+
+
+class Dsv4FlashAime25TestBase(Dsv4Aime25TestBase):
+    """Base for DeepSeek-V4-Flash recipes: threshold 0.93, no regrade."""
+
+    SCORE_THRESHOLD = 0.93
+    REGRADE = False
+
+
+class Dsv4ProAime25TestBase(Dsv4Aime25TestBase):
+    """Base for DeepSeek-V4-Pro recipes: threshold 0.95, regrade enabled."""
+
+    SCORE_THRESHOLD = 0.95
+    REGRADE = True
+
+
+Dsv4Aime25TestBase._BASE_CLASSES = {
+    Dsv4Aime25TestBase,
+    Dsv4FlashAime25TestBase,
+    Dsv4ProAime25TestBase,
+}
