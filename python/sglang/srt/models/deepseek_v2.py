@@ -544,7 +544,7 @@ class DeepseekV2MoE(nn.Module):
                 or get_moe_a2a_backend().is_ascend_fuseep()
                 or get_moe_a2a_backend().is_flashinfer()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
-                or envs.SGLANG_DSV4_SHARED_EXPERT_TP1.get()
+                or envs.SGLANG_SHARED_EXPERT_TP1.get()
             )
             self.shared_experts = DeepseekV2MLP(
                 hidden_size=config.hidden_size,
