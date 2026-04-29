@@ -2,7 +2,7 @@
     "meta_service_url": "tcp://127.0.0.1:5001",
     "config_store_url": "tcp://127.0.0.1:6000",
     "log_level": "info",
-    "protocol": "host_tcp",
+    "protocol": "host_shm",
     "dram_size": "10GB",
     "max_dram_size": "64GB",
     "hbm_size": "0",
