@@ -1212,6 +1212,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
     param_names_mapping = LTX2ArchConfig().param_names_mapping
     reverse_param_names_mapping = LTX2ArchConfig().reverse_param_names_mapping
     lora_param_names_mapping = LTX2ArchConfig().lora_param_names_mapping
+
     @staticmethod
     def _collapse_prompt_timestep(timestep: torch.Tensor) -> torch.Tensor:
         if timestep.ndim <= 1:

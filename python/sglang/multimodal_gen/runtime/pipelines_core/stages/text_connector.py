@@ -45,7 +45,19 @@ class LTX2TextConnectorStage(PipelineStage):
                 else None
             )
 
+        if prompt_embeds is None or prompt_attention_mask is None:
+            raise ValueError(
+                "LTX2TextConnectorStage requires prompt embeddings and "
+                "attention mask."
+            )
+
         if batch.do_classifier_free_guidance:
+            if neg_prompt_embeds is None or neg_prompt_attention_mask is None:
+                raise ValueError(
+                    "LTX2TextConnectorStage requires negative prompt embeddings "
+                    "and attention mask when classifier-free guidance is enabled."
+                )
+
             # Official LTX-2.3 processes positive and negative prompts through
             # the connector independently; batching shifts output numerics.
             dtype = prompt_embeds.dtype
