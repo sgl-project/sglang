@@ -1252,8 +1252,10 @@ class DeepseekV2MoE(nn.Module):
                 buf.topk_idx[num_tokens:].fill_(-1)
                 buf.topk_weights[num_tokens:].zero_()
 
+        # Allocate at least one row so y has a non-null CUDA data_ptr;
+        # the DeepGEMM tvm-ffi binding rejects nullptr in convert_to_torch_tensor().
         y = torch.empty(
-            (num_tokens, hidden_size),
+            (max(num_tokens, 1), hidden_size),
             dtype=torch.bfloat16,
             device=hidden_states.device,
         )
@@ -1268,6 +1270,7 @@ class DeepseekV2MoE(nn.Module):
             activation_clamp=swiglu_limit,
             fast_math=True,
         )
+        y = y[:num_tokens]
 
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             y.mul_(self.routed_scaling_factor)
