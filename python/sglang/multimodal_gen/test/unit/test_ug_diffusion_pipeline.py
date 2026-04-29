@@ -140,29 +140,41 @@ class TestUGDiffusionPipeline(unittest.TestCase):
         self.assertIs(bridge.runtime.session_controller, scheduler.session_controller)
         self.assertEqual(
             [req.rid for req in scheduler.enqueued_requests],
-            [f"{session.session_id}:u1", f"{session.session_id}:u2"],
+            [
+                f"{session.session_id}:u1",
+                f"{session.session_id}:d1",
+                f"{session.session_id}:u2",
+                f"{session.session_id}:d2",
+            ],
         )
         self.assertEqual(
             scheduler.finished_reason_at_enqueue,
-            [None, None],
+            [None, None, None, None],
         )
         self.assertTrue(all(req.finished() for req in scheduler.enqueued_requests))
-        self.assertEqual(scheduler.init_req_max_new_tokens_calls, 2)
-        self.assertEqual(scheduler.run_batch_calls, 2)
-        self.assertEqual(scheduler.process_batch_result_calls, 2)
+        self.assertEqual(
+            [req.sampling_params.max_new_tokens for req in scheduler.enqueued_requests],
+            [0, 1, 0, 1],
+        )
+        self.assertEqual(scheduler.init_req_max_new_tokens_calls, 4)
+        self.assertEqual(scheduler.run_batch_calls, 4)
+        self.assertEqual(scheduler.process_batch_result_calls, 4)
         self.assertEqual(scheduler.pending_queue, [])
         self.assertIsNone(scheduler.last_batch)
         self.assertEqual(
             bridge.runtime.srt_request_executor.events,
             [
                 ("u_prefill", f"{session.session_id}:u1", 3),
-                ("append_image", f"{session.session_id}:u2", 5),
+                ("u_decode", f"{session.session_id}:d1", 3),
+                ("append_image", f"{session.session_id}:u2", 6),
+                ("u_decode", f"{session.session_id}:d2", 6),
             ],
         )
-        self.assertEqual(bridge.runtime.srt_request_executor.sync_step_count, 2)
+        self.assertEqual(bridge.runtime.srt_request_executor.sync_step_count, 4)
         counters = bridge.runtime.get_debug_counters(session)
-        self.assertEqual(counters["srt_executed_request_count"], 2)
-        self.assertEqual(counters["srt_last_executed_state"], "append_image")
+        self.assertEqual(counters["srt_executed_request_count"], 4)
+        self.assertEqual(counters["srt_u_decode_request_count"], 2)
+        self.assertEqual(counters["srt_last_executed_state"], "u_decode")
 
     def test_runtime_guard_rejects_cfg_parallel(self):
         server_args = _make_server_args()
@@ -355,6 +367,8 @@ class RecordingSRTScheduler:
         del result
         self.process_batch_result_calls += 1
         for req in batch.reqs:
+            if req.sampling_params.max_new_tokens > 0:
+                req.output_ids.append(1000 + len(req.output_ids))
             req.check_finished(new_accepted_len=0)
 
     def on_idle(self):

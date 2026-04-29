@@ -154,6 +154,35 @@ class TestUGModelRunnerAdapter(unittest.TestCase):
         self.assertEqual(counters["srt_request_count"], 2)
         self.assertEqual(tree_cache.released_sessions, ["adapter-session"])
 
+    def test_adapter_decode_view_includes_srt_u_decode_metadata(self):
+        model_adapter = RecordingUGModelAdapter()
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(model_adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_u_decode_max_new_tokens=1,
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a boat")],
+            session_id="adapter-u-decode-session",
+        )
+        runtime.decode_next_segment(handle)
+
+        decode_view = model_adapter.session_views[1]
+        self.assertEqual(decode_view.srt_request_count, 2)
+        self.assertEqual(
+            decode_view.srt_last_request_id,
+            "adapter-u-decode-session:d1",
+        )
+        self.assertEqual(
+            decode_view.metadata["srt_u_decode_request_count"],
+            1,
+        )
+        self.assertEqual(
+            decode_view.metadata["srt_last_u_decode_request_id"],
+            "adapter-u-decode-session:d1",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

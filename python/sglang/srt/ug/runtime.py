@@ -107,6 +107,10 @@ class UGSessionRecord:
     srt_last_request_id: str | None = None
     srt_last_origin_input_len: int = 0
     srt_last_origin_input_ids: list[int] = field(default_factory=list)
+    srt_u_decode_request_count: int = 0
+    srt_last_u_decode_request_id: str | None = None
+    srt_last_u_decode_origin_input_len: int = 0
+    srt_last_u_decode_output_ids: list[int] = field(default_factory=list)
     srt_mm_offsets: list[tuple[int, int]] = field(default_factory=list)
     srt_mm_inputs: _UGSessionMMInputs | None = None
     srt_executed_request_count: int = 0
@@ -227,6 +231,7 @@ class UGSessionRuntime:
         capacity_of_str_len: int = 4096,
         tokenizer: Any | None = None,
         vocab_size: int = 32000,
+        srt_u_decode_max_new_tokens: int = 0,
     ) -> None:
         self.model_runner = model_runner or FakeUGModelRunner()
         self.session_controller = session_controller
@@ -234,6 +239,7 @@ class UGSessionRuntime:
         self.capacity_of_str_len = capacity_of_str_len
         self.tokenizer = tokenizer or _UGSimpleTokenizer()
         self.vocab_size = vocab_size
+        self.srt_u_decode_max_new_tokens = srt_u_decode_max_new_tokens
         self._records: dict[str, UGSessionRecord] = {}
 
     @staticmethod
@@ -309,6 +315,8 @@ class UGSessionRuntime:
                 f"Cannot decode U segment from state {record.state} "
                 f"for UG session {handle.session_id}"
             )
+        if self.srt_u_decode_max_new_tokens > 0:
+            self._append_srt_u_decode_request(record)
         result = self.model_runner.decode_next_segment(record=record)
         record.decode_count += 1
         if result.type == "image_marker":
@@ -417,6 +425,12 @@ class UGSessionRuntime:
             "srt_last_request_id": record.srt_last_request_id,
             "srt_last_origin_input_len": record.srt_last_origin_input_len,
             "srt_last_origin_input_ids": record.srt_last_origin_input_ids,
+            "srt_u_decode_request_count": record.srt_u_decode_request_count,
+            "srt_last_u_decode_request_id": record.srt_last_u_decode_request_id,
+            "srt_last_u_decode_origin_input_len": (
+                record.srt_last_u_decode_origin_input_len
+            ),
+            "srt_last_u_decode_output_ids": record.srt_last_u_decode_output_ids,
             "srt_mm_offsets": record.srt_mm_offsets,
             "srt_executed_request_count": record.srt_executed_request_count,
             "srt_last_executed_request_id": record.srt_last_executed_request_id,
@@ -458,27 +472,72 @@ class UGSessionRuntime:
             self.session_controller, "get"
         ):
             return
+        from sglang.srt.session.session_controller import SessionController
+
+        input_ids, input_text, mm_inputs = self._tokenize_interleaved_messages(messages)
+        req, recv_req = self._create_srt_session_req(
+            record,
+            request_id=request_id,
+            input_ids=input_ids,
+            input_text=input_text,
+            mm_inputs=mm_inputs,
+            max_new_tokens=0,
+        )
+
+        if mm_inputs is not None:
+            SessionController.adjust_mm_offsets(recv_req, req, mm_inputs)
+            req.extend_image_inputs(mm_inputs)
+
+        self._execute_srt_req(record, req, state=record.state)
+        self._record_srt_req(record, req, request_id=request_id)
+
+    def _append_srt_u_decode_request(self, record: UGSessionRecord) -> None:
+        request_id = f"{record.session_id}:d{record.decode_count + 1}"
+        req, _ = self._create_srt_session_req(
+            record,
+            request_id=request_id,
+            input_ids=[],
+            input_text="",
+            mm_inputs=None,
+            max_new_tokens=self.srt_u_decode_max_new_tokens,
+        )
+        self._execute_srt_req(record, req, state=UGSegmentState.U_DECODE)
+        self._record_srt_req(record, req, request_id=request_id)
+        record.srt_u_decode_request_count += 1
+        record.srt_last_u_decode_request_id = request_id
+        record.srt_last_u_decode_origin_input_len = len(req.origin_input_ids)
+        record.srt_last_u_decode_output_ids = list(
+            req.output_ids[: req.sampling_params.max_new_tokens]
+        )
+        record.context_length += len(record.srt_last_u_decode_output_ids)
+
+    def _create_srt_session_req(
+        self,
+        record: UGSessionRecord,
+        *,
+        request_id: str,
+        input_ids: list[int],
+        input_text: str,
+        mm_inputs: _UGSessionMMInputs | None,
+        max_new_tokens: int,
+    ):
+        from sglang.srt.managers.io_struct import (
+            SessionParams,
+            TokenizedGenerateReqInput,
+        )
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
         session = self.session_controller.get(record.session_id)
         if session is None:
             raise RuntimeError(
                 f"SRT session {record.session_id} is not open for UG request"
             )
-
-        from sglang.srt.managers.io_struct import (
-            SessionParams,
-            TokenizedGenerateReqInput,
-        )
-        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-        from sglang.srt.sampling.sampling_params import SamplingParams
-        from sglang.srt.session.session_controller import SessionController
-
-        input_ids, input_text, mm_inputs = self._tokenize_interleaved_messages(messages)
         recv_req = TokenizedGenerateReqInput(
             rid=request_id,
             input_text=input_text,
             input_ids=input_ids,
             mm_inputs=mm_inputs,
-            sampling_params=SamplingParams(max_new_tokens=0),
+            sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
             return_logprob=False,
             logprob_start_len=0,
             top_logprobs_num=0,
@@ -501,28 +560,45 @@ class UGSessionRuntime:
                 f"Failed to create SRT UG session request {request_id}: "
                 f"{req.to_finish.to_json()}"
             )
-        if mm_inputs is not None:
-            SessionController.adjust_mm_offsets(recv_req, req, mm_inputs)
-            req.extend_image_inputs(mm_inputs)
+        return req, recv_req
+
+    def _execute_srt_req(
+        self,
+        record: UGSessionRecord,
+        req: Any,
+        *,
+        state: UGSegmentState,
+    ) -> None:
+        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
 
         if self.srt_request_executor is not None:
             self.srt_request_executor.execute_ug_request(
                 record=record,
                 req=req,
-                state=record.state,
+                state=state,
             )
             record.srt_executed_request_count += 1
-            record.srt_last_executed_request_id = request_id
-            record.srt_last_executed_state = record.state.value
+            record.srt_last_executed_request_id = req.rid
+            record.srt_last_executed_state = state.value
 
         if getattr(self.srt_request_executor, "finish_request_after_execute", True):
-            req.finished_reason = FINISH_LENGTH(0)
+            req.finished_reason = FINISH_LENGTH(len(req.output_ids))
+
+    @staticmethod
+    def _record_srt_req(
+        record: UGSessionRecord,
+        req: Any,
+        *,
+        request_id: str,
+    ) -> None:
         record.srt_request_count += 1
         record.srt_last_request_id = request_id
         record.srt_last_origin_input_len = len(req.origin_input_ids)
         record.srt_last_origin_input_ids = list(req.origin_input_ids)
         record.srt_mm_inputs = req.multimodal_inputs
-        record.srt_mm_offsets = self._collect_mm_offsets(req.multimodal_inputs)
+        record.srt_mm_offsets = UGSessionRuntime._collect_mm_offsets(
+            req.multimodal_inputs
+        )
 
     def _tokenize_interleaved_messages(
         self, messages: list[UGInterleavedMessage]

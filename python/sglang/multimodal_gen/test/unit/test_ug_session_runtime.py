@@ -46,6 +46,8 @@ class RecordingSRTRequestExecutor:
                     else []
                 ),
                 "finished_reason": req.finished_reason,
+                "max_new_tokens": req.sampling_params.max_new_tokens,
+                "output_ids": list(req.output_ids),
             }
         )
 
@@ -230,6 +232,40 @@ class TestUGSessionRuntime(unittest.TestCase):
             debug["srt_last_executed_request_id"], handle.anchor_request_id
         )
         self.assertEqual(debug["srt_last_executed_state"], "append_image")
+
+    def test_u_decode_can_materialize_srt_session_decode_request(self):
+        executor = RecordingSRTRequestExecutor()
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+            srt_u_decode_max_new_tokens=1,
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a cat")],
+            session_id="srt-u-decode-session",
+        )
+        marker = runtime.decode_next_segment(handle)
+        debug = runtime.get_debug_counters(handle)
+
+        self.assertEqual(marker.type, "image_marker")
+        self.assertEqual(
+            [event["state"] for event in executor.events],
+            ["u_prefill", "u_decode"],
+        )
+        self.assertEqual(
+            [event["rid"] for event in executor.events],
+            ["srt-u-decode-session:u1", "srt-u-decode-session:d1"],
+        )
+        self.assertEqual([event["max_new_tokens"] for event in executor.events], [0, 1])
+        self.assertEqual(debug["srt_request_count"], 2)
+        self.assertEqual(debug["srt_u_decode_request_count"], 1)
+        self.assertEqual(
+            debug["srt_last_u_decode_request_id"], "srt-u-decode-session:d1"
+        )
+        self.assertEqual(debug["srt_last_executed_state"], "u_decode")
+        self.assertEqual(debug["state"], "g_denoise")
 
     def test_close_session_releases_srt_multimodal_features(self):
         tree_cache = FakeTreeCache()

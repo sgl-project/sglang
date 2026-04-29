@@ -32,7 +32,7 @@ class _UGRuntimeTreeCache:
 
 
 def _build_srt_owned_ug_runtime(
-    model_runner=None, *, scheduler=None
+    model_runner=None, *, scheduler=None, srt_u_decode_max_new_tokens: int = 0
 ) -> UGSessionRuntime:
     srt_request_executor = (
         UGSRTSchedulerExecutor(scheduler)
@@ -51,14 +51,25 @@ def _build_srt_owned_ug_runtime(
         srt_request_executor=srt_request_executor,
         tokenizer=getattr(scheduler, "tokenizer", None),
         vocab_size=getattr(model_config, "vocab_size", 32000),
+        srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
     )
 
 
-def _load_ug_bridge(model_path: str, *, scheduler=None) -> UGDenoiserBridge:
+def _load_ug_bridge(
+    model_path: str,
+    *,
+    scheduler=None,
+    srt_u_decode_max_new_tokens: int | None = None,
+) -> UGDenoiserBridge:
+    if srt_u_decode_max_new_tokens is None:
+        srt_u_decode_max_new_tokens = 1 if scheduler is not None else 0
     model_path_lower = model_path.lower()
     if "fake-ug" in model_path_lower:
         return SRTBackedUGDenoiserBridge(
-            _build_srt_owned_ug_runtime(scheduler=scheduler)
+            _build_srt_owned_ug_runtime(
+                scheduler=scheduler,
+                srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
+            )
         )
     if "bagel" in model_path_lower:
         adapter = create_bagel_ug_model_adapter(model_path)
@@ -66,6 +77,7 @@ def _load_ug_bridge(model_path: str, *, scheduler=None) -> UGDenoiserBridge:
             _build_srt_owned_ug_runtime(
                 UGModelRunnerAdapter(adapter),
                 scheduler=scheduler,
+                srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
             )
         )
     raise ValueError(f"Unsupported UG model path: {model_path}")
@@ -86,6 +98,11 @@ class UGPipeline(ComposedPipelineBase):
             "ug_bridge": _load_ug_bridge(
                 self.model_path,
                 scheduler=getattr(server_args, "ug_srt_scheduler", None),
+                srt_u_decode_max_new_tokens=getattr(
+                    server_args,
+                    "ug_srt_u_decode_max_new_tokens",
+                    None,
+                ),
             )
         }
 

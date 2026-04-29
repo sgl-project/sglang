@@ -149,4 +149,16 @@ class UGModelRunnerAdapter:
             srt_last_request_id=record.srt_last_request_id,
             srt_last_origin_input_len=record.srt_last_origin_input_len,
             srt_mm_offsets=tuple(record.srt_mm_offsets),
+            metadata={
+                "srt_u_decode_request_count": record.srt_u_decode_request_count,
+                "srt_last_u_decode_request_id": (
+                    record.srt_last_u_decode_request_id
+                ),
+                "srt_last_u_decode_origin_input_len": (
+                    record.srt_last_u_decode_origin_input_len
+                ),
+                "srt_last_u_decode_output_ids": tuple(
+                    record.srt_last_u_decode_output_ids
+                ),
+            },
         )

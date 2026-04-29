@@ -107,6 +107,7 @@ class TestUGSRTSchedulerExecutorLive(CustomTestCase):
                 srt_request_executor=executor,
                 tokenizer=scheduler.tokenizer,
                 vocab_size=scheduler.model_config.vocab_size,
+                srt_u_decode_max_new_tokens=1,
             )
 
             handle = runtime.prefill_interleaved(
@@ -115,17 +116,22 @@ class TestUGSRTSchedulerExecutorLive(CustomTestCase):
             )
             self.assertTrue(scheduler.is_fully_idle())
 
-            handle = runtime.prefill_interleaved(
-                [UGInterleavedMessage(type="text", content="continue the session")],
-                session_id=handle.session_id,
-            )
+            segment = runtime.decode_next_segment(handle)
             counters = runtime.get_debug_counters(handle)
 
+            self.assertEqual(segment.type, "image_marker")
             self.assertEqual(counters["session_id"], "ug-live-scheduler-prefill")
-            self.assertEqual(counters["state"], "u_decode")
-            self.assertEqual(counters["prefill_count"], 2)
+            self.assertEqual(counters["state"], "g_denoise")
+            self.assertEqual(counters["prefill_count"], 1)
+            self.assertEqual(counters["decode_count"], 1)
             self.assertEqual(counters["srt_request_count"], 2)
             self.assertEqual(counters["srt_executed_request_count"], 2)
+            self.assertEqual(counters["srt_u_decode_request_count"], 1)
+            self.assertEqual(
+                counters["srt_last_u_decode_request_id"],
+                "ug-live-scheduler-prefill:d1",
+            )
+            self.assertEqual(len(counters["srt_last_u_decode_output_ids"]), 1)
             self.assertEqual(executor.sync_step_count, 2)
             self.assertTrue(scheduler.is_fully_idle())
 
