@@ -748,6 +748,9 @@ class Scheduler(
             )
 
         self.relaykv_config = self.tp_worker.model_runner.relaykv_config
+        self._relaykv_logged_prefill_rids: set[str] = set()
+        self._relaykv_logged_prefill_rid_order: Deque[str] = deque()
+        self._relaykv_logged_prefill_rid_limit = 4096
 
         if self.enable_metrics and hasattr(self, "metrics_collector"):
             self.metrics_collector.emit_cache_config_info(
@@ -2693,6 +2696,18 @@ class Scheduler(
             step_idx = req.extend_batch_idx if phase == "prefill" else req.decode_batch_idx
             if not should_log(step_idx, config.log_interval):
                 continue
+            if phase == "prefill":
+                rid = req.rid
+                if rid in self._relaykv_logged_prefill_rids:
+                    continue
+                self._relaykv_logged_prefill_rids.add(rid)
+                self._relaykv_logged_prefill_rid_order.append(rid)
+                if (
+                    len(self._relaykv_logged_prefill_rid_order)
+                    > self._relaykv_logged_prefill_rid_limit
+                ):
+                    stale_rid = self._relaykv_logged_prefill_rid_order.popleft()
+                    self._relaykv_logged_prefill_rids.discard(stale_rid)
 
             seq_len = len(req.origin_input_ids) + len(req.output_ids)
             log_shadow_plan(
