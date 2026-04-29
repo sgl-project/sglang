@@ -50,6 +50,22 @@ MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_OVERLAP = 1
 
 logger = logging.getLogger(__name__)
 
+def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
+    dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
+    if dtype_name in ("float32", "fp32"):
+        return torch.float32, torch.float32
+    if dtype_name in ("bfloat16", "bf16"):
+        if envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
+            raise ValueError(
+                "SGLANG_DSV4_COMPRESS_STATE_DTYPE=bf16 is not supported when "
+                "SGLANG_OPT_USE_ONLINE_COMPRESS=1; online c128 state must stay float32."
+            )
+        return torch.bfloat16, torch.bfloat16
+    raise ValueError(
+        "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
+        f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
+    )
+    
 _is_npu = is_npu()
 
 
@@ -282,9 +298,13 @@ class ModelRunnerKVCacheMixin:
     def set_num_tokens_hybrid_swa_compress(self: ModelRunner):
         from sglang.srt.model_executor.memory_profiler import DSv4MemoryCalculator
 
-        self.state_dtype = torch.float32
+        self.c4_state_dtype, self.c128_state_dtype = _get_dsv4_compress_state_dtypes()
         logger.info(f"DSv4 compressed attention: kv_cache_dtype={self.kv_cache_dtype}")
-        logger.info(f"DSv4 compressed attention: state_dtype={self.state_dtype}")
+        logger.info(
+            "DSv4 compressed attention: "
+            f"c4_state_dtype={self.c4_state_dtype}, "
+            f"c128_state_dtype={self.c128_state_dtype}"
+        )
 
         page_size = self.server_args.page_size
         assert (
@@ -547,7 +567,8 @@ class ModelRunnerKVCacheMixin:
                 page_size=self.page_size,
                 swa_page_size=swa_page_size,
                 dtype=self.kv_cache_dtype,
-                state_dtype=self.state_dtype,
+                c4_state_dtype=self.c4_state_dtype,
+                c128_state_dtype=self.c128_state_dtype,
                 qk_nope_head_dim=self.model_config.qk_nope_head_dim,
                 qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                 indexer_head_dim=self.model_config.index_head_dim,
