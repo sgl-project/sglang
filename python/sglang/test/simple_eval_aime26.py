@@ -7,14 +7,13 @@ https://huggingface.co/datasets/MathArena/aime_2026
 
 Prompt, dataset, and answer-extraction follow the matharena evaluation
 (https://github.com/eth-sri/matharena), which reproduces the published
-reasoning-model AIME numbers. Reasoning models are trained to emit \\boxed{N},
-so we extract the last \\boxed{...} or \\fbox{...}.
+reasoning-model AIME numbers. Reasoning models emit \\boxed{N}, so we extract
+the last \\boxed{...} or \\fbox{...}; matharena's AIME configs set
+strict_parsing: false, so on a miss we fall back to the last bare integer.
 """
 
-from typing import Optional
-
 from sglang.test import simple_eval_common as common
-from sglang.test.simple_eval_aime25 import extract_boxed_answer, normalize_aime_answer
+from sglang.test.simple_eval_aime25 import extract_aime_answer, normalize_aime_answer
 from sglang.test.simple_eval_common import (
     HTML_JINJA,
     Eval,
@@ -32,7 +31,7 @@ The answer is an integer between 0 and 999 inclusive.
 class AIME26Eval(Eval):
     def __init__(
         self,
-        num_examples: Optional[int],
+        num_examples: int | None,
         num_threads: int,
     ):
         from datasets import load_dataset
@@ -57,8 +56,7 @@ class AIME26Eval(Eval):
             response_text = sampler(prompt_messages)
             response_text = response_text or ""
 
-            extracted_answer = extract_boxed_answer(response_text)
-            extracted_answer = extracted_answer.strip() if extracted_answer else None
+            extracted_answer = extract_aime_answer(response_text)
 
             normalized_extracted = normalize_aime_answer(extracted_answer)
             normalized_correct = normalize_aime_answer(row["answer"])
