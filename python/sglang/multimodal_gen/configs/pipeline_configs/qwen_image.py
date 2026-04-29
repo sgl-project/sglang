@@ -18,6 +18,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     maybe_unpad_latents,
     shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
+    QwenImageRolloutPipelineMixin,
+)
 from sglang.multimodal_gen.runtime.models.vision_utils import resize
 from sglang.multimodal_gen.utils import calculate_dimensions
 
@@ -39,13 +42,19 @@ def qwen_image_preprocess_text(prompt):
     return txt
 
 
-def qwen_image_postprocess_text(outputs, _text_inputs, drop_idx=34):
+def qwen_image_postprocess_text(
+    outputs, _text_inputs, drop_idx=34, return_attention_mask=False
+):
     # squeeze the batch dim
     hidden_states = outputs.hidden_states[-1]
     split_hidden_states = _extract_masked_hidden(
         hidden_states, _text_inputs.attention_mask
     )
     split_hidden_states = [e[drop_idx:] for e in split_hidden_states]
+    attn_mask_list = [
+        torch.ones(e.size(0), dtype=torch.long, device=e.device)
+        for e in split_hidden_states
+    ]
     max_seq_len = max([e.size(0) for e in split_hidden_states])
     prompt_embeds = torch.stack(
         [
@@ -53,6 +62,16 @@ def qwen_image_postprocess_text(outputs, _text_inputs, drop_idx=34):
             for u in split_hidden_states
         ]
     )
+    if return_attention_mask:
+        encoder_attention_mask = torch.stack(
+            [
+                torch.cat([u, u.new_zeros(max_seq_len - u.size(0))])
+                for u in attn_mask_list
+            ]
+        )
+        if encoder_attention_mask.all():
+            return prompt_embeds, None
+        return prompt_embeds, encoder_attention_mask
     return prompt_embeds
 
 
@@ -127,7 +146,7 @@ def _pack_latents(latents, batch_size, num_channels_latents, height, width):
 
 
 @dataclass
-class QwenImagePipelineConfig(ImagePipelineConfig):
+class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig):
     """Configuration for the QwenImage pipeline."""
 
     should_use_guidance: bool = False
@@ -184,9 +203,14 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
         # Qwen-Image follows the official diffusers true-CFG behavior:
         # after combining cond/uncond with true_cfg_scale, match the per-token norm
         # back to the conditional branch.
+        cfg_scale = (
+            batch.true_cfg_scale
+            if batch.true_cfg_scale is not None
+            else batch.guidance_scale
+        )
         if (
-            batch.true_cfg_scale is None
-            or batch.true_cfg_scale <= 1.0
+            cfg_scale is None
+            or cfg_scale <= 1.0
             or not batch.do_classifier_free_guidance
         ):
             return noise_pred
@@ -243,6 +267,18 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
     def get_freqs_cis(img_shapes, txt_seq_lens, rotary_emb, device, dtype):
         # img_shapes: for global entire image
         img_freqs, txt_freqs = rotary_emb(img_shapes, txt_seq_lens, device=device)
+
+        max_txt_seq_len = max(txt_seq_lens) if txt_seq_lens else 0
+        txt_cache_len = int(txt_freqs.shape[0])
+        if max_txt_seq_len > txt_cache_len:
+            overflow = max_txt_seq_len - txt_cache_len
+            raise ValueError(
+                "QwenImage RoPE text cache overflow before denoising: "
+                f"required_txt_seq_len={max_txt_seq_len}, txt_cache_len={txt_cache_len}, "
+                f"overflow={overflow}. "
+                "Please reduce the number of input images, shorten the prompt, "
+                "or lower the requested resolution."
+            )
 
         # flashinfer RoPE expects a float32 cos/sin cache concatenated on the last dim
         img_cos_half = img_freqs.real.to(dtype=torch.float32).contiguous()
@@ -571,6 +607,16 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
     resolution: int = 640
     vae_precision: str = "bf16"
 
+    def postprocess_cfg_noise(
+        self,
+        batch,
+        noise_pred: torch.Tensor,
+        noise_pred_cond: torch.Tensor,
+    ) -> torch.Tensor:
+        if not batch.cfg_normalize:
+            return noise_pred
+        return super().postprocess_cfg_noise(batch, noise_pred, noise_pred_cond)
+
     def _prepare_edit_cond_kwargs(
         self, batch, prompt_embeds, rotary_emb, device, dtype
     ):
@@ -582,7 +628,7 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
         vae_scale_factor = self.get_vae_scale_factor()
 
         img_shapes = batch.img_shapes
-        txt_seq_lens = batch.txt_seq_lens
+        txt_seq_lens = [prompt_embeds[0].shape[1]]
 
         freqs_cis = QwenImageEditPlusPipelineConfig.get_freqs_cis(
             img_shapes, txt_seq_lens, rotary_emb, device, dtype

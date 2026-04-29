@@ -524,10 +524,18 @@ class _MlxBenchRunner:
     def __init__(self, model_runner, server_args):
         from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
-        self.mlx_runner = MlxModelRunner(
+        # Radix cache requires the scheduler's allocator/trie; disable in
+        # standalone bench mode where no scheduler is present.
+        init_kwargs = dict(
             model_path=server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
+            disable_radix_cache=True,
+            mem_fraction_static=server_args.mem_fraction_static,
         )
+        if server_args.max_total_tokens is not None:
+            init_kwargs["pool_size"] = server_args.max_total_tokens
+        self.mlx_runner = MlxModelRunner(**init_kwargs)
+        self.mlx_runner.init_kv_pool(req_to_token_pool=None)
         self.fake_torch_runner = model_runner
 
     def clear(self):
@@ -535,9 +543,19 @@ class _MlxBenchRunner:
 
     def extend(self, reqs):
         req_ids = [str(req.rid) for req in reqs]
-        token_ids_list = [[int(t) for t in req.fill_ids] for req in reqs]
-        next_token_ids = self.mlx_runner.prefill_batch(req_ids, token_ids_list)
-        return torch.tensor(next_token_ids), None, req_ids
+        results = []
+        for rid, req in zip(req_ids, reqs):
+            token_ids = [int(t) for t in req.fill_ids]
+            next_token = self.mlx_runner.prefill(
+                req_id=rid,
+                new_token_ids=token_ids,
+                full_token_ids=token_ids,
+                prefix_slot_ids=[],
+                new_slot_ids=[],
+                req_pool_idx=0,
+            )
+            results.append(next_token)
+        return torch.tensor(results), None, req_ids
 
     def decode(self, next_token_ids, req_ids):
         next_token_ids = self.mlx_runner.decode_batch(req_ids)

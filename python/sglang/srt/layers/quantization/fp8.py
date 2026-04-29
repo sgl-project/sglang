@@ -26,7 +26,12 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import RoutingMethodType, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    get_moe_padding_size,
+    get_moe_runner_backend,
+    get_moe_weight_sizes,
+)
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
     ModelWeightParameter,
@@ -45,6 +50,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
+    _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
@@ -79,6 +85,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
@@ -97,6 +104,7 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -108,6 +116,12 @@ if _use_aiter or _use_hip_int4:
     from aiter import ActivationType, QuantType
     from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
+
+if _use_aiter:
+    from sglang.srt.layers.quantization.fp8_utils import (
+        aiter_w8a8_block_fp8_linear,
+        use_aiter_triton_gemm_w8a8_tuned_gfx950,
+    )
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -173,6 +187,9 @@ class Fp8Config(QuantizationConfig):
         return [torch.bfloat16, torch.half]
 
     def get_min_capability(self) -> int:
+        if _is_musa:
+            return 31
+
         return 100 if self.use_mxfp8 else 80
 
     @classmethod
@@ -497,6 +514,18 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight.data = weight.data
         layer.weight_scale_inv.data = weight_scale.data
 
+        if (
+            _use_aiter_bpreshuffle_gfx95
+            and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
+        ):
+            n, k = layer.weight.shape
+            if not use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k):
+                # TODO(1am9trash), to deal with case that this branch chance
+                # drops as use_aiter_triton_gemm_w8a8_tuned_gfx950() expands
+                t = shuffle_weight(layer.weight, (16, 16))
+                layer.weight.copy_(t)
+                del t
+
     def _process_mxfp8_linear_weight_scale(self, layer: Module) -> None:
         if not self.use_mxfp8:
             return
@@ -814,27 +843,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if self.quant_config.is_checkpoint_fp8_serialized:
             params_dtype = torch.uint32 if _use_hip_int4 else torch.float8_e4m3fn
         tp_size = get_tensor_model_parallel_world_size()
+
+        w13_up_dim, w2_up_dim, weight_padded = get_moe_weight_sizes(
+            intermediate_size_per_partition,
+            is_aiter_moe=_use_aiter,
+            is_concat=True,
+            is_packed=False,
+        )
+
         if self.block_quant:
             block_n, block_k = (
                 self.quant_config.weight_block_size[0],
                 self.quant_config.weight_block_size[1],
             )
-            # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
-            # Required by column parallel or enabling merged weights
-            if intermediate_size_per_partition % block_n != 0:
-                raise ValueError(
-                    f"The output_size of gate's and up's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_n = {block_n}."
-                )
-            if tp_size > 1:
-                # Required by row parallel
-                if intermediate_size_per_partition % block_k != 0:
+
+            padding_size = get_moe_padding_size(_use_aiter)
+            if not (_use_aiter and padding_size == block_n == block_k):
+                # NOTE(HandH1998): To ensure proper alignment of the block-wise quantization scales, the output_size of the weights for both the gate and up layers must be divisible by block_n.
+                # Required by column parallel or enabling merged weights
+                if intermediate_size_per_partition % block_n != 0:
                     raise ValueError(
-                        f"The input_size of down's weight = "
+                        f"The output_size of gate's and up's weight = "
                         f"{intermediate_size_per_partition} is not divisible by "
-                        f"weight quantization block_k = {block_k}."
+                        f"weight quantization block_n = {block_n}."
                     )
+                if tp_size > 1:
+                    # Required by row parallel
+                    if intermediate_size_per_partition % block_k != 0:
+                        raise ValueError(
+                            f"The input_size of down's weight = "
+                            f"{intermediate_size_per_partition} is not divisible by "
+                            f"weight quantization block_k = {block_k}."
+                        )
 
         # WEIGHTS
         if _is_hip and _use_hip_int4:
@@ -861,7 +901,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_weight = torch.nn.Parameter(
                 torch.empty(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    w13_up_dim,
                     hidden_size,
                     dtype=params_dtype,
                 ),
@@ -871,11 +911,15 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 torch.empty(
                     num_experts,
                     hidden_size,
-                    intermediate_size_per_partition,
+                    w2_up_dim,
                     dtype=params_dtype,
                 ),
                 requires_grad=False,
             )
+
+        extra_weight_attrs.update(
+            {"weight_padded": weight_padded},
+        )
 
         layer.register_parameter("w13_weight", w13_weight)
         set_weight_attrs(w13_weight, extra_weight_attrs)
@@ -1439,10 +1483,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight_scale1[expert_id] *= layer.w2_weight_scale[expert_id]
 
     def process_weights_hip_scale_padding(self, layer: Module):
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-            padding_size,  # Avoid circular import
-        )
-
+        padding_size = get_moe_padding_size(_use_aiter)
         if _use_aiter:
             layer.w13_weight = torch.nn.Parameter(
                 shuffle_weight(layer.w13_weight.data, (16, 16)),
@@ -1647,6 +1688,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             num_local_experts = int(getattr(layer, "num_local_experts"))
             moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
 
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                get_activation_type,
+            )
+
+            activation_type = get_activation_type(self.moe_runner_config.activation)
+
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -1687,6 +1734,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     if not self.block_quant
                     else None
                 ),
+                activation_type=activation_type,
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)
@@ -1785,7 +1833,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         if activation == "silu"
                         else ActivationType.Gelu
                     ),
-                    expert_mask=layer.expert_mask_gpu,
+                    expert_mask=layer.dispatcher.expert_mask_gpu,
                 )
             else:
                 return fused_moe(
@@ -1802,7 +1850,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         if activation == "silu"
                         else ActivationType.Gelu
                     ),
-                    expert_mask=layer.expert_mask_gpu,
+                    expert_mask=layer.dispatcher.expert_mask_gpu,
                 )
         return None
 

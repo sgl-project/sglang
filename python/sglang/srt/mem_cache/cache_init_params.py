@@ -8,6 +8,7 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.unified_cache_components import ComponentType
 
 
 @dataclasses.dataclass
@@ -19,6 +20,8 @@ class CacheInitParams:
 
     is_eagle: bool = False
     tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
+    attn_cp_cache_group: Optional[torch.distributed.ProcessGroup] = None
+    attn_tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     eviction_policy: str = "lru"
     disable_finished_insert: bool = False
 
@@ -39,3 +42,5 @@ class CacheInitParams:
 
     # Time-to-live for cache entries in seconds. If None, TTL is disabled.
     cache_ttl_seconds: Optional[float] = None
+
+    tree_components: Optional[tuple[ComponentType, ...]] = None

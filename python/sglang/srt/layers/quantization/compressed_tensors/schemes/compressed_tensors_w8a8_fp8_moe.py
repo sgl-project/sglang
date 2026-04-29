@@ -12,7 +12,10 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
 )
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_runner_backend,
+    get_moe_weight_sizes,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
@@ -120,11 +123,22 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     f"weight quantization block_k = {block_k}."
                 )
 
+        w13_up_dim, w2_down_dim, weight_padded = get_moe_weight_sizes(
+            intermediate_size_per_partition,
+            is_aiter_moe=_use_aiter,
+            is_concat=True,
+            is_packed=False,
+        )
+
+        extra_weight_attrs.update(
+            {"weight_padded": weight_padded},
+        )
+
         # WEIGHTS
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
-                2 * intermediate_size_per_partition,
+                w13_up_dim,
                 hidden_size,
                 dtype=params_dtype,
             ),
@@ -137,7 +151,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             torch.empty(
                 num_experts,
                 hidden_size,
-                intermediate_size_per_partition,
+                w2_down_dim,
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -161,7 +175,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
-                    2 * intermediate_size_per_partition,
+                    w13_up_dim,
                     1,
                     dtype=torch.float32,
                 ),
@@ -384,6 +398,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             return StandardCombineInput(hidden_states=output)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
             if self.use_flashinfer_trtllm:
+                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                    get_activation_type,
+                )
+
+                activation_type = get_activation_type(moe_runner_config.activation)
                 quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
@@ -396,6 +415,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     weight_block_k=self.weight_block_size[1],
                     w13_weight_scale_inv=layer.w13_weight_scale,
                     w2_weight_scale_inv=layer.w2_weight_scale,
+                    activation_type=activation_type,
                 )
             else:
                 quant_info = TritonMoeQuantInfo(

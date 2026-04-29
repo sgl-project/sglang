@@ -484,7 +484,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                             if moe_runner_config.activation == "silu"
                             else ActivationType.Gelu
                         ),
-                        expert_mask=layer.expert_mask_gpu,
+                        expert_mask=layer.dispatcher.expert_mask_gpu,
                     )
                     return StandardCombineInput(hidden_states=output)
                 except RuntimeError as e:
@@ -584,6 +584,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             from sgl_kernel import fused_experts
 
             topk_weights, topk_ids, _ = topk_output
+            if moe_runner_config.apply_router_weight_on_input:
+                x = x * topk_weights.to(x.dtype)
+                topk_weights = torch.ones_like(topk_weights)
             output = fused_experts(
                 x,
                 layer.w13_weight,
@@ -593,6 +596,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
                 b1=getattr(layer, "w13_weight_bias", None),
                 b2=getattr(layer, "w2_weight_bias", None),
                 activation=moe_runner_config.activation,
+                gemm1_alpha=moe_runner_config.gemm1_alpha,
+                gemm1_limit=moe_runner_config.gemm1_clamp_limit,
             )
             return StandardCombineInput(hidden_states=output)
         else:
@@ -692,5 +697,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
 
     def forward_tpu(self, *args, **kwargs) -> CombineInput:
         raise NotImplementedError("The TPU backend currently does not support MoE.")
+
+    def forward_musa(self, *args, **kwargs) -> CombineInput:
+        return self.forward_cuda(*args, **kwargs)
 
     forward_native = forward_cpu
