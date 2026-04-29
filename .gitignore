@@ -276,3 +276,9 @@ sgl-kernel/csrc/**/*_musa/
 *.ply
 *.npz
 artifacts/
+
+# Windows downloaded file metadata
+*:Zone.Identifier
+
+# Local Codex workspace/config
+.codex/
