@@ -192,6 +192,37 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(request.reasoning_effort, "high")
         self.assertEqual(request.chat_template_kwargs, {"thinking": True})
 
+    def test_chat_completion_reasoning_effort_max(self):
+        """`max` is an sglang extension on chat completion's top-level
+        `reasoning_effort` only; the Responses-API-style nested
+        `reasoning.effort` path stays aligned with OpenAI's three levels."""
+        from pydantic import ValidationError
+
+        messages = [{"role": "user", "content": "Hello"}]
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning_effort="max",
+        )
+        self.assertEqual(request.reasoning_effort, "max")
+
+        # Unknown values still rejected.
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="test-model",
+                messages=messages,
+                reasoning_effort="ultra",
+            )
+
+        # Nested reasoning.effort=max is NOT promoted by normalize_reasoning_inputs:
+        # the Responses API path keeps the OpenAI low/medium/high contract.
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=messages,
+            reasoning={"effort": "max"},
+        )
+        self.assertNotEqual(request.reasoning_effort, "max")
+
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""
         transcript = "Good morning! It's 7:00 AM, and I'm just waking up. Today is going to be a busy day, "
