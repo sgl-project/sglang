@@ -14,10 +14,10 @@
             "mean_abs_diff_threshold": 8.0
         },
         "flux_2_klein_image_t2i": {
-            "clip_threshold": 0.83,
-            "ssim_threshold": 0.52,
-            "psnr_threshold": 9.3,
-            "mean_abs_diff_threshold": 68.0
+            "clip_threshold": 0.94,
+            "ssim_threshold": 0.78,
+            "psnr_threshold": 17.0,
+            "mean_abs_diff_threshold": 17.0
         },
         "zimage_image_t2i": {
             "clip_threshold": 0.92,
@@ -192,12 +192,6 @@
             "ssim_threshold": 0.90,
             "psnr_threshold": 18.7,
             "mean_abs_diff_threshold": 8.0
-        },
-        "flux_2_klein_ti2i_2_gpus": {
-            "clip_threshold": 0.92,
-            "ssim_threshold": 0.77,
-            "psnr_threshold": 18.4,
-            "mean_abs_diff_threshold": 18.0
         },
         "wan2_2_t2v_a14b_teacache_2gpu": {
             "clip_threshold": 0.90,

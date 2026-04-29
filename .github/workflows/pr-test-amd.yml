@@ -96,10 +96,10 @@ env:
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
 concurrency:
-  # Scheduled and run_all_tests runs get unique groups (never cancel each other).
+  # Scheduled, run_all_tests, and manual dispatch runs get unique groups (never cancel each other).
   # PR runs share a group per branch so new pushes cancel stale runs.
-  group: pr-test-amd-${{ (inputs.run_all_tests || github.event_name == 'schedule') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
-  cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' && github.event_name != 'schedule' }}
+  group: pr-test-amd-${{ (inputs.run_all_tests || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' && github.event_name != 'schedule' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   call-gate:
