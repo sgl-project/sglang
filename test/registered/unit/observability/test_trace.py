@@ -4,7 +4,7 @@ import os
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=6, suite="stage-a-test-cpu")
 
 import threading
 import unittest
@@ -67,7 +67,7 @@ class TestTraceFunctions(unittest.TestCase):
 
 class TestDataclasses(unittest.TestCase):
     def test_trace_thread_info(self):
-        info = TraceThreadInfo("host", 123, "label", 0, 1)
+        info = TraceThreadInfo("host", 123, "label", 0, 1, 0)
         self.assertEqual(info.thread_label, "label")
 
     def test_trace_event(self):
@@ -79,7 +79,7 @@ class TestDataclasses(unittest.TestCase):
         self.assertEqual(s.slice_name, "slice")
 
     def test_trace_thread_context(self):
-        info = TraceThreadInfo("h", 1, "l", 0, 0)
+        info = TraceThreadInfo("h", 1, "l", 0, 0, 0)
         ctx = TraceThreadContext(thread_info=info, cur_slice_stack=[])
         self.assertEqual(len(ctx.cur_slice_stack), 0)
 
@@ -514,7 +514,7 @@ class TestTraceReqContextEnabled(unittest.TestCase):
 
         pid = threading.get_native_id()
         mod.threads_info[pid] = TraceThreadInfo(
-            "host", pid, "sched", tp_rank=0, dp_rank=0
+            "host", pid, "sched", tp_rank=0, dp_rank=0, pp_rank=0
         )
         ctx = TraceReqContext(rid="req-1")
         ctx.trace_req_start(ts=1000)

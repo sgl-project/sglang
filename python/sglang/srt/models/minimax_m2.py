@@ -17,7 +17,8 @@
 
 import logging
 from contextlib import nullcontext
-from typing import Iterable, Optional, Set, Tuple, Union
+from functools import lru_cache
+from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
 import triton
@@ -25,6 +26,10 @@ import triton.language as tl
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.jit_kernel.all_reduce import (
+    fused_parallel_qknorm,
+    get_fused_parallel_qknorm_max_occupancy,
+)
 from sglang.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_maybe_tbo
 from sglang.srt.distributed import (
@@ -42,6 +47,7 @@ from sglang.srt.layers.communicator import (
 )
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
+    get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
     is_dp_attention_enabled,
@@ -53,10 +59,13 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    should_skip_post_experts_all_reduce,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
@@ -71,16 +80,26 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.server_args import get_global_server_args
+
+# get_bool_env_var is defined in sglang.srt.utils.common, not sglang.srt.distributed.
+# Importing from the wrong module causes this file to fail import, which prevents the
+# native MiniMaxM2ForCausalLM from registering in ModelRegistry. The fallback to the
+# transformers wrapper then crashes on config.rope_parameters (transformers v5 issue).
+# Other files (custom_all_reduce.py, hf_transformers_utils.py) also use sglang.srt.utils.
 from sglang.srt.utils import (
     BumpAllocator,
     add_prefix,
+    get_bool_env_var,
     get_compiler_backend,
+    is_cuda,
     is_non_idle_and_non_empty,
     make_layers,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
+_is_cuda = is_cuda()
 
 
 @triton.jit
@@ -253,27 +272,47 @@ def rms_apply_serial(
 class MiniMaxM2RMSNormTP(nn.Module):
     """RMSNorm with Tensor Parallel support for QK normalization."""
 
-    def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
+    def __init__(self, hidden_size: int, num_heads: int, eps: float = 1e-6) -> None:
         super().__init__()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
 
+        # Align with QKVParallelLinear pattern
+        if self.attn_tp_size >= num_heads:
+            assert (
+                self.attn_tp_size % num_heads == 0
+            ), f"attn_tp_size ({self.attn_tp_size}) must be divisible by num_heads ({num_heads})"
+            self.num_heads = 1
+            self.num_head_replicas = self.attn_tp_size // num_heads
+        else:
+            assert (
+                num_heads % self.attn_tp_size == 0
+            ), f"num_heads ({num_heads}) must be divisible by attn_tp_size ({self.attn_tp_size})"
+            self.num_heads = num_heads // self.attn_tp_size
+            self.num_head_replicas = 1
+
+        self.head_dim = hidden_size // num_heads
+
         # Weight parameter is sharded across TP ranks
-        self.weight = nn.Parameter(torch.ones(int(hidden_size / self.attn_tp_size)))
+        self.weight = nn.Parameter(torch.ones(self.num_heads * self.head_dim))
         self.weight.weight_loader = self.weight_loader
         self.variance_epsilon = eps
 
-    @staticmethod
     def weight_loader(
+        self,
         param: nn.Parameter,
         loaded_weight: torch.Tensor,
     ) -> None:
         """Custom weight loader that handles TP sharding."""
-        attn_tp_size = get_attention_tp_size()
-        attn_tp_rank = get_attention_tp_rank()
-
-        shard_size = loaded_weight.shape[0] // attn_tp_size
-        shard = slice(attn_tp_rank * shard_size, (attn_tp_rank + 1) * shard_size)
+        shard_id = self.attn_tp_rank // self.num_head_replicas
+        shard_size = param.data.shape[0]
+        shard_end = (shard_id + 1) * shard_size
+        assert shard_end <= loaded_weight.shape[0], (
+            f"Weight shard out of bounds: shard [{shard_id * shard_size}:{shard_end}] "
+            f"exceeds loaded_weight size {loaded_weight.shape[0]} "
+            f"(attn_tp_rank={self.attn_tp_rank}, num_head_replicas={self.num_head_replicas})"
+        )
+        shard = slice(shard_id * shard_size, shard_end)
         param.data.copy_(loaded_weight[shard])
 
     @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -301,27 +340,114 @@ class MiniMaxM2RMSNormTP(nn.Module):
 
         return x
 
-    @staticmethod
-    def forward_qk(
-        q_norm: "MiniMaxM2RMSNormTP",
-        k_norm: "MiniMaxM2RMSNormTP",
-        q: torch.Tensor,
-        k: torch.Tensor,
-    ) -> torch.Tensor:
-        sum_sq = rms_sumsq_serial(q, k)
-        if q_norm.attn_tp_size > 1:
-            sum_sq = attn_tp_all_reduce(sum_sq)
 
-        q, k = rms_apply_serial(
-            q,
-            k,
-            q_norm.weight,
-            k_norm.weight,
-            sum_sq,
-            q_norm.attn_tp_size,
-            q_norm.variance_epsilon,
+@register_custom_op(mutates_args=["q", "k"])
+def fused_tp_qknorm(
+    counter: int,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float,
+) -> None:
+    return fused_parallel_qknorm(
+        MiniMaxM2QKRMSNorm.COMM_MAP[counter].obj,
+        q,
+        k,
+        q_weight,
+        k_weight,
+        eps=eps,
+    )
+
+
+class MiniMaxM2QKRMSNorm:
+    COUNTER = 0
+    COMM_MAP: Dict[int, Any] = {}
+
+    def __init__(
+        self,
+        q_norm: MiniMaxM2RMSNormTP,
+        k_norm: MiniMaxM2RMSNormTP,
+    ) -> None:
+        assert q_norm.variance_epsilon == k_norm.variance_epsilon
+        self._q_norm = q_norm
+        self._k_norm = k_norm
+        self._world_size = self._q_norm.attn_tp_size
+        self._eps = q_norm.variance_epsilon
+        use_fused_norm = get_bool_env_var("SGLANG_USE_FUSED_PARALLEL_QKNORM")
+
+        self._forward_impl = self._forward_naive
+        if self._world_size > 1 and _is_cuda and use_fused_norm:
+            occupancy = get_fused_parallel_qknorm_max_occupancy(
+                q_norm.weight.dtype,
+                self._world_size,
+                # NOTE: we need full dimension
+                q_dim=q_norm.weight.shape[0] * self._world_size,
+                k_dim=k_norm.weight.shape[0] * self._world_size,
+            )
+            counter = MiniMaxM2QKRMSNorm._get_comm(q_norm.weight.device, occupancy)
+            if counter is not None:
+                self._counter = counter
+                self._forward_impl = self._forward_fused
+
+    @lru_cache
+    @staticmethod
+    def _get_comm(device: torch.device, occupancy: int):
+        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+            CustomAllReduceV2,
         )
 
+        props = torch.cuda.get_device_properties(device)
+        # probe the maximum tokens for one prefill
+        server_args = get_global_server_args()
+        max_tokens = server_args.chunked_prefill_size
+        if max_tokens is None:
+            max_tokens = server_args.model_config.context_len
+        max_tokens = max(max_tokens, server_args.max_prefill_tokens)
+        logger.info(f"[AR] Using CustomAllReduceV2 for MiniMaxM2 with {max_tokens = }")
+        ALIGN = 512
+        # typically, this should not exceed 1M, since max_tokens is usually less than 16384
+        max_size = ((8 * max_tokens + ALIGN - 1) // ALIGN) * ALIGN
+        comm = CustomAllReduceV2(
+            group=get_attention_tp_group().cpu_group,
+            device=device,
+            max_pull_size=0,
+            max_pull_blocks=0,
+            max_push_size=max_size,
+            max_push_blocks=props.multi_processor_count * occupancy,
+        )
+        counter = MiniMaxM2QKRMSNorm.COUNTER
+        MiniMaxM2QKRMSNorm.COUNTER += 1
+        MiniMaxM2QKRMSNorm.COMM_MAP[counter] = comm
+        return counter if not comm.disabled else None
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor):
+        return self._forward_impl(q, k)
+
+    def _forward_naive(self, q: torch.Tensor, k: torch.Tensor):
+        q, k = q.contiguous(), k.contiguous()
+        sum_sq = rms_sumsq_serial(q, k)
+        if self._world_size > 1:
+            sum_sq = attn_tp_all_reduce(sum_sq)
+        return rms_apply_serial(
+            q,
+            k,
+            self._q_norm.weight,
+            self._k_norm.weight,
+            sum_sq,
+            self._world_size,
+            self._eps,
+        )
+
+    def _forward_fused(self, q: torch.Tensor, k: torch.Tensor):
+        fused_tp_qknorm(
+            self._counter,
+            q,
+            k,
+            self._q_norm.weight,
+            self._k_norm.weight,
+            self._eps,
+        )
         return q, k
 
 
@@ -417,12 +543,19 @@ class MiniMaxM2MoE(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states.to(torch.float32))
-        topk_output = self.topk(hidden_states, router_logits)
+        if hidden_states.shape[0] > 0:
+            # router_logits: (num_tokens, n_experts)
+            router_logits, _ = self.gate(hidden_states.to(torch.float32))
+            topk_output = self.topk(hidden_states, router_logits)
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
 
         final_hidden_states = self.experts(hidden_states, topk_output)
-        if self.tp_size > 1 and not should_allreduce_fusion and not use_reduce_scatter:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
+        ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
         return final_hidden_states.view(num_tokens, hidden_dim)
@@ -641,11 +774,16 @@ class MiniMaxM2Attention(nn.Module):
                 # Use RMSNormTP for proper tensor parallel support
                 # Use total dimensions (before TP sharding) for correct normalization
                 self.q_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_heads * self.head_dim, eps=config.rms_norm_eps
+                    self.total_num_heads * self.head_dim,
+                    num_heads=self.total_num_heads,
+                    eps=config.rms_norm_eps,
                 )
                 self.k_norm = MiniMaxM2RMSNormTP(
-                    self.total_num_kv_heads * self.head_dim, eps=config.rms_norm_eps
+                    self.total_num_kv_heads * self.head_dim,
+                    num_heads=self.total_num_kv_heads,
+                    eps=config.rms_norm_eps,
                 )
+                self.qk_norm_impl = MiniMaxM2QKRMSNorm(self.q_norm, self.k_norm)
             else:
                 raise ValueError(f"Unsupported qk_norm_type: {self.qk_norm_type}")
 
@@ -665,22 +803,23 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        if hidden_states.shape[0] == 0:
+            assert (
+                not self.o_proj.reduce_results
+            ), "short-circuiting allreduce will lead to hangs"
+            return hidden_states, forward_batch, None
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         if self.use_qk_norm:
-            # q = self.q_norm(q.contiguous())
-            # k = self.k_norm(k.contiguous())
-            q, k = MiniMaxM2RMSNormTP.forward_qk(
-                self.q_norm, self.k_norm, q.contiguous(), k.contiguous()
-            )
-        else:
-            q, k = q.contiguous(), k.contiguous()
+            q, k = self.qk_norm_impl.forward(q, k)
         q, k = self.rotary_emb(positions, q, k)
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
-        _, _, inner_state = intermediate_state
+        hidden_states, forward_batch, inner_state = intermediate_state
+        if inner_state is None:
+            return hidden_states
         attn_output = self.attn(*inner_state)
         output, _ = self.o_proj(attn_output)
         return output
@@ -764,6 +903,7 @@ class MiniMaxM2DecoderLayer(nn.Module):
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
+            is_last_layer=(layer_id == config.num_hidden_layers - 1),
         )
 
     def forward(

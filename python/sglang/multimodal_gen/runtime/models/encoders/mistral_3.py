@@ -13,31 +13,43 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
+from contextlib import nullcontext
 from typing import Iterable, Optional, Union
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from transformers import Cache, DynamicCache, LlavaConfig, Mistral3Config, MistralConfig
-from transformers.integrations.sdpa_attention import sdpa_attention_forward
-from transformers.masking_utils import create_causal_mask
+from transformers.masking_utils import (
+    create_causal_mask,
+    create_sliding_window_causal_mask,
+)
 from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.models.mistral3.modeling_mistral3 import (
     Mistral3CausalLMOutputWithPast,
     Mistral3ModelOutputWithPast,
 )
 from transformers.models.mistral.modeling_mistral import (
     MistralMLP,
+    MistralPreTrainedModel,
     MistralRMSNorm,
     MistralRotaryEmbedding,
     apply_rotary_pos_emb,
+    eager_attention_forward,
 )
 
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+_CREATE_CAUSAL_MASK_ARG = (
+    "inputs_embeds"
+    if "inputs_embeds" in inspect.signature(create_causal_mask).parameters
+    else "input_embeds"
+)
 
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -62,10 +74,6 @@ class MistralAttention(nn.Module):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.num_key_value_groups = (
-            config.num_attention_heads // config.num_key_value_heads
-        )
-
         self.head_dim = (
             getattr(config, "head_dim", None)
             or config.hidden_size // config.num_attention_heads
@@ -75,7 +83,6 @@ class MistralAttention(nn.Module):
         )
         self.scaling = self.head_dim**-0.5
         self.attention_dropout = config.attention_dropout
-        self.is_causal = True
         self.q_proj = nn.Linear(
             config.hidden_size, config.num_attention_heads * self.head_dim, bias=False
         )
@@ -91,17 +98,6 @@ class MistralAttention(nn.Module):
         self.is_causal = True
         self.num_heads = config.num_attention_heads
         self.num_key_value_heads = config.num_key_value_heads
-        self.attn = USPAttention(
-            num_heads=self.num_heads,
-            head_size=self.head_dim,
-            dropout_rate=0,
-            softmax_scale=None,
-            causal=False,
-            supported_attention_backends={
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-            },
-        )
 
     def forward(
         self,
@@ -131,7 +127,15 @@ class MistralAttention(nn.Module):
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        attention_interface = sdpa_attention_forward
+        attn_implementation = getattr(self.config, "_attn_implementation", None)
+        attention_interface = eager_attention_forward
+        if attn_implementation and attn_implementation != "eager":
+            if hasattr(ALL_ATTENTION_FUNCTIONS, "get_interface"):
+                attention_interface = ALL_ATTENTION_FUNCTIONS.get_interface(
+                    attn_implementation, eager_attention_forward
+                )
+            else:
+                attention_interface = ALL_ATTENTION_FUNCTIONS[attn_implementation]
         attn_output, attn_weights = attention_interface(
             self,
             query_states,
@@ -148,7 +152,7 @@ class MistralAttention(nn.Module):
 
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
-        return attn_output
+        return attn_output, attn_weights
 
 
 class MistralDecoderLayer(nn.Module):
@@ -180,7 +184,7 @@ class MistralDecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states = self.self_attn(
+        hidden_states, _ = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -200,10 +204,9 @@ class MistralDecoderLayer(nn.Module):
         return hidden_states
 
 
-class MistralModel(nn.Module):
+class MistralModel(MistralPreTrainedModel):
     def __init__(self, config: MistralConfig):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
 
@@ -219,7 +222,7 @@ class MistralModel(nn.Module):
         self.norm = MistralRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = MistralRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-        self.config._attn_implementation = "sdpa"
+        self.post_init()
 
     def forward(
         self,
@@ -256,15 +259,20 @@ class MistralModel(nn.Module):
 
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
-        mask_function = create_causal_mask
-        causal_mask = mask_function(
-            config=self.config,
-            input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
+        mask_function = (
+            create_causal_mask
+            if getattr(self.config, "sliding_window", None) is None
+            else create_sliding_window_causal_mask
         )
+        mask_kwargs = {
+            "config": self.config,
+            _CREATE_CAUSAL_MASK_ARG: inputs_embeds,
+            "attention_mask": attention_mask,
+            "cache_position": cache_position,
+            "past_key_values": past_key_values,
+            "position_ids": position_ids,
+        }
+        causal_mask = mask_function(**mask_kwargs)
 
         hidden_states = inputs_embeds
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
@@ -315,19 +323,21 @@ class Mistral3Model(nn.Module):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        pixel_values: Optional[torch.FloatTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        output_hidden_states: Optional[bool] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        vision_feature_layer: Optional[Union[int, list[int]]] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
-        output_hidoutput_hidden_statesden_states: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         image_sizes: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Union[tuple, Mistral3ModelOutputWithPast]:
+        del pixel_values, vision_feature_layer, return_dict
         output_attentions = False
         output_hidden_states = True
 
@@ -367,6 +377,7 @@ class Mistral3ForConditionalGeneration(nn.Module):
         "^language_model.lm_head": "lm_head",
     }
     _tied_weights_keys = ["lm_head.weight"]
+    uses_sglang_forward_context = False
 
     def __init__(self, config: LlavaConfig):
         super().__init__()
@@ -413,19 +424,30 @@ class Mistral3ForConditionalGeneration(nn.Module):
         """
         output_hidden_states = True
 
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=use_cache,
-            output_hidden_states=output_hidden_states,
-            return_dict=True,
-            cache_position=cache_position,
-            image_sizes=image_sizes,
-            **kwargs,
+        execution_tensor = input_ids if input_ids is not None else inputs_embeds
+        sdpa_context = (
+            sdpa_kernel(SDPBackend.CUDNN_ATTENTION)
+            if execution_tensor is not None
+            and execution_tensor.device.type == "cuda"
+            and current_platform.is_cuda()
+            else nullcontext()
         )
+        with sdpa_context:
+            # FLUX.2 uses the text-only Mistral3 path but still expects the
+            # same local SDPA kernel choice as the official HF implementation.
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=inputs_embeds,
+                use_cache=use_cache,
+                output_hidden_states=output_hidden_states,
+                return_dict=True,
+                cache_position=cache_position,
+                image_sizes=image_sizes,
+                **kwargs,
+            )
 
         return Mistral3CausalLMOutputWithPast(
             hidden_states=outputs.hidden_states,

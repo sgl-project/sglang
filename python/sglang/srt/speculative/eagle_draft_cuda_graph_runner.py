@@ -54,7 +54,13 @@ class EagleDraftInputBuffers(ForwardInputBuffers):
 
 
 class EAGLEDraftCudaGraphRunner:
-    def __init__(self, eagle_worker: EAGLEWorker):
+    def __init__(
+        self,
+        eagle_worker: EAGLEWorker,
+        *,
+        draft_attn_backend=None,
+        speculative_num_steps: Optional[int] = None,
+    ):
         # Parse args
         self.eagle_worker = eagle_worker
         if not hasattr(eagle_worker, "model_runner"):
@@ -72,8 +78,13 @@ class EAGLEDraftCudaGraphRunner:
         self.require_attn_tp_gather = require_attn_tp_gather(model_runner.server_args)
         self.tp_size = self.model_runner.tp_size
         self.dp_size = self.model_runner.dp_size
-        self.speculative_num_steps = model_runner.server_args.speculative_num_steps
+        self.speculative_num_steps = (
+            model_runner.server_args.speculative_num_steps
+            if speculative_num_steps is None
+            else speculative_num_steps
+        )
         self.topk = model_runner.server_args.speculative_eagle_topk
+        self.draft_attn_backend = draft_attn_backend or model_runner.draft_attn_backend
         self.enable_profile_cuda_graph = (
             model_runner.server_args.enable_profile_cuda_graph
         )
@@ -88,10 +99,8 @@ class EAGLEDraftCudaGraphRunner:
         self.max_bs = max(self.capture_bs)
         self.max_num_token = self.max_bs * self.num_tokens_per_bs
 
-        self.model_runner.draft_attn_backend.init_cuda_graph_state(
-            self.max_bs, self.max_num_token
-        )
-        self.seq_len_fill_value = self.model_runner.draft_attn_backend.attn_backends[
+        self.draft_attn_backend.init_cuda_graph_state(self.max_bs, self.max_num_token)
+        self.seq_len_fill_value = self.draft_attn_backend.attn_backends[
             0
         ].get_cuda_graph_seq_len_fill_value()
         seq_lens_cpu = torch.full(
@@ -119,7 +128,7 @@ class EAGLEDraftCudaGraphRunner:
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             hidden_states = torch.zeros(
-                (self.max_bs, self.model_runner.model_config.hidden_size),
+                (self.max_bs, self.model_runner.model_config.spec_hidden_size),
                 dtype=self.model_runner.dtype,
             )
 
@@ -310,9 +319,7 @@ class EAGLEDraftCudaGraphRunner:
         )
 
         # Attention backend
-        self.model_runner.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
-            forward_batch
-        )
+        self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(forward_batch)
 
         # Run and capture
         def run_once():
@@ -409,7 +416,7 @@ class EAGLEDraftCudaGraphRunner:
             buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
             forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
 
-        self.model_runner.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+        self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
             forward_batch, bs
         )
         self.raw_bs = raw_bs

@@ -1,0 +1,507 @@
+---
+title: "LoRA Serving"
+metatags:
+    description: "SGLang multi-LoRA serving: S-LoRA and Punica techniques, dynamic adapter loading, GPU pinning, overlap loading, Triton and CSGMV backends."
+---
+SGLang enables the use of [LoRA adapters](https://arxiv.org/abs/2106.09685) with a base model. By incorporating techniques from [S-LoRA](https://arxiv.org/pdf/2311.03285) and [Punica](https://arxiv.org/pdf/2310.18547), SGLang can efficiently support multiple LoRA adapters for different sequences within a single batch of inputs.
+
+
+## Arguments for LoRA Serving
+
+
+The following server arguments are relevant for multi-LoRA serving:
+
+* `enable_lora`: Enable LoRA support for the model. This argument is automatically set to True if `--lora-paths` is provided for backward compatibility.
+
+* `enable_lora_overlap_loading`: Enable asynchronous LoRA weight loading in order to overlap H2D transfers with GPU compute. This should be enabled if you find that your LoRA workloads are bottlenecked by adapter weight loading, for example when frequently loading large LoRA adapters.
+
+* `lora_paths`: The list of LoRA adapters to load. Each adapter must be specified in one of the following formats: &lt;PATH&gt; | &lt;NAME&gt;=&lt;PATH&gt; | JSON with schema &#123;"lora_name":str,"lora_path":str,"pinned":bool&#125;.
+
+* `max_loras_per_batch`: Maximum number of adaptors used by each batch. This argument can affect the amount of GPU memory reserved for multi-LoRA serving, so it should be set to a smaller value when memory is scarce. Defaults to be 8.
+
+* `max_loaded_loras`: If specified, it limits the maximum number of LoRA adapters loaded in CPU memory at a time. The value must be greater than or equal to `max-loras-per-batch`.
+
+* `lora_eviction_policy`: LoRA adapter eviction policy when GPU memory pool is full. `lru`: Least Recently Used (default, better cache efficiency). `fifo`: First-In-First-Out.
+
+* `lora_backend`: The backend of running GEMM kernels for Lora modules. Currently we support Triton LoRA backend (`triton`) and Chunked SGMV backend (`csgmv`). In the future, faster backend built upon Cutlass or Cuda kernels will be added.
+
+* `max_lora_rank`: The maximum LoRA rank that should be supported. If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of larger LoRA rank after server startup.
+
+* `lora_target_modules`: The union set of all target modules where LoRA should be applied (e.g., `q_proj`, `k_proj`, `gate_proj`). If not specified, it will be automatically inferred from the adapters provided in `--lora-paths`. This argument is needed when you expect to dynamically load adapters of different target modules after server startup. You can also set it to `all` to enable LoRA for all supported modules. However, enabling LoRA on additional modules introduces a minor performance overhead. If your application is performance-sensitive, we recommend only specifying the modules for which you plan to load adapters.
+
+* `--max-lora-chunk-size`: Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance. Please tune this value based on your hardware and workload as needed. Defaults to 16.
+
+* `tp_size`: LoRA serving along with Tensor Parallelism is supported by SGLang. `tp_size` controls the number of GPUs for tensor parallelism. More details on the tensor sharding strategy can be found in [S-Lora](https://arxiv.org/pdf/2311.03285) paper.
+
+From client side, the user needs to provide a list of strings as input batch, and a list of adaptor names that each input sequence corresponds to.
+
+
+## Usage
+
+### Serving Single Adaptor
+
+
+**Note:** SGLang supports LoRA adapters through two APIs:
+
+1. **OpenAI-Compatible API** (`/v1/chat/completions`, `/v1/completions`): Use the `model:adapter-name` syntax. See [OpenAI API with LoRA](../basic_usage/openai_api_completions#using-lora-adapters) for examples.
+
+2. **Native API** (`/generate`): Pass `lora_path` in the request body (shown below).
+
+
+
+```python Example
+import json
+import requests
+
+from sglang.test.doc_patch import launch_server_cmd
+from sglang.utils import wait_for_server, terminate_process
+```
+
+
+```python Example
+server_process, port = launch_server_cmd(
+    # Here we set max-loras-per-batch to 2: one slot for adaptor and another one for base model
+    """
+python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --enable-lora \
+    --lora-paths lora0=algoprog/fact-generation-llama-3.1-8b-instruct-lora \
+    --max-loras-per-batch 2 \
+    --log-level warning \
+"""
+)
+
+wait_for_server(f"http://localhost:{port}")
+```
+
+
+```python Example
+url = f"http://127.0.0.1:{port}"
+json_data = {
+    "text": [
+        "List 3 countries and their capitals.",
+        "List 3 countries and their capitals.",
+    ],
+    "sampling_params": {"max_new_tokens": 32, "temperature": 0},
+    # The first input uses lora0, and the second input uses the base model
+    "lora_path": ["lora0", None],
+}
+response = requests.post(
+    url + "/generate",
+    json=json_data,
+)
+print(f"Output 0: {response.json()[0]['text']}")
+print(f"Output 1: {response.json()[1]['text']}")
+```
+
+
+```python Example
+terminate_process(server_process)
+```
+
+### Serving Multiple Adaptors
+
+
+
+```python Example
+server_process, port = launch_server_cmd(
+    """
+python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --enable-lora \
+    --lora-paths lora0=algoprog/fact-generation-llama-3.1-8b-instruct-lora \
+    lora1=Nutanix/Meta-Llama-3.1-8B-Instruct_SFT_lora_4_alpha_16_humaneval_raw_json \
+    --max-loras-per-batch 2 \
+    --log-level warning \
+"""
+)
+
+wait_for_server(f"http://localhost:{port}")
+```
+
+
+```python Example
+url = f"http://127.0.0.1:{port}"
+json_data = {
+    "text": [
+        "List 3 countries and their capitals.",
+        "List 3 countries and their capitals.",
+    ],
+    "sampling_params": {"max_new_tokens": 32, "temperature": 0},
+    # The first input uses lora0, and the second input uses lora1
+    "lora_path": ["lora0", "lora1"],
+}
+response = requests.post(
+    url + "/generate",
+    json=json_data,
+)
+print(f"Output 0: {response.json()[0]['text']}")
+print(f"Output 1: {response.json()[1]['text']}")
+```
+
+
+```python Example
+terminate_process(server_process)
+```
+
+### Dynamic LoRA loading
+
+
+Instead of specifying all adapters during server startup via `--lora-paths`. You can also load & unload LoRA adapters dynamically via the `/load_lora_adapter` and `/unload_lora_adapter` API.
+
+When using dynamic LoRA loading, it's recommended to explicitly specify both `--max-lora-rank` and `--lora-target-modules` at startup. For backward compatibility, SGLang will infer these values from `--lora-paths` if they are not explicitly provided. However, in that case, you would have to ensure that all dynamically loaded adapters share the same shape (rank and target modules) as those in the initial `--lora-paths` or are strictly "smaller".
+
+
+
+```python Example
+lora0 = "Nutanix/Meta-Llama-3.1-8B-Instruct_SFT_lora_4_alpha_16_humaneval_raw_json"  # rank - 4, target modules - q_proj, k_proj, v_proj, o_proj, gate_proj
+lora1 = "algoprog/fact-generation-llama-3.1-8b-instruct-lora"  # rank - 64, target modules - q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
+lora0_new = "philschmid/code-llama-3-1-8b-text-to-sql-lora"  # rank - 256, target modules - q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
+
+
+# The `--target-lora-modules` param below is technically not needed, as the server will infer it from lora0 which already has all the target modules specified.
+# We are adding it here just to demonstrate usage.
+server_process, port = launch_server_cmd(
+    """
+    python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --enable-lora \
+    --cuda-graph-max-bs 2 \
+    --max-loras-per-batch 2 \
+    --max-lora-rank 256
+    --lora-target-modules all
+    --log-level warning
+    """
+)
+
+url = f"http://127.0.0.1:{port}"
+wait_for_server(url)
+```
+
+Load adapter lora0
+
+
+
+```python Example
+response = requests.post(
+    url + "/load_lora_adapter",
+    json={
+        "lora_name": "lora0",
+        "lora_path": lora0,
+    },
+)
+
+if response.status_code == 200:
+    print("LoRA adapter loaded successfully.", response.json())
+else:
+    print("Failed to load LoRA adapter.", response.json())
+```
+
+Load adapter lora1:
+
+
+
+```python Example
+response = requests.post(
+    url + "/load_lora_adapter",
+    json={
+        "lora_name": "lora1",
+        "lora_path": lora1,
+    },
+)
+
+if response.status_code == 200:
+    print("LoRA adapter loaded successfully.", response.json())
+else:
+    print("Failed to load LoRA adapter.", response.json())
+```
+
+Check inference output:
+
+
+
+```python Example
+url = f"http://127.0.0.1:{port}"
+json_data = {
+    "text": [
+        "List 3 countries and their capitals.",
+        "List 3 countries and their capitals.",
+    ],
+    "sampling_params": {"max_new_tokens": 32, "temperature": 0},
+    # The first input uses lora0, and the second input uses lora1
+    "lora_path": ["lora0", "lora1"],
+}
+response = requests.post(
+    url + "/generate",
+    json=json_data,
+)
+print(f"Output from lora0: \n{response.json()[0]['text']}\n")
+print(f"Output from lora1 (updated): \n{response.json()[1]['text']}\n")
+```
+
+Unload lora0 and replace it with a different adapter:
+
+
+
+```python Example
+response = requests.post(
+    url + "/unload_lora_adapter",
+    json={
+        "lora_name": "lora0",
+    },
+)
+
+response = requests.post(
+    url + "/load_lora_adapter",
+    json={
+        "lora_name": "lora0",
+        "lora_path": lora0_new,
+    },
+)
+
+if response.status_code == 200:
+    print("LoRA adapter loaded successfully.", response.json())
+else:
+    print("Failed to load LoRA adapter.", response.json())
+```
+
+Check output again:
+
+
+
+```python Example
+url = f"http://127.0.0.1:{port}"
+json_data = {
+    "text": [
+        "List 3 countries and their capitals.",
+        "List 3 countries and their capitals.",
+    ],
+    "sampling_params": {"max_new_tokens": 32, "temperature": 0},
+    # The first input uses lora0, and the second input uses lora1
+    "lora_path": ["lora0", "lora1"],
+}
+response = requests.post(
+    url + "/generate",
+    json=json_data,
+)
+print(f"Output from lora0: \n{response.json()[0]['text']}\n")
+print(f"Output from lora1 (updated): \n{response.json()[1]['text']}\n")
+```
+
+
+```python Example
+terminate_process(server_process)
+```
+
+### OpenAI-compatible API usage
+
+You can use LoRA adapters via the OpenAI-compatible APIs by specifying the adapter in the `model` field using the `base-model:adapter-name` syntax (for example, `qwen/qwen2.5-0.5b-instruct:adapter_a`). For more details and examples, see the “Using LoRA Adapters” section in the OpenAI API documentation: [openai_api_completions](../basic_usage/openai_api_completions).
+
+
+
+### LoRA GPU Pinning
+
+
+Another advanced option is to specify adapters as `pinned` during loading. When an adapter is pinned, it is permanently assigned to one of the available GPU pool slots (as configured by `--max-loras-per-batch`) and will not be evicted from GPU memory during runtime. Instead, it remains resident until it is explicitly unloaded.
+
+This can improve performance in scenarios where the same adapter is frequently used across requests, by avoiding repeated memory transfers and reinitialization overhead. However, since GPU pool slots are limited, pinning adapters reduces the flexibility of the system to dynamically load other adapters on demand. If too many adapters are pinned, it may lead to degraded performance, or in the most extreme case (`Number of pinned adapters == max-loras-per-batch`), halt all unpinned requests. Therefore, currently SGLang limits maximal number of pinned adapters to `max-loras-per-batch - 1` to prevent unexpected starvations.
+
+In the example below, we start a server with `lora1` loaded as pinned, `lora2` and `lora3` loaded as regular (unpinned) adapters. Please note that, we intentionally specify `lora2` and `lora3` in two different formats to demonstrate that both are supported.
+
+
+
+```python Example
+server_process, port = launch_server_cmd(
+    """
+    python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --enable-lora \
+    --cuda-graph-max-bs 8 \
+    --max-loras-per-batch 3 \
+    --max-lora-rank 256 \
+    --lora-target-modules all \
+    --lora-paths \
+        {"lora_name":"lora0","lora_path":"Nutanix/Meta-Llama-3.1-8B-Instruct_SFT_lora_4_alpha_16_humaneval_raw_json","pinned":true} \
+        {"lora_name":"lora1","lora_path":"algoprog/fact-generation-llama-3.1-8b-instruct-lora"} \
+        lora2=philschmid/code-llama-3-1-8b-text-to-sql-lora
+    --log-level warning
+    """
+)
+
+
+url = f"http://127.0.0.1:{port}"
+wait_for_server(url)
+```
+
+You can also specify adapter as pinned during dynamic adapter loading. In the example below, we reload `lora2` as pinned adapter:
+
+
+
+```python Example
+response = requests.post(
+    url + "/unload_lora_adapter",
+    json={
+        "lora_name": "lora1",
+    },
+)
+
+response = requests.post(
+    url + "/load_lora_adapter",
+    json={
+        "lora_name": "lora1",
+        "lora_path": "algoprog/fact-generation-llama-3.1-8b-instruct-lora",
+        "pinned": True,  # Pin the adapter to GPU
+    },
+)
+```
+
+Verify that the results are expected:
+
+
+
+```python Example
+url = f"http://127.0.0.1:{port}"
+json_data = {
+    "text": [
+        "List 3 countries and their capitals.",
+        "List 3 countries and their capitals.",
+        "List 3 countries and their capitals.",
+    ],
+    "sampling_params": {"max_new_tokens": 32, "temperature": 0},
+    # The first input uses lora0, and the second input uses lora1
+    "lora_path": ["lora0", "lora1", "lora2"],
+}
+response = requests.post(
+    url + "/generate",
+    json=json_data,
+)
+print(f"Output from lora0 (pinned): \n{response.json()[0]['text']}\n")
+print(f"Output from lora1 (pinned): \n{response.json()[1]['text']}\n")
+print(f"Output from lora2 (not pinned): \n{response.json()[2]['text']}\n")
+```
+
+
+```python Example
+terminate_process(server_process)
+```
+
+## Choosing LoRA Backend
+
+SGLang supports two LoRA backends that you can choose from using the `--lora-backend` argument:
+
+- `triton`: Basic Triton-based backend.
+- `csgmv`: Default chunked SGMV backend optimized for high concurrency scenarios.
+
+The `csgmv` backend was recently introduced to improve performance especially at high-concurrency scenarios. Our benchmark shows that it achieves 20% to 80% latency improvements over the basic triton backend.
+
+
+
+```python Example
+server_process, port = launch_server_cmd(
+    """
+    python3 -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --enable-lora \
+    --lora-backend csgmv \
+    --max-loras-per-batch 16 \
+    --lora-paths lora1=path/to/lora1 lora2=path/to/lora2
+    """
+)
+```
+
+
+```python Example
+terminate_process(server_process)
+```
+
+## LoRA Overlap Loading
+
+
+By using the `--enable-lora-overlap-loading` server argument, the SGLang engine is able to overlap the loading of LoRA weights with prefill and decode compute, essentially hiding the data movement for LoRA weights behind GPU computation. Our benchmarks show that under adversarial conditions, enabling this feature can result in a ~35% reduction in median TTFT - (see the [LoRA overlap loading PR](https://github.com/sgl-project/sglang/pull/15512) for detailed benchmarks).
+
+
+
+```python Example
+lora0 = "Nutanix/Meta-Llama-3.1-8B-Instruct_SFT_lora_4_alpha_16_humaneval_raw_json"
+lora1 = "algoprog/fact-generation-llama-3.1-8b-instruct-lora"
+lora2 = "philschmid/code-llama-3-1-8b-text-to-sql-lora"
+
+
+server_process, port = launch_server_cmd(
+    """
+    python3 -m sglang.launch_server \
+    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --enable-lora \
+    --enable-lora-overlap-loading \
+    --lora-paths lora0=Nutanix/Meta-Llama-3.1-8B-Instruct_SFT_lora_4_alpha_16_humaneval_raw_json \
+    lora1=algoprog/fact-generation-llama-3.1-8b-instruct-lora \
+    lora2=philschmid/code-llama-3-1-8b-text-to-sql-lora \
+    --max-lora-rank 256 \
+    --max-loras-per-batch 2 \
+    --max-loaded-loras 4
+    """
+)
+
+url = f"http://127.0.0.1:{port}"
+wait_for_server(url)
+```
+
+
+```python Example
+json_data = {
+    "text": [
+        "Write a very long fairy-tale.",
+        "List 3 countries and their capitals.",
+        "List 3 countries and their capitals.",
+    ],
+    "sampling_params": [
+        {"max_new_tokens": 1024, "temperature": 0},
+        {"max_new_tokens": 64, "temperature": 0},
+        {"max_new_tokens": 64, "temperature": 0},
+    ],
+    "lora_path": ["lora0", "lora1", "lora2"],
+}
+
+# lora0 and lora1 will be loaded into the memory pool first, and because max_loras_per_batch = 2, lora2's request will remain in the queue.
+# lora1's request will likely finish first, and once it does, lora2 will be loaded. With --enable-lora-overlap-loading, this loading will
+# occur asynchronously and thus decoding for lora0's request won't be blocked.
+response = requests.post(
+    url + "/generate",
+    json=json_data,
+)
+
+for i in range(3):
+    print(f"Output from lora{i}: \n{response.json()[i]['text']}\n")
+```
+
+
+```python Example
+terminate_process(server_process)
+```
+
+#### Limitations of LoRA Overlap Loading
+
+
+However, LoRA overlap loading is not free and comes with two important caveats:
+
+1. **Pinned CPU memory requirement**:
+   Asynchronous H2D memory copies require LoRA weights to be pinned in CPU memory, which is a finite system resource. To mitigate excessive pinned-memory usage, SGLang currently restricts `max_loaded_loras` to be at most 2× `max_loras_per_batch` when LoRA overlap loading is enabled.
+
+2. **Reduced multi-adapter prefill batching**:
+   With overlap loading, adapters become available on the GPU at different times because each adapter is loaded asynchronously. This can reduce the scheduler’s ability to form multi-adapter prefill batches, since only requests whose adapters are currently loaded can be grouped together. As a result, requests for different adapters will be scheduled in separate (or smaller) prefill batches, which can increase TTFT when adapter load time is small compared to prefill compute time. This is why LoRA overlap loading is disabled by default: it should only be enabled when users have determined that LoRA weight loading is a bottleneck (EG high adapter churn, heavy adapter weights, or PCIe-bottlenecked workloads).
+
+
+
+#### Example When Overlap Loading Results in Higher Latency
+
+
+For instance, suppose we have four LoRA adapters: `lora0`, `lora1`, `lora2`, and `lora3`. Loading any adapter takes 2ms, while the prefill step for requests for that adapter takes 20ms.
+
+1. **Baseline**:
+  The engine loads all four adapters synchronously, then runs one combined prefill batch, giving us a total time of ≈ `2 * 4 + 20 = 28ms`
+
+2. **With LoRA overlap loading enabled**:
+  The engine begins loading `lora0` and, once it is ready, schedules a prefill batch containing only `lora0` while `lora1` loads in the background. Then it schedules `lora1`’s prefill while `lora2` loads, and so on. In the worst case where prefill cannot be batched across adapters, total time is ≈ `2 + 4 * 20 = 82ms`
+
+In this scenario, overlap loading reduces adapter-load overhead, but the loss of multi-adapter prefill batching dominates and leads to higher TTFT.
+
+
+## Future Works
+
+The development roadmap for LoRA-related features can be found in this [issue](https://github.com/sgl-project/sglang/issues/2929). Other features, including Embedding Layer, Unified Paging, Cutlass backend are still under development.

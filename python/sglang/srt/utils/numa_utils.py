@@ -56,7 +56,7 @@ def _mp_set_executable(executable: str, debug_str: str):
 
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     multiprocessing.spawn.set_executable(executable)
-    logger.info(f"mp.set_executable {old_executable} -> {executable} ({debug_str})")
+    logger.debug(f"mp.set_executable {old_executable} -> {executable} ({debug_str})")
     try:
         yield
     finally:
@@ -64,7 +64,7 @@ def _mp_set_executable(executable: str, debug_str: str):
             os.fsdecode(multiprocessing.spawn.get_executable()) == executable
         ), f"{multiprocessing.spawn.get_executable()=}"
         multiprocessing.spawn.set_executable(old_executable)
-        logger.info(f"mp.set_executable revert to {old_executable}")
+        logger.debug(f"mp.set_executable revert to {old_executable}")
 
 
 def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional[int]:

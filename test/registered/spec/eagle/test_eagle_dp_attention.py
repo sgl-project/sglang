@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 )
 
 # EAGLE3 with DP attention (tp=2, dp=2, requires 4 GPUs)
-register_cuda_ci(est_time=200, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=99, suite="stage-c-test-4-gpu-h100")
 register_amd_ci(est_time=200, suite="stage-c-test-4-gpu-amd")
 
 
