@@ -55,7 +55,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
-    USE_BLOCK_PTR: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -227,61 +226,29 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                 b_h4 *= exp(b_gk_last4)[None, :]
         b_v = b_v.to(k.dtype.element_ty)
 
-        if USE_BLOCK_PTR:
+        p_k = tl.make_block_ptr(
+            k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+        )
+        b_k = tl.load(p_k, boundary_check=(0, 1))
+        b_h1 += tl.trans(tl.dot(b_k, b_v))
+        if K > 64:
             p_k = tl.make_block_ptr(
-                k, (K, T), (1, stride_k), (0, i_t * BT), (64, BT), (0, 1)
+                k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
             )
             b_k = tl.load(p_k, boundary_check=(0, 1))
-            b_h1 += tl.trans(tl.dot(b_k, b_v))
-            if K > 64:
-                p_k = tl.make_block_ptr(
-                    k, (K, T), (1, stride_k), (64, i_t * BT), (64, BT), (0, 1)
-                )
-                b_k = tl.load(p_k, boundary_check=(0, 1))
-                b_h2 += tl.trans(tl.dot(b_k, b_v))
-            if K > 128:
-                p_k = tl.make_block_ptr(
-                    k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
-                )
-                b_k = tl.load(p_k, boundary_check=(0, 1))
-                b_h3 += tl.trans(tl.dot(b_k, b_v))
-            if K > 192:
-                p_k = tl.make_block_ptr(
-                    k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
-                )
-                b_k = tl.load(p_k, boundary_check=(0, 1))
-                b_h4 += tl.trans(tl.dot(b_k, b_v))
-        else:
-            # Block pointers are becoming deprecated in Triton.
-            # The indexing logic is the same as block pointers.
-            offs_t = i_t * BT + tl.arange(0, BT)  # [BT]
-            offs_k1 = tl.arange(0, 64)  # [64]
-            p_k = k + offs_k1[:, None] + offs_t[None, :] * stride_k  # [64, BT]
-            b_k = tl.load(
-                p_k, mask=(offs_k1[:, None] < K) & (offs_t[None, :] < T), other=0.0
+            b_h2 += tl.trans(tl.dot(b_k, b_v))
+        if K > 128:
+            p_k = tl.make_block_ptr(
+                k, (K, T), (1, stride_k), (128, i_t * BT), (64, BT), (0, 1)
             )
-            b_h1 += tl.trans(tl.dot(b_k, b_v))
-            if K > 64:
-                offs_k2 = 64 + tl.arange(0, 64)
-                p_k = k + offs_k2[:, None] + offs_t[None, :] * stride_k
-                b_k = tl.load(
-                    p_k, mask=(offs_k2[:, None] < K) & (offs_t[None, :] < T), other=0.0
-                )
-                b_h2 += tl.trans(tl.dot(b_k, b_v))
-            if K > 128:
-                offs_k3 = 128 + tl.arange(0, 64)
-                p_k = k + offs_k3[:, None] + offs_t[None, :] * stride_k
-                b_k = tl.load(
-                    p_k, mask=(offs_k3[:, None] < K) & (offs_t[None, :] < T), other=0.0
-                )
-                b_h3 += tl.trans(tl.dot(b_k, b_v))
-            if K > 192:
-                offs_k4 = 192 + tl.arange(0, 64)
-                p_k = k + offs_k4[:, None] + offs_t[None, :] * stride_k
-                b_k = tl.load(
-                    p_k, mask=(offs_k4[:, None] < K) & (offs_t[None, :] < T), other=0.0
-                )
-                b_h4 += tl.trans(tl.dot(b_k, b_v))
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_h3 += tl.trans(tl.dot(b_k, b_v))
+        if K > 192:
+            p_k = tl.make_block_ptr(
+                k, (K, T), (1, stride_k), (192, i_t * BT), (64, BT), (0, 1)
+            )
+            b_k = tl.load(p_k, boundary_check=(0, 1))
+            b_h4 += tl.trans(tl.dot(b_k, b_v))
 
     # epilogue
     if INPLACE_UPDATE:
@@ -340,10 +307,6 @@ def chunk_gated_delta_rule_fwd_h(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), N * H)
 
-    # Block pointers are becoming deprecated in Triton. We use tensor pointers for Intel GPU (XPU) here
-    # to avoid any breakage of other hardware platforms.
-    use_block_ptr = not is_intel
-
     chunk_gated_delta_rule_fwd_kernel_h_blockdim64[grid](
         k=k,
         v=u,
@@ -369,7 +332,6 @@ def chunk_gated_delta_rule_fwd_h(
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
-        USE_BLOCK_PTR=use_block_ptr,
         num_warps=4,
         num_stages=2,
     )
