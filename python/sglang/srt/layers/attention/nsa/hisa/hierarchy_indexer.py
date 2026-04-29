@@ -569,7 +569,7 @@ class HisaIndexer(MultiPlatformOp):
         # DEBUG: SGLANG_HISA_VERIFY=1 compares v3 (with pool cache) against
         # a freshly-computed v1 reference. Prints only for divergence above
         # the configured thresholds (LOGITS_ABS / LOGITS_REL / IOU env vars,
-        # defaults 0.01 / 0.05 / 0.95).
+        # defaults 0.01 / 0.01 / 0.95).
         #
         # Cuda-graph safe: gated on ``not get_is_capture_mode()`` — during
         # capture we skip the compare so the graph doesn't grow.  During
@@ -578,7 +578,7 @@ class HisaIndexer(MultiPlatformOp):
         # ------------------------------------------------------------------
         if (
             use_pool_cache
-            and os.environ.get("SGLANG_HISA_VERIFY") == "1"
+            and os.environ.get("SGLANG_HISA_VERIFY_DECODE") == "1"
             and not get_is_capture_mode()
         ):
             self._hisa_verify_vs_v1(
@@ -609,6 +609,79 @@ class HisaIndexer(MultiPlatformOp):
         return topk_result
 
     @torch.inference_mode()
+    def _compare_logits_vs_v1(
+        self,
+        v1_blk: torch.Tensor,           # [M, K_topk] int (any int)
+        def_blk: torch.Tensor,          # [M, K_topk] int
+        v1_logits: torch.Tensor,        # [M, K_topk * kbs] f32
+        def_logits: torch.Tensor,       # [M, K_topk * kbs] f32
+        label_prefix: str,
+        chunk_start: int = 0,
+    ) -> None:
+        """Vectorized block-IoU + ``torch.testing.assert_close`` on aligned
+        logits. Replaces the per-row Python loop (which paid ~1μs CPU sync per
+        ``.item()`` × 2K blocks × 61 layers, dominating verify cost).
+
+        Steps:
+          1. Sort block ids per row.
+          2. IoU vectorized via merge-sort adjacency (no internal duplicates).
+          3. Gather logits in sorted block order to align v1 ↔ default.
+          4. Subset to rows where the sorted block sets match exactly.
+          5. ``torch.testing.assert_close`` on the aligned subset.
+        """
+        abs_th = float(os.environ.get("SGLANG_HISA_VERIFY_LOGITS_ABS", "0.01"))
+        rel_th = float(os.environ.get("SGLANG_HISA_VERIFY_LOGITS_REL", "0.01"))
+        iou_th = float(os.environ.get("SGLANG_HISA_VERIFY_IOU", "0.99"))
+
+        M, K_topk = v1_blk.shape
+        kbs = v1_logits.shape[-1] // K_topk
+
+        v1_sorted_blk, v1_idx = v1_blk.sort(dim=-1)
+        def_sorted_blk, def_idx = def_blk.sort(dim=-1)
+
+        # IoU per row via merge-sort adjacency (assumes no in-row duplicates).
+        merged = torch.cat([v1_sorted_blk, def_sorted_blk], dim=-1).sort(dim=-1).values
+        inter = (merged[:, :-1] == merged[:, 1:]).sum(dim=-1)        # [M]
+        union = 2 * K_topk - inter
+        iou = inter.float() / union.float().clamp_min(1)
+
+        bad_iou_idx = (iou < iou_th).nonzero(as_tuple=True)[0]
+        if bad_iou_idx.numel() > 0:
+            ridx = bad_iou_idx.tolist()
+            ivals = iou[bad_iou_idx].tolist()
+            for r, v in zip(ridx, ivals):
+                print(
+                    f"[{label_prefix} m={chunk_start + r}] block-topk IoU="
+                    f"{v:.4f} < {iou_th}",
+                    flush=True,
+                )
+
+        # Logits compare on rows whose sorted block sets match exactly.
+        match_mask = (v1_sorted_blk == def_sorted_blk).all(dim=-1)
+        if not bool(match_mask.any().item()):
+            return
+
+        v1_3d = v1_logits.view(M, K_topk, kbs)
+        def_3d = def_logits.view(M, K_topk, kbs)
+        v1_aligned = v1_3d.gather(1, v1_idx[..., None].expand(M, K_topk, kbs))
+        def_aligned = def_3d.gather(1, def_idx[..., None].expand(M, K_topk, kbs))
+        v1_check = v1_aligned[match_mask].reshape(-1, K_topk * kbs)
+        def_check = def_aligned[match_mask].reshape(-1, K_topk * kbs)
+
+        try:
+            torch.testing.assert_close(
+                def_check, v1_check,
+                atol=abs_th, rtol=rel_th, equal_nan=True,
+            )
+        except AssertionError as e:
+            n_match = int(match_mask.sum().item())
+            print(
+                f"[{label_prefix}] logits assert_close FAILED on "
+                f"{n_match}/{M} matching rows (atol={abs_th}, rtol={rel_th}):\n{e}",
+                flush=True,
+            )
+
+    @torch.inference_mode()
     def _hisa_verify_vs_v1(
         self,
         layer_id: int,
@@ -627,14 +700,12 @@ class HisaIndexer(MultiPlatformOp):
         """DEBUG: re-run v1 fresh hierarchy paged MQA and compare logits
         + final topk indices against the v3 (pool-cache) output.
 
-        Prints one line per row that exceeds a threshold. Env knobs:
+        Env knobs (shared with prefill verify):
           SGLANG_HISA_VERIFY_LOGITS_ABS  (default 0.01)
-          SGLANG_HISA_VERIFY_LOGITS_REL  (default 0.05)
-          SGLANG_HISA_VERIFY_IOU         (default 0.95)
+          SGLANG_HISA_VERIFY_LOGITS_REL  (default 0.01)
+          SGLANG_HISA_VERIFY_IOU         (default 0.99)
         """
-        abs_th = float(os.environ.get("SGLANG_HISA_VERIFY_LOGITS_ABS", "0.01"))
-        rel_th = float(os.environ.get("SGLANG_HISA_VERIFY_LOGITS_REL", "0.05"))
-        iou_th = float(os.environ.get("SGLANG_HISA_VERIFY_IOU", "0.95"))
+        iou_th = float(os.environ.get("SGLANG_HISA_VERIFY_IOU", "0.99"))
 
         # --- v1 reference: fresh mean-pool + block_mqa + sparse_paged ---
         v1_block_sparse, v1_topk_block = fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(
@@ -665,57 +736,69 @@ class HisaIndexer(MultiPlatformOp):
             ks=None,
         )  # [B, index_topk] int32
 
-        # --- topk IoU check (final absolute-K-position sets per row) ---
-        v3_tr = v3_topk_result[:B].cpu()
-        v1_tr = v1_topk_result.cpu()
-        for b in range(B):
-            v3_set = set(int(x) for x in v3_tr[b].tolist()) - {-1}
-            v1_set = set(int(x) for x in v1_tr[b].tolist()) - {-1}
-            inter = v3_set & v1_set
-            union = v3_set | v1_set
-            iou = len(inter) / max(len(union), 1)
-            if iou < iou_th:
+        # --- final-token-level topk IoU (vectorized, ignores -1 padding) ---
+        v3_tr = v3_topk_result[:B]
+        v1_tr = v1_topk_result
+        merged_tr = torch.cat([v1_tr, v3_tr], dim=-1).sort(dim=-1).values
+        # Equal-adjacent pairs that are not the -1 sentinel = intersection size.
+        inter_tr = ((merged_tr[:, :-1] == merged_tr[:, 1:])
+                    & (merged_tr[:, :-1] != -1)).sum(dim=-1)
+        v1_count = (v1_tr != -1).sum(dim=-1)
+        v3_count = (v3_tr != -1).sum(dim=-1)
+        union_tr = v1_count + v3_count - inter_tr
+        iou_tr = inter_tr.float() / union_tr.float().clamp_min(1)
+        bad = (iou_tr < iou_th).nonzero(as_tuple=True)[0]
+        if bad.numel() > 0:
+            for b, v, vi, vv in zip(
+                bad.tolist(), iou_tr[bad].tolist(),
+                v1_count[bad].tolist(), v3_count[bad].tolist(),
+            ):
                 print(
-                    f"[HISA_VERIFY layer={layer_id} b={b}] topk IoU={iou:.4f} "
-                    f"< {iou_th}  |v1|={len(v1_set)} |v3|={len(v3_set)} "
-                    f"|∩|={len(inter)}",
+                    f"[HISA_VERIFY layer={layer_id} b={b}] final topk IoU="
+                    f"{v:.4f} < {iou_th}  |v1|={vi} |v3|={vv}",
                     flush=True,
                 )
 
-        # --- logits check: only where v1/v3 topk_block_indices set match
-        # (otherwise their block_sparse_logits describe different K-blocks
-        # and element-wise compare is meaningless). ---
-        v3_blk_cpu = v3_topk_block_indices[:B].cpu()
-        v1_blk_cpu = v1_topk_block.cpu()
-        kbs = self.hisa_k_block_size
-        for b in range(B):
-            v1_blk = [int(x) for x in v1_blk_cpu[b].tolist()]
-            v3_blk = [int(x) for x in v3_blk_cpu[b].tolist()]
-            if sorted(v1_blk) != sorted(v3_blk):
-                # Different block selections — IoU check above already
-                # flagged this. Skip element-wise logits compare.
-                continue
-            v1_order = {bid: idx for idx, bid in enumerate(v1_blk)}
-            max_abs_row = 0.0
-            max_rel_row = 0.0
-            for pos_v3, bid in enumerate(v3_blk):
-                pos_v1 = v1_order[bid]
-                seg_v1 = v1_block_sparse[b, pos_v1 * kbs : (pos_v1 + 1) * kbs]
-                seg_v3 = v3_block_sparse_logits[b, pos_v3 * kbs : (pos_v3 + 1) * kbs]
-                finite = torch.isfinite(seg_v1) & torch.isfinite(seg_v3)
-                if not finite.any():
-                    continue
-                abs_d = (seg_v1 - seg_v3)[finite].abs()
-                rel_d = abs_d / (seg_v1[finite].abs() + 1e-6)
-                max_abs_row = max(max_abs_row, abs_d.max().item())
-                max_rel_row = max(max_rel_row, rel_d.max().item())
-            if max_abs_row > abs_th or max_rel_row > rel_th:
-                print(
-                    f"[HISA_VERIFY layer={layer_id} b={b}] logits diff: "
-                    f"abs_max={max_abs_row:.4e} (th {abs_th})  "
-                    f"rel_max={max_rel_row:.4e} (th {rel_th})",
-                    flush=True,
+        # --- block-level IoU + logits assert_close (vectorized helper) ---
+        self._compare_logits_vs_v1(
+            v1_blk=v1_topk_block,
+            def_blk=v3_topk_block_indices[:B],
+            v1_logits=v1_block_sparse,
+            def_logits=v3_block_sparse_logits[:B],
+            label_prefix=f"HISA_VERIFY layer={layer_id}",
+        )
+
+    @torch.inference_mode()
+    def _hisa_verify_prefill_vs_v1(
+        self,
+        layer_id: int,
+        q_fp8_slice: torch.Tensor,                  # [M, H, D] fp8
+        kv_fp8: tuple,                              # (k_fp8 [N, D] fp8, k_scale)
+        weights_slice: torch.Tensor,                # [M, H] f32
+        ks_slice: torch.Tensor,                     # [M] i32
+        ke_slice: torch.Tensor,                     # [M] i32
+        default_block_sparse_logits: torch.Tensor,  # [M, sparse_len] f32
+        default_topk_block_indices: torch.Tensor,   # [M, block_topk] int64
+        chunk_start: int = 0,
+    ) -> None:
+        """Re-run v1 (tilelang_legacy) prefill and compare per-row logits +
+        block-topk IoU against the default (triton-mixed) output."""
+        with self._with_real_sm_count():
+            v1_block_sparse, v1_topk_block = (
+                fp8_native_hierarchy_mqa_logits_tilelang_legacy(
+                    q_fp8_slice, kv_fp8, weights_slice,
+                    ks_slice, ke_slice,
+                    self.hisa_k_block_size, self.hisa_block_topk,
                 )
+            )
+        self._compare_logits_vs_v1(
+            v1_blk=v1_topk_block,
+            def_blk=default_topk_block_indices,
+            v1_logits=v1_block_sparse,
+            def_logits=default_block_sparse_logits,
+            label_prefix=f"HISA_VERIFY_PREFILL layer={layer_id}",
+            chunk_start=chunk_start,
+        )
 
     def _should_chunk_mqa_logits(
         self,
@@ -903,6 +986,24 @@ class HisaIndexer(MultiPlatformOp):
                     self.hisa_k_block_size,
                     self.hisa_block_topk,
                 )
+            # DEBUG: verify default-path output against v1 (tilelang_legacy).
+            # Only fires when default path was taken (mqa_logits_fn != legacy)
+            # and SGLANG_HISA_VERIFY=1, outside cuda graph capture.
+            if (
+                mqa_logits_fn is fp8_native_hierarchy_mqa_logits
+                and os.environ.get("SGLANG_HISA_VERIFY_PREFILL") == "1"
+                and not get_is_capture_mode()
+            ):
+                self._hisa_verify_prefill_vs_v1(
+                    layer_id=layer_id,
+                    q_fp8_slice=q_fp8[:q_offset],
+                    kv_fp8=kv_fp8,
+                    weights_slice=weights[:q_offset],
+                    ks_slice=ks,
+                    ke_slice=ke,
+                    default_block_sparse_logits=block_sparse_logits,
+                    default_topk_block_indices=topk_block_indices,
+                )
             # vLLM-patch-style conversion (indexers.py:435-458): topk via
             # fast_topk_v2 and the gather + ks-subtract + mask steps fused
             # into a single triton kernel (hisa_coord_transform).
@@ -963,6 +1064,23 @@ class HisaIndexer(MultiPlatformOp):
                     ke[start:end],
                     self.hisa_k_block_size,
                     self.hisa_block_topk,
+                )
+            # DEBUG: same v1 verify as the non-chunked branch above.
+            if (
+                mqa_logits_fn is fp8_native_hierarchy_mqa_logits
+                and os.environ.get("SGLANG_HISA_VERIFY_PREFILL") == "1"
+                and not get_is_capture_mode()
+            ):
+                self._hisa_verify_prefill_vs_v1(
+                    layer_id=layer_id,
+                    q_fp8_slice=q_fp8[start:end],
+                    kv_fp8=kv_fp8,
+                    weights_slice=weights[start:end],
+                    ks_slice=ks[start:end],
+                    ke_slice=ke[start:end],
+                    default_block_sparse_logits=block_sparse_logits,
+                    default_topk_block_indices=topk_block_indices,
+                    chunk_start=start,
                 )
             # Same conversion as the non-chunked branch, via the fused kernel.
             M_chunk, sparse_len = block_sparse_logits.shape

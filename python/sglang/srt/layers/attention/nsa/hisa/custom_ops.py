@@ -2301,7 +2301,7 @@ def fp8_native_paged_mean_pooling(
     FP8_MAX_INV = 1.0 / 448.0
 
     block_N = paged_block_size
-    assert pooling_block_size % block_N == 0, "For simplicity, we require pooling_block_size to be a multiple of paged_block_size"
+    assert pooling_block_size % block_N == 0, f"For simplicity, we require pooling_block_size {pooling_block_size} to be a multiple of paged_block_size {block_N}"
 
     @T.prim_func
     def fp8_native_paged_mean_pooling_kernel(

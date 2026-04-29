@@ -919,6 +919,101 @@ def _block_sparse_mqa_grouped_kernel(
     )
 
 
+@triton.jit
+def _block_sparse_mqa_persistent_kernel(
+    Q_ptr, K_ptr, KS_ptr,
+    TopK_ptr, Logits_ptr, W_ptr,
+    CuKS_ptr, CuKE_ptr,
+    stride_q_s, stride_q_h, stride_q_d,
+    stride_k_s, stride_k_d,
+    stride_ks_s,
+    stride_topk_s, stride_topk_n,
+    stride_logits_s, stride_logits_n,
+    stride_w_s, stride_w_h,
+    seq_kv,
+    topk,                               # runtime int, may not divide GROUP_SIZE
+    HEADS: tl.constexpr,
+    DIM: tl.constexpr,
+    KV_BLOCK_SIZE: tl.constexpr,        # k_block_size, < 128
+    GROUP_SIZE: tl.constexpr,           # GEMM_TILE // KV_BLOCK_SIZE
+    K_CHUNKS: tl.constexpr,             # chunks per CTA (persistent inner-loop trip count)
+):
+    """Persistent variant of ``_block_sparse_mqa_grouped_kernel``.
+
+    Each CTA iterates ``K_CHUNKS`` consecutive grouped chunks of the same
+    seq instead of just one — Q[H,D] and W[H] (8.25KB / row) are loaded
+    *once* and reused across the inner loop, dropping ~K_CHUNKS× redundant
+    HBM traffic. ``tl.range(num_stages=N)`` lets the K-tile gather of
+    iter i+1 overlap the GEMM of iter i, hiding gather latency.
+
+    Grid: ``(seq_q, ceil(num_chunks_per_seq / K_CHUNKS))``. Tail chunks
+    (where ``chunk_idx >= num_chunks_per_seq``) are handled by the same
+    masks as the non-persistent kernel:
+      - ``g_mask = g_idx < topk`` → load -1 sentinel for invalid lanes
+      - ``k_mask = (k_rows >= 0) & ...`` and ``pos_valid`` force -inf
+      - output ``out_mask = out_cols < topk*K`` skips OOB writes
+    so the iteration is wasted but produces no incorrect side effects.
+    """
+    GEMM_TILE: tl.constexpr = KV_BLOCK_SIZE * GROUP_SIZE
+    seq_i = tl.program_id(0)
+    outer = tl.program_id(1)
+
+    # Loaded ONCE — reused across K_CHUNKS inner iters.
+    h_offs = tl.arange(0, HEADS)
+    d_offs = tl.arange(0, DIM)
+    q = tl.load(
+        Q_ptr + seq_i * stride_q_s
+        + h_offs[:, None] * stride_q_h + d_offs[None, :] * stride_q_d
+    )  # fp8 [H, D]
+    w = tl.load(W_ptr + seq_i * stride_w_s + h_offs * stride_w_h)  # f32 [H]
+    ks_min = tl.load(CuKS_ptr + seq_i)
+    ke_max = tl.load(CuKE_ptr + seq_i)
+
+    g_offs = tl.arange(0, GROUP_SIZE)
+    b_offs = tl.arange(0, KV_BLOCK_SIZE)
+    bn_offs = tl.arange(0, GEMM_TILE)
+
+    for k_iter in tl.range(K_CHUNKS, num_stages=2):
+        chunk_idx = outer * K_CHUNKS + k_iter
+        n_i_start = chunk_idx * GROUP_SIZE
+
+        g_idx = n_i_start + g_offs                                # [G]
+        g_mask = g_idx < topk                                     # [G]
+        topk_block_ids = tl.load(
+            TopK_ptr + seq_i * stride_topk_s + g_idx * stride_topk_n,
+            mask=g_mask, other=-1,
+        ).to(tl.int32)
+        k_rows_2d = topk_block_ids[:, None] * KV_BLOCK_SIZE + b_offs[None, :]
+        k_rows = tl.reshape(k_rows_2d, (GEMM_TILE,))
+
+        k_mask = (k_rows >= 0) & (k_rows < seq_kv)
+        safe_rows = tl.where(k_mask, k_rows, 0)
+
+        k = tl.load(
+            K_ptr + safe_rows[:, None] * stride_k_s + d_offs[None, :] * stride_k_d
+        )                                                          # fp8 [GEMM_TILE, D]
+        ks = tl.load(
+            KS_ptr + safe_rows * stride_ks_s, mask=k_mask, other=0.0,
+        )                                                          # f32 [GEMM_TILE]
+
+        s = tl.dot(k, q.trans(1, 0), out_dtype=tl.float32)
+        s = s * ks[:, None]
+        s = tl.maximum(s, 0.0)
+        s = s * w[None, :]
+        logits = tl.sum(s, axis=1)
+
+        pos_valid = (k_rows >= ks_min) & (k_rows < ke_max) & k_mask
+        logits = tl.where(pos_valid, logits, float("-inf"))
+
+        out_cols = n_i_start * KV_BLOCK_SIZE + bn_offs
+        out_mask = out_cols < topk * KV_BLOCK_SIZE
+        tl.store(
+            Logits_ptr + seq_i * stride_logits_s + out_cols * stride_logits_n,
+            logits,
+            mask=out_mask,
+        )
+
+
 def block_sparse_mqa_triton(
     q_fp8: torch.Tensor,              # [seq, H, D] fp8
     k_fp8: torch.Tensor,              # [seq_kv, D] fp8
@@ -963,6 +1058,37 @@ def block_sparse_mqa_triton(
         # Non-divisible topk: ceil to num_chunks; tail-pad lanes are handled
         # in-kernel via masked load (other=-1) + out_cols < topk*K store mask.
         num_chunks = (topk + GROUP_SIZE - 1) // GROUP_SIZE
+
+        # Stage 4 persistent: amortize Q[H,D] / W[H] HBM load across K_CHUNKS
+        # chunks per CTA. Sweep on H100 (sq=8192, skv∈{32K…128K}, topk=2048):
+        #   K=16, 32: K_CHUNKS=16 num_stages=2 num_warps=8 → 1.22-1.27×
+        #   K=8     : best persistent only +5%; K_CHUNKS=16/w=8 *regresses* 18%
+        #   K=64    : K_CHUNKS=32 num_warps=4 wins 1.31× (different config; TODO)
+        # Dispatch persistent only where speedup is non-marginal *and* config
+        # is uniform (K=16/32).
+        if kv_block_size in (16, 32):
+            K_CHUNKS = 16
+            outer = (num_chunks + K_CHUNKS - 1) // K_CHUNKS
+            grid = (seq_len, outer)
+            _block_sparse_mqa_persistent_kernel[grid](
+                q_fp8, k_fp8, k_scale, topk_block_index, logits, weights,
+                cu_seqlen_ks, cu_seqlen_ke,
+                q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2),
+                k_fp8.stride(0), k_fp8.stride(1),
+                k_scale.stride(0),
+                topk_block_index.stride(0), topk_block_index.stride(1),
+                logits.stride(0), logits.stride(1),
+                weights.stride(0), weights.stride(1),
+                seq_kv,
+                topk,
+                HEADS=H, DIM=D,
+                KV_BLOCK_SIZE=kv_block_size,
+                GROUP_SIZE=GROUP_SIZE,
+                K_CHUNKS=K_CHUNKS,
+                num_warps=8,
+            )
+            return logits
+
         grid = (seq_len, num_chunks)
         _block_sparse_mqa_grouped_kernel[grid](
             q_fp8, k_fp8, k_scale, topk_block_index, logits, weights,
