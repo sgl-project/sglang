@@ -212,8 +212,7 @@ def flash_attn_varlen_func(
             "flash_attn at sgl-kernel is only supported on sm90 and above"
         )
 
-    kernel = _load_fa3_kernels()["flash_attn_varlen_func"]
-    kwargs = dict(
+    return _load_fa3_kernels()["flash_attn_varlen_func"](
         q=q,
         k=k,
         v=v,
@@ -238,12 +237,5 @@ def flash_attn_varlen_func(
         sm_margin=sm_margin,
         return_softmax_lse=return_softmax_lse,
         sinks=sinks,
+        out=out,
     )
-    if out is None:
-        return kernel(**kwargs)
-    try:
-        return kernel(**kwargs, out=out)
-    except TypeError as exc:
-        if "unexpected keyword argument 'out'" not in str(exc):
-            raise
-        return kernel(**kwargs)
