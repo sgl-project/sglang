@@ -30,6 +30,14 @@ class _NoopSender:
         del args, kwargs
 
 
+def _replace_sender_with_noop(scheduler, name: str) -> None:
+    sender = getattr(scheduler, name, None)
+    socket = getattr(sender, "socket", None)
+    if socket is not None:
+        socket.close(linger=0)
+    setattr(scheduler, name, _NoopSender())
+
+
 @unittest.skipUnless(os.getenv(_MODEL_ENV), f"Set {_MODEL_ENV} for live smoke")
 class TestUGSRTSchedulerExecutorLive(CustomTestCase):
     def test_real_scheduler_runs_prefill_only_ug_session_requests(self):
@@ -63,6 +71,7 @@ class TestUGSRTSchedulerExecutorLive(CustomTestCase):
             pp_size=1,
             dp_size=1,
             disable_cuda_graph=True,
+            disable_piecewise_cuda_graph=True,
             disable_overlap_schedule=True,
             skip_server_warmup=True,
             mem_fraction_static=float(
@@ -87,8 +96,8 @@ class TestUGSRTSchedulerExecutorLive(CustomTestCase):
             moe_dp_rank=0,
             dp_rank=None,
         )
-        scheduler.send_to_tokenizer = _NoopSender()
-        scheduler.send_to_detokenizer = _NoopSender()
+        _replace_sender_with_noop(scheduler, "send_to_tokenizer")
+        _replace_sender_with_noop(scheduler, "send_to_detokenizer")
 
         try:
             executor = UGSRTSchedulerExecutor(scheduler, max_sync_steps=16)
