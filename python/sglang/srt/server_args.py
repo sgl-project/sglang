@@ -304,6 +304,7 @@ class ServerArgs:
     model_path: str
     tokenizer_path: Optional[str] = None
     tokenizer_mode: str = "auto"
+    tokenizer_backend: str = "huggingface"
     tokenizer_worker_num: int = 1
     skip_tokenizer_init: bool = False
     load_format: str = "auto"
@@ -562,6 +563,7 @@ class ServerArgs:
     elastic_ep_backend: Literal[None, "mooncake", "nixl"] = None
     enable_elastic_expert_backup: bool = False
     mooncake_ib_device: Optional[str] = None
+    elastic_ep_rejoin: bool = False
 
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
@@ -1858,10 +1860,24 @@ class ServerArgs:
                     self.attention_backend = "trtllm_mha"
                 elif is_sm90_supported():
                     self.attention_backend = "fa3"
+                elif is_xpu():
+                    self.attention_backend = "intel_xpu"
                 elif is_hip():
                     self.attention_backend = "aiter"
                 else:
                     self.attention_backend = "triton"
+
+            if is_xpu():
+                # Check for bf16 dtype on Intel XPU
+                if self.dtype == "auto":
+                    logger.warning(
+                        "GptOssForCausalLM on Intel XPU currently supports bfloat16 dtype only"
+                    )
+                elif self.dtype not in ["bfloat16"]:
+                    raise NotImplementedError(
+                        f"GptOssForCausalLM on Intel XPU only supports bfloat16 dtype, "
+                        f"but got '{self.dtype}'. Please use --dtype bfloat16 or remove --dtype to use auto."
+                    )
 
             supported_backends = [
                 "triton",
@@ -1869,6 +1885,7 @@ class ServerArgs:
                 "fa3",
                 "fa4",
                 "ascend",
+                "intel_xpu",
                 "aiter",
             ]
             prefill_attn_backend, decode_attn_backend = self.get_attention_backends()
@@ -3082,10 +3099,16 @@ class ServerArgs:
                     "elasticity_aware_hierarchical",
                 ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
 
+            assert self.pp_size == 1, "PP size should be set to 1 under elastic EP"
+
             if self.elastic_ep_backend == "mooncake":
                 self.mooncake_ib_device = self._validate_ib_devices(
                     self.mooncake_ib_device
                 )
+        if self.elastic_ep_rejoin:
+            assert (
+                self.elastic_ep_backend is not None
+            ), "Elastic EP rejoin requires elastic_ep_backend to be set."
 
     def _handle_expert_distribution_metrics(self):
         if self.enable_expert_distribution_metrics and (
@@ -4095,6 +4118,15 @@ class ServerArgs:
             help="Tokenizer mode. 'auto' will use the fast "
             "tokenizer if available, and 'slow' will "
             "always use the slow tokenizer.",
+        )
+        parser.add_argument(
+            "--tokenizer-backend",
+            type=str,
+            default=ServerArgs.tokenizer_backend,
+            choices=["huggingface", "fastokens"],
+            help="Tokenizer backend. 'huggingface' uses the default HuggingFace "
+            "tokenizers library, and 'fastokens' uses the fastokens library "
+            "for faster tokenization. Requires the fastokens package to be installed.",
         )
         parser.add_argument(
             "--tokenizer-worker-num",
@@ -5581,6 +5613,12 @@ class ServerArgs:
             "(e.g., --mooncake-ib-device mlx5_0,mlx5_1). "
             "Default is None, which triggers automatic device detection when Mooncake Backend is enabled.",
         )
+        parser.add_argument(
+            "--elastic-ep-rejoin",
+            action="store_true",
+            default=ServerArgs.elastic_ep_rejoin,
+            help="Indicates that this process is a relaunched elastic EP rank that should rejoin an existing process group.",
+        )
 
         # Mamba Cache
         parser.add_argument(
@@ -6254,7 +6292,11 @@ class ServerArgs:
             "--debug-tensor-dump-output-folder",
             type=str,
             default=ServerArgs.debug_tensor_dump_output_folder,
-            help="The output folder for dumping tensors.",
+            help=(
+                "The output folder for dumping tensors. "
+                "In Eagle mode, tensor outputs from draft and target models "
+                "are stored in separate subdirectories ('draft' and 'target')."
+            ),
         )
         parser.add_argument(
             "--debug-tensor-dump-layers",
