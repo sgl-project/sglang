@@ -227,6 +227,14 @@ def get_hf_text_config(config: PretrainedConfig):
             if getattr(_converted, "dtype", None) is None and parent_dtype is not None:
                 _converted.dtype = parent_dtype
             setattr(config, _attr, _converted)
+        elif _sub is not None and parent_dtype is not None:
+            # transformers v5 multimodal configs (e.g. Mistral3Config) carry
+            # `dtype` only on the top-level config, leaving the sub-configs at
+            # None. Without this, _get_and_verify_dtype falls back to float32
+            # and then "auto" downcasts to float16, which overflows the Pixtral
+            # vision tower on real images and produces NaN features.
+            if getattr(_sub, "dtype", None) is None:
+                _sub.dtype = parent_dtype
 
     # Priority: thinker_config > llm_config > language_config > text_config
     if hasattr(config, "thinker_config"):

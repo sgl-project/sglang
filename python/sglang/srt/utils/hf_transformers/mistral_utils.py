@@ -73,6 +73,22 @@ def adapt_config_dict(
             config_dict["architectures"] = ["MixtralForCausalLM"]
     else:
         config_dict["architectures"] = ["MistralForCausalLM"]
+        config_dict["model_type"] = "mistral"
+        # Mistral models use non-interleaved RoPE (is_neox_style=False),
+        # unlike Llama which defaults to True.
+        config_dict["rope_is_neox_style"] = False
+        # Remove None-valued MLA fields that would shadow defaults in
+        # model_config._derive_model_shapes (getattr returns None instead
+        # of the fallback when the attribute exists but is None).
+        for mla_key in (
+            "q_lora_rank",
+            "qk_rope_head_dim",
+            "qk_nope_head_dim",
+            "kv_lora_rank",
+            "v_head_dim",
+        ):
+            if config_dict.get(mla_key) is None:
+                config_dict.pop(mla_key, None)
 
     if bool(config_dict.get("yarn")):
         config_dict = _remap_mistral_yarn_args(config_dict)
