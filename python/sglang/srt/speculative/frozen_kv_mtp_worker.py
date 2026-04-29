@@ -164,8 +164,14 @@ class FrozenKVMTPWorker(TpModelWorker):
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
 
-        self.cuda_graph_runner = None
         self.draft_attn_backend = self.draft_model_runner.attn_backend
+        self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.cuda_graph_runner = None
+
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            self.init_cuda_graphs()
 
     @property
     def draft_model_runner(self):
@@ -258,6 +264,60 @@ class FrozenKVMTPWorker(TpModelWorker):
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata(forward_batch)
         forward_batch.attn_backend = self.draft_attn_backend
+
+    def _init_frozen_kv_metadata_capture_cuda_graph(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        with self._frozen_kv_target_view(forward_batch):
+            self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.batch_size * self.topk,
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=None,
+            )
+        forward_batch.attn_backend = self.draft_attn_backend
+
+    def _init_frozen_kv_metadata_replay_cuda_graph(
+        self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
+    ) -> None:
+        with self._frozen_kv_target_view(forward_batch):
+            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                forward_batch.req_pool_indices[:bs],
+                forward_batch.seq_lens[:bs],
+                seq_lens_sum,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=None,
+                seq_lens_cpu=(
+                    forward_batch.seq_lens_cpu[:bs]
+                    if forward_batch.seq_lens_cpu is not None
+                    else None
+                ),
+            )
+        forward_batch.attn_backend = self.draft_attn_backend
+
+    def init_cuda_graphs(self) -> None:
+        if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:
+            return
+        if self.target_worker.device != "cuda":
+            logger.info(
+                "Frozen-KV MTP draft CUDA graph is only supported on CUDA; "
+                "running the draft loop eagerly on %s.",
+                self.target_worker.device,
+            )
+            return
+
+        from sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner import (
+            FrozenKVMTPCudaGraphRunner,
+        )
+
+        logger.info("Capture Frozen-KV MTP draft cuda graph begin.")
+        self.cuda_graph_runner = FrozenKVMTPCudaGraphRunner(self)
+        logger.info("Capture Frozen-KV MTP draft cuda graph end.")
 
     def _select_last_extend_hidden(
         self, batch: ScheduleBatch, hidden_states: torch.Tensor
@@ -510,9 +570,19 @@ class FrozenKVMTPWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         self._set_positions(forward_batch)
-        forward_batch.can_run_dp_cuda_graph = False
 
-        parent_list, top_scores_index, draft_tokens = self.draft_forward(forward_batch)
+        can_run_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
+            forward_batch
+        )
+        if can_run_cuda_graph:
+            parent_list, top_scores_index, draft_tokens = self.cuda_graph_runner.replay(
+                forward_batch
+            )
+        else:
+            forward_batch.can_run_dp_cuda_graph = False
+            parent_list, top_scores_index, draft_tokens = self.draft_forward(
+                forward_batch
+            )
 
         (
             tree_mask,
@@ -549,7 +619,9 @@ class FrozenKVMTPWorker(TpModelWorker):
             seq_lens_cpu=forward_batch.seq_lens_cpu,
         )
 
-    def draft_forward(self, forward_batch: ForwardBatch):
+    def draft_forward(
+        self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
+    ):
         spec_info = forward_batch.spec_info
         assert isinstance(spec_info, EagleDraftInput)
         topk_p, topk_index, hidden_states = (
@@ -562,6 +634,9 @@ class FrozenKVMTPWorker(TpModelWorker):
         score_list: List[torch.Tensor] = []
         token_list: List[torch.Tensor] = []
         parents_list: List[torch.Tensor] = []
+
+        if not skip_attn_backend_init and self.speculative_num_steps > 1:
+            self._init_frozen_kv_metadata(forward_batch)
 
         scores = None
         for i in range(self.speculative_num_steps):
@@ -578,7 +653,6 @@ class FrozenKVMTPWorker(TpModelWorker):
             forward_batch.input_ids = input_ids
             forward_batch.spec_info.hidden_states = hidden_states
             self._set_positions(forward_batch)
-            self._init_frozen_kv_metadata(forward_batch)
 
             with self._target_kv_pool_view(forward_batch):
                 logits_output = self.draft_model_runner.forward(

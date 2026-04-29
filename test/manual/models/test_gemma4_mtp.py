@@ -1,18 +1,16 @@
-"""Manual Gemma 4 MTP GSM8K validation across three configs.
+"""Manual Gemma 4 MTP GSM8K validation.
 
 Implements the validation plan in
 ``/workspace/gemma4_downloads/frozen_kv_mtp_design.md`` §10.2:
 
 * config A (no MTP, baseline): launched once in :meth:`setUpClass` to
   record the calibrated target score.
-* config B (MTP, eager): ``--disable-cuda-graph`` so neither the target
-  nor the draft loop captures graphs.
 * config C (MTP + CUDA graph): default cuda graph capture (target +
-  ``FrozenKVMTPCudaGraphRunner`` for the recurrent draft loop).
+  ``FrozenKVMTPCudaGraphRunner`` for the recurrent draft loop), including
+  normal padding to the nearest captured batch size.
 
-Pass criterion: GSM8K score in B and C is within
-``gsm8k_score_drop_tolerance`` of A, and ``avg_spec_accept_length`` is
-above ``accept_length_threshold`` for both MTP configs.
+Pass criterion: GSM8K score in C is within ``gsm8k_score_drop_tolerance``
+of A, and ``avg_spec_accept_length`` is above ``accept_length_threshold``.
 
 Useful env vars (all optional):
 
@@ -96,12 +94,19 @@ def get_avg_spec_accept_length(base_url: str) -> Optional[float]:
     return float(val)
 
 
+def get_server_info(base_url: str) -> Dict:
+    response = requests.get(base_url + "/server_info", timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
 class Gemma4MTPGSM8KMixin:
-    """Three-config GSM8K harness: no-MTP / MTP eager / MTP + CUDA graph.
+    """Two-config GSM8K harness: no-MTP / MTP + CUDA graph.
 
     ``setUpClass`` launches the target-only baseline (config A) and records
-    the score. Each ``test_gsm8k_*`` method then launches its own MTP
-    server, runs GSM8K, asserts the score did not drop, and tears down.
+    the score. ``test_gsm8k_mtp_cuda_graph`` launches the MTP server with
+    CUDA graph enabled, runs GSM8K, asserts the score did not drop, and
+    tears down.
     """
 
     model_pair: ModelPair
@@ -162,9 +167,11 @@ class Gemma4MTPGSM8KMixin:
         return args
 
     @classmethod
-    def _mtp_server_args(cls, cuda_graph: bool) -> List[str]:
+    def _mtp_server_args(cls) -> List[str]:
         # NEXTN is resolved to Frozen-KV MTP for Gemma4 assistant drafts.
-        args = [
+        # Do not override --cuda-graph-bs; the test should exercise the
+        # default capture set and padding-to-captured-batch-size behavior.
+        return [
             "--speculative-algorithm",
             "NEXTN",
             "--speculative-draft-model-path",
@@ -176,10 +183,7 @@ class Gemma4MTPGSM8KMixin:
             "--speculative-num-draft-tokens",
             "6",
             "--disable-overlap-schedule",
-        ]
-        if not cuda_graph:
-            args.append("--disable-cuda-graph")
-        return args + cls._common_server_args()
+        ] + cls._common_server_args()
 
     @classmethod
     def _gsm8k_args(cls, base_url: str) -> SimpleNamespace:
@@ -240,16 +244,24 @@ class Gemma4MTPGSM8KMixin:
     # ------------------------------------------------------------------
     # MTP runs
     # ------------------------------------------------------------------
-    def _run_mtp_gsm8k(self, *, cuda_graph: bool, label: str) -> None:
+    def _run_mtp_gsm8k(self) -> None:
+        label = "mtp-cuda-graph"
         process = popen_launch_server(
             self.model_pair.target_path,
             self.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             env=self._server_env(),
-            other_args=self._mtp_server_args(cuda_graph=cuda_graph),
+            other_args=self._mtp_server_args(),
         )
         try:
             requests.get(self.base_url + "/flush_cache", timeout=30)
+            server_info = get_server_info(self.base_url)
+            disable_cuda_graph = bool(server_info.get("disable_cuda_graph"))
+            if disable_cuda_graph:
+                self.fail(
+                    f"[{self.model_pair.name}/{label}]: CUDA graph was requested "
+                    "but the server started with disable_cuda_graph=True"
+                )
             metrics = run_eval(self._gsm8k_args(self.base_url))
             mtp_score = float(metrics["score"])
             avg_accept = get_avg_spec_accept_length(self.base_url) or 0.0
@@ -288,13 +300,9 @@ class Gemma4MTPGSM8KMixin:
         """Acknowledge the calibrated baseline run from ``setUpClass``."""
         print(f"[{self.model_pair.name}/no-mtp] baseline score={self.target_score:.4f}")
 
-    def test_gsm8k_mtp_eager(self) -> None:
-        """Config B: MTP enabled, all CUDA graphs disabled."""
-        self._run_mtp_gsm8k(cuda_graph=False, label="mtp-eager")
-
     def test_gsm8k_mtp_cuda_graph(self) -> None:
         """Config C: MTP enabled with the FrozenKVMTPCudaGraphRunner."""
-        self._run_mtp_gsm8k(cuda_graph=True, label="mtp-cuda-graph")
+        self._run_mtp_gsm8k()
 
 
 class TestGemma4E2BMTPGSM8K(Gemma4MTPGSM8KMixin, CustomTestCase):
