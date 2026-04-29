@@ -462,6 +462,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_constraint = parser.get_structure_constraint(
                     request.tool_choice,
                     parallel_tool_calls=request.parallel_tool_calls,
+                    thinking_mode=thinking_mode,
                 )
             # Fallback: use generic JSON schema for required/named tool choice
             # only when no parser-specific constraint was set
