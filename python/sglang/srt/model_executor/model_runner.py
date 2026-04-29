@@ -1003,9 +1003,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 sv = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
                     t.untyped_storage()
                 )
-                if sv.data_ptr() not in {
-                    v.data_ptr() for v in model_tensors.values()
-                }:
+                if sv.data_ptr() not in {v.data_ptr() for v in model_tensors.values()}:
                     model_tensors[f"{name}.__storage"] = sv
 
         nixl_metadata = nixl_mgr.register_tensors(model_tensors)
