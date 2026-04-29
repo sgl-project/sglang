@@ -205,6 +205,13 @@ class RequestStage:
         "spec_draft_extend",
         level=3,
     )
+
+    # CPU-side run batch
+    RUN_BATCH_CPU = RequestStageConfig(
+        "run_batch_cpu",
+        level=4,
+    )
+
     # other
     ANONYMOUS = RequestStageConfig("")
 
@@ -565,6 +572,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     last_decode_scheduled_time: float = 0.0
     last_forward_entry_time: float = 0.0
     last_prefill_finished_time: float = 0.0
+    run_batch_cpu_start_time: float = 0.0
 
     # speculative decoding
     spec_draft_start_time: float = 0.0
@@ -632,6 +640,18 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             ts = time.perf_counter()
         stage = RequestStage.SPEC_DRAFT_EXTEND
         self.trace_slice(stage, self.spec_draft_extend_start_time, ts)
+
+    def set_run_batch_cpu_start_time(self, ts=None, attrs=None):
+        ts = ts or time.perf_counter()
+        self.run_batch_cpu_start_time = ts
+
+    def set_run_batch_cpu_end_time(self, ts=None, attrs=None):
+        ts = ts or time.perf_counter()
+        if self.run_batch_cpu_start_time > 0.0:
+            self.trace_slice(
+                RequestStage.RUN_BATCH_CPU, self.run_batch_cpu_start_time, ts, attrs
+            )
+            self.run_batch_cpu_start_time = 0.0
 
     def set_retract_time(self, ts=None):
         ts = ts or time.perf_counter()
@@ -1105,7 +1125,12 @@ def set_schedule_time_batch(batch: ScheduleBatch):
         req.time_stats.set_last_scheduled_time(batch.forward_mode, ts, _attrs)
 
 
-def set_time_batch(reqs: List[Any], set_func: str, trace_only: bool = False):
+def set_time_batch(
+    reqs: List[Any],
+    set_func: str,
+    trace_only: bool = False,
+    attrs: Optional[Dict[str, Any]] = None,
+):
     if reqs is None or len(reqs) == 0:
         return
     if trace_only and not get_global_tracing_enabled():
@@ -1114,4 +1139,7 @@ def set_time_batch(reqs: List[Any], set_func: str, trace_only: bool = False):
     ts = time.perf_counter()
     for req in reqs:
         method = getattr(req.time_stats, set_func)
-        method(ts)
+        if attrs is None:
+            method(ts)
+        else:
+            method(ts, attrs)

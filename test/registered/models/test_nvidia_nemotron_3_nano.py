@@ -7,7 +7,6 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 register_cuda_ci(
     est_time=564,
     suite="stage-b-test-2-gpu-large",
-    disabled="Temporarily disabled; failing on main.",
 )
 
 NEMOTRON_3_NANO_THINKING_ARGS = [
