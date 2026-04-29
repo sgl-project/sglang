@@ -40,7 +40,7 @@ constexpr int32_t kTileElements = 4;
 
 /// \brief Need to improve register usage to reduce latency
 #define C4_KERNEL __global__ __launch_bounds__(128, 4)
-#define WRITE_KERNEL __global__ __launch_bounds__(128, 20)
+#define WRITE_KERNEL __global__ __launch_bounds__(128, 16)
 
 struct Compress4DecodeParams {
   void* __restrict__ kv_buffer;

@@ -60,6 +60,8 @@ def _jit_compress_plan_module() -> Module:
         cuda_wrappers=[
             ("plan_prefill", "plan_compress_prefill"),
             ("plan_decode", "plan_compress_decode"),
+            ("plan_prefill_legacy", "plan_compress_prefill_legacy"),
+            ("plan_decode_legacy", "plan_compress_decode_legacy"),
         ],
     )
 
@@ -134,6 +136,20 @@ class CompressorDecodePlan(NamedTuple):
             int(compress_ratio),
             int(swa_page_size),
             int(ring_size),
+        )
+        return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
+
+    @staticmethod
+    def generate_legacy(
+        compress_ratio: Literal[4, 128],
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> CompressorDecodePlan:
+        module = _jit_compress_plan_module()
+        plan_d = module.plan_decode_legacy(
+            req_pool_indices,
+            seq_lens,
+            int(compress_ratio),
         )
         return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
 
@@ -229,6 +245,37 @@ class CompressorPrefillPlan(NamedTuple):
             plan_tensor[1, : plan_lens[1]].to(device, non_blocking=True),
         )
 
+    @staticmethod
+    def generate_legacy(
+        compress_ratio: Literal[4, 128],
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        extend_lens: torch.Tensor,
+        num_q_tokens: int,
+        device: torch.device,
+        use_cuda_graph: bool = False,
+    ) -> CompressorPrefillPlan:
+        pin_buffer = torch.empty(
+            num_q_tokens * _PREFILL_PLAN_BYTES,
+            dtype=torch.uint8,
+            pin_memory=True,
+        )
+        module = _jit_compress_plan_module()
+        plan_c, plan_w = module.plan_prefill_legacy(
+            req_pool_indices,
+            seq_lens,
+            extend_lens,
+            pin_buffer,
+            int(num_q_tokens),
+            int(compress_ratio),
+            bool(use_cuda_graph),
+        )
+        return CompressorPrefillPlan(
+            compress_ratio,
+            torch.from_dlpack(plan_c),
+            torch.from_dlpack(plan_w),
+        )
+
     @property
     def is_decode(self) -> bool:
         return False
@@ -244,11 +291,6 @@ def compress_forward(
     compress_ratio: Literal[4, 128],
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Run the c4/c128 compress kernel.
-
-    The plan tensors carry all the state-pool slot information; no separate
-    `indices` or `extra_data` arguments are needed.
-    """
     assert head_dim % 128 == 0
     num_q_tokens = kv_score_input.shape[0]
     if out is None:

@@ -55,6 +55,26 @@ struct DecodeParams {
   int32_t compress_ratio;
 };
 
+struct Prefill1ParamsLegacy {
+  PlanC* plan_c;
+  PlanW* plan_w;
+  const RID_T* rid_ptr;  // [batch_size]
+  uint32_t num_c;
+  uint32_t num_w;
+  uint32_t num_c_padded;
+  uint32_t num_w_padded;
+  uint32_t num_work;
+  int32_t compress_ratio;
+};
+
+struct DecodeParamsLegacy {
+  PlanD* plan_d;
+  const RID_T* rid_ptr;  // [batch_size]
+  const IDX_T* seq_ptr;  // [batch_size]
+  uint32_t batch_size;
+  int32_t compress_ratio;
+};
+
 /// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
 SGL_DEVICE __host__ PlanW pack_w(uint32_t ragged_id, uint32_t batch_id, int32_t seq_len) {
   return {static_cast<uint32_t>(ragged_id | batch_id << 16), seq_len};
@@ -133,6 +153,79 @@ __global__ void plan_compress_decode_kernel(const DecodeParams params) {
   const auto write_loc = compute_loc(swa_loc_1);
   const auto read_page_0 = compute_loc(swa_loc_0) / params.compress_ratio;
   const auto read_page_1 = write_loc / params.compress_ratio;
+  params.plan_d[idx] = {
+      .seq_len = static_cast<uint32_t>(seq_len),
+      .write_loc = write_loc,
+      .read_page_0 = read_page_0,
+      .read_page_1 = read_page_1,
+  };
+}
+
+__global__ void plan_compress_prefill_legacy_kernel(const Prefill1ParamsLegacy params) {
+  const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= params.num_work) return;
+  auto plan_c = idx < params.num_c ? params.plan_c[idx] : PlanC::invalid();
+  auto plan_w = idx < params.num_w ? params.plan_w[idx] : PlanW::invalid();
+
+  /// Per-request ring buffer slot translation:
+  /// - c4:   page = rid * 2 + (position / 4) % 2; slot = page * 4 + position % 4
+  /// - c128: page = rid;                          slot = rid * 128 + position % 128
+  const auto legacy_compute_page = [&](int32_t rid, int32_t position) {
+    if (params.compress_ratio == 4) return rid * 2 + ((position / 4) & 1);
+    return rid;  // c128
+  };
+  const auto legacy_compute_loc = [&](int32_t rid, int32_t position) {
+    const auto remainder = position % params.compress_ratio;
+    return legacy_compute_page(rid, position) * params.compress_ratio + remainder;
+  };
+
+  if (!plan_c.is_invalid()) {
+    const auto batch_id = plan_c.read_page_1;
+    const auto rid = static_cast<int32_t>(params.rid_ptr[batch_id]);
+    // `seq_len` is ratio-aligned for compress events
+    const auto position_1 = static_cast<int32_t>(plan_c.seq_len) - 1;
+    const auto position_0 = max(position_1 - params.compress_ratio, 0);
+    plan_c.read_page_0 = legacy_compute_page(rid, position_0);
+    plan_c.read_page_1 = legacy_compute_page(rid, position_1);
+    params.plan_c[idx] = plan_c;
+  } else if (idx < params.num_c_padded) {
+    params.plan_c[idx] = PlanC::invalid();
+  }
+
+  if (!plan_w.is_invalid()) {
+    const auto [ragged_id, batch_id] = unpack_w(plan_w);
+    const auto rid = static_cast<int32_t>(params.rid_ptr[batch_id]);
+    // `write_loc` carries (position + 1) at this stage; may not be ratio-aligned
+    const auto position = static_cast<int32_t>(plan_w.write_loc) - 1;
+    plan_w.ragged_id = ragged_id;
+    plan_w.write_loc = legacy_compute_loc(rid, position);
+    params.plan_w[idx] = plan_w;
+  } else if (idx < params.num_w_padded) {
+    params.plan_w[idx] = PlanW::invalid();
+  }
+}
+
+__global__ void plan_compress_decode_legacy_kernel(const DecodeParamsLegacy params) {
+  const auto idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= params.batch_size) return;
+  /// Per-request ring buffer slot translation:
+  /// - c4:   page = rid * 2 + (position / 4) % 2; slot = page * 4 + position % 4
+  /// - c128: page = rid;                          slot = rid * 128 + position % 128
+  const auto legacy_compute_page = [&](int32_t rid, int32_t position) {
+    if (params.compress_ratio == 4) return rid * 2 + ((position / 4) & 1);
+    return rid;  // c128
+  };
+  const auto legacy_compute_loc = [&](int32_t rid, int32_t position) {
+    const auto remainder = position % params.compress_ratio;
+    return legacy_compute_page(rid, position) * params.compress_ratio + remainder;
+  };
+  const auto rid = static_cast<int32_t>(params.rid_ptr[idx]);
+  const auto seq_len = static_cast<int32_t>(params.seq_ptr[idx]);
+  const auto position_1 = seq_len - 1;
+  const auto position_0 = max(position_1 - params.compress_ratio, 0);
+  const auto write_loc = legacy_compute_loc(rid, position_1);
+  const auto read_page_0 = legacy_compute_page(rid, position_0);
+  const auto read_page_1 = legacy_compute_page(rid, position_1);
   params.plan_d[idx] = {
       .seq_len = static_cast<uint32_t>(seq_len),
       .write_loc = write_loc,
@@ -242,7 +335,10 @@ inline PrefillPlan plan_compress_prefill(
     RuntimeCheck(0 < extend_len && extend_len <= seq_len);
     const auto should_write = [=](int32_t position) {
       if (position >= first_w_pos) return true;
-      return is_overlap && (position + 1) % swa_page_size >= (swa_page_size - compress_ratio);
+      // Write the last `compress_ratio` positions of every swa_page so the
+      // overlap page is fully populated when prefix-matching resumes from a
+      // swa_page boundary.
+      return is_overlap && position % swa_page_size >= (swa_page_size - compress_ratio);
     };
     for (const auto j : irange(extend_len)) {
       const int32_t position = prefix_len + j;
@@ -345,6 +441,160 @@ inline tvm::ffi::Tensor plan_compress_decode(
   const auto block_size = 256;
   const auto num_blocks = div_ceil(batch_size, block_size);
   LaunchKernel(num_blocks, block_size, device)(plan_compress_decode_kernel, params);
+  return D;
+}
+
+/**
+ * \brief Build c4/c128 prefill plan tensors for the legacy non-paged ring
+ * buffer. Uses only `req_pool_indices` to derive ring slots:
+ *   - c4 (overlap):  each request occupies 2 contiguous pages (8 token slots)
+ *   - c128:          each request occupies 1 page (128 token slots)
+ *
+ * Inputs:
+ * @param req_pool_indices  `[batch_size]` int64 (GPU)
+ * @param seq_lens          `[batch_size]` int64 (CPU)
+ * @param extend_lens       `[batch_size]` int64 (CPU)
+ * @param pin_buffer        pinned scratch (CPU uint8)
+ * @return (compress plan tensor, write plan tensor)
+ */
+inline PrefillPlan plan_compress_prefill_legacy(
+    const tvm::ffi::TensorView req_pool_indices,  // GPU
+    const tvm::ffi::TensorView seq_lens,          // CPU
+    const tvm::ffi::TensorView extend_lens,       // CPU
+    const tvm::ffi::TensorView pin_buffer,        // CPU
+    const uint32_t num_q_tokens,
+    const int32_t compress_ratio,
+    const bool use_cuda_graph) {
+  auto B = SymbolicSize{"batch_size"};
+  auto device_ = SymbolicDevice{};
+  device_.set_options<kDLCUDA>();
+
+  TensorMatcher({B})  //
+      .with_dtype<RID_T>()
+      .with_device(device_)
+      .verify(req_pool_indices);
+  TensorMatcher({B})  //
+      .with_dtype<IDX_T>()
+      .with_device<kDLCPU>()
+      .verify(seq_lens)
+      .verify(extend_lens);
+  TensorMatcher({-1})  //
+      .with_dtype<uint8_t>()
+      .with_device<kDLCPU>()
+      .verify(pin_buffer);
+
+  const auto pin_buffer_bytes = static_cast<size_t>(pin_buffer.numel()) * sizeof(uint8_t);
+  RuntimeCheck(pin_buffer_bytes >= num_q_tokens * (sizeof(PlanC) + sizeof(PlanW)));
+  const auto plan_c_ptr = reinterpret_cast<PlanC*>(pin_buffer.data_ptr());
+  const auto plan_w_ptr = reinterpret_cast<PlanW*>(plan_c_ptr + num_q_tokens);
+
+  const bool is_overlap = (compress_ratio == 4);
+  const auto seq_ptr = static_cast<const IDX_T*>(seq_lens.data_ptr());
+  const auto ext_ptr = static_cast<const IDX_T*>(extend_lens.data_ptr());
+  const auto rid_ptr = static_cast<const RID_T*>(req_pool_indices.data_ptr());
+
+  const auto window_size = compress_ratio * (is_overlap ? 2 : 1);
+  const auto batch_size = static_cast<uint32_t>(B.unwrap());
+  constexpr auto kMaxTokens = static_cast<uint32_t>(std::numeric_limits<uint16_t>::max());
+  RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
+  RuntimeCheck(batch_size <= num_q_tokens && num_q_tokens <= kMaxTokens);
+
+  uint32_t counter = 0;
+  uint32_t counter_c = 0;
+  uint32_t counter_w = 0;
+  const auto should_compress = [=](int32_t position) { return (position + 1) % compress_ratio == 0; };
+  for (const auto i : irange(batch_size)) {
+    const int32_t seq_len = seq_ptr[i];
+    const int32_t extend_len = ext_ptr[i];
+    const int32_t prefix_len = seq_len - extend_len;
+    const int32_t last_c_pos = seq_len / compress_ratio * compress_ratio;
+    const int32_t first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
+    RuntimeCheck(0 < extend_len && extend_len <= seq_len);
+    const auto should_write = [=](int32_t position) { return position >= first_w_pos; };
+    for (const auto j : irange(extend_len)) {
+      const int32_t position = prefix_len + j;
+      const int32_t ragged_id = counter + j;
+      if (should_compress(position)) {
+        const auto buffer_len = window_size - std::min(j + 1, window_size);
+        plan_c_ptr[counter_c++] = {
+            .seq_len = static_cast<uint32_t>(position + 1),
+            .ragged_id = static_cast<uint16_t>(ragged_id),
+            .buffer_len = static_cast<uint16_t>(buffer_len),
+            // to be filled by kernel
+            .read_page_0 = -1,
+            .read_page_1 = static_cast<int32_t>(i),
+        };
+      }
+      if (should_write(position)) {
+        plan_w_ptr[counter_w++] = pack_w(ragged_id, i, position + 1);
+      }
+    }
+    counter += extend_len;
+  }
+  RuntimeCheck(counter == num_q_tokens);
+
+  const auto device = device_.unwrap();
+  const auto stream = LaunchKernel::resolve_device(device);
+  const auto copy_to_device = [stream](void* cuda_ptr, auto* host_ptr, size_t count) {
+    const auto size_bytes = count * sizeof(*host_ptr);
+    RuntimeDeviceCheck(cudaMemcpyAsync(cuda_ptr, host_ptr, size_bytes, cudaMemcpyHostToDevice, stream));
+  };
+  const auto num_c_padded = use_cuda_graph ? num_q_tokens : counter_c;
+  const auto num_w_padded = use_cuda_graph ? num_q_tokens : counter_w;
+  auto C = ffi::empty({num_c_padded, sizeof(PlanC)}, kDLUInt8, device);
+  auto W = ffi::empty({num_w_padded, sizeof(PlanW)}, kDLUInt8, device);
+  copy_to_device(C.data_ptr(), plan_c_ptr, counter_c);
+  copy_to_device(W.data_ptr(), plan_w_ptr, counter_w);
+  const auto params = Prefill1ParamsLegacy{
+      .plan_c = static_cast<PlanC*>(C.data_ptr()),
+      .plan_w = static_cast<PlanW*>(W.data_ptr()),
+      .rid_ptr = rid_ptr,
+      .num_c = counter_c,
+      .num_w = counter_w,
+      .num_c_padded = num_c_padded,
+      .num_w_padded = num_w_padded,
+      .num_work = std::max(num_c_padded, num_w_padded),
+      .compress_ratio = compress_ratio,
+  };
+  const auto block_size = 256;
+  const auto num_blocks = div_ceil(params.num_work, block_size);
+  if (num_blocks > 0) {
+    LaunchKernel(num_blocks, block_size, device)(plan_compress_prefill_legacy_kernel, params);
+  }
+  return PrefillPlan{std::move(C), std::move(W)};
+}
+
+inline tvm::ffi::Tensor plan_compress_decode_legacy(
+    const tvm::ffi::TensorView req_pool_indices,  // GPU
+    const tvm::ffi::TensorView seq_lens,          // GPU
+    const int32_t compress_ratio) {
+  auto B = SymbolicSize{"batch_size"};
+  auto device_ = SymbolicDevice{};
+  device_.set_options<kDLCUDA>();
+
+  TensorMatcher({B})  //
+      .with_dtype<RID_T>()
+      .with_device(device_)
+      .verify(req_pool_indices);
+  TensorMatcher({B})  //
+      .with_dtype<IDX_T>()
+      .with_device(device_)
+      .verify(seq_lens);
+  RuntimeCheck(compress_ratio == 4 || compress_ratio == 128);
+
+  const auto batch_size = static_cast<uint32_t>(B.unwrap());
+  const auto device = device_.unwrap();
+  auto D = ffi::empty({batch_size, sizeof(PlanD)}, kDLUInt8, device);
+  const auto params = DecodeParamsLegacy{
+      .plan_d = static_cast<PlanD*>(D.data_ptr()),
+      .rid_ptr = static_cast<const RID_T*>(req_pool_indices.data_ptr()),
+      .seq_ptr = static_cast<const IDX_T*>(seq_lens.data_ptr()),
+      .batch_size = batch_size,
+      .compress_ratio = compress_ratio,
+  };
+  const auto block_size = 256;
+  const auto num_blocks = div_ceil(batch_size, block_size);
+  LaunchKernel(num_blocks, block_size, device)(plan_compress_decode_legacy_kernel, params);
   return D;
 }
 

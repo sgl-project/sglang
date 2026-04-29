@@ -45,7 +45,7 @@ constexpr uint32_t kWriteBlockSize = 128;  // one warp per write
 
 /// \brief Need to reduce register usage to increase occupancy
 #define C128_KERNEL __global__ __launch_bounds__(kBlockSize, 2)
-#define WRITE_KERNEL __global__ __launch_bounds__(kWriteBlockSize, 20)
+#define WRITE_KERNEL __global__ __launch_bounds__(kWriteBlockSize, 16)
 
 struct Compress128DecodeParams {
   void* __restrict__ kv_buffer;
