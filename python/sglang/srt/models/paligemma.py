@@ -38,7 +38,6 @@ from sglang.srt.model_loader.weight_utils import (
 from sglang.srt.models.gemma2 import Gemma2ForCausalLM
 from sglang.srt.models.siglip import SiglipVisionModel
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -153,10 +152,7 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
         all_pixel_values = [item.feature for item in items]
         # Flatten list of tensors
         pixel_values = torch.cat(
-            [
-                pv if pv.dim() == 4 else pv.unsqueeze(0)
-                for pv in all_pixel_values
-            ],
+            [pv if pv.dim() == 4 else pv.unsqueeze(0) for pv in all_pixel_values],
             dim=0,
         )
 
@@ -172,7 +168,7 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
         projected = self.multi_modal_projector(image_features)
 
         # Scale embeddings (matches HuggingFace implementation)
-        projected = projected * (self.config.hidden_size ** -0.5)
+        projected = projected * (self.config.hidden_size**-0.5)
 
         return projected
 
@@ -220,12 +216,12 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
             # Apply prefix remapping
             for old_prefix, new_prefix in hf_to_sglang.items():
                 if name.startswith(old_prefix):
-                    name = new_prefix + name[len(old_prefix):]
+                    name = new_prefix + name[len(old_prefix) :]
                     break
 
             if name.startswith("language_model."):
                 # Strip the "language_model." prefix before delegating
-                lm_name = name[len("language_model."):]
+                lm_name = name[len("language_model.") :]
                 lm_weights.append((lm_name, loaded_weight))
             else:
                 other_weights.append((name, loaded_weight))
