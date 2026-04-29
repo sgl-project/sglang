@@ -358,7 +358,7 @@ class SchedulerOutputProcessorMixin:
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
         result.num_accepted_drafts = sum(accept_lens) - len(batch.reqs)
-        result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
+        result.num_accepted_drafts_per_req_cpu = [x - 1 for x in accept_lens]
 
         predict_tokens = []
         stride = self.draft_worker.speculative_num_draft_tokens
@@ -371,7 +371,7 @@ class SchedulerOutputProcessorMixin:
             )
             req.spec_verify_ct += 1
 
-            accepted_draft_tokens = result.accept_length_per_req_cpu[i]
+            accepted_draft_tokens = result.num_accepted_drafts_per_req_cpu[i]
             req.spec_accepted_drafts += accepted_draft_tokens
             req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
@@ -603,13 +603,13 @@ class SchedulerOutputProcessorMixin:
                 req.mamba_last_track_seqlen = seq_len
             elif (
                 not batch.spec_algorithm.is_none()
-                and result.accept_length_per_req_cpu is not None
+                and result.num_accepted_drafts_per_req_cpu is not None
             ):
                 # for spec decode, update mamba_last_track_seqlen if this iteration crosses a track interval
                 actual_seq_len = req.seqlen - 1
                 if (
                     actual_seq_len // mamba_track_interval
-                    != (actual_seq_len - result.accept_length_per_req_cpu[i] - 1)
+                    != (actual_seq_len - result.num_accepted_drafts_per_req_cpu[i] - 1)
                     // mamba_track_interval
                 ):
                     req.mamba_next_track_idx = (
