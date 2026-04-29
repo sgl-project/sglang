@@ -8,7 +8,6 @@
     "hbm_size": "0",
     "device_id": 0,
     "init_bm": true,
-    "check_server": true,
-    "metrics_url": "http://127.0.0.1:8000",
+    "check_server": false,
     "conf_file_path": "/usr/local/memcache_hybrid/latest/config/mmc-local.conf"
 }

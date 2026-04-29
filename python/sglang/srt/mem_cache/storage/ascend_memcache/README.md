@@ -15,10 +15,32 @@
 git clone https://github.com/nbbb24/sglang.git
 ```
 [ascend安装指南](https://github.com/nbbb24/sglang/blob/main/docs/platforms/ascend/ascend_npu.md)
+
+##### 安装sglang kernel npu 
+[链接](https://github.com/sgl-project/sgl-kernel-npu/blob/main/python/sgl_kernel_npu/README.md)
+先cd出sglang文件夹
 ```
-cd sglang
-cd python 
-python -m pip install -e .
+git clone https://github.com/sgl-project/sgl-kernel-npu.git
+```
+编译
+```
+cd sgl-kernel-npu
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+bash build.sh
+pip install output/sgl_kernel_npu*.whl
+python -c "import sgl_kernel_npu; print(sgl_kernel_npu.__path__)"
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+```
+cd至sglang文件夹
+
+```
+apt update
+apt install libgl1 libglib2.0-0
+pip install "setuptools<80"
+```
+```
+mv python/pyproject_npu.toml python/pyproject.toml
+pip install -e python[all_npu]
 ```
 
 
@@ -301,10 +323,36 @@ export PYTHONPATH=/home/sxy/sglang/python:$PYTHONPATH
 运行
 ```
 python -m sglang.launch_server \
-  --model-path /data/atb_testdata/weights/DeepSeek-V2-Lite-Chat \
+  --model-path /home/data/weights/DeepSeek-V2-Lite-Chat \
   --attention-backend ascend \
   --enable-hierarchical-cache \
   --hicache-storage-backend ascend_memcache \
   --host 0.0.0.0 \
   --port 30000
+```
+
+测试
+```
+curl -X POST http://localhost:30000/generate \
+    -H "Content-Type: application/json" \
+    -d '{
+        "text": "The capital of France is",
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 16
+        }
+    }'
+```
+
+```
+curl -X POST http://localhost:30000/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "You are a careful assistant. Read the following long context and then answer.\n\n[Document Start]\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\nParis is the capital of France and has many landmarks such as the Eiffel Tower, Louvre Museum, and Notre-Dame Cathedral. The city is known for art, history, architecture, fashion, and cuisine. This paragraph is repeated to create a long prompt for KV cache testing.\n[Document End]\n\nQuestion: Where is the capital of France? What is it famous for? Is it in Asia?",
+    "sampling_params": {
+      "temperature": 0,
+      "max_new_tokens": 100
+    }
+  }'
+
 ```
