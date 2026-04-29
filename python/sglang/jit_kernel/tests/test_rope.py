@@ -14,11 +14,11 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=64, suite="stage-b-kernel-unit-1-gpu-large")
 register_cuda_ci(est_time=256, suite="nightly-kernel-1-gpu", nightly=True)
 
-# Determine device: prefer XPU if available, otherwise CUDA
-if hasattr(torch, "xpu") and torch.xpu.is_available():
-    DEVICE = "xpu"
-elif torch.cuda.is_available():
+# Determine device: prefer CUDA for CUDA CI coverage, fall back to XPU
+if torch.cuda.is_available():
     DEVICE = "cuda"
+elif hasattr(torch, "xpu") and torch.xpu.is_available():
+    DEVICE = "xpu"
 else:
     DEVICE = None
 

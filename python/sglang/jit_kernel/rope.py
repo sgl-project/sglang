@@ -48,37 +48,46 @@ def _jit_fused_rope_module(is_neox: bool, rope_dim: int, dtype: torch.dtype) -> 
 
 # XPU/SYCL implementations
 if _HAS_XPU:
+    _SUPPORTED_XPU_ROPE_DTYPES = {
+        torch.float16: "fp16",
+        torch.bfloat16: "bf16",
+    }
+    _SUPPORTED_XPU_ROPE_DIMS = [64, 80, 96, 128, 256, 512]
+    
     @cache_once
-    def _jit_fused_rope_module_xpu(is_neox: bool, rope_dim: int, dtype: torch.dtype):
-        """XPU/SYCL version of fused RoPE JIT compilation"""
-        dtype_map = {
-            torch.float16: "fp16",
-            torch.bfloat16: "bf16",
-        }
+    def _jit_fused_rope_base_module_xpu(rope_dim: int):
+        """Compile/load the shared XPU/SYCL fused RoPE module for a rope_dim.
         
-        if dtype not in dtype_map:
-            raise ValueError(f"Unsupported dtype for XPU RoPE: {dtype}. Only fp16/bf16 supported.")
+        The module exports all is_neox and dtype variants for the given rope_dim,
+        so it's cached only by rope_dim to avoid redundant compilations.
+        """
+        if rope_dim not in _SUPPORTED_XPU_ROPE_DIMS:
+            raise ValueError(
+                f"Unsupported rope_dim for XPU RoPE: {rope_dim}. "
+                f"Supported: {_SUPPORTED_XPU_ROPE_DIMS}"
+            )
         
-        dtype_str = dtype_map[dtype]
-        
-        # Currently only common rope_dims are pre-compiled
-        supported_rope_dims = [64, 80, 96, 128, 256, 512]
-        if rope_dim not in supported_rope_dims:
-            raise ValueError(f"Unsupported rope_dim for XPU RoPE: {rope_dim}. Supported: {supported_rope_dims}")
-        
-        # Compile for requested configuration
-        is_neox_str = "true" if is_neox else "false"
-        
-        module = load_jit_sycl(
+        return load_jit_sycl(
             "fused_rope",
-            is_neox_str,
             str(rope_dim),
-            dtype_str,
             sycl_files=["elementwise/rope.hpp"],
             extra_sycl_cflags=[
                 f"-DSGL_ROPE_DIM={rope_dim}",
             ],
         )
+    
+    def _jit_fused_rope_module_xpu(is_neox: bool, rope_dim: int, dtype: torch.dtype):
+        """XPU/SYCL version of fused RoPE JIT compilation"""
+        if dtype not in _SUPPORTED_XPU_ROPE_DTYPES:
+            raise ValueError(
+                f"Unsupported dtype for XPU RoPE: {dtype}. "
+                f"Only fp16/bf16 supported."
+            )
+        
+        dtype_str = _SUPPORTED_XPU_ROPE_DTYPES[dtype]
+        
+        # Get the shared base module (cached by rope_dim only)
+        module = _jit_fused_rope_base_module_xpu(rope_dim)
         
         return XPUFusedRopeWrapper(module, is_neox, rope_dim, dtype_str)
     
@@ -94,6 +103,22 @@ if _HAS_XPU:
         def run_rope(self, q, k, cos_sin_cache, positions):
             """Apply RoPE inplace to q and k"""
             import ctypes
+            
+            # Validate tensor dtypes and layout
+            if positions.dtype not in (torch.int32, torch.int64):
+                raise ValueError(
+                    f"positions must be int32 or int64, got {positions.dtype}"
+                )
+            if cos_sin_cache.dtype != torch.float32:
+                raise ValueError(
+                    f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}"
+                )
+            if not q.is_contiguous() or not k.is_contiguous():
+                raise ValueError("q and k tensors must be contiguous")
+            if q.shape[2] != self._rope_dim:
+                raise ValueError(
+                    f"q head dimension {q.shape[2]} does not match rope_dim {self._rope_dim}"
+                )
             
             # Get XPU queue
             queue = torch.xpu.current_stream().sycl_queue
@@ -145,6 +170,31 @@ if _HAS_XPU:
         def run_rope_store(self, q, k, v, k_cache, v_cache, cos_sin_cache, positions, out_loc):
             """Apply RoPE inplace and store K/V to cache"""
             import ctypes
+            
+            # Validate tensor dtypes and layout
+            if positions.dtype not in (torch.int32, torch.int64):
+                raise ValueError(
+                    f"positions must be int32 or int64, got {positions.dtype}"
+                )
+            if out_loc.dtype not in (torch.int32, torch.int64):
+                raise ValueError(
+                    f"out_loc must be int32 or int64, got {out_loc.dtype}"
+                )
+            if positions.dtype != out_loc.dtype:
+                raise ValueError(
+                    f"positions and out_loc must have the same dtype, "
+                    f"got {positions.dtype} and {out_loc.dtype}"
+                )
+            if cos_sin_cache.dtype != torch.float32:
+                raise ValueError(
+                    f"cos_sin_cache must be float32, got {cos_sin_cache.dtype}"
+                )
+            if not q.is_contiguous() or not k.is_contiguous() or not v.is_contiguous():
+                raise ValueError("q, k, v tensors must be contiguous")
+            if q.shape[2] != self._rope_dim:
+                raise ValueError(
+                    f"q head dimension {q.shape[2]} does not match rope_dim {self._rope_dim}"
+                )
             
             # Get XPU queue
             queue = torch.xpu.current_stream().sycl_queue

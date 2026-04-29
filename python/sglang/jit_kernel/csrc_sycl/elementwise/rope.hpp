@@ -149,11 +149,12 @@ public:
                 const aligned_vector<float, 2>* sin_ptr_vec = reinterpret_cast<const aligned_vector<float, 2>*>(sin_ptr);
                 
                 #pragma unroll 4
-                for (int64_t i = lane_id; i < kVecSize; i += kWorkThreads) {
-                    DType2 input_vec_x = input_vec_x_ptr[i];
-                    DType2 input_vec_y = input_vec_y_ptr[i];
-                    aligned_vector<float, 2> cos_pair = cos_ptr_vec[i];
-                    aligned_vector<float, 2> sin_pair = sin_ptr_vec[i];
+                for (int64_t i = 0; i < kVecSize; ++i) {
+                    const int64_t vec_idx = static_cast<int64_t>(lane_id) * kVecSize + i;
+                    DType2 input_vec_x = input_vec_x_ptr[vec_idx];
+                    DType2 input_vec_y = input_vec_y_ptr[vec_idx];
+                    aligned_vector<float, 2> cos_pair = cos_ptr_vec[vec_idx];
+                    aligned_vector<float, 2> sin_pair = sin_ptr_vec[vec_idx];
                     
                     #pragma unroll
                     for (int j = 0; j < 2; ++j) {
@@ -169,8 +170,8 @@ public:
                         input_vec_y[j] = static_cast<DType>(out_y);
                     }
                     
-                    input_vec_x_ptr[i] = input_vec_x;
-                    input_vec_y_ptr[i] = input_vec_y;
+                    input_vec_x_ptr[vec_idx] = input_vec_x;
+                    input_vec_y_ptr[vec_idx] = input_vec_y;
                 }
             } else {
                 // Interleaved style (GPT-J): pairs (x, y) adjacent
@@ -179,16 +180,17 @@ public:
                 const float* sin_vec_ptr = sin_ptr;
                 
                 #pragma unroll 4
-                for (int64_t i = lane_id; i < kVecSize; i += kWorkThreads) {
-                    DType2 input_vec = input_vec_ptr[i];
-                    float cos_val = cos_vec_ptr[i];
-                    float sin_val = sin_vec_ptr[i];
+                for (int64_t i = 0; i < kVecSize; ++i) {
+                    const int64_t vec_idx = static_cast<int64_t>(lane_id) * kVecSize + i;
+                    DType2 input_vec = input_vec_ptr[vec_idx];
+                    float cos_val = cos_vec_ptr[vec_idx];
+                    float sin_val = sin_vec_ptr[vec_idx];
                     
                     packed2_t xy = cast_to_fp32x2(input_vec);
                     float out_x = xy.x * cos_val - xy.y * sin_val;
                     float out_y = xy.x * sin_val + xy.y * cos_val;
                     
-                    input_vec_ptr[i] = cast_from_fp32x2<DType>({out_x, out_y});
+                    input_vec_ptr[vec_idx] = cast_from_fp32x2<DType>({out_x, out_y});
                 }
             }
         }
@@ -239,7 +241,7 @@ public:
             
             DType* input = load_q 
                 ? base.q_ptr + token_id * base.q_stride + head_id * base.head_stride
-                : base.k_ptr + token_id * base.k_stride + head_id * base.head_stride;
+                : base.k_ptr + token_id * base.k_stride + kv_head_id * base.head_stride;
             
             const float* cos_ptr = cos_cache_ptr + pos * kRopeDim;
             const float* sin_ptr = sin_cache_ptr + pos * kRopeDim;
@@ -253,11 +255,12 @@ public:
                 const aligned_vector<float, 2>* sin_ptr_vec = reinterpret_cast<const aligned_vector<float, 2>*>(sin_ptr);
                 
                 #pragma unroll 4
-                for (int64_t i = lane_id; i < kVecSize; i += kWorkThreads) {
-                    DType2 input_vec_x = input_vec_x_ptr[i];
-                    DType2 input_vec_y = input_vec_y_ptr[i];
-                    aligned_vector<float, 2> cos_pair = cos_ptr_vec[i];
-                    aligned_vector<float, 2> sin_pair = sin_ptr_vec[i];
+                for (int64_t i = 0; i < kVecSize; ++i) {
+                    const int64_t vec_idx = static_cast<int64_t>(lane_id) * kVecSize + i;
+                    DType2 input_vec_x = input_vec_x_ptr[vec_idx];
+                    DType2 input_vec_y = input_vec_y_ptr[vec_idx];
+                    aligned_vector<float, 2> cos_pair = cos_ptr_vec[vec_idx];
+                    aligned_vector<float, 2> sin_pair = sin_ptr_vec[vec_idx];
                     
                     #pragma unroll
                     for (int j = 0; j < 2; ++j) {
@@ -273,15 +276,15 @@ public:
                         input_vec_y[j] = static_cast<DType>(out_y);
                     }
                     
-                    input_vec_x_ptr[i] = input_vec_x;
-                    input_vec_y_ptr[i] = input_vec_y;
+                    input_vec_x_ptr[vec_idx] = input_vec_x;
+                    input_vec_y_ptr[vec_idx] = input_vec_y;
                     
                     // Store to K cache if this is a K head
                     if (!load_q) {
                         DType* k_out = params_.k_cache + loc * params_.cache_stride + kv_head_id * base.head_stride;
                         DType* k_out_y = k_out + (kRopeDim / 2);
-                        reinterpret_cast<DType2*>(k_out)[i] = input_vec_x;
-                        reinterpret_cast<DType2*>(k_out_y)[i] = input_vec_y;
+                        reinterpret_cast<DType2*>(k_out)[vec_idx] = input_vec_x;
+                        reinterpret_cast<DType2*>(k_out_y)[vec_idx] = input_vec_y;
                     }
                 }
             } else {
@@ -290,22 +293,23 @@ public:
                 const float* sin_vec_ptr = sin_ptr;
                 
                 #pragma unroll 4
-                for (int64_t i = lane_id; i < kVecSize; i += kWorkThreads) {
-                    DType2 input_vec = input_vec_ptr[i];
-                    float cos_val = cos_vec_ptr[i];
-                    float sin_val = sin_vec_ptr[i];
+                for (int64_t i = 0; i < kVecSize; ++i) {
+                    const int64_t vec_idx = static_cast<int64_t>(lane_id) * kVecSize + i;
+                    DType2 input_vec = input_vec_ptr[vec_idx];
+                    float cos_val = cos_vec_ptr[vec_idx];
+                    float sin_val = sin_vec_ptr[vec_idx];
                     
                     packed2_t xy = cast_to_fp32x2(input_vec);
                     float out_x = xy.x * cos_val - xy.y * sin_val;
                     float out_y = xy.x * sin_val + xy.y * cos_val;
                     
                     DType2 result = cast_from_fp32x2<DType>({out_x, out_y});
-                    input_vec_ptr[i] = result;
+                    input_vec_ptr[vec_idx] = result;
                     
                     // Store to K cache if this is a K head
                     if (!load_q) {
                         DType* k_out = params_.k_cache + loc * params_.cache_stride + kv_head_id * base.head_stride;
-                        reinterpret_cast<DType2*>(k_out)[i] = result;
+                        reinterpret_cast<DType2*>(k_out)[vec_idx] = result;
                     }
                 }
             }
@@ -367,10 +371,10 @@ void fused_rope_launcher(
     const uint32_t num_works = num_q_and_k_heads * num_tokens;
     const uint32_t num_blocks = (num_works + kWorkersPerBlock - 1) / kWorkersPerBlock;
     
-    // Prepare parameters (offset k_ptr by num_qo_heads)
+    // Prepare parameters. K ptr stays at allocated buffer start; indexing handles offset.
     FusedRopeParams<DType, IdType> params{
         q_ptr,
-        k_ptr - static_cast<int64_t>(num_qo_heads) * head_stride,
+        k_ptr,
         cos_sin_cache_ptr,
         positions,
         q_stride,
@@ -429,7 +433,7 @@ void fused_rope_store_launcher(
     
     FusedRopeParams<DType, IdType> base_params{
         q_ptr,
-        k_ptr - static_cast<int64_t>(num_qo_heads) * head_stride,
+        k_ptr,
         cos_sin_cache_ptr,
         positions,
         q_stride,
@@ -540,7 +544,7 @@ extern "C" void fused_rope_store_##IS_NEOX##_##ROPE_DIM##_##DTYPE_SUFFIX##_##IDT
     DEFINE_ROPE_API(false, ROPE_DIM, bf16, ::sycl::ext::oneapi::bfloat16, i32, int32_t) \
     DEFINE_ROPE_API(false, ROPE_DIM, bf16, ::sycl::ext::oneapi::bfloat16, i64, int64_t)
 
-// Common rope dimensions (power of 2 for efficient vectorization)
+// Common rope dimensions (including non-power-of-2 like 80, 96)
 #ifdef SGL_ROPE_DIM
   // JIT mode: compile only requested dimension
   DEFINE_ROPE_ALL_COMBOS(SGL_ROPE_DIM)
