@@ -7109,7 +7109,10 @@ class ServerArgs:
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
         # ModelExpress source mode needs TransferEngine init only if transport is transfer_engine.
-        if self.modelexpress_source and self.modelexpress_transport == "transfer_engine":
+        if (
+            self.modelexpress_source
+            and self.modelexpress_transport == "transfer_engine"
+        ):
             return True
         # Use TransferEngine as client backend.
         elif (
