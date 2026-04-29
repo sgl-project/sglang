@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
+from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 
 logger = init_logger(__name__)
 
@@ -114,7 +115,7 @@ class Scheduler(SchedulerDisaggMixin):
             MergeLoraWeightsReq: self._handle_merge_lora,
             UnmergeLoraWeightsReq: self._handle_unmerge_lora,
             Req: self._handle_generation,
-            List[Req]: self._handle_generation,
+            list: self._handle_generation,
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
             GetDisaggStatsReq: self._handle_get_disagg_stats,
@@ -123,7 +124,7 @@ class Scheduler(SchedulerDisaggMixin):
         }
 
         # FIFO, new reqs are appended
-        self.waiting_queue: deque[tuple[bytes, Req]] = deque()
+        self.waiting_queue: deque[tuple[bytes, Any]] = deque()
 
         # whether we've send the necessary warmup reqs
         self.warmed_up = False
@@ -194,7 +195,9 @@ class Scheduler(SchedulerDisaggMixin):
         checksums = self.worker.get_weights_checksum(module_names=req.module_names)
         return OutputBatch(output=checksums)
 
-    def _handle_generation(self, reqs: List[Req]):
+    def _handle_generation(self, reqs: List[Req] | list[list[Req]]):
+        if len(reqs) == 1 and isinstance(reqs[0], list):
+            reqs = reqs[0]
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
             self._warmup_processed += len(warmup_reqs)
@@ -205,7 +208,16 @@ class Scheduler(SchedulerDisaggMixin):
             else:
                 logger.info("Processing warmup req...")
 
-        return self.worker.execute_forward(reqs)
+        # Diffusion dispatches one generation request at a time, so reqs[0]
+        # always carries the trace context for the entire batch.
+        req = reqs[0]
+        req.trace_ctx.rebuild_thread_context()
+        with trace_slice(
+            req.trace_ctx,
+            DiffStage.SCHEDULER_DISPATCH,
+            thread_finish_flag=True,
+        ):
+            return self.worker.execute_forward(reqs)
 
     def return_result(
         self,
@@ -219,7 +231,7 @@ class Scheduler(SchedulerDisaggMixin):
         if not is_warmup and self.receiver is not None and identity is not None:
             self.receiver.send_multipart([identity, b"", pickle.dumps(output_batch)])
 
-    def get_next_batch_to_run(self) -> list[tuple[bytes, Req]] | None:
+    def get_next_batch_to_run(self) -> list[tuple[bytes, Any]] | None:
         """pull a req from waiting_queue"""
         if not self.waiting_queue:
             return None
@@ -332,7 +344,8 @@ class Scheduler(SchedulerDisaggMixin):
 
         # handle server req-based warmup by inserting an identical req to the beginning of the waiting queue
         # only the very first req through server's lifetime will be warmed up
-        identity, req = recv_reqs[0]
+        identity, req_or_group = recv_reqs[0]
+        req = req_or_group[0] if isinstance(req_or_group, list) else req_or_group
         if isinstance(req, Req):
             warmup_req = req.copy_as_warmup(self.server_args.warmup_steps)
             recv_reqs.insert(0, (identity, warmup_req))
@@ -361,12 +374,14 @@ class Scheduler(SchedulerDisaggMixin):
                 raise
 
             if recv_reqs:
-                # Ensure recv_reqs is a list
-                if not isinstance(recv_reqs, list):
-                    recv_reqs = [recv_reqs]
-
-                # Pack with identity for rank 0
-                recv_reqs = [(identity, req) for req in recv_reqs]
+                if isinstance(recv_reqs, list) and all(
+                    isinstance(req, Req) for req in recv_reqs
+                ):
+                    recv_reqs = [(identity, recv_reqs)]
+                else:
+                    if not isinstance(recv_reqs, list):
+                        recv_reqs = [recv_reqs]
+                    recv_reqs = [(identity, req) for req in recv_reqs]
         else:
             recv_reqs = None
 
@@ -453,9 +468,14 @@ class Scheduler(SchedulerDisaggMixin):
 
             try:
                 processed_req = reqs[0]
-                is_warmup = (
-                    processed_req.is_warmup if isinstance(processed_req, Req) else False
-                )
+                if isinstance(processed_req, list) and processed_req:
+                    is_warmup = processed_req[0].is_warmup
+                else:
+                    is_warmup = (
+                        processed_req.is_warmup
+                        if isinstance(processed_req, Req)
+                        else False
+                    )
 
                 handler = self.request_handlers.get(type(processed_req))
                 if handler:
@@ -473,9 +493,14 @@ class Scheduler(SchedulerDisaggMixin):
 
             # 3. return results
             try:
-                is_warmup = (
-                    processed_req.is_warmup if isinstance(processed_req, Req) else False
-                )
+                if isinstance(processed_req, list) and processed_req:
+                    is_warmup = processed_req[0].is_warmup
+                else:
+                    is_warmup = (
+                        processed_req.is_warmup
+                        if isinstance(processed_req, Req)
+                        else False
+                    )
                 if is_warmup:
                     if output_batch.error is None:
                         if self._warmup_total > 0:

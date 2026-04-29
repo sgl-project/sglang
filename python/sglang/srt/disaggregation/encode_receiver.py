@@ -662,6 +662,7 @@ class MMReceiverBase(ABC):
                         trust_remote_code=server_args.trust_remote_code,
                         revision=server_args.revision,
                         use_fast=not server_args.disable_fast_image_processor,
+                        tokenizer_backend=server_args.tokenizer_backend,
                     )
                 except ValueError as e:
                     error_message = str(e)
@@ -675,6 +676,7 @@ class MMReceiverBase(ABC):
                             trust_remote_code=server_args.trust_remote_code,
                             revision=server_args.revision,
                             use_fast=True,
+                            tokenizer_backend=server_args.tokenizer_backend,
                         )
                     else:
                         raise e

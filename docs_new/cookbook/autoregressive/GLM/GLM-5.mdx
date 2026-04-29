@@ -101,7 +101,7 @@ Deploy GLM-5 with the following command (FP8 on H200, all features enabled):
 
 ```shell Command
 sglang serve \
-  --model zai-org/GLM-5-FP8 \
+  --model-path zai-org/GLM-5-FP8 \
   --tp 8 \
   --tool-call-parser glm47 \
   --reasoning-parser glm45 \
@@ -120,7 +120,7 @@ The following ROCm command is an additional option for AMD GPUs and does not rep
 
 ```shell Command
 sglang serve \
-  --model zai-org/GLM-5 \
+  --model-path zai-org/GLM-5 \
   --tp 8 \
   --trust-remote-code \
   --nsa-prefill-backend tilelang \
