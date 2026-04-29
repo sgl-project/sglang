@@ -556,6 +556,7 @@ class Scheduler(
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
                     use_fast=not server_args.disable_fast_image_processor,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -564,6 +565,7 @@ class Scheduler(
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
 
         # Load multimodal processor for M-RoPE fallback computation.
@@ -702,7 +704,7 @@ class Scheduler(
             _,
             _,
         ) = self.tp_worker.get_worker_info()
-        if get_global_server_args().pp_max_micro_batch_size is None:
+        if not get_global_server_args().pp_max_micro_batch_size:
             get_global_server_args().pp_max_micro_batch_size = max(
                 self.max_running_requests // self.pp_size, 1
             )
@@ -803,14 +805,14 @@ class Scheduler(
                 if self.server_args.enable_dp_attention
                 else self.tp_cpu_group
             ),
+            attn_cp_cache_group=self.attn_cp_cpu_group,
+            attn_tp_cache_group=self.attn_tp_cpu_group,
             eviction_policy=server_args.radix_eviction_policy,
             enable_metrics=self.enable_metrics,
             enable_kv_cache_events=self.enable_kv_cache_events,
             enable_mamba_extra_buffer=server_args.enable_mamba_extra_buffer(),
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
-            attn_cp_rank=self.attn_cp_rank,
-            attn_cp_size=self.attn_cp_size,
             chunked_prefill_size=effective_chunked_prefill_size,
             sliding_window_size=self.sliding_window_size,
         )
@@ -1087,7 +1089,7 @@ class Scheduler(
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=(
-                    model_config.hidden_size
+                    model_config.spec_hidden_size
                     if self.spec_algorithm.is_eagle()
                     else 16  # minimal padding size for RDMA
                 ),
@@ -1140,7 +1142,7 @@ class Scheduler(
             self.disagg_metadata_buffers = MetadataBuffers(
                 buffer_size,
                 hidden_size=(
-                    model_config.hidden_size
+                    model_config.spec_hidden_size
                     if self.spec_algorithm.is_eagle()
                     or self.spec_algorithm.is_standalone()
                     else 16  # minimal padding size for RDMA
@@ -3795,7 +3797,7 @@ def run_scheduler_process(
             thread_label = "Prefill Scheduler"
         elif server_args.disaggregation_mode == "decode":
             thread_label = "Decode Scheduler"
-        trace_set_thread_info(thread_label, tp_rank, dp_rank)
+        trace_set_thread_info(thread_label, tp_rank, dp_rank, pp_rank)
 
     # Create a scheduler and run the event loop
     try:

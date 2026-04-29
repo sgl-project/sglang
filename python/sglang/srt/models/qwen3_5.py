@@ -124,8 +124,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         self.attn_tp_rank = get_attention_tp_rank()
         self.attn_tp_size = get_attention_tp_size()
         self.hidden_size = config.hidden_size
-        self.num_v_heads = config.linear_num_value_heads
-        self.num_k_heads = config.linear_num_key_heads
+        self.num_v_heads = (
+            config.linear_num_value_heads
+            if not _is_cpu
+            else config.linear_num_value_heads_cpu
+        )
+        self.num_k_heads = (
+            config.linear_num_key_heads
+            if not _is_cpu
+            else config.linear_num_key_heads_cpu
+        )
         self.head_k_dim = config.linear_key_head_dim
         self.head_v_dim = config.linear_value_head_dim
         self.key_dim = self.head_k_dim * self.num_k_heads
@@ -321,7 +329,20 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                     chunks = [loaded_weight.reshape(1)]
                 else:
                     split_dim = getattr(param, "output_dim", 0)
-                    chunks = loaded_weight.split(split_sizes, dim=split_dim)
+                    if _is_cpu:
+                        cpu_split_sizes = []
+                        split_size_sum = sum(split_sizes)
+                        target_size_sim = loaded_weight.size(split_dim)
+                        for i in range(len(split_sizes)):
+                            cpu_split_sizes.append(
+                                int(target_size_sim * split_sizes[i] / split_size_sum)
+                            )
+                        assert (
+                            sum(cpu_split_sizes) == target_size_sim
+                        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {cpu_split_sizes} to {target_size_sim}"
+                        chunks = loaded_weight.split(cpu_split_sizes, dim=split_dim)
+                    else:
+                        chunks = loaded_weight.split(split_sizes, dim=split_dim)
 
                 assert len(chunks) == len(loaded_shard_id), (
                     f"Chunk/shard mismatch: {len(chunks)=}, "
@@ -443,7 +464,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
+        if (
+            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            and not _is_cpu
+            and not _is_npu
+        ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -454,7 +479,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
         elif _is_cpu and _is_amx_available:
             mixed_qkv, z, b, a = (
-                torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_cpu(
+                torch.ops.sgl_kernel.fused_qkvzba_split_reshape_cat_contiguous_cpu(
                     projected_states_qkvz,
                     projected_states_ba,
                     self.num_k_heads // self.attn_tp_size,
@@ -467,10 +492,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 projected_states_qkvz, projected_states_ba
             )
+            b = b.contiguous()
+            a = a.contiguous()
+
             query, key, value = map(
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
             )
             mixed_qkv = torch.cat((query, key, value), dim=-1)
+
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
@@ -909,13 +938,12 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
-    if _is_gfx95 or _is_npu:
-        packed_modules_mapping = {
-            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-            "gate_up_proj": ["gate_proj", "up_proj"],
-            "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-            "in_proj_ba": ["in_proj_b", "in_proj_a"],
-        }
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    }
 
     def __init__(
         self,
@@ -1354,9 +1382,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
-    if _is_gfx95 or _is_npu:
-        packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
-        hf_to_sglang_mapper = None
+
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+    hf_to_sglang_mapper = None
 
     def __init__(
         self,
@@ -1484,6 +1512,16 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, loaded_weight)
+                if (
+                    self.config.tie_word_embeddings
+                    and name == "model.embed_tokens.weight"
+                    and (_is_cpu and _is_amx_available)
+                ):
+                    param_lm_head = params_dict["lm_head.weight"]
+                    weight_loader = getattr(
+                        param_lm_head, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param_lm_head, loaded_weight)
             loaded_params.add(name)
         return loaded_params
 
@@ -1491,9 +1529,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
-    if _is_gfx95 or _is_npu:
-        packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
-        hf_to_sglang_mapper = None
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+    hf_to_sglang_mapper = None
 
     def __init__(
         self,

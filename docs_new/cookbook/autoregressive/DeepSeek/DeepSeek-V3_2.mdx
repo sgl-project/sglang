@@ -55,7 +55,7 @@ DeepSeek-V3.2 supports reasoning mode. Enable the reasoning parser during deploy
 
 ```shell Command
 sglang serve \
-  --model deepseek-ai/DeepSeek-V3.2-Exp \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
   --reasoning-parser deepseek-v3 \
   --tp 8 \
   --host 0.0.0.0 \
@@ -139,7 +139,7 @@ For DeepSeek-V3.2-Exp:
 
 ```shell Command
 sglang serve \
-  --model deepseek-ai/DeepSeek-V3.2-Exp \
+  --model-path deepseek-ai/DeepSeek-V3.2-Exp \
   --tool-call-parser deepseekv31 \
   --reasoning-parser deepseek-v3 \
   --chat-template ./examples/chat_template/tool_chat_template_deepseekv32.jinja \

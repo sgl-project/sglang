@@ -357,7 +357,7 @@ class SchedulerOutputProcessorMixin:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
+        result.num_accepted_drafts = sum(accept_lens) - len(batch.reqs)
         result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
         predict_tokens = []
@@ -372,7 +372,7 @@ class SchedulerOutputProcessorMixin:
             req.spec_verify_ct += 1
 
             accepted_draft_tokens = result.accept_length_per_req_cpu[i]
-            req.spec_accepted_tokens += accepted_draft_tokens
+            req.spec_accepted_drafts += accepted_draft_tokens
             req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         return predict_tokens
@@ -432,7 +432,7 @@ class SchedulerOutputProcessorMixin:
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
-            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+            self.update_spec_metrics(batch.batch_size(), result.num_accepted_drafts)
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph
@@ -545,7 +545,7 @@ class SchedulerOutputProcessorMixin:
         self.report_decode_stats(
             can_run_cuda_graph,
             running_batch=batch,
-            num_accepted_tokens=result.num_accepted_tokens,
+            num_accepted_drafts=result.num_accepted_drafts,
         )
 
     def _handle_finished_req(
@@ -962,7 +962,7 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
-        spec_accepted_tokens = []
+        spec_accepted_drafts = []
         spec_acceptance_histogram = []
         retraction_counts = []
         output_hidden_states = None
@@ -1071,7 +1071,7 @@ class SchedulerOutputProcessorMixin:
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
-                    spec_accepted_tokens.append(req.spec_accepted_tokens)
+                    spec_accepted_drafts.append(req.spec_accepted_drafts)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
 
                 if return_logprob:
@@ -1176,7 +1176,7 @@ class SchedulerOutputProcessorMixin:
                     rids=rids,
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
-                    spec_accepted_tokens=spec_accepted_tokens,
+                    spec_accepted_drafts=spec_accepted_drafts,
                     spec_acceptance_histogram=spec_acceptance_histogram,
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,
