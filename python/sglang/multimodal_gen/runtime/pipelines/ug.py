@@ -44,10 +44,13 @@ def _build_srt_owned_ug_runtime(
         if scheduler is not None
         else SessionController(_UGRuntimeTreeCache())
     )
+    model_config = getattr(scheduler, "model_config", None)
     return UGSessionRuntime(
         model_runner=model_runner or FakeUGModelRunner(),
         session_controller=session_controller,
         srt_request_executor=srt_request_executor,
+        tokenizer=getattr(scheduler, "tokenizer", None),
+        vocab_size=getattr(model_config, "vocab_size", 32000),
     )
 
 

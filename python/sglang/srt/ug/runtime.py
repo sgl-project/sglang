@@ -527,14 +527,14 @@ class UGSessionRuntime:
     def _tokenize_interleaved_messages(
         self, messages: list[UGInterleavedMessage]
     ) -> tuple[list[int], str, _UGSessionMMInputs | None]:
-        input_ids = [self.tokenizer.bos_token_id]
+        input_ids = [self._bos_token_id()]
         text_parts: list[str] = []
         mm_items: list[_UGSessionMMItem] = []
         for message in messages:
             if message.type == "text":
                 text = str(message.content)
                 text_parts.append(text)
-                input_ids.extend(self._fake_text_token_ids(text))
+                input_ids.extend(self._text_token_ids(text))
             elif message.type == "image":
                 start = len(input_ids)
                 input_ids.extend([self.vocab_size + 1, self.vocab_size + 2])
@@ -544,6 +544,21 @@ class UGSessionRuntime:
                 raise ValueError(f"Unsupported UG message type: {message.type}")
         mm_inputs = _UGSessionMMInputs(mm_items) if mm_items else None
         return input_ids, " ".join(text_parts), mm_inputs
+
+    def _bos_token_id(self) -> int:
+        token_id = getattr(self.tokenizer, "bos_token_id", None)
+        if token_id is None:
+            token_id = getattr(self.tokenizer, "eos_token_id", None)
+        return int(token_id) if token_id is not None else 1
+
+    def _text_token_ids(self, text: str) -> list[int]:
+        encode = getattr(self.tokenizer, "encode", None)
+        if callable(encode):
+            try:
+                return list(encode(text, add_special_tokens=False))
+            except TypeError:
+                return list(encode(text))
+        return self._fake_text_token_ids(text)
 
     @staticmethod
     def _fake_text_token_ids(text: str) -> list[int]:
