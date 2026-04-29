@@ -33,21 +33,21 @@ on:
         default: ''
         options:
           - ''
-          - sgl-kernel-unit-test-amd
-          - sgl-kernel-unit-test-2-gpu-amd
-          - stage-a-test-1-gpu-small-amd
-          - jit-kernel-unit-test-amd
-          - stage-b-test-1-gpu-small-amd
-          - stage-b-test-1-gpu-small-amd-nondeterministic
-          - stage-b-test-1-gpu-small-amd-mi35x
-          - stage-b-test-1-gpu-large-amd
-          - stage-b-test-2-gpu-large-amd
-          - multimodal-gen-test-1-gpu-amd
-          - multimodal-gen-test-2-gpu-amd
-          - stage-c-test-large-8-gpu-amd
-          - stage-c-test-large-8-gpu-amd-mi35x
-          - stage-b-test-large-8-gpu-disaggregation-amd
-          - stage-c-test-4-gpu-amd
+          - sgl-kernel-unit-test-amd-rocm720
+          - sgl-kernel-unit-test-2-gpu-amd-rocm720
+          - stage-a-test-1-gpu-small-amd-rocm720
+          - jit-kernel-unit-test-amd-rocm720
+          - stage-b-test-1-gpu-small-amd-rocm720
+          - stage-b-test-1-gpu-small-amd-nondeterministic-rocm720
+          - stage-b-test-1-gpu-small-amd-mi35x-rocm720
+          - stage-b-test-1-gpu-large-amd-rocm720
+          - stage-b-test-2-gpu-large-amd-rocm720
+          - multimodal-gen-test-1-gpu-amd-rocm720
+          - multimodal-gen-test-2-gpu-amd-rocm720
+          - stage-c-test-large-8-gpu-amd-rocm720
+          - stage-c-test-large-8-gpu-amd-mi35x-rocm720
+          - stage-b-test-large-8-gpu-disaggregation-amd-rocm720
+          - stage-c-test-4-gpu-amd-rocm720
       target_stage:
         description: "Or type comma-separated stage names (overrides dropdown if non-empty)"
         required: false
@@ -93,6 +93,8 @@ on:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
 concurrency:
   # When called via workflow_call with run_all_tests=true, use a unique group per run to
@@ -147,13 +149,13 @@ jobs:
               - "test/**/!(*.md)"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             sgl_kernel:
-              - "sgl-kernel/**/*.!(md|txt)"
+              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             jit_kernel:
               - "python/sglang/jit_kernel/**"
               - ".github/workflows/pr-test-amd-rocm720.yml"
             multimodal_gen:
-              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
+              - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/cli/**"
               - "python/sglang/jit_kernel/diffusion/**"
               - "python/sglang/jit_kernel/tests/diffusion/**"
@@ -162,12 +164,12 @@ jobs:
               - "python/pyproject_other.toml"
 
   # =============================================== sgl-kernel ====================================================
-  sgl-kernel-unit-test-amd:
+  sgl-kernel-unit-test-amd-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.sgl_kernel == 'true'
@@ -208,12 +210,12 @@ jobs:
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_moe_topk_sigmoid.py
           docker exec -w /sglang-checkout/sgl-kernel/tests ci_sglang python3 -m pytest test_torch_defaults_reset.py
 
-  sgl-kernel-unit-test-2-gpu-amd:
+  sgl-kernel-unit-test-2-gpu-amd-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',sgl-kernel-unit-test-2-gpu-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.sgl_kernel == 'true'
@@ -249,12 +251,12 @@ jobs:
 
   # =============================================== primary ====================================================
 
-  stage-a-test-1-gpu-small-amd:
+  stage-a-test-1-gpu-small-amd-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-gpu-small-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-a-test-1-gpu-small-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -288,12 +290,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-a-test-1-gpu-small-amd ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  jit-kernel-unit-test-amd:
+  jit-kernel-unit-test-amd-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',jit-kernel-unit-test-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           needs.check-changes.outputs.jit_kernel == 'true'
@@ -326,12 +328,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout" python3 -m pytest -q python/sglang/jit_kernel/tests/test_store_cache.py
 
-  stage-b-test-1-gpu-small-amd:
+  stage-b-test-1-gpu-small-amd-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -365,12 +367,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 14 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  stage-b-test-1-gpu-small-amd-nondeterministic:
+  stage-b-test-1-gpu-small-amd-nondeterministic-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-nondeterministic,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-nondeterministic-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -403,12 +405,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-nondeterministic --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  stage-b-test-1-gpu-small-amd-mi35x:
+  stage-b-test-1-gpu-small-amd-mi35x-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-mi35x,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-small-amd-mi35x-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -441,12 +443,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  stage-b-test-1-gpu-large-amd:
+  stage-b-test-1-gpu-large-amd-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-large-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-1-gpu-large-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -480,12 +482,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  stage-b-test-2-gpu-large-amd:
+  stage-b-test-2-gpu-large-amd-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-2-gpu-large-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-2-gpu-large-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -519,12 +521,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  multimodal-gen-test-1-gpu-amd:
+  multimodal-gen-test-1-gpu-amd-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-1-gpu-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -650,12 +652,12 @@ jobs:
           echo "=== Post-test System Memory Status ==="
           free -h
 
-  multimodal-gen-test-2-gpu-amd:
+  multimodal-gen-test-2-gpu-amd-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',multimodal-gen-test-2-gpu-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -667,7 +669,7 @@ jobs:
       max-parallel: 1  # Run one at a time to avoid eviction from resource exhaustion during AITER kernel JIT
       matrix:
         runner: [linux-mi325-2gpu-sglang]
-        part: [0, 1]  # 2 partitions: 9 tests ÷ 2 = ~4-5 tests each
+        part: [0, 1, 2]  # 3 partitions: 2 parametrized + 1 standalone (test_disagg_server.py)
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
@@ -749,7 +751,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (2-GPU)
-        timeout-minutes: 80
+        timeout-minutes: 150
         run: |
           # AMD CI: All 2-GPU tests including LoRA
           # Tests: T2V, T2I, I2V, LoRA
@@ -773,19 +775,19 @@ jobs:
             ci_sglang python3 sglang/multimodal_gen/test/run_suite.py \
               --suite 2-gpu \
               --partition-id ${{ matrix.part }} \
-              --total-partitions 2
+              --total-partitions 3
 
           # Post-test diagnostics
           echo "=== Post-test System Memory Status ==="
           free -h
 
 
-  stage-c-test-4-gpu-amd:
-    needs: [check-changes, stage-b-test-1-gpu-small-amd, stage-b-test-2-gpu-large-amd]
+  stage-c-test-4-gpu-amd-rocm720:
+    needs: [check-changes, stage-b-test-1-gpu-small-amd-rocm720, stage-b-test-2-gpu-large-amd-rocm720]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-4-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-4-gpu-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -836,12 +838,12 @@ jobs:
               --retry-timeout-increase 0 \
               ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  stage-c-test-large-8-gpu-amd:
+  stage-c-test-large-8-gpu-amd-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -883,12 +885,12 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  stage-c-test-large-8-gpu-amd-mi35x:
+  stage-c-test-large-8-gpu-amd-mi35x-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-mi35x,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-c-test-large-8-gpu-amd-mi35x-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -923,12 +925,12 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 3600 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
   # =============================================== Disaggregation ====================================================
-  stage-b-test-large-8-gpu-35x-disaggregation-amd:
+  stage-b-test-large-8-gpu-35x-disaggregation-amd-rocm720:
     needs: [check-changes]
     if: |
       always() &&
       (
-        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-disaggregation-amd,')) ||
+        (contains(format(',{0},', inputs.target_stage || inputs.target_stage_select), ',stage-b-test-large-8-gpu-disaggregation-amd-rocm720,')) ||
         (
           !(inputs.target_stage || inputs.target_stage_select) &&
           (!failure() && !cancelled()) &&
@@ -1034,28 +1036,28 @@ jobs:
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-35x-disaggregation-amd --timeout-per-file 1800 ${{ inputs.continue_on_error && '--continue-on-error' || '' }}
 
-  pr-test-amd-finish:
+  pr-test-amd-rocm720-finish:
     needs:
       [
         call-gate,
         check-changes,
 
-        sgl-kernel-unit-test-amd,
-        sgl-kernel-unit-test-2-gpu-amd,
-        multimodal-gen-test-1-gpu-amd,
-        multimodal-gen-test-2-gpu-amd,
+        sgl-kernel-unit-test-amd-rocm720,
+        sgl-kernel-unit-test-2-gpu-amd-rocm720,
+        multimodal-gen-test-1-gpu-amd-rocm720,
+        multimodal-gen-test-2-gpu-amd-rocm720,
 
-        stage-a-test-1-gpu-small-amd,
-        jit-kernel-unit-test-amd,
-        stage-b-test-1-gpu-small-amd,
-        stage-b-test-1-gpu-small-amd-nondeterministic,
-        stage-b-test-1-gpu-small-amd-mi35x,
-        stage-b-test-1-gpu-large-amd,
-        stage-b-test-2-gpu-large-amd,
-        stage-b-test-large-8-gpu-35x-disaggregation-amd,
-        stage-c-test-4-gpu-amd,
-        stage-c-test-large-8-gpu-amd,
-        stage-c-test-large-8-gpu-amd-mi35x,
+        stage-a-test-1-gpu-small-amd-rocm720,
+        jit-kernel-unit-test-amd-rocm720,
+        stage-b-test-1-gpu-small-amd-rocm720,
+        stage-b-test-1-gpu-small-amd-nondeterministic-rocm720,
+        stage-b-test-1-gpu-small-amd-mi35x-rocm720,
+        stage-b-test-1-gpu-large-amd-rocm720,
+        stage-b-test-2-gpu-large-amd-rocm720,
+        stage-b-test-large-8-gpu-35x-disaggregation-amd-rocm720,
+        stage-c-test-4-gpu-amd-rocm720,
+        stage-c-test-large-8-gpu-amd-rocm720,
+        stage-c-test-large-8-gpu-amd-mi35x-rocm720,
       ]
     if: always()
     runs-on: ubuntu-latest

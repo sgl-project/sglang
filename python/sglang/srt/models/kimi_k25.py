@@ -28,6 +28,7 @@ except ImportError:
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.quark.quark import QuarkConfig
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -42,7 +43,6 @@ from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix, is_npu
 
-KIMIV_VT_INFER_MAX_PATCH_NUM = 16328
 logger = logging.getLogger(__name__)
 
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -622,59 +622,6 @@ def mm_projection_auto(
     return proj_out
 
 
-@torch.inference_mode()
-def vision_tower_forward_auto(
-    vision_tower: torch.nn.Module,
-    pixel_values: torch.Tensor,
-    grid_thw: torch.Tensor,
-    mm_projector: torch.nn.Module | None = None,
-) -> list[torch.Tensor]:
-    """Auto-batched vision tower forward."""
-    assert isinstance(
-        pixel_values, torch.Tensor
-    ), "expect pixel_values to be a tensor, get {}".format(type(pixel_values))
-    n = grid_thw.shape[0]
-    n_patches_each_media = grid_thw.prod(-1)
-    max_infer_batch = max(n_patches_each_media.max(), KIMIV_VT_INFER_MAX_PATCH_NUM)
-    logger.debug(
-        "vt max_infer_batch: %s, KIMIV_VT_INFER_MAX_PATCH_NUM: %s",
-        max_infer_batch,
-        KIMIV_VT_INFER_MAX_PATCH_NUM,
-    )
-    tensors = []
-    pre_sum = 0
-    current_group_start = 0
-    current_group_patches = 0
-
-    for i in range(n):
-        current_media_patches = n_patches_each_media[i].item()
-        if current_group_patches + current_media_patches <= max_infer_batch:
-            current_group_patches += current_media_patches
-        else:
-            if current_group_start < i:
-                group_grid_thw = grid_thw[current_group_start:i]
-                group_n_patches = n_patches_each_media[current_group_start:i].sum()
-                group_input = pixel_values[pre_sum : pre_sum + group_n_patches]
-                group_output = vision_tower(group_input, group_grid_thw)
-                proj_out = mm_projection_auto(mm_projector, group_output)
-                tensors.extend(proj_out)
-                pre_sum += group_n_patches
-
-            current_group_start = i
-            current_group_patches = current_media_patches
-
-    # Process the last group
-    if current_group_start < n:
-        group_grid_thw = grid_thw[current_group_start:n]
-        group_n_patches = n_patches_each_media[current_group_start:n].sum()
-        group_input = pixel_values[pre_sum : pre_sum + group_n_patches]
-        group_output = vision_tower(group_input, group_grid_thw)
-        proj_out = mm_projection_auto(mm_projector, group_output)
-        tensors.extend(proj_out)
-
-    return tensors
-
-
 class KimiK25ForConditionalGeneration(nn.Module):
     # Support nvidia/Kimi-K2.5-NVFP4 naming: language_model.layers.*.
     # Ref: HF config.json for nvidia/Kimi-K2.5-NVFP4
@@ -715,7 +662,7 @@ class KimiK25ForConditionalGeneration(nn.Module):
                 quant_config,
                 prefix=(
                     "language_model"
-                    if isinstance(quant_config, ModelSlimConfig)
+                    if isinstance(quant_config, (ModelSlimConfig, QuarkConfig))
                     else ""
                 ),
             )
@@ -733,7 +680,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
         pixel_values = torch.cat([item.feature for item in items], dim=0).to(
             device=device, dtype=target_dtype
         )
-        grid_thws = torch.concat([item.grid_thws for item in items], dim=0).to(device)
+        grid_thws = torch.concat([item.image_grid_thw for item in items], dim=0).to(
+            device
+        )
 
         if self.use_data_parallel:
             image_embeds = run_dp_sharded_mrope_vision_model(
@@ -745,14 +694,9 @@ class KimiK25ForConditionalGeneration(nn.Module):
             image_features = self.mm_projector(image_embeds)
             return image_features
 
-        image_features = vision_tower_forward_auto(
-            self.vision_tower,
-            pixel_values,
-            grid_thws,
-            mm_projector=self.mm_projector,
-        )
-        image_features = torch.cat(image_features, dim=0)
-        return image_features
+        image_embeds = self.vision_tower(pixel_values, grid_thws)
+        proj_out = mm_projection_auto(self.mm_projector, image_embeds)
+        return torch.cat(proj_out, dim=0)
 
     def pad_input_ids(self, input_ids: List[int], mm_inputs: MultimodalInputs):
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()

@@ -31,7 +31,8 @@ First use [../sglang-diffusion-benchmark-profile/SKILL.md](../sglang-diffusion-b
 - measure the real denoise regression
 - collect the perf dump baseline
 - capture one representative `torch.profiler` trace
-- rule out existing merged fast paths
+- rule out existing mainline fast paths
+- prove the run stayed on the native SGLang diffusion backend, not a diffusers fallback
 
 If a future specialized optimization skill matches the kernel family better than AKO4ALL, hand off there instead. The diagnosis contract stays the same.
 
@@ -127,5 +128,9 @@ See [references/ako-loop.md](references/ako-loop.md) for the checklist and commo
 
 - Treat AKO4ALL repo hygiene as a gate, not a suggestion.
 - Prefer exact local snapshot validation over hand-wavy “remote tree is close enough”.
+- Do not start or justify kernel work from traces collected after
+  `Falling back to diffusers backend`, `Using diffusers backend`, or
+  `Loaded diffusers pipeline`; fix backend selection and rerun the
+  benchmark/profile workflow first.
 - Keep model-level validation honest: if microbench improves but denoise does not, do not keep the AKO-only variant in the main code path.
 - When writing conclusions, explain the win in terms of measurable causes such as lower registers per thread, higher occupancy, fewer executed instructions, or better scheduler eligibility.

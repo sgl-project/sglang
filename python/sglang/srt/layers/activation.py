@@ -36,6 +36,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
     set_weight_attrs,
@@ -43,16 +44,25 @@ from sglang.srt.utils import (
 from sglang.utils import resolve_obj_by_qualname
 
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
 
-if _is_cuda or _is_xpu:
+if _is_cuda:
+    from sglang.jit_kernel.activation import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+    )
+elif _is_xpu:
     from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 elif _is_hip:
     from sgl_kernel import gelu_and_mul, gelu_quick, gelu_tanh_and_mul, silu_and_mul
+elif _is_musa:
+    from sgl_kernel import silu_and_mul
 
 if is_npu():
     import torch_npu
@@ -94,6 +104,15 @@ class SiluAndMul(MultiPlatformOp):
         out = torch.empty(output_shape, dtype=x.dtype, device=x.device)
         silu_and_mul(x, out)
         return out
+
+    def forward_musa(self, x: torch.Tensor) -> torch.Tensor:
+        if not get_global_server_args().disable_piecewise_cuda_graph:
+            return self.forward_native(x)
+
+        if not hasattr(self, "_musa_swish_glu"):
+            # XXX (MUSA): nn.SwishGLU seems to have better performance than silu_and_mul on MUSA, we can switch to it for now. We can consider implementing a silu_and_mul kernel for MUSA in the future if needed.
+            self._musa_swish_glu = nn.SwishGLU()
+        return self._musa_swish_glu(x)
 
 
 class GeluAndMul(MultiPlatformOp):
