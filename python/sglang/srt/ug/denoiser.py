@@ -135,8 +135,19 @@ class FakeUGDenoiserBridge:
 class SRTBackedUGDenoiserBridge:
     """Diffusion-side bridge that delegates UG model work to SRT runtime state."""
 
-    def __init__(self, runtime: UGSessionRuntime | None = None) -> None:
+    def __init__(
+        self,
+        runtime: UGSessionRuntime | None = None,
+        *,
+        max_pre_image_decode_steps: int = 16,
+    ) -> None:
+        if max_pre_image_decode_steps <= 0:
+            raise ValueError(
+                "max_pre_image_decode_steps must be positive, got "
+                f"{max_pre_image_decode_steps}"
+            )
         self.runtime = runtime or UGSessionRuntime(model_runner=FakeUGModelRunner())
+        self.max_pre_image_decode_steps = max_pre_image_decode_steps
 
     def build_contexts(
         self, *, prompt: str | list[str] | None, image: Any | None
@@ -150,17 +161,28 @@ class SRTBackedUGDenoiserBridge:
         messages = normalize_ug_interleaved_messages(messages)
         session = self.runtime.prefill_interleaved(messages)
         pre_image_segments: list[dict[str, Any]] = []
-        while True:
-            segment = self.runtime.decode_next_segment(session)
-            if segment.type == "image_marker":
-                break
-            if segment.type == "text":
-                pre_image_segments.append({"type": "text", "text": segment.text or ""})
-                continue
-            raise ValueError(
-                "UG denoise bridge expected U decode to request an image segment, "
-                f"got {segment.type}"
-            )
+        try:
+            for _ in range(self.max_pre_image_decode_steps):
+                segment = self.runtime.decode_next_segment(session)
+                if segment.type == "image_marker":
+                    break
+                if segment.type == "text":
+                    pre_image_segments.append(
+                        {"type": "text", "text": segment.text or ""}
+                    )
+                    continue
+                raise ValueError(
+                    "UG denoise bridge expected U decode to request an image segment, "
+                    f"got {segment.type}"
+                )
+            else:
+                raise ValueError(
+                    "UG denoise bridge did not receive an image marker within "
+                    f"{self.max_pre_image_decode_steps} U decode steps"
+                )
+        except Exception:
+            self.runtime.close_session(session)
+            raise
 
         text_tokens = sum(
             len(str(message.content).split())

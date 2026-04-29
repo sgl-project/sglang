@@ -458,11 +458,11 @@ class FakeReqToTokenPool:
 
 
 class FakeTokenToKVPoolAllocator:
-    page_size = 1
-
-    def __init__(self, start=20):
+    def __init__(self, start=20, page_size=1):
         self.next_index = start
+        self.page_size = page_size
         self.alloc_calls = []
+        self.alloc_extend_calls = []
         self.freed = []
 
     def alloc(self, need_size):
@@ -481,6 +481,10 @@ class FakeTokenToKVPoolAllocator:
     def get_kvcache(self):
         return "fake-kv-cache"
 
+    def alloc_extend(self, *args, **kwargs):
+        self.alloc_extend_calls.append((args, kwargs))
+        raise AssertionError("UG temp G must not extend into the U prefix page")
+
 
 class FakeAttentionBackend:
     def __init__(self):
@@ -491,11 +495,13 @@ class FakeAttentionBackend:
 
 
 class FakeModelRunner:
-    def __init__(self, model):
+    def __init__(self, model, *, token_to_kv_pool_allocator=None):
         self.device = "cpu"
         self.model = model
         self.req_to_token_pool = FakeReqToTokenPool()
-        self.token_to_kv_pool_allocator = FakeTokenToKVPoolAllocator()
+        self.token_to_kv_pool_allocator = (
+            token_to_kv_pool_allocator or FakeTokenToKVPoolAllocator()
+        )
         self.token_to_kv_pool = "fake-kv-cache"
         self.attn_backend = FakeAttentionBackend()
         self.spec_algorithm = None
@@ -1480,7 +1486,7 @@ class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
         )
         self.assertEqual(
             native_model.prepare_vae_latent_calls[0]["curr_rope"],
-            [5],
+            [1],
         )
         counters = runtime.get_debug_counters(response.session)
         self.assertEqual(counters["prefill_count"], 1)
@@ -1528,7 +1534,8 @@ class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
         state = backend.sessions["bagel-native-image-u"]
         self.assertEqual(state.append_image_count, 1)
         self.assertTrue(state.native_srt_u_context)
-        self.assertEqual(state.gen_context["kv_lens"], [12])
+        self.assertEqual(state.gen_context["kv_lens"], [13])
+        self.assertEqual(state.gen_context["ropes"], [5])
         counters = runtime.get_debug_counters(handle)
         self.assertEqual(counters["append_image_count"], 1)
         self.assertEqual(counters["srt_request_count"], 5)
@@ -1612,6 +1619,56 @@ class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
         )
         self.assertEqual(scheduler_executor.temp_g_forward_count, 1)
         self.assertEqual(scheduler_executor.temp_g_allocated_token_count, 4)
+
+    def test_scheduler_executor_temp_g_uses_owned_page_aligned_scratch(self):
+        native_model = FakeNativeSRTVelocityModel()
+        allocator = FakeTokenToKVPoolAllocator(start=20, page_size=4)
+        model_runner = FakeModelRunner(
+            native_model,
+            token_to_kv_pool_allocator=allocator,
+        )
+        scheduler_executor = UGSRTSchedulerExecutor(
+            FakeSchedulerWithModelRunner(model_runner)
+        )
+        denoise_executor = scheduler_executor.create_bagel_native_srt_denoise_executor()
+        binding = UGSRTKVTokenBinding(
+            session_id="bagel-temp-g-paged",
+            request_id="bagel-temp-g-paged:u1",
+            token_count=3,
+            token_indices=torch.tensor([101, 102, 103], dtype=torch.long),
+        )
+        prepared = BAGELNativeSRTPreparedDenoise(
+            generation_input={
+                "packed_text_ids": torch.tensor([1]),
+                "packed_text_indexes": torch.tensor([0]),
+                "packed_vae_token_indexes": torch.tensor([1, 2]),
+                "packed_vae_position_ids": torch.tensor([0, 1]),
+                "packed_seqlens": torch.tensor([3], dtype=torch.int32),
+                "packed_position_ids": torch.tensor([1, 1, 1]),
+                "packed_indexes": torch.tensor([0, 1, 2]),
+                "key_values_lens": torch.tensor([3], dtype=torch.int32),
+                "packed_key_value_indexes": torch.tensor([0, 1, 2]),
+            },
+            srt_kv_token_binding=binding,
+        )
+
+        denoise_executor.predict_velocity(
+            prepared=prepared,
+            latent_tokens=torch.zeros(2, 4),
+            timestep=torch.tensor([0.5]),
+        )
+
+        forward_batch = native_model.calls[0]["forward_batch"]
+        self.assertTrue(
+            torch.equal(forward_batch.out_cache_loc.cpu(), torch.tensor([20, 21, 22]))
+        )
+        self.assertEqual(
+            model_runner.req_to_token_pool.req_to_token[0, :6].tolist(),
+            [101, 102, 103, 20, 21, 22],
+        )
+        self.assertEqual(allocator.alloc_calls, [4])
+        self.assertEqual(allocator.alloc_extend_calls, [])
+        self.assertEqual([x.tolist() for x in allocator.freed], [[20, 21, 22, 23]])
 
 
 class TestBAGELInterleaveContextBackend(unittest.TestCase):

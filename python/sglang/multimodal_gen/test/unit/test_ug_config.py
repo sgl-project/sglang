@@ -15,6 +15,8 @@ class TestUGSamplingParams(unittest.TestCase):
         self.assertEqual(params.width, 1024)
         self.assertEqual(params.num_frames, 1)
         self.assertEqual(params.num_inference_steps, 50)
+        self.assertEqual(params.cfg_text_scale, 1.0)
+        self.assertEqual(params.cfg_img_scale, 1.0)
         self.assertEqual(params.cfg_interval, [0.4, 1.0])
 
     def test_cfg_interval_must_be_ordered_unit_interval(self):

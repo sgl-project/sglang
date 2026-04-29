@@ -8,6 +8,7 @@ from PIL import Image
 
 from sglang.srt.ug.context import UGSessionHandle
 from sglang.srt.ug.denoiser import FakeUGDenoiserBridge, SRTBackedUGDenoiserBridge
+from sglang.srt.ug.runtime import UGDecodeResult, UGSessionRuntime
 
 
 class TestFakeUGDenoiserBridge(unittest.TestCase):
@@ -90,7 +91,9 @@ class TestSRTBackedUGDenoiserBridge(unittest.TestCase):
         bridge.append_generated_image(contexts=contexts, image=object())
         post_image_segment = bridge.decode_next_segment(contexts=contexts)
 
-        self.assertEqual(contexts.full.session.session_id, session_before_image.session_id)
+        self.assertEqual(
+            contexts.full.session.session_id, session_before_image.session_id
+        )
         self.assertGreater(
             contexts.full.session.context_version,
             session_before_image.context_version,
@@ -105,6 +108,53 @@ class TestSRTBackedUGDenoiserBridge(unittest.TestCase):
         self.assertEqual(counters["append_image_count"], 1)
         self.assertEqual(counters["decode_count"], 2)
         self.assertEqual(counters["state"], "u_decode")
+
+    def test_bridge_bounds_pre_image_decode_loop_and_closes_session(self):
+        runner = TextOnlyUGModelRunner()
+        bridge = SRTBackedUGDenoiserBridge(
+            UGSessionRuntime(model_runner=runner),
+            max_pre_image_decode_steps=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "image marker"):
+            bridge.build_contexts(prompt="never image", image=None)
+
+        self.assertEqual(runner.decode_count, 2)
+        self.assertEqual(len(runner.closed_sessions), 1)
+
+
+class TextOnlyUGModelRunner:
+    def __init__(self):
+        self.decode_count = 0
+        self.closed_sessions = []
+
+    def prefill_interleaved(self, *, record, messages):
+        del record
+        return sum(len(str(message.content).split()) for message in messages)
+
+    def decode_next_segment(self, *, record):
+        del record
+        self.decode_count += 1
+        return UGDecodeResult(type="text", text="still text")
+
+    def predict_velocity_from_session(self, *, request, record):
+        del request, record
+        raise AssertionError("velocity should not be requested before image_marker")
+
+    def prepare_latents_from_session(self, *, request, record):
+        del request, record
+        return None
+
+    def append_generated_image(self, *, record, image):
+        del record, image
+        return 0
+
+    def decode_latents_to_image(self, *, request, record):
+        del request, record
+        return None
+
+    def close_session(self, *, session_id):
+        self.closed_sessions.append(session_id)
 
 
 if __name__ == "__main__":

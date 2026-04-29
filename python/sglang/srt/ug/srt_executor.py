@@ -24,6 +24,7 @@ class UGSRTTemporaryForwardBatch:
     token_to_kv_pool_allocator: Any
     temp_req: Any
     out_cache_loc: torch.Tensor
+    owned_cache_loc: torch.Tensor | None = None
     released: bool = False
 
     def release(self) -> None:
@@ -31,8 +32,8 @@ class UGSRTTemporaryForwardBatch:
             return
         self.released = True
         try:
-            if self.out_cache_loc is not None:
-                self.token_to_kv_pool_allocator.free(self.out_cache_loc)
+            if self.owned_cache_loc is not None:
+                self.token_to_kv_pool_allocator.free(self.owned_cache_loc)
         finally:
             free_mamba_cache = getattr(self.req_to_token_pool, "free_mamba_cache", None)
             try:
@@ -240,9 +241,10 @@ class UGSRTSchedulerExecutor:
 
         temp_req = self._alloc_temp_req_slot(req_to_token_pool)
         out_cache_loc = None
+        owned_cache_loc = None
         context = None
         try:
-            out_cache_loc = self._alloc_temp_g_cache(
+            out_cache_loc, owned_cache_loc = self._alloc_temp_g_cache(
                 model_runner=model_runner,
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
                 prefix_indices=prefix_indices,
@@ -279,6 +281,7 @@ class UGSRTSchedulerExecutor:
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
                 temp_req=temp_req,
                 out_cache_loc=out_cache_loc,
+                owned_cache_loc=owned_cache_loc,
             )
             prepare_forward_batch = getattr(
                 getattr(model_runner, "model", None),
@@ -295,8 +298,8 @@ class UGSRTSchedulerExecutor:
             if context is not None:
                 context.release()
             else:
-                if out_cache_loc is not None:
-                    token_to_kv_pool_allocator.free(out_cache_loc)
+                if owned_cache_loc is not None:
+                    token_to_kv_pool_allocator.free(owned_cache_loc)
                 self._free_temp_req_slot(req_to_token_pool, temp_req)
             raise
 
@@ -458,7 +461,7 @@ class UGSRTSchedulerExecutor:
         seq_len: int,
         extend_num_tokens: int,
         device: torch.device,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         tree_cache = getattr(self.scheduler, "tree_cache", None)
         page_size = int(
             getattr(
@@ -467,29 +470,30 @@ class UGSRTSchedulerExecutor:
                 getattr(token_to_kv_pool_allocator, "page_size", 1),
             )
         )
+        owned_num_tokens = self._ceil_to_page(extend_num_tokens, page_size)
         self._evict_for_temp_g(
             tree_cache,
-            extend_num_tokens=extend_num_tokens,
+            extend_num_tokens=owned_num_tokens,
             page_size=page_size,
         )
-        if page_size > 1 and hasattr(token_to_kv_pool_allocator, "alloc_extend"):
-            prefix_lens_cpu = torch.tensor([prefix_len], dtype=torch.int64)
-            seq_lens_cpu = torch.tensor([seq_len], dtype=torch.int64)
-            out_cache_loc = token_to_kv_pool_allocator.alloc_extend(
-                prefix_lens=prefix_lens_cpu.to(device, non_blocking=True),
-                prefix_lens_cpu=prefix_lens_cpu,
-                seq_lens=torch.tensor([seq_len], dtype=torch.int64, device=device),
-                seq_lens_cpu=seq_lens_cpu,
-                last_loc=prefix_indices[-1:],
-                extend_num_tokens=extend_num_tokens,
-            )
-        else:
-            out_cache_loc = token_to_kv_pool_allocator.alloc(extend_num_tokens)
-        if out_cache_loc is None:
+        owned_cache_loc = token_to_kv_pool_allocator.alloc(owned_num_tokens)
+        if owned_cache_loc is None:
             raise UGSRTSchedulerExecutorError(
                 "UG G temporary batch could not allocate KV cache slots"
             )
-        return out_cache_loc.to(device=device, dtype=torch.int64, non_blocking=True)
+        owned_cache_loc = owned_cache_loc.to(
+            device=device,
+            dtype=torch.int64,
+            non_blocking=True,
+        )
+        out_cache_loc = owned_cache_loc[:extend_num_tokens]
+        return out_cache_loc, owned_cache_loc
+
+    @staticmethod
+    def _ceil_to_page(num_tokens: int, page_size: int) -> int:
+        if page_size <= 1:
+            return num_tokens
+        return ((num_tokens + page_size - 1) // page_size) * page_size
 
     @staticmethod
     def _evict_for_temp_g(

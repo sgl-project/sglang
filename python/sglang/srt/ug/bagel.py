@@ -456,6 +456,11 @@ class BAGELNativeSRTUForwardExecutor(BAGELSRTUForwardExecutor):
         backend._bind_srt_request_tokens(request)
 
         state = backend._state_for(session.handle.session_id)
+        backend._sync_native_srt_context_from_request(
+            state,
+            request=request,
+            messages=messages,
+        )
         added_tokens = int(request.metadata.get("ug_srt_added_token_count", 0))
         state.native_srt_pending_added_tokens += max(0, added_tokens)
         is_final_segment = bool(request.metadata.get("ug_srt_is_final_segment", True))
@@ -907,7 +912,7 @@ class BAGELInterleaveContextBackend:
             )
         image_shape = self._image_shape_from_params(sampling_params, state.image_shape)
         binding = self._native_srt_token_binding(state)
-        curr_kvlens, curr_rope = [binding.token_count], [binding.token_count]
+        curr_kvlens, curr_rope = self._native_srt_curr_lengths(state)
         model = self._native_srt_model()
         with _bagel_seed_context(seed):
             generation_input = model.prepare_vae_latent(
@@ -1033,6 +1038,7 @@ class BAGELInterleaveContextBackend:
         metadata = {
             "bagel_u_image_stage": stage,
             "ug_srt_added_token_count": seq_len,
+            "ug_srt_bagel_rope_delta": 0,
         }
         return UGSRTPreparedInput(
             input_ids=input_ids,
@@ -1081,10 +1087,46 @@ class BAGELInterleaveContextBackend:
         binding = state.native_srt_u_context_token_binding
         if binding is not None:
             token_count = int(binding.token_count)
-            return [token_count], [token_count]
+            ropes = state.gen_context.get("ropes") or [0]
+            return [token_count], [int(ropes[0])]
         kv_lens = state.gen_context.get("kv_lens") or [0]
         ropes = state.gen_context.get("ropes") or [0]
         return [int(kv_lens[0])], [int(ropes[0])]
+
+    def _sync_native_srt_context_from_request(
+        self,
+        state: BAGELSessionContext,
+        *,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> None:
+        binding = request.metadata.get("srt_kv_token_binding")
+        if binding is not None:
+            state.native_srt_u_context_token_binding = binding
+            state.gen_context["kv_lens"] = [int(binding.token_count)]
+
+        rope_delta = self._native_srt_rope_delta(request=request, messages=messages)
+        if rope_delta:
+            ropes = state.gen_context.get("ropes") or [0]
+            state.gen_context["ropes"] = [int(ropes[0]) + rope_delta]
+
+    @staticmethod
+    def _native_srt_rope_delta(
+        *,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> int:
+        explicit = request.metadata.get("ug_srt_bagel_rope_delta")
+        if explicit is not None:
+            return int(explicit)
+        if request.state == UGSegmentState.U_DECODE.value:
+            return 1 if request.output_ids else 0
+        if request.state in {
+            UGSegmentState.U_PREFILL.value,
+            UGSegmentState.APPEND_IMAGE.value,
+        }:
+            return len(messages)
+        return 0
 
     def _uses_native_srt_u_forward(self) -> bool:
         return isinstance(

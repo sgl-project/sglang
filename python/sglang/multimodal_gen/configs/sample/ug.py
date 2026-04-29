@@ -20,8 +20,8 @@ class UGSamplingParams(SamplingParams):
     width: int | None = 1024
     num_inference_steps: int | None = 50
 
-    cfg_text_scale: float = 3.0
-    cfg_img_scale: float = 1.5
+    cfg_text_scale: float = 1.0
+    cfg_img_scale: float = 1.0
     cfg_interval: list[float] = field(default_factory=lambda: [0.4, 1.0])
     cfg_renorm_min: float = 0.0
     cfg_renorm_type: str = "global"
