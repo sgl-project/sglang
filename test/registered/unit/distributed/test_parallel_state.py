@@ -20,15 +20,8 @@ class _OverridingPlatform(SRTPlatform):
         return "fake_backend"
 
 
-# A platform whose override raises an unexpected error at init time.
-class _RaisingPlatform(SRTPlatform):
-    device_type = "cuda"
-
-    def get_torch_distributed_backend_str(self) -> str:
-        raise RuntimeError("network init failure")
-
-
-# Mirrors all in-tree platforms today: no override, base raises NotImplementedError.
+# Mirrors all in-tree platforms today: no override, so DeviceMixin's default
+# body returns _DEVICE_TO_DISTRIBUTED_BACKEND.get(device_type, "gloo").
 class _DefaultPlatform(SRTPlatform):
     device_type = "cuda"
 
@@ -36,15 +29,17 @@ class _DefaultPlatform(SRTPlatform):
 class TestGetDefaultDistributedBackend(CustomTestCase):
     """Cover all paths of get_default_distributed_backend.
 
-    The function looks up `_DEVICE_TO_DISTRIBUTED_BACKEND[device]` by default,
-    but when `device == current_platform.device_type` it first asks
-    `current_platform.get_torch_distributed_backend_str()`. Tests use real
-    SRTPlatform subclasses so the assertions stay close to how an actual
-    out-of-tree plugin would interact with this dispatcher.
+    When ``device == current_platform.device_type`` the dispatcher asks
+    ``current_platform.get_torch_distributed_backend_str()``; otherwise it
+    looks up ``_DEVICE_TO_DISTRIBUTED_BACKEND[device]`` for cross-device
+    queries (e.g. auxiliary "cpu"/gloo groups on a CUDA process).
 
-    `current_platform` is exposed via __getattr__ on the platforms module
-    backed by the `_current_platform` singleton, so the test overrides that
-    singleton directly and restores it in tearDown.
+    Tests use real SRTPlatform subclasses so the assertions stay close to
+    how an actual out-of-tree plugin would interact with this dispatcher.
+
+    ``current_platform`` is exposed via ``__getattr__`` on the platforms
+    module backed by the ``_current_platform`` singleton, so the test
+    overrides that singleton directly and restores it in tearDown.
     """
 
     def setUp(self):
@@ -61,27 +56,15 @@ class TestGetDefaultDistributedBackend(CustomTestCase):
         self.assertEqual(get_default_distributed_backend("cuda"), "fake_backend")
 
     def test_overriding_platform_skipped_for_non_active_device(self):
-        # Even when current_platform implements get_torch_distributed_backend_str,
+        # Even when current_platform overrides get_torch_distributed_backend_str,
         # callers asking for a different device (e.g. an auxiliary "cpu" gloo
         # group on a CUDA process) must keep going through the dict.
         self._install(_OverridingPlatform())
         self.assertEqual(get_default_distributed_backend("cpu"), "gloo")
 
-    def test_unexpected_exception_warns_and_falls_back_to_dict(self):
-        self._install(_RaisingPlatform())
-        with self.assertLogs(
-            "sglang.srt.distributed.parallel_state", level="WARNING"
-        ) as cm:
-            self.assertEqual(get_default_distributed_backend("cuda"), "nccl")
-        self.assertTrue(
-            any("network init failure" in line for line in cm.output),
-            f"warning should mention the underlying error, got {cm.output!r}",
-        )
-
-    def test_default_platform_preserves_in_tree_behavior(self):
-        # In-tree platforms today don't override get_torch_distributed_backend_str
-        # (the base raises NotImplementedError). The dispatcher must silently
-        # fall through to the dict so cuda still resolves to nccl, etc.
+    def test_default_platform_uses_device_mixin_table(self):
+        # No override: DeviceMixin's default body looks up the device_type in
+        # _DEVICE_TO_DISTRIBUTED_BACKEND, so cuda still resolves to nccl.
         self._install(_DefaultPlatform())
         self.assertEqual(get_default_distributed_backend("cuda"), "nccl")
 

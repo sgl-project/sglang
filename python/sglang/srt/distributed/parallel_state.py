@@ -40,10 +40,12 @@ import torch
 import torch.distributed
 from torch.distributed import Backend, ProcessGroup
 
+from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.utils import set_global_tcp_store
 from sglang.srt.environ import envs
+from sglang.srt.platforms.device_mixin import _DEVICE_TO_DISTRIBUTED_BACKEND
 from sglang.srt.utils import (
     get_current_device_stream_fast,
     get_int_env_var,
@@ -1579,37 +1581,14 @@ def set_torch_symm_mem_all_reduce(enable: bool):
     _ENABLE_TORCH_SYMM_MEM_ALL_REDUCE = enable
 
 
-_DEVICE_TO_DISTRIBUTED_BACKEND = {
-    "cuda": "nccl",
-    "xpu": "xccl",
-    "hpu": "hccl",
-    "cpu": "gloo",
-    "npu": "hccl",
-    "musa": "mccl",
-}
-
-
+# TODO: refactor in-tree platforms to get rid of this wrapper
 def get_default_distributed_backend(device: str) -> str:
-    from sglang.srt.platforms import current_platform
-
-    # Only trust the active platform's backend when the caller's requested
-    # device actually matches it. This keeps callers that explicitly ask for a
-    # different device (e.g. an auxiliary "cpu"/gloo coordination group on a
-    # CUDA process) on the dict path.
-    if device == current_platform.device_type:
-        try:
-            return current_platform.get_torch_distributed_backend_str()
-        except NotImplementedError:
-            # TODO: Refactor in-tree platforms to override this method.
-            # Fall through to the device->backend table below for now.
-            pass
-        except Exception as e:
-            logger.warning(
-                "current_platform.get_torch_distributed_backend_str() failed for %s: %s. "
-                "Falling back to _DEVICE_TO_DISTRIBUTED_BACKEND.",
-                device,
-                e,
-            )
+    # We deliberately go through ``platforms.current_platform`` (rather than
+    # ``from ... import current_platform``) so each call resolves through the
+    # platforms package's lazy ``__getattr__`` and picks up runtime overrides
+    # of ``_current_platform`` (e.g. in tests).
+    if device == platforms.current_platform.device_type:
+        return platforms.current_platform.get_torch_distributed_backend_str()
     return _DEVICE_TO_DISTRIBUTED_BACKEND.get(device, "gloo")
 
 

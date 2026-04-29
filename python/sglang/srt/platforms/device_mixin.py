@@ -78,6 +78,16 @@ class DeviceCapability(NamedTuple):
         return self.major * 10 + self.minor
 
 
+_DEVICE_TO_DISTRIBUTED_BACKEND: dict[str, str] = {
+    "cuda": "nccl",
+    "xpu": "xccl",
+    "hpu": "hccl",
+    "cpu": "gloo",
+    "npu": "hccl",
+    "musa": "mccl",
+}
+
+
 class DeviceMixin:
     """Mixin providing device identity queries and basic device operations.
 
@@ -191,8 +201,13 @@ class DeviceMixin:
     # ---- Distributed ----
 
     def get_torch_distributed_backend_str(self) -> str:
-        """[Planned] Return the torch.distributed backend string (e.g. "nccl", "hccl")."""
-        raise NotImplementedError
+        """Return the torch.distributed backend string (e.g. "nccl", "hccl").
+
+        Default: lookup ``self.device_type`` in ``_DEVICE_TO_DISTRIBUTED_BACKEND``,
+        falling back to ``"gloo"``. Subclasses override only when they need a
+        non-default backend (e.g. mooncake, or a brand-new device).
+        """
+        return _DEVICE_TO_DISTRIBUTED_BACKEND.get(self.device_type, "gloo")
 
     def get_communicator_class(self) -> type | None:
         """[Planned] Return platform-specific communicator class, or None for default."""
