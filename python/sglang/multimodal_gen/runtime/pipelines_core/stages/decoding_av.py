@@ -42,9 +42,17 @@ class LTX2AVDecodingStage(DecodingStage):
             vae_dtype != torch.float32
         ) and not server_args.disable_autocast
 
-        original_dtype = vae_dtype
-        self.vae.to(torch.bfloat16)
-        latents = latents.to(torch.bfloat16)
+        vae_parameters = getattr(self.vae, "parameters", None)
+        original_param = (
+            next(vae_parameters(), None) if callable(vae_parameters) else None
+        )
+        if original_param is not None:
+            original_dtype = original_param.dtype
+        else:
+            original_dtype = getattr(self.vae, "dtype", torch.float32)
+
+        self.vae.to(dtype=vae_dtype)
+        latents = latents.to(dtype=vae_dtype)
         if self._ltx2_should_externally_denorm_video_latents(server_args):
             std = self.vae.latents_std.view(1, -1, 1, 1, 1).to(latents)
             mean = self.vae.latents_mean.view(1, -1, 1, 1, 1).to(latents)
