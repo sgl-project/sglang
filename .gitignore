@@ -281,4 +281,4 @@ artifacts/
 *:Zone.Identifier
 
 # Local Codex workspace/config
-.codex/
+.codex
