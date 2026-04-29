@@ -103,8 +103,6 @@ void mscclpp_allreduce(fptr_t _context, torch::Tensor& inp, torch::Tensor& out, 
 /*
  * From csrc/attention
  */
-void merge_state(
-    at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void merge_state_v2(
     at::Tensor v_a, at::Tensor s_a, at::Tensor v_b, at::Tensor s_b, at::Tensor v_merged, at::Tensor s_merged);
 void cutlass_mla_decode(
@@ -129,6 +127,8 @@ int64_t cutlass_mla_get_workspace_size(
 void rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void sgl_fused_add_rmsnorm(
     torch::Tensor input, torch::Tensor residual, torch::Tensor weight, double eps, bool enable_pdl);
+void musa_fused_add_rms_norm(
+    torch::Tensor& input, torch::Tensor& residual, torch::Tensor& weight, double epsilon, bool enable_pdl);
 void gemma_rmsnorm(at::Tensor& output, at::Tensor& input, at::Tensor& weight, double eps, bool enable_pdl);
 void gemma_fused_add_rmsnorm(at::Tensor& input, at::Tensor& residual, at::Tensor& weight, double eps, bool enable_pdl);
 void silu_and_mul(at::Tensor& out, at::Tensor& input);
@@ -142,17 +142,6 @@ void rotary_embedding(
     int64_t head_size,
     torch::Tensor& cos_sin_cache,
     bool is_neox);
-
-void downcast_fp8(
-    at::Tensor& k,
-    at::Tensor& v,
-    at::Tensor& k_out,
-    at::Tensor& v_out,
-    at::Tensor& k_scale,
-    at::Tensor& v_scale,
-    at::Tensor& loc,
-    int64_t mult,
-    int64_t offset);
 
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output);
 void concat_mla_k(torch::Tensor k, torch::Tensor k_nope, torch::Tensor k_rope);
@@ -603,9 +592,6 @@ void top_k_renorm_probs(
 
 void top_p_renorm_probs(
     at::Tensor probs, at::Tensor renorm_probs, std::optional<at::Tensor> maybe_top_p_arr, double top_p_val);
-
-void top_k_mask_logits(
-    at::Tensor logits, at::Tensor mask_logits, std::optional<at::Tensor> maybe_top_k_arr, int64_t top_k_val);
 
 namespace flash {
 /*

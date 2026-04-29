@@ -46,12 +46,12 @@ from sglang.srt.model_loader.utils import (
 )
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.utils import (
-    _is_cpu,
-    _is_cpu_amx_available,
     _is_cuda,
     _is_fp8_fnuz,
     _is_hip,
+    _is_musa,
     _is_npu,
+    _is_xpu,
     _use_aiter_gfx95,
     awq_dequantize_func,
     enable_nextn_moe_bf16_cast_to_fp8,
@@ -499,7 +499,7 @@ class DeepseekV2WeightLoaderMixin:
                         )
 
                     if (
-                        _is_cuda
+                        (_is_cuda or _is_musa or _is_xpu)
                         and weight_block_size[0] == 128
                         and weight_block_size[1] == 128
                     ):
@@ -561,6 +561,9 @@ class DeepseekV2WeightLoaderMixin:
                 _use_aiter_gfx95
                 and self.quant_config is not None
                 and self.quant_config.get_name() == "quark"
+                and self.config.architectures
+                and self.config.architectures[0]
+                == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
             ):
                 w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
                     quark_post_load_weights(self_attn, w, "mxfp4")
@@ -583,8 +586,8 @@ class DeepseekV2WeightLoaderMixin:
                     )
                     if _is_hip:
                         self_attn.w_scale *= 2.0
-                # TODO: remove this after adding FP8 support in bmm cpu kernel
-                if _is_cpu and _is_cpu_amx_available and w.dtype == torch.float8_e4m3fn:
+                # XXX (MUSA): Remove this after adding FP8 support in bmm kernel on MUSA
+                if _is_musa and w.dtype == torch.float8_e4m3fn:
                     self_attn.w_kc = (
                         self_attn.w_kc.to(torch.bfloat16) * self_attn.w_scale
                     )

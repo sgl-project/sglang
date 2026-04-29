@@ -3,8 +3,8 @@ from typing import Dict, List, TypedDict
 
 import torch
 
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import get_config_dtype_str
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config import (
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_dtype_str
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     get_config_file_name,
 )
 from sglang.srt.utils import is_hip
@@ -37,11 +37,7 @@ def get_model_config(
     topk_ids_dir: str = None,
 ) -> Dict:
     config = get_config(model_name, trust_remote_code=True)
-
-    # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
-    if hasattr(config, "text_config"):
-        config = config.get_text_config()
-
+    architecture = config.architectures[0]
     block_shape = None
     if (
         hasattr(config, "quantization_config")
@@ -61,8 +57,9 @@ def get_model_config(
         group_size = weights_config.get("group_size")
         block_shape = [0, group_size]
         assert len(block_shape) == 2
-
-    architecture = config.architectures[0]
+    # Replace config with text_config for encoder-decoder models after getting block_shape and architecture
+    if hasattr(config, "text_config"):
+        config = config.get_text_config()
 
     hidden_size = config.hidden_size
     if architecture == "DbrxForCausalLM":
@@ -132,11 +129,23 @@ def get_model_config(
         E = config.num_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
+    elif architecture == "HYV3ForCausalLM":
+        E = config.num_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.expert_hidden_dim
     elif architecture == "NemotronHForCausalLM":
         E = config.n_routed_experts // ep_size
         topk = config.num_experts_per_tok
         intermediate_size = config.moe_intermediate_size
         hidden_size = getattr(config, "moe_latent_size", None) or hidden_size
+    elif architecture == "Gemma4ForConditionalGeneration":
+        E = config.num_experts // ep_size
+        topk = config.top_k_experts
+        intermediate_size = config.moe_intermediate_size
+    elif architecture == "Lfm2MoeForCausalLM":
+        E = config.num_experts // ep_size
+        topk = config.num_experts_per_tok
+        intermediate_size = config.moe_intermediate_size
     else:
         # Default: Mixtral
         E = config.num_local_experts // ep_size
