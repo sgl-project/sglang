@@ -68,6 +68,18 @@ def main() -> None:
         raise AssertionError(host_backup_estimate)
     if host_backup_estimate.host_backup_would_copy is not False:
         raise AssertionError(host_backup_estimate)
+    if host_backup_estimate.resident_anchor_ranges != [[0, 4]]:
+        raise AssertionError(host_backup_estimate)
+    if host_backup_estimate.resident_recent_ranges != [[1767, 2535]]:
+        raise AssertionError(host_backup_estimate)
+    if host_backup_estimate.cold_candidate_ranges != [[4, 1767]]:
+        raise AssertionError(host_backup_estimate)
+    if host_backup_estimate.host_backup_copy_target_ranges != [[4, 1767]]:
+        raise AssertionError(host_backup_estimate)
+    if host_backup_estimate.host_backup_copy_target_tokens != 1763:
+        raise AssertionError(host_backup_estimate)
+    if host_backup_estimate.host_backup_copy_target_reason != "metadata_only_no_tensor_copy_range_token_mismatch":
+        raise AssertionError(host_backup_estimate)
     payload = plan.to_log_dict()
     payload.update(estimate_from_model.to_log_dict())
     payload.update({"host_backup_planned": True, **host_backup_estimate.to_log_dict()})

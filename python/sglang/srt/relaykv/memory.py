@@ -55,6 +55,12 @@ RELAYKV_SHADOW_LOG_HOST_BACKUP_KEYS = {
     "host_backup_candidate_tokens",
     "host_backup_candidate_kv_bytes",
     "host_backup_candidate_kv_mib",
+    "resident_anchor_ranges",
+    "resident_recent_ranges",
+    "cold_candidate_ranges",
+    "host_backup_copy_target_ranges",
+    "host_backup_copy_target_tokens",
+    "host_backup_copy_target_reason",
     "host_backup_max_mib",
     "host_backup_budget_ok",
     "host_backup_would_copy",
@@ -68,6 +74,12 @@ class RelayKVHostBackupShadowEstimate:
     host_backup_candidate_tokens: int
     host_backup_candidate_kv_bytes: Optional[int]
     host_backup_candidate_kv_mib: Optional[float]
+    resident_anchor_ranges: list[list[int]]
+    resident_recent_ranges: list[list[int]]
+    cold_candidate_ranges: list[list[int]]
+    host_backup_copy_target_ranges: list[list[int]]
+    host_backup_copy_target_tokens: int
+    host_backup_copy_target_reason: str
     host_backup_max_mib: float
     host_backup_budget_ok: Optional[bool]
     host_backup_would_copy: bool
@@ -87,6 +99,13 @@ def _to_mib(num_bytes: Optional[int]) -> Optional[float]:
     if num_bytes is None:
         return None
     return round(num_bytes / (1024 * 1024), 3)
+
+
+def _range_tokens(ranges: list[list[int]]) -> int:
+    total = 0
+    for start, end in ranges:
+        total += max(end - start, 0)
+    return total
 
 
 def estimate_kv_memory_from_metadata(
@@ -180,6 +199,12 @@ def estimate_host_backup_shadow_for_plan(
             host_backup_candidate_tokens=0,
             host_backup_candidate_kv_bytes=0,
             host_backup_candidate_kv_mib=0.0,
+            resident_anchor_ranges=plan.resident_anchor_ranges,
+            resident_recent_ranges=plan.resident_recent_ranges,
+            cold_candidate_ranges=plan.cold_candidate_ranges,
+            host_backup_copy_target_ranges=[],
+            host_backup_copy_target_tokens=0,
+            host_backup_copy_target_reason="host_backup_shadow_disabled",
             host_backup_max_mib=host_backup_max_mib,
             host_backup_budget_ok=True,
             host_backup_would_copy=False,
@@ -188,6 +213,14 @@ def estimate_host_backup_shadow_for_plan(
 
     candidate_kv_bytes = memory_estimate.planned_cold_kv_bytes
     candidate_kv_mib = memory_estimate.planned_cold_kv_mib
+    copy_target_ranges = plan.cold_candidate_ranges
+    copy_target_tokens = _range_tokens(copy_target_ranges)
+    if copy_target_tokens != plan.planned_cold_tokens:
+        copy_target_reason = (
+            "metadata_only_no_tensor_copy_range_token_mismatch"
+        )
+    else:
+        copy_target_reason = "metadata_only_no_tensor_copy"
     if candidate_kv_mib is None:
         budget_ok = None
         reason = "metadata_only_no_tensor_copy_insufficient_memory_metadata"
@@ -203,6 +236,12 @@ def estimate_host_backup_shadow_for_plan(
         host_backup_candidate_tokens=plan.planned_cold_tokens,
         host_backup_candidate_kv_bytes=candidate_kv_bytes,
         host_backup_candidate_kv_mib=candidate_kv_mib,
+        resident_anchor_ranges=plan.resident_anchor_ranges,
+        resident_recent_ranges=plan.resident_recent_ranges,
+        cold_candidate_ranges=plan.cold_candidate_ranges,
+        host_backup_copy_target_ranges=copy_target_ranges,
+        host_backup_copy_target_tokens=copy_target_tokens,
+        host_backup_copy_target_reason=copy_target_reason,
         host_backup_max_mib=host_backup_max_mib,
         host_backup_budget_ok=budget_ok,
         host_backup_would_copy=False,

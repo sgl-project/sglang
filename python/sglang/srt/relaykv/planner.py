@@ -18,6 +18,9 @@ class RelayKVPlan:
     planned_cold_tokens: int
     anchor_pages: List[int]
     recent_page_range: Tuple[int, int]
+    resident_anchor_ranges: List[List[int]]
+    resident_recent_ranges: List[List[int]]
+    cold_candidate_ranges: List[List[int]]
     estimated_resident_ratio: float
 
     def to_log_dict(self) -> Dict[str, Any]:
@@ -33,6 +36,12 @@ def _ceil_div(x: int, y: int) -> int:
     if y <= 0:
         raise ValueError("page_size must be > 0")
     return (x + y - 1) // y
+
+
+def _make_range(start: int, end: int) -> List[List[int]]:
+    if end <= start:
+        return []
+    return [[start, end]]
 
 
 def build_shadow_plan(
@@ -68,6 +77,9 @@ def build_shadow_plan(
             planned_cold_tokens=0,
             anchor_pages=[],
             recent_page_range=(0, seq_len),
+            resident_anchor_ranges=[],
+            resident_recent_ranges=_make_range(0, seq_len),
+            cold_candidate_ranges=[],
             estimated_resident_ratio=1.0 if seq_len > 0 else 0.0,
         )
 
@@ -80,10 +92,18 @@ def build_shadow_plan(
     total_pages = _ceil_div(seq_len, page_size) if seq_len else 0
     anchor_page_count = min(config.anchor_pages, total_pages)
     anchors = list(range(anchor_page_count))
+    anchor_ranges = _make_range(0, anchor_page_count)
 
     recent_tokens = min(config.recent_window, planned_resident, seq_len)
     recent_start = max(seq_len - recent_tokens, 0)
     recent_end = seq_len
+    recent_ranges = _make_range(recent_start, recent_end)
+
+    cold_start = anchor_page_count
+    cold_end = recent_start
+    if cold_end < cold_start:
+        cold_end = cold_start
+    cold_candidate_ranges = _make_range(cold_start, cold_end)
 
     ratio = (planned_resident / seq_len) if seq_len > 0 else 0.0
 
@@ -98,6 +118,9 @@ def build_shadow_plan(
         planned_cold_tokens=planned_cold,
         anchor_pages=anchors,
         recent_page_range=(recent_start, recent_end),
+        resident_anchor_ranges=anchor_ranges,
+        resident_recent_ranges=recent_ranges,
+        cold_candidate_ranges=cold_candidate_ranges,
         estimated_resident_ratio=ratio,
     )
 
