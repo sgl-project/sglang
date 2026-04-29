@@ -408,23 +408,22 @@ class SchedulerMetricsMixin:
                     num_write_bytes_per_gpu=write_bytes,
                 )
 
-            # Basics
+            priority_enabled = self.enable_priority_scheduling
             total_tokens = prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
             cache_hit_rate = (
                 prefill_stats.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
             )
 
+            # Basics
             self.stats.num_running_reqs = prefill_stats.num_running_reqs
-            self.stats.num_running_reqs_offline_batch = 0
-            pool_stats.update_scheduler_stats(self.stats)
-
-            priority_enabled = self.enable_priority_scheduling
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
 
+            # Memory pool usage ratios / Absolute token counts
+            pool_stats.update_scheduler_stats(self.stats)
             self.stats.max_total_num_tokens = self.max_total_num_tokens
 
             # Retract
@@ -450,7 +449,7 @@ class SchedulerMetricsMixin:
                     self.disagg_decode_transfer_queue.queue, priority_enabled
                 )
 
-            # Others
+            # Utilization / LoRA / HiCache
             self.calculate_utilization()
             self.update_lora_metrics()
             self._log_hicache_stats()
@@ -505,7 +504,6 @@ class SchedulerMetricsMixin:
 
         self.num_generated_tokens = 0
         num_running_reqs = len(batch.reqs)
-        num_running_reqs_offline_batch = 0
 
         pool_stats = self.get_pool_stats()
         token_usage_msg = ", ".join(pool_stats.get_decode_usage_msg_parts()) + ", "
@@ -590,27 +588,26 @@ class SchedulerMetricsMixin:
             logger.info(msg)
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.enable_priority_scheduling
+
             # Basics
             self.stats.num_running_reqs = QueueCount.from_reqs(
                 batch.reqs, priority_enabled
             )
-            self.stats.num_running_reqs_offline_batch = num_running_reqs_offline_batch
-            pool_stats.update_scheduler_stats(self.stats)
-            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
-            self.stats.gen_throughput = self.last_gen_throughput
             self.stats.num_queue_reqs = QueueCount.from_reqs(
                 self.waiting_queue, priority_enabled
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
+            self.stats.gen_throughput = self.last_gen_throughput
             self.stats.cache_hit_rate = cache_hit_rate
+            self.stats.decode_sum_seq_lens = batch.seq_lens_cpu.sum().item()
 
+            # Memory pool usage ratios / Absolute token counts
+            pool_stats.update_scheduler_stats(self.stats)
             self.stats.max_total_num_tokens = self.max_total_num_tokens
-            self.stats.num_streaming_sessions = self._streaming_session_count()
-            self.stats.streaming_session_held_tokens = self._session_held_tokens()
 
             # Speculative decoding
-            self.stats.spec_accept_rate = spec_accept_rate
             self.stats.spec_accept_length = spec_accept_length
+            self.stats.spec_accept_rate = spec_accept_rate
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
@@ -632,6 +629,12 @@ class SchedulerMetricsMixin:
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.disagg_decode_transfer_queue.queue, priority_enabled
                 )
+
+            # Streaming session metrics
+            self.stats.num_streaming_sessions = self._streaming_session_count()
+            self.stats.streaming_session_held_tokens = self._session_held_tokens()
+
+            # Routing key metrics
             running_routing_keys = [r.routing_key for r in batch.reqs]
             waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
             (
@@ -642,7 +645,7 @@ class SchedulerMetricsMixin:
                 running_routing_keys + waiting_routing_keys
             )
 
-            # Others
+            # Utilization / LoRA / HiCache
             self.calculate_utilization()
             self.update_lora_metrics()
             self._log_hicache_stats()
