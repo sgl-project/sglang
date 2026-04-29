@@ -42,6 +42,19 @@ if TYPE_CHECKING:
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 
+# Optional ROCm fast path: AITER fused QK rmsnorm.
+# Replaces the two separate Q-norm + K-norm RMSNorm kernels with a single fused HIP
+# kernel.  Particularly impactful for the DFlash draft model on ROCm, where every
+# decode step runs Q/K norm 5x (one per draft layer) for every active request.
+_aiter_fused_qk_rmsnorm = None
+if _is_hip:
+    try:
+        from aiter.ops.fused_qk_norm_rope_cache_quant import (
+            fused_qk_rmsnorm as _aiter_fused_qk_rmsnorm,
+        )
+    except ImportError:
+        pass
+
 WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
 
@@ -442,6 +455,30 @@ def apply_qk_norm(
     batch_size = q.size(0)
     q_eps = q_norm.variance_epsilon
     k_eps = k_norm.variance_epsilon
+
+    # ROCm fast path: single fused AITER kernel for Q-norm + K-norm.
+    # Unlike the CUDA path below (which is in-place), AITER returns new tensors,
+    # so it is safe even when callers do not allow in-place updates.
+    # NOTE: must use reshape (not view) because qkv.split() returns non-contiguous
+    # strided views; ROCm RMSNorm kernels fault on strided inputs (see #23159).
+    if (
+        _is_hip
+        and _aiter_fused_qk_rmsnorm is not None
+        and (q_eps == k_eps)
+        and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
+    ):
+        q_2d = q.reshape(-1, head_dim)
+        k_2d = k.reshape(-1, head_dim)
+        q_normed, k_normed = _aiter_fused_qk_rmsnorm(
+            q_2d,
+            q_norm.weight,
+            q_eps,
+            k_2d,
+            k_norm.weight,
+            k_eps,
+        )
+        return q_normed.view(q.shape), k_normed.view(k.shape)
+
     if (
         _is_cuda  # TODO(dark): have not tested on ROCm or other backends
         and allow_inplace  # TODO(dark): this can be relaxed if needed
