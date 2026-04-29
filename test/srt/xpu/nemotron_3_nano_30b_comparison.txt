@@ -1,0 +1,4 @@
+NVIDIA-Nemotron-3-Nano-30B-A3B — device comparison log
+Model: nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16
+Run started (UTC): 2026-04-27T03:33:40.346398+00:00
+================================================================================
