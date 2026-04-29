@@ -14,7 +14,7 @@ so we extract the last \\boxed{...} or \\fbox{...}.
 from typing import Optional
 
 from sglang.test import simple_eval_common as common
-from sglang.test.simple_eval_aime25 import normalize_aime_answer
+from sglang.test.simple_eval_aime25 import extract_boxed_answer, normalize_aime_answer
 from sglang.test.simple_eval_common import (
     HTML_JINJA,
     Eval,
@@ -29,54 +29,13 @@ The answer is an integer between 0 and 999 inclusive.
 {question}"""
 
 
-def extract_boxed_answer(text: str) -> Optional[str]:
-    """Return the content of the last \\boxed{...} or \\fbox{...} with balanced braces."""
-    if not text:
-        return None
-    markers = ("\\boxed{", "\\fbox{")
-    last_content = None
-    i = 0
-    while i < len(text):
-        next_idx = -1
-        next_marker_len = 0
-        for marker in markers:
-            j = text.find(marker, i)
-            if j != -1 and (next_idx == -1 or j < next_idx):
-                next_idx = j
-                next_marker_len = len(marker)
-        if next_idx == -1:
-            break
-        start = next_idx + next_marker_len
-        depth = 1
-        k = start
-        while k < len(text) and depth > 0:
-            c = text[k]
-            if c == "{":
-                depth += 1
-            elif c == "}":
-                depth -= 1
-            k += 1
-        if depth == 0:
-            last_content = text[start : k - 1]
-            i = k
-        else:
-            break
-    return last_content
-
-
 class AIME26Eval(Eval):
     def __init__(
         self,
         num_examples: Optional[int],
         num_threads: int,
     ):
-        try:
-            from datasets import load_dataset
-        except ImportError:
-            raise ImportError(
-                "The 'datasets' package is required for AIME26 evaluation. "
-                "Please install it with: pip install datasets"
-            )
+        from datasets import load_dataset
 
         dataset = load_dataset("MathArena/aime_2026", split="train")
         examples = [

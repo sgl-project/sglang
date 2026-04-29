@@ -2,19 +2,19 @@
 
 """
 AIME 2025 - American Invitational Mathematics Examination 2025
-Dataset: opencompass/AIME2025
-https://huggingface.co/datasets/opencompass/AIME2025
+Dataset: MathArena/aime_2025
+https://huggingface.co/datasets/MathArena/aime_2025
 
-The American Invitational Mathematics Examination (AIME) is a challenging
-competition math exam. All answers are integers from 000 to 999.
+Prompt, dataset, and answer-extraction follow the matharena evaluation
+(https://github.com/eth-sri/matharena), which reproduces the published
+reasoning-model AIME numbers. Reasoning models are trained to emit \\boxed{N},
+so we extract the last \\boxed{...} or \\fbox{...}.
 """
 
-import re
 from typing import Optional
 
 from sglang.test import simple_eval_common as common
 from sglang.test.simple_eval_common import (
-    ANSWER_PATTERN,
     HTML_JINJA,
     Eval,
     EvalResult,
@@ -22,29 +22,18 @@ from sglang.test.simple_eval_common import (
     SingleEvalResult,
 )
 
-QUERY_TEMPLATE = """
-Solve the following AIME (American Invitational Mathematics Examination) problem step by step. The last line of your response should be of the form Answer: $ANSWER (without quotes) where $ANSWER is the answer to the problem.
+QUERY_TEMPLATE = """Put your final answer within \\boxed{{}}.
+The answer is an integer between 0 and 999 inclusive.
 
-Note: AIME answers are always integers from 000 to 999 (inclusive). If you get a non-integer answer, you likely made a computational error.
-
-{question}
-
-Remember to put your answer on its own line after "Answer:", and express your answer as an integer from 000 to 999.
-""".strip()
+{question}"""
 
 
 def normalize_aime_answer(answer: str) -> Optional[str]:
-    """
-    Normalize AIME answer to standard format.
-    AIME answers are integers from 000 to 999.
-    """
+    """Normalize AIME answer to a canonical integer-string in 0..999."""
     if answer is None:
         return None
-    # Remove whitespace and convert to string
     answer = str(answer).strip()
-    # Try to extract integer from answer
     try:
-        # Handle various formats like "42", "042", "42.0", etc.
         num = int(float(answer))
         if 0 <= num <= 999:
             return str(num)
@@ -53,32 +42,54 @@ def normalize_aime_answer(answer: str) -> Optional[str]:
     return answer
 
 
+def extract_boxed_answer(text: str) -> Optional[str]:
+    """Return the content of the last \\boxed{...} or \\fbox{...} with balanced braces."""
+    if not text:
+        return None
+    markers = ("\\boxed{", "\\fbox{")
+    last_content = None
+    i = 0
+    while i < len(text):
+        next_idx = -1
+        next_marker_len = 0
+        for marker in markers:
+            j = text.find(marker, i)
+            if j != -1 and (next_idx == -1 or j < next_idx):
+                next_idx = j
+                next_marker_len = len(marker)
+        if next_idx == -1:
+            break
+        start = next_idx + next_marker_len
+        depth = 1
+        k = start
+        while k < len(text) and depth > 0:
+            c = text[k]
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth -= 1
+            k += 1
+        if depth == 0:
+            last_content = text[start : k - 1]
+            i = k
+        else:
+            break
+    return last_content
+
+
 class AIME25Eval(Eval):
     def __init__(
         self,
         num_examples: Optional[int],
         num_threads: int,
     ):
-        try:
-            from datasets import load_dataset
-        except ImportError:
-            raise ImportError(
-                "The 'datasets' package is required for AIME25 evaluation. "
-                "Please install it with: pip install datasets"
-            )
+        from datasets import load_dataset
 
-        # Load AIME 2025 dataset from HuggingFace
-        dataset1 = load_dataset("opencompass/AIME2025", "AIME2025-I", split="test")
-        dataset2 = load_dataset("opencompass/AIME2025", "AIME2025-II", split="test")
-        examples1 = [
-            {"question": row["question"], "answer": str(row["answer"])}
-            for row in dataset1
+        dataset = load_dataset("MathArena/aime_2025", split="train")
+        examples = [
+            {"question": row["problem"], "answer": str(row["answer"])}
+            for row in dataset
         ]
-        examples2 = [
-            {"question": row["question"], "answer": str(row["answer"])}
-            for row in dataset2
-        ]
-        examples = examples1 + examples2
 
         if num_examples:
             examples = examples[: min(num_examples, len(examples))]
@@ -94,15 +105,12 @@ class AIME25Eval(Eval):
             response_text = sampler(prompt_messages)
             response_text = response_text or ""
 
-            # Extract answer from response
-            match = re.search(ANSWER_PATTERN, response_text)
-            extracted_answer = match.group(1).strip() if match else None
+            extracted_answer = extract_boxed_answer(response_text)
+            extracted_answer = extracted_answer.strip() if extracted_answer else None
 
-            # Normalize both answers for comparison
             normalized_extracted = normalize_aime_answer(extracted_answer)
             normalized_correct = normalize_aime_answer(row["answer"])
 
-            # Score: 1.0 if correct, 0.0 otherwise
             score = 1.0 if normalized_extracted == normalized_correct else 0.0
 
             html = common.jinja_env.from_string(HTML_JINJA).render(
