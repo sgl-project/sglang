@@ -38,6 +38,7 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
+    batch_invariant=False,
     score_mod=None,
     aux_tensors=None,
     ver=3,
@@ -164,6 +165,7 @@ def flash_attn_with_kvcache(
             sm_margin=sm_margin,
             return_softmax_lse=return_softmax_lse,
             sinks=sinks,
+            batch_invariant=batch_invariant,
         )
     elif ver == 4:
         from .flash_attention_v4 import (
@@ -229,6 +231,7 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
+    batch_invariant=False,
     score_mod=None,
     aux_tensors=None,
     ver=3,
@@ -260,6 +263,7 @@ def flash_attn_varlen_func(
             sm_margin=sm_margin,
             return_softmax_lse=return_softmax_lse,
             sinks=sinks,
+            batch_invariant=batch_invariant,
         )
     elif ver == 4:
         from .flash_attention_v4 import (

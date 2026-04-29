@@ -180,18 +180,18 @@ class FlashAttentionBackend(AttentionBackend):
         self.flash_attn_with_kvcache = flash_attn_with_kvcache
 
         # If num_splits == 0, we use a heuristic to automatically determine the number of splits.
-        # We set nums splits to 1 if deterministic inference is enabled.
+        # We set a fixed num_splits for deterministic inference to ensure batch-invariant split boundaries.
         # See https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/ for more details.
         # Furthermore, FA4 does not support num_splits=0 with CUDA Graph, so we set num_splits to 1 if CUDA Graph is enabled.
-        self.num_splits = (
-            1
-            if model_runner.server_args.enable_deterministic_inference
-            or (
-                self.fa_impl_ver == 4
-                and not model_runner.server_args.disable_cuda_graph
-            )
-            else 0
-        )
+        if model_runner.server_args.enable_deterministic_inference:
+            # FA3 supports static num_splits > 1 with batch-invariant scheduling.
+            # FA4 and other backends use num_splits=1 for deterministic mode.
+            self.num_splits = 4 if self.fa_impl_ver == 3 else 1
+        elif self.fa_impl_ver == 4 and not model_runner.server_args.disable_cuda_graph:
+            self.num_splits = 1
+        else:
+            self.num_splits = 0
+        self.batch_invariant = model_runner.server_args.enable_deterministic_inference
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
@@ -698,6 +698,7 @@ class FlashAttentionBackend(AttentionBackend):
                         v_descale=v_descale,
                         return_softmax_lse=use_cascade_attn,
                         num_splits=self.num_splits,
+                        batch_invariant=self.batch_invariant,
                         ver=self.fa_impl_ver,
                         **kwargs,
                     )
@@ -726,6 +727,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    batch_invariant=self.batch_invariant,
                     ver=self.fa_impl_ver,
                     **kwargs,
                 )
@@ -754,6 +756,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
+                    batch_invariant=self.batch_invariant,
                     ver=self.fa_impl_ver,
                     **kwargs,
                 )
@@ -872,6 +875,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    batch_invariant=self.batch_invariant,
                     ver=self.fa_impl_ver,
                 )
                 if use_cascade_attn:
@@ -895,6 +899,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=v_descale,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
+                            batch_invariant=self.batch_invariant,
                             ver=self.fa_impl_ver,
                         )
                     )
@@ -1016,6 +1021,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
+                    batch_invariant=self.batch_invariant,
                     ver=self.fa_impl_ver,
                     **kwargs,
                 )
@@ -1037,6 +1043,7 @@ class FlashAttentionBackend(AttentionBackend):
                     k_descale=k_descale,
                     v_descale=v_descale,
                     num_splits=self.num_splits,
+                    batch_invariant=self.batch_invariant,
                     ver=self.fa_impl_ver,
                     **kwargs,
                 )
@@ -1075,6 +1082,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=use_cascade_attn,
                     num_splits=self.num_splits,
+                    batch_invariant=self.batch_invariant,
                     ver=self.fa_impl_ver,
                     **kwargs,
                 )
@@ -1098,6 +1106,7 @@ class FlashAttentionBackend(AttentionBackend):
                             v_descale=v_descale,
                             return_softmax_lse=True,
                             num_splits=self.num_splits,
+                            batch_invariant=self.batch_invariant,
                             ver=self.fa_impl_ver,
                             **kwargs,
                         )
@@ -1155,6 +1164,7 @@ class FlashAttentionBackend(AttentionBackend):
                 v_descale=v_descale,
                 return_softmax_lse=use_cascade_attn,  # softmax_lse is needed for merge states
                 num_splits=self.num_splits,
+                batch_invariant=self.batch_invariant,
                 ver=self.fa_impl_ver,
             )
             if use_cascade_attn:
@@ -1177,6 +1187,7 @@ class FlashAttentionBackend(AttentionBackend):
                     v_descale=v_descale,
                     return_softmax_lse=True,
                     num_splits=self.num_splits,
+                    batch_invariant=self.batch_invariant,
                     ver=self.fa_impl_ver,
                 )
                 o, _ = merge_state_v2(

@@ -65,6 +65,7 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
+    batch_invariant=False,  # If True, split boundaries are batch-invariant (deterministic)
     score_mod=None,
     aux_tensors=None,
     ver=3,
@@ -222,6 +223,7 @@ def flash_attn_with_kvcache(
         pack_gqa,
         sm_margin,
         sinks,
+        batch_invariant,
     )
     # return (out, softmax_lse) if return_softmax_lse else out
     return (out, softmax_lse, *rest) if return_softmax_lse else out
@@ -253,6 +255,7 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
+    batch_invariant=False,
     score_mod=None,
     aux_tensors=None,
     ver=3,
@@ -309,6 +312,7 @@ def flash_attn_varlen_func(
         pack_gqa=pack_gqa,
         sm_margin=sm_margin,
         sinks=sinks,
+        batch_invariant=batch_invariant,
     )
 
     return (out, softmax_lse, *rest) if return_softmax_lse else out
