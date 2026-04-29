@@ -26,8 +26,8 @@ from sglang.srt.ug.runtime import (
     UGLatentDecodeRequest,
     UGLatentPrepareRequest,
     UGLatentPrepareResult,
-    UGSRTPreparedInput,
     UGSegmentState,
+    UGSRTPreparedInput,
     UGVelocityRequest,
 )
 
@@ -42,6 +42,13 @@ _BAGEL_REQUIRED_MODULES = (
     "data.data_utils",
     "data.transforms",
     "inferencer",
+    "modeling.autoencoder",
+    "modeling.bagel",
+    "modeling.qwen2",
+)
+_BAGEL_NATIVE_SRT_REQUIRED_MODULES = (
+    "data.data_utils",
+    "data.transforms",
     "modeling.autoencoder",
     "modeling.bagel",
     "modeling.qwen2",
@@ -487,7 +494,7 @@ class BAGELNativeSRTUForwardExecutor(BAGELSRTUForwardExecutor):
 
 
 class BAGELInterleaveContextBackend:
-    """Wraps an official BAGEL InterleaveInferencer behind UG adapter methods."""
+    """Wraps a BAGEL inferencer or native-SRT shell behind UG adapter methods."""
 
     def __init__(
         self,
@@ -623,7 +630,12 @@ class BAGELInterleaveContextBackend:
             )
         latent_tokens = request.latent_tokens
         timestep = request.timestep
-        runtime_device = _bagel_runtime_device(self.inferencer.model)
+        runtime_model = (
+            self._native_srt_model()
+            if isinstance(state.prepared_denoise, BAGELNativeSRTPreparedDenoise)
+            else self.inferencer.model
+        )
+        runtime_device = _bagel_runtime_device(runtime_model)
         if runtime_device is not None:
             latent_tokens = latent_tokens.to(runtime_device)
             timestep = timestep.to(runtime_device)
@@ -677,10 +689,13 @@ class BAGELInterleaveContextBackend:
             request.sampling_params,
             state.image_shape,
         )
+        latent_shape_model = (
+            self._native_srt_model()
+            if isinstance(state.prepared_denoise, BAGELNativeSRTPreparedDenoise)
+            else self.inferencer.model
+        )
         latent_shape = _bagel_latent_shape(
-            self.inferencer.model,
-            image_shape,
-            latent_tokens,
+            latent_shape_model, image_shape, latent_tokens
         )
         return UGLatentPrepareResult(
             latent_tokens=latent_tokens,
@@ -745,6 +760,15 @@ class BAGELInterleaveContextBackend:
         latent_tokens = request.latent_tokens
         if latent_tokens.ndim == 3:
             latent_tokens = latent_tokens[0]
+
+        if state.native_srt_u_context:
+            decoder = getattr(self._native_srt_model(), "decode_bagel_image", None)
+            if not callable(decoder):
+                raise BAGELAdapterError(
+                    "BAGEL native SRT image decode requires decode_bagel_image "
+                    "on the SRT model"
+                )
+            return decoder(latent_tokens, image_shape)
 
         vae_model = getattr(self.inferencer, "vae_model", None)
         vae_device = _bagel_runtime_device(vae_model)
@@ -884,7 +908,7 @@ class BAGELInterleaveContextBackend:
         image_shape = self._image_shape_from_params(sampling_params, state.image_shape)
         binding = self._native_srt_token_binding(state)
         curr_kvlens, curr_rope = [binding.token_count], [binding.token_count]
-        model = self.inferencer.model
+        model = self._native_srt_model()
         with _bagel_seed_context(seed):
             generation_input = model.prepare_vae_latent(
                 curr_kvlens=curr_kvlens,
@@ -909,13 +933,13 @@ class BAGELInterleaveContextBackend:
         image: Any | None,
         state: UGSegmentState,
     ) -> list[UGSRTPreparedInput]:
-        model = self.inferencer.model
+        model = self._native_srt_model()
         if not hasattr(model, "prepare_vae_images") or not hasattr(
             model, "prepare_vit_images"
         ):
             raise BAGELAdapterError(
-                "Native SRT BAGEL image U forward requires official BAGEL "
-                "prepare_vae_images/prepare_vit_images embedding builders"
+                "Native SRT BAGEL image U forward requires "
+                "prepare_vae_images/prepare_vit_images on the SRT model"
             )
 
         session_state = self._state_for(session.handle.session_id)
@@ -1031,118 +1055,24 @@ class BAGELInterleaveContextBackend:
     def _embed_native_srt_vae_image(
         self, generation_input: dict[str, Any]
     ) -> torch.Tensor:
-        model = self.inferencer.model
-        packed_sequence = self._native_srt_base_text_sequence(generation_input)
-        vae_model = self.inferencer.vae_model
-        padded_images = generation_input["padded_images"]
-        runtime_device = _bagel_runtime_device(vae_model) or _bagel_runtime_device(
-            model
-        )
-        if runtime_device is not None:
-            padded_images = padded_images.to(runtime_device)
-        vae_dtype = _bagel_runtime_dtype(vae_model)
-        if vae_dtype is not None and padded_images.is_floating_point():
-            padded_images = padded_images.to(dtype=vae_dtype)
-
-        padded_latent = vae_model.encode(padded_images)
-        patch_size = int(getattr(model, "latent_patch_size", 2))
-        latent_channel = int(getattr(model, "latent_channel", 16))
-        packed_latents = []
-        for latent, (height, width) in zip(
-            padded_latent,
-            generation_input["patchified_vae_latent_shapes"],
-        ):
-            latent = latent[:, : height * patch_size, : width * patch_size].reshape(
-                latent_channel,
-                height,
-                patch_size,
-                width,
-                patch_size,
+        embedder = getattr(self._native_srt_model(), "embed_bagel_vae_image", None)
+        if not callable(embedder):
+            raise BAGELAdapterError(
+                "BAGEL native SRT image U forward requires embed_bagel_vae_image "
+                "on the SRT model"
             )
-            latent = torch.einsum("chpwq->hwpqc", latent).reshape(
-                -1,
-                patch_size * patch_size * latent_channel,
-            )
-            packed_latents.append(latent)
-        packed_latent = torch.cat(packed_latents, dim=0)
-        device = model.vae2llm.weight.device
-        packed_latent = packed_latent.to(
-            device=device, dtype=model.vae2llm.weight.dtype
-        )
-        packed_vae_position_ids = generation_input["packed_vae_position_ids"].to(
-            device=device,
-            dtype=torch.long,
-        )
-        packed_timesteps = generation_input["packed_timesteps"].to(device=device)
-        if packed_timesteps.numel() == 1:
-            packed_timesteps = packed_timesteps.reshape(1).expand(
-                packed_latent.shape[0]
-            )
-        packed_latent = (
-            model.vae2llm(packed_latent)
-            + model.time_embedder(packed_timesteps)
-            + model.latent_pos_embed(packed_vae_position_ids)
-        )
-        packed_sequence = packed_sequence.to(device=device)
-        packed_sequence[generation_input["packed_vae_token_indexes"].to(device)] = (
-            packed_latent.to(packed_sequence.dtype)
-        )
-        return packed_sequence
+        return embedder(generation_input)
 
     def _embed_native_srt_vit_image(
         self, generation_input: dict[str, Any]
     ) -> torch.Tensor:
-        model = self.inferencer.model
-        packed_sequence = self._native_srt_base_text_sequence(generation_input)
-        vit_tokens = generation_input["packed_vit_tokens"]
-        runtime_device = _bagel_runtime_device(getattr(model, "vit_model", None))
-        if runtime_device is not None:
-            vit_tokens = vit_tokens.to(runtime_device)
-        packed_vit_position_ids = generation_input["packed_vit_position_ids"]
-        if runtime_device is not None:
-            packed_vit_position_ids = packed_vit_position_ids.to(runtime_device)
-        vit_token_seqlens = generation_input["vit_token_seqlens"]
-        if runtime_device is not None:
-            vit_token_seqlens = vit_token_seqlens.to(runtime_device)
-        cu_seqlens = torch.nn.functional.pad(
-            torch.cumsum(vit_token_seqlens, dim=0),
-            (1, 0),
-        ).to(torch.int32)
-        max_seqlen = torch.max(vit_token_seqlens).item()
-        packed_vit_token_embed = model.vit_model(
-            packed_pixel_values=vit_tokens,
-            packed_flattened_position_ids=packed_vit_position_ids,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
-        packed_vit_token_embed = model.connector(packed_vit_token_embed)
-        packed_vit_token_embed = packed_vit_token_embed + model.vit_pos_embed(
-            packed_vit_position_ids
-        )
-        device = packed_vit_token_embed.device
-        packed_sequence = packed_sequence.to(device=device)
-        packed_sequence[generation_input["packed_vit_token_indexes"].to(device)] = (
-            packed_vit_token_embed.to(packed_sequence.dtype)
-        )
-        return packed_sequence
-
-    def _native_srt_base_text_sequence(
-        self,
-        generation_input: dict[str, Any],
-    ) -> torch.Tensor:
-        model = self.inferencer.model
-        embed_tokens = model.language_model.model.embed_tokens
-        packed_text_ids = generation_input["packed_text_ids"].to(
-            device=embed_tokens.weight.device,
-            dtype=torch.long,
-        )
-        packed_text_embedding = embed_tokens(packed_text_ids)
-        seq_len = int(generation_input["packed_seqlens"].sum().item())
-        packed_sequence = packed_text_embedding.new_zeros((seq_len, model.hidden_size))
-        packed_sequence[
-            generation_input["packed_text_indexes"].to(packed_sequence.device)
-        ] = packed_text_embedding
-        return packed_sequence
+        embedder = getattr(self._native_srt_model(), "embed_bagel_vit_image", None)
+        if not callable(embedder):
+            raise BAGELAdapterError(
+                "BAGEL native SRT image U forward requires embed_bagel_vit_image "
+                "on the SRT model"
+            )
+        return embedder(generation_input)
 
     def _native_srt_curr_lengths(
         self,
@@ -1161,6 +1091,18 @@ class BAGELInterleaveContextBackend:
             self.u_forward_bridge.srt_u_forward_executor,
             BAGELNativeSRTUForwardExecutor,
         )
+
+    def _native_srt_model(self) -> Any:
+        if self.native_srt_denoise_executor is None:
+            raise BAGELAdapterError(
+                "BAGEL native SRT path requires a native SRT denoise executor"
+            )
+        srt_model = getattr(self.native_srt_denoise_executor, "srt_model", None)
+        if srt_model is None:
+            raise BAGELAdapterError(
+                "BAGEL native SRT denoise executor does not expose an SRT model"
+            )
+        return srt_model
 
     @staticmethod
     def _native_srt_token_binding(state: BAGELSessionContext) -> Any:
@@ -1251,8 +1193,8 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
 
     The adapter can use either a deterministic mock backend for smoke tests or
     the official BAGEL modules behind the SRT-owned UG runtime. In the native
-    SRT path, official modules prepare embeddings/latents while SRT owns the
-    session requests, KV cache, and per-step G velocity execution.
+    SRT path, the shell keeps tokenizer/transforms only; SRT owns feature
+    extractors, session requests, KV cache, and per-step G velocity execution.
     """
 
     def __init__(
@@ -1362,8 +1304,13 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
                 "checkout with the official config and weight files."
             )
 
+        required_modules = (
+            _BAGEL_NATIVE_SRT_REQUIRED_MODULES
+            if native_srt_u_context
+            else _BAGEL_REQUIRED_MODULES
+        )
         missing_modules = [
-            name for name in _BAGEL_REQUIRED_MODULES if _find_spec(name) is None
+            name for name in required_modules if _find_spec(name) is None
         ]
         if missing_modules:
             raise BAGELAdapterError(
@@ -1373,7 +1320,10 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
                 "the real BAGEL backend."
             )
 
-        inferencer = _build_official_bagel_inferencer(checkpoint_dir)
+        if native_srt_u_context:
+            inferencer = _build_native_srt_bagel_inferencer_shell(checkpoint_dir)
+        else:
+            inferencer = _build_official_bagel_inferencer(checkpoint_dir)
         u_forward_bridge = None
         if native_srt_u_context:
             u_forward_bridge = BAGELUForwardBridge(
@@ -1638,6 +1588,91 @@ def _build_official_bagel_inferencer(
         vit_transform=vit_transform,
         new_token_ids=new_token_ids,
     )
+
+
+class BAGELNativeSRTInferencerShell:
+    """Tokenizer/transform shell for native SRT BAGEL execution.
+
+    The shell intentionally does not load the official BAGEL model or VAE/VIT
+    feature extractors. Native execution gets those modules from the SRT model
+    instance loaded by ModelRunner.
+    """
+
+    def __init__(
+        self,
+        *,
+        tokenizer: Any,
+        vae_transform: Any,
+        vit_transform: Any,
+        new_token_ids: dict[str, int],
+    ) -> None:
+        self.model = None
+        self.vae_model = None
+        self.tokenizer = tokenizer
+        self.vae_transform = vae_transform
+        self.vit_transform = vit_transform
+        self.new_token_ids = new_token_ids
+
+    def init_gen_context(self) -> dict[str, Any]:
+        return {
+            "kv_lens": [0],
+            "ropes": [0],
+            "past_key_values": None,
+        }
+
+    def update_context_text(self, *args, **kwargs):
+        del args, kwargs
+        raise BAGELAdapterError(
+            "Native SRT BAGEL shell cannot update context through official BAGEL"
+        )
+
+    def update_context_image(self, *args, **kwargs):
+        del args, kwargs
+        raise BAGELAdapterError(
+            "Native SRT BAGEL shell cannot append images through official BAGEL"
+        )
+
+    def decode_image(self, *args, **kwargs):
+        del args, kwargs
+        raise BAGELAdapterError(
+            "Native SRT BAGEL shell cannot decode through official BAGEL"
+        )
+
+    def gen_text(self, *args, **kwargs):
+        del args, kwargs
+        raise BAGELAdapterError(
+            "Native SRT BAGEL shell cannot decode text through official BAGEL"
+        )
+
+
+def _build_native_srt_bagel_inferencer_shell(
+    checkpoint_dir: Path,
+    *,
+    loader_symbols: dict[str, Any] | None = None,
+) -> BAGELNativeSRTInferencerShell:
+    _ensure_bagel_transformers_compat()
+    symbols = loader_symbols or _import_bagel_native_srt_shell_symbols()
+
+    tokenizer = symbols["Qwen2Tokenizer"].from_pretrained(str(checkpoint_dir))
+    tokenizer, new_token_ids, _ = symbols["add_special_tokens"](tokenizer)
+    return BAGELNativeSRTInferencerShell(
+        tokenizer=tokenizer,
+        vae_transform=symbols["ImageTransform"](1024, 512, 16),
+        vit_transform=symbols["ImageTransform"](980, 224, 14),
+        new_token_ids=new_token_ids,
+    )
+
+
+def _import_bagel_native_srt_shell_symbols() -> dict[str, Any]:
+    data_utils = _import_module("data.data_utils")
+    transforms = _import_module("data.transforms")
+    qwen2 = _import_module("modeling.qwen2")
+
+    return {
+        "add_special_tokens": _module_attr(data_utils, "add_special_tokens"),
+        "ImageTransform": _module_attr(transforms, "ImageTransform"),
+        "Qwen2Tokenizer": _module_attr(qwen2, "Qwen2Tokenizer"),
+    }
 
 
 def _pin_bagel_shared_modules(device_map: dict[str, Any]) -> dict[str, Any]:

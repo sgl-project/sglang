@@ -93,6 +93,13 @@ def _write_language_model_view(checkpoint_dir: Path, output_dir: Path) -> Path:
     config.update(
         {
             "architectures": ["BAGELQwen2MoTForCausalLM"],
+            "bagel_checkpoint_dir": str(checkpoint_dir),
+            "bagel_enable_visual_feature_extractors": True,
+            "bagel_connector_act": "gelu_pytorch_tanh",
+            "bagel_latent_patch_size": 2,
+            "bagel_max_latent_size": 64,
+            "bagel_max_latent_tokens": 64 * 64,
+            "bagel_vit_max_num_patch_per_side": 70,
             "layer_module": "Qwen2MoTDecoderLayer",
             "qk_norm": True,
             "tie_word_embeddings": False,
@@ -146,32 +153,41 @@ def _make_ug_pipeline_server_args(scheduler) -> SimpleNamespace:
 @unittest.skipUnless(os.getenv(_MODEL_ENV), f"Set {_MODEL_ENV} for live smoke")
 class TestBAGELQwen2MoTNativeLive(CustomTestCase):
     def test_real_bagel_language_weights_run_srt_u_forward(self):
+        import importlib.util
+
         import torch
         import torch.distributed as dist
 
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for the BAGEL native live smoke")
 
+        _maybe_add_official_bagel_repo_to_path()
+        if importlib.util.find_spec("inferencer") is None:
+            self.skipTest(
+                "Set SGLANG_TEST_BAGEL_OFFICIAL_REPO to the official BAGEL repo "
+                "for the BAGEL visual feature extractor live smoke"
+            )
+
         from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.models.bagel_qwen2_mot import (
+            _iter_bagel_language_model_weights,
+        )
         from sglang.srt.server_args import (
             PortArgs,
             ServerArgs,
             set_global_server_args_for_scheduler,
+        )
+        from sglang.srt.ug.bagel import BAGELNativeSRTPreparedDenoise
+        from sglang.srt.ug.bagel_checkpoint import (
+            load_bagel_checkpoint_keys,
+            summarize_bagel_checkpoint_keys,
         )
         from sglang.srt.ug.runtime import (
             FakeUGModelRunner,
             UGInterleavedMessage,
             UGSessionRuntime,
         )
-        from sglang.srt.ug.bagel import BAGELNativeSRTPreparedDenoise
         from sglang.srt.ug.srt_executor import UGSRTSchedulerExecutor
-        from sglang.srt.ug.bagel_checkpoint import (
-            load_bagel_checkpoint_keys,
-            summarize_bagel_checkpoint_keys,
-        )
-        from sglang.srt.models.bagel_qwen2_mot import (
-            _iter_bagel_language_model_weights,
-        )
 
         checkpoint_dir = Path(os.environ[_MODEL_ENV])
         keys = load_bagel_checkpoint_keys(checkpoint_dir)

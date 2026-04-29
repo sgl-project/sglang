@@ -25,6 +25,7 @@ from sglang.srt.ug.bagel import (
     BAGELUForwardBridge,
     BAGELUGModelAdapter,
     MockBAGELBackend,
+    _build_native_srt_bagel_inferencer_shell,
     _build_official_bagel_inferencer,
     _ensure_bagel_transformers_compat,
     create_bagel_ug_model_adapter,
@@ -35,7 +36,7 @@ from sglang.srt.ug.bagel_cache import (
     BAGELSRTKVCacheFactory,
     InMemoryBAGELSRTKVCacheBacking,
 )
-from sglang.srt.ug.context import UGSRTKVTokenBinding, UGSessionHandle
+from sglang.srt.ug.context import UGSessionHandle, UGSRTKVTokenBinding
 from sglang.srt.ug.runtime import (
     UGInterleavedMessage,
     UGLatentDecodeRequest,
@@ -97,7 +98,37 @@ class TestBAGELUGModelAdapter(unittest.TestCase):
             _write_required_checkpoint_files(checkpoint_dir)
             with patch("sglang.srt.ug.bagel._find_spec", return_value=object()):
                 with patch(
-                    "sglang.srt.ug.bagel._build_official_bagel_inferencer",
+                    "sglang.srt.ug.bagel._build_native_srt_bagel_inferencer_shell",
+                    return_value=inferencer,
+                ) as build_shell:
+                    adapter = BAGELUGModelAdapter(
+                        tmpdir,
+                        native_srt_denoise_executor=native_executor,
+                    )
+
+        self.assertIs(adapter.backend.native_srt_denoise_executor, native_executor)
+        self.assertIs(adapter.backend.inferencer, inferencer)
+        build_shell.assert_called_once_with(checkpoint_dir)
+        self.assertIsInstance(
+            adapter.backend.u_forward_bridge.srt_u_forward_executor,
+            BAGELNativeSRTUForwardExecutor,
+        )
+
+    def test_native_real_loader_does_not_require_full_official_runtime_modules(self):
+        inferencer = FakeBAGELInferencer()
+        native_executor = BAGELNativeSRTDenoiseExecutor(FakeNativeSRTVelocityModel())
+
+        def find_spec(module_name):
+            if module_name in {"accelerate", "inferencer"}:
+                return None
+            return object()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_dir = Path(tmpdir)
+            _write_required_checkpoint_files(checkpoint_dir)
+            with patch("sglang.srt.ug.bagel._find_spec", side_effect=find_spec):
+                with patch(
+                    "sglang.srt.ug.bagel._build_native_srt_bagel_inferencer_shell",
                     return_value=inferencer,
                 ):
                     adapter = BAGELUGModelAdapter(
@@ -105,11 +136,7 @@ class TestBAGELUGModelAdapter(unittest.TestCase):
                         native_srt_denoise_executor=native_executor,
                     )
 
-        self.assertIs(adapter.backend.native_srt_denoise_executor, native_executor)
-        self.assertIsInstance(
-            adapter.backend.u_forward_bridge.srt_u_forward_executor,
-            BAGELNativeSRTUForwardExecutor,
-        )
+        self.assertIs(adapter.backend.inferencer, inferencer)
 
     def test_load_bagel_bridge_wires_scheduler_executor_to_native_denoise(self):
         native_model = FakeNativeSRTVelocityModel()
@@ -341,6 +368,21 @@ class FakeContextBAGELModel(FakeOfficialBAGELModel):
         }
         return generation_input, [int(curr_kvlens[0]) + 4], [position + 1]
 
+    def embed_bagel_vae_image(self, generation_input):
+        return self._fake_embeds_from_generation_input(generation_input)
+
+    def embed_bagel_vit_image(self, generation_input):
+        return self._fake_embeds_from_generation_input(generation_input)
+
+    def decode_bagel_image(self, latent, image_shape):
+        del latent
+        return FakeImage(size=(image_shape[1], image_shape[0]))
+
+    def _fake_embeds_from_generation_input(self, generation_input):
+        seq_len = int(generation_input["packed_seqlens"].sum().item())
+        values = torch.arange(seq_len * self.hidden_size, dtype=torch.float32)
+        return values.reshape(seq_len, self.hidden_size)
+
 
 class FakeVAEModel(torch.nn.Module):
     def encode(self, padded_images):
@@ -374,9 +416,11 @@ class FakeTimeEmbedder(torch.nn.Module):
         return timestep.reshape(-1, 1).to(torch.float32) * self.weight.reshape(1, -1)
 
 
-class FakeNativeSRTVelocityModel:
+class FakeNativeSRTVelocityModel(FakeContextBAGELModel):
     def __init__(self):
+        super().__init__()
         self.calls = []
+        self.latent_downsample = 16
 
     def predict_velocity_from_packed_gen(self, **kwargs):
         self.calls.append(kwargs)
@@ -994,6 +1038,25 @@ class TestBAGELRealLoader(unittest.TestCase):
         self.assertEqual(inferencer.kwargs["vae_transform"].args, (1024, 512, 16))
         self.assertEqual(inferencer.kwargs["vit_transform"].args, (980, 224, 14))
 
+    def test_build_native_srt_inferencer_shell_skips_official_model_load(self):
+        records = {}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_dir = Path(tmpdir)
+            _write_required_checkpoint_files(checkpoint_dir)
+            inferencer = _build_native_srt_bagel_inferencer_shell(
+                checkpoint_dir,
+                loader_symbols=_fake_bagel_loader_symbols(records),
+            )
+
+        self.assertIsNone(inferencer.model)
+        self.assertIsNone(inferencer.vae_model)
+        self.assertNotIn("dispatch_model", records)
+        self.assertEqual(inferencer.vae_transform.args, (1024, 512, 16))
+        self.assertEqual(inferencer.vit_transform.args, (980, 224, 14))
+        self.assertEqual(inferencer.init_gen_context()["kv_lens"], [0])
+        with self.assertRaisesRegex(BAGELAdapterError, "official BAGEL"):
+            inferencer.update_context_image(None, {})
+
     def test_build_official_inferencer_requires_cuda(self):
         with patch("sglang.srt.ug.bagel.torch.cuda.device_count", return_value=0):
             with self.assertRaisesRegex(
@@ -1412,11 +1475,11 @@ class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
             )
         )
         self.assertEqual(
-            inferencer.model.prepare_vae_latent_calls[0]["curr_kvlens"],
+            native_model.prepare_vae_latent_calls[0]["curr_kvlens"],
             [5],
         )
         self.assertEqual(
-            inferencer.model.prepare_vae_latent_calls[0]["curr_rope"],
+            native_model.prepare_vae_latent_calls[0]["curr_rope"],
             [5],
         )
         counters = runtime.get_debug_counters(response.session)
