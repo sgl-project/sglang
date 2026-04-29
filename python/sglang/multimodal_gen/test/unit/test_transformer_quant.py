@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+from torch import nn
 
 partial_json_parser = types.ModuleType("partial_json_parser")
 partial_json_parser_core = types.ModuleType("partial_json_parser.core")
@@ -54,6 +55,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _filter_duplicate_precision_variant_safetensors,
     _Flux2Nvfp4FallbackAdapter,
+    _TransformerFp8CastAdapter,
     resolve_transformer_quant_load_spec,
     resolve_transformer_safetensors_to_load,
 )
@@ -73,6 +75,16 @@ class _FakeQuantConfig:
         return "modelopt_fp4"
 
 
+class _FakeFp8CastTransformer(nn.Module):
+    @staticmethod
+    def should_apply_fp8_cast_to_module(name: str, module: nn.Module) -> bool:
+        return name == "blocks.0.match"
+
+
+class _FakeNoFp8CastRuleTransformer(nn.Module):
+    pass
+
+
 class TestTransformerQuantHelpers(unittest.TestCase):
     def _make_server_args(self, **overrides):
         defaults = dict(
@@ -87,6 +99,7 @@ class TestTransformerQuantHelpers(unittest.TestCase):
             tp_size=1,
             dit_cpu_offload=False,
             text_encoder_cpu_offload=False,
+            transformer_fp8_cast=False,
         )
         defaults.update(overrides)
         return SimpleNamespace(**defaults)
@@ -146,6 +159,44 @@ class TestTransformerQuantHelpers(unittest.TestCase):
         resolved = _filter_duplicate_precision_variant_safetensors(files)
 
         self.assertEqual(resolved, files)
+
+    def test_transformer_fp8_cast_hook_rounds_only_model_declared_modules(self):
+        model = nn.Module()
+        model.blocks = nn.ModuleList([nn.Module()])
+        model.blocks[0].match = nn.Linear(2, 2)
+        model.blocks[0].keep = nn.Linear(2, 2)
+
+        match_weight = model.blocks[0].match.weight.detach().clone()
+        keep_weight = model.blocks[0].keep.weight.detach().clone()
+        hook = _TransformerFp8CastAdapter(
+            cls_name=_FakeFp8CastTransformer.__name__,
+            model_cls=_FakeFp8CastTransformer,
+            server_args=self._make_server_args(transformer_fp8_cast=True),
+        ).get_post_load_hooks()[0]
+
+        hook(model)
+
+        torch.testing.assert_close(
+            model.blocks[0].match.weight,
+            match_weight.to(torch.float8_e4m3fn).to(match_weight.dtype),
+            rtol=0,
+            atol=0,
+        )
+        torch.testing.assert_close(
+            model.blocks[0].keep.weight,
+            keep_weight,
+            rtol=0,
+            atol=0,
+        )
+
+    def test_transformer_fp8_cast_noops_without_model_rule(self):
+        hooks = _TransformerFp8CastAdapter(
+            cls_name=_FakeNoFp8CastRuleTransformer.__name__,
+            model_cls=_FakeNoFp8CastRuleTransformer,
+            server_args=self._make_server_args(transformer_fp8_cast=True),
+        ).get_post_load_hooks()
+
+        self.assertEqual(hooks, [])
 
     @patch(
         "sglang.multimodal_gen.runtime.loader.transformer_load_utils.build_nvfp4_config_from_safetensors_list",

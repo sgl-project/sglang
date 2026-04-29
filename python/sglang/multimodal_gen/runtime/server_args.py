@@ -194,6 +194,7 @@ class ServerArgs(DisaggArgsMixin):
     use_fsdp_inference: bool = False
     pin_cpu_memory: bool = True
     ltx2_two_stage_device_mode: str | None = None
+    transformer_fp8_cast: bool = False
 
     # ComfyUI integration
     comfyui_mode: bool = False
@@ -996,6 +997,16 @@ class ServerArgs(DisaggArgsMixin):
                 "'snapshot' keeps premerged stage2 with snapshot-based release, "
                 "'resident' keeps both transformers resident on GPU. "
                 "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise snapshot."
+            ),
+        )
+        parser.add_argument(
+            "--transformer-fp8-cast",
+            action=StoreBoolean,
+            default=ServerArgs.transformer_fp8_cast,
+            help=(
+                "Round supported transformer weights through float8_e4m3fn at "
+                "load time, then restore the original dtype. This is a "
+                "reference-compatibility mode, not FP8 GEMM. Default is disabled."
             ),
         )
         parser.add_argument(
