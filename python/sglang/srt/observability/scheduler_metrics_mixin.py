@@ -110,6 +110,8 @@ class SchedulerMetricsMixin:
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
+        self.kv_transfer_rdma_speed_gb_s: float = 0.0
+        self.kv_transfer_rdma_latency_ms: float = 0.0
 
         self.stats = SchedulerStats()
 
@@ -442,6 +444,12 @@ class SchedulerMetricsMixin:
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
+                self.stats.kv_transfer_rdma_speed_gb_s = (
+                    self.kv_transfer_rdma_speed_gb_s
+                )
+                self.stats.kv_transfer_rdma_latency_ms = (
+                    self.kv_transfer_rdma_latency_ms
+                )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
                     self.disagg_decode_prealloc_queue.queue, priority_enabled
@@ -887,6 +895,8 @@ class SchedulerMetricsMixin:
                 decode_retracted_queue_reqs=decode_retracted,
                 kv_transfer_speed_gb_s=self.stats.kv_transfer_speed_gb_s,
                 kv_transfer_latency_ms=self.stats.kv_transfer_latency_ms,
+                kv_transfer_rdma_speed_gb_s=self.stats.kv_transfer_rdma_speed_gb_s,
+                kv_transfer_rdma_latency_ms=self.stats.kv_transfer_rdma_latency_ms,
             )
 
         queues = None

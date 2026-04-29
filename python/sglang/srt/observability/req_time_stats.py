@@ -580,6 +580,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
     spec_draft_extend_start_time: float = 0.0
 
     # other
+    transfer_elapsed_s: float = 0.0
     transfer_speed_gb_s: float = 0.0
     transfer_total_mb: float = 0.0
     # Number of prefill retries for this request
@@ -874,6 +875,12 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
             result["latency_ms"] = latency_ms
             result["total_mb"] = total_mb
             result["speed_gb_s"] = speed_gb_s
+
+            if self.transfer_elapsed_s > 0:
+                result["rdma_latency_ms"] = self.transfer_elapsed_s * 1000
+                result["rdma_speed_gb_s"] = (
+                    self.transfer_total_mb / 1024
+                ) / self.transfer_elapsed_s
 
             if self.enable_metrics:
                 self.metrics_collector.observe_kv_transfer_metrics(
