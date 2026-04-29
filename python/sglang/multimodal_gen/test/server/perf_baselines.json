@@ -812,7 +812,7 @@
                 "46": 42.62,
                 "47": 5.33,
                 "48": 189.41,
-                "49": 43.03
+                "49": 177.01
             },
             "expected_e2e_ms": 4956.71,
             "expected_avg_denoise_ms": 85.38,
@@ -2119,27 +2119,6 @@
             "expected_median_denoise_ms": 151.72,
             "estimated_full_test_time_s": 129.3
         },
-        "flux_2_klein_ti2i_2_gpus": {
-            "stages_ms": {
-                "InputValidationStage": 35.39,
-                "DecodingStage": 6.68,
-                "TextEncodingStage": 160.46,
-                "TimestepPreparationStage": 27.82,
-                "LatentPreparationStage": 0.4,
-                "DenoisingStage": 364.99,
-                "ImageVAEEncodingStage": 65.69
-            },
-            "denoise_step_ms": {
-                "0": 30.19,
-                "1": 63.04,
-                "2": 89.37,
-                "3": 89.7
-            },
-            "expected_e2e_ms": 827.17,
-            "expected_avg_denoise_ms": 68.93,
-            "expected_median_denoise_ms": 77.89,
-            "estimated_full_test_time_s": 120.8
-        },
         "flux_2_image_t2i_upscaling_4x": {
             "stages_ms": {
                 "TextEncodingStage": 494.65,
@@ -2576,7 +2555,7 @@
                 "LTX2AVLatentPreparationStage": 0.33,
                 "LTX2ImageEncodingStage": 0.04,
                 "LTX2AVDenoisingStage": 25873.2,
-                "LTX2UpsampleStage": 216.72,
+                "LTX2UpsampleStage": 752.07,
                 "LTX2RefinementStage": 2553.3,
                 "LTX2AVDecodingStage": 585.0,
                 "per_frame_generation": null

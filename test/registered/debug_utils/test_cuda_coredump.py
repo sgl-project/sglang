@@ -1,7 +1,7 @@
-"""Smoke test: intentionally trigger a CUDA illegal memory access
+"""Intentionally trigger a CUDA illegal memory access
 to verify the coredump collection pipeline works end-to-end.
 
-Manual use:  python3 test/registered/debug_utils/test_cuda_coredump_smoke.py
+Manual use:  python3 test/registered/debug_utils/test_cuda_coredump.py
 """
 
 import unittest
@@ -17,7 +17,7 @@ register_cuda_ci(
 )
 
 
-class TestCudaCoredumpSmoke(unittest.TestCase):
+class TestCudaCoredump(unittest.TestCase):
     def test_trigger_illegal_memory_access(self):
         x = torch.zeros(10, device="cuda")
         y = torch.arange(10, device="cuda")

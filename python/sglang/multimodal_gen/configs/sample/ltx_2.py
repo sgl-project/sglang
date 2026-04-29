@@ -64,6 +64,7 @@ class LTX23SamplingParams(LTX2SamplingParams):
     audio_modality_scale: float = 3.0
     audio_skip_step: int = 0
     audio_stg_blocks: list[int] = field(default_factory=lambda: [28])
+    skip_v2a_cross_attn_for_video_gt: bool = False
 
     def build_request_extra(self) -> dict[str, Any]:
         extra = super().build_request_extra()
@@ -81,6 +82,8 @@ class LTX23SamplingParams(LTX2SamplingParams):
             "audio_skip_step": self.audio_skip_step,
             "audio_stg_blocks": self.audio_stg_blocks,
         }
+        if self.skip_v2a_cross_attn_for_video_gt:
+            extra["ltx2_skip_v2a_cross_attn_for_video_gt"] = True
         return extra
 
 

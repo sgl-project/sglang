@@ -39,6 +39,7 @@ from sglang.srt.configs import (
     KimiVLConfig,
     LongcatFlashConfig,
     MultiModalityConfig,
+    NemotronH_Nano_Omni_Reasoning_V3_Config,
     NemotronH_Nano_VL_V2_Config,
     NemotronHConfig,
     Olmo3Config,
@@ -87,6 +88,7 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
         DotsVLMConfig,
         DotsOCRConfig,
         NemotronH_Nano_VL_V2_Config,
+        NemotronH_Nano_Omni_Reasoning_V3_Config,
         NemotronHConfig,
         DeepseekVLV2Config,
         Qwen3_5Config,
@@ -169,7 +171,7 @@ def get_rope_config(config):
     rope_params = getattr(config, "rope_parameters", None)
     if rope_params is not None:
         return rope_params["rope_theta"], rope_params
-    return config.rope_theta, getattr(config, "rope_scaling", None)
+    return getattr(config, "rope_theta", 10000), getattr(config, "rope_scaling", None)
 
 
 def _patch_text_config(parent_config: PretrainedConfig, text_config):
@@ -225,6 +227,14 @@ def get_hf_text_config(config: PretrainedConfig):
             if getattr(_converted, "dtype", None) is None and parent_dtype is not None:
                 _converted.dtype = parent_dtype
             setattr(config, _attr, _converted)
+        elif _sub is not None and parent_dtype is not None:
+            # transformers v5 multimodal configs (e.g. Mistral3Config) carry
+            # `dtype` only on the top-level config, leaving the sub-configs at
+            # None. Without this, _get_and_verify_dtype falls back to float32
+            # and then "auto" downcasts to float16, which overflows the Pixtral
+            # vision tower on real images and produces NaN features.
+            if getattr(_sub, "dtype", None) is None:
+                _sub.dtype = parent_dtype
 
     # Priority: thinker_config > llm_config > language_config > text_config
     if hasattr(config, "thinker_config"):
