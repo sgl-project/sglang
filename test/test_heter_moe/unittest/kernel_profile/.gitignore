@@ -1,0 +1,7 @@
+# per-shard intermediates — keep merged outputs only
+results/*.log
+results/int4_table.n*.csv
+results/bf16_table.n*.csv
+results/optimal_assignment.M*.csv
+results/optimal_assignment.M*.all_x.csv
+results/tune_shards/
