@@ -16,14 +16,17 @@ SGL_FA3_KERNEL_REVISION = "v1"
 DEFAULT_FA3_KERNEL_LOCKFILE = "kernels.lock"
 
 
-def _call_fa3_kernel(kernel, *args, out=None):
-    if out is None:
+def _call_fa3_kernel(kernel, *args, batch_invariant=False, out=None):
+    kwargs = {}
+    if batch_invariant:
+        kwargs["batch_invariant"] = batch_invariant
+    if out is not None:
+        kwargs["out"] = out
+    if not kwargs:
         return kernel(*args)
     try:
-        return kernel(*args, out=out)
-    except TypeError as exc:
-        if "unexpected keyword argument 'out'" not in str(exc):
-            raise
+        return kernel(*args, **kwargs)
+    except TypeError:
         return kernel(*args)
 
 
@@ -131,6 +134,7 @@ def flash_attn_with_kvcache(
     sm_margin=0,  # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     sinks=None,
+    batch_invariant=False,
     out=None,
 ):
     if not _is_fa3_supported():
@@ -174,6 +178,7 @@ def flash_attn_with_kvcache(
         sm_margin,
         return_softmax_lse,
         sinks,
+        batch_invariant=batch_invariant,
         out=out,
     )
 
@@ -204,6 +209,7 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_softmax_lse=False,
     sinks=None,
+    batch_invariant=False,
     out=None,
 ):
 
@@ -237,5 +243,6 @@ def flash_attn_varlen_func(
         sm_margin=sm_margin,
         return_softmax_lse=return_softmax_lse,
         sinks=sinks,
+        batch_invariant=batch_invariant,
         out=out,
     )
