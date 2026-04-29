@@ -1022,6 +1022,25 @@ class TritonAttnBackend(AttentionBackend):
         # Build unified kv_indices using fused Triton kernel
         extend_kv_indices = forward_batch.out_cache_loc
 
+        # For SWA layers, translate out_cache_loc from full pool space to SWA pool space.
+        # The deterministic unified kernel concatenates prefix_kv_indices (already in SWA
+        # pool space) with extend_kv_indices (out_cache_loc, in full pool space). For SWA
+        # layers, the kernel indexes into swa_kv_pool buffers, so extend_kv_indices must
+        # also be in SWA pool space. Without this translation, full pool indices can exceed
+        # the SWA buffer size, causing out-of-bounds reads and degenerate output.
+        original_out_cache_loc = None
+        if (
+            layer.sliding_window_size is not None
+            and layer.sliding_window_size > -1
+            and hasattr(self.token_to_kv_pool_allocator, "translate_loc_from_full_to_swa")
+        ):
+            original_out_cache_loc = forward_batch.out_cache_loc
+            translated_loc = self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                forward_batch.out_cache_loc
+            )
+            forward_batch.out_cache_loc = translated_loc
+            extend_kv_indices = translated_loc
+
         # Handle cases where extend_seq_lens or extend_start_loc might not be set
         # In speculative decoding, we can infer these from spec_info or compute them
         if forward_batch.extend_seq_lens is None:
@@ -1075,29 +1094,34 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        # Call unified kernel
-        self.extend_attention_fwd_unified(
-            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
-            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
-            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-            k_descale,
-            v_descale,
-            self.forward_metadata.qo_indptr,
-            unified_kv_indptr,
-            unified_kv_indices,
-            prefix_lens,
-            self.forward_metadata.max_extend_len,
-            custom_mask=self.forward_metadata.custom_mask,
-            mask_indptr=self.forward_metadata.mask_indptr,
-            sm_scale=layer.scaling,
-            logit_cap=logits_soft_cap,
-            is_causal=causal,
-            sliding_window_size=sliding_window_size,
-            sinks=sinks,
-            window_start_pos=window_start_pos,
-            xai_temperature_len=layer.xai_temperature_len,
-        )
+        try:
+            # Call unified kernel
+            self.extend_attention_fwd_unified(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                k_descale,
+                v_descale,
+                self.forward_metadata.qo_indptr,
+                unified_kv_indptr,
+                unified_kv_indices,
+                prefix_lens,
+                self.forward_metadata.max_extend_len,
+                custom_mask=self.forward_metadata.custom_mask,
+                mask_indptr=self.forward_metadata.mask_indptr,
+                sm_scale=layer.scaling,
+                logit_cap=logits_soft_cap,
+                is_causal=causal,
+                sliding_window_size=sliding_window_size,
+                sinks=sinks,
+                window_start_pos=window_start_pos,
+                xai_temperature_len=layer.xai_temperature_len,
+            )
+        finally:
+            # Restore original out_cache_loc for SWA layers
+            if original_out_cache_loc is not None:
+                forward_batch.out_cache_loc = original_out_cache_loc
 
         return o
 
