@@ -18,7 +18,6 @@
 // sglang's tvm-ffi load_jit cache.
 
 #include <cublasdx.hpp>
-#include <cusolverdx.hpp>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -46,17 +45,67 @@ struct ipm_smem {
   bool avail_flag;
 };
 
+// In-place Cholesky factorization a = L L^T (lower triangle), no external
+// linkage. Replaces cuSolverDx::posv to keep the kernel self-contained
+// under sglang's tvm-ffi load_jit (which uses plain c++ for the final
+// link step and so cannot satisfy cuSolverDx's device-link requirement).
+//
+// For the typical LPLB shape (N <= 32) the algorithm is dwarfed by the
+// cuBLASDx GEMMs.
+template <int N, int BLOCK_DIM>
+__device__ __forceinline__ void cholesky_factor(float a[N][N]) {
+  const int tid = threadIdx.x;
+  for (int k = 0; k < N; k++) {
+    if (tid == 0) {
+      a[k][k] = sqrtf(a[k][k]);
+    }
+    __syncthreads();
+    const float pivot = a[k][k];
+    for (int i = k + 1 + tid; i < N; i += BLOCK_DIM) {
+      a[i][k] /= pivot;
+    }
+    __syncthreads();
+    // Schur complement: a[i][j] -= a[i][k] * a[j][k] for j>k, i>=j
+    for (int idx = tid; idx < N * N; idx += BLOCK_DIM) {
+      const int i = idx / N, j = idx % N;
+      if (j > k && i >= j && i < N) {
+        a[i][j] -= a[i][k] * a[j][k];
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// Solve L L^T x = b in-place on b, where L is the lower triangle of a
+// (filled by `cholesky_factor`). Forward then back substitution; both
+// run on a single thread because N is small and the inner loops have
+// loop-carried dependencies that don't parallelize cheaply.
+template <int N, int BLOCK_DIM>
+__device__ __forceinline__ void cholesky_apply(const float a[N][N], float b[N]) {
+  const int tid = threadIdx.x;
+  if (tid == 0) {
+    for (int i = 0; i < N; i++) {
+      float s = b[i];
+      for (int j = 0; j < i; j++) {
+        s -= a[i][j] * b[j];
+      }
+      b[i] = s / a[i][i];
+    }
+    for (int i = N - 1; i >= 0; i--) {
+      float s = b[i];
+      for (int j = i + 1; j < N; j++) {
+        s -= a[j][i] * b[j];
+      }
+      b[i] = s / a[i][i];
+    }
+  }
+  __syncthreads();
+}
+
 template <int N, int SM_VER, int BLOCK_DIM>
 __device__ __forceinline__ void cholesky_solve(float a[N][N], float b[N]) {
-  int status;
-  decltype(cusolverdx::Size<N>() +
-           cusolverdx::Function<cusolverdx::function::posv>() +
-           cusolverdx::Arrangement<cusolverdx::row_major,
-                                   cusolverdx::row_major>() +
-           cusolverdx::SM<SM_VER>() + cusolverdx::Block() +
-           cusolverdx::FillMode<cusolverdx::lower>() +
-           cusolverdx::BlockDim<BLOCK_DIM>())()
-      .execute(a[0], b, &status);
+  cholesky_factor<N, BLOCK_DIM>(a);
+  cholesky_apply<N, BLOCK_DIM>(a, b);
 }
 
 template <int M, int N, int K, int SM_VER, int BLOCK_DIM>
