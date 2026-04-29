@@ -1661,7 +1661,6 @@ class AiterAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        **kwargs,
     ):
 
         num_kv_splits = None

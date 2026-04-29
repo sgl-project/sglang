@@ -633,7 +633,6 @@ class DeepseekV2MoE(nn.Module):
                     should_allreduce_fusion,
                     use_reduce_scatter,
                     gemm_output_zero_allocator,
-                    input_ids_global=input_ids_global,
                 )
             else:
                 return self.forward_normal(
@@ -655,7 +654,6 @@ class DeepseekV2MoE(nn.Module):
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
-        input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(current_stream)
@@ -671,12 +669,10 @@ class DeepseekV2MoE(nn.Module):
         with torch.cuda.stream(self.alt_stream):
             # router_logits: (num_tokens, n_experts)
             router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
-            topk_kwargs = {"input_ids": input_ids_global} if self.is_hash else {}
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
                 expert_location_dispatch_info=dispatch_info,
-                **topk_kwargs,
             )
             final_hidden_states = self.experts(hidden_states, topk_output)
             if not (_is_cuda or _is_musa) or isinstance(

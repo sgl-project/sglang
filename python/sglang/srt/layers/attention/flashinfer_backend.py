@@ -717,7 +717,6 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        **kwargs,
     ):
         if forward_mode.is_decode_or_idle():
             self.indices_updater_decode.update(

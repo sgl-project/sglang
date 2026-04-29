@@ -169,19 +169,18 @@ class PagedIndexerMetadata(IndexerMetadata):
 
     def copy_(self, other: "PagedIndexerMetadata"):
         if is_hip():
-            copy_metadata(
-                src=other,
-                dst=self,
-                check_eq_fields=["page_size", "deep_gemm_metadata"],
-                copy_fields=["page_table", "c4_seq_lens"],
-            )
+            # HIP/ROCm: don't copy deep_gemm_metadata (it's None)
+            copy_fields = ["page_table", "c4_seq_lens"]
         else:
-            copy_metadata(
-                src=other,
-                dst=self,
-                check_eq_fields=["page_size"],
-                copy_fields=["page_table", "c4_seq_lens", "deep_gemm_metadata"],
-            )
+            # CUDA: original behavior
+            copy_fields = ["page_table", "c4_seq_lens", "deep_gemm_metadata"]
+
+        copy_metadata(
+            src=other,
+            dst=self,
+            check_eq_fields=["page_size"],
+            copy_fields=copy_fields,
+        )
 
 
 @dataclass

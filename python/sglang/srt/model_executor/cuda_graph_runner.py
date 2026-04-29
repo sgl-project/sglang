@@ -1152,9 +1152,7 @@ class CudaGraphRunner:
         # Python branch (if self.swa_loc is not None) takes the fast path,
         # and the graph records GPU ops using this buffer instead of the
         # per-layer translate_loc_from_full_to_swa fallback.
-        if self.buffers.out_cache_loc_swa is not None and hasattr(
-            self.model_runner.token_to_kv_pool, "set_swa_loc"
-        ):
+        if self.buffers.out_cache_loc_swa is not None:
             self.model_runner.token_to_kv_pool.set_swa_loc(
                 self.buffers.out_cache_loc_swa[:num_tokens]
             )
@@ -1163,9 +1161,6 @@ class CudaGraphRunner:
             self.device_module.synchronize()
             self.model_runner.tp_group.barrier()
             run_once()
-
-        if hasattr(attn_backend, "on_after_cuda_graph_warmup_pass"):
-            attn_backend.on_after_cuda_graph_warmup_pass()
 
         if get_global_graph_memory_pool() is None:
             set_global_graph_memory_pool(self.device_module.graph_pool_handle())
@@ -1272,7 +1267,6 @@ class CudaGraphRunner:
             attn_backend = self.model_runner.decode_attn_backend_group[stream_idx]
         else:
             attn_backend = self.attn_backend
-        num_tokens = bs * self.num_tokens_per_bs
         attn_backend.init_forward_metadata_replay_cuda_graph(
             bs,
             buffers.req_pool_indices[:bs],
@@ -1282,8 +1276,6 @@ class CudaGraphRunner:
             self.capture_forward_mode,
             forward_batch.spec_info,
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
-            out_cache_loc=buffers.out_cache_loc[:num_tokens],
-            actual_forward_mode=forward_batch.forward_mode,
         )
 
         # Store fields

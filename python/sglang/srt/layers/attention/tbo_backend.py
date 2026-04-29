@@ -79,7 +79,6 @@ class TboAttnBackend(AttentionBackend):
         forward_mode: "ForwardMode",
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        **kwargs,
     ):
         self.primary.init_forward_metadata_replay_cuda_graph(
             bs=bs,
@@ -90,7 +89,6 @@ class TboAttnBackend(AttentionBackend):
             forward_mode=forward_mode,
             spec_info=spec_info,
             seq_lens_cpu=seq_lens_cpu,
-            **kwargs,
         )
 
         self._init_forward_metadata_cuda_graph_children(

@@ -95,7 +95,6 @@ class HybridAttnBackend(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        **kwargs,
     ):
         backend = self._select_backend(forward_mode)
         backend.init_forward_metadata_replay_cuda_graph(
@@ -107,7 +106,6 @@ class HybridAttnBackend(AttentionBackend):
             forward_mode,
             spec_info,
             seq_lens_cpu,
-            **kwargs,
         )
 
     def get_cuda_graph_seq_len_fill_value(self):

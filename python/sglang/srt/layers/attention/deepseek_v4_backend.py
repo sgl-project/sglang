@@ -149,10 +149,8 @@ class DeepseekV4Backend(AttentionBackend, C4IndexerBackend, CompressorBackend):
                 max_seq_len=self.max_seq_len_for_capture,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
-                # Dummy value (must be int64 to match real out_cache_loc dtype)
-                out_cache_loc=torch.zeros(
-                    seq_lens.shape, dtype=torch.int64, device=seq_lens.device
-                ),
+                # Dummy value
+                out_cache_loc=torch.zeros_like(seq_lens),
             )
 
             self.decode_cuda_graph_metadata_of_bs[bs] = metadata

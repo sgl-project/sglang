@@ -450,7 +450,6 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
-        **kwargs,
     ):
         """Replay CUDA graph with new inputs."""
         seq_lens = seq_lens[:bs]
