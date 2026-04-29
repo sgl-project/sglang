@@ -323,7 +323,8 @@ class BAGELNativeSRTUForwardExecutor(BAGELSRTUForwardExecutor):
 
     This executor deliberately does not call official BAGEL
     `update_context_text`. It marks the session as SRT-owned and leaves G
-    denoise disabled until the native BAGEL generation branch is implemented.
+    denoise disabled until the native generation branch is wired into SRT
+    ForwardBatch.
     """
 
     def execute(
@@ -672,7 +673,7 @@ class BAGELInterleaveContextBackend:
         if state.native_srt_u_context:
             raise BAGELAdapterError(
                 "BAGEL native SRT U context cannot prepare G denoise yet; "
-                "native BAGEL mode='gen' forward must be implemented first"
+                "native BAGEL mode='gen' still needs an SRT ForwardBatch bridge"
             )
         image_shape = self._image_shape_from_params(sampling_params, state.image_shape)
         model = self.inferencer.model
