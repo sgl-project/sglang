@@ -210,17 +210,20 @@ class LPLBSolver:
         """
         device = topk_ids.device
 
-        # Step 1: Count local tokens per logical expert
+        # Step 1: Count local tokens per logical expert.
+        # topk_ids comes from the router and is by construction in
+        # [0, num_logical), so we can scatter_add directly without filtering.
+        # Boolean masking + numel() (the previous defensive form) forced a
+        # GPU->host sync on every forward pass via aten::nonzero and a
+        # tensor-shape read; scatter_add on the flattened tensor is async
+        # and a no-op when topk_ids is empty (DP-attention idle rank case).
         local_counts = torch.zeros(self.num_logical, dtype=torch.int32, device=device)
         flat_ids = topk_ids.flatten()
-        valid_mask = (flat_ids >= 0) & (flat_ids < self.num_logical)
-        valid_ids = flat_ids[valid_mask]
-        if valid_ids.numel() > 0:
-            local_counts.scatter_add_(
-                0,
-                valid_ids.long(),
-                torch.ones(valid_ids.shape[0], dtype=torch.int32, device=device),
-            )
+        local_counts.scatter_add_(
+            0,
+            flat_ids.long(),
+            torch.ones_like(flat_ids, dtype=torch.int32),
+        )
 
         # Step 2: All-reduce to get global counts across all EP ranks.
         # All EP ranks must participate — empty-token ranks contribute zeros.
