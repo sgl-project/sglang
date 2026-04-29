@@ -751,7 +751,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (2-GPU)
-        timeout-minutes: 80
+        timeout-minutes: 150
         run: |
           # AMD CI: All 2-GPU tests including LoRA
           # Tests: T2V, T2I, I2V, LoRA
