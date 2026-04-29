@@ -129,8 +129,9 @@ def solve_ipm(
     """
     Barrier-method Interior Point solver for standard-form LP.
 
-    Dispatches to the fused cuBLASDx+cuSolverDx kernel when available
-    (Hopper+ GPU with nvmath-python[cu12-dx] installed, shape fits in shmem).
+    Dispatches to the JIT-compiled CUDA C++ kernel when available
+    (Hopper+ GPU with Math-DX cuBLASDx headers reachable via
+    ``MATHDX_HOME``, ``nvidia-mathdx``, or ``download-mathdx.sh``).
     Falls back to the PyTorch reference implementation otherwise.
 
     Args:
@@ -173,7 +174,8 @@ def solve_ipm(
         if not _FUSED_AVAILABLE:
             reason = (
                 "fused backend unavailable (no CUDA, GPU SM < 9.0, or "
-                "nvmath-python[cu12-dx] / numba-cuda not importable)"
+                "Math-DX cuBLASDx headers not found — set MATHDX_HOME or "
+                "run python/sglang/jit_kernel/lplb/resources/download-mathdx.sh)"
             )
         elif not A.is_cuda:
             reason = f"input A is on {A.device}, not CUDA"

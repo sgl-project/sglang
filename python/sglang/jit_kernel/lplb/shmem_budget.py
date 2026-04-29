@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# 4 B slack per block for Numba/cuSolverDx runtime state
+# Per-block slack reserved for cuBLASDx workspace and CUDA runtime state.
 _RUNTIME_PAD_BYTES = 256
 
 # fp32
