@@ -273,9 +273,8 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        self._enable_deepep_waterfill = enable_deepep_waterfill
-        self._deepep_waterfill_balancer = None
-        self._deepep_waterfill_num_routed_experts = None
+        self.enable_deepep_waterfill = enable_deepep_waterfill
+        self.deepep_waterfill_balancer = None
         if enable_deepep_waterfill:
             if num_fused_shared_experts != 1:
                 raise ValueError("DeepEP waterfill expects exactly one shared expert.")
@@ -285,8 +284,6 @@ class TopK(MultiPlatformOp):
                 raise ValueError("DeepEP waterfill TopK is only supported on CUDA.")
             if output_format not in (None, TopKOutputFormat.STANDARD):
                 raise ValueError("DeepEP waterfill requires STANDARD TopK output.")
-            if correction_bias is not None:
-                self._deepep_waterfill_num_routed_experts = correction_bias.shape[0]
             # Waterfill appends the shared expert after routed TopK selection.
             top_k -= num_fused_shared_experts
             num_fused_shared_experts = 0
@@ -308,45 +305,17 @@ class TopK(MultiPlatformOp):
             scoring_func=scoring_func,
         )
 
-    def _prepare_deepep_waterfill(
-        self, router_logits: Optional[torch.Tensor] = None
-    ) -> None:
-        if not self._enable_deepep_waterfill:
-            return
-        if self._deepep_waterfill_balancer is None:
-            if self._deepep_waterfill_num_routed_experts is None:
-                if router_logits is None:
-                    raise ValueError(
-                        "DeepEP waterfill cannot infer num_routed_experts before "
-                        "the first non-empty TopK forward."
-                    )
-                self._deepep_waterfill_num_routed_experts = router_logits.shape[-1]
-
-            from sglang.srt.layers.moe.deepep_waterfill import (
-                DeepEPWaterfillBalancer,
-            )
-
-            self._deepep_waterfill_balancer = DeepEPWaterfillBalancer(
-                num_routed_experts=self._deepep_waterfill_num_routed_experts,
-                world_size=get_moe_expert_parallel_world_size(),
-                rank=get_moe_expert_parallel_rank(),
-                layer_id=self.layer_id,
-                routed_scaling_factor=(
-                    self.topk_config.routed_scaling_factor
-                    if self.topk_config.routed_scaling_factor is not None
-                    else 1.0
-                ),
-            )
-        if self._deepep_waterfill_balancer is not None:
-            self._deepep_waterfill_balancer.update_static_weights()
-
     def _apply_deepep_waterfill(
         self, topk_output: TopKOutput, num_tokens: int
     ) -> TopKOutput:
-        if self._deepep_waterfill_balancer is None:
+        if self.enable_deepep_waterfill and self.deepep_waterfill_balancer is None:
+            raise RuntimeError(
+                "DeepEP waterfill TopK must be prepared by ModelRunner before forward."
+            )
+        if self.deepep_waterfill_balancer is None:
             return topk_output
         assert TopKOutputChecker.format_is_standard(topk_output)
-        return self._deepep_waterfill_balancer.expand_topk(topk_output, num_tokens)
+        return self.deepep_waterfill_balancer.expand_topk(topk_output, num_tokens)
 
     def forward_native(
         self,
@@ -356,7 +325,6 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
-        self._prepare_deepep_waterfill(router_logits)
         self.topk_config.torch_native = True
         topk_output = select_experts(
             hidden_states=hidden_states,
@@ -376,7 +344,6 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
-        self._prepare_deepep_waterfill(router_logits)
         if self.topk_config.output_format is not None:
             output_format = self.topk_config.output_format
         elif get_moe_runner_backend().is_triton_kernels():
@@ -428,7 +395,6 @@ class TopK(MultiPlatformOp):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ) -> TopKOutput:
-        self._prepare_deepep_waterfill(router_logits)
         topk_output = select_experts(
             hidden_states=hidden_states,
             layer_id=self.layer_id,
@@ -460,7 +426,6 @@ class TopK(MultiPlatformOp):
         )
 
     def empty_topk_output(self, device: torch.device) -> TopKOutput:
-        self._prepare_deepep_waterfill()
         topk = self.topk_config.top_k - self.topk_config.num_fused_shared_experts
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
