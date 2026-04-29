@@ -59,7 +59,7 @@ _is_npu = is_npu()
 if _is_npu:
     import torch_npu
 
-if _is_cuda:
+elif _is_cuda:
     from sglang.jit_kernel.awq_dequantize import awq_dequantize
     from sglang.jit_kernel.awq_marlin_repack import (
         awq_marlin_moe_repack,
@@ -84,7 +84,7 @@ elif _is_xpu:
 
     warnings.warn(f"XPU does not support fused_marlin_moe currently.")
 else:
-    warnings.warn(f"Only CUDA, HIP and XPU support AWQ currently.")
+    warnings.warn(f"Only CUDA, HIP, XPU and NPU support AWQ currently.")
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +179,8 @@ class AWQConfig(QuantizationConfig):
                     return UnquantizedLinearMethod()
                 return AWQLinearAscendMethod(self)
             elif isinstance(layer, FusedMoE):
+                if is_layer_skipped_awq(prefix, self.modules_to_not_convert):
+                    return None
                 return AWQMoEAscendMethod(self)
             return None
 
