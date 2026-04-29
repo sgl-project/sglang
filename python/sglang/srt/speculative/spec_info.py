@@ -13,11 +13,7 @@ if TYPE_CHECKING:
 
 
 class SpeculativeAlgorithm(Enum):
-    """Speculative decoding algorithms.
-
-    ``FROZEN_KV_MTP`` reuses EAGLE verify plumbing (``is_eagle()`` true) but
-    reads only target KV; see ``is_frozen_kv_mtp()``.
-    """
+    """Speculative decoding algorithms."""
 
     DFLASH = auto()
     EAGLE = auto()
@@ -43,8 +39,8 @@ class SpeculativeAlgorithm(Enum):
         return self != SpeculativeAlgorithm.NONE
 
     def is_eagle(self) -> bool:
-        # EAGLE3 variant; FROZEN_KV_MTP shares verify-input contract — use
-        # is_frozen_kv_mtp / is_eagle3 where semantics matter.
+        # FIXME(kpham_sgl): Remove FROZEN_KV_MTP here once we
+        # have established support for it in the scheduler.
         return self in (
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
