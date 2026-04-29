@@ -508,6 +508,9 @@ class PipelineConfig:
     def _unpad_and_unpack_latents(self, latents, audio_latents, batch, vae, audio_vae):
         raise NotImplementedError("not yet implemented")
 
+    def gather_denoising_env_static_for_sp(self, batch, cond_kwargs: dict | None):
+        return cond_kwargs
+
     @staticmethod
     def add_cli_args(
         parser: FlexibleArgumentParser, prefix: str = ""

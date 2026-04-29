@@ -62,6 +62,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_xpu,
 )
@@ -80,8 +81,9 @@ _is_xpu = is_xpu()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_is_musa = is_musa()
 
-if _is_cuda:
+if _is_cuda or _is_musa:
     from sgl_kernel import moe_fused_gate
 
     try:
@@ -124,7 +126,7 @@ if _is_cuda:
     except ImportError as e:
         pass
 
-if _is_cuda or _is_hip or _is_xpu:
+if _is_cuda or _is_hip or _is_xpu or _is_musa:
     from sgl_kernel import topk_softmax
 
     try:
@@ -536,13 +538,24 @@ def fused_topk(
                 renormalize,
             )
     elif scoring_func == "sigmoid":
-        topk_sigmoid(
-            topk_weights,
-            topk_ids,
-            gating_output,
-            renormalize,
-            correction_bias,
-        )
+        if _use_aiter and correction_bias is not None:
+            aiter_biased_grouped_topk(
+                gating_output,
+                correction_bias.to(dtype=gating_output.dtype),
+                topk_weights,
+                topk_ids,
+                num_expert_group=1,
+                topk_group=1,
+                need_renorm=renormalize,
+            )
+        else:
+            topk_sigmoid(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                renormalize,
+                correction_bias,
+            )
     else:
         raise ValueError(f"Invalid scoring function: {scoring_func}")
 
@@ -851,7 +864,7 @@ def biased_grouped_topk_gpu(
         return topk_weights, topk_ids
 
     elif (
-        _is_cuda
+        (_is_cuda or _is_musa)
         # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and experts_per_group <= 32
         and is_power_of_two(num_experts)
@@ -900,6 +913,30 @@ def biased_grouped_topk_gpu(
                 renormalize=renormalize,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
+        elif (
+            _is_cuda
+            and num_expert_group == 1
+            and topk_group == 1
+            and num_fused_shared_experts == 0
+            and num_experts <= 512
+            and topk <= 8
+        ):
+            from sglang.jit_kernel.grouped_topk import grouped_topk as jit_grouped_topk
+
+            scaling = (
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            )
+            if not apply_routed_scaling_factor_on_output:
+                scaling = 1.0
+            return jit_grouped_topk(
+                gating_output.to(dtype=torch.float32),
+                correction_bias.to(dtype=torch.float32),
+                num_expert_group,
+                topk_group,
+                topk,
+                renormalize,
+                scaling,
             )
         else:
             return biased_grouped_topk_impl(
@@ -1017,9 +1054,21 @@ def _post_process_topk_ids(
         topk_ids=topk_ids,
     )
     if _is_cuda:
-        topk_ids = _biased_grouped_topk_postprocess(
-            topk_ids, expert_location_dispatch_info, num_token_non_padded
-        )
+        # When shared experts are fused (appended as extra columns in topk_ids),
+        # EPLB dispatch must only remap the routed expert columns.
+        # The shared expert column (value = n_routed_experts) would be out-of-bounds
+        # for the logical-to-physical dispatch table.
+        if num_fused_shared_experts > 0 and is_deepep_class_backend():
+            shared_cols = topk_ids[:, -num_fused_shared_experts:]
+            routed_cols = topk_ids[:, :-num_fused_shared_experts]
+            routed_cols = _biased_grouped_topk_postprocess(
+                routed_cols, expert_location_dispatch_info, num_token_non_padded
+            )
+            topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
+        else:
+            topk_ids = _biased_grouped_topk_postprocess(
+                topk_ids, expert_location_dispatch_info, num_token_non_padded
+            )
 
     if num_fused_shared_experts > 0 and _use_aiter:
         M, N = router_logits.shape
@@ -1030,7 +1079,7 @@ def _post_process_topk_ids(
         )
 
         # Lazy import to avoid circular-import issues
-        from sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_kernels import (
+        from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_kernels import (
             fused_append_shared_experts,
         )
 
@@ -1065,7 +1114,6 @@ def select_experts(
     num_token_non_padded: Optional[torch.Tensor] = None,
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> StandardTopKOutput:
-
     top_k = topk_config.top_k
     use_grouped_topk = topk_config.use_grouped_topk
     topk_group = topk_config.topk_group
@@ -1082,12 +1130,13 @@ def select_experts(
 
     scoring_func = topk_config.scoring_func
 
-    router_logits, correction_bias = (
-        expert_location_dispatch.transform_select_experts_inputs(
-            router_logits=router_logits,
-            correction_bias=correction_bias,
-            info=expert_location_dispatch_info,
-        )
+    (
+        router_logits,
+        correction_bias,
+    ) = expert_location_dispatch.transform_select_experts_inputs(
+        router_logits=router_logits,
+        correction_bias=correction_bias,
+        info=expert_location_dispatch_info,
     )
 
     # DeepSeek V2/V3/R1 series models use grouped_top_k

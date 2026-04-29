@@ -5,7 +5,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import requests
 import torch
@@ -15,6 +15,10 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.memory_pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.observability.metrics_collector import StorageMetrics
@@ -385,13 +389,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
             logger.info("Mooncake store setup successfully.")
 
+            self.local_rank = (
+                storage_config.tp_rank if storage_config is not None else 0
+            )
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
             self.enable_storage_metrics = False
             if storage_config is not None:
                 self.is_mla_backend = storage_config.is_mla_model
-                self.local_rank = storage_config.tp_rank
                 self.pp_rank = storage_config.pp_rank
                 self.pp_size = storage_config.pp_size
                 self.attn_cp_rank = storage_config.attn_cp_rank
@@ -406,12 +412,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.attn_cp_size = 1
 
             self.enable_pp = self.pp_size > 1
-            self.enable_cp = self.attn_cp_size > 1
-            if self.enable_pp or self.enable_cp:
-                self.mha_suffix = (
-                    f"{self.local_rank}_{self.pp_rank}_{self.attn_cp_rank}"
-                )
-                self.mla_suffix = f"{self.pp_rank}_{self.attn_cp_rank}"
+            if self.enable_pp:
+                self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
+                self.mla_suffix = f"{self.pp_rank}"
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
@@ -424,13 +427,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
                 base_rank = self.local_rank * self.split_factor
                 target_ranks = [base_rank + i for i in range(self.split_factor)]
-                if self.enable_pp or self.enable_cp:
+                if self.enable_pp:
                     self.mha_suffix = [
-                        f"{rank}_{self.pp_rank}_{self.attn_cp_rank}"
-                        for rank in target_ranks
+                        f"{rank}_{self.pp_rank}" for rank in target_ranks
                     ]
                 else:
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
+
+            self.registered_pools = {}
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -481,7 +485,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def warmup(self):
         warmup_key = "sglang_mooncake_store_warmup_key" + uuid.uuid4().hex
         warmup_value = bytes(4 * 1024)  # 4 KB
-        assert self.store.put(warmup_key, warmup_value) == 0
+
+        # Retry logic to handle Transfer Engine startup race condition
+        max_retries = 10
+        retry_delay = 1.0  # seconds
+
+        for attempt in range(max_retries):
+            ret = self.store.put(warmup_key, warmup_value)
+            if ret == 0:
+                break
+            logger.warning(
+                f"[TP{self.local_rank}] Warmup put failed (attempt {attempt + 1}/{max_retries}), "
+                f"ret={ret}, retrying in {retry_delay}s..."
+            )
+            time.sleep(retry_delay)
+        else:
+            raise RuntimeError(
+                f"[TP{self.local_rank}] Warmup put failed after {max_retries} attempts, "
+                "Transfer Engine might not be ready"
+            )
+
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
 
@@ -491,7 +514,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             "page_first",
             "page_first_direct",
             "page_head",
-        ], "mooncake store storage backend only support page first or page first direct layout"
+            "page_first_kv_spilt",
+        ], "mooncake store storage backend only support page first, page first direct, page head and  page_first_kv_spilt layout"
         buffer = self.mem_pool_host.kv_buffer
         try:
             super().register_buffer(buffer)
@@ -501,6 +525,154 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         bytes_per_page = mem_pool_host.get_ksize_per_token() * mem_pool_host.page_size
         self.gb_per_page = bytes_per_page / (1 << 30)
+
+    def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
+        # KV anchor memory is already registered via register_mem_pool_host().
+        # v2 here only registers additional hybrid pools.
+        if host_pool_name == PoolName.KV:
+            return
+        # Keep a name->pool mapping so batch v2 can resolve PoolTransfer.name to
+        # the corresponding host pool implementation at runtime.
+        self.registered_pools[host_pool_name] = host_pool
+
+        # Hybrid pools expose the tensors that Mooncake needs for zero-copy I/O.
+        # The storage backend only depends on this accessor, not concrete fields.
+        buf_list = host_pool.get_hybrid_pool_buffer()
+        for buf in buf_list:
+            super().register_buffer(buf)
+
+    def _tag_keys(self, keys: List[str]) -> List[str]:
+        if self.extra_backend_tag is None:
+            return keys
+        return [f"{ self.extra_backend_tag}_{key}" for key in keys]
+
+    def _get_hybrid_page_component_keys(
+        self, page_keys: List[str], transfer: PoolTransfer
+    ) -> Tuple[List[str], int]:
+        # A logical "page" may map to multiple physical objects in storage.
+        # - INDEXER: one key per page
+        # - MAMBA  : one temporal key + N conv keys per page
+        # key_multiplier records how many component keys are generated per page.
+        name = transfer.name
+        suffixes = []
+        if name == PoolName.INDEXER:
+            suffixes = [f"_{self.mla_suffix}_{PoolName.INDEXER}"]
+        elif name == PoolName.MAMBA:
+            pools = getattr(self, "registered_pools", {})
+            mamba_pool = pools.get(PoolName.MAMBA)
+            conv_num = len(getattr(mamba_pool, "conv_buffer", None) or [])
+            base_suffix = f"_{self.mha_suffix}"
+            suffixes = [f"{base_suffix}_temporal"] + [
+                f"{base_suffix}_conv_{i}" for i in range(conv_num)
+            ]
+        key_multiplier = len(suffixes)
+        component_keys = [
+            f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
+        ]
+        return component_keys, key_multiplier
+
+    def batch_exists_v2(
+        self,
+        keys: List[str],
+        pool_transfers: Optional[List[PoolTransfer]] = None,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> PoolTransferResult:
+        qkeys = self._tag_keys(keys)
+        kv_pages = self.batch_exists(qkeys, extra_info)
+
+        hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
+        final_pages = kv_pages
+
+        for transfer in pool_transfers or []:
+            if final_pages == 0:
+                break
+            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
+                qkeys, transfer
+            )
+            ex = self._batch_exist(component_keys)
+            if key_multiplier > 0:
+                page_exists = [
+                    all(
+                        r == 1
+                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
+                    )
+                    for i in range(kv_pages)
+                ]
+            else:
+                page_exists = [False] * kv_pages
+            boundary = 0
+            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+                try:
+                    boundary = page_exists.index(False)
+                except ValueError:
+                    boundary = kv_pages
+            elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                for prefix_len in range(kv_pages, 0, -1):
+                    if all(
+                        page_exists[i]
+                        for i in range(max(0, prefix_len - trailing), prefix_len)
+                    ):
+                        boundary = prefix_len
+                        break
+            if boundary:
+                hit_count[transfer.name] = boundary
+            final_pages = min(final_pages, boundary)
+
+        return PoolTransferResult(final_pages, hit_count)
+
+    def _batch_io_v2(self, transfers: List[PoolTransfer], is_set: bool):
+        # Unified v2 I/O path: each PoolTransfer can expand to one or more
+        # storage objects per logical page, but API still reports page-level result.
+        results: dict = {}
+        for transfer in transfers:
+            host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
+            keys = transfer.keys
+            page_size = getattr(host_pool, "page_size", 1) or 1
+            host_indices = transfer.host_indices
+            assert len(keys) > 0
+            assert len(keys) == len(host_indices) // page_size
+
+            ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+            key_strs, key_multiplier = self._get_hybrid_page_component_keys(
+                keys, transfer
+            )
+            key_strs = self._tag_keys(key_strs)
+
+            if is_set:
+                exist_result = self._batch_exist(key_strs)
+                io_results = [0 if state == 1 else -1 for state in exist_result]
+                missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
+                if missing_idx:
+                    put_results = self._put_batch_zero_copy_impl(
+                        [key_strs[i] for i in missing_idx],
+                        [ptr_list[i] for i in missing_idx],
+                        [element_size_list[i] for i in missing_idx],
+                    )
+                    for i, res in zip(missing_idx, put_results):
+                        io_results[i] = res
+            else:
+                io_results = self._get_batch_zero_copy_impl(
+                    key_strs, ptr_list, element_size_list
+                )
+            results[transfer.name] = self._batch_postprocess(
+                io_results, is_set_operate=is_set, key_multiplier=key_multiplier
+            )
+        return results
+
+    def batch_get_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=False)
+
+    def batch_set_v2(
+        self,
+        transfers: List[PoolTransfer],
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+    ) -> dict:
+        return self._batch_io_v2(transfers, is_set=True)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = (
@@ -544,7 +716,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 return self._get_mha_buffer_meta(keys, host_indices)
 
-    def _batch_postprocess(self, results: List[int], is_set_operate=False):
+    def _batch_postprocess(
+        self, results: List[int], is_set_operate=False, key_multiplier=None
+    ):
         """
         refer to https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store/include/pybind_client.h
         for batch_get_into, results is Vector of integers,
@@ -552,32 +726,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for batch_put_from, results is Vector of integers,
             where each element is 0 on success, or a negative value on error
         """
-        if self.is_mla_backend:
-            return [k_res == 0 if is_set_operate else k_res > 0 for k_res in results]
-        else:
-            if self.storage_config.should_split_heads:
-                kv_groups = [
-                    results[i : i + self.split_factor * 2]
-                    for i in range(0, len(results), self.split_factor * 2)
-                ]
-                return [
-                    (
-                        all(res == 0 for res in kv_group)
-                        if is_set_operate
-                        else all(res > 0 for res in kv_group)
-                    )
-                    for kv_group in kv_groups
-                ]
+        if key_multiplier is None:
+            if self.is_mla_backend:
+                key_multiplier = 1
             else:
-                kv_pairs = zip(results[::2], results[1::2])
-                return [
-                    (
-                        (k_res == 0 and v_res == 0)
-                        if is_set_operate
-                        else (k_res > 0 and v_res > 0)
-                    )
-                    for k_res, v_res in kv_pairs
-                ]
+                key_multiplier = 2
+                if self.storage_config.should_split_heads:
+                    key_multiplier *= self.split_factor
+
+        result_groups = [
+            results[i : i + key_multiplier]
+            for i in range(0, len(results), key_multiplier)
+        ]
+        return [
+            (
+                all(res == 0 for res in group)
+                if is_set_operate
+                else all(res > 0 for res in group)
+            )
+            for group in result_groups
+        ]
 
     def batch_get_v1(
         self,
@@ -586,9 +754,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         # Apply extra_backend_tag prefix if available
-        if self.extra_backend_tag is not None:
-            prefix = self.extra_backend_tag
-            keys = [f"{prefix}_{key}" for key in keys]
+        keys = self._tag_keys(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
@@ -613,9 +779,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
         # Apply extra_backend_tag prefix if available
-        if self.extra_backend_tag is not None:
-            prefix = self.extra_backend_tag
-            keys = [f"{prefix}_{key}" for key in keys]
+        keys = self._tag_keys(keys)
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         exist_result = self._batch_exist(key_strs)
@@ -780,9 +944,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
         # Apply extra_backend_tag prefix if available
-        if self.extra_backend_tag is not None:
-            prefix = self.extra_backend_tag
-            keys = [f"{prefix}_{key}" for key in keys]
+        keys = self._tag_keys(keys)
 
         if self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
