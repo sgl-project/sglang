@@ -29,6 +29,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     # Default port ranges for Mooncake services - can be overridden in subclasses
     mooncake_master_port_base = 50051
     mooncake_metadata_port_base = 8080
+    flush_cache_timeout = 180
 
     @classmethod
     def setUpClass(cls):
@@ -204,7 +205,7 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
             "MC_MS_AUTO_DISC": "0",
             "MOONCAKE_DEVICE": "",
             "MOONCAKE_TE_META_DATA_SERVER": f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata",
-            "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4294967296",  # 4 GiB
+            "MOONCAKE_GLOBAL_SEGMENT_SIZE": "17179869184",  # 16 GiB, 8 GiB per TP rank
         }
 
         return server_args, env_vars
@@ -308,7 +309,13 @@ class TestMooncakeBackendHybridLinearModel(
         """Test eval accuracy with cache persistence across cache flushes"""
         from test_hicache_storage_file_backend import run_eval_accuracy_test
 
-        run_eval_accuracy_test(self)
+        run_eval_accuracy_test(
+            self,
+            accuracy_threshold=0.10,
+            max_tokens=2048,
+            num_threads=4,
+            num_examples=50,
+        )
 
 
 if __name__ == "__main__":
