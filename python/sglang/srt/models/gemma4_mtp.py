@@ -68,6 +68,18 @@ def _get_text_config(model_or_config) -> PretrainedConfig:
     return getattr(cfg, "text_config", cfg)
 
 
+def _resolve_target_text_model(target_model):
+    for attr in ("language_model", "model"):
+        candidate = getattr(target_model, attr, None)
+        if candidate is not None and hasattr(candidate, "layers"):
+            return candidate
+    raise AttributeError(
+        f"Frozen-KV MTP cannot locate the target trunk on "
+        f"{type(target_model).__name__}; expected ``.language_model`` "
+        "(multimodal) or ``.model`` (text-only) with a ``.layers`` attribute."
+    )
+
+
 def build_frozen_kv_context(
     assistant_model: "Gemma4AssistantForCausalLM",
     target_model,
