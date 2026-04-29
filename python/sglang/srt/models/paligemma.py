@@ -26,7 +26,7 @@ from transformers import PaliGemmaConfig, PreTrainedModel
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternImageTokens,
+    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
@@ -140,9 +140,12 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
     def pad_input_ids(
         self, input_ids: List[int], image_inputs: MultimodalInputs
     ) -> List[int]:
-        """Replace image placeholder tokens with actual image token IDs."""
-        image_token_id = self.config.image_token_index
-        pattern = MultiModalityDataPaddingPatternImageTokens(image_token_id)
+        """Replace image placeholder tokens with actual image feature tokens.
+
+        PaliGemma2 uses repeated <image> tokens (no start/end pair),
+        so we use the multimodal token pattern.
+        """
+        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, image_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
