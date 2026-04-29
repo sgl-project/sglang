@@ -2611,6 +2611,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def maybe_evict_swa(self):
+        # Only run SWA eviction for chunk caches. SWA radix cache manages eviction
+        # internally via its own bookkeeping; running this loop on a radix cache can
+        # double-free SWA slots and corrupt the KV pool, leading to garbage outputs
+        # or assertion failures during long-context decode.
+        if not self.tree_cache.is_chunk_cache():
+            return
+
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
             server_args = get_global_server_args()
