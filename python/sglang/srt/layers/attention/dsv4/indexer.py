@@ -485,10 +485,18 @@ class C4IndexerBackendMixin:
                     )
                 )
 
-        _sort_c4_sparse_indices_by_row(
-            core_metadata.c4_sparse_page_indices,
-            core_metadata.c4_sparse_topk_lengths,
+        in_kernel_canonical = (
+            envs.SGLANG_DSV4_CANONICAL_TOPK_IN_KERNEL.get()
+            and not envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and not envs.SGLANG_TOPK_TRANSFORM_512_TORCH.get()
+            and hisparse_coordinator is None
+            and core_metadata.c4_sparse_page_indices.shape[1] == 512
         )
+        if not in_kernel_canonical:
+            _sort_c4_sparse_indices_by_row(
+                core_metadata.c4_sparse_page_indices,
+                core_metadata.c4_sparse_topk_lengths,
+            )
 
         if capture_enabled:
             compress_layer_id = token_to_kv_pool.layer_mapping[
