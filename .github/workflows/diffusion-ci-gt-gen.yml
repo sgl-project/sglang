@@ -323,6 +323,9 @@ jobs:
             diffusion-ci/consistency_gt/official_generated/ltx_2.3_one_stage_ti2v_2gpu_frame_0.png
             diffusion-ci/consistency_gt/official_generated/ltx_2.3_one_stage_ti2v_2gpu_frame_mid.png
             diffusion-ci/consistency_gt/official_generated/ltx_2.3_one_stage_ti2v_2gpu_frame_last.png
+            diffusion-ci/consistency_gt/official_generated/ltx_2.3_two_stage_t2v_2gpus_2gpu_frame_0.png
+            diffusion-ci/consistency_gt/official_generated/ltx_2.3_two_stage_t2v_2gpus_2gpu_frame_mid.png
+            diffusion-ci/consistency_gt/official_generated/ltx_2.3_two_stage_t2v_2gpus_2gpu_frame_last.png
             diffusion-ci/repro_scripts/gen_official_ltx23.py
             diffusion-ci/repro_scripts/run_official_ltx23.sh
             diffusion-ci/repro_scripts/official_repro_case_map.json
@@ -336,6 +339,9 @@ jobs:
           diffusion-ci/consistency_gt/official_generated/ltx_2.3_one_stage_ti2v_2gpu_frame_0.png
           diffusion-ci/consistency_gt/official_generated/ltx_2.3_one_stage_ti2v_2gpu_frame_mid.png
           diffusion-ci/consistency_gt/official_generated/ltx_2.3_one_stage_ti2v_2gpu_frame_last.png
+          diffusion-ci/consistency_gt/official_generated/ltx_2.3_two_stage_t2v_2gpus_2gpu_frame_0.png
+          diffusion-ci/consistency_gt/official_generated/ltx_2.3_two_stage_t2v_2gpus_2gpu_frame_mid.png
+          diffusion-ci/consistency_gt/official_generated/ltx_2.3_two_stage_t2v_2gpus_2gpu_frame_last.png
           diffusion-ci/repro_scripts/gen_official_ltx23.py
           diffusion-ci/repro_scripts/run_official_ltx23.sh
           diffusion-ci/repro_scripts/official_repro_case_map.json
