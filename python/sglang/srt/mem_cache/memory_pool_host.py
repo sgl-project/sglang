@@ -88,6 +88,20 @@ def get_allocator_from_storage(allocator_type):
                 "Fallback to use default allocator."
             )
             return HostTensorAllocator()
+    elif allocator_type == "umbp":
+        try:
+            from sglang.srt.mem_cache.storage.umbp.umbp_host_allocator import (
+                UMBPHostTensorAllocator,
+            )
+
+            return UMBPHostTensorAllocator()
+        except (ImportError, RuntimeError) as exc:
+            logger.warning(
+                "UMBPHostTensorAllocator unavailable (%s). "
+                "Falling back to torch.empty-based allocator.",
+                exc,
+            )
+            return HostTensorAllocator()
     else:
         return HostTensorAllocator()
 
