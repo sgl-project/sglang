@@ -504,7 +504,7 @@ class NativeSparseAttnBackend(
                     page_table, repeats=self.speculative_num_draft_tokens, dim=0
                 )
             else:
-                # DRAFT_EXTEND (v1): V1 worker extends by (accept_length + 1) per request
+                # DRAFT_EXTEND (v1): V1 worker extends by (num_accepted_drafts + 1) per request
                 # after verification. Lengths vary per request based on how many tokens
                 # were accepted.
                 page_table = torch.repeat_interleave(
@@ -1037,7 +1037,7 @@ class NativeSparseAttnBackend(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
 
-            extend_seq_lens = spec_info.accept_length[:bs]
+            extend_seq_lens = spec_info.num_accepted_tokens[:bs]
             extend_seq_lens_cpu = extend_seq_lens.tolist()
 
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
