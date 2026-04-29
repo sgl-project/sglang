@@ -168,6 +168,8 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.relaykv.metrics import log_shadow_plan, should_log
+from sglang.srt.relaykv.planner import make_shadow_plan
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -744,6 +746,8 @@ class Scheduler(
                 f"context_len={self.model_config.context_len}, "
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}={avail_mem:.2f} GB"
             )
+
+        self.relaykv_config = self.tp_worker.model_runner.relaykv_config
 
         if self.enable_metrics and hasattr(self, "metrics_collector"):
             self.metrics_collector.emit_cache_config_info(
@@ -2642,6 +2646,7 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        self._maybe_log_relaykv_shadow_plans(can_run_list, phase="prefill")
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -2678,6 +2683,27 @@ class Scheduler(
             new_batch.decoding_reqs = None
 
         return new_batch
+
+    def _maybe_log_relaykv_shadow_plans(self, reqs: List[Req], phase: str) -> None:
+        config = self.relaykv_config
+        if not config.enabled or config.mode != "shadow":
+            return
+
+        for req in reqs:
+            step_idx = req.extend_batch_idx if phase == "prefill" else req.decode_batch_idx
+            if not should_log(step_idx, config.log_interval):
+                continue
+
+            seq_len = len(req.origin_input_ids) + len(req.output_ids)
+            log_shadow_plan(
+                make_shadow_plan(
+                    seq_len=seq_len,
+                    config=config,
+                    page_size=1,
+                    request_id=req.rid,
+                ),
+                prefix=f"relaykv_shadow_plan_{phase}",
+            )
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the current running decoding batch."""
