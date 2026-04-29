@@ -1,19 +1,29 @@
-"""Unit tests for the breakable CUDA graph mechanism.
+"""Tests for the breakable CUDA graph (BCG) runner.
 
-Tests the core capture/replay logic with simple tensor operations,
-verifying that graph breaks work correctly and outputs are properly
-propagated across segments.
+Two test classes:
+- ``TestBreakableCUDAGraphBasic`` / ``TestCopyOutput`` / ``TestBreakGraphHelper``:
+  unit tests for the core capture / replay mechanism (simple tensor ops).
+- ``TestBreakableCudaGraph``: integration test — spin up Qwen3-8B with
+  ``--enable-breakable-cuda-graph`` and check mgsm_en accuracy.
 """
 
 import unittest
 
 import torch
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.run_eval import run_eval
+from sglang.test.test_utils import (
+    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+    DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
+    SimpleNamespace,
+    popen_launch_server,
+)
 
-# CI Registration
-register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-small")
+# CI Registration — large suite to fit the integration test's server startup.
+register_cuda_ci(est_time=79, suite="stage-b-test-1-gpu-large")
 
 
 def _skip_if_no_cuda(test_func):
@@ -279,6 +289,42 @@ class TestBreakGraphHelper(CustomTestCase):
         torch.cuda.synchronize()
         # x=10 -> +1=11 -> break -> +2=13
         self.assertTrue(torch.allclose(y, torch.full((4,), 13.0, device=self.device)))
+
+
+class TestBreakableCudaGraph(CustomTestCase):
+    """Integration: Qwen3-8B with --enable-breakable-cuda-graph on mgsm_en."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "Qwen/Qwen3-8B"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--enable-breakable-cuda-graph",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k_accuracy(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="mgsm_en",
+            num_examples=1319,
+            num_threads=1024,
+        )
+
+        metrics = run_eval(args)
+        score = metrics["score"]
+        print(f"mgsm_en accuracy with breakable CUDA graph: {score:.3f}")
+
+        self.assertGreaterEqual(score, 0.80)
 
 
 if __name__ == "__main__":

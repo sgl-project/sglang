@@ -825,7 +825,8 @@
                   "docs/developer_guide/bench_serving"
                 ]
               },
-              "docs/developer_guide/evaluating_new_models"
+              "docs/developer_guide/evaluating_new_models",
+              "docs/developer_guide/msprobe_debugging_guide"
             ]
           },
           {
@@ -940,6 +941,7 @@
                   {
                     "group": "DeepSeek",
                     "pages": [
+                      "cookbook/autoregressive/DeepSeek/DeepSeek-V4",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_2",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3_1",
                       "cookbook/autoregressive/DeepSeek/DeepSeek-V3",
@@ -1059,6 +1061,7 @@
                   {
                     "group": "Xiaomi",
                     "pages": [
+                      "cookbook/autoregressive/Xiaomi/MiMo-V2.5",
                       "cookbook/autoregressive/Xiaomi/MiMo-V2-Flash"
                     ]
                   },
@@ -1091,6 +1094,12 @@
                     "pages": [
                       "cookbook/diffusion/Wan/Wan2.1",
                       "cookbook/diffusion/Wan/Wan2.2"
+                    ]
+                  },
+                  {
+                    "group": "LTX",
+                    "pages": [
+                      "cookbook/diffusion/LTX/LTX"
                     ]
                   },
                   {
