@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import random
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -259,6 +260,25 @@ class TestGluonSupports(CustomTestCase):
         finally:
             mod._GLUON_FN = saved_fn
             mod._try_import_gluon = saved_try
+
+    def test_get_extend_attention_hints_from_cpu_metadata(self):
+        from sglang.srt.layers.attention.gluon_extend_attention import (
+            get_extend_attention_hints,
+        )
+
+        forward_batch = SimpleNamespace(
+            extend_prefix_lens_cpu=[8, 16, 32],
+            extend_seq_lens_cpu=[1, 4, 2],
+        )
+
+        self.assertEqual(
+            get_extend_attention_hints(forward_batch),
+            {
+                "total_prefix_len": 56,
+                "total_extend_len": 7,
+                "min_len_extend": 1,
+            },
+        )
 
     def _meta_wrapper_args(self, D=128, kv_dtype=torch.bfloat16):
         q = self._mktensor((4, 8, D), dtype=torch.bfloat16)

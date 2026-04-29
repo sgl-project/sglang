@@ -11,7 +11,7 @@ This package is the standalone Gluon-kernels home for the extend
 kernel; the SGLang fork vendors a mirror of these files at
 ``python/sglang/srt/layers/attention/gluon_ops/cdna4/extend_attention/``
 and consumes them through ``TritonAttnBackend`` behind
-``--enable-gluon-extend-attention``.
+``SGLANG_ENABLE_GLUON_EXTEND_ATTENTION=1``.
 
 Public entry point:
 

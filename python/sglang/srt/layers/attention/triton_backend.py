@@ -9,6 +9,7 @@ import triton
 import triton.language as tl
 
 logger = logging.getLogger(__name__)
+_GLUON_EXTEND_ATTENTION_ENV = "SGLANG_ENABLE_GLUON_EXTEND_ATTENTION"
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -58,10 +59,6 @@ class ForwardMetadata:
     window_kv_offsets: torch.Tensor
     # Separate attn_logits for SWA layers when v_head_dim differs
     swa_attn_logits: Optional[torch.Tensor] = None
-    # Optional Gluon routing hints.
-    total_prefix_len: Optional[int] = None
-    total_extend_len: Optional[int] = None
-    min_len_extend: Optional[int] = None
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -85,25 +82,26 @@ class TritonAttnBackend(AttentionBackend):
 
         self.decode_attention_fwd = torch.compiler.disable(decode_attention_fwd)
         # Optional gfx950 Gluon extend attention.
-        self._gluon_extend_enabled = False
+        self._get_gluon_extend_hints = None
         _extend_fwd = extend_attention_fwd
         _mla_model = model_runner.model_config.attention_arch == AttentionArch.MLA
         if (
-            model_runner.server_args.enable_gluon_extend_attention
+            get_bool_env_var(_GLUON_EXTEND_ATTENTION_ENV)
             and is_gfx95_supported()
             and not _mla_model
         ):
             from sglang.srt.layers.attention.gluon_extend_attention import (
+                get_extend_attention_hints,
                 make_extend_attention_fwd,
             )
 
             _gluon_fwd = make_extend_attention_fwd(extend_attention_fwd)
             if _gluon_fwd is not extend_attention_fwd:
-                self._gluon_extend_enabled = True
+                self._get_gluon_extend_hints = get_extend_attention_hints
                 _extend_fwd = _gluon_fwd
                 logger.info(
                     "Gluon extend attention enabled on gfx950 "
-                    "(--enable-gluon-extend-attention)."
+                    f"({_GLUON_EXTEND_ATTENTION_ENV}=1)."
                 )
         self.extend_attention_fwd = torch.compiler.disable(_extend_fwd)
         self.extend_attention_fwd_unified = torch.compiler.disable(
@@ -477,22 +475,6 @@ class TritonAttnBackend(AttentionBackend):
             max_extend_len = max(forward_batch.extend_seq_lens_cpu)
             num_kv_splits = None
 
-        # Use CPU-side lengths when available; no GPU sync.
-        _pfx_cpu = getattr(forward_batch, "extend_prefix_lens_cpu", None)
-        _ext_cpu = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if _pfx_cpu is not None and _ext_cpu is not None:
-            if isinstance(_pfx_cpu, torch.Tensor):
-                _pfx_cpu = _pfx_cpu.tolist()
-            if isinstance(_ext_cpu, torch.Tensor):
-                _ext_cpu = _ext_cpu.tolist()
-            _total_prefix_len = int(sum(_pfx_cpu)) if _pfx_cpu else 0
-            _total_extend_len = int(sum(_ext_cpu)) if _ext_cpu else 0
-            _min_len_extend = int(min(_ext_cpu)) if _ext_cpu else None
-        else:
-            _total_prefix_len = None
-            _total_extend_len = None
-            _min_len_extend = None
-
         self.forward_metadata = ForwardMetadata(
             attn_logits,
             attn_lse,
@@ -508,9 +490,6 @@ class TritonAttnBackend(AttentionBackend):
             window_num_kv_splits,
             window_kv_offsets,
             swa_attn_logits=swa_attn_logits,
-            total_prefix_len=_total_prefix_len,
-            total_extend_len=_total_extend_len,
-            min_len_extend=_min_len_extend,
         )
 
     def init_cuda_graph_state(
@@ -994,29 +973,18 @@ class TritonAttnBackend(AttentionBackend):
             k_descale = 1.0
             v_descale = 1.0
 
-        # The Gluon wrapper accepts these keyword-only hints.
         _gluon_hints = (
-            dict(
-                total_prefix_len=self.forward_metadata.total_prefix_len,
-                total_extend_len=self.forward_metadata.total_extend_len,
-                min_len_extend=self.forward_metadata.min_len_extend,
-            )
-            if self._gluon_extend_enabled
+            self._get_gluon_extend_hints(forward_batch)
+            if self._get_gluon_extend_hints is not None
             else {}
         )
-        q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-        k_contig = k.contiguous()
-        v_contig = v.contiguous()
-        o_view = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-        key_buffer = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
-        value_buffer = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
         self.extend_attention_fwd(
-            q_view,
-            k_contig,
-            v_contig,
-            o_view,
-            key_buffer,
-            value_buffer,
+            q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+            k.contiguous(),
+            v.contiguous(),
+            o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+            forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
+            forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
             self.forward_metadata.qo_indptr,
             kv_indptr,
             kv_indices,

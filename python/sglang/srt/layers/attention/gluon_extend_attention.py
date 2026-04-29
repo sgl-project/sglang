@@ -17,6 +17,29 @@ _GLUON_SUPPORTED_FP8_KV_DTYPES = {torch.float8_e4m3fn}
 _GLUON_FN: Optional[Callable] = None
 
 
+def get_extend_attention_hints(forward_batch) -> dict[str, Optional[int]]:
+    """Build Gluon-only scheduling hints from CPU-side batch metadata."""
+    prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    if prefix_lens is None or extend_lens is None:
+        return {
+            "total_prefix_len": None,
+            "total_extend_len": None,
+            "min_len_extend": None,
+        }
+
+    if isinstance(prefix_lens, torch.Tensor):
+        prefix_lens = prefix_lens.tolist()
+    if isinstance(extend_lens, torch.Tensor):
+        extend_lens = extend_lens.tolist()
+
+    return {
+        "total_prefix_len": int(sum(prefix_lens)) if prefix_lens else 0,
+        "total_extend_len": int(sum(extend_lens)) if extend_lens else 0,
+        "min_len_extend": int(min(extend_lens)) if extend_lens else None,
+    }
+
+
 def _try_import_gluon() -> bool:
     """Cache the Gluon entry point if it imports cleanly."""
     global _GLUON_FN
