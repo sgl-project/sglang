@@ -2700,6 +2700,7 @@ class Scheduler(
             "host_backup_shadow": config.host_backup_shadow,
             "host_backup_max_mib": config.host_backup_max_mib,
             "host_backup_planned": config.host_backup_shadow,
+            "host_backup_dry_copy": config.host_backup_dry_copy,
         }
 
         for req in reqs:
@@ -2736,6 +2737,7 @@ class Scheduler(
                 memory_estimate=memory_estimate,
                 host_backup_shadow=config.host_backup_shadow,
                 host_backup_max_mib=config.host_backup_max_mib,
+                host_backup_dry_copy=config.host_backup_dry_copy,
             )
             log_shadow_plan(
                 plan,

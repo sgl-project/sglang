@@ -60,6 +60,7 @@ def main() -> None:
         memory_estimate=estimate_from_model,
         host_backup_shadow=True,
         host_backup_max_mib=0.0,
+        host_backup_dry_copy=True,
     )
     if host_backup_estimate.host_backup_candidate_tokens != 1511:
         raise AssertionError(host_backup_estimate)
@@ -79,6 +80,12 @@ def main() -> None:
     if host_backup_estimate.host_backup_copy_target_tokens != 1763:
         raise AssertionError(host_backup_estimate)
     if host_backup_estimate.host_backup_copy_target_reason != "metadata_only_no_tensor_copy_range_token_mismatch":
+        raise AssertionError(host_backup_estimate)
+    if host_backup_estimate.host_backup_dry_copy_guard_ok is not True:
+        raise AssertionError(host_backup_estimate)
+    if host_backup_estimate.host_backup_dry_copy_would_run is not True:
+        raise AssertionError(host_backup_estimate)
+    if host_backup_estimate.host_backup_dry_copy_reason != "guard_only_no_tensor_copy":
         raise AssertionError(host_backup_estimate)
     payload = plan.to_log_dict()
     payload.update(estimate_from_model.to_log_dict())

@@ -65,6 +65,10 @@ RELAYKV_SHADOW_LOG_HOST_BACKUP_KEYS = {
     "host_backup_budget_ok",
     "host_backup_would_copy",
     "host_backup_reason",
+    "host_backup_dry_copy",
+    "host_backup_dry_copy_guard_ok",
+    "host_backup_dry_copy_would_run",
+    "host_backup_dry_copy_reason",
 }
 
 
@@ -84,6 +88,10 @@ class RelayKVHostBackupShadowEstimate:
     host_backup_budget_ok: Optional[bool]
     host_backup_would_copy: bool
     host_backup_reason: str
+    host_backup_dry_copy: bool
+    host_backup_dry_copy_guard_ok: bool
+    host_backup_dry_copy_would_run: bool
+    host_backup_dry_copy_reason: str
 
     def to_log_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -192,6 +200,7 @@ def estimate_host_backup_shadow_for_plan(
     memory_estimate: RelayKVMemoryEstimate,
     host_backup_shadow: bool,
     host_backup_max_mib: float,
+    host_backup_dry_copy: bool,
 ) -> RelayKVHostBackupShadowEstimate:
     if not host_backup_shadow:
         return RelayKVHostBackupShadowEstimate(
@@ -209,6 +218,10 @@ def estimate_host_backup_shadow_for_plan(
             host_backup_budget_ok=True,
             host_backup_would_copy=False,
             host_backup_reason="host_backup_shadow_disabled",
+            host_backup_dry_copy=host_backup_dry_copy,
+            host_backup_dry_copy_guard_ok=False,
+            host_backup_dry_copy_would_run=False,
+            host_backup_dry_copy_reason="dry_copy_disabled",
         )
 
     candidate_kv_bytes = memory_estimate.planned_cold_kv_bytes
@@ -231,6 +244,23 @@ def estimate_host_backup_shadow_for_plan(
         budget_ok = candidate_kv_mib <= host_backup_max_mib
         reason = "metadata_only_no_tensor_copy"
 
+    dry_copy_guard_ok = bool(
+        host_backup_shadow
+        and host_backup_dry_copy
+        and budget_ok is True
+        and copy_target_tokens > 0
+    )
+    if not host_backup_dry_copy:
+        dry_copy_reason = "dry_copy_disabled"
+    elif budget_ok is False:
+        dry_copy_reason = "host_backup_budget_exceeded"
+    elif copy_target_tokens <= 0:
+        dry_copy_reason = "no_copy_target_tokens"
+    elif budget_ok is None:
+        dry_copy_reason = "insufficient_memory_metadata"
+    else:
+        dry_copy_reason = "guard_only_no_tensor_copy"
+
     return RelayKVHostBackupShadowEstimate(
         host_backup_shadow=True,
         host_backup_candidate_tokens=plan.planned_cold_tokens,
@@ -246,6 +276,10 @@ def estimate_host_backup_shadow_for_plan(
         host_backup_budget_ok=budget_ok,
         host_backup_would_copy=False,
         host_backup_reason=reason,
+        host_backup_dry_copy=host_backup_dry_copy,
+        host_backup_dry_copy_guard_ok=dry_copy_guard_ok,
+        host_backup_dry_copy_would_run=dry_copy_guard_ok,
+        host_backup_dry_copy_reason=dry_copy_reason,
     )
 
 

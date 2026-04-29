@@ -23,6 +23,7 @@ class RelayKVConfig:
     log_interval: int = 1
     host_backup_shadow: bool = False
     host_backup_max_mib: float = 0.0
+    host_backup_dry_copy: bool = False
 
     @classmethod
     def from_server_args(cls, server_args: object) -> "RelayKVConfig":
@@ -46,6 +47,9 @@ class RelayKVConfig:
             ),
             host_backup_max_mib=float(
                 getattr(server_args, "relaykv_host_backup_max_mib", 0.0) or 0.0
+            ),
+            host_backup_dry_copy=bool(
+                getattr(server_args, "relaykv_host_backup_dry_copy", False)
             ),
         )
 

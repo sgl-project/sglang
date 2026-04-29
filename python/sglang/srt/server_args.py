@@ -600,6 +600,7 @@ class ServerArgs:
     relaykv_log_interval: int = 1
     relaykv_host_backup_shadow: bool = False
     relaykv_host_backup_max_mib: float = 0.0
+    relaykv_host_backup_dry_copy: bool = False
 
     # LMCache
     enable_lmcache: bool = False
@@ -5848,6 +5849,12 @@ class ServerArgs:
             type=float,
             default=ServerArgs.relaykv_host_backup_max_mib,
             help="Optional host backup budget guard in MiB; 0 means unlimited for shadow planning.",
+        )
+        parser.add_argument(
+            "--relaykv-host-backup-dry-copy",
+            action="store_true",
+            default=ServerArgs.relaykv_host_backup_dry_copy,
+            help="Enable RelayKV host-backup dry-copy guard path for shadow logging only; no tensors are copied.",
         )
 
         # Ktransformer server args
