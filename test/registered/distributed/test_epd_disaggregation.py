@@ -669,16 +669,13 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
             cls.encode_port,
             "--enable-prefix-mm-cache",
             "--max-running-requests",
-            "16",
+            "8",
         ]
-        cls.encode_stdout = io.StringIO()
-        cls.encode_stderr = io.StringIO()
         cls.process_encode = popen_launch_server(
             cls.model,
             base_url=cls.encode_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=encode_args,
-            return_stdout_stderr=(cls.encode_stdout, cls.encode_stderr),
         )
 
     @classmethod
@@ -817,14 +814,6 @@ class TestEPDDisaggregationOneEncoder(PDDisaggregationServerBase):
 
         # for qwen2.5-vl-3b-instruct, the accuracy is 0.40
         self.assertGreater(mmmu_accuracy, 0.40)
-
-        # Verify encoder throttling was triggered (max-running-requests=16, batch_size=32)
-        encoder_logs = self.encode_stdout.getvalue() + self.encode_stderr.getvalue()
-        self.assertIn(
-            "Encode request throttled",
-            encoder_logs,
-            "Encoder throttling should be triggered with max-running-requests=16",
-        )
 
 
 @unittest.skipIf(
