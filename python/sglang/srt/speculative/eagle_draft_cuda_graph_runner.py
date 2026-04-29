@@ -128,7 +128,7 @@ class EAGLEDraftCudaGraphRunner:
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             hidden_states = torch.zeros(
-                (self.max_bs, self.model_runner.model_config.hidden_size),
+                (self.max_bs, self.model_runner.model_config.spec_hidden_size),
                 dtype=self.model_runner.dtype,
             )
 
