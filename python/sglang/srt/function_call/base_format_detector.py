@@ -394,7 +394,7 @@ class BaseFormatDetector(ABC):
         model_id = self.get_model_structural_tag_id()
         empty_thinking_as_non_thinking = self.empty_thinking_as_non_thinking()
         tool_choice_type = (
-            "required" if isinstance(tool_choice, ToolChoice) else tool_choice
+            "forced" if isinstance(tool_choice, ToolChoice) else tool_choice
         )
         tool_dicts = []
 
