@@ -7,6 +7,7 @@ import torch
 from torch.nn import functional as F
 
 from sglang.srt.layers.activation import GeluAndMul, SiluAndMul
+from sglang.srt.layers.moe.fused_moe_triton.fused_moe import swiglu_with_alpha_and_limit
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher import (
     StandardCombineInput,
@@ -76,6 +77,9 @@ def moe_forward_native(
     else:
         raise ValueError(f"Unsupported activation: {moe_runner_config.activation=}")
 
+    # Get bias terms if available
+    w13_bias = getattr(layer, "w13_weight_bias", None)
+    w2_bias = getattr(layer, "w2_weight_bias", None)
     outputs = []
     start_idx = 0
     for i, num_tokens in enumerate(tokens_per_expert):
@@ -87,9 +91,43 @@ def moe_forward_native(
         layer_w13_weight = layer.w13_weight[i]
         layer_w2_weight = layer.w2_weight[i]
 
+        # Store original dtype
+        original_dtype = tokens_for_this_expert.dtype
+
+        # Get bias terms if available for this expert
+        layer_w13_bias = w13_bias[i] if w13_bias is not None else None
+        layer_w2_bias = w2_bias[i] if w2_bias is not None else None
+
+        # Apply w13 linear
         gate_up = F.linear(tokens_for_this_expert, layer_w13_weight)
-        gate_up = act(gate_up)
+
+        # Add bias if present (for models like GPT-OSS)
+        if layer_w13_bias is not None:
+            gate_up_fp32 = gate_up.float() + layer_w13_bias
+            gate_up = gate_up_fp32.to(original_dtype)
+
+        # Apply activation
+        if (
+            moe_runner_config.activation == "silu"
+            and moe_runner_config.gemm1_alpha is not None
+        ):
+            assert moe_runner_config.gemm1_clamp_limit is not None
+            gate_up = swiglu_with_alpha_and_limit(
+                gate_up,
+                moe_runner_config.gemm1_alpha,
+                moe_runner_config.gemm1_clamp_limit,
+            )
+        else:
+            gate_up = act(gate_up)
+
+        # Apply w2 linear
         expert_out = F.linear(gate_up, layer_w2_weight)
+
+        # Add bias if present (for models like GPT-OSS)
+        if layer_w2_bias is not None:
+            expert_out = expert_out.float() + layer_w2_bias
+            expert_out = expert_out.to(original_dtype)
+
         outputs.append(expert_out)
         start_idx = end_idx
 

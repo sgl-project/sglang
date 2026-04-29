@@ -44,7 +44,7 @@ class GetWeightsChecksumReqInput:
 class RolloutRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = None
-    seed: int = 1024
+    seed: Optional[int] = None
     generator_device: str = "cuda"
 
     width: Optional[int] = None
@@ -67,6 +67,10 @@ class RolloutRequest(BaseModel):
 
     rollout_return_denoising_env: bool = False
     rollout_return_dit_trajectory: bool = False
+
+    # 0-indexed denoising-loop step filters. None = all steps.
+    rollout_sde_step_indices: Optional[list[int]] = None
+    rollout_return_step_indices: Optional[list[int]] = None
 
     image_path: Optional[list[str]] = None
 

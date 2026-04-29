@@ -31,6 +31,32 @@ from sglang.multimodal_gen.utils import FlexibleArgumentParser
 logger = init_logger(__name__)
 
 
+def _resolve_cli_sampling_params_cls(server_args: ServerArgs) -> type[SamplingParams]:
+    pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
+    if pipeline_class_name:
+        from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+        config_classes = get_pipeline_config_classes(pipeline_class_name)
+        if config_classes is not None:
+            _, sampling_params_cls = config_classes
+            return sampling_params_cls
+
+    try:
+        from sglang.multimodal_gen.registry import get_model_info
+
+        model_info = get_model_info(
+            server_args.model_path,
+            backend=server_args.backend,
+            model_id=server_args.model_id,
+        )
+        if model_info is not None:
+            return model_info.sampling_param_cls
+    except Exception as exc:
+        logger.debug("Falling back to base SamplingParams for CLI parsing: %s", exc)
+
+    return SamplingParams
+
+
 def add_multimodal_gen_generate_args(parser: argparse.ArgumentParser):
     """Add the arguments for the generate command."""
     parser.add_argument(
@@ -130,6 +156,7 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     args.request_id = "mocked_fake_id_for_offline_generate"
 
     server_args = ServerArgs.from_cli_args(args, unknown_args)
+    sampling_params_cls = _resolve_cli_sampling_params_cls(server_args)
 
     sampling_params_kwargs = {}
     config_file = getattr(args, "config", None)
@@ -137,7 +164,7 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
     if config_file:
         config_args = ServerArgs.load_config_file(config_file) or {}
         sampling_param_fields = {
-            field.name for field in dataclasses.fields(SamplingParams)
+            field.name for field in dataclasses.fields(sampling_params_cls)
         }
         sampling_params_kwargs.update(
             {
@@ -147,7 +174,7 @@ def generate_cmd(args: argparse.Namespace, unknown_args: list[str] | None = None
             }
         )
 
-    sampling_params_kwargs.update(SamplingParams.get_cli_args(args))
+    sampling_params_kwargs.update(sampling_params_cls.get_cli_args(args))
     _apply_output_file_path_override(args, sampling_params_kwargs)
     sampling_params_kwargs["request_id"] = generate_request_id()
 
