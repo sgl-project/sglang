@@ -264,6 +264,7 @@ class BAGELUForwardBridge:
     ) -> None:
         state = backend._state_for(session.handle.session_id)
         state.srt_u_forward_events.append((request.state, request.request_id))
+        backend._bind_srt_request_tokens(request)
 
         if request.state == UGSegmentState.U_PREFILL.value:
             state.srt_u_forward_results[request.request_id] = (
@@ -577,6 +578,13 @@ class BAGELInterleaveContextBackend:
             role=role,
         )
         return cloned
+
+    def _bind_srt_request_tokens(self, request: UGSRTRequestView) -> None:
+        if self.srt_kv_cache_factory is None:
+            return
+        binding = request.metadata.get("srt_kv_token_binding")
+        if binding is not None:
+            self.srt_kv_cache_factory.bind_request_tokens(binding)
 
     def _prepare_denoise(
         self,

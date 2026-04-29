@@ -37,6 +37,16 @@ class UGSRTRequestView:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class UGSRTKVTokenBinding:
+    """Opaque SRT request token locations for UG model-side cache adapters."""
+
+    session_id: str
+    request_id: str
+    token_count: int
+    token_indices: Any
+
+
 @dataclass(slots=True)
 class UGContextHandle:
     request_id: str

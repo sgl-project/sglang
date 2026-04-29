@@ -30,7 +30,7 @@ from sglang.srt.ug.bagel_cache import (
     BAGELSRTKVCacheFactory,
     InMemoryBAGELSRTKVCacheBacking,
 )
-from sglang.srt.ug.context import UGSessionHandle
+from sglang.srt.ug.context import UGSRTKVTokenBinding, UGSessionHandle
 from sglang.srt.ug.runtime import (
     UGInterleavedMessage,
     UGLatentDecodeRequest,
@@ -220,6 +220,26 @@ class OutputAppendingSRTExecutor:
         self.events.append((state.value, req.rid, req.sampling_params.max_new_tokens))
         if req.sampling_params.max_new_tokens > 0:
             req.output_ids.append(self.token_id)
+
+
+class BindingSRTExecutor(OutputAppendingSRTExecutor):
+    def __init__(self, token_id=123, start_index=4):
+        super().__init__(token_id=token_id)
+        self.start_index = start_index
+
+    def get_ug_request_token_binding(self, *, record, req, state):
+        del state
+        token_count = len(req.origin_input_ids)
+        return UGSRTKVTokenBinding(
+            session_id=record.session_id,
+            request_id=req.rid,
+            token_count=token_count,
+            token_indices=torch.arange(
+                self.start_index,
+                self.start_index + token_count,
+                dtype=torch.long,
+            ),
+        )
 
 
 class FakeBAGELImageTransform:
@@ -763,6 +783,42 @@ class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
         self.assertEqual(len(allocator.freed), 2)
         self.assertEqual(tuple(allocator.freed[-1].shape), (8,))
 
+    def test_paged_backing_can_bind_to_srt_request_token_indices(self):
+        allocator = FakePagedAllocator(page_size=4)
+        backing = BAGELPagedKVCacheBacking(allocator)
+        factory = BAGELSRTKVCacheFactory(backing)
+        cache = factory.create_cache(
+            session_id="bound-cache-session",
+            role="full",
+            template_cache=FakeNaiveBAGELCache(num_layers=2),
+        )
+
+        factory.bind_request_tokens(
+            UGSRTKVTokenBinding(
+                session_id="bound-cache-session",
+                request_id="bound-cache-session:u1",
+                token_count=4,
+                token_indices=torch.tensor([4, 5, 6, 7], dtype=torch.long),
+            )
+        )
+        key = torch.arange(6, dtype=torch.float32).reshape(3, 1, 2)
+        value = key + 10
+        cache.key_cache[0] = key
+        cache.value_cache[0] = value
+
+        self.assertEqual(allocator.alloc_sizes, [])
+        self.assertTrue(torch.equal(cache.key_cache[0], key))
+        self.assertTrue(torch.equal(cache.value_cache[0], value))
+        self.assertTrue(
+            torch.equal(
+                allocator.kv_cache.get_key_buffer(0)[5:8],
+                key,
+            )
+        )
+
+        factory.release_session("bound-cache-session")
+        self.assertEqual(allocator.freed, [])
+
     def test_context_backend_can_replace_bagel_naive_cache_with_srt_cache(self):
         backing = InMemoryBAGELSRTKVCacheBacking()
         backend = BAGELInterleaveContextBackend(
@@ -797,6 +853,43 @@ class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
 
         runtime.close_session(handle)
         self.assertEqual(backing.released_sessions, ["bagel-srt-kv-cache"])
+
+    def test_context_backend_binds_srt_forward_view_to_request_tokens(self):
+        allocator = FakePagedAllocator(page_size=4)
+        backend = BAGELInterleaveContextBackend(
+            FakeSRTCacheBAGELInferencer(),
+            srt_kv_cache_factory=BAGELSRTKVCacheFactory(
+                BAGELPagedKVCacheBacking(allocator)
+            ),
+            default_image_shape=(32, 32),
+        )
+        adapter = BAGELUGModelAdapter("already-loaded-bagel", backend=backend)
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=BindingSRTExecutor(start_index=6),
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="red kite")],
+            session_id="bagel-bound-srt-view",
+        )
+
+        self.assertEqual(allocator.alloc_sizes, [])
+        self.assertEqual(allocator.freed, [])
+        self.assertEqual(
+            backend.sessions["bagel-bound-srt-view"].gen_context["kv_lens"], [2]
+        )
+        self.assertTrue(
+            torch.equal(
+                allocator.kv_cache.get_key_buffer(0)[7:9],
+                torch.full((2, 1, 2), 1.0),
+            )
+        )
+        self.assertEqual(
+            runtime.get_debug_counters(handle)["srt_last_request_id"],
+            "bagel-bound-srt-view:u1",
+        )
 
 
 class TestBAGELInterleaveContextBackend(unittest.TestCase):

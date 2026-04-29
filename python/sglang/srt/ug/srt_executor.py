@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import torch
+
+from sglang.srt.ug.context import UGSRTKVTokenBinding
+
 
 class UGSRTSchedulerExecutorError(RuntimeError):
     """Raised when UG cannot synchronously execute an SRT scheduler request."""
@@ -63,6 +67,24 @@ class UGSRTSchedulerExecutor:
         self.scheduler._add_request_to_queue(req)
         if self.run_synchronously:
             self._run_until_request_complete(req)
+
+    def get_ug_request_token_binding(
+        self,
+        *,
+        record,
+        req,
+        state,
+    ) -> UGSRTKVTokenBinding | None:
+        del state
+        token_indices = self._request_token_indices(record, req)
+        if token_indices is None:
+            return None
+        return UGSRTKVTokenBinding(
+            session_id=record.session_id,
+            request_id=req.rid,
+            token_count=int(token_indices.numel()),
+            token_indices=token_indices,
+        )
 
     def _run_until_request_complete(self, req: Any) -> None:
         self._require_scheduler_methods(
@@ -132,3 +154,37 @@ class UGSRTSchedulerExecutor:
             "UG synchronous scheduler execution requires an idle scheduler before "
             f"enqueuing request {req.rid}"
         )
+
+    def _request_token_indices(self, record: Any, req: Any) -> torch.Tensor | None:
+        tree_cache = getattr(self.scheduler, "tree_cache", None)
+        if tree_cache is None:
+            return None
+        req_to_token_pool = getattr(tree_cache, "req_to_token_pool", None)
+        req_to_token = getattr(req_to_token_pool, "req_to_token", None)
+        if req_to_token is None:
+            return None
+
+        pool_idx = getattr(req, "req_pool_idx", None)
+        token_count = int(getattr(req, "kv_committed_len", 0) or 0)
+        if pool_idx is None or token_count <= 0:
+            slot = self._streaming_session_slot(tree_cache, record.session_id)
+            if slot is None:
+                return None
+            pool_idx = getattr(slot, "req_pool_idx", None)
+            token_count = int(getattr(slot, "kv_committed_len", 0) or 0)
+        if pool_idx is None or token_count <= 0:
+            return None
+
+        token_indices = req_to_token[pool_idx, :token_count].to(dtype=torch.int64)
+        return token_indices.clone()
+
+    @staticmethod
+    def _streaming_session_slot(tree_cache: Any, session_id: str) -> Any | None:
+        slots = getattr(tree_cache, "slots", None)
+        if isinstance(slots, dict) and session_id in slots:
+            return slots[session_id]
+        streaming_session = getattr(tree_cache, "session", None)
+        slots = getattr(streaming_session, "slots", None)
+        if isinstance(slots, dict):
+            return slots.get(session_id)
+        return None

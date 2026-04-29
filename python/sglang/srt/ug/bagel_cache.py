@@ -9,6 +9,8 @@ from typing import Any, Protocol
 
 import torch
 
+from sglang.srt.ug.context import UGSRTKVTokenBinding
+
 
 class BAGELSRTKVCacheError(RuntimeError):
     """Raised when BAGEL KV cache cannot be mapped to SRT-owned storage."""
@@ -90,6 +92,11 @@ class BAGELSRTKVCacheFactory:
 
     def release_session(self, session_id: str) -> None:
         self.backing.release_session(session_id)
+
+    def bind_request_tokens(self, binding: UGSRTKVTokenBinding) -> None:
+        bind = getattr(self.backing, "bind_request_tokens", None)
+        if callable(bind):
+            bind(binding)
 
 
 class BAGELSRTKVCache:
@@ -214,6 +221,10 @@ class InMemoryBAGELSRTKVCacheBacking:
         self._records: dict[str, _InMemoryCacheRecord] = {}
         self._session_cache_ids: dict[str, list[str]] = defaultdict(list)
         self.released_sessions: list[str] = []
+        self.request_bindings: list[UGSRTKVTokenBinding] = []
+
+    def bind_request_tokens(self, binding: UGSRTKVTokenBinding) -> None:
+        self.request_bindings.append(binding)
 
     def create_cache(
         self, *, session_id: str, role: str, num_layers: int
@@ -319,6 +330,25 @@ class BAGELPagedKVCacheBacking:
         self._counter = itertools.count(1)
         self._records: dict[str, _PagedCacheRecord] = {}
         self._session_cache_ids: dict[str, list[str]] = defaultdict(list)
+        self._active_request_bindings: dict[str, UGSRTKVTokenBinding] = {}
+
+    def bind_request_tokens(self, binding: UGSRTKVTokenBinding) -> None:
+        token_indices = binding.token_indices
+        if not isinstance(token_indices, torch.Tensor):
+            token_indices = torch.as_tensor(token_indices, dtype=torch.long)
+            binding = UGSRTKVTokenBinding(
+                session_id=binding.session_id,
+                request_id=binding.request_id,
+                token_count=binding.token_count,
+                token_indices=token_indices,
+            )
+        if int(binding.token_count) != int(token_indices.numel()):
+            raise BAGELSRTKVCacheError(
+                "BAGEL SRT KV token binding token_count does not match "
+                f"token_indices length: {binding.token_count} vs "
+                f"{token_indices.numel()}"
+            )
+        self._active_request_bindings[binding.session_id] = binding
 
     def create_cache(
         self, *, session_id: str, role: str, num_layers: int
@@ -378,6 +408,22 @@ class BAGELPagedKVCacheBacking:
             self._free_entry(old_entry)
             return
 
+        buffer = self._buffer_for(kind=kind, layer_id=layer_id)
+        bound_indices = self._bound_request_indices(
+            handle,
+            tensor=tensor,
+            device=buffer.device,
+        )
+        if bound_indices is not None:
+            entries[layer_id] = _PagedLayerEntry(
+                active_indices=bound_indices,
+                allocated_indices=bound_indices,
+                owns_indices=False,
+            )
+            buffer[bound_indices] = tensor.to(device=buffer.device, dtype=buffer.dtype)
+            self._free_entry(old_entry)
+            return
+
         counterpart = self._counterpart_entry(record, kind=kind, layer_id=layer_id)
         if counterpart is not None and counterpart.active_indices.numel() == int(
             tensor.shape[0]
@@ -393,7 +439,6 @@ class BAGELPagedKVCacheBacking:
             allocated_indices = self._alloc_indices(int(tensor.shape[0]))
             active_indices = allocated_indices[: tensor.shape[0]]
             owns_indices = True
-        buffer = self._buffer_for(kind=kind, layer_id=layer_id)
         buffer[active_indices] = tensor.to(device=buffer.device, dtype=buffer.dtype)
         entries[layer_id] = _PagedLayerEntry(
             active_indices=active_indices,
@@ -411,6 +456,7 @@ class BAGELPagedKVCacheBacking:
             for entries in (record.key_layers, record.value_layers):
                 for entry in entries.values():
                     self._free_entry(entry)
+        self._active_request_bindings.pop(session_id, None)
 
     def _alloc_indices(self, num_tokens: int) -> torch.Tensor:
         padded_tokens = _ceil_to_page(max(num_tokens, 1), self.page_size)
@@ -424,6 +470,25 @@ class BAGELPagedKVCacheBacking:
     def _free_entry(self, entry: _PagedLayerEntry | None) -> None:
         if entry is not None and entry.owns_indices:
             self.allocator.free(entry.allocated_indices)
+
+    def _bound_request_indices(
+        self,
+        handle: BAGELSRTKVCacheHandle,
+        *,
+        tensor: torch.Tensor,
+        device: torch.device,
+    ) -> torch.Tensor | None:
+        binding = self._active_request_bindings.get(handle.session_id)
+        if binding is None:
+            return None
+        token_count = int(tensor.shape[0])
+        if token_count <= 0 or token_count > int(binding.token_count):
+            return None
+        token_indices = binding.token_indices[-token_count:].to(
+            device=device,
+            dtype=torch.int64,
+        )
+        return token_indices.clone()
 
     @staticmethod
     def _same_allocation(

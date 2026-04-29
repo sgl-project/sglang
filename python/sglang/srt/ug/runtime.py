@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
@@ -9,7 +10,11 @@ from typing import Any, Literal, Protocol
 
 import torch
 
-from sglang.srt.ug.context import UGSRTRequestView, UGSessionHandle
+from sglang.srt.ug.context import (
+    UGSRTKVTokenBinding,
+    UGSRTRequestView,
+    UGSessionHandle,
+)
 
 
 class _UGSimpleTokenizer:
@@ -656,9 +661,59 @@ class UGSessionRuntime:
                 max_new_tokens=req.sampling_params.max_new_tokens,
                 input_text=input_text,
                 mm_offsets=tuple(self._collect_mm_offsets(req.multimodal_inputs)),
+                metadata=self._srt_request_view_metadata(record, req, state=state),
             ),
             messages=messages,
         )
+
+    def _srt_request_view_metadata(
+        self,
+        record: UGSessionRecord,
+        req: Any,
+        *,
+        state: UGSegmentState,
+    ) -> dict[str, Any]:
+        token_binding = self._srt_kv_token_binding(record, req, state=state)
+        if token_binding is None:
+            return {}
+        return {"srt_kv_token_binding": token_binding}
+
+    def _srt_kv_token_binding(
+        self,
+        record: UGSessionRecord,
+        req: Any,
+        *,
+        state: UGSegmentState,
+    ) -> UGSRTKVTokenBinding | None:
+        provider = getattr(
+            self.srt_request_executor, "get_ug_request_token_binding", None
+        )
+        if not callable(provider):
+            return None
+
+        signature = inspect.signature(provider)
+        parameters = signature.parameters
+        accepts_kwargs = any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        kwargs = {
+            "record": record,
+            "state": state,
+        }
+        if "req" in parameters or accepts_kwargs:
+            kwargs["req"] = req
+        elif "request" in parameters:
+            kwargs["request"] = req
+        binding = provider(**kwargs)
+        if binding is None:
+            return None
+        if not isinstance(binding, UGSRTKVTokenBinding):
+            raise TypeError(
+                "UG SRT request token binding provider must return "
+                f"UGSRTKVTokenBinding, got {type(binding).__name__}"
+            )
+        return binding
 
     def _tokenize_interleaved_messages(
         self, messages: list[UGInterleavedMessage]

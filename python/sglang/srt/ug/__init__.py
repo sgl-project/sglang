@@ -30,6 +30,7 @@ from sglang.srt.ug.bagel_cache import (
 from sglang.srt.ug.context import (
     UGContextBundle,
     UGContextHandle,
+    UGSRTKVTokenBinding,
     UGSRTRequestView,
     UGSessionHandle,
 )
@@ -82,6 +83,7 @@ __all__ = [
     "UGModelPrefillResult",
     "UGModelRunnerAdapter",
     "UGModelSessionView",
+    "UGSRTKVTokenBinding",
     "UGSRTRequestView",
     "UGSegmentState",
     "UGSessionHandle",
