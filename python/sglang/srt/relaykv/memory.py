@@ -99,6 +99,8 @@ RELAYKV_SHADOW_LOG_HOST_BACKUP_KEYS = {
     "mapping_readiness_reason",
     "prefill_pending_tokens",
     "prefill_complete_for_request",
+    "host_backup_dry_copy_final_guard_ok",
+    "host_backup_dry_copy_final_guard_reason",
 }
 
 
@@ -166,6 +168,8 @@ class RelayKVPoolMappingObservation:
     mapping_readiness_reason: str
     prefill_pending_tokens: Optional[int]
     prefill_complete_for_request: Optional[bool]
+    host_backup_dry_copy_final_guard_ok: bool
+    host_backup_dry_copy_final_guard_reason: str
 
     def to_log_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -546,6 +550,8 @@ def observe_request_kv_pool_mapping(
             mapping_readiness_reason="req_to_token_pool_not_found",
             prefill_pending_tokens=None,
             prefill_complete_for_request=None,
+            host_backup_dry_copy_final_guard_ok=False,
+            host_backup_dry_copy_final_guard_reason="req_to_token_pool_not_found",
         )
     if request_pool_idx is None:
         return RelayKVPoolMappingObservation(
@@ -569,6 +575,8 @@ def observe_request_kv_pool_mapping(
             mapping_readiness_reason="request_pool_idx_missing",
             prefill_pending_tokens=None,
             prefill_complete_for_request=None,
+            host_backup_dry_copy_final_guard_ok=False,
+            host_backup_dry_copy_final_guard_reason="request_pool_idx_missing",
         )
     req_to_token = getattr(req_to_token_pool, "req_to_token", None)
     if req_to_token is None:
@@ -593,6 +601,8 @@ def observe_request_kv_pool_mapping(
             mapping_readiness_reason="req_to_token_tensor_not_found",
             prefill_pending_tokens=None,
             prefill_complete_for_request=None,
+            host_backup_dry_copy_final_guard_ok=False,
+            host_backup_dry_copy_final_guard_reason="req_to_token_tensor_not_found",
         )
 
     mapping_shape = _tensor_shape_list(req_to_token)
@@ -620,6 +630,8 @@ def observe_request_kv_pool_mapping(
             mapping_readiness_reason="req_to_token_tensor_rank_unsupported",
             prefill_pending_tokens=None,
             prefill_complete_for_request=None,
+            host_backup_dry_copy_final_guard_ok=False,
+            host_backup_dry_copy_final_guard_reason="req_to_token_tensor_rank_unsupported",
         )
     if request_pool_idx < 0 or request_pool_idx >= int(req_to_token.shape[0]):
         return RelayKVPoolMappingObservation(
@@ -643,6 +655,8 @@ def observe_request_kv_pool_mapping(
             mapping_readiness_reason="request_pool_idx_out_of_bounds",
             prefill_pending_tokens=None,
             prefill_complete_for_request=None,
+            host_backup_dry_copy_final_guard_ok=False,
+            host_backup_dry_copy_final_guard_reason="request_pool_idx_out_of_bounds",
         )
 
     total_seq_len = max(int(seq_len), 0)
@@ -730,6 +744,19 @@ def observe_request_kv_pool_mapping(
         mapping_ready_for_copy = False
         mapping_readiness_reason = "mapping_count_mismatch"
 
+    if prefill_complete is False:
+        final_guard_ok = False
+        final_guard_reason = "prefill_not_complete"
+    elif not cold_range_mapping_supported:
+        final_guard_ok = False
+        final_guard_reason = cold_range_mapping_reason
+    elif not mapping_ready_for_copy:
+        final_guard_ok = False
+        final_guard_reason = mapping_readiness_reason
+    else:
+        final_guard_ok = True
+        final_guard_reason = "ready_for_execution_metadata_only"
+
     return RelayKVPoolMappingObservation(
         kv_pool_mapping_observed=True,
         kv_pool_mapping_reason="ok",
@@ -751,6 +778,8 @@ def observe_request_kv_pool_mapping(
         mapping_readiness_reason=mapping_readiness_reason,
         prefill_pending_tokens=pending_tokens,
         prefill_complete_for_request=prefill_complete,
+        host_backup_dry_copy_final_guard_ok=final_guard_ok,
+        host_backup_dry_copy_final_guard_reason=final_guard_reason,
     )
 
 

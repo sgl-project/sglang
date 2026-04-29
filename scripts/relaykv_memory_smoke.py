@@ -167,6 +167,13 @@ def main() -> None:
         raise AssertionError(mapping_observation)
     if mapping_observation.prefill_complete_for_request is not True:
         raise AssertionError(mapping_observation)
+    if mapping_observation.host_backup_dry_copy_final_guard_ok is not True:
+        raise AssertionError(mapping_observation)
+    if (
+        mapping_observation.host_backup_dry_copy_final_guard_reason
+        != "ready_for_execution_metadata_only"
+    ):
+        raise AssertionError(mapping_observation)
     payload = plan.to_log_dict()
     payload.update(estimate_from_model.to_log_dict())
     payload.update({"host_backup_planned": True, **host_backup_estimate.to_log_dict()})
