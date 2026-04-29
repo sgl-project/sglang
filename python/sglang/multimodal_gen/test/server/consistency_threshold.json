@@ -145,12 +145,6 @@
             "psnr_threshold": 9.5,
             "mean_abs_diff_threshold": 46.0
         },
-        "zimage_image_t2i_multi_lora": {
-            "clip_threshold": 0.90,
-            "ssim_threshold": 0.52,
-            "psnr_threshold": 9.5,
-            "mean_abs_diff_threshold": 46.0
-        },
         "fsdp-inference": {
             "clip_threshold": 0.92,
             "ssim_threshold": 0.90,
