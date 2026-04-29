@@ -46,6 +46,26 @@ class TestServerArgsPathExpansion(unittest.TestCase):
         )
 
 
+class TestServerArgsCli(unittest.TestCase):
+    def test_transformer_fp8_cast_cli_arg_is_disabled_by_default(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args, _ = parser.parse_known_args(["--model-path", "/fake"])
+
+        self.assertFalse(args.transformer_fp8_cast)
+
+    def test_transformer_fp8_cast_cli_arg_can_be_enabled(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args, _ = parser.parse_known_args(
+            ["--model-path", "/fake", "--transformer-fp8-cast"]
+        )
+
+        self.assertTrue(args.transformer_fp8_cast)
+
+
 class TestModelIdResolution(unittest.TestCase):
     def setUp(self):
         _get_config_info.cache_clear()
@@ -209,6 +229,23 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
             server_args = ServerArgs.from_cli_args(args, unknown_args)
 
         self.assertEqual(server_args.pipeline_config.resolution, 768)
+
+    def test_disable_autocast_is_preserved_after_pipeline_config_resolution(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "Qwen/Qwen-Image-Layered",
+            "--disable-autocast",
+            "true",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertTrue(server_args.pipeline_config.disable_autocast)
+        self.assertTrue(server_args.disable_autocast)
 
 
 if __name__ == "__main__":
