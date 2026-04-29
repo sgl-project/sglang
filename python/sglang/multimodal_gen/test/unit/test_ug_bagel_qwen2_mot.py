@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -25,6 +26,10 @@ class TestBAGELQwen2MoTModel(unittest.TestCase):
                 "mot_q",
             ),
             ("language_model.model.layers.0.mlp_moe_gen.gate_proj.weight", "mot_mlp"),
+            ("time_embedder.mlp.0.weight", "time"),
+            ("vae2llm.weight", "vae2llm"),
+            ("llm2vae.weight", "llm2vae"),
+            ("latent_pos_embed.pos_embed", "latent_pos"),
             ("vit_model.vision_model.embeddings.patch_embedding.weight", "vit"),
             ("decoder.conv_in.weight", "vae"),
             ("connector.fc1.weight", "outer"),
@@ -39,6 +44,10 @@ class TestBAGELQwen2MoTModel(unittest.TestCase):
                 ("model.embed_tokens.weight", "embed"),
                 ("model.layers.0.self_attn.q_proj_moe_gen.weight", "mot_q"),
                 ("model.layers.0.mlp_moe_gen.gate_proj.weight", "mot_mlp"),
+                ("time_embedder.mlp.0.weight", "time"),
+                ("vae2llm.weight", "vae2llm"),
+                ("llm2vae.weight", "llm2vae"),
+                ("latent_pos_embed.pos_embed", "latent_pos"),
                 ("model.layers.0.self_attn.q_proj.weight", "plain_qwen"),
             ],
         )
@@ -226,6 +235,45 @@ class TestBAGELQwen2MoTModel(unittest.TestCase):
             )
         )
 
+    def test_predict_velocity_from_packed_gen_uses_native_gen_head(self):
+        model = object.__new__(BAGELQwen2MoTForCausalLM)
+        nn.Module.__init__(model)
+        model.config = SimpleNamespace(hidden_size=2)
+        model.model = _FakePackedGenModel()
+        model.vae2llm = _WeightedAddModule(1.0)
+        model.time_embedder = _FakeTimeEmbedder(2.0)
+        model.latent_pos_embed = _FakeLatentPositionEmbedding(3.0)
+        model.llm2vae = _AddModule(100.0)
+
+        velocity = model.predict_velocity_from_packed_gen(
+            latent_tokens=torch.zeros(2, 2),
+            timestep=torch.tensor([0.5]),
+            packed_vae_token_indexes=torch.tensor([1, 2]),
+            packed_vae_position_ids=torch.tensor([4, 5]),
+            packed_text_ids=torch.tensor([7, 8]),
+            packed_text_indexes=torch.tensor([0, 3]),
+            packed_position_ids=torch.tensor([9, 9, 9, 9]),
+            packed_seqlens=torch.tensor([4]),
+            forward_batch=object(),
+        )
+
+        self.assertTrue(torch.equal(velocity, torch.full((2, 2), 116.0)))
+        self.assertTrue(
+            torch.equal(
+                model.model.input_embeds,
+                torch.tensor(
+                    [
+                        [7.0, 7.0],
+                        [6.0, 6.0],
+                        [6.0, 6.0],
+                        [8.0, 8.0],
+                    ]
+                ),
+            )
+        )
+        self.assertTrue(torch.equal(model.model.text_indices, torch.tensor([0, 3])))
+        self.assertTrue(torch.equal(model.model.vae_indices, torch.tensor([1, 2])))
+
 
 class _AddModule(nn.Module):
     def __init__(self, value: float):
@@ -240,6 +288,59 @@ class _AddModule(nn.Module):
 class _TupleAddModule(_AddModule):
     def forward(self, x):
         return x + self.value, None
+
+
+class _WeightedAddModule(_AddModule):
+    def __init__(self, value: float):
+        super().__init__(value)
+        self.weight = nn.Parameter(torch.zeros(1))
+
+
+class _FakeTimeEmbedder(nn.Module):
+    def __init__(self, value: float):
+        super().__init__()
+        self.value = value
+
+    def forward(self, timestep):
+        return torch.full((timestep.shape[0], 2), self.value)
+
+
+class _FakeLatentPositionEmbedding(nn.Module):
+    def __init__(self, value: float):
+        super().__init__()
+        self.value = value
+
+    def forward(self, position_ids):
+        return torch.full((position_ids.shape[0], 2), self.value)
+
+
+class _FakePackedGenModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed_tokens = _FakeTextEmbedding()
+        self.input_embeds = None
+        self.text_indices = None
+        self.vae_indices = None
+
+    def forward_gen_embeds(
+        self,
+        *,
+        input_embeds,
+        positions,
+        forward_batch,
+        text_token_indices,
+        vae_token_indices,
+    ):
+        del positions, forward_batch
+        self.input_embeds = input_embeds
+        self.text_indices = text_token_indices
+        self.vae_indices = vae_token_indices
+        return input_embeds + 10.0
+
+
+class _FakeTextEmbedding(nn.Module):
+    def forward(self, input_ids):
+        return input_ids.to(torch.float32).unsqueeze(1).expand(-1, 2)
 
 
 class _FakeQKVProjector(nn.Module):

@@ -115,6 +115,105 @@ class BAGELPreparedDenoise:
         self.cfg_type = cfg_type
 
 
+@dataclass
+class BAGELNativeSRTPreparedDenoise:
+    """Denoise inputs whose U context is owned by SRT KV cache."""
+
+    generation_input: dict[str, Any]
+    cfg_text_scale: float = 1.0
+    cfg_img_scale: float = 1.0
+    cfg_interval: tuple[float, float] = (0.0, 1.0)
+    cfg_renorm_min: float = 0.0
+    cfg_renorm_type: str = "global"
+    cfg_type: str = "parallel"
+
+
+class BAGELNativeSRTDenoiseExecutor:
+    """Calls SRT-native BAGEL gen forward instead of official `_forward_flow`."""
+
+    def __init__(
+        self,
+        srt_model: Any,
+        *,
+        forward_batch_provider: Any | None = None,
+    ) -> None:
+        self.srt_model = srt_model
+        self.forward_batch_provider = forward_batch_provider
+        self.velocity_count = 0
+
+    def predict_velocity(
+        self,
+        *,
+        prepared: BAGELNativeSRTPreparedDenoise,
+        latent_tokens: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        self._validate_prepared(prepared)
+        self._validate_cfg(prepared, timestep)
+        generation_input = prepared.generation_input
+        forward_batch = self._build_forward_batch(
+            prepared=prepared,
+            latent_tokens=latent_tokens,
+            timestep=timestep,
+        )
+        predictor = getattr(self.srt_model, "predict_velocity_from_packed_gen", None)
+        if not callable(predictor):
+            raise BAGELAdapterError(
+                "Native SRT BAGEL denoise requires "
+                "predict_velocity_from_packed_gen on the SRT model"
+            )
+        self.velocity_count += 1
+        return predictor(
+            latent_tokens=latent_tokens,
+            timestep=timestep,
+            packed_vae_token_indexes=generation_input["packed_vae_token_indexes"],
+            packed_vae_position_ids=generation_input["packed_vae_position_ids"],
+            packed_text_ids=generation_input["packed_text_ids"],
+            packed_text_indexes=generation_input["packed_text_indexes"],
+            packed_position_ids=generation_input["packed_position_ids"],
+            packed_seqlens=generation_input["packed_seqlens"],
+            forward_batch=forward_batch,
+        )
+
+    def _build_forward_batch(
+        self,
+        *,
+        prepared: BAGELNativeSRTPreparedDenoise,
+        latent_tokens: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> Any:
+        if self.forward_batch_provider is None:
+            return None
+        return self.forward_batch_provider(
+            prepared=prepared,
+            latent_tokens=latent_tokens,
+            timestep=timestep,
+        )
+
+    @staticmethod
+    def _validate_prepared(prepared: BAGELNativeSRTPreparedDenoise) -> None:
+        _require_keys(
+            prepared.generation_input,
+            _BAGEL_GENERATION_INPUT_KEYS,
+            "native_srt_generation_input",
+        )
+
+    @staticmethod
+    def _validate_cfg(
+        prepared: BAGELNativeSRTPreparedDenoise,
+        timestep: torch.Tensor,
+    ) -> None:
+        cfg_text_scale, cfg_img_scale = BAGELDenoiseStepRunner._effective_cfg_scales(
+            prepared,
+            timestep,
+        )
+        if cfg_text_scale > 1.0 or cfg_img_scale > 1.0:
+            raise BAGELDenoiseStepError(
+                "Native SRT BAGEL denoise currently supports cfg_text_scale <= 1 "
+                "and cfg_img_scale <= 1 only"
+            )
+
+
 class BAGELDenoiseStepRunner:
     """Runs the single `_forward_flow` step extracted from BAGEL.generate_image."""
 
@@ -370,12 +469,14 @@ class BAGELInterleaveContextBackend:
         step_runner: BAGELDenoiseStepRunner | None = None,
         u_forward_bridge: BAGELUForwardBridge | None = None,
         srt_kv_cache_factory: BAGELSRTKVCacheFactory | None = None,
+        native_srt_denoise_executor: BAGELNativeSRTDenoiseExecutor | None = None,
         default_image_shape: tuple[int, int] = (1024, 1024),
     ) -> None:
         self.inferencer = inferencer
         self.step_runner = step_runner or BAGELDenoiseStepRunner()
         self.u_forward_bridge = u_forward_bridge or BAGELUForwardBridge()
         self.srt_kv_cache_factory = srt_kv_cache_factory
+        self.native_srt_denoise_executor = native_srt_denoise_executor
         self.default_image_shape = default_image_shape
         self.sessions: dict[str, BAGELSessionContext] = {}
 
@@ -484,12 +585,24 @@ class BAGELInterleaveContextBackend:
             enabled=latent_tokens.is_cuda,
             dtype=torch.bfloat16,
         ):
-            velocity = self.step_runner.predict_velocity(
-                model=self.inferencer.model,
-                prepared=state.prepared_denoise,
-                latent_tokens=latent_tokens,
-                timestep=timestep,
-            )
+            if isinstance(state.prepared_denoise, BAGELNativeSRTPreparedDenoise):
+                if self.native_srt_denoise_executor is None:
+                    raise BAGELAdapterError(
+                        "BAGEL native SRT U context requires a native SRT denoise "
+                        "executor"
+                    )
+                velocity = self.native_srt_denoise_executor.predict_velocity(
+                    prepared=state.prepared_denoise,
+                    latent_tokens=latent_tokens,
+                    timestep=timestep,
+                )
+            else:
+                velocity = self.step_runner.predict_velocity(
+                    model=self.inferencer.model,
+                    prepared=state.prepared_denoise,
+                    latent_tokens=latent_tokens,
+                    timestep=timestep,
+                )
         return velocity.to(request.latent_tokens.device)
 
     def prepare_latents_from_session(
@@ -669,11 +782,12 @@ class BAGELInterleaveContextBackend:
         sampling_params: Any | None,
         *,
         seed: int | None = None,
-    ) -> BAGELPreparedDenoise:
+    ) -> BAGELPreparedDenoise | BAGELNativeSRTPreparedDenoise:
         if state.native_srt_u_context:
-            raise BAGELAdapterError(
-                "BAGEL native SRT U context cannot prepare G denoise yet; "
-                "native BAGEL mode='gen' still needs an SRT ForwardBatch bridge"
+            return self._prepare_native_srt_denoise(
+                state,
+                sampling_params,
+                seed=seed,
             )
         image_shape = self._image_shape_from_params(sampling_params, state.image_shape)
         model = self.inferencer.model
@@ -707,6 +821,50 @@ class BAGELInterleaveContextBackend:
             cfg_renorm_min=float(getattr(sampling_params, "cfg_renorm_min", 0.0)),
             cfg_renorm_type=getattr(sampling_params, "cfg_renorm_type", "global"),
         )
+
+    def _prepare_native_srt_denoise(
+        self,
+        state: BAGELSessionContext,
+        sampling_params: Any | None,
+        *,
+        seed: int | None = None,
+    ) -> BAGELNativeSRTPreparedDenoise:
+        if self.native_srt_denoise_executor is None:
+            raise BAGELAdapterError(
+                "BAGEL native SRT U context requires a native SRT denoise executor"
+            )
+        image_shape = self._image_shape_from_params(sampling_params, state.image_shape)
+        curr_kvlens, curr_rope = self._native_srt_context_lengths(state)
+        model = self.inferencer.model
+        with _bagel_seed_context(seed):
+            generation_input = model.prepare_vae_latent(
+                curr_kvlens=curr_kvlens,
+                curr_rope=curr_rope,
+                image_sizes=[image_shape],
+                new_token_ids=self.inferencer.new_token_ids,
+            )
+        return BAGELNativeSRTPreparedDenoise(
+            generation_input=generation_input,
+            cfg_text_scale=float(getattr(sampling_params, "cfg_text_scale", 1.0)),
+            cfg_img_scale=float(getattr(sampling_params, "cfg_img_scale", 1.0)),
+            cfg_interval=tuple(getattr(sampling_params, "cfg_interval", (0.0, 1.0))),
+            cfg_renorm_min=float(getattr(sampling_params, "cfg_renorm_min", 0.0)),
+            cfg_renorm_type=getattr(sampling_params, "cfg_renorm_type", "global"),
+        )
+
+    @staticmethod
+    def _native_srt_context_lengths(
+        state: BAGELSessionContext,
+    ) -> tuple[list[int], list[int]]:
+        binding = state.native_srt_u_context_token_binding
+        if binding is None:
+            raise BAGELAdapterError(
+                "BAGEL native SRT U context is missing SRT token binding"
+            )
+        token_count = int(binding.token_count)
+        if token_count <= 0:
+            raise BAGELAdapterError("BAGEL native SRT U context token binding is empty")
+        return [token_count], [token_count]
 
     def _prepare_image(self, image: Any | None) -> Any | None:
         if image is None:

@@ -17,6 +17,7 @@ from sglang.srt.ug.bagel import (
     BAGELDenoiseStepError,
     BAGELDenoiseStepRunner,
     BAGELInterleaveContextBackend,
+    BAGELNativeSRTDenoiseExecutor,
     BAGELNativeSRTUForwardExecutor,
     BAGELPreparedDenoise,
     BAGELSRTUForwardExecutor,
@@ -198,6 +199,15 @@ class FakeContextBAGELModel(FakeOfficialBAGELModel):
         payload = dict(_fake_bagel_prepared().cfg_text_generation_input)
         payload["cfg_key_values_lens"] = torch.tensor(curr_kvlens, dtype=torch.int)
         return payload
+
+
+class FakeNativeSRTVelocityModel:
+    def __init__(self):
+        self.calls = []
+
+    def predict_velocity_from_packed_gen(self, **kwargs):
+        self.calls.append(kwargs)
+        return kwargs["latent_tokens"] + 9.0
 
 
 class FakeImage:
@@ -1064,6 +1074,93 @@ class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
         counters = runtime.get_debug_counters(handle)
         self.assertEqual(counters["prefill_count"], 1)
         self.assertEqual(counters["state"], "g_denoise")
+
+    def test_native_srt_u_context_uses_native_denoise_executor(self):
+        inferencer = FakeBAGELInferencer()
+        native_model = FakeNativeSRTVelocityModel()
+        backend = BAGELInterleaveContextBackend(
+            inferencer,
+            u_forward_bridge=BAGELUForwardBridge(
+                srt_u_forward_executor=BAGELNativeSRTUForwardExecutor()
+            ),
+            native_srt_denoise_executor=BAGELNativeSRTDenoiseExecutor(
+                native_model,
+                forward_batch_provider=lambda **kwargs: SimpleNamespace(
+                    source="native-srt", kwargs=kwargs
+                ),
+            ),
+            default_image_shape=(32, 32),
+        )
+        adapter = BAGELUGModelAdapter("already-loaded-bagel", backend=backend)
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=BindingSRTExecutor(start_index=9),
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a quiet river")],
+            session_id="bagel-native-srt-g-denoise",
+        )
+        runtime.decode_next_segment(handle)
+        sampling_params = SimpleNamespace(
+            height=32,
+            width=32,
+            cfg_text_scale=1.0,
+            cfg_img_scale=1.0,
+            cfg_interval=(0.0, 1.0),
+            cfg_renorm_min=0.0,
+            cfg_renorm_type="global",
+        )
+        prepared_latents = runtime.prepare_latents(
+            UGLatentPrepareRequest(
+                session=handle,
+                sampling_params=sampling_params,
+                seed=123,
+            )
+        )
+        response = runtime.predict_velocity(
+            UGVelocityRequest(
+                session=handle,
+                latent_tokens=prepared_latents.latent_tokens,
+                timestep=torch.tensor([0.5]),
+                latent_position_ids=prepared_latents.latent_position_ids,
+                sampling_params=sampling_params,
+            )
+        )
+
+        self.assertTrue(
+            torch.equal(response.velocity, prepared_latents.latent_tokens + 9.0)
+        )
+        self.assertEqual(inferencer.model.forward_flow_calls, [])
+        self.assertEqual(len(native_model.calls), 1)
+        native_call = native_model.calls[0]
+        self.assertTrue(
+            torch.equal(
+                native_call["packed_vae_token_indexes"],
+                torch.tensor([1, 2]),
+            )
+        )
+        self.assertTrue(
+            torch.equal(native_call["packed_text_indexes"], torch.tensor([0, 3]))
+        )
+        self.assertTrue(
+            torch.equal(
+                native_call["packed_seqlens"],
+                torch.tensor([4], dtype=torch.int32),
+            )
+        )
+        self.assertEqual(
+            inferencer.model.prepare_vae_latent_calls[0]["curr_kvlens"],
+            [5],
+        )
+        self.assertEqual(
+            inferencer.model.prepare_vae_latent_calls[0]["curr_rope"],
+            [5],
+        )
+        counters = runtime.get_debug_counters(response.session)
+        self.assertEqual(counters["prefill_count"], 1)
+        self.assertEqual(counters["velocity_count"], 1)
 
 
 class TestBAGELInterleaveContextBackend(unittest.TestCase):

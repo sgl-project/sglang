@@ -11,6 +11,7 @@ without exposing KV cache internals.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
@@ -483,6 +484,15 @@ class BAGELQwen2MoTForCausalLM(Qwen2ForCausalLM):
             quant_config=quant_config,
             prefix=add_prefix("model", prefix),
         )
+        patch_latent_dim = int(getattr(config, "bagel_patch_latent_dim", 64))
+        max_latent_tokens = int(getattr(config, "bagel_max_latent_tokens", 4096))
+        self.time_embedder = BAGELTimestepEmbedder(config.hidden_size)
+        self.vae2llm = nn.Linear(patch_latent_dim, config.hidden_size)
+        self.llm2vae = nn.Linear(config.hidden_size, patch_latent_dim)
+        self.latent_pos_embed = BAGELLatentPositionEmbedding(
+            max_latent_tokens,
+            config.hidden_size,
+        )
 
         if self.pp_group.is_last_rank:
             if self.pp_group.world_size == 1 and config.tie_word_embeddings:
@@ -520,6 +530,108 @@ class BAGELQwen2MoTForCausalLM(Qwen2ForCausalLM):
             text_token_indices=text_token_indices,
             vae_token_indices=vae_token_indices,
         )
+
+    def predict_velocity_from_packed_gen(
+        self,
+        *,
+        latent_tokens: torch.Tensor,
+        timestep: torch.Tensor,
+        packed_vae_token_indexes: torch.Tensor,
+        packed_vae_position_ids: torch.Tensor,
+        packed_text_ids: torch.Tensor,
+        packed_text_indexes: torch.Tensor,
+        packed_position_ids: torch.Tensor,
+        packed_seqlens: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        device = self.vae2llm.weight.device
+        latent_tokens = latent_tokens.to(device=device)
+        packed_text_ids = packed_text_ids.to(device=device, dtype=torch.long)
+        packed_text_indexes = packed_text_indexes.to(device=device, dtype=torch.long)
+        packed_vae_token_indexes = packed_vae_token_indexes.to(
+            device=device,
+            dtype=torch.long,
+        )
+        packed_vae_position_ids = packed_vae_position_ids.to(
+            device=device,
+            dtype=torch.long,
+        )
+        packed_position_ids = packed_position_ids.to(device=device, dtype=torch.long)
+
+        sequence_length = int(packed_seqlens.sum().item())
+        text_embeds = self.model.embed_tokens(packed_text_ids)
+        packed_sequence = text_embeds.new_zeros(
+            sequence_length, self.config.hidden_size
+        )
+        packed_sequence[packed_text_indexes] = text_embeds
+        packed_sequence[packed_vae_token_indexes] = self._embed_bagel_latents(
+            latent_tokens=latent_tokens,
+            timestep=timestep,
+            latent_position_ids=packed_vae_position_ids,
+        )
+
+        hidden_states = self.model.forward_gen_embeds(
+            input_embeds=packed_sequence,
+            positions=packed_position_ids,
+            forward_batch=forward_batch,
+            text_token_indices=packed_text_indexes,
+            vae_token_indices=packed_vae_token_indexes,
+        )
+        return self.llm2vae(hidden_states.index_select(0, packed_vae_token_indexes))
+
+    def _embed_bagel_latents(
+        self,
+        *,
+        latent_tokens: torch.Tensor,
+        timestep: torch.Tensor,
+        latent_position_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        latent_tokens = latent_tokens.to(
+            device=self.vae2llm.weight.device,
+            dtype=self.vae2llm.weight.dtype,
+        )
+        timestep = _expand_bagel_timestep(timestep, latent_tokens).to(
+            device=latent_tokens.device
+        )
+        latent_position_ids = latent_position_ids.to(
+            device=latent_tokens.device,
+            dtype=torch.long,
+        )
+        return (
+            self.vae2llm(latent_tokens)
+            + self.time_embedder(timestep)
+            + self.latent_pos_embed(latent_position_ids)
+        )
+
+
+class BAGELTimestepEmbedder(nn.Module):
+    def __init__(self, hidden_size: int, frequency_embedding_size: int = 256) -> None:
+        super().__init__()
+        self.frequency_embedding_size = frequency_embedding_size
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+
+    def forward(self, timestep: torch.Tensor) -> torch.Tensor:
+        embedding = _bagel_timestep_embedding(
+            timestep,
+            self.frequency_embedding_size,
+        )
+        return self.mlp(embedding.to(dtype=self.mlp[0].weight.dtype))
+
+
+class BAGELLatentPositionEmbedding(nn.Module):
+    def __init__(self, max_latent_tokens: int, hidden_size: int) -> None:
+        super().__init__()
+        self.pos_embed = nn.Parameter(
+            torch.zeros(max_latent_tokens, hidden_size),
+            requires_grad=False,
+        )
+
+    def forward(self, position_ids: torch.Tensor) -> torch.Tensor:
+        return self.pos_embed[position_ids]
 
 
 def _apply_indexed_norm_with_residual(
@@ -568,10 +680,49 @@ def _apply_indexed_module(
     output[token_indices] = branch_output
 
 
+def _expand_bagel_timestep(
+    timestep: torch.Tensor,
+    latent_tokens: torch.Tensor,
+) -> torch.Tensor:
+    timestep = timestep.to(device=latent_tokens.device)
+    if timestep.numel() == 1:
+        return timestep.reshape(1).expand(latent_tokens.shape[0])
+    if timestep.shape[0] != latent_tokens.shape[0]:
+        raise ValueError(
+            "BAGEL timestep must be scalar or match latent token count: "
+            f"{tuple(timestep.shape)} vs {tuple(latent_tokens.shape)}"
+        )
+    return timestep
+
+
+def _bagel_timestep_embedding(
+    timestep: torch.Tensor,
+    embedding_size: int,
+    *,
+    max_period: int = 10000,
+) -> torch.Tensor:
+    half = embedding_size // 2
+    freqs = torch.exp(
+        -math.log(max_period)
+        * torch.arange(0, half, dtype=torch.float32, device=timestep.device)
+        / half
+    )
+    args = timestep[:, None].float() * freqs[None]
+    embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if embedding_size % 2:
+        embedding = torch.cat(
+            [embedding, torch.zeros_like(embedding[:, :1])],
+            dim=-1,
+        )
+    return embedding
+
+
 def _iter_bagel_language_model_weights(weights: Iterable[Tuple[str, torch.Tensor]]):
     for name, loaded_weight in weights:
         if name.startswith("language_model."):
             yield name[len("language_model.") :], loaded_weight
+        elif _is_bagel_visual_gen_key(name):
+            yield name, loaded_weight
         elif _is_qwen2_language_model_key(name):
             yield name, loaded_weight
 
@@ -581,6 +732,17 @@ def _is_qwen2_language_model_key(name: str) -> bool:
         (
             "model.",
             "lm_head.",
+        )
+    )
+
+
+def _is_bagel_visual_gen_key(name: str) -> bool:
+    return name.startswith(
+        (
+            "time_embedder.",
+            "vae2llm.",
+            "llm2vae.",
+            "latent_pos_embed.",
         )
     )
 

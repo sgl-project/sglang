@@ -131,11 +131,16 @@ class TestBAGELQwen2MoTNativeLive(CustomTestCase):
         language_keys = list(
             _iter_bagel_language_model_weights((key, None) for key in keys)
         )
-        self.assertEqual(
+        language_key_names = {name for name, _ in language_keys}
+        self.assertGreaterEqual(
             len(language_keys),
             summary.counts["qwen2_shared"] + summary.counts["mot_gen_branch"],
         )
         self.assertGreater(summary.counts["mot_gen_branch"], 0)
+        self.assertIn("vae2llm.weight", language_key_names)
+        self.assertIn("llm2vae.weight", language_key_names)
+        self.assertIn("time_embedder.mlp.0.weight", language_key_names)
+        self.assertIn("latent_pos_embed.pos_embed", language_key_names)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             model_path = _write_language_model_view(checkpoint_dir, Path(tmpdir))
