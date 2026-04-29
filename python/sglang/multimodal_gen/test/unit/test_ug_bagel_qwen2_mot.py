@@ -7,6 +7,7 @@ from torch import nn
 
 from sglang.srt.models.bagel_qwen2_mot import (
     BAGELMoTTokenRouting,
+    BAGELQwen2MoTAttention,
     BAGELQwen2MoTDecoderLayer,
     BAGELQwen2MoTForCausalLM,
     _iter_bagel_language_model_weights,
@@ -135,14 +136,134 @@ class TestBAGELQwen2MoTModel(unittest.TestCase):
             )
         )
 
+    def test_attention_gen_routes_text_and_vae_qkv_and_output_branches(self):
+        attention = object.__new__(BAGELQwen2MoTAttention)
+        nn.Module.__init__(attention)
+        attention.head_dim = 2
+        attention.q_size = 2
+        attention.kv_size = 2
+        attention.alt_stream = None
+        attention.qkv_proj = _FakeQKVProjector(q_value=10.0, k_value=20.0, v_value=30.0)
+        attention.qkv_proj_moe_gen = _FakeQKVProjector(
+            q_value=100.0,
+            k_value=200.0,
+            v_value=300.0,
+        )
+        attention.q_norm = _AddModule(1.0)
+        attention.k_norm = _AddModule(2.0)
+        attention.q_norm_moe_gen = _AddModule(3.0)
+        attention.k_norm_moe_gen = _AddModule(4.0)
+        attention.rotary_emb = _FakeRotary()
+        attention.attn = _FakeRadixAttention()
+        attention.o_proj = _TupleAddModule(10000.0)
+        attention.o_proj_moe_gen = _TupleAddModule(20000.0)
+
+        output = attention.forward_gen(
+            positions=torch.arange(4),
+            hidden_states=torch.zeros(4, 2),
+            forward_batch=object(),
+            routing=BAGELMoTTokenRouting(
+                text_token_indices=torch.tensor([0, 2]),
+                vae_token_indices=torch.tensor([1, 3]),
+            ),
+        )
+
+        self.assertTrue(
+            torch.equal(
+                attention.attn.q,
+                torch.tensor(
+                    [
+                        [1011.0, 1011.0],
+                        [1103.0, 1103.0],
+                        [1011.0, 1011.0],
+                        [1103.0, 1103.0],
+                    ]
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                attention.attn.k,
+                torch.tensor(
+                    [
+                        [2022.0, 2022.0],
+                        [2204.0, 2204.0],
+                        [2022.0, 2022.0],
+                        [2204.0, 2204.0],
+                    ]
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                attention.attn.v,
+                torch.tensor(
+                    [
+                        [30.0, 30.0],
+                        [300.0, 300.0],
+                        [30.0, 30.0],
+                        [300.0, 300.0],
+                    ]
+                ),
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                output,
+                torch.tensor(
+                    [
+                        [10030.0, 10030.0],
+                        [20300.0, 20300.0],
+                        [10030.0, 10030.0],
+                        [20300.0, 20300.0],
+                    ]
+                ),
+            )
+        )
+
 
 class _AddModule(nn.Module):
     def __init__(self, value: float):
         super().__init__()
         self.value = value
+        self.variance_epsilon = 1e-6
 
     def forward(self, x):
         return x + self.value
+
+
+class _TupleAddModule(_AddModule):
+    def forward(self, x):
+        return x + self.value, None
+
+
+class _FakeQKVProjector(nn.Module):
+    def __init__(self, *, q_value: float, k_value: float, v_value: float):
+        super().__init__()
+        self.values = (q_value, k_value, v_value)
+
+    def forward(self, x):
+        parts = [torch.full_like(x, value) for value in self.values]
+        return torch.cat(parts, dim=-1), None
+
+
+class _FakeRotary(nn.Module):
+    def forward(self, positions, q, k):
+        return q + 1000.0, k + 2000.0
+
+
+class _FakeRadixAttention(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.q = None
+        self.k = None
+        self.v = None
+
+    def forward(self, q, k, v, forward_batch):
+        self.q = q
+        self.k = k
+        self.v = v
+        return v
 
 
 class _FakeGenAttention(nn.Module):
