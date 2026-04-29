@@ -15,8 +15,8 @@ on:
         required: false
         type: string
         default: ''
-      custom_image:
-        description: 'Use a custom AMD CI Docker image for all test jobs (optional)'
+      custom_image_suffix:
+        description: 'Use AMD CI Docker images with this tag suffix, e.g. 20260429-preview (optional)'
         required: false
         type: string
         default: ''
@@ -84,8 +84,8 @@ on:
         required: false
         type: string
         default: ''
-      custom_image:
-        description: 'Use a custom AMD CI Docker image for all test jobs (optional)'
+      custom_image_suffix:
+        description: 'Use AMD CI Docker images with this tag suffix, e.g. 20260429-preview (optional)'
         required: false
         type: string
         default: ''
@@ -102,14 +102,15 @@ on:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
-  AMD_CI_CUSTOM_IMAGE: ${{ inputs.custom_image || '' }}
+  AMD_CI_CUSTOM_IMAGE_SUFFIX: ${{ inputs.custom_image_suffix || '' }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
 concurrency:
-  # Workflow_call runs get a unique group per caller run. Direct triggers include
-  # the event name so manual dispatches on main do not cancel scheduled runs.
-  group: nightly-test-amd-rocm720-${{ inputs.ref && format('caller-{0}', github.run_id) || format('{0}-{1}', github.event_name, github.ref) }}
+  # When called via workflow_call with ref set, use a unique group per caller run to avoid
+  # collisions with direct schedule/push triggers. We use inputs.ref (not github.event_name)
+  # to detect this, because github.event_name inherits from the caller in workflow_call.
+  group: nightly-test-amd-rocm720-${{ inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
   cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' }}
 
 jobs:

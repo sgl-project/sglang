@@ -54,8 +54,8 @@ on:
         required: false
         type: string
         default: ''
-      custom_image:
-        description: 'Use a custom AMD CI Docker image for all test jobs (optional)'
+      custom_image_suffix:
+        description: 'Use AMD CI Docker images with this tag suffix, e.g. 20260429 (optional)'
         required: false
         type: string
         default: ''
@@ -89,8 +89,8 @@ on:
         required: false
         type: string
         default: ''
-      custom_image:
-        description: 'Use a custom AMD CI Docker image for all test jobs (optional)'
+      custom_image_suffix:
+        description: 'Use AMD CI Docker images with this tag suffix, e.g. 20260429 (optional)'
         required: false
         type: string
         default: ''
@@ -102,7 +102,7 @@ on:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
-  AMD_CI_CUSTOM_IMAGE: ${{ inputs.custom_image || '' }}
+  AMD_CI_CUSTOM_IMAGE_SUFFIX: ${{ inputs.custom_image_suffix || '' }}
   DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
   DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 

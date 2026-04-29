@@ -28,7 +28,7 @@ LOCAL_DOCKER_REGISTRY="10.245.143.50:5000"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
-CUSTOM_IMAGE="${AMD_CI_CUSTOM_IMAGE:-}"
+CUSTOM_IMAGE_SUFFIX="${AMD_CI_CUSTOM_IMAGE_SUFFIX:-}"
 BUILD_FROM_DOCKERFILE=""
 GPU_ARCH_BUILD=""
 
@@ -36,7 +36,7 @@ while [[ $# -gt 0 ]]; do
   case $1 in
     --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
-    --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
+    --custom-image-suffix) CUSTOM_IMAGE_SUFFIX="$2"; shift 2;;
     --build-from-dockerfile) BUILD_FROM_DOCKERFILE="1"; shift;;
     --gpu-arch) GPU_ARCH_BUILD="$2"; shift 2;;
     --rocm-version)
@@ -50,8 +50,8 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --mi30x-base-tag TAG       Override MI30x base image tag"
       echo "  --mi35x-base-tag TAG       Override MI35x base image tag"
-      echo "  --custom-image IMAGE       Use a specific Docker image directly"
-      echo "                              Can also be set with AMD_CI_CUSTOM_IMAGE"
+      echo "  --custom-image-suffix SFX  Use arch-specific image tags with this suffix"
+      echo "                              Can also be set with AMD_CI_CUSTOM_IMAGE_SUFFIX"
       echo "  --build-from-dockerfile    Build image from docker/rocm.Dockerfile"
       echo "  --gpu-arch ARCH            GPU architecture for Dockerfile build (e.g., gfx950-rocm720)"
       echo "  --rocm-version VERSION     Override ROCm version for image lookup (e.g., rocm720)"
@@ -219,14 +219,30 @@ find_latest_image() {
   esac
 }
 
+image_from_suffix() {
+  local gpu_arch=$1
+  local suffix=${2#-}
+  local base_tag
+
+  case "${gpu_arch}" in
+      mi30x) base_tag="${MI30X_BASE_TAG}" ;;
+      mi35x) base_tag="${MI35X_BASE_TAG}" ;;
+      *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
+  esac
+
+  echo "rocm/sgl-dev:${base_tag}-${suffix}"
+}
+
 # Determine which image to use
-if [[ -n "${CUSTOM_IMAGE}" ]]; then
-  # Use explicitly provided custom image
-  IMAGE="${CUSTOM_IMAGE}"
-  echo "Using custom image: ${IMAGE}"
-  if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
-    docker pull "${IMAGE}"
+if [[ -n "${CUSTOM_IMAGE_SUFFIX}" ]]; then
+  IMAGE=$(image_from_suffix "${GPU_ARCH}" "${CUSTOM_IMAGE_SUFFIX}")
+  echo "Using custom image suffix '${CUSTOM_IMAGE_SUFFIX}' for ${GPU_ARCH}: ${IMAGE}"
+  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
   else
+    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
     retry_with_backoff 6 docker pull "${IMAGE}"
   fi
 elif [[ -n "${BUILD_FROM_DOCKERFILE}" ]]; then

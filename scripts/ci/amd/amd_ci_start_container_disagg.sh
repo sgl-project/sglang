@@ -28,13 +28,13 @@ LOCAL_DOCKER_REGISTRY="10.245.143.50:5000"
 # Parse command line arguments
 MI30X_BASE_TAG="${DEFAULT_MI30X_BASE_TAG}"
 MI35X_BASE_TAG="${DEFAULT_MI35X_BASE_TAG}"
-CUSTOM_IMAGE="${AMD_CI_CUSTOM_IMAGE:-}"
+CUSTOM_IMAGE_SUFFIX="${AMD_CI_CUSTOM_IMAGE_SUFFIX:-}"
 
 while [[ $# -gt 0 ]]; do
   case $1 in
     --mi30x-base-tag) MI30X_BASE_TAG="$2"; shift 2;;
     --mi35x-base-tag) MI35X_BASE_TAG="$2"; shift 2;;
-    --custom-image) CUSTOM_IMAGE="$2"; shift 2;;
+    --custom-image-suffix) CUSTOM_IMAGE_SUFFIX="$2"; shift 2;;
     --rocm-version)
       ROCM_VERSION="$2"
       MI30X_BASE_TAG="${SGLANG_VERSION}-${ROCM_VERSION}-mi30x"
@@ -42,9 +42,9 @@ while [[ $# -gt 0 ]]; do
       echo "Using ROCm version override: ${ROCM_VERSION}"
       shift 2;;
     -h|--help)
-      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--custom-image IMAGE] [--rocm-version VERSION]"
-      echo "  --custom-image IMAGE       Use a specific Docker image directly"
-      echo "                              Can also be set with AMD_CI_CUSTOM_IMAGE"
+      echo "Usage: $0 [--mi30x-base-tag TAG] [--mi35x-base-tag TAG] [--custom-image-suffix SFX] [--rocm-version VERSION]"
+      echo "  --custom-image-suffix SFX  Use arch-specific image tags with this suffix"
+      echo "                              Can also be set with AMD_CI_CUSTOM_IMAGE_SUFFIX"
       exit 0
       ;;
     *) echo "Unknown option $1"; exit 1;;
@@ -205,30 +205,39 @@ find_latest_image() {
   esac
 }
 
-# Determine which image to use
-if [[ -n "${CUSTOM_IMAGE}" ]]; then
-  IMAGE="${CUSTOM_IMAGE}"
-  echo "Using custom image: ${IMAGE}"
-  if [[ "${IMAGE}" == "${LOCAL_DOCKER_REGISTRY}/"* ]]; then
-    docker pull "${IMAGE}"
-  else
-    retry_with_backoff 6 docker pull "${IMAGE}"
-  fi
+image_from_suffix() {
+  local gpu_arch=$1
+  local suffix=${2#-}
+  local base_tag
+
+  case "${gpu_arch}" in
+      mi30x) base_tag="${MI30X_BASE_TAG}" ;;
+      mi35x) base_tag="${MI35X_BASE_TAG}" ;;
+      *)     echo "Error: unsupported GPU architecture '${gpu_arch}'" >&2; return 1 ;;
+  esac
+
+  echo "rocm/sgl-dev:${base_tag}-${suffix}"
+}
+
+# Pull and run the selected image
+if [[ -n "${CUSTOM_IMAGE_SUFFIX}" ]]; then
+  IMAGE=$(image_from_suffix "${GPU_ARCH}" "${CUSTOM_IMAGE_SUFFIX}")
+  echo "Using custom image suffix '${CUSTOM_IMAGE_SUFFIX}' for ${GPU_ARCH}: ${IMAGE}"
 else
   IMAGE=$(find_latest_image "${GPU_ARCH}")
-  # Try the local docker registry first (avoids Docker Hub rate limits and is
-  # faster on the LAN); if that fails for any reason, fall back to the
-  # public registry with exponential-backoff retries. Capture stderr so the
-  # real failure reason (TLS handshake, 404, connection refused, etc.) is
-  # visible in the job log instead of being silently swallowed.
-  if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
-    echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
-    docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
-  else
-    echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
-    printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
-    retry_with_backoff 6 docker pull "${IMAGE}"
-  fi
+fi
+# Try the local docker registry first (avoids Docker Hub rate limits and is
+# faster on the LAN); if that fails for any reason, fall back to the
+# public registry with exponential-backoff retries. Capture stderr so the
+# real failure reason (TLS handshake, 404, connection refused, etc.) is
+# visible in the job log instead of being silently swallowed.
+if local_pull_output=$(docker pull "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" 2>&1); then
+  echo "Pulled from local docker registry: ${LOCAL_DOCKER_REGISTRY}/${IMAGE}"
+  docker tag "${LOCAL_DOCKER_REGISTRY}/${IMAGE}" "${IMAGE}"
+else
+  echo "Local docker registry pull failed; falling back to public registry: ${IMAGE}" >&2
+  printf '%s\n' "${local_pull_output}" | sed 's/^/  [local-pull] /' >&2
+  retry_with_backoff 6 docker pull "${IMAGE}"
 fi
 
 # CACHE_HOST=/home/runner/sgl-data

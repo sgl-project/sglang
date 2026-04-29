@@ -11,13 +11,8 @@ on:
         required: false
         type: string
         default: 'main'
-      custom_image_rocm700:
-        description: 'Use a custom AMD CI Docker image for ROCm 7.0 downstream SGLang workflows (optional)'
-        required: false
-        type: string
-        default: ''
-      custom_image_rocm720:
-        description: 'Use a custom AMD CI Docker image for ROCm 7.2 downstream SGLang workflows (optional)'
+      custom_image_suffix:
+        description: 'Use AMD CI Docker images with this tag suffix, e.g. 20260429 (optional)'
         required: false
         type: string
         default: ''
@@ -100,7 +95,7 @@ jobs:
     with:
       ref: ${{ github.sha }}
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
-      custom_image: ${{ inputs.custom_image_rocm700 || '' }}
+      custom_image_suffix: ${{ inputs.custom_image_suffix || '' }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
@@ -112,7 +107,7 @@ jobs:
     with:
       ref: ${{ github.sha }}
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
-      custom_image: ${{ inputs.custom_image_rocm720 || '' }}
+      custom_image_suffix: ${{ inputs.custom_image_suffix || '' }}
       job_filter: 'all'
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
@@ -124,7 +119,7 @@ jobs:
     with:
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
-      custom_image: ${{ inputs.custom_image_rocm700 || '' }}
+      custom_image_suffix: ${{ inputs.custom_image_suffix || '' }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   call-pr-test-amd-rocm720:
@@ -135,7 +130,7 @@ jobs:
     with:
       run_all_tests: true
       aiter_ref: ${{ needs.resolve-aiter.outputs.aiter_sha }}
-      custom_image: ${{ inputs.custom_image_rocm720 || '' }}
+      custom_image_suffix: ${{ inputs.custom_image_suffix || '' }}
       continue_on_error: ${{ inputs.continue_on_error == '' && true || inputs.continue_on_error }}
 
   check-all-jobs:
@@ -154,8 +149,7 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER SHA:** \`${{ needs.resolve-aiter.outputs.aiter_sha }}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **AITER commit:** https://github.com/ROCm/aiter/commit/${{ needs.resolve-aiter.outputs.aiter_sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **ROCm 7.0 custom image:** \`${{ inputs.custom_image_rocm700 || 'default SGLang AMD CI image' }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **ROCm 7.2 custom image:** \`${{ inputs.custom_image_rocm720 || 'default SGLang AMD CI image' }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Custom image suffix:** \`${{ inputs.custom_image_suffix || 'default SGLang AMD CI image' }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Workflow | Result |" >> $GITHUB_STEP_SUMMARY
           echo "|----------|--------|" >> $GITHUB_STEP_SUMMARY
