@@ -10,7 +10,7 @@ from sglang.srt.platforms.device_mixin import (
 )
 
 if TYPE_CHECKING:
-    import torch
+    import torch  # pyright: ignore[reportMissingImports]
 
 
 def _import_torch() -> Any:

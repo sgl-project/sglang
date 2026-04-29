@@ -26,7 +26,7 @@ _current_platform: SRTPlatform | None = None
 
 def _is_cuda_available() -> bool:
     torch = import_module("torch")
-    return bool(torch.cuda.is_available())
+    return bool(torch.cuda.is_available() and torch.version.hip is None)
 
 
 def _resolve_platform() -> SRTPlatform:
@@ -45,7 +45,8 @@ def _resolve_platform() -> SRTPlatform:
 
        SGLANG_PLATFORM unset (auto-discover):
          - Import and activate all discovered plugins
-         - 0 activated → fallback base SRTPlatform
+        - 0 activated + CUDA available → fallback CudaSRTPlatform
+        - 0 activated + no CUDA → fallback base SRTPlatform
          - 1 activated → use it
          - N activated → RuntimeError (must set SGLANG_PLATFORM)
 

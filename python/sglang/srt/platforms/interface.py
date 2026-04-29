@@ -131,5 +131,3 @@ class SRTPlatform(DeviceMixin):
 
 class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
     """Default in-tree CUDA SRT platform."""
-
-    pass
