@@ -9,12 +9,24 @@
 - [Ascend MemCache Python API](https://gitcode.com/Ascend/memcache/blob/master/doc/memcache_python_api.md)
 - [SGLang HiCache Design](https://docs.sglang.io/advanced_features/hicache_design.html)
 
+
+## 安装SGLang
+```
+git clone https://github.com/nbbb24/sglang.git
+```
+[ascend安装指南](https://github.com/nbbb24/sglang/blob/main/docs/platforms/ascend/ascend_npu.md)
+```
+cd sglang
+cd python 
+python -m pip install -e .
+```
+
+
+
 ## 关于 MemCache
 
 MemCache 是 Ascend 提供的分布式缓存系统，底层基于 MemFabric，可以提供高性能的分布式内存池。  
 在 SGLang HiCache 中，MemCache 可以作为 L3 KV Cache backend，用于存储和复用 KV cache。
-`
-
 
 
 ## 安装 MemCache
@@ -54,7 +66,7 @@ git submodule update --recursive --init
 ```
 ##### 编译，执行如下命令进行编译，编译成功后，会生成run包在output目录下
 ```
-bash script/build_and_pack_run.sh --build_mode RELEASE --build_python ON --xpu_type NPU --build_test OFF --build_hcom OFF
+bash script/build_and_pack_run.sh --build_mode RELEASE --build_python ON --xpu_type NPU --build_test ON --build_hcom ON --build_hcom_rdma ON --build_hcom_ub ON
 ```
 ##### run包默认安装根路径为 /usr/local/
 
@@ -192,27 +204,52 @@ python3 test_mmc_demo.py
 ```
 2. 方式二（推荐）：Python 入口直接指定 local 配置文件路径
 ```
-from memcache_hybrid import DistributedObjectStore, LocalConfig
-
-config = LocalConfig()
-config.protocol = "device_rdma"
-config.dram_size = "10GB"
-config.max_dram_size = "64GB"
-print(config)
-
-store = DistributedObjectStore()
-assert store.setup(config) == 0, "setup local config failed"
-ret = store.setup("/usr/local/memcache_hybrid/latest/config/mmc-local.conf", device_id=0, init_bm=True)
-print(ret)
+python3 -c "
+from memcache_hybrid import DistributedObjectStore, LocalConfig;
+config = LocalConfig();
+config.meta_service_url = 'tcp://127.0.0.1:5001';
+config.config_store_url = 'tcp://127.0.0.1:6000';
+config.log_level = 'info';
+config.protocol = 'host_tcp';
+config.dram_size = '10GB';
+config.max_dram_size = '64GB';
+config.hbm_size = '0';
+print(config);
+store = DistributedObjectStore();
+ret = store.setup(config);
+print(f'Setup Return Code: {ret}');
+"
 ```
 3. 方法三：在ascend_memcache添加localservice_config.json
 ```
 {
+  "ock.mmc.meta_service_url": "tcp://127.0.0.1:5001",
+  "ock.mmc.local_service.config_store_url": "tcp://127.0.0.1:6000",
+  "ock.mmc.log_level": "info",
+
+  "ock.mmc.local_service.protocol": "host_tcp",
+
+  "ock.mmc.local_service.dram.size": "10GB",
+  "ock.mmc.local_service.max.dram.size": "64GB",
+
+  "ock.mmc.local_service.hbm.size": "0",
+  "ock.mmc.local_service.max.hbm.size": "0"
+}
+```
+
+```
+{
+    "meta_service_url": "tcp://127.0.0.1:5001",
+    "config_store_url": "tcp://127.0.0.1:6000",
+    "log_level": "info",
     "protocol": "host_tcp",
     "dram_size": "10GB",
     "max_dram_size": "64GB",
+    "hbm_size": "0",
     "device_id": 0,
     "init_bm": true,
+    "check_server": true,
+    "metrics_url": "http://127.0.0.1:8000"
     "conf_file_path": "/usr/local/memcache_hybrid/latest/config/mmc-local.conf"
 }
 ```
@@ -253,32 +290,21 @@ docker exec -it sglang_a3_service bash
 cd /home/sxy/sglang
 ```
 ```
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/memfabric_hybrid/set_env.sh
 source /usr/local/memcache_hybrid/set_env.sh
 
-export SGLANG_HICACHE_MEMCACHE_CONFIG_PATH=python/sglang/srt/mem_cache/storage/ascend_memcache/localservice_config.json
-```
-添加local store config
-```
-{
-  "meta_service_url": "tcp://127.0.0.1:5001",
-  "config_store_url": "tcp://127.0.0.1:6000",
-  "log_level": "info",
-  "protocol": "host_tcp",
-  "dram_size": "10GB",
-  "max_dram_size": "64GB",
-  "hbm_size": "0",
-  "device_id": 0,
-  "init_bm": true,
-  "check_server": true,
-  "metrics_url": "http://127.0.0.1:8000"
-}
-```
-```
+export SGLANG_HICACHE_MEMCACHE_CONFIG_PATH=/home/sxy/sglang/python/sglang/srt/mem_cache/storage/ascend_memcache/localservice_config.json
+export MMC_LOCAL_CONFIG_PATH=/usr/local/memcache_hybrid/latest/config/mmc-local.conf
 export PYTHONPATH=/home/sxy/sglang/python:$PYTHONPATH
+```
+运行
+```
 python -m sglang.launch_server \
   --model-path /data/atb_testdata/weights/DeepSeek-V2-Lite-Chat \
   --attention-backend ascend \
   --enable-hierarchical-cache \
-  --hicache-storage-backend ascend_memcache
+  --hicache-storage-backend ascend_memcache \
+  --host 0.0.0.0 \
+  --port 30000
 ```

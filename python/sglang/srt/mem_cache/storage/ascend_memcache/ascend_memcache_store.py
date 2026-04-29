@@ -255,11 +255,28 @@ class AscendMemcacheStore(HiCacheStorage):
         )
 
     def warmup(self):
+        # warmup_key = "sglang_ascend_memcache_store_warmup_key" + uuid.uuid4().hex
+        # warmup_value = bytes(4 * 1024)
+        # assert self.store.put(warmup_key, warmup_value) == 0
+        # assert self.store.is_exist(warmup_key) == 1
+        # assert self.store.get(warmup_key) == warmup_value
+
         warmup_key = "sglang_ascend_memcache_store_warmup_key" + uuid.uuid4().hex
-        warmup_value = bytes(4 * 1024)
-        assert self.store.put(warmup_key, warmup_value) == 0
-        assert self.store.is_exist(warmup_key) == 1
-        assert self.store.get(warmup_key) == warmup_value
+
+        buf = torch.zeros(4096, dtype=torch.uint8)
+        ptr = buf.data_ptr()
+        size = buf.numel() * buf.element_size()
+
+        put_ret = self.store.batch_put_from([warmup_key], [ptr], [size])
+        assert put_ret[0] == 0, f"warmup batch_put_from failed: {put_ret}"
+
+        exist_ret = self.store.batch_is_exist([warmup_key])
+        assert exist_ret[0] == 1, f"warmup batch_is_exist failed: {exist_ret}"
+
+        out = torch.empty_like(buf)
+        get_ret = self.store.batch_get_into([warmup_key], [out.data_ptr()], [size])
+        assert get_ret[0] == 0, f"warmup batch_get_into failed: {get_ret}"
+        
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
