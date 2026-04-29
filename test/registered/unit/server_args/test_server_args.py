@@ -104,6 +104,34 @@ class TestHiSparseNsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"backend\(s\) \[flashmla_sparse\]"):
             server_args._validate_hisparse_nsa_backend("nsa_decode_backend", "decode")
 
+    def test_hisparse_accepts_bfloat16_kv_cache_dtype(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="bfloat16",
+        )
+
+        server_args._validate_hisparse_kv_cache_dtype()
+
+    def test_hisparse_accepts_fp8_e4m3_kv_cache_dtype(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="fp8_e4m3",
+        )
+
+        server_args._validate_hisparse_kv_cache_dtype()
+
+    def test_hisparse_rejects_unsupported_kv_cache_dtype(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            kv_cache_dtype="float16",
+        )
+
+        with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
+            server_args._validate_hisparse_kv_cache_dtype()
+
 
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
