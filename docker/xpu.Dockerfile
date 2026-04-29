@@ -63,7 +63,6 @@ RUN --mount=type=secret,id=github_token \
     cd sglang && cd python && \
     cp pyproject_xpu.toml pyproject.toml && \
     pip install . --extra-index-url https://download.pytorch.org/whl/xpu && \
-    pip install xgrammar --no-deps && \
     pip install msgspec blake3 py-cpuinfo compressed_tensors gguf partial_json_parser einops tabulate --root-user-action=ignore && \
     conda install libsqlite=3.48.0 -y && \
     # Add environment setup commands to .bashrc again (in case it was overwritten)
