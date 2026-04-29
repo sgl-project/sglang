@@ -152,7 +152,7 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
-    def get_structure_tag(
+    def get_legacy_structure_tag(
         self, at_least_one: bool = False
     ) -> StructuralTagResponseFormat:
         """
@@ -237,13 +237,13 @@ class FunctionCallParser:
             if structural_tag is not None:
                 return ("structural_tag", structural_tag)
 
-        if self.detector.supports_structural_tag():
-            # For "required"/named: always use structural_tag to preserve the
-            # model's native tool call format. Schema is only included when
-            # strict=True, per OpenAI protocol semantics.
-            # For "auto": only constrain when strict is enabled.
-            if is_required or should_constrain_auto:
-                tag = self.get_structure_tag(at_least_one=is_required)
+            # Fallback to legacy structural tag if model-native tag is not supported.
+            if self.detector.supports_structural_tag():
+                # For "required"/named: always use structural_tag to preserve the
+                # model's native tool call format. Schema is only included when
+                # strict=True, per OpenAI protocol semantics.
+                # For "auto": only constrain when strict is enabled.
+                tag = self.get_legacy_structure_tag(at_least_one=is_required)
                 return ("structural_tag", tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
             json_schema = get_json_schema_constraint(
