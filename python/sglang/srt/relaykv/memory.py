@@ -50,6 +50,32 @@ RELAYKV_SHADOW_LOG_MEMORY_KEYS = {
     "logical_kv_mib",
 }
 
+RELAYKV_SHADOW_LOG_HOST_BACKUP_KEYS = {
+    "host_backup_shadow",
+    "host_backup_candidate_tokens",
+    "host_backup_candidate_kv_bytes",
+    "host_backup_candidate_kv_mib",
+    "host_backup_max_mib",
+    "host_backup_budget_ok",
+    "host_backup_would_copy",
+    "host_backup_reason",
+}
+
+
+@dataclass(frozen=True)
+class RelayKVHostBackupShadowEstimate:
+    host_backup_shadow: bool
+    host_backup_candidate_tokens: int
+    host_backup_candidate_kv_bytes: Optional[int]
+    host_backup_candidate_kv_mib: Optional[float]
+    host_backup_max_mib: float
+    host_backup_budget_ok: Optional[bool]
+    host_backup_would_copy: bool
+    host_backup_reason: str
+
+    def to_log_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
 
 def _dtype_bytes(dtype: Any) -> Optional[int]:
     if dtype is None:
@@ -141,7 +167,55 @@ def estimate_kv_memory_for_plan(
     )
 
 
+def estimate_host_backup_shadow_for_plan(
+    plan: RelayKVPlan,
+    *,
+    memory_estimate: RelayKVMemoryEstimate,
+    host_backup_shadow: bool,
+    host_backup_max_mib: float,
+) -> RelayKVHostBackupShadowEstimate:
+    if not host_backup_shadow:
+        return RelayKVHostBackupShadowEstimate(
+            host_backup_shadow=False,
+            host_backup_candidate_tokens=0,
+            host_backup_candidate_kv_bytes=0,
+            host_backup_candidate_kv_mib=0.0,
+            host_backup_max_mib=host_backup_max_mib,
+            host_backup_budget_ok=True,
+            host_backup_would_copy=False,
+            host_backup_reason="host_backup_shadow_disabled",
+        )
+
+    candidate_kv_bytes = memory_estimate.planned_cold_kv_bytes
+    candidate_kv_mib = memory_estimate.planned_cold_kv_mib
+    if candidate_kv_mib is None:
+        budget_ok = None
+        reason = "metadata_only_no_tensor_copy_insufficient_memory_metadata"
+    elif host_backup_max_mib == 0.0:
+        budget_ok = True
+        reason = "metadata_only_no_tensor_copy"
+    else:
+        budget_ok = candidate_kv_mib <= host_backup_max_mib
+        reason = "metadata_only_no_tensor_copy"
+
+    return RelayKVHostBackupShadowEstimate(
+        host_backup_shadow=True,
+        host_backup_candidate_tokens=plan.planned_cold_tokens,
+        host_backup_candidate_kv_bytes=candidate_kv_bytes,
+        host_backup_candidate_kv_mib=candidate_kv_mib,
+        host_backup_max_mib=host_backup_max_mib,
+        host_backup_budget_ok=budget_ok,
+        host_backup_would_copy=False,
+        host_backup_reason=reason,
+    )
+
+
 def validate_shadow_log_schema(payload: dict[str, Any]) -> None:
     missing = RELAYKV_SHADOW_LOG_MEMORY_KEYS - payload.keys()
     if missing:
         raise AssertionError(f"Missing RelayKV shadow log keys: {sorted(missing)}")
+    missing_host_backup = RELAYKV_SHADOW_LOG_HOST_BACKUP_KEYS - payload.keys()
+    if missing_host_backup:
+        raise AssertionError(
+            f"Missing RelayKV host-backup log keys: {sorted(missing_host_backup)}"
+        )

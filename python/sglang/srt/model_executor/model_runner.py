@@ -156,7 +156,10 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
-from sglang.srt.relaykv.memory import estimate_kv_memory_for_plan
+from sglang.srt.relaykv.memory import (
+    estimate_host_backup_shadow_for_plan,
+    estimate_kv_memory_for_plan,
+)
 from sglang.srt.relaykv import RelayKVConfig, make_shadow_plan
 from sglang.srt.relaykv.metrics import log_shadow_plan
 from sglang.srt.relaykv.profile import infer_model_profile
@@ -783,11 +786,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             "host_backup_shadow": config.host_backup_shadow,
             "host_backup_max_mib": config.host_backup_max_mib,
             "host_backup_planned": config.host_backup_shadow,
-            "host_backup_reason": (
-                "metadata-only host backup shadow requested; tensor copy is disabled"
-                if config.host_backup_shadow
-                else "host backup shadow disabled"
-            ),
         }
 
         model_profile = infer_model_profile(self.model_config.hf_config)
@@ -833,12 +831,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_config=self.model_config,
             kv_dtype=getattr(self, "kv_cache_dtype", None),
         )
+        host_backup_estimate = estimate_host_backup_shadow_for_plan(
+            plan,
+            memory_estimate=memory_estimate,
+            host_backup_shadow=config.host_backup_shadow,
+            host_backup_max_mib=config.host_backup_max_mib,
+        )
         log_shadow_plan(
             plan,
             prefix="relaykv_shadow_plan_startup",
             extra=model_profile.to_log_dict()
             | memory_estimate.to_log_dict()
-            | host_backup_shadow_info,
+            | host_backup_shadow_info
+            | host_backup_estimate.to_log_dict(),
         )
 
     def init_routed_experts_capturer(self):

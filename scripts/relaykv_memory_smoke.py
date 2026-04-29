@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sglang.srt.relaykv import RelayKVConfig, make_shadow_plan
 from sglang.srt.relaykv.memory import (
+    estimate_host_backup_shadow_for_plan,
     estimate_kv_memory_for_plan,
     estimate_kv_memory_from_metadata,
     validate_shadow_log_schema,
@@ -54,8 +55,22 @@ def main() -> None:
         model_config=_FakeModelConfig(),
         kv_dtype="torch.bfloat16",
     )
+    host_backup_estimate = estimate_host_backup_shadow_for_plan(
+        plan,
+        memory_estimate=estimate_from_model,
+        host_backup_shadow=True,
+        host_backup_max_mib=0.0,
+    )
+    if host_backup_estimate.host_backup_candidate_tokens != 1511:
+        raise AssertionError(host_backup_estimate)
+    _assert_close(host_backup_estimate.host_backup_candidate_kv_mib, 41.316)
+    if host_backup_estimate.host_backup_budget_ok is not True:
+        raise AssertionError(host_backup_estimate)
+    if host_backup_estimate.host_backup_would_copy is not False:
+        raise AssertionError(host_backup_estimate)
     payload = plan.to_log_dict()
     payload.update(estimate_from_model.to_log_dict())
+    payload.update({"host_backup_planned": True, **host_backup_estimate.to_log_dict()})
     validate_shadow_log_schema(payload)
 
     print("relaykv_memory_smoke: ok")
