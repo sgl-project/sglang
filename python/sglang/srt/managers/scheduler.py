@@ -171,6 +171,7 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.relaykv.memory import (
     estimate_host_backup_shadow_for_plan,
     estimate_kv_memory_for_plan,
+    observe_kv_layout_for_host_backup,
 )
 from sglang.srt.relaykv.metrics import log_shadow_plan, should_log
 from sglang.srt.relaykv.planner import make_shadow_plan
@@ -2739,13 +2740,25 @@ class Scheduler(
                 host_backup_max_mib=config.host_backup_max_mib,
                 host_backup_dry_copy=config.host_backup_dry_copy,
             )
+            extra = (
+                self.relaykv_model_profile.to_log_dict()
+                | memory_estimate.to_log_dict()
+                | host_backup_shadow_info
+                | host_backup_estimate.to_log_dict()
+            )
+            if host_backup_estimate.host_backup_dry_copy_guard_ok:
+                layout_observation = observe_kv_layout_for_host_backup(
+                    token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    req_to_token_pool=self.req_to_token_pool,
+                    request_id=req.rid,
+                    seq_len=seq_len,
+                    copy_target_ranges=host_backup_estimate.host_backup_copy_target_ranges,
+                )
+                extra |= layout_observation.to_log_dict()
             log_shadow_plan(
                 plan,
                 prefix=f"relaykv_shadow_plan_{phase}",
-                extra=self.relaykv_model_profile.to_log_dict()
-                | memory_estimate.to_log_dict()
-                | host_backup_shadow_info
-                | host_backup_estimate.to_log_dict(),
+                extra=extra,
             )
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:

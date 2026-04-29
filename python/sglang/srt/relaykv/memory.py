@@ -69,6 +69,16 @@ RELAYKV_SHADOW_LOG_HOST_BACKUP_KEYS = {
     "host_backup_dry_copy_guard_ok",
     "host_backup_dry_copy_would_run",
     "host_backup_dry_copy_reason",
+    "kv_layout_observed",
+    "kv_layout_object_type",
+    "kv_layout_k_shape",
+    "kv_layout_v_shape",
+    "kv_layout_dtype",
+    "kv_layout_device",
+    "kv_layout_num_layers_observed",
+    "kv_layout_reason",
+    "kv_layout_range_mapping_supported",
+    "kv_layout_range_mapping_reason",
 }
 
 
@@ -97,6 +107,23 @@ class RelayKVHostBackupShadowEstimate:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class RelayKVLayoutObservation:
+    kv_layout_observed: bool
+    kv_layout_object_type: Optional[str]
+    kv_layout_k_shape: Optional[list[int]]
+    kv_layout_v_shape: Optional[list[int]]
+    kv_layout_dtype: Optional[str]
+    kv_layout_device: Optional[str]
+    kv_layout_num_layers_observed: Optional[int]
+    kv_layout_reason: str
+    kv_layout_range_mapping_supported: bool
+    kv_layout_range_mapping_reason: str
+
+    def to_log_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 def _dtype_bytes(dtype: Any) -> Optional[int]:
     if dtype is None:
         return None
@@ -114,6 +141,42 @@ def _range_tokens(ranges: list[list[int]]) -> int:
     for start, end in ranges:
         total += max(end - start, 0)
     return total
+
+
+def _tensor_shape_list(tensor: Any) -> Optional[list[int]]:
+    shape = getattr(tensor, "shape", None)
+    if shape is None:
+        return None
+    return [int(dim) for dim in shape]
+
+
+def _extract_buffer_sample(buffer: Any) -> tuple[Optional[Any], Optional[int]]:
+    if buffer is None:
+        return None, None
+    if isinstance(buffer, list):
+        if not buffer:
+            return None, 0
+        sample = buffer[0]
+        if hasattr(sample, "shape"):
+            return sample, len(buffer)
+        return None, len(buffer)
+    if hasattr(buffer, "shape"):
+        return buffer, None
+    return None, None
+
+
+def _resolve_kv_layout_object(token_to_kv_pool_allocator: Any) -> tuple[Optional[Any], str]:
+    if token_to_kv_pool_allocator is None:
+        return None, "kv_cache_object_not_found"
+    if hasattr(token_to_kv_pool_allocator, "get_kvcache"):
+        kvcache = token_to_kv_pool_allocator.get_kvcache()
+    else:
+        kvcache = getattr(token_to_kv_pool_allocator, "_kvcache", None)
+    if kvcache is None:
+        return None, "kv_cache_object_not_found"
+    if hasattr(kvcache, "full_kv_pool"):
+        return getattr(kvcache, "full_kv_pool"), "ok_swa_full_kv_pool"
+    return kvcache, "ok"
 
 
 def estimate_kv_memory_from_metadata(
@@ -280,6 +343,120 @@ def estimate_host_backup_shadow_for_plan(
         host_backup_dry_copy_guard_ok=dry_copy_guard_ok,
         host_backup_dry_copy_would_run=dry_copy_guard_ok,
         host_backup_dry_copy_reason=dry_copy_reason,
+    )
+
+
+def observe_kv_layout_for_host_backup(
+    *,
+    token_to_kv_pool_allocator: Any,
+    req_to_token_pool: Any,
+    request_id: Optional[str],
+    seq_len: int,
+    copy_target_ranges: list[list[int]],
+) -> RelayKVLayoutObservation:
+    kv_object, base_reason = _resolve_kv_layout_object(token_to_kv_pool_allocator)
+    if kv_object is None:
+        return RelayKVLayoutObservation(
+            kv_layout_observed=False,
+            kv_layout_object_type=None,
+            kv_layout_k_shape=None,
+            kv_layout_v_shape=None,
+            kv_layout_dtype=None,
+            kv_layout_device=None,
+            kv_layout_num_layers_observed=None,
+            kv_layout_reason=base_reason,
+            kv_layout_range_mapping_supported=False,
+            kv_layout_range_mapping_reason="kv_cache_object_not_found",
+        )
+
+    k_sample, k_layers = _extract_buffer_sample(getattr(kv_object, "k_buffer", None))
+    v_sample, v_layers = _extract_buffer_sample(getattr(kv_object, "v_buffer", None))
+    observe_reason = base_reason
+
+    if k_sample is None and v_sample is None:
+        kv_sample, kv_layers = _extract_buffer_sample(getattr(kv_object, "kv_buffer", None))
+        if kv_sample is None:
+            return RelayKVLayoutObservation(
+                kv_layout_observed=False,
+                kv_layout_object_type=type(kv_object).__name__,
+                kv_layout_k_shape=None,
+                kv_layout_v_shape=None,
+                kv_layout_dtype=str(getattr(kv_object, "dtype", None))
+                if getattr(kv_object, "dtype", None) is not None
+                else None,
+                kv_layout_device=str(getattr(kv_object, "device", None))
+                if getattr(kv_object, "device", None) is not None
+                else None,
+                kv_layout_num_layers_observed=kv_layers,
+                kv_layout_reason="kv_layout_buffer_attrs_not_found",
+                kv_layout_range_mapping_supported=False,
+                kv_layout_range_mapping_reason="kv_layout_not_observed",
+            )
+        k_shape = _tensor_shape_list(kv_sample)
+        return RelayKVLayoutObservation(
+            kv_layout_observed=True,
+            kv_layout_object_type=type(kv_object).__name__,
+            kv_layout_k_shape=k_shape,
+            kv_layout_v_shape=None,
+            kv_layout_dtype=str(getattr(kv_sample, "dtype", getattr(kv_object, "dtype", None))),
+            kv_layout_device=str(
+                getattr(kv_sample, "device", getattr(kv_object, "device", None))
+            ),
+            kv_layout_num_layers_observed=kv_layers,
+            kv_layout_reason="combined_kv_buffer_only",
+            kv_layout_range_mapping_supported=bool(
+                request_id and seq_len > 0 and copy_target_ranges
+                and getattr(token_to_kv_pool_allocator, "page_size", None) == 1
+                and req_to_token_pool is not None
+            ),
+            kv_layout_range_mapping_reason=(
+                "page_size_1_metadata_only"
+                if (
+                    request_id
+                    and seq_len > 0
+                    and copy_target_ranges
+                    and getattr(token_to_kv_pool_allocator, "page_size", None) == 1
+                    and req_to_token_pool is not None
+                )
+                else "combined_kv_buffer_range_mapping_unknown"
+            ),
+        )
+
+    sample = k_sample if k_sample is not None else v_sample
+    page_size = getattr(token_to_kv_pool_allocator, "page_size", None)
+    range_mapping_supported = bool(
+        request_id
+        and seq_len > 0
+        and copy_target_ranges
+        and page_size == 1
+        and req_to_token_pool is not None
+    )
+    if not request_id:
+        range_mapping_reason = "request_id_missing"
+    elif seq_len <= 0:
+        range_mapping_reason = "seq_len_missing"
+    elif not copy_target_ranges:
+        range_mapping_reason = "copy_target_ranges_empty"
+    elif page_size != 1:
+        range_mapping_reason = "page_size_not_token_aligned"
+    elif req_to_token_pool is None:
+        range_mapping_reason = "req_to_token_pool_not_found"
+    else:
+        range_mapping_reason = "page_size_1_metadata_only"
+
+    return RelayKVLayoutObservation(
+        kv_layout_observed=True,
+        kv_layout_object_type=type(kv_object).__name__,
+        kv_layout_k_shape=_tensor_shape_list(k_sample),
+        kv_layout_v_shape=_tensor_shape_list(v_sample),
+        kv_layout_dtype=str(getattr(sample, "dtype", getattr(kv_object, "dtype", None))),
+        kv_layout_device=str(
+            getattr(sample, "device", getattr(kv_object, "device", None))
+        ),
+        kv_layout_num_layers_observed=k_layers or v_layers,
+        kv_layout_reason=observe_reason,
+        kv_layout_range_mapping_supported=range_mapping_supported,
+        kv_layout_range_mapping_reason=range_mapping_reason,
     )
 
 

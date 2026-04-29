@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import torch
+
 from sglang.srt.relaykv import RelayKVConfig, make_shadow_plan
 from sglang.srt.relaykv.memory import (
     estimate_host_backup_shadow_for_plan,
     estimate_kv_memory_for_plan,
     estimate_kv_memory_from_metadata,
+    observe_kv_layout_for_host_backup,
     validate_shadow_log_schema,
 )
 
@@ -15,6 +18,25 @@ class _FakeModelConfig:
     num_attention_heads = 16
     hidden_size = 2048
     head_dim = 128
+
+
+class _FakeKVCache:
+    dtype = torch.bfloat16
+    device = "cuda:0"
+
+    def __init__(self):
+        self.k_buffer = [torch.zeros((2536, 2, 128), dtype=torch.bfloat16)]
+        self.v_buffer = [torch.zeros((2536, 2, 128), dtype=torch.bfloat16)]
+
+
+class _FakeAllocator:
+    page_size = 1
+
+    def __init__(self):
+        self._kvcache = _FakeKVCache()
+
+    def get_kvcache(self):
+        return self._kvcache
 
 
 def _assert_close(actual: float, expected: float) -> None:
@@ -87,9 +109,29 @@ def main() -> None:
         raise AssertionError(host_backup_estimate)
     if host_backup_estimate.host_backup_dry_copy_reason != "guard_only_no_tensor_copy":
         raise AssertionError(host_backup_estimate)
+    layout_observation = observe_kv_layout_for_host_backup(
+        token_to_kv_pool_allocator=_FakeAllocator(),
+        req_to_token_pool=object(),
+        request_id="smoke-rid",
+        seq_len=plan.seq_len,
+        copy_target_ranges=host_backup_estimate.host_backup_copy_target_ranges,
+    )
+    if layout_observation.kv_layout_observed is not True:
+        raise AssertionError(layout_observation)
+    if layout_observation.kv_layout_k_shape != [2536, 2, 128]:
+        raise AssertionError(layout_observation)
+    if layout_observation.kv_layout_v_shape != [2536, 2, 128]:
+        raise AssertionError(layout_observation)
+    if layout_observation.kv_layout_dtype != "torch.bfloat16":
+        raise AssertionError(layout_observation)
+    if layout_observation.kv_layout_device != "cpu":
+        raise AssertionError(layout_observation)
+    if layout_observation.kv_layout_range_mapping_supported is not True:
+        raise AssertionError(layout_observation)
     payload = plan.to_log_dict()
     payload.update(estimate_from_model.to_log_dict())
     payload.update({"host_backup_planned": True, **host_backup_estimate.to_log_dict()})
+    payload.update(layout_observation.to_log_dict())
     validate_shadow_log_schema(payload)
 
     print("relaykv_memory_smoke: ok")
