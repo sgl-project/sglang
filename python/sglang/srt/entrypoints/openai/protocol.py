@@ -1124,6 +1124,13 @@ class TokenizeRequest(BaseModel):
     model: str = DEFAULT_MODEL_NAME
     prompt: Optional[Union[str, List[str]]] = None
     messages: Optional[List[ChatCompletionMessageParam]] = None
+    tools: Optional[List[Tool]] = Field(default=None, examples=[None])
+    tool_choice: Optional[Union[ToolChoice, Literal["auto", "required", "none"]]] = (
+        Field(default=None, examples=["auto"])
+    )
+    reasoning_effort: Optional[Literal["none", "low", "medium", "high"]] = None
+    continue_final_message: bool = False
+    chat_template_kwargs: Optional[Dict] = None
     add_special_tokens: bool = Field(
         default=True,
         description="whether to add model-specific special tokens (e.g. BOS/EOS) during encoding.",
