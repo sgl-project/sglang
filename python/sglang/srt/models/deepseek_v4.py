@@ -904,8 +904,8 @@ class MQALayer(nn.Module):
         if self.tp_size > 1:
             o = attn_tp_all_reduce(o)
 
-        return o
-
+        if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
+            o = attn_tp_all_reduce(o)
 
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
