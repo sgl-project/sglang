@@ -2132,7 +2132,15 @@ class ServerArgs:
                         )
                 else:
                     self.quantization = model_config.quantization
-                self.moe_runner_backend = "flashinfer_cutlass"
+                if self.moe_runner_backend == "auto":
+                    if is_sm100_supported() and self.moe_a2a_backend == "none":
+                        self.moe_runner_backend = "flashinfer_trtllm"
+                        logger.info(
+                            "Use flashinfer_trtllm as MoE runner backend on sm100 for "
+                            f"{model_arch}"
+                        )
+                    else:
+                        self.moe_runner_backend = "flashinfer_cutlass"
 
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
