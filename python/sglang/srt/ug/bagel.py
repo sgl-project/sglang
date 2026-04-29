@@ -120,6 +120,7 @@ class BAGELNativeSRTPreparedDenoise:
     """Denoise inputs whose U context is owned by SRT KV cache."""
 
     generation_input: dict[str, Any]
+    srt_kv_token_binding: Any | None = None
     cfg_text_scale: float = 1.0
     cfg_img_scale: float = 1.0
     cfg_interval: tuple[float, float] = (0.0, 1.0)
@@ -151,29 +152,39 @@ class BAGELNativeSRTDenoiseExecutor:
         self._validate_prepared(prepared)
         self._validate_cfg(prepared, timestep)
         generation_input = prepared.generation_input
-        forward_batch = self._build_forward_batch(
-            prepared=prepared,
-            latent_tokens=latent_tokens,
-            timestep=timestep,
-        )
         predictor = getattr(self.srt_model, "predict_velocity_from_packed_gen", None)
         if not callable(predictor):
             raise BAGELAdapterError(
                 "Native SRT BAGEL denoise requires "
                 "predict_velocity_from_packed_gen on the SRT model"
             )
-        self.velocity_count += 1
-        return predictor(
+        forward_batch_context = self._build_forward_batch(
+            prepared=prepared,
             latent_tokens=latent_tokens,
             timestep=timestep,
-            packed_vae_token_indexes=generation_input["packed_vae_token_indexes"],
-            packed_vae_position_ids=generation_input["packed_vae_position_ids"],
-            packed_text_ids=generation_input["packed_text_ids"],
-            packed_text_indexes=generation_input["packed_text_indexes"],
-            packed_position_ids=generation_input["packed_position_ids"],
-            packed_seqlens=generation_input["packed_seqlens"],
-            forward_batch=forward_batch,
         )
+        forward_batch = getattr(
+            forward_batch_context,
+            "forward_batch",
+            forward_batch_context,
+        )
+        self.velocity_count += 1
+        try:
+            return predictor(
+                latent_tokens=latent_tokens,
+                timestep=timestep,
+                packed_vae_token_indexes=generation_input["packed_vae_token_indexes"],
+                packed_vae_position_ids=generation_input["packed_vae_position_ids"],
+                packed_text_ids=generation_input["packed_text_ids"],
+                packed_text_indexes=generation_input["packed_text_indexes"],
+                packed_position_ids=generation_input["packed_position_ids"],
+                packed_seqlens=generation_input["packed_seqlens"],
+                forward_batch=forward_batch,
+            )
+        finally:
+            release = getattr(forward_batch_context, "release", None)
+            if callable(release):
+                release()
 
     def _build_forward_batch(
         self,
@@ -834,7 +845,8 @@ class BAGELInterleaveContextBackend:
                 "BAGEL native SRT U context requires a native SRT denoise executor"
             )
         image_shape = self._image_shape_from_params(sampling_params, state.image_shape)
-        curr_kvlens, curr_rope = self._native_srt_context_lengths(state)
+        binding = self._native_srt_token_binding(state)
+        curr_kvlens, curr_rope = [binding.token_count], [binding.token_count]
         model = self.inferencer.model
         with _bagel_seed_context(seed):
             generation_input = model.prepare_vae_latent(
@@ -845,6 +857,7 @@ class BAGELInterleaveContextBackend:
             )
         return BAGELNativeSRTPreparedDenoise(
             generation_input=generation_input,
+            srt_kv_token_binding=binding,
             cfg_text_scale=float(getattr(sampling_params, "cfg_text_scale", 1.0)),
             cfg_img_scale=float(getattr(sampling_params, "cfg_img_scale", 1.0)),
             cfg_interval=tuple(getattr(sampling_params, "cfg_interval", (0.0, 1.0))),
@@ -853,9 +866,7 @@ class BAGELInterleaveContextBackend:
         )
 
     @staticmethod
-    def _native_srt_context_lengths(
-        state: BAGELSessionContext,
-    ) -> tuple[list[int], list[int]]:
+    def _native_srt_token_binding(state: BAGELSessionContext) -> Any:
         binding = state.native_srt_u_context_token_binding
         if binding is None:
             raise BAGELAdapterError(
@@ -864,7 +875,7 @@ class BAGELInterleaveContextBackend:
         token_count = int(binding.token_count)
         if token_count <= 0:
             raise BAGELAdapterError("BAGEL native SRT U context token binding is empty")
-        return [token_count], [token_count]
+        return binding
 
     def _prepare_image(self, image: Any | None) -> Any | None:
         if image is None:
@@ -944,9 +955,13 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
         model_path: str,
         *,
         backend: BAGELBackendProtocol | None = None,
+        native_srt_denoise_executor: BAGELNativeSRTDenoiseExecutor | None = None,
     ) -> None:
         self.model_path = model_path
-        self.backend = backend or self._load_real_backend(model_path)
+        self.backend = backend or self._load_real_backend(
+            model_path,
+            native_srt_denoise_executor=native_srt_denoise_executor,
+        )
 
     def prefill_interleaved(
         self, *, session, messages: list[UGInterleavedMessage]
@@ -1000,7 +1015,11 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
         self.backend.close_session(session_id=session_id)
 
     @staticmethod
-    def _load_real_backend(model_path: str) -> BAGELBackendProtocol:
+    def _load_real_backend(
+        model_path: str,
+        *,
+        native_srt_denoise_executor: BAGELNativeSRTDenoiseExecutor | None = None,
+    ) -> BAGELBackendProtocol:
         checkpoint_dir = Path(model_path).expanduser()
         if not checkpoint_dir.exists():
             raise BAGELAdapterError(
@@ -1033,7 +1052,10 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
             )
 
         inferencer = _build_official_bagel_inferencer(checkpoint_dir)
-        return BAGELInterleaveContextBackend(inferencer)
+        return BAGELInterleaveContextBackend(
+            inferencer,
+            native_srt_denoise_executor=native_srt_denoise_executor,
+        )
 
 
 class MockBAGELBackend:
@@ -1117,10 +1139,17 @@ class MockBAGELBackend:
         self.events.append((event, session.handle.session_id))
 
 
-def create_bagel_ug_model_adapter(model_path: str) -> BAGELUGModelAdapter:
+def create_bagel_ug_model_adapter(
+    model_path: str,
+    *,
+    native_srt_denoise_executor: BAGELNativeSRTDenoiseExecutor | None = None,
+) -> BAGELUGModelAdapter:
     if "mock-bagel" in model_path.lower():
         return BAGELUGModelAdapter(model_path, backend=MockBAGELBackend())
-    return BAGELUGModelAdapter(model_path)
+    return BAGELUGModelAdapter(
+        model_path,
+        native_srt_denoise_executor=native_srt_denoise_executor,
+    )
 
 
 def _require_keys(

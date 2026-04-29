@@ -32,13 +32,14 @@ class _UGRuntimeTreeCache:
 
 
 def _build_srt_owned_ug_runtime(
-    model_runner=None, *, scheduler=None, srt_u_decode_max_new_tokens: int = 0
+    model_runner=None,
+    *,
+    scheduler=None,
+    srt_request_executor=None,
+    srt_u_decode_max_new_tokens: int = 0,
 ) -> UGSessionRuntime:
-    srt_request_executor = (
-        UGSRTSchedulerExecutor(scheduler)
-        if scheduler is not None
-        else UGSRTRequestBoundaryExecutor()
-    )
+    if srt_request_executor is None:
+        srt_request_executor = _build_srt_request_executor(scheduler)
     session_controller = (
         srt_request_executor.session_controller
         if scheduler is not None
@@ -55,6 +56,12 @@ def _build_srt_owned_ug_runtime(
     )
 
 
+def _build_srt_request_executor(scheduler=None):
+    if scheduler is not None:
+        return UGSRTSchedulerExecutor(scheduler)
+    return UGSRTRequestBoundaryExecutor()
+
+
 def _load_ug_bridge(
     model_path: str,
     *,
@@ -63,20 +70,31 @@ def _load_ug_bridge(
 ) -> UGDenoiserBridge:
     if srt_u_decode_max_new_tokens is None:
         srt_u_decode_max_new_tokens = 1 if scheduler is not None else 0
+    srt_request_executor = _build_srt_request_executor(scheduler)
     model_path_lower = model_path.lower()
     if "fake-ug" in model_path_lower:
         return SRTBackedUGDenoiserBridge(
             _build_srt_owned_ug_runtime(
                 scheduler=scheduler,
+                srt_request_executor=srt_request_executor,
                 srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
             )
         )
     if "bagel" in model_path_lower:
-        adapter = create_bagel_ug_model_adapter(model_path)
+        native_srt_denoise_executor = None
+        if scheduler is not None and "mock-bagel" not in model_path_lower:
+            native_srt_denoise_executor = (
+                srt_request_executor.create_bagel_native_srt_denoise_executor()
+            )
+        adapter = create_bagel_ug_model_adapter(
+            model_path,
+            native_srt_denoise_executor=native_srt_denoise_executor,
+        )
         return SRTBackedUGDenoiserBridge(
             _build_srt_owned_ug_runtime(
                 UGModelRunnerAdapter(adapter),
                 scheduler=scheduler,
+                srt_request_executor=srt_request_executor,
                 srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
             )
         )

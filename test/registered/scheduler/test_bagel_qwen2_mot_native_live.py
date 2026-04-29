@@ -116,6 +116,7 @@ class TestBAGELQwen2MoTNativeLive(CustomTestCase):
             UGInterleavedMessage,
             UGSessionRuntime,
         )
+        from sglang.srt.ug.bagel import BAGELNativeSRTPreparedDenoise
         from sglang.srt.ug.srt_executor import UGSRTSchedulerExecutor
         from sglang.srt.ug.bagel_checkpoint import (
             load_bagel_checkpoint_keys,
@@ -223,6 +224,61 @@ class TestBAGELQwen2MoTNativeLive(CustomTestCase):
                 self.assertTrue(
                     all(binding.token_count > 0 for binding in token_bindings)
                 )
+
+                latest_binding = token_bindings[-1]
+                req_slots_before = scheduler.req_to_token_pool.available_size()
+                kv_slots_before = scheduler.token_to_kv_pool_allocator.available_size()
+                native_denoise_executor = (
+                    executor.create_bagel_native_srt_denoise_executor()
+                )
+                prepared = BAGELNativeSRTPreparedDenoise(
+                    generation_input={
+                        "packed_text_ids": torch.tensor([1, 2], dtype=torch.long),
+                        "packed_text_indexes": torch.tensor([0, 3], dtype=torch.long),
+                        "packed_vae_token_indexes": torch.tensor(
+                            [1, 2], dtype=torch.long
+                        ),
+                        "packed_vae_position_ids": torch.tensor(
+                            [0, 1], dtype=torch.long
+                        ),
+                        "packed_seqlens": torch.tensor([4], dtype=torch.int32),
+                        "packed_position_ids": torch.arange(
+                            latest_binding.token_count,
+                            latest_binding.token_count + 4,
+                            dtype=torch.long,
+                        ),
+                        "packed_indexes": torch.arange(4, dtype=torch.long),
+                        "key_values_lens": torch.tensor(
+                            [latest_binding.token_count], dtype=torch.int32
+                        ),
+                        "packed_key_value_indexes": torch.arange(
+                            latest_binding.token_count, dtype=torch.long
+                        ),
+                    },
+                    srt_kv_token_binding=latest_binding,
+                )
+                velocity = native_denoise_executor.predict_velocity(
+                    prepared=prepared,
+                    latent_tokens=torch.zeros(
+                        2,
+                        64,
+                        dtype=torch.bfloat16,
+                        device=torch.device("cuda"),
+                    ),
+                    timestep=torch.tensor([0.5], device=torch.device("cuda")),
+                )
+
+                self.assertEqual(tuple(velocity.shape), (2, 64))
+                self.assertEqual(executor.temp_g_forward_count, 1)
+                self.assertEqual(executor.temp_g_allocated_token_count, 4)
+                self.assertEqual(
+                    scheduler.req_to_token_pool.available_size(), req_slots_before
+                )
+                self.assertGreaterEqual(
+                    scheduler.token_to_kv_pool_allocator.available_size(),
+                    kv_slots_before,
+                )
+                self.assertTrue(scheduler.is_fully_idle())
 
                 runtime.close_session(handle)
                 self.assertNotIn(
