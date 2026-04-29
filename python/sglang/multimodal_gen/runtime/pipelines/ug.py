@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
@@ -37,6 +37,7 @@ def _build_srt_owned_ug_runtime(
     scheduler=None,
     srt_request_executor=None,
     srt_u_decode_max_new_tokens: int = 0,
+    srt_image_tokenization: Literal["multimodal", "text_placeholder"] = "multimodal",
 ) -> UGSessionRuntime:
     if srt_request_executor is None:
         srt_request_executor = _build_srt_request_executor(scheduler)
@@ -53,6 +54,7 @@ def _build_srt_owned_ug_runtime(
         tokenizer=getattr(scheduler, "tokenizer", None),
         vocab_size=getattr(model_config, "vocab_size", 32000),
         srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
+        srt_image_tokenization=srt_image_tokenization,
     )
 
 
@@ -82,13 +84,16 @@ def _load_ug_bridge(
         )
     if "bagel" in model_path_lower:
         native_srt_denoise_executor = None
+        native_srt_u_context = False
         if scheduler is not None and "mock-bagel" not in model_path_lower:
             native_srt_denoise_executor = (
                 srt_request_executor.create_bagel_native_srt_denoise_executor()
             )
+            native_srt_u_context = True
         adapter = create_bagel_ug_model_adapter(
             model_path,
             native_srt_denoise_executor=native_srt_denoise_executor,
+            native_srt_u_context=native_srt_u_context,
         )
         return SRTBackedUGDenoiserBridge(
             _build_srt_owned_ug_runtime(
@@ -96,6 +101,9 @@ def _load_ug_bridge(
                 scheduler=scheduler,
                 srt_request_executor=srt_request_executor,
                 srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
+                srt_image_tokenization=(
+                    "text_placeholder" if native_srt_u_context else "multimodal"
+                ),
             )
         )
     raise ValueError(f"Unsupported UG model path: {model_path}")

@@ -106,6 +106,10 @@ class TestBAGELUGModelAdapter(unittest.TestCase):
                     )
 
         self.assertIs(adapter.backend.native_srt_denoise_executor, native_executor)
+        self.assertIsInstance(
+            adapter.backend.u_forward_bridge.srt_u_forward_executor,
+            BAGELNativeSRTUForwardExecutor,
+        )
 
     def test_load_bagel_bridge_wires_scheduler_executor_to_native_denoise(self):
         native_model = FakeNativeSRTVelocityModel()
@@ -124,12 +128,14 @@ class TestBAGELUGModelAdapter(unittest.TestCase):
 
         create.assert_called_once()
         native_executor = create.call_args.kwargs["native_srt_denoise_executor"]
+        self.assertTrue(create.call_args.kwargs["native_srt_u_context"])
         self.assertIs(native_executor.srt_model, native_model)
         self.assertIs(
             native_executor.forward_batch_provider.__self__,
             bridge.runtime.srt_request_executor,
         )
         self.assertIs(bridge.runtime.session_controller, scheduler.session_controller)
+        self.assertEqual(bridge.runtime.srt_image_tokenization, "text_placeholder")
 
     def test_mock_bagel_adapter_factory_runs_u_g_u_loop(self):
         adapter = create_bagel_ug_model_adapter("sglang-internal/mock-bagel")

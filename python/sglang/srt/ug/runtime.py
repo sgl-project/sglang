@@ -255,6 +255,9 @@ class UGSessionRuntime:
         tokenizer: Any | None = None,
         vocab_size: int = 32000,
         srt_u_decode_max_new_tokens: int = 0,
+        srt_image_tokenization: Literal[
+            "multimodal", "text_placeholder"
+        ] = "multimodal",
     ) -> None:
         self.model_runner = model_runner or FakeUGModelRunner()
         self.session_controller = session_controller
@@ -263,6 +266,7 @@ class UGSessionRuntime:
         self.tokenizer = tokenizer or _UGSimpleTokenizer()
         self.vocab_size = vocab_size
         self.srt_u_decode_max_new_tokens = srt_u_decode_max_new_tokens
+        self.srt_image_tokenization = srt_image_tokenization
         self._records: dict[str, UGSessionRecord] = {}
         register_observer = getattr(
             self.srt_request_executor,
@@ -796,9 +800,12 @@ class UGSessionRuntime:
                 text_parts.append(text)
                 input_ids.extend(self._text_token_ids(text))
             elif message.type == "image":
-                start = len(input_ids)
-                input_ids.extend([self.vocab_size + 1, self.vocab_size + 2])
-                mm_items.append(_UGSessionMMItem(offsets=[(start, len(input_ids))]))
+                if self.srt_image_tokenization == "text_placeholder":
+                    input_ids.extend(self._text_token_ids("<image>"))
+                else:
+                    start = len(input_ids)
+                    input_ids.extend([self.vocab_size + 1, self.vocab_size + 2])
+                    mm_items.append(_UGSessionMMItem(offsets=[(start, len(input_ids))]))
                 text_parts.append("<image>")
             else:
                 raise ValueError(f"Unsupported UG message type: {message.type}")

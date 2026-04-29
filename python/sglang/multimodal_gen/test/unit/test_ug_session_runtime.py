@@ -221,6 +221,42 @@ class TestUGSessionRuntime(unittest.TestCase):
         self.assertEqual(debug["srt_last_origin_input_ids"], [9, 11, 12])
         self.assertEqual(debug["srt_last_origin_input_len"], 3)
 
+    def test_text_placeholder_image_tokenization_avoids_srt_mm_inputs(self):
+        class EncodedTokenizer:
+            bos_token_id = 1
+
+            def __init__(self):
+                self.calls = []
+
+            def encode(self, text, add_special_tokens=False):
+                self.calls.append((text, add_special_tokens))
+                return {"<image>": [41], "hello": [42]}[text]
+
+        tokenizer = EncodedTokenizer()
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(),
+            session_controller=SessionController(FakeTreeCache()),
+            tokenizer=tokenizer,
+            vocab_size=128,
+            srt_image_tokenization="text_placeholder",
+        )
+
+        handle = runtime.prefill_interleaved(
+            [
+                UGInterleavedMessage(type="image", content=object()),
+                UGInterleavedMessage(type="text", content="hello"),
+            ],
+            session_id="placeholder-image",
+        )
+        debug = runtime.get_debug_counters(handle)
+
+        self.assertEqual(
+            tokenizer.calls,
+            [("<image>", False), ("hello", False)],
+        )
+        self.assertEqual(debug["srt_last_origin_input_ids"], [1, 41, 42])
+        self.assertEqual(debug["srt_mm_offsets"], [])
+
     def test_append_generated_image_uses_srt_session_offset_shift(self):
         controller = SessionController(FakeTreeCache())
         runtime = UGSessionRuntime(

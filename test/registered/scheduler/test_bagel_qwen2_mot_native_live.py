@@ -9,9 +9,12 @@ python3 test/registered/scheduler/test_bagel_qwen2_mot_native_live.py
 
 import json
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -26,6 +29,10 @@ register_cuda_ci(
 )
 
 _MODEL_ENV = "SGLANG_TEST_BAGEL_QWEN2_MOT_MODEL"
+_OFFICIAL_REPO_ENV = "SGLANG_TEST_BAGEL_OFFICIAL_REPO"
+_GLOBAL_ARGS_PATCH = (
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.base." "get_global_server_args"
+)
 
 
 class _NoopSender:
@@ -94,6 +101,46 @@ def _write_language_model_view(checkpoint_dir: Path, output_dir: Path) -> Path:
     (output_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
     os.symlink(weight_path, output_dir / "model.safetensors")
     return output_dir
+
+
+def _maybe_add_official_bagel_repo_to_path() -> None:
+    candidates = []
+    configured = os.getenv(_OFFICIAL_REPO_ENV)
+    if configured:
+        candidates.append(Path(configured))
+    candidates.append(Path("/data/BAGEL"))
+
+    for candidate in candidates:
+        if not candidate.exists():
+            continue
+        if not (candidate / "inferencer.py").exists():
+            continue
+        candidate_str = str(candidate)
+        if candidate_str not in sys.path:
+            sys.path.insert(0, candidate_str)
+        return
+
+
+def _make_ug_pipeline_server_args(scheduler) -> SimpleNamespace:
+    from sglang.multimodal_gen.configs.pipeline_configs.ug import UGPipelineConfig
+    from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
+
+    return SimpleNamespace(
+        pipeline_config=UGPipelineConfig(
+            default_height=32,
+            default_width=32,
+            latent_downsample=16,
+            latent_patch_size=2,
+            latent_channel=16,
+        ),
+        num_gpus=1,
+        enable_cfg_parallel=False,
+        disagg_mode=False,
+        disagg_role=RoleType.MONOLITHIC,
+        comfyui_mode=True,
+        ug_srt_scheduler=scheduler,
+        ug_srt_u_decode_max_new_tokens=1,
+    )
 
 
 @unittest.skipUnless(os.getenv(_MODEL_ENV), f"Set {_MODEL_ENV} for live smoke")
@@ -285,6 +332,157 @@ class TestBAGELQwen2MoTNativeLive(CustomTestCase):
                     handle.session_id, scheduler.session_controller.sessions
                 )
             finally:
+                if dist.is_available() and dist.is_initialized():
+                    dist.destroy_process_group()
+                torch.cuda.empty_cache()
+
+    def test_full_ug_pipeline_uses_native_srt_g_velocity(self):
+        import importlib.util
+
+        import torch
+        import torch.distributed as dist
+        from PIL import Image
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for the BAGEL native pipeline live smoke")
+
+        _maybe_add_official_bagel_repo_to_path()
+        if importlib.util.find_spec("inferencer") is None:
+            self.skipTest(
+                "Set SGLANG_TEST_BAGEL_OFFICIAL_REPO to the official BAGEL repo "
+                "for the full BAGEL pipeline smoke"
+            )
+
+        from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
+        from sglang.multimodal_gen.runtime.pipelines.ug import UGPipeline
+        from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
+            SyncExecutor,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.server_args import (
+            PortArgs,
+            ServerArgs,
+            set_global_server_args_for_scheduler,
+        )
+
+        checkpoint_dir = Path(os.environ[_MODEL_ENV])
+        contexts = None
+        bridge = None
+        scheduler = None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = _write_language_model_view(checkpoint_dir, Path(tmpdir))
+            server_args = ServerArgs(
+                model_path=str(model_path),
+                tokenizer_path=str(checkpoint_dir),
+                trust_remote_code=True,
+                dtype="bfloat16",
+                tp_size=1,
+                pp_size=1,
+                dp_size=1,
+                disable_cuda_graph=True,
+                disable_piecewise_cuda_graph=True,
+                disable_overlap_schedule=True,
+                skip_server_warmup=True,
+                mem_fraction_static=float(
+                    os.getenv("SGLANG_TEST_BAGEL_QWEN2_MOT_MEM_FRACTION", "0.35")
+                ),
+                chunked_prefill_size=int(
+                    os.getenv("SGLANG_TEST_BAGEL_QWEN2_MOT_CHUNKED_PREFILL", "256")
+                ),
+                log_level="error",
+            )
+            server_args.check_server_args()
+            set_global_server_args_for_scheduler(server_args)
+
+            scheduler = Scheduler(
+                server_args,
+                PortArgs.init_new(server_args),
+                gpu_id=int(os.getenv("SGLANG_TEST_BAGEL_QWEN2_MOT_GPU_ID", "0")),
+                tp_rank=0,
+                moe_ep_rank=0,
+                pp_rank=0,
+                attn_cp_rank=0,
+                moe_dp_rank=0,
+                dp_rank=None,
+            )
+            _replace_sender_with_noop(scheduler, "send_to_tokenizer")
+            _replace_sender_with_noop(scheduler, "send_to_detokenizer")
+
+            try:
+                diffusion_args = _make_ug_pipeline_server_args(scheduler)
+                with patch(_GLOBAL_ARGS_PATCH, return_value=diffusion_args):
+                    pipeline = UGPipeline(
+                        str(checkpoint_dir),
+                        diffusion_args,
+                        executor=SyncExecutor(diffusion_args),
+                    )
+
+                bridge = pipeline.get_module("ug_bridge")
+                runtime = bridge.runtime
+                srt_executor = runtime.srt_request_executor
+                native_executor = (
+                    runtime.model_runner.adapter.backend.native_srt_denoise_executor
+                )
+                req_slots_before = scheduler.req_to_token_pool.available_size()
+                num_inference_steps = 3
+
+                result = pipeline.forward(
+                    Req(
+                        sampling_params=UGSamplingParams(
+                            prompt="draw a small lantern, then describe it",
+                            width=32,
+                            height=32,
+                            seed=123,
+                            num_inference_steps=num_inference_steps,
+                            cfg_text_scale=1.0,
+                            cfg_img_scale=1.0,
+                            cfg_interval=[0.0, 1.0],
+                            return_trajectory_latents=True,
+                            suppress_logs=True,
+                        ),
+                        condition_image=Image.new("RGB", (16, 16), color="white"),
+                    ),
+                    diffusion_args,
+                )
+                contexts = result.extra["ug_contexts"]
+                session = contexts.full.session
+                counters = runtime.get_debug_counters(session)
+
+                self.assertEqual(tuple(result.output.shape), (1, 32, 32, 3))
+                self.assertEqual(result.extra["ug_post_image_segment"].type, "text")
+                self.assertEqual(contexts.full.session.session_id, session.session_id)
+                self.assertEqual(counters["prefill_count"], 1)
+                self.assertEqual(counters["velocity_count"], num_inference_steps - 1)
+                self.assertEqual(counters["append_image_count"], 1)
+                self.assertEqual(counters["decode_count"], 2)
+                self.assertEqual(counters["srt_request_count"], 4)
+                self.assertEqual(counters["srt_u_decode_request_count"], 2)
+                self.assertEqual(counters["srt_executed_request_count"], 4)
+                self.assertEqual(
+                    srt_executor.temp_g_forward_count,
+                    num_inference_steps - 1,
+                )
+                self.assertEqual(
+                    native_executor.velocity_count,
+                    num_inference_steps - 1,
+                )
+                self.assertGreater(srt_executor.temp_g_allocated_token_count, 0)
+                self.assertTrue(scheduler.is_fully_idle())
+
+                bridge.release_contexts(contexts)
+                contexts = None
+                closed = runtime.get_debug_counters(session.session_id)
+                self.assertTrue(closed["closed"])
+                self.assertEqual(closed["state"], "done")
+                self.assertGreaterEqual(
+                    scheduler.req_to_token_pool.available_size(),
+                    req_slots_before,
+                )
+                self.assertTrue(scheduler.is_fully_idle())
+            finally:
+                if bridge is not None and contexts is not None:
+                    bridge.release_contexts(contexts)
                 if dist.is_available() and dist.is_initialized():
                     dist.destroy_process_group()
                 torch.cuda.empty_cache()

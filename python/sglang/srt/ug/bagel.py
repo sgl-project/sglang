@@ -432,9 +432,8 @@ class BAGELNativeSRTUForwardExecutor(BAGELSRTUForwardExecutor):
     """Consumes U-prefill views produced by native SRT BAGEL forward.
 
     This executor deliberately does not call official BAGEL
-    `update_context_text`. It marks the session as SRT-owned and leaves G
-    denoise disabled until the native generation branch is wired into SRT
-    ForwardBatch.
+    `update_context_text`. It marks the session as SRT-owned so the G denoise
+    path can reuse SRT KV through a native generation ForwardBatch.
     """
 
     def execute(
@@ -956,11 +955,15 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
         *,
         backend: BAGELBackendProtocol | None = None,
         native_srt_denoise_executor: BAGELNativeSRTDenoiseExecutor | None = None,
+        native_srt_u_context: bool | None = None,
     ) -> None:
         self.model_path = model_path
+        if native_srt_u_context is None:
+            native_srt_u_context = native_srt_denoise_executor is not None
         self.backend = backend or self._load_real_backend(
             model_path,
             native_srt_denoise_executor=native_srt_denoise_executor,
+            native_srt_u_context=native_srt_u_context,
         )
 
     def prefill_interleaved(
@@ -1019,6 +1022,7 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
         model_path: str,
         *,
         native_srt_denoise_executor: BAGELNativeSRTDenoiseExecutor | None = None,
+        native_srt_u_context: bool = False,
     ) -> BAGELBackendProtocol:
         checkpoint_dir = Path(model_path).expanduser()
         if not checkpoint_dir.exists():
@@ -1052,8 +1056,14 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
             )
 
         inferencer = _build_official_bagel_inferencer(checkpoint_dir)
+        u_forward_bridge = None
+        if native_srt_u_context:
+            u_forward_bridge = BAGELUForwardBridge(
+                srt_u_forward_executor=BAGELNativeSRTUForwardExecutor()
+            )
         return BAGELInterleaveContextBackend(
             inferencer,
+            u_forward_bridge=u_forward_bridge,
             native_srt_denoise_executor=native_srt_denoise_executor,
         )
 
@@ -1143,12 +1153,16 @@ def create_bagel_ug_model_adapter(
     model_path: str,
     *,
     native_srt_denoise_executor: BAGELNativeSRTDenoiseExecutor | None = None,
+    native_srt_u_context: bool | None = None,
 ) -> BAGELUGModelAdapter:
     if "mock-bagel" in model_path.lower():
         return BAGELUGModelAdapter(model_path, backend=MockBAGELBackend())
+    if native_srt_u_context is None:
+        native_srt_u_context = native_srt_denoise_executor is not None
     return BAGELUGModelAdapter(
         model_path,
         native_srt_denoise_executor=native_srt_denoise_executor,
+        native_srt_u_context=native_srt_u_context,
     )
 
 
