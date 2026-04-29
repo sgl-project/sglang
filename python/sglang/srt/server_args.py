@@ -301,6 +301,49 @@ def add_rl_on_policy_target_choices(choices):
     RL_ON_POLICY_TARGET_CHOICES.extend(choices)
 
 
+def _resolve_speculative_algorithm_alias(
+    speculative_algorithm: Optional[str],
+    speculative_draft_model_path: Optional[str],
+) -> Optional[str]:
+    """Resolve CLI speculative algorithm; NEXTN/EAGLE may become FROZEN_KV_MTP for Gemma4 assistant drafts."""
+
+    is_gemma4_draft = False
+    if speculative_draft_model_path:
+        from transformers import AutoConfig
+
+        cfg = AutoConfig.from_pretrained(
+            speculative_draft_model_path, trust_remote_code=True
+        )
+        is_gemma4_draft = "Gemma4AssistantForCausalLM" in (
+            getattr(cfg, "architectures", None) or []
+        )
+
+    if speculative_algorithm == "EAGLE3" and is_gemma4_draft:
+        raise ValueError(
+            "Gemma4AssistantForCausalLM draft requires "
+            "--speculative-algorithm NEXTN (FROZEN_KV_MTP); EAGLE3 is "
+            "not supported for this draft architecture."
+        )
+
+    if speculative_algorithm == "NEXTN":
+        if is_gemma4_draft:
+            logger.info(
+                "speculative: detected Gemma4AssistantForCausalLM draft; "
+                "promoting --speculative-algorithm NEXTN to FROZEN_KV_MTP."
+            )
+            return "FROZEN_KV_MTP"
+        return "EAGLE"
+
+    if speculative_algorithm == "EAGLE" and is_gemma4_draft:
+        logger.info(
+            "speculative: detected Gemma4AssistantForCausalLM draft with "
+            "--speculative-algorithm EAGLE; promoting to FROZEN_KV_MTP."
+        )
+        return "FROZEN_KV_MTP"
+
+    return speculative_algorithm
+
+
 @dataclasses.dataclass
 class ServerArgs:
     """
@@ -3276,8 +3319,10 @@ class ServerArgs:
                 self.speculative_moe_runner_backend
             ).is_flashinfer_trtllm(), "Currently speculative MoE runner backend doesn't support flashinfer_trtllm, please use triton or auto backend for speculative moe runner instead."
 
-        if self.speculative_algorithm == "NEXTN":
-            self.speculative_algorithm = "EAGLE"
+        self.speculative_algorithm = _resolve_speculative_algorithm_alias(
+            self.speculative_algorithm,
+            self.speculative_draft_model_path,
+        )
 
         if self.speculative_skip_dp_mlp_sync:
             assert self.speculative_algorithm == "EAGLE", (

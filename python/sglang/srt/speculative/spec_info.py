@@ -13,11 +13,16 @@ if TYPE_CHECKING:
 
 
 class SpeculativeAlgorithm(Enum):
-    """Enumeration of speculative decoding algorithms."""
+    """Speculative decoding algorithms.
+
+    ``FROZEN_KV_MTP`` reuses EAGLE verify plumbing (``is_eagle()`` true) but
+    reads only target KV; see ``is_frozen_kv_mtp()``.
+    """
 
     DFLASH = auto()
     EAGLE = auto()
     EAGLE3 = auto()
+    FROZEN_KV_MTP = auto()
     STANDALONE = auto()
     NGRAM = auto()
     NONE = auto()
@@ -38,11 +43,19 @@ class SpeculativeAlgorithm(Enum):
         return self != SpeculativeAlgorithm.NONE
 
     def is_eagle(self) -> bool:
-        # NOTE: EAGLE3 is a variant of EAGLE
-        return self == SpeculativeAlgorithm.EAGLE or self == SpeculativeAlgorithm.EAGLE3
+        # EAGLE3 variant; FROZEN_KV_MTP shares verify-input contract — use
+        # is_frozen_kv_mtp / is_eagle3 where semantics matter.
+        return self in (
+            SpeculativeAlgorithm.EAGLE,
+            SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.FROZEN_KV_MTP,
+        )
 
     def is_eagle3(self) -> bool:
         return self == SpeculativeAlgorithm.EAGLE3
+
+    def is_frozen_kv_mtp(self) -> bool:
+        return self == SpeculativeAlgorithm.FROZEN_KV_MTP
 
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
@@ -73,6 +86,20 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.dflash_worker import DFlashWorker
 
             return DFlashWorker
+
+        if self.is_frozen_kv_mtp():
+            if enable_overlap:
+                from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import (
+                    FrozenKVMTPWorkerV2,
+                )
+
+                return FrozenKVMTPWorkerV2
+
+            from sglang.srt.speculative.frozen_kv_mtp_worker import (
+                FrozenKVMTPWorker,
+            )
+
+            return FrozenKVMTPWorker
 
         if self.is_eagle() and server_args.enable_multi_layer_eagle:
             # FIXME: migrate to EagleWorker
