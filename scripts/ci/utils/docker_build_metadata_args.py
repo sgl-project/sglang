@@ -48,7 +48,6 @@ def build_arg_tokens(
     image_repo: str,
     version: str,
     build_commit: str,
-    build_pipeline: str,
     build_url: str,
     date: str,
     short_sha: str,
@@ -56,7 +55,6 @@ def build_arg_tokens(
     image_tag = select_tag(tag_config, cuda, version, date, short_sha)
     build_args = {
         "SGLANG_BUILD_COMMIT": build_commit,
-        "SGLANG_BUILD_PIPELINE": build_pipeline,
         "SGLANG_BUILD_URL": build_url,
         "SGLANG_IMAGE_TAG": f"{image_repo}:{image_tag}",
     }
@@ -80,7 +78,6 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Commit checked out for the Docker build.",
     )
-    parser.add_argument("--build-pipeline", default="local", help="CI pipeline name.")
     parser.add_argument("--build-url", default="", help="CI run URL.")
     parser.add_argument(
         "--date",
@@ -106,7 +103,6 @@ def main() -> int:
             image_repo=args.image_repo,
             version=args.sgl_version,
             build_commit=args.build_commit,
-            build_pipeline=args.build_pipeline,
             build_url=args.build_url,
             date=args.date,
             short_sha=short_sha,

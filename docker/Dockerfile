@@ -598,7 +598,6 @@ ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
 ARG SGLANG_BUILD_COMMIT=unknown
-ARG SGLANG_BUILD_PIPELINE=local
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
 
@@ -645,7 +644,6 @@ WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
-    SGLANG_BUILD_PIPELINE=${SGLANG_BUILD_PIPELINE:-local} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
 LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
@@ -653,7 +651,6 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
-      ai.sglang.build.pipeline="${SGLANG_BUILD_PIPELINE}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
@@ -681,7 +678,6 @@ ARG CUDA_VERSION
 ARG TARGETARCH
 ARG GDRCOPY_VERSION=2.5.1
 ARG SGLANG_BUILD_COMMIT=unknown
-ARG SGLANG_BUILD_PIPELINE=local
 ARG SGLANG_BUILD_URL=
 ARG SGLANG_IMAGE_TAG=local/sglang:dev
 
@@ -806,7 +802,6 @@ WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
-    SGLANG_BUILD_PIPELINE=${SGLANG_BUILD_PIPELINE:-local} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
 LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
@@ -814,7 +809,6 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
       org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
       org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
       ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
-      ai.sglang.build.pipeline="${SGLANG_BUILD_PIPELINE}" \
       ai.sglang.build.url="${SGLANG_BUILD_URL}" \
       ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 

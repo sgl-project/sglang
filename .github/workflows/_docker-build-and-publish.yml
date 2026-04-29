@@ -76,7 +76,6 @@ jobs:
               --image-repo "${IMAGE_REPO}" \
               --sgl-version "${SGL_VERSION}" \
               --build-commit "${BUILD_COMMIT}" \
-              --build-pipeline "${GITHUB_WORKFLOW}" \
               --build-url "${BUILD_URL}" \
               > "/tmp/docker-metadata-${CUDA_VARIANT}.args"
           done
@@ -200,7 +199,6 @@ jobs:
               --image-repo "${IMAGE_REPO}" \
               --sgl-version "${SGL_VERSION}" \
               --build-commit "${BUILD_COMMIT}" \
-              --build-pipeline "${GITHUB_WORKFLOW}" \
               --build-url "${BUILD_URL}" \
               > "/tmp/docker-metadata-${CUDA_VARIANT}.args"
           done
