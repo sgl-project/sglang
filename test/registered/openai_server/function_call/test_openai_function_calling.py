@@ -552,6 +552,7 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
                         },
                         "required": ["city"],
                     },
+                    "strict": True,
                 },
             },
         ]

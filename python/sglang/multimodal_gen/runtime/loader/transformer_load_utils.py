@@ -186,26 +186,13 @@ class _ModelOptFp8OffloadAdapter(_TransformerQuantAdapter):
         if quant_name != "modelopt_fp8":
             return
 
-        disabled_args: list[str] = []
-
         if server_args.dit_cpu_offload:
             server_args.dit_cpu_offload = False
-            disabled_args.append("dit_cpu_offload")
-
-        if server_args.dit_layerwise_offload:
-            server_args.dit_layerwise_offload = False
-            disabled_args.append("dit_layerwise_offload")
-
-        if not disabled_args:
-            return
-
-        logger.warning(
-            "ModelOpt FP8 diffusion checkpoints currently require the transformer "
-            "FP8 weights to stay GPU-resident in their column-major layout; "
-            "disabling %s for this run. Text encoder / VAE offload settings are "
-            "left unchanged.",
-            ", ".join(disabled_args),
-        )
+            logger.warning(
+                "ModelOpt FP8 diffusion checkpoints currently keep dit_cpu_offload "
+                "disabled. Layerwise DiT offload stays enabled because the runtime "
+                "now preserves the restored FP8 tensor strides.",
+            )
 
     def prepare(self) -> None:
         _ModelOptFp8OffloadAdapter._maybe_disable_incompatible_dit_offload_modes(

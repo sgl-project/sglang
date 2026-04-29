@@ -198,6 +198,9 @@ def _get_quantization_config(
     packed_modules_mapping = getattr(model_class, "packed_modules_mapping", {})
     remap_prefix = getattr(model_class, "remap_prefix", None)
     # TODO: we should remove this code and switch to the packed_modules_mapping declared inside the modeling files
+    if model_config.quantization == "quark":
+        packed_modules_mapping.update({"gate_up_proj": ["gate_proj", "up_proj"]})
+
     if _is_npu:
         packed_modules_mapping.update(
             {

@@ -136,6 +136,21 @@
             }
         },
         {
+            "id": "ltx2.3_twostage_ti2v_2gpus",
+            "model": "Lightricks/LTX-2.3",
+            "task": "image-to-video",
+            "prompt": "The cat starts walking slowly towards the camera.",
+            "num_frames": 121,
+            "seed": 42,
+            "num_gpus": 2,
+            "frameworks": {
+                "sglang": {
+                    "serve_args": "--enable-torch-compile --warmup --pipeline-class-name LTX2TwoStagePipeline",
+                    "extra_env": {}
+                }
+            }
+        },
+        {
             "id": "wan22_i2v_a14b_720p",
             "model": "Wan-AI/Wan2.2-I2V-A14B-Diffusers",
             "task": "image-to-video",

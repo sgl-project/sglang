@@ -1090,12 +1090,14 @@ class TokenizerCommunicatorMixin:
         elif obj.session_id in self.session_futures:
             return None
 
+        future = asyncio.Future()
+        self.session_futures[obj.session_id] = future
         self.send_to_scheduler.send_pyobj(obj)
 
-        self.session_futures[obj.session_id] = asyncio.Future()
-        session_id = await self.session_futures[obj.session_id]
-        del self.session_futures[obj.session_id]
-        return session_id
+        try:
+            return await future
+        finally:
+            self.session_futures.pop(obj.session_id, None)
 
     async def close_session(
         self: TokenizerManager,

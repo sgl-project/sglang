@@ -507,6 +507,16 @@ class PrefillAdder:
         return available_and_evictable - self.cur_rem_token_offset
 
     def _swa_budget_for_req(self, extend_input_len: int) -> int:
+        """SWA pool budget per request. Only valid when is_hybrid_swa is True.
+
+        With chunked prefill + overlap scheduler, the peak SWA occupancy is:
+          chunk N (running, not yet in tree) + sliding window (locked in tree)
+          + chunk N+1 (new allocation)
+        Since chunk N and locked tokens are already excluded from
+        swa_available + swa_evictable, the budget only needs to cover the
+        chunk N+1 allocation. We floor at sliding_window_size to reserve
+        room for the decode phase.
+        """
         if self.rem_chunk_tokens is not None:
             alloc = min(extend_input_len, self.rem_chunk_tokens)
         else:
@@ -625,9 +635,14 @@ class PrefillAdder:
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
+                # alloc_extend needs extend_num_tokens + page_size per request,
+                # so reserve one page here to avoid OOM (matches main #23174,
+                # cherry-picked into fork before this merge target).
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
+            # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
+            # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
                 if self.is_hybrid_swa:
                     # skip to avoid alloc_extend OOM
@@ -792,14 +807,11 @@ class PrefillAdder:
         # _update_prefill_budget already accounts for this in the deduction.
         # Without this, admission is more optimistic than the actual budget
         # deduction, allowing over-admission when the pool is nearly full.
-        total_tokens = (
-            req.extend_input_len
-            + min(
-                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-                CLIP_MAX_NEW_TOKENS,
-            )
-            + self.page_size
+        max_new = min(
+            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+            CLIP_MAX_NEW_TOKENS,
         )
+        total_tokens = req.extend_input_len + max_new + self.page_size
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length

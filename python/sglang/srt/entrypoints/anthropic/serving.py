@@ -36,6 +36,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ToolChoice,
     ToolChoiceFuncName,
 )
+from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
@@ -313,7 +314,7 @@ class AnthropicServing:
         raw_request: Request,
     ) -> JSONResponse:
         """Handle non-streaming Anthropic request by delegating to OpenAI handler."""
-        received_time = time.time()
+        received_time = monotonic_time()
         received_time_perf = time.perf_counter()
 
         # Validate
@@ -369,7 +370,7 @@ class AnthropicServing:
         raw_request: Request,
     ) -> Union[StreamingResponse, JSONResponse]:
         """Handle streaming Anthropic request."""
-        received_time = time.time()
+        received_time = monotonic_time()
         received_time_perf = time.perf_counter()
 
         # Validate

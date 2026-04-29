@@ -27,7 +27,7 @@ Before running any benchmark, profiler, or kernel-validation command:
 
 ## Main Reference
 
-- [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses the checked-in nightly-aligned presets, including `LTX-2` two-stage
+- [benchmark-and-profile.md](benchmark-and-profile.md) — canonical denoise benchmark, perf dump, and `torch.profiler` workflow; uses the checked-in nightly-aligned presets, plus `LTX-2`, `LTX-2.3` one-stage, and `LTX-2.3` two-stage benchmark recipes
 - [existing-fast-paths.md](existing-fast-paths.md) — map bottlenecks to existing fused kernels, packed QKV paths, fused `QK norm + RoPE`, and distributed overlap patterns before proposing new code
 - [scripts/diffusion_skill_env.py](scripts/diffusion_skill_env.py) — preflight helper: repo root discovery via `sglang.__file__`, write-access probe, benchmark/profile output directories, idle GPU selection
 - [scripts/bench_diffusion_denoise.py](scripts/bench_diffusion_denoise.py) — end-to-end denoise benchmark preset runner via `sglang generate`; use `--list-models` to inspect preset order, then save perf dumps by label and compare them with `compare_perf.py`

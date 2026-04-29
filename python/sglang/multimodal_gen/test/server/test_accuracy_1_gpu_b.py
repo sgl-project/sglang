@@ -10,10 +10,10 @@ from sglang.multimodal_gen.test.server.accuracy_utils import (
     run_text_encoder_accuracy_case,
 )
 from sglang.multimodal_gen.test.server.component_accuracy import AccuracyEngine
-from sglang.multimodal_gen.test.server.testcase_configs import ONE_GPU_CASES_B
+from sglang.multimodal_gen.test.server.testcase_configs import ACCURACY_ONE_GPU_CASES_B
 
 
-@pytest.mark.parametrize("case", ONE_GPU_CASES_B, ids=lambda x: x.id)
+@pytest.mark.parametrize("case", ACCURACY_ONE_GPU_CASES_B, ids=lambda x: x.id)
 class TestAccuracy1GPU_B:
     """1-GPU Component Accuracy Suite (Set B)."""
 

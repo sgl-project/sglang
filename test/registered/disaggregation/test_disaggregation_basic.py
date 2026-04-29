@@ -10,6 +10,7 @@ import requests
 from transformers import AutoTokenizer
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -23,11 +24,13 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=394, suite="stage-b-test-2-gpu-large")
 
 
-class TestDisaggregationAccuracy(PDDisaggregationServerBase):
+class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.pause_generate_url = cls.lb_url
+        cls.pause_target_urls = [cls.prefill_url, cls.decode_url]
         cls.launch_all()
 
     def test_gsm8k(self):

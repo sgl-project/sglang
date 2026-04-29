@@ -163,6 +163,7 @@ class HybridCacheController(BaseHiCacheController):
         pp_rank: int = 0,
         pp_size: int = 1,
         transfer_layer_num: Optional[int] = None,
+        enable_storage_metrics: bool = False,
     ):
         startup_storage_backend = storage_backend
         super().__init__(
@@ -179,6 +180,7 @@ class HybridCacheController(BaseHiCacheController):
             storage_backend_extra_config=storage_backend_extra_config,
             pp_rank=pp_rank,
             pp_size=pp_size,
+            enable_storage_metrics=enable_storage_metrics,
         )
         # Override layer_num: hybrid models transfer all layers (For example, Linear Model (KV + Mamba)),
         # not just the full attention layers reported by full_kv_pool.
@@ -230,7 +232,10 @@ class HybridCacheController(BaseHiCacheController):
         if host_indices is None:
             return None
         pool_transfers = self._resolve_pool_transfers_allocation(
-            extra_pools, alloc_host=True
+            extra_pools,
+            alloc_host=True,
+            kv_device_indices=device_indices,
+            kv_host_indices=host_indices,
         )
         if pool_transfers is None and extra_pools:
             self.mem_pool_host.free(host_indices)
@@ -289,7 +294,10 @@ class HybridCacheController(BaseHiCacheController):
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
 
         pool_transfers = self._resolve_pool_transfers_allocation(
-            extra_pools, alloc_host=False
+            extra_pools,
+            alloc_host=False,
+            kv_device_indices=device_indices,
+            kv_host_indices=host_indices,
         )
         if pool_transfers is None and extra_pools:
             if need_load_kv:
@@ -415,6 +423,7 @@ class HybridCacheController(BaseHiCacheController):
     def _page_transfer(self, operation):
         # Transfer extra pools
         if operation.pool_transfers and not operation.is_terminated():
+            self._resolve_shared_pool_transfers(operation)
             results = self.storage_backend.batch_get_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
@@ -424,11 +433,19 @@ class HybridCacheController(BaseHiCacheController):
     def _page_backup(self, operation):
         # Backup extra pools
         if operation.pool_transfers:
+            self._resolve_shared_pool_transfers(operation)
             results = self.storage_backend.batch_set_v2(operation.pool_transfers)
             operation.pool_storage_result.update_extra_pool_hit_pages(results)
 
         # Backup kv pools
         super()._page_backup(operation)
+
+    def _resolve_shared_pool_transfers(self, operation):
+        for transfer in operation.pool_transfers:
+            entry = self.mem_pool_host.entry_map.get(transfer.name)
+            if entry.share_indices_with_anchor:
+                transfer.keys = operation.hash_value
+                transfer.host_indices = operation.host_indices
 
     def _sync_trailing_keys(
         self,
@@ -454,6 +471,8 @@ class HybridCacheController(BaseHiCacheController):
         self,
         extra_pools: Optional[list[PoolTransfer]],
         alloc_host: bool,
+        kv_device_indices: Optional[torch.Tensor] = None,
+        kv_host_indices: Optional[torch.Tensor] = None,
     ) -> Optional[list[PoolTransfer]]:
         """Auto-alloc host or device indices for PoolTransfers where they are None."""
         if not extra_pools:
@@ -462,6 +481,10 @@ class HybridCacheController(BaseHiCacheController):
         for pool in extra_pools:
             entry = self.mem_pool_host.entry_map.get(pool.name)
             if entry is None:
+                continue
+            if entry.share_indices_with_anchor:
+                pool.device_indices = kv_device_indices
+                pool.host_indices = kv_host_indices
                 continue
             if alloc_host:
                 if pool.host_indices is not None or pool.device_indices is None:

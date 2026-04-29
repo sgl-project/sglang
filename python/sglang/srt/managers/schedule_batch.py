@@ -2520,12 +2520,23 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
                 and hasattr(self.tree_cache, "dec_swa_lock_only")
             )
+
+            # Eviction_interval: trade-off between SWA token waste and eviction overhead
+            page_size = self.tree_cache.page_size
+            eviction_interval = max(
+                page_size,
+                int(
+                    sliding_window_size
+                    * envs.SGLANG_SWA_EVICTION_INTERVAL_MULTIPLIER.get()
+                ),
+            )
+            eviction_interval = (eviction_interval // page_size) * page_size
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
                     # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict swa every window_size tokens to reduce the overhead.
-                    if req.decode_batch_idx % sliding_window_size == 1:
+                    # 2. Evict swa every eviction_interval tokens to reduce the overhead.
+                    if req.decode_batch_idx % eviction_interval == 1:
                         self._evict_swa(req, req.seqlen - 1)
 
                     # Once the decode position has moved past the sliding window,

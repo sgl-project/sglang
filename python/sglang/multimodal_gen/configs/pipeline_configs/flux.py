@@ -81,6 +81,13 @@ class FluxPipelineConfig(ImagePipelineConfig):
         ]
     )
 
+    def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
+        # Flux v1 does not use attention masks for text encoders.
+        return None
+
+    def get_text_encoder_pooler_output(self, outputs, encoder_index):
+        return outputs.pooler_output
+
     def prepare_sigmas(self, sigmas, num_inference_steps):
         return self._prepare_sigmas(sigmas, num_inference_steps)
 
@@ -390,6 +397,14 @@ class Flux2PipelineConfig(FluxPipelineConfig):
             )
         ]
     )
+
+    def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
+        # Flux2 uses standard attention masks (unlike Flux v1).
+        return text_inputs.get("attention_mask")
+
+    def get_text_encoder_pooler_output(self, outputs, encoder_index):
+        # Flux2 does not use pooler output.
+        return None
 
     def tokenize_prompt(self, prompts: list[str], tokenizer, tok_kwargs) -> dict:
         messages = build_flux2_text_messages(prompts)

@@ -61,6 +61,12 @@ class LTX2AVLatentPreparationStage(LatentPreparationStage):
         batch: Req,
         server_args: ServerArgs,
     ):
+        if is_ltx23_native_variant(server_args.pipeline_config.vae_config.arch_config):
+            if server_args.pipeline_class_name == "LTX2TwoStagePipeline":
+                return server_args.pipeline_config.get_latent_dtype(
+                    batch.prompt_embeds[0].dtype
+                )
+            return torch.float32
         return torch.float32
 
     @staticmethod

@@ -12,7 +12,7 @@ Usage:
     # Tag the run for later compare_perf.py usage
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --model flux --label tuned
 
-    # All 12 preset models
+    # All 14 preset models
     python3 python/sglang/multimodal_gen/.claude/skills/sglang-diffusion-benchmark-profile/scripts/bench_diffusion_denoise.py --all
 
     # Show preset order, model path, and nightly mapping
@@ -193,6 +193,39 @@ MODELS = {
         ],
     },
     # 10. Skill-only extra preset
+    "ltx23-one-stage": {
+        "path": "Lightricks/LTX-2.3",
+        "prompt": "A beautiful sunset over the ocean",
+        "negative_prompt": "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static.",
+        "seed": 1234,
+        "extra_args": [
+            "--width=768",
+            "--height=512",
+            "--num-frames=121",
+            "--fps=24",
+            "--num-inference-steps=30",
+            "--guidance-scale=3.0",
+            "--num-gpus=2",
+        ],
+    },
+    # 11. Skill-only extra preset
+    "ltx23-two-stage": {
+        "path": "Lightricks/LTX-2.3",
+        "prompt": "A beautiful sunset over the ocean",
+        "negative_prompt": "shaky, glitchy, low quality, worst quality, deformed, distorted, disfigured, motion smear, motion artifacts, fused fingers, bad anatomy, weird hand, ugly, transition, static.",
+        "seed": 1234,
+        "extra_args": [
+            "--pipeline-class-name=LTX2TwoStagePipeline",
+            "--width=1536",
+            "--height=1024",
+            "--num-frames=121",
+            "--fps=24",
+            "--num-inference-steps=30",
+            "--guidance-scale=3.0",
+            "--num-gpus=2",
+        ],
+    },
+    # 12. Skill-only extra preset
     "hunyuanvideo": {
         "path": "hunyuanvideo-community/HunyuanVideo",
         "prompt": "A cat and a dog baking a cake together in a kitchen. The cat is carefully measuring flour, while the dog is stirring the batter with a wooden spoon. The kitchen is cozy, with sunlight streaming through the window.",
@@ -205,7 +238,7 @@ MODELS = {
             "--num-inference-steps=30",
         ],
     },
-    # 11. Skill-only extra preset
+    # 13. Skill-only extra preset
     # Requires: <repo>/inputs/diffusion_benchmark/figs/mova_single_person.jpg
     "mova-720p": {
         "path": "OpenMOSS-Team/MOVA-720p",
@@ -221,7 +254,7 @@ MODELS = {
             "--num-inference-steps=2",
         ],
     },
-    # 12. Skill-only extra preset
+    # 14. Skill-only extra preset
     "helios": {
         "path": "BestWishYsh/Helios-Base",
         "prompt": "A curious raccoon",
@@ -247,6 +280,8 @@ def required_gpus_for_model(model_key: str) -> int:
         return 4
     if model_key == "mova-720p":
         return 4
+    if model_key in {"ltx23-one-stage", "ltx23-two-stage"}:
+        return 2
     return 1
 
 
@@ -260,11 +295,11 @@ def print_model_catalog():
     print("=" * 95)
     print("MODEL PRESETS — Nightly-aligned first, skill-only extras after")
     print("=" * 95)
-    print(f"{'Preset':<14} {'Nightly':<28} {'Model Path':<46} {'GPUs':>4}")
+    print(f"{'Preset':<17} {'Nightly':<28} {'Model Path':<46} {'GPUs':>4}")
     print("-" * 95)
     for model_key, cfg in MODELS.items():
         print(
-            f"{model_key:<14} {model_nightly_case_id(model_key):<28} {cfg['path']:<46} {required_gpus_for_model(model_key):>4}"
+            f"{model_key:<17} {model_nightly_case_id(model_key):<28} {cfg['path']:<46} {required_gpus_for_model(model_key):>4}"
         )
     print("-" * 112)
     print(
@@ -474,7 +509,7 @@ def main():
         choices=list(MODELS.keys()),
         help="Model to benchmark (default: flux)",
     )
-    parser.add_argument("--all", action="store_true", help="Benchmark all 12 models")
+    parser.add_argument("--all", action="store_true", help="Benchmark all 14 models")
     parser.add_argument(
         "--list-models",
         action="store_true",

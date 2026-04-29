@@ -47,6 +47,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
+    get_dp_global_num_tokens,
     get_global_dp_buffer,
     get_local_dp_buffer,
     is_allocation_symmetric,
@@ -55,6 +56,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    should_use_dp_reduce_scatterv,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -167,11 +169,12 @@ def apply_flashinfer_allreduce_fusion(batch_size: int):
 def apply_aiter_all_reduce_fusion(input_tensor: torch.Tensor):
     n = input_tensor.shape[-1]
     total_bytes = input_tensor.numel() * input_tensor.element_size()
+    # Aiter's should_custom_ar uses <= max_size/2 (64 MB); match that boundary.
     return (
         _use_aiter
         and total_bytes > 0
         and n <= 16384
-        and total_bytes < 8 * 1024 * 8192
+        and total_bytes <= 8 * 1024 * 8192
         and get_tensor_model_parallel_world_size() != 6
         and not is_dp_attention_enabled()
         and get_global_server_args().enable_aiter_allreduce_fusion
@@ -1095,8 +1098,13 @@ class CommunicateSummableTensorPairFn:
             get_local_dp_buffer(),
             hidden_states,
         )
-        if allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
-            # When using padding, all_reduce is skipped after MLP and MOE and reduce scatter is used here instead.
+        if should_use_dp_reduce_scatterv():
+            get_tp_group().reduce_scatterv(
+                global_hidden_states,
+                output=hidden_states,
+                sizes=get_dp_global_num_tokens(),
+            )
+        elif allow_reduce_scatter and forward_batch.dp_padding_mode.is_max_len():
             dp_reduce_scatter_tensor(hidden_states, global_hidden_states)
         else:
             dp_scatter(hidden_states, global_hidden_states, forward_batch)
