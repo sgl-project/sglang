@@ -250,10 +250,21 @@ response = client.chat.completions.create(
         }
     ],
     temperature=0.7,
-    extra_body={"reasoning_effort": "high"},
+    extra_body={"reasoning_effort": "none"},
 )
 
 print(response.choices[0].message.content)
+```
+
+**Output:**
+
+```text Output
+The image features a stylized representation of the acronym "SGL." The letters
+are large, bold, and orange with a brown outline, giving them a three-dimensional
+effect. To the left of the letters, there is a graphic that resembles a neuron
+or a node with connections, also in a similar orange and brown color scheme. The
+node has a code symbol (</>) inside a square, suggesting a connection to
+programming or technology.
 ```
 
 ### 4.6 Loading the Reference System Prompt
@@ -309,8 +320,8 @@ python3 benchmark/gsm8k/bench_sglang.py --port 30000
 ```text Output
 Accuracy: 0.945
 Invalid: 0.000
-Latency: 16.305 s
-Output throughput: 1305.931 token/s
+Latency: 13.594 s
+Output throughput: 1560.660 token/s
 ```
 
 #### MMMU (vision benchmark, 100 samples)
@@ -327,7 +338,7 @@ python3 -m sglang.test.run_eval \
 **Results:**
 
 ```text Output
-Score: 0.270
+Score: 0.260
 ```
 
 ### 5.2 Speed Benchmarks
@@ -351,13 +362,13 @@ python3 -m sglang.bench_serving \
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Successful requests:                     10
-Benchmark duration (s):                  42.19
+Benchmark duration (s):                  38.86
 Total input tokens:                      6101
 Total generated tokens:                  2684
-Output token throughput (tok/s):         63.61
-Mean E2E Latency (ms):                   4216.94
-Median TTFT (ms):                        108.82
-Median TPOT (ms):                        15.40
+Output token throughput (tok/s):         69.07
+Mean E2E Latency (ms):                   3883.80
+Median TTFT (ms):                        95.90
+Median TPOT (ms):                        14.19
 ==================================================
 ```
 
@@ -380,13 +391,13 @@ python3 -m sglang.bench_serving \
 ============ Serving Benchmark Result ============
 Backend:                                 sglang
 Successful requests:                     1000
-Benchmark duration (s):                  120.14
+Benchmark duration (s):                  117.28
 Total input tokens:                      512842
 Total generated tokens:                  262023
-Output token throughput (tok/s):         2180.89
-Total token throughput (tok/s):          6449.42
-Mean E2E Latency (ms):                   11554.55
-Median TTFT (ms):                        156.32
-Median TPOT (ms):                        43.41
+Output token throughput (tok/s):         2234.18
+Total token throughput (tok/s):          6607.01
+Mean E2E Latency (ms):                   11303.79
+Median TTFT (ms):                        152.95
+Median TPOT (ms):                        42.53
 ==================================================
 ```
