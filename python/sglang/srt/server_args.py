@@ -250,18 +250,6 @@ MAMBA_BACKEND_CHOICES = ["triton", "flashinfer"]
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = ["triton", "cutedsl", "flashinfer"]
 
 
-def parse_bool(value: str) -> bool:
-    """argparse `type=` callable for value-taking boolean flags."""
-    v = value.strip().lower()
-    if v == "true":
-        return True
-    if v == "false":
-        return False
-    raise argparse.ArgumentTypeError(
-        f"Expected 'true' or 'false' (case-insensitive); got {value!r}."
-    )
-
-
 # Allow external code to add more choices
 def add_load_format_choices(choices):
     LOAD_FORMAT_CHOICES.extend(choices)
@@ -7403,6 +7391,18 @@ class PortArgs:
                 metrics_ipc_name=NetworkAddress(dist_init_host, metrics_port).to_tcp(),
                 tokenizer_worker_ipc_name=tokenizer_worker_ipc_name,
             )
+
+
+def parse_bool(value: str) -> bool:
+    """argparse `type=` callable for value-taking boolean flags."""
+    v = value.strip().lower()
+    if v == "true":
+        return True
+    if v == "false":
+        return False
+    raise argparse.ArgumentTypeError(
+        f"Expected 'true' or 'false' (case-insensitive); got {value!r}."
+    )
 
 
 class LoRAPathAction(argparse.Action):
