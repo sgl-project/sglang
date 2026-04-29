@@ -21,6 +21,7 @@ from collections.abc import Iterable
 from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
+from sglang.srt.platforms import current_platform
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -762,8 +763,8 @@ class ExaoneMoEForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False

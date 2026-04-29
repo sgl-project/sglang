@@ -17,6 +17,7 @@
 from typing import Iterable, Optional, Tuple
 
 import torch
+from sglang.srt.platforms import current_platform
 from torch import nn
 from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import (
     Ernie4_5_MoeConfig,
@@ -196,8 +197,8 @@ class Ernie4_5_MoeForCausalLMMTP(nn.Module):
         else:
             del self.lm_head.weight
             self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
 
 EntryClass = [Ernie4_5_MoeForCausalLMMTP]

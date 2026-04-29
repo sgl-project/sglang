@@ -16,6 +16,7 @@ import logging
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
+from sglang.srt.platforms import current_platform
 import torch.nn.functional as F
 from torch import nn
 
@@ -1172,8 +1173,8 @@ class MiMoV2ForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.model.load_kv_cache_scales(quantization_param_path)

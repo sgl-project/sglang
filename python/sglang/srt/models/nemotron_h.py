@@ -19,6 +19,7 @@ from collections.abc import Iterable
 from typing import Optional, Union
 
 import torch
+from sglang.srt.platforms import current_platform
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
@@ -781,8 +782,8 @@ class NemotronHForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]], is_mtp: bool = False

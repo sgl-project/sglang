@@ -16,6 +16,7 @@ import logging
 from typing import Iterable, Optional, Tuple
 
 import torch
+from sglang.srt.platforms import current_platform
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -382,8 +383,8 @@ class MiMoV2MTP(MiMoV2ForCausalLM):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
 
 EntryClass = MiMoV2MTP

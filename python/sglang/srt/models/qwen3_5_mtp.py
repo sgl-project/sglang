@@ -19,6 +19,7 @@ from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
 
 import torch
+from sglang.srt.platforms import current_platform
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -114,8 +115,8 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     @torch.no_grad()
     def forward(

@@ -35,6 +35,7 @@ import logging
 from typing import Iterable, List, Optional, Tuple
 
 import torch
+from sglang.srt.platforms import current_platform
 from torch import nn
 
 from sglang.srt.configs import LongcatFlashConfig
@@ -1044,8 +1045,8 @@ class LongcatFlashForCausalLM(nn.Module):
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
         self.lm_head.weight = head
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
+        current_platform.empty_cache()
+        current_platform.synchronize()
 
     @classmethod
     def get_model_config_for_expert_location(cls, config):
