@@ -162,7 +162,7 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
 
         pixel_values = pixel_values.to(
             device=self.vision_tower.device,
-            dtype=self.language_model.dtype(),
+            dtype=next(self.language_model.parameters()).dtype,
         )
 
         # Encode through SigLIP
@@ -205,24 +205,16 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
         return self.language_model.tie_weights(**kwargs)
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        stacked_params_mapping = [
-            (".qkv_proj", ".q_proj", "q"),
-            (".qkv_proj", ".k_proj", "k"),
-            (".qkv_proj", ".v_proj", "v"),
-            ("gate_up_proj", "up_proj", 1),
-            ("gate_up_proj", "gate_proj", 0),
-        ]
-
         # Weight key remapping (transformers v4.52+ uses different prefixes)
         hf_to_sglang = {
-            "model.language_model.": "language_model.model.",
+            "model.language_model.": "language_model.",
             "model.vision_tower.": "vision_tower.",
             "model.multi_modal_projector.": "multi_modal_projector.",
             "lm_head.": "language_model.lm_head.",
         }
 
-        params_dict = dict(self.named_parameters())
-        loaded_params: Set[str] = set()
+        lm_weights = []
+        other_weights = []
 
         for name, loaded_weight in weights:
             # Apply prefix remapping
@@ -231,13 +223,26 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
                     name = new_prefix + name[len(old_prefix):]
                     break
 
-            if "language_model" in name:
-                causal_loaded = Gemma2ForCausalLM.load_weights(
-                    self, [(name, loaded_weight)]
-                )
-                loaded_params.update(causal_loaded)
-                continue
+            if name.startswith("language_model."):
+                # Strip the "language_model." prefix before delegating
+                lm_name = name[len("language_model."):]
+                lm_weights.append((lm_name, loaded_weight))
+            else:
+                other_weights.append((name, loaded_weight))
 
+        # Delegate language model weights to Gemma2ForCausalLM
+        loaded_params: Set[str] = set()
+        lm_loaded = self.language_model.load_weights(lm_weights)
+        loaded_params.update(f"language_model.{n}" for n in lm_loaded)
+
+        params_dict = dict(self.named_parameters())
+        stacked_params_mapping = [
+            (".qkv_proj", ".q_proj", "q"),
+            (".qkv_proj", ".k_proj", "k"),
+            (".qkv_proj", ".v_proj", "v"),
+        ]
+
+        for name, loaded_weight in other_weights:
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
