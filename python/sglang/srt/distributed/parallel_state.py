@@ -2114,7 +2114,9 @@ _TP_STATE_PATCHED = False
 
 
 @contextmanager
-def patch_tensor_parallel_group(tp_group: GroupCoordinator):
+def patch_tensor_parallel_group(
+    tp_group: GroupCoordinator, also_patch_attn_tp: bool = False
+):
     """Patch the tp group temporarily until this function ends.
 
     This method is for draft workers of speculative decoding to run draft model
@@ -2122,20 +2124,52 @@ def patch_tensor_parallel_group(tp_group: GroupCoordinator):
 
     Args:
         tp_group (GroupCoordinator): the tp group coordinator
+        also_patch_attn_tp (bool): if True, also patch _ATTN_TP so that
+            attention/KV-cache code sees the same tp_size as the draft model.
     """
-    global _TP_STATE_PATCHED
+    global _TP_STATE_PATCHED, _TP, _ATTN_TP
     assert not _TP_STATE_PATCHED, "Should not call when it's already patched"
 
     _TP_STATE_PATCHED = True
-    old_tp_group = get_tp_group()
-    global _TP
+    old_tp_group = _TP
+    old_attn_tp_group = _ATTN_TP
     _TP = tp_group
+    if also_patch_attn_tp:
+        _ATTN_TP = tp_group
     try:
         yield
     finally:
         # restore the original state
         _TP_STATE_PATCHED = False
         _TP = old_tp_group
+        if also_patch_attn_tp:
+            _ATTN_TP = old_attn_tp_group
+
+
+@contextmanager
+def patch_moe_parallel_group(
+    moe_ep_group: GroupCoordinator,
+    moe_tp_group: GroupCoordinator = None,
+):
+    """Patch MOE EP (and optionally MOE TP) groups temporarily.
+
+    Used by draft-DP mode to make the draft MoE layer see ep_size=1,
+    loading all experts locally on each rank.
+    If moe_tp_group is None, _MOE_TP is not changed (keeps original TP sharding
+    for expert intermediate_size, ensuring computation matches target).
+    """
+    global _MOE_EP, _MOE_TP
+    old_moe_ep = _MOE_EP
+    old_moe_tp = _MOE_TP
+    _MOE_EP = moe_ep_group
+    if moe_tp_group is not None:
+        _MOE_TP = moe_tp_group
+    try:
+        yield
+    finally:
+        _MOE_EP = old_moe_ep
+        if moe_tp_group is not None:
+            _MOE_TP = old_moe_tp
 
 
 def get_world_size():

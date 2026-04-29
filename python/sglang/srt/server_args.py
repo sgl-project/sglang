@@ -522,6 +522,7 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
+    speculative_draft_dp: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -3498,6 +3499,18 @@ class ServerArgs:
                     "speculative_eagle_topk > 1 with page_size > 1 is unstable and produces incorrect results for paged attention backends. This combination is only supported for the 'flashinfer' backend."
                 )
 
+        if self.speculative_draft_dp:
+            if self.tp_size <= 1 and self.ep_size <= 1:
+                logger.warning(
+                    "--speculative-draft-dp has no effect with tp_size=1 and ep_size=1. Ignoring."
+                )
+                self.speculative_draft_dp = False
+            elif self.speculative_moe_a2a_backend is None:
+                self.speculative_moe_a2a_backend = "none"
+                logger.info(
+                    "--speculative-draft-dp: auto-setting --speculative-moe-a2a-backend=none"
+                )
+
         if self.speculative_algorithm == "NGRAM":
             if not self.device.startswith("cuda"):
                 raise ValueError(
@@ -5387,6 +5400,13 @@ class ServerArgs:
             choices=SPECULATIVE_DRAFT_MODEL_QUANTIZATION_CHOICES,
             default=ServerArgs.speculative_draft_model_quantization,
             help="The quantization method for speculative model.",
+        )
+        parser.add_argument(
+            "--speculative-draft-dp",
+            action="store_true",
+            default=ServerArgs.speculative_draft_dp,
+            help="Run the draft model with data parallelism (tp_size=1, ep_size=1 per rank) "
+            "to eliminate allreduce/all-to-all communication during draft multi-step decode.",
         )
 
         # Speculative decoding (ngram)

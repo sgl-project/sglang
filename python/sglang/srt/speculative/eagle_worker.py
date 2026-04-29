@@ -57,6 +57,8 @@ from sglang.srt.speculative.eagle_utils import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     assign_draft_cache_locs,
+    create_draft_dp_group,
+    draft_dp_full_context,
     draft_tp_context,
     fast_topk,
     generate_token_bitmask,
@@ -149,20 +151,54 @@ class EAGLEWorker(TpModelWorker):
             self.hot_token_id = None
 
         # Init draft worker
-        if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
+        # Draft-DP requires enable_dp_attention so each rank has complete KV cache.
+        # Use DP attention's draft_tp_context (patches _TP to attn_tp group, keeps _ATTN_TP intact)
+        # and additionally patch _MOE_EP/_MOE_TP for MoE-only DP.
+        from sglang.srt.distributed.parallel_state import patch_moe_parallel_group
+
+        if server_args.speculative_draft_dp and server_args.enable_dp_attention:
+            # Draft-DP + DP attention:
+            # - Attention: use attn_tp group (size=1, per-rank KV cache)
+            # - MoE: patch _MOE_EP/_MOE_TP to size=1 (all experts local, no EP all-to-all)
+            # Since _TP is patched to attn_tp (size=1), MoE layer's self.tp_size=1, skipping allreduce
+            self.draft_dp_group = create_draft_dp_group()
+            attn_tp_group = get_attention_tp_group()
+            from contextlib import ExitStack
+
+            self._init_stack = ExitStack()
+            ctx = self._init_stack
+            ctx.enter_context(draft_tp_context(attn_tp_group))
+            ctx.enter_context(
+                patch_moe_parallel_group(
+                    self.draft_dp_group, self.draft_dp_group
+                )
+            )
+        elif server_args.speculative_draft_dp:
+            # Draft DP without DP attention — patch everything (may have KV cache issues)
+            self.draft_dp_group = create_draft_dp_group()
+            ctx = draft_dp_full_context(
+                self.draft_dp_group, self.draft_dp_group, self.draft_dp_group
+            )
+        elif server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
         else:
             ctx = empty_context()
+        # Don't change tp_rank when using DP attention (each rank keeps its own rank)
+        draft_tp_rank = tp_rank if server_args.enable_dp_attention else (
+            0 if server_args.speculative_draft_dp else tp_rank
+        )
+        # Draft-DP patches MOE_EP to size=1, so ep_rank must be 0 (all experts local)
+        draft_ep_rank = 0 if server_args.speculative_draft_dp else moe_ep_rank
         with (
             ctx
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             super().__init__(
                 server_args=server_args,
                 gpu_id=gpu_id,
-                tp_rank=tp_rank,
+                tp_rank=draft_tp_rank,
                 pp_rank=0,  # FIXME
                 dp_rank=dp_rank,
-                moe_ep_rank=moe_ep_rank,
+                moe_ep_rank=draft_ep_rank,
                 attn_cp_rank=attn_cp_rank,
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
@@ -171,10 +207,48 @@ class EAGLEWorker(TpModelWorker):
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
+        if hasattr(self, "_init_stack"):
+            self._init_stack.close()
 
         embed, head = self.target_worker.model_runner.model.get_embed_and_head()
 
-        if self.speculative_algorithm.is_eagle3():
+        if server_args.speculative_draft_dp and server_args.enable_dp_attention:
+            # Draft-DP + DPA: draft is at tp=1, target at tp=8.
+            # MTP weight loader skips embed/head — they must come from target via set_embed_and_head.
+            # With DPA, target's embed is full (use_attn_tp_group=True), so no allgather needed.
+            # Target's lm_head is sharded by TP (use_attn_tp_group=False), so allgather it.
+            target_tp_group = self.target_worker.model_runner.tp_group
+            full_embed = embed  # Already full with DPA
+            full_head = self._allgather_tensor(head, target_tp_group)
+            if self.speculative_algorithm.is_eagle3():
+                self.draft_model_runner.model.set_embed(full_embed)
+                if (
+                    hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
+                    and self.draft_model_runner.model.load_lm_head_from_target
+                ):
+                    self.draft_model_runner.model.lm_head.weight.data.copy_(full_head)
+            else:
+                self.draft_model_runner.model.set_embed_and_head(
+                    full_embed, full_head
+                )
+        elif server_args.speculative_draft_dp and not server_args.enable_dp_attention:
+            # Draft-DP without DP attention: allgather target's sharded embed/head
+            target_tp_group = self.target_worker.model_runner.tp_group
+            full_embed = self._allgather_tensor(embed, target_tp_group)
+            if self.speculative_algorithm.is_eagle3():
+                self.draft_model_runner.model.set_embed(full_embed)
+                if (
+                    hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
+                    and self.draft_model_runner.model.load_lm_head_from_target
+                ):
+                    full_head = self._allgather_tensor(head, target_tp_group)
+                    self.draft_model_runner.model.lm_head.weight.data.copy_(full_head)
+            else:
+                full_head = self._allgather_tensor(head, target_tp_group)
+                self.draft_model_runner.model.set_embed_and_head(
+                    full_embed, full_head
+                )
+        elif self.speculative_algorithm.is_eagle3():
             # most cases EAGLE3 models don't share lm_head
             # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
             if (
@@ -190,7 +264,6 @@ class EAGLEWorker(TpModelWorker):
                 self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
                     embed.device
                 )
-
         else:
             if self.hot_token_id is not None:
                 head = head.clone()
@@ -204,9 +277,32 @@ class EAGLEWorker(TpModelWorker):
         self.draft_model_runner.server_args.disable_cuda_graph = (
             backup_disable_cuda_graph
         )
-        self.draft_tp_context = (
-            draft_tp_context if server_args.enable_dp_attention else empty_context
-        )
+        if server_args.speculative_draft_dp and server_args.enable_dp_attention:
+            # Draft-DP + DP attention: patch TP (via attn_tp) + MOE (via draft_dp_group)
+            @contextmanager
+            def _dpa_dp_ctx(_tp_group=None):
+                tp_grp = _tp_group or self.draft_model_runner.tp_group
+                with draft_tp_context(tp_grp), patch_moe_parallel_group(
+                    self.draft_dp_group, self.draft_dp_group
+                ):
+                    yield
+
+            self._draft_ctx_fn = _dpa_dp_ctx
+            self.draft_tp_context = _dpa_dp_ctx
+        elif server_args.speculative_draft_dp:
+            # Draft-DP without DP attention
+            self._draft_ctx_fn = lambda: draft_dp_full_context(
+                self.draft_dp_group, self.draft_dp_group, self.draft_dp_group
+            )
+            self.draft_tp_context = lambda _tp_group=None: self._draft_ctx_fn()
+        elif server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
+            self._draft_ctx_fn = lambda: draft_tp_context(
+                self.draft_model_runner.tp_group
+            )
+            self.draft_tp_context = draft_tp_context
+        else:
+            self._draft_ctx_fn = empty_context
+            self.draft_tp_context = empty_context
         self.eagle_use_aux_hidden_state = False
         if self.speculative_algorithm.is_eagle3():
             self.eagle_use_aux_hidden_state = True
@@ -216,9 +312,7 @@ class EAGLEWorker(TpModelWorker):
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+        with self._draft_ctx_fn(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             self.init_attention_backend()
             self.init_cuda_graphs()
             if self.adaptive_controller is not None:
@@ -241,6 +335,23 @@ class EAGLEWorker(TpModelWorker):
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+    @staticmethod
+    def _allgather_tensor(tensor, tp_group):
+        if tp_group.world_size <= 1:
+            return tensor
+        gathered = [torch.empty_like(tensor) for _ in range(tp_group.world_size)]
+        torch.distributed.all_gather(gathered, tensor, group=tp_group.device_group)
+        return torch.cat(gathered, dim=0)
+
+    @contextmanager
+    def _draft_forward_context(self):
+        """In draft-DP mode, patches MoE A2A backend (TP already patched by draft_tp_context)."""
+        if self.server_args.speculative_draft_dp:
+            with speculative_moe_a2a_backend_context():
+                yield
+        else:
+            yield
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -829,49 +940,50 @@ class EAGLEWorker(TpModelWorker):
 
         # Forward multiple steps
         scores = None
-        for i in range(self.speculative_num_steps):
-            input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
-                i, topk_p, topk_index, hidden_states, scores, self.topk
-            )
-            score_list.append(tree_info[0])
-            token_list.append(tree_info[1])
-            parents_list.append(tree_info[2])
+        with self._draft_forward_context():
+            for i in range(self.speculative_num_steps):
+                input_ids, hidden_states, scores, tree_info = select_top_k_tokens(
+                    i, topk_p, topk_index, hidden_states, scores, self.topk
+                )
+                score_list.append(tree_info[0])
+                token_list.append(tree_info[1])
+                parents_list.append(tree_info[2])
 
-            # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
-            if i == self.speculative_num_steps - 1:
-                break
+                # We don't need to run the last forward. we get 1 token from draft prefill and (#spec steps - 1) tokens here
+                if i == self.speculative_num_steps - 1:
+                    break
 
-            # Set inputs
-            forward_batch.input_ids = input_ids
-            # This is a temporary fix for the case that the user is using standalone
-            # speculative decoding and the draft model architecture is gpt-oss. gpt-oss
-            # rope kernel needs cache_loc to be contiguous.
-            if (
-                self.server_args.speculative_algorithm == "STANDALONE"
-                and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
-            ):
-                out_cache_loc = out_cache_loc.contiguous()
-            forward_batch.out_cache_loc = out_cache_loc[i]
-            forward_batch.positions.add_(1)
-            forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
-            spec_info.hidden_states = hidden_states
+                # Set inputs
+                forward_batch.input_ids = input_ids
+                # This is a temporary fix for the case that the user is using standalone
+                # speculative decoding and the draft model architecture is gpt-oss. gpt-oss
+                # rope kernel needs cache_loc to be contiguous.
+                if (
+                    self.server_args.speculative_algorithm == "STANDALONE"
+                    and self.model_config.hf_config.architectures[0] == "GptOssForCausalLM"
+                ):
+                    out_cache_loc = out_cache_loc.contiguous()
+                forward_batch.out_cache_loc = out_cache_loc[i]
+                forward_batch.positions.add_(1)
+                forward_batch.attn_backend = self.draft_attn_backend.attn_backends[i]
+                spec_info.hidden_states = hidden_states
 
-            # Run forward
-            logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
-            maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
-            probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
-            maybe_detect_oob(
-                topk_index,
-                0,
-                logits_output.next_token_logits.shape[-1],
-                f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
-            )
-            if self.hot_token_id is not None:
-                topk_index = self.hot_token_id[topk_index]
-            hidden_states = logits_output.hidden_states
+                # Run forward
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
+                maybe_detect_nan(logits_output.next_token_logits, f"draft_forward step {i}")
+                probs = torch.softmax(logits_output.next_token_logits, dim=-1)
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+                maybe_detect_oob(
+                    topk_index,
+                    0,
+                    logits_output.next_token_logits.shape[-1],
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                )
+                if self.hot_token_id is not None:
+                    topk_index = self.hot_token_id[topk_index]
+                hidden_states = logits_output.hidden_states
 
         parent_list, top_scores_index, draft_tokens = organize_draft_results(
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
@@ -1091,7 +1203,8 @@ class EAGLEWorker(TpModelWorker):
         forward_batch.return_logprob = False
         if mm_input_embeds is not None:
             forward_batch.mm_input_embeds = mm_input_embeds
-        logits_output = self.draft_model_runner.forward(forward_batch).logits_output
+        with self._draft_forward_context():
+            logits_output = self.draft_model_runner.forward(forward_batch).logits_output
         maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
         assert isinstance(forward_batch.spec_info, EagleDraftInput)
         assert forward_batch.spec_info is batch.spec_info
@@ -1172,9 +1285,10 @@ class EAGLEWorker(TpModelWorker):
                 )
                 attn_backend.init_forward_metadata(forward_batch)
                 forward_batch.attn_backend = attn_backend
-            logits_output = self.draft_model_runner.forward(
-                forward_batch, skip_attn_backend_init=True
-            ).logits_output
+            with self._draft_forward_context():
+                logits_output = self.draft_model_runner.forward(
+                    forward_batch, skip_attn_backend_init=True
+                ).logits_output
             self.capture_for_decode(logits_output, forward_batch.spec_info)
 
         maybe_detect_nan(

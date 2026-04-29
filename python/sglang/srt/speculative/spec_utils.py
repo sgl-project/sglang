@@ -14,6 +14,7 @@ from huggingface_hub import snapshot_download
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarObject
 from sglang.srt.distributed.parallel_state import (
     GroupCoordinator,
+    patch_moe_parallel_group,
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
@@ -726,6 +727,50 @@ def draft_tp_context(tp_group: GroupCoordinator):
     # We disable mscclpp now because it doesn't support 2 comm groups.
     with patch_tensor_parallel_group(tp_group):
         yield
+
+
+@contextmanager
+def draft_dp_full_context(
+    tp_group: GroupCoordinator,
+    moe_ep_group: GroupCoordinator,
+    moe_tp_group: GroupCoordinator,
+):
+    """Patch TP, ATTN_TP, MOE_EP, and MOE_TP for draft-DP mode with MoE."""
+    with patch_tensor_parallel_group(
+        tp_group, also_patch_attn_tp=True
+    ), patch_moe_parallel_group(moe_ep_group, moe_tp_group):
+        yield
+
+
+def create_draft_dp_group() -> GroupCoordinator:
+    """Create a single-rank GroupCoordinator for draft-DP mode.
+
+    Each rank gets its own group of size 1. All ranks must call this
+    simultaneously (it uses torch.distributed.new_group which is collective).
+    """
+    import torch.distributed as dist
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    group_ranks = [[r] for r in range(world_size)]
+    local_rank = rank
+    if os.environ.get("SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS"):
+        local_rank = 0
+
+    return GroupCoordinator(
+        group_ranks=group_ranks,
+        local_rank=local_rank,
+        torch_distributed_backend="nccl",
+        use_pynccl=False,
+        use_pymscclpp=False,
+        use_custom_allreduce=False,
+        use_torch_symm_mem_all_reduce=False,
+        use_hpu_communicator=False,
+        use_xpu_communicator=False,
+        use_npu_communicator=False,
+        use_message_queue_broadcaster=False,
+        group_name="draft_dp",
+    )
 
 
 def maybe_detect_nan(tensor: torch.Tensor, msg: str = ""):
