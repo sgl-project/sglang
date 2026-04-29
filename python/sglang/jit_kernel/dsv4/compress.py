@@ -191,10 +191,11 @@ class CompressorPrefillPlan(NamedTuple):
                 device=device,
                 use_cuda_graph=use_cuda_graph,
             )
+        is_gpu_input = seq_lens.device.type == "cuda"
         pin_buffer = torch.empty(
-            num_q_tokens * _PREFILL_PLAN_BYTES,
+            0 if is_gpu_input else num_q_tokens * _PREFILL_PLAN_BYTES,
             dtype=torch.uint8,
-            pin_memory=True,
+            pin_memory=not is_gpu_input,
         )
         module = _jit_compress_plan_module()
         plan_c, plan_w = module.plan_prefill(

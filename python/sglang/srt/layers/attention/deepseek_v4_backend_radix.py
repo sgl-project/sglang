@@ -606,6 +606,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         bs, num_draft_tokens = len(seq_lens), self.speculative_num_draft_tokens
         seq_lens = seq_lens + self.speculative_num_draft_tokens
         extend_seq_lens = raw_metadata.extend_seq_lens
+        assert extend_seq_lens is not None
 
         seq_lens_casual, req_pool_indices_repeated = (
             self.expend_extend_with_same_length(
@@ -627,8 +628,8 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            extend_lens=extend_seq_lens,
+            seq_lens=seq_lens.to(torch.int64),
+            extend_lens=extend_seq_lens.to(torch.int64),
             seq_lens_cpu=None,
             extend_lens_cpu=None,
             use_prefill_cuda_graph=True,

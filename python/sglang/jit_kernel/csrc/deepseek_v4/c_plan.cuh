@@ -3,6 +3,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <sgl_kernel/deepseek_v4/compress_v2.cuh>
 
@@ -24,6 +25,27 @@ using RID_T = int64_t;
 using R2T_T = int32_t;
 using F2S_T = int64_t;
 using IDX_T = int64_t;
+
+/// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
+SGL_DEVICE __host__ PlanW pack_w(uint32_t ragged_id, uint32_t batch_id, int32_t seq_len) {
+  return {static_cast<uint32_t>(ragged_id | batch_id << 16), seq_len};
+}
+
+/// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
+SGL_DEVICE uint2 unpack_w(PlanW plan) {
+  return {static_cast<uint16_t>(plan.ragged_id), static_cast<uint16_t>(plan.ragged_id >> 16)};
+}
+
+struct Prefill0Params {
+  PlanC* plan_c;
+  PlanW* plan_w;
+  const IDX_T* seq_lens_ptr;     // [batch_size]
+  const IDX_T* extend_lens_ptr;  // [batch_size]
+  uint32_t batch_size;
+  uint32_t num_q_tokens;
+  int32_t compress_ratio;
+  int32_t swa_page_size;
+};
 
 struct Prefill1Params {
   PlanC* plan_c;
@@ -75,14 +97,184 @@ struct DecodeParamsLegacy {
   int32_t compress_ratio;
 };
 
-/// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
-SGL_DEVICE __host__ PlanW pack_w(uint32_t ragged_id, uint32_t batch_id, int32_t seq_len) {
-  return {static_cast<uint32_t>(ragged_id | batch_id << 16), seq_len};
+inline constexpr uint32_t kMaxPrefillBatchSize = 1024;
+
+inline constexpr int32_t kMaxMTPDraftTokens = 4;
+
+SGL_DEVICE uint32_t warp_inclusive_sum(uint32_t lane_id, uint32_t val) {
+  static_assert(device::kWarpThreads == 32);
+#pragma unroll
+  for (uint32_t offset = 1; offset < 32; offset *= 2) {
+    uint32_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
+    if (lane_id >= offset) val += n;
+  }
+  return val;
 }
 
-/// NOTE: for the internal use, we pack the ragged and batch id, since both not exceed 65536
-SGL_DEVICE uint2 unpack_w(PlanW plan) {
-  return {static_cast<uint16_t>(plan.ragged_id), static_cast<uint16_t>(plan.ragged_id >> 16)};
+/// Warp-wide max/min for integer types. `device::warp::reduce_max` routes through
+/// `dtype_trait<T>::max` which is only specialized for FP types.
+SGL_DEVICE uint32_t warp_reduce_max_u32(uint32_t val) {
+#pragma unroll
+  for (uint32_t mask = 16; mask > 0; mask >>= 1) {
+    val = max(val, __shfl_xor_sync(0xFFFFFFFF, val, mask, 32));
+  }
+  return val;
+}
+
+SGL_DEVICE uint32_t warp_reduce_min_u32(uint32_t val) {
+#pragma unroll
+  for (uint32_t mask = 16; mask > 0; mask >>= 1) {
+    val = min(val, __shfl_xor_sync(0xFFFFFFFF, val, mask, 32));
+  }
+  return val;
+}
+
+__global__ __launch_bounds__(1024, 1)  //
+    void plan_compress_prefill_kernel0(const Prefill0Params params) {
+  using namespace device;
+  const auto tx = threadIdx.x;
+  const auto block_size = kMaxPrefillBatchSize;
+  constexpr auto kNumWarps = kMaxPrefillBatchSize / kWarpThreads;
+  const auto cr = params.compress_ratio;
+  const auto sps = params.swa_page_size;
+  const bool is_overlap = (cr == 4);
+  const int32_t window_size = cr * (is_overlap ? 2 : 1);
+
+  alignas(128) __shared__ uint32_t counter_c;
+  alignas(128) __shared__ uint32_t counter_w;
+  __shared__ int32_t s_seq_len[kMaxPrefillBatchSize];
+  __shared__ int32_t s_prefix_len[kMaxPrefillBatchSize];
+  __shared__ uint32_t warp_max[kNumWarps];
+  __shared__ uint32_t warp_min[kNumWarps];
+  __shared__ uint32_t s_max_extend;
+  __shared__ uint32_t s_min_extend;
+
+  const auto lane_id = tx % kWarpThreads;
+  const auto warp_id = tx / kWarpThreads;
+
+  // === Stage A: load per-batch fields, init shared scratch ===
+  int32_t seq_len = 0, extend_len = 0, prefix_len = 0;
+  if (tx < params.batch_size) {
+    seq_len = static_cast<int32_t>(params.seq_lens_ptr[tx]);
+    extend_len = static_cast<int32_t>(params.extend_lens_ptr[tx]);
+    prefix_len = seq_len - extend_len;
+    s_seq_len[tx] = seq_len;
+    s_prefix_len[tx] = prefix_len;
+  }
+  if (tx == 0) {
+    counter_c = 0;
+    counter_w = 0;
+  }
+  if (tx < kNumWarps) {
+    warp_max[tx] = 0;
+    warp_min[tx] = 0xFFFFFFFFu;
+  }
+
+  // === Stage B: min/max(extend_len) for MTP-uniform detection ===
+  // For min, treat threads outside `batch_size` as +inf so they don't pull the min down.
+  const uint32_t e_for_max = static_cast<uint32_t>(extend_len);
+  const uint32_t e_for_min = (tx < params.batch_size) ? e_for_max : 0xFFFFFFFFu;
+  warp_max[warp_id] = warp_reduce_max_u32(e_for_max);
+  warp_min[warp_id] = warp_reduce_min_u32(e_for_min);
+  __syncthreads();
+  if (warp_id == 0) {
+    s_max_extend = warp_reduce_max_u32(warp_max[lane_id]);
+    s_min_extend = warp_reduce_min_u32(warp_min[lane_id]);
+  }
+  __syncthreads();
+
+  const auto num_q = params.num_q_tokens;
+  // MTP-uniform: every batch shares the same small extend_len `E`, so we can decompose
+  // a global token id `k` into (batch_id, j) = (k / E, k % E) and skip the per-batch loop.
+  const bool is_mtp_extend = (s_min_extend == s_max_extend) && (s_max_extend > 0) && (s_max_extend <= 32);
+
+  // === Stage C: emit valid plans, slot allocation via shared-mem atomicAdd ===
+  if (is_mtp_extend) {
+    // Path 1: token-driven. Each global token id maps to exactly one (batch_id, j).
+    const uint32_t E = s_max_extend;
+    for (uint32_t k = tx; k < num_q; k += block_size) {
+      const uint32_t batch_id = k / E;
+      const uint32_t j = k % E;
+      const int32_t pl = s_prefix_len[batch_id];
+      const int32_t sl = s_seq_len[batch_id];
+      const int32_t position = pl + static_cast<int32_t>(j);
+      const uint32_t ragged_id = k;
+
+      if ((position + 1) % cr == 0) {
+        const int32_t buffer_len = window_size - min(static_cast<int32_t>(j) + 1, window_size);
+        const uint32_t out_idx = atomicAdd(&counter_c, 1u);
+        params.plan_c[out_idx] = {
+            .seq_len = static_cast<uint32_t>(position + 1),
+            .ragged_id = static_cast<uint16_t>(ragged_id),
+            .buffer_len = static_cast<uint16_t>(buffer_len),
+            .read_page_0 = -1,
+            .read_page_1 = static_cast<int32_t>(batch_id),
+        };
+      }
+
+      // w-event: A-region tail (position >= first_w_pos) plus, for c4, the swa_page
+      // boundary band so the overlap page is fully populated when prefix-matching
+      // resumes from a page edge. Pull `first_w_pos` back to also cover the trailing
+      // `kMaxMTPDraftTokens` positions so MTP rollback always has the draft tokens.
+      const int32_t last_c_pos = (sl / cr) * cr;
+      const int32_t first_w_pos = min(last_c_pos - (is_overlap ? cr : 0), sl - kMaxMTPDraftTokens);
+      bool do_write = position >= first_w_pos;
+      if (!do_write && is_overlap) do_write = (position % sps) >= (sps - cr);
+      if (do_write) {
+        const uint32_t out_idx = atomicAdd(&counter_w, 1u);
+        params.plan_w[out_idx] = pack_w(ragged_id, batch_id, position + 1);
+      }
+    }
+  } else {
+    // Path 2: general prefill (long extend_len). Iterate batches in an outer loop;
+    // the whole block sweeps each batch's tokens in parallel.
+    uint32_t base_e = 0;
+    for (uint32_t batch_id = 0; batch_id < params.batch_size; ++batch_id) {
+      const int32_t pl = s_prefix_len[batch_id];
+      const int32_t sl = s_seq_len[batch_id];
+      const int32_t el = sl - pl;
+      const int32_t last_c_pos = (sl / cr) * cr;
+      // Include the trailing `kMaxMTPDraftTokens` positions in the always-write tail
+      // so MTP rollback can recover them; see kMaxMTPDraftTokens definition.
+      const int32_t first_w_pos = min(last_c_pos - (is_overlap ? cr : 0), sl - kMaxMTPDraftTokens);
+
+      for (int32_t j = static_cast<int32_t>(tx); j < el; j += static_cast<int32_t>(block_size)) {
+        const int32_t position = pl + j;
+        const uint32_t ragged_id = base_e + static_cast<uint32_t>(j);
+
+        if ((position + 1) % cr == 0) {
+          const int32_t buffer_len = window_size - min(j + 1, window_size);
+          const uint32_t out_idx = atomicAdd(&counter_c, 1u);
+          params.plan_c[out_idx] = {
+              .seq_len = static_cast<uint32_t>(position + 1),
+              .ragged_id = static_cast<uint16_t>(ragged_id),
+              .buffer_len = static_cast<uint16_t>(buffer_len),
+              .read_page_0 = -1,
+              .read_page_1 = static_cast<int32_t>(batch_id),
+          };
+        }
+
+        bool do_write = position >= first_w_pos;
+        if (!do_write && is_overlap) do_write = (position % sps) >= (sps - cr);
+        if (do_write) {
+          const uint32_t out_idx = atomicAdd(&counter_w, 1u);
+          params.plan_w[out_idx] = pack_w(ragged_id, static_cast<uint32_t>(batch_id), position + 1);
+        }
+      }
+      base_e += static_cast<uint32_t>(el);
+    }
+  }
+  __syncthreads();
+
+  // === Stage D: pad [counter_c, num_q) / [counter_w, num_q) with invalid ===
+  const auto total_c = counter_c;
+  const auto total_w = counter_w;
+  for (uint32_t k = total_c + tx; k < num_q; k += block_size) {
+    params.plan_c[k] = PlanC::invalid();
+  }
+  for (uint32_t k = total_w + tx; k < num_q; k += block_size) {
+    params.plan_w[k] = PlanW::invalid();
+  }
 }
 
 /// NOTE: stage 1
@@ -291,11 +483,6 @@ inline PrefillPlan plan_compress_prefill(
       .with_device<kDLCPU>()
       .verify(pin_buffer);
 
-  const auto pin_buffer_bytes = static_cast<size_t>(pin_buffer.numel()) * sizeof(uint8_t);
-  RuntimeCheck(pin_buffer_bytes >= num_q_tokens * (sizeof(PlanC) + sizeof(PlanW)));
-  const auto plan_c_ptr = reinterpret_cast<PlanC*>(pin_buffer.data_ptr());
-  const auto plan_w_ptr = reinterpret_cast<PlanW*>(plan_c_ptr + num_q_tokens);
-
   const bool is_overlap = (compress_ratio == 4);
   const int32_t window_size = compress_ratio * (is_overlap ? 2 : 1);
 
@@ -315,11 +502,52 @@ inline PrefillPlan plan_compress_prefill(
   const auto device = device_.unwrap();
   const auto stream = LaunchKernel::resolve_device(device);
   if (cpu_or_gpu.unwrap().device_type == kDLCUDA) {
-    /// TODO: implement this
-    /// 1: make plan metadata (no read/write info) on GPU
-    /// 2: finalize the read/write info
-    Panic("plan_compress_prefill: GPU input tensors not supported yet");
+    // GPU input path: kernel0 builds the (CPU-loop-equivalent) plan metadata directly
+    // on device, padding to num_q_tokens with invalid; kernel_1 then finalizes the
+    // SWA-translated read/write locations. Used for MTP / cuda-graph capture where
+    // a host sync would be expensive.
+    RuntimeCheck(batch_size <= kMaxPrefillBatchSize, "GPU plan only support batch size up to ", kMaxPrefillBatchSize);
+    auto C = ffi::empty({num_q_tokens, sizeof(PlanC)}, kDLUInt8, device);
+    auto W = ffi::empty({num_q_tokens, sizeof(PlanW)}, kDLUInt8, device);
+    const auto params0 = Prefill0Params{
+        .plan_c = static_cast<PlanC*>(C.data_ptr()),
+        .plan_w = static_cast<PlanW*>(W.data_ptr()),
+        .seq_lens_ptr = seq_ptr,
+        .extend_lens_ptr = ext_ptr,
+        .batch_size = batch_size,
+        .num_q_tokens = num_q_tokens,
+        .compress_ratio = compress_ratio,
+        .swa_page_size = swa_page_size,
+    };
+    LaunchKernel(1, kMaxPrefillBatchSize, device)(plan_compress_prefill_kernel0, params0);
+    // kernel_1 sees the already-padded buffers, so num_c == num_w == num_padded == num_q_tokens.
+    const auto params1 = Prefill1Params{
+        .plan_c = static_cast<PlanC*>(C.data_ptr()),
+        .plan_w = static_cast<PlanW*>(W.data_ptr()),
+        .rid_ptr = rid_ptr,
+        .r2t_ptr = r2t_ptr,
+        .f2s_ptr = f2s_ptr,
+        .stride_r2t = req_to_token.size(1),
+        .num_c = num_q_tokens,
+        .num_w = num_q_tokens,
+        .num_c_padded = num_q_tokens,
+        .num_w_padded = num_q_tokens,
+        .num_work = num_q_tokens,
+        .swa_page_size = swa_page_size,
+        .ring_size = ring_size,
+        .compress_ratio = compress_ratio,
+    };
+    const auto block_size_1 = 256;
+    const auto num_blocks_1 = div_ceil(params1.num_work, block_size_1);
+    LaunchKernel(num_blocks_1, block_size_1, device)(plan_compress_prefill_kernel_1, params1);
+    return PrefillPlan{std::move(C), std::move(W)};
   }
+
+  // CPU input path: only here do we need the pinned scratch buffer.
+  const auto pin_buffer_bytes = static_cast<size_t>(pin_buffer.numel()) * sizeof(uint8_t);
+  RuntimeCheck(pin_buffer_bytes >= num_q_tokens * (sizeof(PlanC) + sizeof(PlanW)));
+  const auto plan_c_ptr = reinterpret_cast<PlanC*>(pin_buffer.data_ptr());
+  const auto plan_w_ptr = reinterpret_cast<PlanW*>(plan_c_ptr + num_q_tokens);
 
   uint32_t counter = 0;
   uint32_t counter_c = 0;
@@ -331,7 +559,10 @@ inline PrefillPlan plan_compress_prefill(
     const int32_t extend_len = ext_ptr[i];
     const int32_t prefix_len = seq_len - extend_len;
     const int32_t last_c_pos = seq_len / compress_ratio * compress_ratio;
-    const int32_t first_w_pos = last_c_pos - (is_overlap ? compress_ratio : 0);
+    // Pull `first_w_pos` back so the trailing `kMaxMTPDraftTokens` positions always
+    // fall into the always-write tail; without this, c128 with seq_len % 128 == 0
+    // (or c4 with a tiny extend) would drop the MTP draft tokens on rollback.
+    const int32_t first_w_pos = std::min(last_c_pos - (is_overlap ? compress_ratio : 0), seq_len - kMaxMTPDraftTokens);
     RuntimeCheck(0 < extend_len && extend_len <= seq_len);
     const auto should_write = [=](int32_t position) {
       if (position >= first_w_pos) return true;

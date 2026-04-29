@@ -200,8 +200,6 @@ def create_paged_compressor_data(
 
     if is_prefill:
         assert extend_lens is not None
-        # The CPU planner loop reads seq_lens / extend_lens; both must be
-        # CPU-resident (per c_plan.cuh's current implementation).
         if seq_lens_cpu is not None:
             assert extend_lens_cpu is not None
             seq_lens_planner = torch.tensor(seq_lens_cpu, dtype=torch.int64)
@@ -209,7 +207,8 @@ def create_paged_compressor_data(
             num_q_tokens = sum(extend_lens_cpu)
         else:
             assert num_q_tokens is not None
-            assert False, "Not supported yet"
+            seq_lens_planner = seq_lens.to(torch.int64)
+            extend_lens_planner = extend_lens.to(torch.int64)
 
         return CompressorPrefillPlan.generate(
             compress_ratio=compress_ratio,
