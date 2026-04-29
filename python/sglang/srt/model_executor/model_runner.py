@@ -779,6 +779,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         config = self.relaykv_config
         if not config.enabled or config.mode != "shadow":
             return
+        host_backup_shadow_info = {
+            "host_backup_shadow": config.host_backup_shadow,
+            "host_backup_max_mib": config.host_backup_max_mib,
+            "host_backup_planned": config.host_backup_shadow,
+            "host_backup_reason": (
+                "metadata-only host backup shadow requested; tensor copy is disabled"
+                if config.host_backup_shadow
+                else "host backup shadow disabled"
+            ),
+        }
 
         model_profile = infer_model_profile(self.model_config.hf_config)
         logger.info(
@@ -795,6 +805,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "pp_rank": self.pp_rank,
                 "is_draft_worker": self.is_draft_worker,
                 "model_profile": model_profile.to_log_dict(),
+                **host_backup_shadow_info,
             },
         )
 
@@ -825,7 +836,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         log_shadow_plan(
             plan,
             prefix="relaykv_shadow_plan_startup",
-            extra=model_profile.to_log_dict() | memory_estimate.to_log_dict(),
+            extra=model_profile.to_log_dict()
+            | memory_estimate.to_log_dict()
+            | host_backup_shadow_info,
         )
 
     def init_routed_experts_capturer(self):

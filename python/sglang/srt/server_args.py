@@ -598,6 +598,8 @@ class ServerArgs:
     relaykv_recent_window: int = 0
     relaykv_anchor_pages: int = 0
     relaykv_log_interval: int = 1
+    relaykv_host_backup_shadow: bool = False
+    relaykv_host_backup_max_mib: float = 0.0
 
     # LMCache
     enable_lmcache: bool = False
@@ -5834,6 +5836,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.relaykv_log_interval,
             help="Decode-step interval for RelayKV shadow logs once runtime hooks are attached.",
+        )
+        parser.add_argument(
+            "--relaykv-host-backup-shadow",
+            action="store_true",
+            default=ServerArgs.relaykv_host_backup_shadow,
+            help="Enable RelayKV host-backup shadow planning/logging without copying tensors.",
+        )
+        parser.add_argument(
+            "--relaykv-host-backup-max-mib",
+            type=float,
+            default=ServerArgs.relaykv_host_backup_max_mib,
+            help="Optional host backup budget guard in MiB; 0 means unlimited for shadow planning.",
         )
 
         # Ktransformer server args

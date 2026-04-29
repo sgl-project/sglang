@@ -2693,6 +2693,16 @@ class Scheduler(
         config = self.relaykv_config
         if not config.enabled or config.mode != "shadow":
             return
+        host_backup_shadow_info = {
+            "host_backup_shadow": config.host_backup_shadow,
+            "host_backup_max_mib": config.host_backup_max_mib,
+            "host_backup_planned": config.host_backup_shadow,
+            "host_backup_reason": (
+                "metadata-only host backup shadow requested; tensor copy is disabled"
+                if config.host_backup_shadow
+                else "host backup shadow disabled"
+            ),
+        }
 
         for req in reqs:
             step_idx = req.extend_batch_idx if phase == "prefill" else req.decode_batch_idx
@@ -2727,7 +2737,8 @@ class Scheduler(
                 plan,
                 prefix=f"relaykv_shadow_plan_{phase}",
                 extra=self.relaykv_model_profile.to_log_dict()
-                | memory_estimate.to_log_dict(),
+                | memory_estimate.to_log_dict()
+                | host_backup_shadow_info,
             )
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:

@@ -21,6 +21,8 @@ class RelayKVConfig:
     recent_window: int = 0
     anchor_pages: int = 0
     log_interval: int = 1
+    host_backup_shadow: bool = False
+    host_backup_max_mib: float = 0.0
 
     @classmethod
     def from_server_args(cls, server_args: object) -> "RelayKVConfig":
@@ -39,6 +41,12 @@ class RelayKVConfig:
             recent_window=int(getattr(server_args, "relaykv_recent_window", 0) or 0),
             anchor_pages=int(getattr(server_args, "relaykv_anchor_pages", 0) or 0),
             log_interval=int(getattr(server_args, "relaykv_log_interval", 1) or 1),
+            host_backup_shadow=bool(
+                getattr(server_args, "relaykv_host_backup_shadow", False)
+            ),
+            host_backup_max_mib=float(
+                getattr(server_args, "relaykv_host_backup_max_mib", 0.0) or 0.0
+            ),
         )
 
     def validate(self) -> None:
@@ -54,3 +62,5 @@ class RelayKVConfig:
             raise ValueError("--relaykv-anchor-pages must be >= 0")
         if self.log_interval <= 0:
             raise ValueError("--relaykv-log-interval must be > 0")
+        if self.host_backup_max_mib < 0:
+            raise ValueError("--relaykv-host-backup-max-mib must be >= 0")
