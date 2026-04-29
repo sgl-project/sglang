@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import unittest
+from unittest.mock import patch
 
 import torch
 from torch import nn
@@ -158,15 +159,19 @@ class TestBAGELQwen2MoTModel(unittest.TestCase):
         attention.o_proj = _TupleAddModule(10000.0)
         attention.o_proj_moe_gen = _TupleAddModule(20000.0)
 
-        output = attention.forward_gen(
-            positions=torch.arange(4),
-            hidden_states=torch.zeros(4, 2),
-            forward_batch=object(),
-            routing=BAGELMoTTokenRouting(
-                text_token_indices=torch.tensor([0, 2]),
-                vae_token_indices=torch.tensor([1, 3]),
-            ),
-        )
+        with patch(
+            "sglang.srt.models.bagel_qwen2_mot.apply_qk_norm",
+            _fake_apply_qk_norm,
+        ):
+            output = attention.forward_gen(
+                positions=torch.arange(4),
+                hidden_states=torch.zeros(4, 2),
+                forward_batch=object(),
+                routing=BAGELMoTTokenRouting(
+                    text_token_indices=torch.tensor([0, 2]),
+                    vae_token_indices=torch.tensor([1, 3]),
+                ),
+            )
 
         self.assertTrue(
             torch.equal(
@@ -264,6 +269,10 @@ class _FakeRadixAttention(nn.Module):
         self.k = k
         self.v = v
         return v
+
+
+def _fake_apply_qk_norm(*, q, k, q_norm, k_norm, head_dim, alt_stream=None):
+    return q_norm(q), k_norm(k)
 
 
 class _FakeGenAttention(nn.Module):
