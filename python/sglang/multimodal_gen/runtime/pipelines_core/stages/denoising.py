@@ -563,12 +563,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # Get latents and embeddings
         latents = batch.latents
-        prompt_embeds = batch.prompt_embeds
         # Removed Tensor truthiness assert to avoid GPU sync
-        neg_prompt_embeds = None
         if batch.do_classifier_free_guidance:
-            neg_prompt_embeds = batch.negative_prompt_embeds
-            assert neg_prompt_embeds is not None
+            assert batch.negative_prompt_embeds is not None
             # Removed Tensor truthiness assert to avoid GPU sync
 
         should_preprocess_for_wan_ti2v = should_apply_wan_ti2v(batch, server_args)
@@ -624,6 +621,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
+                "encoder_hidden_states_mask": batch.prompt_attention_mask,
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
@@ -644,6 +642,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
+                    "encoder_hidden_states_mask": batch.negative_attention_mask,
                 }
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
