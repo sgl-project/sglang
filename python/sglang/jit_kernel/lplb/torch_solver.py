@@ -61,7 +61,8 @@ def _init_fused_backend() -> None:
         return
 
     try:
-        from sglang.jit_kernel.lplb.cublasdx_solver import (
+        from sglang.jit_kernel.lplb.cuda_solver import (
+            _FUSED_REJECTED_SHAPES as _CUDA_REJECTED,
             solve_ipm as fused_solve_ipm,
             warmup as fused_warmup,
         )
@@ -69,15 +70,20 @@ def _init_fused_backend() -> None:
     except ImportError as e:
         logger.info(
             f"LPLB fused solver disabled: {e}. "
-            "Install with: pip install 'nvmath-python[cu12-dx]==0.9.0' 'numba-cuda>=0.28.1'"
+            "Provide Math-DX (cuBLASDx + cuSolverDx) via MATHDX_HOME or "
+            "python/sglang/jit_kernel/lplb/resources/download-mathdx.sh."
         )
         return
 
     _FUSED_SOLVE_IPM = fused_solve_ipm
     _FUSED_WARMUP = fused_warmup
     _FUSED_ASSERT_FITS = assert_fits
+    # Share the rejection set so torch_solver and cuda_solver agree on which
+    # shapes have already failed and should fall back to the torch reference.
+    _FUSED_REJECTED_SHAPES.update(_CUDA_REJECTED)
+    _CUDA_REJECTED.update(_FUSED_REJECTED_SHAPES)
     _FUSED_AVAILABLE = True
-    logger.info("LPLB fused solver enabled (cuBLASDx + cuSolverDx)")
+    logger.info("LPLB fused solver enabled (CUDA C++ via load_jit, cuBLASDx + cuSolverDx)")
 
 
 def warmup(nc: int, nv: int, num_iters: int = 5, device: str = "cuda") -> None:

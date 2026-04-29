@@ -307,3 +307,133 @@ def test_lplb_rejects_unsafe_non_deepseek_moe(arch):
     assert arch in msg, f"Error doesn't name the architecture: {msg}"
     assert "ep-dispatch-algorithm lp" in msg, f"Error doesn't reference the flag: {msg}"
     assert "all-reduce" in msg, f"Error doesn't explain the deadlock cause: {msg}"
+
+
+# ---------------------------------------------------------------------------
+# CUDA IPM solver — JIT-compiled kernel via load_jit
+# ---------------------------------------------------------------------------
+
+
+def _cuda_solver_or_skip():
+    """Skip the calling test if the CUDA IPM solver can't run on this host.
+
+    Skipped when: no CUDA, GPU SM < 9.0 (cuBLASDx requires Hopper+),
+    cuda_solver module fails to import, or Math-DX (mathdx) headers are
+    missing so load_jit can't compile.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    if torch.cuda.get_device_capability()[0] < 9:
+        pytest.skip("Requires SM >= 9.0 (Hopper+) for cuBLASDx/cuSolverDx")
+    try:
+        from sglang.jit_kernel.lplb import cuda_solver
+    except ImportError as e:
+        pytest.skip(f"cuda_solver import failed: {e}")
+    try:
+        from sglang.jit_kernel.utils import get_mathdx_root
+
+        if get_mathdx_root() is None:
+            pytest.skip(
+                "Math-DX (cuBLASDx + cuSolverDx) not found. Set MATHDX_HOME or "
+                "run python/sglang/jit_kernel/lplb/resources/download-mathdx.sh."
+            )
+    except Exception as e:
+        pytest.skip(f"Math-DX probe failed: {e}")
+    return cuda_solver
+
+
+def _make_feasible_lp(nc: int, nv: int, seed: int = 42, device: str = "cuda"):
+    """Build a small feasible LP whose Big-M variable is the last column.
+
+    Same shape contract as the LPLB solver's actual call site:
+        A: (NC, NV) float32, last column is the Big-M slack
+        b: (NC,)   float32, set so x=1 is feasible
+        c: (NV,)   float32, all zero except c[-2]=1, c[-1]=1000 (Big-M)
+    """
+    torch.manual_seed(seed)
+    A = torch.randn(nc, nv, dtype=torch.float32, device=device)
+    b = A @ torch.ones(nv, dtype=torch.float32, device=device)
+    c = torch.zeros(nv, dtype=torch.float32, device=device)
+    c[-2] = 1.0
+    c[-1] = 1000.0
+    return A, b, c
+
+
+def test_cuda_solver_returns_correct_shape():
+    """Kernel writes a finite (NV,) float32 vector for a feasible problem."""
+    cuda_solver = _cuda_solver_or_skip()
+    nc, nv = 4, 6
+    A, b, c = _make_feasible_lp(nc, nv)
+    cuda_solver.warmup(nc, nv)
+
+    x = cuda_solver.solve_ipm(A, b, c, num_iters=5)
+
+    assert x.shape == (nv,)
+    assert x.dtype == torch.float32
+    assert x.is_cuda
+    assert torch.isfinite(x).all(), f"Non-finite values in CUDA solution: {x}"
+
+
+def test_cuda_solver_matches_torch_oracle():
+    """The JIT'd CUDA kernel agrees with the torch IPM reference on a
+    feasible LP. Discriminator: tells "kernel ran the IPM" apart from
+    "kernel silently emitted the 0.5 fallback for everything"."""
+    cuda_solver = _cuda_solver_or_skip()
+    from sglang.jit_kernel.lplb.torch_solver import _solve_ipm_torch
+
+    nc, nv = 4, 6
+    A, b, c = _make_feasible_lp(nc, nv)
+    cuda_solver.warmup(nc, nv)
+
+    x_cuda = cuda_solver.solve_ipm(A, b, c, num_iters=5)
+    x_ref = _solve_ipm_torch(A, b, c, num_iters=5)
+
+    # If both fell back to 0.5, that's a vacuous match — assert at least one
+    # diverged from 0.5, then check they agree.
+    not_fallback = (x_ref - 0.5).abs().max().item() > 1e-3
+    assert not_fallback, (
+        "Reference solver hit the 0.5 fallback; pick a different test problem"
+    )
+    diff = (x_cuda - x_ref).abs().max().item()
+    assert diff < 5e-2, (
+        f"CUDA kernel disagrees with torch oracle: max abs diff {diff:.4f}\n"
+        f"  cuda: {x_cuda.cpu().tolist()}\n"
+        f"  torch: {x_ref.cpu().tolist()}"
+    )
+
+
+def test_cuda_solver_compile_cache_is_per_shape():
+    """Re-calling warmup for the same (NC, NV, num_iters) hits the cache and
+    returns the same compiled module. Different shapes yield different ones.
+    """
+    cuda_solver = _cuda_solver_or_skip()
+
+    mod1 = cuda_solver._ipm_module(4, 6, 256, 5, cuda_solver._sm_ver())
+    mod2 = cuda_solver._ipm_module(4, 6, 256, 5, cuda_solver._sm_ver())
+    mod3 = cuda_solver._ipm_module(8, 10, 256, 5, cuda_solver._sm_ver())
+
+    assert mod1 is mod2, "cache_once should return the same module for the same shape"
+    assert mod1 is not mod3, "different shapes must compile different modules"
+
+
+def test_cuda_solver_fallback_on_nonconvergence():
+    """When the IPM cannot converge (e.g. infeasible LP), the kernel writes
+    0.5 to every entry rather than NaN/Inf."""
+    cuda_solver = _cuda_solver_or_skip()
+
+    nc, nv = 4, 6
+    # Force infeasibility: b is far outside any plausible value of A @ x for x>=0
+    A = torch.randn(nc, nv, dtype=torch.float32, device="cuda")
+    b = torch.full((nc,), 1e6, dtype=torch.float32, device="cuda")
+    c = torch.zeros(nv, dtype=torch.float32, device="cuda")
+    c[-1] = 1000.0
+    cuda_solver.warmup(nc, nv)
+
+    x = cuda_solver.solve_ipm(A, b, c, num_iters=5)
+    assert torch.isfinite(x).all()
+    # Either the kernel converged to something or hit the fallback. If it hit
+    # the fallback every entry should be exactly 0.5.
+    if (x - 0.5).abs().max().item() < 1e-6:
+        return  # explicitly the fallback path — pass
+    # Otherwise it claimed convergence; values must still be plausibly bounded.
+    assert x.abs().max().item() < 1e6, f"Kernel produced unbounded output: {x}"
