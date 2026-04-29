@@ -256,10 +256,6 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
-<Note>
-Mistral has flagged that multimodal performance is currently subpar relative to leading VLMs. Expect competitive text quality but lower MMMU-style benchmarks until the next checkpoint refresh.
-</Note>
-
 ### 4.6 Loading the Reference System Prompt
 
 Mistral ships a `SYSTEM_PROMPT.txt` alongside the weights. The reference setup loads it from the HF repo and substitutes `{name}`, `{today}`, and `{yesterday}` at runtime so the model knows its identity and the current date. SGLang's chat template will inject a default system prompt if you omit one, but for full parity with Mistral's reference, load it explicitly:
@@ -302,60 +298,19 @@ Validation runs on 4× H200 with `--tp 4`, served via the `/v1/chat/completions`
 
 ### 5.1 Accuracy Benchmarks
 
-#### GSM8K (chat API, 200 questions, temperature=0)
+#### GSM8K
 
-```python Command
-# Drop-in eval against a running server
-import re, time, concurrent.futures
-from openai import OpenAI
-from sglang.utils import download_and_cache_file, read_jsonl
-
-INVALID = -9999999
-client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
-url = "https://raw.githubusercontent.com/openai/grade-school-math/master/grade_school_math/data/test.jsonl"
-lines = list(read_jsonl(download_and_cache_file(url)))
-
-def get_answer_value(s):
-    s = s.replace(",", "")
-    nums = re.findall(r"-?\d+\.?\d*", s)
-    if not nums: return INVALID
-    try: return int(float(nums[-1]))
-    except: return INVALID
-
-def extract(text):
-    if "####" in text: return get_answer_value(text.split("####")[-1])
-    boxed = re.findall(r"\\boxed\{([^}]+)\}", text)
-    if boxed: return get_answer_value(boxed[-1])
-    return get_answer_value(text)
-
-def eval_one(i):
-    q = lines[i]["question"]
-    label = get_answer_value(lines[i]["answer"])
-    resp = client.chat.completions.create(
-        model="mistralai/Mistral-Medium-3.5-128B",
-        messages=[
-            {"role": "system", "content": "You are a math problem solver. Solve step by step and give your final numeric answer."},
-            {"role": "user", "content": q},
-        ],
-        max_tokens=1024, temperature=0,
-    )
-    return extract(resp.choices[0].message.content or ""), label
-
-N = 200
-results = [None] * N
-with concurrent.futures.ThreadPoolExecutor(max_workers=64) as ex:
-    futs = {ex.submit(eval_one, i): i for i in range(N)}
-    for f in concurrent.futures.as_completed(futs):
-        results[futs[f]] = f.result()
-
-correct = sum(p == l for p, l in results)
-print(f"Accuracy: {correct/N:.3f} ({correct}/{N})")
+```bash Command
+python3 benchmark/gsm8k/bench_sglang.py --port 30000
 ```
 
 **Results:**
 
 ```text Output
-Accuracy: 0.940 (188/200)
+Accuracy: 0.945
+Invalid: 0.000
+Latency: 16.305 s
+Output throughput: 1305.931 token/s
 ```
 
 #### MMMU (vision benchmark, 100 samples)
@@ -382,6 +337,7 @@ Score: 0.270
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
+  --dataset-name random \
   --num-prompts 10 \
   --max-concurrency 1 \
   --random-input-len 1024 \
@@ -392,7 +348,17 @@ python3 -m sglang.bench_serving \
 **Results:**
 
 ```text Output
-TODO
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Successful requests:                     10
+Benchmark duration (s):                  42.19
+Total input tokens:                      6101
+Total generated tokens:                  2684
+Output token throughput (tok/s):         63.61
+Mean E2E Latency (ms):                   4216.94
+Median TTFT (ms):                        108.82
+Median TPOT (ms):                        15.40
+==================================================
 ```
 
 #### Throughput (High Concurrency)
@@ -400,6 +366,7 @@ TODO
 ```bash Command
 python3 -m sglang.bench_serving \
   --backend sglang \
+  --dataset-name random \
   --num-prompts 1000 \
   --max-concurrency 100 \
   --random-input-len 1024 \
@@ -410,5 +377,16 @@ python3 -m sglang.bench_serving \
 **Results:**
 
 ```text Output
-TODO
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Successful requests:                     1000
+Benchmark duration (s):                  120.14
+Total input tokens:                      512842
+Total generated tokens:                  262023
+Output token throughput (tok/s):         2180.89
+Total token throughput (tok/s):          6449.42
+Mean E2E Latency (ms):                   11554.55
+Median TTFT (ms):                        156.32
+Median TPOT (ms):                        43.41
+==================================================
 ```
