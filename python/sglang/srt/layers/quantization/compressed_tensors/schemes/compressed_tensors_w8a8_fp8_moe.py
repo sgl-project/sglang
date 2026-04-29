@@ -398,6 +398,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             return StandardCombineInput(hidden_states=output)
         elif self.weight_quant.strategy == QuantizationStrategy.BLOCK:
             if self.use_flashinfer_trtllm:
+                from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                    get_activation_type,
+                )
+
+                activation_type = get_activation_type(moe_runner_config.activation)
                 quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                     w13_weight=layer.w13_weight,
                     w2_weight=layer.w2_weight,
@@ -410,6 +415,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     weight_block_k=self.weight_block_size[1],
                     w13_weight_scale_inv=layer.w13_weight_scale,
                     w2_weight_scale_inv=layer.w2_weight_scale,
+                    activation_type=activation_type,
                 )
             else:
                 quant_info = TritonMoeQuantInfo(
