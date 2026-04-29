@@ -163,10 +163,6 @@ class Envs:
     SGLANG_USE_MODELSCOPE = EnvBool(False)
     SGLANG_SORT_WEIGHT_FILES = EnvBool(False)
     SGLANG_DISABLED_MODEL_ARCHS = EnvTuple(tuple())
-    # "none" = use checkpoint's config.json, "small"/"large" = force the packaged
-    # config_backup_{small,large}.json, "auto" = pick small/large based on the
-    # checkpoint's num_hidden_layers.
-    SGLANG_APPLY_CONFIG_BACKUP = EnvStr("auto")
 
     # Logging Options
     SGLANG_LOG_GC = EnvBool(False)

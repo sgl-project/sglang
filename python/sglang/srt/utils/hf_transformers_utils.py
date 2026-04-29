@@ -26,7 +26,6 @@ from typing import Any, Dict, List, Literal, Optional, Type, Union
 import torch
 from huggingface_hub import snapshot_download
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
@@ -257,56 +256,14 @@ def get_hf_text_config(config: PretrainedConfig):
 # Temporary hack for DeepSeek-V3.2 model
 def _load_deepseek_temp_model(
     model_path: str,
-    model_type: Literal["deepseek_v32", "deepseek_ref"],
+    model_type: Literal["deepseek_v32", "deepseek_v4"],
     architecture: Literal["DeepseekV3ForCausalLM", "DeepseekV4ForCausalLM"],
     trust_remote_code: bool = False,
     revision: Optional[str] = None,
     **kwargs,
 ):
-    # first get the local path
     local_path = download_from_hf(model_path)
-    # then load the config file in json
-    backup_mode = envs.SGLANG_APPLY_CONFIG_BACKUP.get()
-    if backup_mode == "auto":
-        real_config_file = os.path.join(local_path, "config.json")
-        if not os.path.exists(real_config_file):
-            raise RuntimeError(
-                f"SGLANG_APPLY_CONFIG_BACKUP=auto requires the checkpoint's "
-                f"config.json at {real_config_file} to read num_hidden_layers."
-            )
-        with open(real_config_file, "r") as f:
-            num_hidden_layers = json.load(f).get("num_hidden_layers")
-        if not isinstance(num_hidden_layers, int):
-            raise RuntimeError(
-                f"SGLANG_APPLY_CONFIG_BACKUP=auto could not read a numeric "
-                f"num_hidden_layers from {real_config_file} (got {num_hidden_layers!r})."
-            )
-        backup_mode = "small" if num_hidden_layers <= 50 else "large"
-        logger.warning(
-            f"SGLANG_APPLY_CONFIG_BACKUP=auto: checkpoint has "
-            f"num_hidden_layers={num_hidden_layers}, dispatching to {backup_mode!r}."
-        )
-    if backup_mode != "none":
-        backup_file = {
-            "small": "config_backup_small.json",
-            "large": "config_backup_large.json",
-        }.get(backup_mode)
-        if backup_file is None:
-            raise ValueError(
-                f"SGLANG_APPLY_CONFIG_BACKUP={backup_mode!r} is not recognized; "
-                f"use 'none' (off), 'small', 'large', or 'auto'."
-            )
-        config_file = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "configs",
-            backup_file,
-        )
-        logger.warning(
-            f"SGLANG_APPLY_CONFIG_BACKUP={backup_mode}: using packaged {config_file} "
-            f"instead of the checkpoint's config.json at {local_path}."
-        )
-    else:
-        config_file = os.path.join(local_path, "config.json")
+    config_file = os.path.join(local_path, "config.json")
     if not os.path.exists(config_file):
         raise RuntimeError(f"Can't find config file at {config_file}.")
 
@@ -550,15 +507,6 @@ def get_config(
         config = _load_mistral_large_3_for_causal_LM(
             model, trust_remote_code=trust_remote_code, revision=revision
         )
-    elif envs.SGLANG_APPLY_CONFIG_BACKUP.get() != "none":
-        config = _load_deepseek_temp_model(
-            model,
-            model_type="deepseek_ref",
-            architecture="DeepseekV4ForCausalLM",
-            trust_remote_code=trust_remote_code,
-            revision=revision,
-            **kwargs,
-        )
     else:
         _ensure_llama_flash_attention2_compat()
         try:
@@ -566,10 +514,10 @@ def get_config(
                 model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
             )
         except ValueError as e:
-            if "deepseek_ref" in str(e):
+            if "deepseek_v4" in str(e):
                 config = _load_deepseek_temp_model(
                     model,
-                    model_type="deepseek_ref",
+                    model_type="deepseek_v4",
                     architecture="DeepseekV4ForCausalLM",
                     trust_remote_code=trust_remote_code,
                     revision=revision,
