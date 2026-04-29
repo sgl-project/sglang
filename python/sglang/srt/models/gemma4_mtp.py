@@ -359,6 +359,7 @@ class Gemma4AssistantForCausalLM(PreTrainedModel):
         self.vocab_size = text_config.vocab_size
         self.hidden_size = text_config.hidden_size
         self.backbone_hidden_size = config.backbone_hidden_size
+        self.target_embed_scale = self.backbone_hidden_size**0.5
         self.use_ordered_embeddings = bool(
             getattr(config, "use_ordered_embeddings", False)
         )
@@ -453,7 +454,7 @@ class Gemma4AssistantForCausalLM(PreTrainedModel):
         **kwargs,
     ) -> LogitsProcessorOutput:
         token_embed = (
-            self.target_embed_tokens(input_ids)
+            self.target_embed_tokens(input_ids) * self.target_embed_scale
             if input_embeds is None
             else input_embeds
         )
