@@ -16,8 +16,8 @@ from sglang.srt.ug.bagel import (
     BAGELNativeSRTPreparedDenoise,
     BAGELNativeSRTUForwardExecutor,
     BAGELPreparedDenoise,
-    BAGELSRTUForwardExecutor,
     BAGELSessionContext,
+    BAGELSRTUForwardExecutor,
     BAGELUForwardBridge,
     BAGELUGModelAdapter,
     MockBAGELBackend,
@@ -34,22 +34,30 @@ from sglang.srt.ug.bagel_cache import (
 from sglang.srt.ug.context import (
     UGContextBundle,
     UGContextHandle,
+    UGSessionHandle,
     UGSRTKVTokenBinding,
     UGSRTRequestView,
-    UGSessionHandle,
 )
 from sglang.srt.ug.denoiser import (
     FakeUGDenoiserBridge,
     SRTBackedUGDenoiserBridge,
     UGDenoiserBridge,
 )
+from sglang.srt.ug.interleaved import (
+    UGGeneratedImage,
+    UGInputSegment,
+    UGInterleavedRequest,
+    UGInterleavedResponse,
+    UGOutputSegment,
+    UGRuntimeStats,
+)
 from sglang.srt.ug.runtime import (
     FakeUGModelRunner,
     UGDecodeResult,
     UGInterleavedMessage,
-    UGSRTPreparedInput,
     UGSegmentState,
     UGSessionRuntime,
+    UGSRTPreparedInput,
     UGVelocityRequest,
     UGVelocityResponse,
 )
@@ -86,7 +94,11 @@ __all__ = [
     "UGContextHandle",
     "UGDecodeResult",
     "UGDenoiserBridge",
+    "UGGeneratedImage",
+    "UGInputSegment",
     "UGInterleavedMessage",
+    "UGInterleavedRequest",
+    "UGInterleavedResponse",
     "UGModelAdapterProtocol",
     "UGModelAppendImageResult",
     "UGModelPrefillResult",
@@ -98,6 +110,8 @@ __all__ = [
     "UGSegmentState",
     "UGSessionHandle",
     "UGSessionRuntime",
+    "UGOutputSegment",
+    "UGRuntimeStats",
     "UGSRTRequestBoundaryExecutor",
     "UGSRTSchedulerExecutor",
     "UGSRTSchedulerExecutorError",

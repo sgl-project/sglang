@@ -109,6 +109,34 @@ MM_PAD_SHIFT_VALUE = 1_000_000
 
 logger = logging.getLogger(__name__)
 
+UG_BATCH_COMPAT_CAUSAL = "causal"
+UG_BATCH_COMPAT_NON_CAUSAL_QUERY = "ug_non_causal_query"
+
+
+def get_ug_batch_compat_key(req: "Req") -> str:
+    if getattr(req, "ug_non_causal_query_attention", False):
+        return UG_BATCH_COMPAT_NON_CAUSAL_QUERY
+    return UG_BATCH_COMPAT_CAUSAL
+
+
+def get_ug_batch_compat_key_for_reqs(reqs: List["Req"]) -> str:
+    batch_compat_keys = {get_ug_batch_compat_key(req) for req in reqs}
+    if len(batch_compat_keys) > 1:
+        raise ValueError(
+            "UG non-causal query attention requests cannot be mixed with "
+            "ordinary causal requests in the same SRT batch"
+        )
+    return next(iter(batch_compat_keys), UG_BATCH_COMPAT_CAUSAL)
+
+
+def is_ug_batch_compatible(req: "Req", batch_compat_key: Optional[str]) -> bool:
+    return batch_compat_key is None or get_ug_batch_compat_key(req) == batch_compat_key
+
+
+def check_ug_non_causal_batch_compat(reqs: List["Req"]) -> bool:
+    batch_compat_key = get_ug_batch_compat_key_for_reqs(reqs)
+    return batch_compat_key == UG_BATCH_COMPAT_NON_CAUSAL_QUERY
+
 
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
@@ -1673,6 +1701,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         orig_seq_lens = [max(len(r.fill_ids), len(r.origin_input_ids)) for r in reqs]
         prefix_lens = [len(r.prefix_indices) for r in reqs]
         extend_lens = [r.extend_input_len for r in reqs]
+        ug_non_causal_query_attention = check_ug_non_causal_batch_compat(reqs)
 
         # For matryoshka embeddings
         if self.model_config.is_matryoshka and any(
@@ -1732,8 +1761,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         has_custom_position_ids = any(
             getattr(req, "ug_position_ids", None) is not None for req in reqs
         )
-        ug_non_causal_query_attention = False
-        ug_non_causal_req_count = 0
         bagel_mot_text_token_indices = []
         bagel_mot_vae_token_indices = []
         input_id_pointer = 0
@@ -1811,7 +1838,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             if getattr(req, "ug_non_causal_query_attention", False):
                 ug_non_causal_query_attention = True
-                ug_non_causal_req_count += 1
 
             local_bagel_text_indices = []
             local_bagel_vae_indices = []
@@ -1922,12 +1948,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         - len(logprob_token_ids)
                     )
                 )
-
-        if ug_non_causal_query_attention and ug_non_causal_req_count != len(reqs):
-            raise ValueError(
-                "UG non-causal query attention requests cannot be mixed with "
-                "ordinary causal requests in the same SRT batch"
-            )
 
         if self.return_logprob:
             extend_input_logprob_token_ids = torch.tensor(

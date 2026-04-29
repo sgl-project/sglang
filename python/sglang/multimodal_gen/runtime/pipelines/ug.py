@@ -18,6 +18,11 @@ from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
 from sglang.srt.ug.bagel import create_bagel_ug_model_adapter
 from sglang.srt.ug.denoiser import SRTBackedUGDenoiserBridge, UGDenoiserBridge
+from sglang.srt.ug.interleaved import (
+    UGInterleavedRequest,
+    UGInterleavedResponse,
+    UGRuntimeStats,
+)
 from sglang.srt.ug.runtime import FakeUGModelRunner, UGSessionRuntime
 from sglang.srt.ug.srt_executor import (
     UGSRTRequestBoundaryExecutor,
@@ -141,11 +146,11 @@ class UGPipeline(ComposedPipelineBase):
 
     def forward_interleaved(
         self,
-        messages: list[dict[str, Any]],
+        messages: UGInterleavedRequest | list[Any],
         sampling_params: UGSamplingParams | dict[str, Any] | None = None,
         server_args: ServerArgs | None = None,
         **sampling_kwargs: Any,
-    ) -> list[dict[str, Any]]:
+    ) -> UGInterleavedResponse:
         """Experimental UG interleaved API.
 
         This is intentionally Python-only and internal for now. It accepts a
@@ -156,16 +161,24 @@ class UGPipeline(ComposedPipelineBase):
         server_args = server_args or self.server_args
         if server_args is None:
             raise ValueError("UG interleaved API requires server_args")
-        sampling_params = _normalize_interleaved_sampling_params(
-            sampling_params, sampling_kwargs
+        request = _normalize_interleaved_request(
+            messages, sampling_params, sampling_kwargs
         )
         batch = Req(
-            sampling_params=sampling_params,
-            extra={"ug_interleaved_messages": messages},
+            sampling_params=request.sampling_params,
+            extra={"ug_interleaved_messages": request.to_legacy_segments()},
         )
         try:
             result = self.forward(batch, server_args)
-            return list(result.extra["ug_output_segments"])
+            contexts = result.extra.get("ug_contexts")
+            stats = _collect_interleaved_runtime_stats(
+                self.get_module("ug_bridge"), contexts
+            )
+            return UGInterleavedResponse.from_legacy_segments(
+                list(result.extra["ug_output_segments"]),
+                stats=stats,
+                metadata=dict(request.metadata),
+            )
         finally:
             contexts = batch.extra.get("ug_contexts")
             if contexts is not None:
@@ -173,6 +186,39 @@ class UGPipeline(ComposedPipelineBase):
 
 
 EntryClass = UGPipeline
+
+
+def _normalize_interleaved_request(
+    messages: UGInterleavedRequest | list[Any],
+    sampling_params: UGSamplingParams | dict[str, Any] | None,
+    sampling_kwargs: dict[str, Any],
+) -> UGInterleavedRequest:
+    if isinstance(messages, UGInterleavedRequest):
+        if messages.sampling_params is not None and (
+            sampling_params is not None or sampling_kwargs
+        ):
+            raise ValueError(
+                "UG interleaved request already contains sampling_params; pass "
+                "overrides by constructing a new UGInterleavedRequest"
+            )
+        return UGInterleavedRequest(
+            messages=messages.messages,
+            sampling_params=_normalize_interleaved_sampling_params(
+                (
+                    messages.sampling_params
+                    if sampling_params is None
+                    else sampling_params
+                ),
+                sampling_kwargs,
+            ),
+            metadata=dict(messages.metadata),
+        )
+    return UGInterleavedRequest.from_segments(
+        messages,
+        sampling_params=_normalize_interleaved_sampling_params(
+            sampling_params, sampling_kwargs
+        ),
+    )
 
 
 def _normalize_interleaved_sampling_params(
@@ -191,3 +237,17 @@ def _normalize_interleaved_sampling_params(
             "to be omitted or passed as a dict"
         )
     return sampling_params
+
+
+def _collect_interleaved_runtime_stats(
+    bridge: UGDenoiserBridge,
+    contexts: Any | None,
+) -> UGRuntimeStats | None:
+    if contexts is None or contexts.full.session is None:
+        return None
+    runtime = getattr(bridge, "runtime", None)
+    if runtime is None:
+        return None
+    return UGRuntimeStats.from_debug_counters(
+        runtime.get_debug_counters(contexts.full.session)
+    )

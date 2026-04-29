@@ -581,7 +581,7 @@ class TestBAGELQwen2MoTNativeLive(CustomTestCase):
                         executor=SyncExecutor(diffusion_args),
                     )
 
-                segments = pipeline.forward_interleaved(
+                response = pipeline.forward_interleaved(
                     [
                         {
                             "type": "image",
@@ -603,6 +603,7 @@ class TestBAGELQwen2MoTNativeLive(CustomTestCase):
                         "suppress_logs": True,
                     },
                 )
+                segments = response.to_legacy_segments()
 
                 self.assertEqual(
                     [segment["type"] for segment in segments],
@@ -611,6 +612,11 @@ class TestBAGELQwen2MoTNativeLive(CustomTestCase):
                 self.assertIsInstance(segments[0]["image"], Image.Image)
                 self.assertEqual(segments[0]["image"].size, (32, 32))
                 self.assertIsInstance(segments[1]["text"], str)
+                self.assertEqual(response.stats.prefill_count, 1)
+                self.assertEqual(response.stats.velocity_count, 2)
+                self.assertEqual(response.stats.append_image_count, 1)
+                self.assertEqual(response.stats.decode_count, 2)
+                self.assertEqual(response.stats.srt_executed_request_count, 7)
                 self.assertTrue(scheduler.is_fully_idle())
                 self.assertEqual(scheduler.session_controller.sessions, {})
             finally:

@@ -6,9 +6,17 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.session.session_controller import SessionController
+from sglang.srt.managers.schedule_batch import (
+    UG_BATCH_COMPAT_CAUSAL,
+    UG_BATCH_COMPAT_NON_CAUSAL_QUERY,
+    check_ug_non_causal_batch_compat,
+    get_ug_batch_compat_key,
+    get_ug_batch_compat_key_for_reqs,
+    is_ug_batch_compatible,
+)
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.ug.context import UGSRTKVTokenBinding, UGSRTRequestView, UGSessionHandle
+from sglang.srt.session.session_controller import SessionController
+from sglang.srt.ug.context import UGSessionHandle, UGSRTKVTokenBinding, UGSRTRequestView
 from sglang.srt.ug.runtime import (
     FakeUGModelRunner,
     UGInterleavedMessage,
@@ -461,6 +469,121 @@ class TestUGSessionRuntime(unittest.TestCase):
         self.assertTrue(debug["srt_mm_features_released"])
         self.assertEqual(tree_cache.released_sessions, ["srt-backed-close"])
         self.assertNotIn("srt-backed-close", controller.sessions)
+
+    def test_two_ug_sessions_are_isolated_when_interleaved(self):
+        tree_cache = FakeTreeCache()
+        controller = SessionController(tree_cache)
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(),
+            session_controller=controller,
+        )
+
+        handle_a = runtime.prefill_interleaved(
+            [
+                UGInterleavedMessage(type="image", content=object()),
+                UGInterleavedMessage(type="text", content="draw a red kite"),
+            ],
+            session_id="ug-session-a",
+        )
+        marker_a = runtime.decode_next_segment(handle_a)
+        self.assertEqual(marker_a.type, "image_marker")
+
+        handle_b = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a blue boat")],
+            session_id="ug-session-b",
+        )
+        marker_b = runtime.decode_next_segment(handle_b)
+        self.assertEqual(marker_b.type, "image_marker")
+
+        response_a = runtime.predict_velocity(
+            UGVelocityRequest(
+                session=handle_a,
+                latent_tokens=torch.zeros(1, 2, 4),
+                timestep=torch.tensor([0.75]),
+                latent_position_ids=torch.arange(2),
+                sampling_params=None,
+            )
+        )
+        response_b = runtime.predict_velocity(
+            UGVelocityRequest(
+                session=handle_b,
+                latent_tokens=torch.zeros(1, 2, 4),
+                timestep=torch.tensor([0.5]),
+                latent_position_ids=torch.arange(2),
+                sampling_params=None,
+            )
+        )
+        self.assertEqual(response_a.session.session_id, "ug-session-a")
+        self.assertEqual(response_b.session.session_id, "ug-session-b")
+
+        handle_a = runtime.append_generated_image(handle_a, image=object())
+        text_a = runtime.decode_next_segment(handle_a)
+        self.assertEqual(text_a.type, "text")
+
+        debug_a = runtime.get_debug_counters(handle_a)
+        debug_b = runtime.get_debug_counters(handle_b)
+        self.assertEqual(debug_a["session_id"], "ug-session-a")
+        self.assertEqual(debug_b["session_id"], "ug-session-b")
+        self.assertEqual(debug_a["prefill_count"], 1)
+        self.assertEqual(debug_b["prefill_count"], 1)
+        self.assertEqual(debug_a["velocity_count"], 1)
+        self.assertEqual(debug_b["velocity_count"], 1)
+        self.assertEqual(debug_a["append_image_count"], 1)
+        self.assertEqual(debug_b["append_image_count"], 0)
+        self.assertEqual(debug_a["state"], "u_decode")
+        self.assertEqual(debug_b["state"], "g_denoise")
+
+        runtime.close_session(handle_a)
+        self.assertEqual(tree_cache.released_sessions, ["ug-session-a"])
+        self.assertNotIn("ug-session-a", controller.sessions)
+        self.assertIn("ug-session-b", controller.sessions)
+        self.assertEqual(runtime.get_state(handle_b), UGSegmentState.G_DENOISE)
+
+        response_b = runtime.predict_velocity(
+            UGVelocityRequest(
+                session=handle_b,
+                latent_tokens=torch.zeros(1, 2, 4),
+                timestep=torch.tensor([0.25]),
+                latent_position_ids=torch.arange(2),
+                sampling_params=None,
+            )
+        )
+        self.assertEqual(response_b.session.session_id, "ug-session-b")
+        self.assertEqual(
+            runtime.get_debug_counters(handle_b)["velocity_count"],
+            2,
+        )
+
+    def test_ug_non_causal_batch_guard_rejects_mixed_batches(self):
+        ordinary = SimpleNamespace()
+        non_causal = SimpleNamespace(ug_non_causal_query_attention=True)
+
+        self.assertEqual(get_ug_batch_compat_key(ordinary), UG_BATCH_COMPAT_CAUSAL)
+        self.assertEqual(
+            get_ug_batch_compat_key(non_causal),
+            UG_BATCH_COMPAT_NON_CAUSAL_QUERY,
+        )
+        self.assertTrue(is_ug_batch_compatible(ordinary, None))
+        self.assertTrue(
+            is_ug_batch_compatible(non_causal, UG_BATCH_COMPAT_NON_CAUSAL_QUERY)
+        )
+        self.assertFalse(
+            is_ug_batch_compatible(ordinary, UG_BATCH_COMPAT_NON_CAUSAL_QUERY)
+        )
+        self.assertEqual(
+            get_ug_batch_compat_key_for_reqs([ordinary, ordinary]),
+            UG_BATCH_COMPAT_CAUSAL,
+        )
+        self.assertEqual(
+            get_ug_batch_compat_key_for_reqs([non_causal, non_causal]),
+            UG_BATCH_COMPAT_NON_CAUSAL_QUERY,
+        )
+        self.assertFalse(check_ug_non_causal_batch_compat([ordinary, ordinary]))
+        self.assertTrue(check_ug_non_causal_batch_compat([non_causal, non_causal]))
+        with self.assertRaisesRegex(ValueError, "cannot be mixed"):
+            check_ug_non_causal_batch_compat([ordinary, non_causal])
+        with self.assertRaisesRegex(ValueError, "cannot be mixed"):
+            get_ug_batch_compat_key_for_reqs([ordinary, non_causal])
 
     def test_u_g_u_minimal_loop_keeps_one_session(self):
         runtime = UGSessionRuntime(model_runner=FakeUGModelRunner())

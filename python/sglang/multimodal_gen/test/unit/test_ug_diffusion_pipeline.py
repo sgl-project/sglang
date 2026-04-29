@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle
+from sglang.srt.ug.interleaved import UGInputSegment, UGInterleavedRequest
 from sglang.srt.ug.runtime import UGDecodeResult, UGLatentPrepareResult
 
 _GLOBAL_ARGS_PATCH = (
@@ -119,7 +120,7 @@ class TestUGDiffusionPipeline(unittest.TestCase):
                 executor=SyncExecutor(server_args),
             )
 
-        segments = pipeline.forward_interleaved(
+        response = pipeline.forward_interleaved(
             [
                 {"type": "image", "image": Image.new("RGB", (16, 16), "white")},
                 {"type": "text", "text": "draw a small lamp and describe it"},
@@ -133,11 +134,21 @@ class TestUGDiffusionPipeline(unittest.TestCase):
             ),
             server_args,
         )
+        segments = response.to_legacy_segments()
 
         self.assertEqual([segment["type"] for segment in segments], ["image", "text"])
         self.assertIsInstance(segments[0]["image"], Image.Image)
         self.assertEqual(segments[0]["image"].size, (32, 32))
         self.assertEqual(segments[1]["text"], "generated_text_after_image")
+        self.assertEqual([segment["type"] for segment in response], ["image", "text"])
+        self.assertEqual(
+            [segment.type for segment in response.segments], ["image", "text"]
+        )
+        self.assertIsNotNone(response.segments[0].image)
+        self.assertEqual(response.stats.prefill_count, 1)
+        self.assertEqual(response.stats.velocity_count, 1)
+        self.assertEqual(response.stats.append_image_count, 1)
+        self.assertEqual(response.stats.decode_count, 2)
         bridge = pipeline.get_module("ug_bridge")
         self.assertEqual(
             len(bridge.runtime.session_controller.tree_cache.released_sessions),
@@ -157,7 +168,7 @@ class TestUGDiffusionPipeline(unittest.TestCase):
                 executor=SyncExecutor(server_args),
             )
 
-        segments = pipeline.forward_interleaved(
+        response = pipeline.forward_interleaved(
             [
                 {"type": "image", "image": Image.new("RGB", (16, 16), "white")},
                 {"type": "text", "text": "draw then explain"},
@@ -171,6 +182,7 @@ class TestUGDiffusionPipeline(unittest.TestCase):
             ),
             server_args,
         )
+        segments = response.to_segments()
 
         self.assertEqual(
             [segment["type"] for segment in segments], ["text", "image", "text"]
@@ -182,6 +194,7 @@ class TestUGDiffusionPipeline(unittest.TestCase):
             [message.type for message in bridge.interleaved_messages],
             ["image", "text"],
         )
+        self.assertIsNone(response.stats)
 
     def test_experimental_interleaved_api_accepts_dict_sampling_params(self):
         server_args = _make_server_args()
@@ -192,7 +205,7 @@ class TestUGDiffusionPipeline(unittest.TestCase):
                 executor=SyncExecutor(server_args),
             )
 
-        segments = pipeline.forward_interleaved(
+        response = pipeline.forward_interleaved(
             [
                 {"type": "image", "image": Image.new("RGB", (16, 16), "white")},
                 {"type": "text", "text": "draw a small lamp and describe it"},
@@ -205,11 +218,91 @@ class TestUGDiffusionPipeline(unittest.TestCase):
                 "suppress_logs": True,
             },
         )
+        segments = response.to_legacy_segments()
 
         self.assertEqual([segment["type"] for segment in segments], ["image", "text"])
         self.assertIsInstance(segments[0]["image"], Image.Image)
         self.assertEqual(segments[0]["image"].size, (32, 32))
         self.assertEqual(segments[1]["text"], "generated_text_after_image")
+
+    def test_experimental_interleaved_api_accepts_request_schema(self):
+        server_args = _make_server_args()
+        with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
+            pipeline = UGPipeline(
+                "sglang-internal/fake-ug",
+                server_args,
+                executor=SyncExecutor(server_args),
+            )
+
+        request = UGInterleavedRequest.from_segments(
+            [
+                UGInputSegment.from_image(Image.new("RGB", (16, 16), "white")),
+                UGInputSegment.from_text("draw a small lamp and describe it"),
+            ],
+            sampling_params={
+                "width": 32,
+                "height": 32,
+                "seed": 123,
+                "num_inference_steps": 2,
+                "suppress_logs": True,
+            },
+            metadata={"request_id": "schema-test"},
+        )
+        response = pipeline.forward_interleaved(request)
+
+        self.assertEqual(response.metadata, {"request_id": "schema-test"})
+        self.assertEqual(
+            [segment.type for segment in response.segments], ["image", "text"]
+        )
+        self.assertEqual(response.stats.prefill_count, 1)
+        self.assertEqual(response.stats.velocity_count, 1)
+
+    def test_experimental_interleaved_api_isolates_two_sessions(self):
+        server_args = _make_server_args()
+        with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
+            pipeline = UGPipeline(
+                "sglang-internal/fake-ug",
+                server_args,
+                executor=SyncExecutor(server_args),
+            )
+
+        first = pipeline.forward_interleaved(
+            [
+                {"type": "image", "image": Image.new("RGB", (16, 16), "white")},
+                {"type": "text", "text": "draw a red kite"},
+            ],
+            {
+                "width": 32,
+                "height": 32,
+                "seed": 123,
+                "num_inference_steps": 2,
+                "suppress_logs": True,
+            },
+        )
+        second = pipeline.forward_interleaved(
+            [
+                {"type": "image", "image": Image.new("RGB", (16, 16), "black")},
+                {"type": "text", "text": "draw a blue boat"},
+            ],
+            {
+                "width": 32,
+                "height": 32,
+                "seed": 456,
+                "num_inference_steps": 2,
+                "suppress_logs": True,
+            },
+        )
+
+        self.assertNotEqual(first.stats.session_id, second.stats.session_id)
+        self.assertEqual(first.stats.prefill_count, 1)
+        self.assertEqual(second.stats.prefill_count, 1)
+        self.assertEqual(first.stats.velocity_count, 1)
+        self.assertEqual(second.stats.velocity_count, 1)
+        bridge = pipeline.get_module("ug_bridge")
+        self.assertEqual(
+            bridge.runtime.session_controller.tree_cache.released_sessions,
+            [first.stats.session_id, second.stats.session_id],
+        )
 
     def test_experimental_interleaved_api_rejects_kwargs_with_params_object(self):
         server_args = _make_server_args()
@@ -231,6 +324,27 @@ class TestUGDiffusionPipeline(unittest.TestCase):
                 ),
                 width=64,
             )
+
+    def test_experimental_interleaved_api_rejects_sampling_overrides_on_request(self):
+        server_args = _make_server_args()
+        with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
+            pipeline = UGPipeline(
+                "sglang-internal/fake-ug",
+                server_args,
+                executor=SyncExecutor(server_args),
+            )
+
+        request = UGInterleavedRequest.from_segments(
+            [{"type": "text", "text": "draw"}],
+            sampling_params=UGSamplingParams(
+                width=32,
+                height=32,
+                num_inference_steps=2,
+                suppress_logs=True,
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "already contains sampling_params"):
+            pipeline.forward_interleaved(request, width=64)
 
     def test_fake_pipeline_can_use_injected_srt_scheduler_executor(self):
         server_args = _make_server_args()

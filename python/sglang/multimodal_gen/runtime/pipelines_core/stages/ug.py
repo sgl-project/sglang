@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.ug.denoiser import UGDenoiserBridge
+from sglang.srt.ug.interleaved import UGInputSegment, UGInterleavedRequest
 from sglang.srt.ug.runtime import UGInterleavedMessage
 
 
@@ -238,11 +239,15 @@ def _image_to_numpy_batch(image) -> np.ndarray:
 
 
 def _normalize_pipeline_interleaved_messages(messages) -> list[UGInterleavedMessage]:
+    if isinstance(messages, UGInterleavedRequest):
+        messages = messages.to_legacy_segments()
     normalized = []
     for message in messages:
         if isinstance(message, UGInterleavedMessage):
             normalized.append(message)
             continue
+        if isinstance(message, UGInputSegment):
+            message = message.to_legacy_segment()
         if not isinstance(message, dict):
             raise TypeError(f"UG interleaved message must be a dict: {message!r}")
         message_type = message.get("type")
