@@ -235,6 +235,7 @@ NSA_CHOICES = [
 
 HISPARSE_CUDA_NSA_BACKENDS = ("flashmla_sparse",)
 HISPARSE_ROCM_NSA_BACKENDS = ("tilelang",)
+HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
@@ -1649,6 +1650,18 @@ class ServerArgs:
                 f"but got --nsa-{label}-backend={backend}. "
                 f"Please use --nsa-{label}-backend={self._get_default_hisparse_nsa_backend()} or omit it."
             )
+
+    def _validate_hisparse_kv_cache_dtype(self):
+        if self.kv_cache_dtype in HISPARSE_KV_CACHE_DTYPES:
+            return
+
+        choices = " or ".join(
+            f"--kv-cache-dtype={dtype}" for dtype in HISPARSE_KV_CACHE_DTYPES
+        )
+        raise ValueError(
+            f"HiSparse requires one of {HISPARSE_KV_CACHE_DTYPES} KV cache dtypes, "
+            f"but got --kv-cache-dtype={self.kv_cache_dtype}. Please use {choices}."
+        )
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa
@@ -6766,11 +6779,7 @@ class ServerArgs:
             ]:
                 self._validate_hisparse_nsa_backend(attr, label)
 
-            if self.kv_cache_dtype != "bfloat16":
-                raise ValueError(
-                    f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
-                    f"Please use --kv-cache-dtype=bfloat16."
-                )
+            self._validate_hisparse_kv_cache_dtype()
 
         assert (
             self.schedule_conservativeness >= 0
