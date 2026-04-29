@@ -597,9 +597,6 @@ ARG BUILD_TYPE
 ARG CUDA_VERSION
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG
-ARG SGLANG_BUILD_COMMIT=unknown
-ARG SGLANG_BUILD_URL=
-ARG SGLANG_IMAGE_TAG=local/sglang:dev
 
 WORKDIR /sgl-workspace
 
@@ -643,6 +640,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
+ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_URL=
+ARG SGLANG_IMAGE_TAG=local/sglang:dev
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
@@ -677,9 +677,6 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
 ARG CUDA_VERSION
 ARG TARGETARCH
 ARG GDRCOPY_VERSION=2.5.1
-ARG SGLANG_BUILD_COMMIT=unknown
-ARG SGLANG_BUILD_URL=
-ARG SGLANG_IMAGE_TAG=local/sglang:dev
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
@@ -801,6 +798,9 @@ RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linu
 WORKDIR /sgl-workspace/sglang
 
 # Keep build provenance at the end so metadata changes do not invalidate build layers.
+ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_URL=
+ARG SGLANG_IMAGE_TAG=local/sglang:dev
 ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
     SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
     SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
