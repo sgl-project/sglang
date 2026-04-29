@@ -338,7 +338,7 @@ def maybe_init_custom_mem_pool(
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
     # NIXL VMM allocator: MNNVL-compatible KV cache allocation.
-    # Use with NIXL backend + UCX_CUDA_IPC_ENABLE_MNNVL=yes.
+    # Use with NIXL backend
     if envs.SGLANG_NIXL_VMM_MEM_POOL.get():
         from sglang.srt.mem_cache.nixl_vmm_allocator import init_nixl_vmm_mem_pool
 
