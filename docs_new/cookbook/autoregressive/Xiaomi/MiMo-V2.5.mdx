@@ -65,6 +65,8 @@ Refer to the [official SGLang installation guide](../../../docs/get-started/inst
 
 > Pull the image matching your GPU's CUDA driver. `lmsysorg/sglang:latest` will not load either checkpoint.
 
+**TPU (sgl-jax):** MiMo-V2.5-Pro can also be served on TPU via the JAX-based [sgl-jax](https://github.com/sgl-project/sglang-jax) runtime. The container image and `pip install` steps are listed in [§3.3 TPU Deployment](#33-tpu-deployment-mimo-v25-pro-sgl-jax).
+
 ## 3. Model Deployment
 
 ### 3.1 Basic Configuration
@@ -94,6 +96,40 @@ import { MiMoV25Deployment } from '/src/snippets/autoregressive/mimo-v25-deploym
 - DeepEP replaces the default MoE all-to-all dispatch with a fused [DeepEP](https://github.com/deepseek-ai/DeepEP) backend; it lowers expert dispatch latency and memory traffic, so it pays off under **high concurrency / throughput-bound workloads** on H100/H200. Under concurrency=1 / latency-bound workloads the gain is negligible — leave it off.
 - Enabling adds `--moe-a2a-backend deepep` + `--moe-dense-tp-size 1` (and `--ep <tp>` for Pro) plus `SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256` env to cap the dispatch buffer. Requires `pip install deep_ep` (not part of the default sglang install).
 - On Blackwell (B200, GB300) the verified MoE backend is `flashinfer_trtllm`; the DeepEP toggle is a no-op there.
+
+### 3.3 TPU Deployment (MiMo-V2.5-Pro, sgl-jax)
+
+MiMo-V2.5-Pro can also be served on TPU via [sgl-jax](https://github.com/sgl-project/sglang-jax). The runtime is a separate JAX-based stack (`sgl_jax.launch_server`); pick **TPU v7x** or **TPU v6e** in the panel above to generate the launch command. Verified topologies:
+
+| TPU Type | Topology | Chips/Node | Nodes | Total Chips | JAX Devices/Chip | Total JAX Devices (= `--tp-size`) |
+| --- | --- | --- | --- | --- | --- | --- |
+| **v7x** | 2×2×4 | 4 | 4 | 16 | 2 | 32 |
+| **v6e** | 4×4×4 | 4 | 16 | 64 | 1 | 64 |
+
+> v7x exposes **2 logical JAX devices per chip**, so `--tp-size = 16 chips × 2 = 32`. v6e exposes 1 device per chip, so `--tp-size = 64`. Always set `--tp-size` to the total JAX device count across all nodes, not the chip count.
+
+All nodes must sit in the same TPU slice and reach each other on the JAX init port (`20000`) and the TPU process port (`8471`).
+
+**Step 1 — Launch the JAX TPU container on every node:**
+
+```shell Command
+docker run -it --privileged \
+  --shm-size=32g \
+  --ipc=host \
+  --network=host \
+  -v /dev:/dev \
+  us-docker.pkg.dev/cloud-tpu-images/jax-ai-image/tpu:jax0.8.1-rev1 bash
+```
+
+> The image is pinned to `jax0.8.1-rev1` to keep the JAX runtime aligned with sgl-jax's TPU extras.
+
+**Step 2 — Clone and install sgl-jax (inside the container):**
+
+```shell Command
+git clone https://github.com/sgl-project/sglang-jax.git
+cd sglang-jax
+pip install -e "python[tpu]"
+```
 
 ## 4. Model Invocation
 
