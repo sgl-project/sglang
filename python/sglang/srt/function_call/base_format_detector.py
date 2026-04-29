@@ -393,44 +393,33 @@ class BaseFormatDetector(ABC):
 
         model_id = self.get_model_structural_tag_id()
         empty_thinking_as_non_thinking = self.empty_thinking_as_non_thinking()
+        tool_choice_type = (
+            "required" if isinstance(tool_choice, ToolChoice) else tool_choice
+        )
+        tool_dicts = []
 
         if isinstance(tool_choice, ToolChoice):
             # Handle forced tool choice.
-            required_tool = []
             for tool in tools:
                 if tool.function.name == tool_choice.function.name:
-                    required_tool.append(tool)
-
-            if thinking_mode:
-                return get_model_structural_tag(
-                    model=model_id,
-                    tools=required_tool,
-                    tool_choice="required",
-                    reasoning=True,
-                    force_empty_reasoning=False,
-                )
-            else:
-                return get_model_structural_tag(
-                    model=model_id,
-                    tools=required_tool,
-                    tool_choice="required",
-                    reasoning=not empty_thinking_as_non_thinking,
-                    force_empty_reasoning=empty_thinking_as_non_thinking,
-                )
+                    tool_dicts.append(tool.model_dump())
         else:
-            if thinking_mode:
-                return get_model_structural_tag(
-                    model=model_id,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    reasoning=True,
-                    force_empty_reasoning=False,
-                )
-            else:
-                return get_model_structural_tag(
-                    model=model_id,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    reasoning=not empty_thinking_as_non_thinking,
-                    force_empty_reasoning=empty_thinking_as_non_thinking,
-                )
+            for tool in tools:
+                tool_dicts.append(tool.model_dump())
+
+        if thinking_mode:
+            return get_model_structural_tag(
+                model=model_id,
+                tools=tool_dicts,
+                tool_choice=tool_choice_type,
+                reasoning=True,
+                force_empty_reasoning=False,
+            )
+        else:
+            return get_model_structural_tag(
+                model=model_id,
+                tools=tool_dicts,
+                tool_choice=tool_choice_type,
+                reasoning=not empty_thinking_as_non_thinking,
+                force_empty_reasoning=empty_thinking_as_non_thinking,
+            )

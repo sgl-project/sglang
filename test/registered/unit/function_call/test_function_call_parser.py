@@ -1639,12 +1639,6 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         params = json.loads(tool_calls_by_index[0]["parameters"])
         self.assertEqual(params, {})
 
-    # ==================== Structural tag (xgrammar builtin) ====================
-    # DeepSeek V3.2 uses the new builtin structural tag path, not the legacy one.
-
-    def test_supports_structural_tag(self):
-        self.assertFalse(self.detector.supports_structural_tag())
-
     def test_supports_model_structural_tag(self):
         self.assertTrue(self.detector.supports_model_structural_tag())
 
@@ -1677,7 +1671,7 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         grammar = xgr.Grammar.from_structural_tag(structural_tag)
         self.assertIsInstance(grammar, xgr.Grammar)
 
-        tool_choice_name = ToolChoiceFuncName(name="get_current_weather")
+        tool_choice_name = ToolChoiceFuncName(name="search")
         tool_choice = ToolChoice(function=tool_choice_name)
         structural_tag = self.detector.get_xgrammar_model_structural_tag(
             self.tools, thinking_mode=True, tool_choice=tool_choice
@@ -3394,7 +3388,7 @@ class TestLfm2Detector(unittest.TestCase):
         """Test that LFM2 does not support structural tags (Pythonic format)."""
         # LFM2 uses Pythonic format which is not JSON-compatible,
         # so structural_tag constrained generation cannot be used
-        self.assertFalse(self.detector.supports_legacy_structural_tag())
+        self.assertFalse(self.detector.supports_structural_tag())
 
     def test_structure_info(self):
         """Test structure info for constrained generation."""
