@@ -9,7 +9,7 @@ cd "$(dirname "$0")/../../../.."
 OUT_DIR=test/test_heter_moe/unittest/kernel_profile/results
 mkdir -p "$OUT_DIR"
 
-M_VALUES=(32 64 96 128 192 256 384 512 768 1024 1280 1536 1792 2048 2560 3072 3584 4096 4608 5120 6144 7168 8192 9216)
+M_VALUES=(32 64 96 128 256 512 1024 1536 2048 3072 4096)
 
 PIDS=()
 gpu=0

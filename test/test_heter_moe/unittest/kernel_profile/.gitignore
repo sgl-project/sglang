@@ -5,3 +5,6 @@ results/bf16_table.n*.csv
 results/optimal_assignment.M*.csv
 results/optimal_assignment.M*.all_x.csv
 results/tune_shards/
+results/tune_shards_v1/
+results/tune_sep_shards/
+results/tune_sep_shards_v1/

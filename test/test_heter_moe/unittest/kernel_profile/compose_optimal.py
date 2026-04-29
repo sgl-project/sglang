@@ -45,20 +45,23 @@ from _utils import (  # noqa: E402
     make_bf16_weights,
     make_int4_weights,
     make_zipf_routing,
+    override_split_config,
     read_csv,
     read_json,
     sparse_active_dispatch,
     write_csv,
 )
 
-# 24 M_global values: dense at decode (memory-bound) + dense at prefill
-# (compute-bound), plus mid-range crossover.
+# 11 M_global values that match exact-tuned keys in the production
+# E=128,N=768,device_name=NVIDIA_A100-SXM4-80GB.json. Anywhere else, the
+# nearest-neighbor lookup makes the comparison apples-to-oranges (production
+# falls back to a tile tuned for a different M).
 M_GLOBAL_VALUES = [
-    32, 64, 96, 128, 192, 256, 384, 512,
-    768, 1024, 1280, 1536, 1792, 2048, 2560, 3072,
-    3584, 4096, 4608, 5120, 6144, 7168, 8192, 9216,
+    32, 64, 96, 128, 256, 512, 1024, 1536, 2048, 3072, 4096,
 ]
-X_CANDIDATES = [0, 8, 16, 24, 32, 40, 48, 56, 64]
+# 17 x candidates: x=0 (pure INT4 baseline) + 16 BF16 promotion levels
+# matching the autotune column grid {4, 8, ..., 64}.
+X_CANDIDATES = [0] + list(range(4, 64 + 1, 4))
 TOLERANCE = 0.10
 
 
@@ -145,25 +148,43 @@ def measure(M_global: int, x: int, bf16_configs, hot_set, cold_set,
     cold_ids, cold_w = sparse_active_dispatch(topk_ids, topk_w, cold_active, "marlin")
 
     # Hot (BF16) — sparse activation on hot_set, with PINNED autotuned tile
+    # (separated up + down). For the new bf16_sparse_configs_sep.json each
+    # cell has both "up" and "down" tile dicts; we use override_split_config
+    # to inject both into try_get_optimal_moe_config.
+    use_split = False
+    up_tile = down_tile = None
     if x > 0:
         hot_active = torch.tensor(hot_set, device=device, dtype=topk_ids.dtype)
         hot_ids, hot_w = sparse_active_dispatch(topk_ids, topk_w, hot_active, "triton")
         bse_hot = float(expert_freq[hot_active].float().mean().item())
         tile_key, tile_meta = hierarchical_lookup(bf16_configs, x, int(round(bse_hot)))
-        tile_pure = {k: v for k, v in tile_meta.items() if not k.startswith("_")}
+        if isinstance(tile_meta, dict) and "up" in tile_meta and "down" in tile_meta:
+            up_tile = {k: v for k, v in tile_meta["up"].items() if not k.startswith("_")}
+            down_tile = {k: v for k, v in tile_meta["down"].items() if not k.startswith("_")}
+            use_split = True
+        else:
+            tile_pure = {k: v for k, v in tile_meta.items() if not k.startswith("_")}
     else:
-        tile_pure = None
         tile_key = "n/a"
         hot_ids = hot_w = None
 
     if x > 0 and (KERN_E - x) > 0:
-        def fn():
-            fused_marlin_moe(
-                x_, int4_w1, int4_w2, int4_s1, int4_s2, gating, cold_w, cold_ids,
-                num_bits=KERN_NUM_BITS, is_k_full=True,
-            )
-            with override_config(tile_pure):
-                outplace_fused_experts(x_, bf16_w13, bf16_w2, hot_w, hot_ids)
+        if use_split:
+            def fn():
+                fused_marlin_moe(
+                    x_, int4_w1, int4_w2, int4_s1, int4_s2, gating, cold_w, cold_ids,
+                    num_bits=KERN_NUM_BITS, is_k_full=True,
+                )
+                with override_split_config(up_tile, down_tile):
+                    outplace_fused_experts(x_, bf16_w13, bf16_w2, hot_w, hot_ids)
+        else:
+            def fn():
+                fused_marlin_moe(
+                    x_, int4_w1, int4_w2, int4_s1, int4_s2, gating, cold_w, cold_ids,
+                    num_bits=KERN_NUM_BITS, is_k_full=True,
+                )
+                with override_config(tile_pure):
+                    outplace_fused_experts(x_, bf16_w13, bf16_w2, hot_w, hot_ids)
     elif x == 0:
         def fn():
             fused_marlin_moe(
@@ -171,9 +192,14 @@ def measure(M_global: int, x: int, bf16_configs, hot_set, cold_set,
                 num_bits=KERN_NUM_BITS, is_k_full=True,
             )
     else:  # x == E (all bf16; not in our X_CANDIDATES but covered defensively)
-        def fn():
-            with override_config(tile_pure):
-                outplace_fused_experts(x_, bf16_w13, bf16_w2, hot_w, hot_ids)
+        if use_split:
+            def fn():
+                with override_split_config(up_tile, down_tile):
+                    outplace_fused_experts(x_, bf16_w13, bf16_w2, hot_w, hot_ids)
+        else:
+            def fn():
+                with override_config(tile_pure):
+                    outplace_fused_experts(x_, bf16_w13, bf16_w2, hot_w, hot_ids)
 
     return bench(fn, device), tile_key
 
@@ -188,7 +214,7 @@ def main():
         default="test/test_heter_moe/unittest/kernel_profile/results/bf16_table.csv")
     parser.add_argument(
         "--bf16-configs", type=str,
-        default="test/test_heter_moe/unittest/kernel_profile/results/bf16_sparse_configs.json")
+        default="test/test_heter_moe/unittest/kernel_profile/results/bf16_sparse_configs_sep.json")
     parser.add_argument(
         "--out", type=str,
         default="test/test_heter_moe/unittest/kernel_profile/results/optimal_assignment.csv")

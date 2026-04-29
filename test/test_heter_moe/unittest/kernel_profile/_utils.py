@@ -232,6 +232,39 @@ def make_zipf_routing(M_global: int, device: torch.device,
 # ---------------------------------------------------------------------------
 
 
+from contextlib import contextmanager
+
+
+@contextmanager
+def override_split_config(up_cfg: dict, down_cfg: dict):
+    """Force `try_get_optimal_moe_config` to return (up_cfg, (down_cfg, ...))
+    for the duration of the `with` block.
+
+    The existing `override_config` (sglang.srt.layers.moe.fused_moe_triton)
+    only injects ONE tile — both up and down end up using it. For the
+    separated tune we need to pin different tiles to each direction.
+
+    The fused kernel asserts up.BLOCK_SIZE_M == down.BLOCK_SIZE_M
+    (fused_moe_triton_config.py:300-303), which the separated tune already
+    enforces.
+    """
+    import sglang.srt.layers.moe.fused_moe_triton.fused_moe_triton_config as cfg_mod
+
+    orig = cfg_mod.try_get_optimal_moe_config
+    block_m = max(up_cfg["BLOCK_SIZE_M"], down_cfg["BLOCK_SIZE_M"])
+
+    def patched(*args, return_down_config=False, **kwargs):
+        if return_down_config:
+            return up_cfg, (down_cfg, block_m)
+        return up_cfg
+
+    cfg_mod.try_get_optimal_moe_config = patched
+    try:
+        yield
+    finally:
+        cfg_mod.try_get_optimal_moe_config = orig
+
+
 def hierarchical_lookup(configs: Dict[str, dict], n_active: int,
                         m_per_expert: int) -> Tuple[str, dict]:
     """Find nearest-(n_active, m_per_expert) tile config in the JSON.

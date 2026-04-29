@@ -1,40 +1,30 @@
-# Optimal BF16/INT4 expert assignment vs. global batch size
+# Heter-MoE speedup matrix vs. pure INT4
 
 Qwen3-30B-A3B (E=128, K=2048, N=768, top_k=8) on A100-SXM4-80GB.
-Routing: synthetic Zipf (alpha=1.1, seed=42) per `scripts/heter_moe_collect_routing.py:generate_synthetic_routing`.
+Routing: synthetic Zipf (alpha=1.1, seed=42).
 Promotion policy: top-x experts by routing frequency → BF16; rest → INT4 (Marlin).
-BF16 tile pinned per-cell from autotuned `results/bf16_sparse_configs.json`.
-Latency = paired sparse-active kernel call (fused_marlin_moe + outplace_fused_experts), median-of-50 with L2 flush + CUDA graph.
+BF16 path uses **separately autotuned up + down tiles** (`bf16_sparse_configs_sep.json`), pinned via override.
+INT4 path: Marlin with its built-in heuristic.
+M_global rows are the 11 production-tuned batch sizes (`E=128,N=768,A100-80GB.json` keys) so both paths run on their best-tuned tile.
+Each cell `xN` = `t_pure_int4 / t_at_x_N` (speedup, ≥1 means promoting N experts to BF16 helps).
 
-| M_global | x* (#BF16) | T* (snap) | t_layer (ms) | BF16 tile | t_pure_int4 (ms) | speedup |
-|---:|---:|---:|---:|:---|---:|---:|
-| 32 | 0 | 72 | 0.1454 | `n/a` | 0.1454 | 1.000× |
-| 64 | 0 | 112 | 0.2212 | `n/a` | 0.2212 | 1.000× |
-| 96 | 8 | 16 | 0.2847 | `n8_bse64` | 0.2929 | 1.029× |
-| 128 | 0 | 224 | 0.3308 | `n/a` | 0.3308 | 1.000× |
-| 192 | 8 | 40 | 0.3553 | `n8_bse128` | 0.3656 | 1.029× |
-| 256 | 0 | 400 | 0.4168 | `n/a` | 0.4168 | 1.000× |
-| 384 | 0 | 704 | 0.4874 | `n/a` | 0.4874 | 1.000× |
-| 512 | 0 | 912 | 0.6103 | `n/a` | 0.6103 | 1.000× |
-| 768 | 16 | 56 | 0.8192 | `n16_bse256` | 0.8325 | 1.016× |
-| 1024 | 32 | 40 | 0.9196 | `n32_bse256` | 0.9431 | 1.026× |
-| 1280 | 48 | 32 | 1.0220 | `n48_bse128` | 1.0670 | 1.044× |
-| 1536 | 24 | 80 | 1.1203 | `n16_bse512` | 1.1919 | 1.064× |
-| 1792 | 32 | 72 | 1.2483 | `n32_bse256` | 1.6036 | 1.285× |
-| 2048 | 32 | 80 | 1.3763 | `n32_bse512` | 1.4418 | 1.048× |
-| 2560 | 48 | 64 | 1.5974 | `n48_bse256` | 1.7162 | 1.074× |
-| 3072 | 40 | 96 | 1.8504 | `n32_bse512` | 1.9681 | 1.064× |
-| 3584 | 56 | 80 | 2.0726 | `n48_bse512` | 2.8191 | 1.360× |
-| 4096 | 56 | 88 | 2.3316 | `n48_bse512` | 2.5467 | 1.092× |
-| 4608 | 56 | 96 | 2.5907 | `n48_bse512` | 3.4324 | 1.325× |
-| 5120 | 56 | 104 | 2.8672 | `n48_bse512` | 3.1304 | 1.092× |
-| 6144 | 32 | 248 | 3.4335 | `n32_bse1024` | 3.7171 | 1.083× |
-| 7168 | 24 | 384 | 4.0325 | `n16_bse2048` | 4.2916 | 1.064× |
-| 8192 | 64 | 152 | 4.4308 | `n64_bse1024` | 4.8497 | 1.095× |
-| 9216 | 64 | 168 | 4.9101 | `n64_bse1024` | 5.4252 | 1.105× |
+| M_global | x4 | x8 | x12 | x16 | x20 | x24 | x28 | x32 | x36 | x40 | x44 | x48 | x52 | x56 | x60 | x64 | **x\*** | **T\*** | **best** | **t_int4(ms)** | **t_winner(ms)** |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32 | 0.645 | 0.650 | 0.655 | 0.625 | 0.627 | 0.578 | 0.555 | 0.495 | 0.486 | 0.483 | 0.468 | 0.453 | 0.431 | 0.419 | 0.398 | 0.373 | **12** | **0** | **0.655×** | 0.1638 | 0.2499 |
+| 64 | 0.796 | 0.840 | 0.818 | 0.785 | 0.714 | 0.689 | 0.629 | 0.616 | 0.591 | 0.569 | 0.553 | 0.522 | 0.534 | 0.519 | 0.493 | 0.453 | **8** | **16** | **0.840×** | 0.2202 | 0.2621 |
+| 96 | 0.785 | 0.803 | 0.790 | 0.723 | 0.700 | 0.690 | 0.647 | 0.661 | 0.633 | 0.615 | 0.591 | 0.573 | 0.523 | 0.509 | 0.495 | 0.481 | **8** | **16** | **0.803×** | 0.2458 | 0.3062 |
+| 128 | 0.684 | 0.614 | 0.614 | 0.613 | 0.606 | 0.580 | 0.575 | 0.636 | 0.619 | 0.572 | 0.554 | 0.543 | 0.529 | 0.523 | 0.510 | 0.496 | **4** | **48** | **0.684×** | 0.2775 | 0.4055 |
+| 256 | 0.863 | 0.829 | 0.829 | 0.843 | 0.829 | 0.824 | 0.814 | 0.819 | 0.804 | 0.755 | 0.746 | 0.721 | 0.720 | 0.702 | 0.682 | 0.675 | **4** | **96** | **0.863×** | 0.4127 | 0.4782 |
+| 512 | 0.902 | 0.909 | 0.914 | 0.940 | 0.902 | 0.895 | 0.899 | 0.895 | 0.886 | 0.868 | 0.875 | 0.871 | 0.860 | 0.823 | 0.807 | 0.785 | **16** | **48** | **0.940×** | 0.6103 | 0.6492 |
+| 1024 | 1.062 | 1.081 | 1.112 | 1.201 | 1.222 | 1.233 | 1.237 | 1.235 | 1.228 | 1.224 | 1.213 | 1.228 | 1.217 | 1.214 | 1.199 | 1.184 | **28** | **48** | **1.237×** | 1.1428 | 0.9236 |
+| 1536 | 0.962 | 0.969 | 1.004 | 0.990 | 0.997 | 1.029 | 1.013 | 1.003 | 1.000 | 0.991 | 0.988 | 0.990 | 0.969 | 0.971 | 0.957 | 0.951 | **24** | **80** | **1.029×** | 1.1807 | 1.1469 |
+| 2048 | 0.969 | 0.989 | 1.001 | 1.000 | 1.022 | 1.021 | 1.024 | 1.051 | 1.031 | 1.032 | 1.027 | 1.038 | 1.030 | 1.045 | 1.029 | 1.023 | **32** | **80** | **1.051×** | 1.4397 | 1.3701 |
+| 3072 | 1.157 | 1.205 | 1.217 | 1.230 | 1.245 | 1.252 | 1.268 | 1.270 | 1.280 | 1.307 | 1.287 | 1.293 | 1.293 | 1.292 | 1.266 | 1.266 | **40** | **96** | **1.307×** | 2.3665 | 1.8104 |
+| 4096 | 1.002 | 1.004 | 1.018 | 1.034 | 1.043 | 1.050 | 1.054 | 1.059 | 1.241 | 1.263 | 1.257 | 1.262 | 1.258 | 1.262 | 1.275 | 1.263 | **60** | **80** | **1.275×** | 3.0310 | 2.3767 |
 
-## Reading the table
+## Reading
 
-- **x\***: optimal number of experts to keep in BF16 at this M_global. The remaining 128−x* are kept in INT4.
-- **T\* (snap)**: threshold (tokens/expert) snapped to the nearest multiple of 8 — the runtime knob `bf16_promotion_threshold` would be set to this value to promote the top-x* experts under this routing distribution at this M_global.
-- **speedup**: latency reduction vs. pure-INT4 (x=0) at this M_global.
+- **x* (winner)**: optimal number of experts promoted to BF16 at this M_global.
+- **T\***: per-expert-load threshold (snap-to-8) — set `bf16_promotion_threshold = T*` in the runtime config to promote the same set under this routing distribution at this M_global.
+- **best speedup**: t_pure_int4 / t_at_winner_x. <1.0 means the heter-MoE path is slower than pure INT4 at this M_global (no useful promotion).
+- Inner cells (`x4`..`x64`): each is the measured speedup at that specific N_active. Lets you see the shape of the curve across promotion levels per row.
