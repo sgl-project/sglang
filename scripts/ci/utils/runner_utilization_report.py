@@ -112,131 +112,6 @@ def parse_time(time_str: str) -> datetime:
     return datetime.fromisoformat(time_str.replace("Z", "+00:00"))
 
 
-# Known runner counts per label (fallback when API unavailable)
-KNOWN_RUNNER_COUNTS = {
-    "1-gpu-5090": 16,
-    "h200": 8,
-    "h20": 4,
-    "b200": 4,
-    "amd": 8,
-    "github-hosted": 20,  # GitHub hosted runners (variable)
-    "other": 10,
-}
-
-
-def calculate_concurrency_metrics(
-    jobs: list[dict],
-    window_start: datetime,
-    window_end: datetime,
-    num_runners: int,
-) -> dict:
-    """
-    Calculate concurrency metrics using a sweep line algorithm.
-
-    Tracks:
-    - Peak concurrent runners in use
-    - Average concurrent runners over time
-    - Time at saturation (all runners busy)
-    - Queue depth when runners are saturated
-    """
-    if not jobs:
-        return {
-            "peak_concurrent": 0,
-            "avg_concurrent": 0.0,
-            "saturation_seconds": 0,
-            "saturation_pct": 0.0,
-            "peak_queue": 0,
-        }
-
-    window_seconds = (window_end - window_start).total_seconds()
-    if window_seconds <= 0:
-        return {
-            "peak_concurrent": 0,
-            "avg_concurrent": 0.0,
-            "saturation_seconds": 0,
-            "saturation_pct": 0.0,
-            "peak_queue": 0,
-        }
-
-    # Create events for running jobs: +1 at start, -1 at end
-    running_events = []
-    for job in jobs:
-        start = job["start"]
-        end = job["end"]
-        # Clamp to window
-        if end < window_start or start > window_end:
-            continue
-        clamped_start = max(start, window_start)
-        clamped_end = min(end, window_end)
-        running_events.append((clamped_start, 1, "start"))  # +1 for start
-        running_events.append((clamped_end, -1, "end"))  # -1 for end
-
-    # Create events for queue tracking (jobs created but not started)
-    queue_events = []
-    for job in jobs:
-        created_at = job.get("created_at")
-        started_at = job["start"]
-        if created_at and created_at < started_at:
-            # Clamp to window
-            if started_at < window_start or created_at > window_end:
-                continue
-            clamped_created = max(created_at, window_start)
-            clamped_started = min(started_at, window_end)
-            queue_events.append((clamped_created, 1, "queued"))
-            queue_events.append((clamped_started, -1, "dequeued"))
-
-    # Sort running events: by time, then ends before starts at same time
-    running_events.sort(key=lambda e: (e[0], e[1] == 1))
-
-    # Process running events to get concurrency metrics
-    current_running = 0
-    peak_running = 0
-    prev_time = window_start
-    total_running_seconds = 0.0
-    saturation_seconds = 0.0
-
-    for event_time, delta, _ in running_events:
-        # Accumulate time at previous concurrency level
-        time_delta = (event_time - prev_time).total_seconds()
-        if time_delta > 0:
-            total_running_seconds += current_running * time_delta
-            if current_running >= num_runners:
-                saturation_seconds += time_delta
-
-        # Update concurrency
-        current_running += delta
-        peak_running = max(peak_running, current_running)
-        prev_time = event_time
-
-    # Handle remaining time after last event
-    if prev_time < window_end:
-        time_delta = (window_end - prev_time).total_seconds()
-        total_running_seconds += current_running * time_delta
-        if current_running >= num_runners:
-            saturation_seconds += time_delta
-
-    # Sort queue events and calculate peak queue depth
-    queue_events.sort(key=lambda e: (e[0], e[1] == 1))
-    current_queued = 0
-    peak_queue = 0
-
-    for _, delta, _ in queue_events:
-        current_queued += delta
-        peak_queue = max(peak_queue, current_queued)
-
-    avg_concurrent = total_running_seconds / window_seconds if window_seconds > 0 else 0
-
-    return {
-        "peak_concurrent": peak_running,
-        "avg_concurrent": avg_concurrent,
-        "saturation_seconds": saturation_seconds,
-        "saturation_pct": (
-            (saturation_seconds / window_seconds * 100) if window_seconds > 0 else 0
-        ),
-        "peak_queue": peak_queue,
-    }
-
-
 def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None):
     """Calculate runner utilization metrics."""
 
@@ -341,230 +216,111 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
 
     print(f"Tracking {len(all_labels)} runner labels: {sorted(all_labels)}")
 
-    # Calculate metrics per label
     window_seconds = hours * 3600
     window_end = datetime.now(timezone.utc)
     window_start = window_end - timedelta(hours=hours)
 
-    results = []
+    # Per-host window-clamped busy time (each physical machine counted once).
+    host_busy_seconds = {}
+    for host, jobs in host_jobs.items():
+        busy = 0.0
+        for j in jobs:
+            cs = max(j["start"], window_start)
+            ce = min(j["end"], window_end)
+            if ce > cs:
+                busy += (ce - cs).total_seconds()
+        host_busy_seconds[host] = busy
 
-    for label in sorted(all_labels):
-        # Use API runner count if available, otherwise use job-observed count
+    # Group labels into pools: labels that map to an identical host set
+    # (e.g. `4-gpu-b200`, `4-gpu-b200-kernel`, `4-gpu-b200-low-disk`,
+    # `4-gpu-b200-kernel-low-disk` all map to the same 3 b200 hosts and
+    # collapse into one row).
+    label_to_hosts = {}
+    for label in all_labels:
         if label in api_label_runners and api_label_runners[label]:
-            num_runners = len(api_label_runners[label])
+            label_to_hosts[label] = frozenset(api_label_runners[label])
         elif label in job_label_runners:
-            num_runners = len(job_label_runners[label])
-        else:
-            num_runners = KNOWN_RUNNER_COUNTS.get(label, 1)
+            label_to_hosts[label] = frozenset(job_label_runners[label])
 
-        total_capacity_seconds = window_seconds * num_runners
+    pools = defaultdict(list)
+    for label, hosts in label_to_hosts.items():
+        if hosts:
+            pools[hosts].append(label)
 
-        jobs = label_jobs.get(label, [])
-        total_active_seconds = sum(j["duration"] for j in jobs)
+    results = []
+    for hosts, labels in pools.items():
+        # Pool busy time: sum of window-clamped busy time across hosts.
+        # Any job that ran on these hosts (regardless of which label
+        # triggered it) consumed shared capacity.
+        busy_seconds = sum(host_busy_seconds.get(h, 0.0) for h in hosts)
+        # Job count and queue stats are restricted to jobs that actually
+        # ran under one of the labels in this pool (otherwise queue stats
+        # for `4-gpu-b200` would mix in stats from `1-gpu-h100`).
+        pool_jobs = []
+        seen_jobs = set()
+        for label in labels:
+            for j in label_jobs.get(label, []):
+                key = (j["runner_name"], j["start"], j["job_name"])
+                if key in seen_jobs:
+                    continue
+                seen_jobs.add(key)
+                pool_jobs.append(j)
+        queue_times = [j["queue_time"] for j in pool_jobs if j["queue_time"] > 0]
+        avg_queue = sum(queue_times) / len(queue_times) if queue_times else 0
+        max_queue = max(queue_times) if queue_times else 0
 
-        utilization = (
-            (total_active_seconds / total_capacity_seconds * 100)
-            if total_capacity_seconds > 0
-            else 0
-        )
-        idle_seconds = total_capacity_seconds - total_active_seconds
-
-        # Calculate queue time metrics
-        queue_times = [j["queue_time"] for j in jobs if j["queue_time"] > 0]
-        avg_queue_time = sum(queue_times) / len(queue_times) if queue_times else 0
-        max_queue_time = max(queue_times) if queue_times else 0
-
-        # Calculate concurrency metrics
-        # First pass: get peak concurrent to determine effective capacity
-        concurrency_initial = calculate_concurrency_metrics(
-            jobs, window_start, window_end, num_runners
-        )
-
-        # Use observed peak as effective capacity if lower than API count
-        # This handles cases where not all runners are active all the time
-        effective_runners = min(num_runners, concurrency_initial["peak_concurrent"])
-        if effective_runners < num_runners and effective_runners > 0:
-            # Recalculate with effective capacity for accurate saturation
-            concurrency = calculate_concurrency_metrics(
-                jobs, window_start, window_end, effective_runners
-            )
-        else:
-            concurrency = concurrency_initial
-            effective_runners = num_runners
+        capacity = len(hosts) * window_seconds
+        utilization = busy_seconds / capacity * 100 if capacity > 0 else 0
 
         results.append(
             {
-                "label": label,
-                "num_runners": num_runners,
-                "effective_runners": effective_runners,
-                "num_jobs": len(jobs),
-                "total_active_hours": total_active_seconds / 3600,
-                "total_idle_hours": idle_seconds / 3600,
-                "total_capacity_hours": total_capacity_seconds / 3600,
-                "utilization_pct": utilization,
-                "avg_queue_min": avg_queue_time / 60,
-                "max_queue_min": max_queue_time / 60,
-                # Concurrency metrics
-                "peak_concurrent": concurrency_initial["peak_concurrent"],
-                "avg_concurrent": concurrency["avg_concurrent"],
-                "saturation_hours": concurrency["saturation_seconds"] / 3600,
-                "saturation_pct": concurrency["saturation_pct"],
-                "peak_queue": concurrency["peak_queue"],
-            }
-        )
-
-    # Per-host metrics: each physical machine once, with its true busy time
-    # against window capacity. Overlapping labels do not multiply the
-    # denominator here (unlike the per-label view).
-    host_results = []
-    for host, jobs in host_jobs.items():
-        if runner_filter and not any(runner_filter in lbl for lbl in host_labels[host]):
-            continue
-        # Clamp each job to the window before summing — a job spanning the
-        # window edge should only contribute the portion inside the window.
-        busy_seconds = 0.0
-        for j in jobs:
-            clamped_start = max(j["start"], window_start)
-            clamped_end = min(j["end"], window_end)
-            if clamped_end > clamped_start:
-                busy_seconds += (clamped_end - clamped_start).total_seconds()
-        host_results.append(
-            {
-                "host": host,
-                "labels": sorted(host_labels[host]),
-                "num_jobs": len(jobs),
+                "labels": sorted(labels),
+                "num_hosts": len(hosts),
+                "num_jobs": len(pool_jobs),
                 "busy_hours": busy_seconds / 3600,
-                "utilization_pct": (
-                    busy_seconds / window_seconds * 100 if window_seconds > 0 else 0
-                ),
+                "utilization_pct": utilization,
+                "avg_queue_min": avg_queue / 60,
+                "max_queue_min": max_queue / 60,
             }
         )
-    host_results.sort(key=lambda r: -r["utilization_pct"])
+    results.sort(key=lambda r: -r["utilization_pct"])
 
-    return results, host_results
+    return results
 
 
-def format_report(results: list[dict], host_results: list[dict], hours: int) -> str:
-    """Format results as markdown report."""
+def format_report(results: list[dict], hours: int) -> str:
+    """Format results as a single compact markdown table.
+
+    One row per host pool — labels that share an identical host set are
+    collapsed (e.g. `4-gpu-b200` + `4-gpu-b200-kernel` + `4-gpu-b200-low-disk`
+    + `4-gpu-b200-kernel-low-disk` → one row, since they all live on the
+    same 3 hosts). Utilization is computed against the pool's actual hosts
+    × window, and the busy-time numerator counts every job that ran on
+    those hosts (any label) — so the percentage reflects real hardware
+    occupancy regardless of which label dispatched the job.
+    """
     lines = [
         "# Runner Utilization Report",
         "",
-        f"**Time window:** Last {hours} hours",
+        f"**Time window:** Last {hours} hours · "
         f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         "",
-        "## Per Host Utilization",
+        "Utilization = busy time of all jobs on the pool's hosts ÷ "
+        "(host count × window). Labels sharing the same host set are "
+        "collapsed into one row.",
         "",
-        "Each physical runner machine is counted once, regardless of how many "
-        "overlapping labels it advertises (e.g. a single B200 host advertises "
-        "`4-gpu-b200`, `4-gpu-b200-kernel`, `4-gpu-b200-low-disk`, "
-        "`4-gpu-b200-kernel-low-disk` — but only one job runs on it at a time). "
-        "**This is the source-of-truth view of capacity utilization.** "
-        "If you want per-class numbers, see the Per Label section below, but "
-        "note those denominators are inflated when labels share hosts.",
-        "",
-        "| Host | Jobs | Busy (hrs) | Utilization | Labels |",
-        "|------|------|------------|-------------|--------|",
+        "| Label(s) | Hosts | Jobs | Busy (hrs) | Utilization | Avg Queue | Max Queue |",
+        "|----------|-------|------|------------|-------------|-----------|-----------|",
     ]
-    for h in host_results:
-        bar = "█" * int(h["utilization_pct"] / 10) + "░" * (
-            10 - int(h["utilization_pct"] / 10)
-        )
-        labels_str = ", ".join(h["labels"]) if h["labels"] else "—"
-        lines.append(
-            f"| {h['host']} | {h['num_jobs']} | "
-            f"{h['busy_hours']:.1f} | "
-            f"{h['utilization_pct']:.1f}% {bar} | "
-            f"{labels_str} |"
-        )
-
-    lines.extend(
-        [
-            "",
-            "## Concurrency Analysis",
-            "",
-            "| Label | Runners (API/Effective) | Peak Concurrent | Avg Concurrent | Saturation Time | Peak Queue |",
-            "|-------|-------------------------|-----------------|----------------|-----------------|------------|",
-        ]
-    )
-
     for r in results:
-        effective = r["effective_runners"]
-        avg_pct = (r["avg_concurrent"] / effective * 100) if effective > 0 else 0
-        runner_str = (
-            f"{r['num_runners']}/{effective}"
-            if effective != r["num_runners"]
-            else str(r["num_runners"])
-        )
-        lines.append(
-            f"| {r['label']} | {runner_str} | "
-            f"{r['peak_concurrent']} | "
-            f"{r['avg_concurrent']:.1f} ({avg_pct:.0f}%) | "
-            f"{r['saturation_hours']:.1f}h ({r['saturation_pct']:.0f}%) | "
-            f"{r['peak_queue']} jobs |"
-        )
-
-    # Add recommendations section
-    lines.extend(["", "## Recommendations", ""])
-    has_recommendations = False
-    for r in results:
-        label = r["label"]
-        saturation_pct = r["saturation_pct"]
-        peak_queue = r["peak_queue"]
-        effective = r["effective_runners"]
-        avg_pct = (r["avg_concurrent"] / effective * 100) if effective > 0 else 0
-
-        if saturation_pct > 50 or peak_queue > 5:
-            lines.append(
-                f"⚠️ **{label}**: High saturation ({saturation_pct:.0f}%) "
-                f"with queue buildup ({peak_queue} jobs). Consider adding runners."
-            )
-            has_recommendations = True
-        elif saturation_pct > 20 or peak_queue > 0:
-            lines.append(
-                f"📊 **{label}**: Moderate saturation ({saturation_pct:.0f}%), "
-                f"peak queue {peak_queue} jobs. Monitor for trends."
-            )
-            has_recommendations = True
-        elif avg_pct < 30 and r["num_jobs"] > 0:
-            lines.append(
-                f"💡 **{label}**: Low average utilization ({avg_pct:.0f}%). "
-                f"Runner pool may be oversized."
-            )
-            has_recommendations = True
-        else:
-            lines.append(f"✓ **{label}**: Healthy utilization with minimal queueing.")
-
-    if not has_recommendations and results:
-        lines.append("All runner pools have healthy utilization.")
-
-    # Add summary table
-    lines.extend(
-        [
-            "",
-            "## Summary by Runner Label",
-            "",
-            "Note: hosts often advertise multiple labels (e.g. one B200 host "
-            "carries `4-gpu-b200`, `4-gpu-b200-kernel`, `4-gpu-b200-low-disk`, "
-            "`4-gpu-b200-kernel-low-disk`; one H100 GPU pair carries "
-            "`2-gpu-runner`, `2-gpu-large`, `2-gpu-h100`, `1-gpu-h100-h200`). "
-            "Each label below is shown against its own `num_runners × window` "
-            "denominator, which double-counts capacity when labels share "
-            "hosts and makes per-label utilization look low. **Use the Per "
-            "Host Utilization table above for actual host utilization.**",
-            "",
-            "| Label | Runners | Jobs | Active (hrs) | Utilization | Avg Queue | Max Queue |",
-            "|-------|---------|------|--------------|-------------|-----------|-----------|",
-        ]
-    )
-
-    for r in results:
-        utilization_bar = "█" * int(r["utilization_pct"] / 10) + "░" * (
+        bar = "█" * int(r["utilization_pct"] / 10) + "░" * (
             10 - int(r["utilization_pct"] / 10)
         )
+        labels_str = ", ".join(r["labels"])
         lines.append(
-            f"| {r['label']} | {r['num_runners']} | {r['num_jobs']} | "
-            f"{r['total_active_hours']:.1f} | "
-            f"{r['utilization_pct']:.1f}% {utilization_bar} | "
+            f"| {labels_str} | {r['num_hosts']} | {r['num_jobs']} | "
+            f"{r['busy_hours']:.1f} | "
+            f"{r['utilization_pct']:.1f}% {bar} | "
             f"{r['avg_queue_min']:.1f}m | {r['max_queue_min']:.1f}m |"
         )
 
@@ -581,8 +337,8 @@ def main():
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
     args = parser.parse_args()
 
-    results, host_results = calculate_utilization(args.repo, args.hours, args.filter)
-    report = format_report(results, host_results, args.hours)
+    results = calculate_utilization(args.repo, args.hours, args.filter)
+    report = format_report(results, args.hours)
 
     if args.output:
         with open(args.output, "w") as f:
