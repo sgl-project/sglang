@@ -59,10 +59,13 @@ def _ipm_module(nc: int, nv: int, block_dim: int, num_iters: int, sm_ver: int) -
     lib_dir = _mathdx_lib_dir()
     if lib_dir is not None:
         # cuSolverDx ships a static device-side library; cuBLASDx is header-only.
+        # Math-DX 25.06 names the static lib `libcusolverdx.a` (no `_static`
+        # suffix). Older versions used `_static`.
         extra_ldflags.append(f"-L{lib_dir}")
-        # Library name varies by Math-DX version; try the canonical static name
-        # and let the linker drop it if absent.
-        extra_ldflags.append("-lcusolverdx_static")
+        if (lib_dir / "libcusolverdx.a").exists():
+            extra_ldflags.append("-lcusolverdx")
+        elif (lib_dir / "libcusolverdx_static.a").exists():
+            extra_ldflags.append("-lcusolverdx_static")
     return load_jit(
         "lplb_ipm",
         *args,

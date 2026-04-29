@@ -30,12 +30,19 @@ _REQUIRE_FUSED_CACHED: Optional[bool] = None
 
 
 def _require_fused() -> bool:
-    """Whether --lplb-require-fused is set; read once and cached at first call."""
+    """Whether --lplb-require-fused is set; read once and cached at first call.
+
+    Returns False when no global ServerArgs is set (e.g. unit tests calling the
+    solver directly without launching a server).
+    """
     global _REQUIRE_FUSED_CACHED
     if _REQUIRE_FUSED_CACHED is None:
-        from sglang.srt.server_args import get_global_server_args
+        try:
+            from sglang.srt.server_args import get_global_server_args
 
-        _REQUIRE_FUSED_CACHED = bool(get_global_server_args().lplb_require_fused)
+            _REQUIRE_FUSED_CACHED = bool(get_global_server_args().lplb_require_fused)
+        except Exception:
+            _REQUIRE_FUSED_CACHED = False
     return _REQUIRE_FUSED_CACHED
 
 
