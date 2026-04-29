@@ -494,12 +494,12 @@ print()
 
 ### 5.1 Environment
 
-| Model | Hardware | Tensor Parallel | mem-fraction-static | SGLang Version |
-|---|---|---|---|---|
-| Qwen/Qwen3.6-35B-A3B-FP8 | 1× NVIDIA H100 NVL (95 GB) | 1 | 0.80 | 0.0.0.dev11998 |
-| Qwen/Qwen3.6-35B-A3B | 1× NVIDIA H100 NVL (95 GB) | 1 | 0.92 | 0.0.0.dev11998 |
-| Qwen/Qwen3.6-27B-FP8 | 1× NVIDIA H100 NVL (95 GB) | 1 | 0.85 | 0.0.0.dev11998 |
-| Qwen/Qwen3.6-27B | 1× NVIDIA H100 NVL (95 GB) | 1 | 0.88 | 0.0.0.dev11998 |
+| Model | Hardware | Tensor Parallel | mem-fraction-static | SGLang Version | Docker Image |
+|---|---|---|---|---|---|
+| Qwen/Qwen3.6-35B-A3B-FP8 | 1× NVIDIA H100 NVL (95 GB) | 1 | 0.80 | 0.0.0.dev11998 | `lmsysorg/sglang:nightly-dev-20260427-977830e9` |
+| Qwen/Qwen3.6-35B-A3B | 1× NVIDIA H100 NVL (95 GB) | 1 | 0.92 | 0.0.0.dev11998 | `lmsysorg/sglang:nightly-dev-20260427-977830e9` |
+| Qwen/Qwen3.6-27B-FP8 | 1× NVIDIA H100 NVL (95 GB) | 1 | 0.85 | 0.0.0.dev11998 | `lmsysorg/sglang:nightly-dev-20260427-977830e9` |
+| Qwen/Qwen3.6-27B | 1× NVIDIA H100 NVL (95 GB) | 1 | 0.88 | 0.0.0.dev11998 | `lmsysorg/sglang:nightly-dev-20260427-977830e9` |
 
 All variants use EAGLE speculative decoding (`--speculative-algorithm EAGLE --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4`) and `--mamba-scheduler-strategy extra_buffer` required for the hybrid Mamba/Attention architecture. `SGLANG_ENABLE_SPEC_V2=1` is required to enable EAGLE with overlap scheduling.
 
