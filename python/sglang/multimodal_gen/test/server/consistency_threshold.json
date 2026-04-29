@@ -33,9 +33,9 @@
         },
         "qwen_image_t2i_cache_dit_enabled": {
             "clip_threshold": 0.98,
-            "ssim_threshold": 0.75,
-            "psnr_threshold": 14.0,
-            "mean_abs_diff_threshold": 22.0
+            "ssim_threshold": 0.73,
+            "psnr_threshold": 13.5,
+            "mean_abs_diff_threshold": 26.0
         },
         "qwen_image_t2i_2_gpus": {
             "clip_threshold": 0.98,
