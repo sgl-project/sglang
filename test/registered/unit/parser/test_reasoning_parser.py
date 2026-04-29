@@ -1258,21 +1258,37 @@ class TestMiniMaxAppendThinkDetector(CustomTestCase):
 
         self.detector = MiniMaxAppendThinkDetector()
 
-    def test_detect_and_parse_prepends_think(self):
-        """Test that detect_and_parse prepends <think> to the text."""
+    def test_detect_and_parse_no_end_tag(self):
+        """Test that detect_and_parse with no </think> treats all as reasoning."""
         result = self.detector.detect_and_parse("Hello world")
-        self.assertEqual(result.normal_text, "<think>Hello world")
+        self.assertEqual(result.reasoning_text, "Hello world")
+        self.assertEqual(result.normal_text, "")
+
+    def test_detect_and_parse_with_end_tag(self):
+        """Test that detect_and_parse correctly splits reasoning and content."""
+        result = self.detector.detect_and_parse("thinking here</think>actual answer")
+        self.assertEqual(result.reasoning_text, "thinking here")
+        self.assertEqual(result.normal_text, "actual answer")
 
     def test_streaming_first_chunk_prepends_think(self):
-        """Test that first streaming chunk gets <think> prepended."""
+        """Test that first streaming chunk gets <think> prepended and enters reasoning."""
         result = self.detector.parse_streaming_increment("First chunk")
-        self.assertEqual(result.normal_text, "<think>First chunk")
+        self.assertEqual(result.reasoning_text, "First chunk")
+        self.assertEqual(result.normal_text, "")
 
     def test_streaming_second_chunk_no_prepend(self):
-        """Test that subsequent streaming chunks are passed through."""
+        """Test that subsequent streaming chunks continue in reasoning mode."""
         self.detector.parse_streaming_increment("First")
         result = self.detector.parse_streaming_increment("Second")
-        self.assertEqual(result.normal_text, "Second")
+        self.assertEqual(result.reasoning_text, "Second")
+        self.assertEqual(result.normal_text, "")
+
+    def test_streaming_end_tag_splits(self):
+        """Test that streaming correctly splits on </think> tag."""
+        self.detector.parse_streaming_increment("reasoning")
+        result = self.detector.parse_streaming_increment("</think>answer")
+        self.assertEqual(result.reasoning_text, "")
+        self.assertEqual(result.normal_text, "answer")
 
 
 class TestReasoningParserAdvanced(CustomTestCase):
