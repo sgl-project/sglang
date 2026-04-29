@@ -158,7 +158,7 @@ class PaliGemmaForConditionalGeneration(PreTrainedModel):
 
         pixel_values = pixel_values.to(
             device=self.vision_tower.device,
-            dtype=next(self.language_model.parameters()).dtype,
+            dtype=self.dtype,
         )
 
         # Encode through SigLIP
