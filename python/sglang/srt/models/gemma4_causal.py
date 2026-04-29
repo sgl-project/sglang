@@ -563,7 +563,7 @@ class Gemma4DecoderLayer(nn.Module):
             )
             hidden_states = self.mlp(hidden_states)
 
-        if False:
+        if not self.has_ple and hidden_states.is_cuda and hidden_states.dim() == 2:
             # Fused: (post_ff_norm(h) + residual) * layer_scalar in one kernel
             norm = self.post_feedforward_layernorm
             hidden_states = gemma_rmsnorm_residual_scalar(
