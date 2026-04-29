@@ -370,6 +370,14 @@ class BaseFormatDetector(ABC):
         thinking_mode: bool = True,
     ) -> Optional[StructuralTag]:
         """
-        Return a XGrammar's model structural tag for the given tools and thinking mode.
+        Return a model-native XGrammar structural tag when supported.
+
+        Args:
+            tools: List of available tools
+            tool_choice: The tool choice setting from the request
+            thinking_mode: Whether thinking mode is enabled
+
+        Returns:
+            StructuralTag if this detector supports model-native tags, otherwise None
         """
         return None
