@@ -9,7 +9,7 @@ from typing import Any, Literal, Protocol
 
 import torch
 
-from sglang.srt.ug.context import UGSessionHandle
+from sglang.srt.ug.context import UGSRTRequestView, UGSessionHandle
 
 
 class _UGSimpleTokenizer:
@@ -128,6 +128,14 @@ class UGSessionRecord:
 
 
 class UGModelRunnerProtocol(Protocol):
+    def observe_srt_u_forward(
+        self,
+        *,
+        record: UGSessionRecord,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> None: ...
+
     def prefill_interleaved(
         self, *, record: UGSessionRecord, messages: list[UGInterleavedMessage]
     ) -> int: ...
@@ -217,6 +225,15 @@ class FakeUGModelRunner:
 
     def close_session(self, *, session_id: str) -> None:
         del session_id
+
+    def observe_srt_u_forward(
+        self,
+        *,
+        record: UGSessionRecord,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> None:
+        del record, request, messages
 
 
 class UGSessionRuntime:
@@ -490,6 +507,13 @@ class UGSessionRuntime:
 
         self._execute_srt_req(record, req, state=record.state)
         self._record_srt_req(record, req, request_id=request_id)
+        self._notify_srt_u_forward(
+            record,
+            req,
+            state=record.state,
+            input_text=input_text,
+            messages=messages,
+        )
 
     def _append_srt_u_decode_request(self, record: UGSessionRecord) -> None:
         request_id = f"{record.session_id}:d{record.decode_count + 1}"
@@ -510,6 +534,13 @@ class UGSessionRuntime:
             req.output_ids[: req.sampling_params.max_new_tokens]
         )
         record.context_length += len(record.srt_last_u_decode_output_ids)
+        self._notify_srt_u_forward(
+            record,
+            req,
+            state=UGSegmentState.U_DECODE,
+            input_text="",
+            messages=[],
+        )
 
     def _create_srt_session_req(
         self,
@@ -598,6 +629,35 @@ class UGSessionRuntime:
         record.srt_mm_inputs = req.multimodal_inputs
         record.srt_mm_offsets = UGSessionRuntime._collect_mm_offsets(
             req.multimodal_inputs
+        )
+
+    def _notify_srt_u_forward(
+        self,
+        record: UGSessionRecord,
+        req: Any,
+        *,
+        state: UGSegmentState,
+        input_text: str,
+        messages: list[UGInterleavedMessage],
+    ) -> None:
+        observe = getattr(self.model_runner, "observe_srt_u_forward", None)
+        if not callable(observe):
+            return
+        output_ids = tuple(req.output_ids[: req.sampling_params.max_new_tokens])
+        observe(
+            record=record,
+            request=UGSRTRequestView(
+                session=record.handle(),
+                state=state.value,
+                request_id=req.rid,
+                origin_input_len=len(req.origin_input_ids),
+                origin_input_ids=tuple(req.origin_input_ids),
+                output_ids=output_ids,
+                max_new_tokens=req.sampling_params.max_new_tokens,
+                input_text=input_text,
+                mm_offsets=tuple(self._collect_mm_offsets(req.multimodal_inputs)),
+            ),
+            messages=messages,
         )
 
     def _tokenize_interleaved_messages(

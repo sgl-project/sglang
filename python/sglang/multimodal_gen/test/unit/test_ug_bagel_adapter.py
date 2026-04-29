@@ -9,6 +9,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.runtime.pipelines.ug import _load_ug_bridge
+from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.adapter import UGModelRunnerAdapter, UGModelSessionView
 from sglang.srt.ug.bagel import (
     BAGELAdapterError,
@@ -192,6 +193,26 @@ class FakeContextBAGELModel(FakeOfficialBAGELModel):
 class FakeImage:
     def __init__(self, size=(16, 8)):
         self.size = size
+
+
+class FakeTreeCache:
+    def __init__(self):
+        self.released_sessions = []
+
+    def release_session(self, session_id):
+        self.released_sessions.append(session_id)
+
+
+class OutputAppendingSRTExecutor:
+    def __init__(self, token_id=123):
+        self.token_id = token_id
+        self.events = []
+
+    def execute_ug_request(self, *, record, req, state):
+        del record
+        self.events.append((state.value, req.rid, req.sampling_params.max_new_tokens))
+        if req.sampling_params.max_new_tokens > 0:
+            req.output_ids.append(self.token_id)
 
 
 class FakeBAGELImageTransform:
@@ -554,6 +575,77 @@ class TestBAGELRealLoader(unittest.TestCase):
 
 
 class TestBAGELInterleaveContextBackend(unittest.TestCase):
+    def test_context_backend_consumes_prefill_and_append_from_srt_forward_view(self):
+        inferencer = FakeBAGELInferencer()
+        backend = BAGELInterleaveContextBackend(
+            inferencer,
+            default_image_shape=(32, 32),
+        )
+        adapter = BAGELUGModelAdapter("already-loaded-bagel", backend=backend)
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a quiet river")],
+            session_id="bagel-srt-u-forward",
+        )
+        state = backend.sessions["bagel-srt-u-forward"]
+
+        self.assertEqual(
+            state.srt_u_forward_events,
+            [("u_prefill", "bagel-srt-u-forward:u1")],
+        )
+        self.assertEqual(len([event for event in inferencer.events if event[0] == "text"]), 2)
+        self.assertEqual(state.srt_u_forward_results, {})
+
+        runtime.decode_next_segment(handle)
+        image = FakeImage(size=(24, 12))
+        handle = runtime.append_generated_image(handle, image=image)
+
+        self.assertEqual(
+            state.srt_u_forward_events,
+            [
+                ("u_prefill", "bagel-srt-u-forward:u1"),
+                ("append_image", "bagel-srt-u-forward:u2"),
+            ],
+        )
+        self.assertEqual(
+            len([event for event in inferencer.events if event[0] == "image"]),
+            1,
+        )
+        self.assertEqual(inferencer.vae_transform.resize_calls, [image])
+        self.assertEqual(state.srt_u_forward_results, {})
+        self.assertEqual(runtime.get_debug_counters(handle)["append_image_count"], 1)
+
+    def test_context_backend_observes_srt_u_decode_output_ids(self):
+        inferencer = FakeBAGELInferencer()
+        backend = BAGELInterleaveContextBackend(inferencer)
+        adapter = BAGELUGModelAdapter("already-loaded-bagel", backend=backend)
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=OutputAppendingSRTExecutor(token_id=77),
+            srt_u_decode_max_new_tokens=1,
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a tree")],
+            session_id="bagel-srt-u-decode",
+        )
+        runtime.decode_next_segment(handle)
+        state = backend.sessions["bagel-srt-u-decode"]
+
+        self.assertEqual(
+            state.srt_u_forward_events,
+            [
+                ("u_prefill", "bagel-srt-u-decode:u1"),
+                ("u_decode", "bagel-srt-u-decode:d1"),
+            ],
+        )
+        self.assertEqual(state.srt_last_u_decode_output_ids, (77,))
+
     def test_context_backend_runs_u_g_u_with_single_prepare(self):
         inferencer = FakeBAGELInferencer()
         adapter = BAGELUGModelAdapter(

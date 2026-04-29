@@ -12,6 +12,7 @@ from sglang.srt.ug.adapter import (
     UGModelRunnerAdapter,
     UGModelSessionView,
 )
+from sglang.srt.ug.context import UGSRTRequestView
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
@@ -73,6 +74,17 @@ class RecordingUGModelAdapter:
         self.session_views.append(session)
 
 
+class RecordingSRTForwardAdapter(RecordingUGModelAdapter):
+    def __init__(self):
+        super().__init__()
+        self.srt_forward_requests = []
+
+    def observe_srt_u_forward(self, *, session, request, messages):
+        del messages
+        self._record("srt_u_forward", session)
+        self.srt_forward_requests.append(request)
+
+
 class TestUGModelRunnerAdapter(unittest.TestCase):
     def test_session_view_does_not_expose_kv_details(self):
         names = {field.name for field in fields(UGModelSessionView)}
@@ -81,6 +93,42 @@ class TestUGModelRunnerAdapter(unittest.TestCase):
         self.assertFalse(any("slot" in name.lower() for name in names))
         self.assertFalse(any("page" in name.lower() for name in names))
         self.assertFalse(any("allocator" in name.lower() for name in names))
+
+    def test_srt_request_view_does_not_expose_kv_details(self):
+        names = {field.name for field in fields(UGSRTRequestView)}
+
+        self.assertFalse(any("kv" in name.lower() for name in names))
+        self.assertFalse(any("slot" in name.lower() for name in names))
+        self.assertFalse(any("page" in name.lower() for name in names))
+        self.assertFalse(any("allocator" in name.lower() for name in names))
+
+    def test_runner_forwards_safe_srt_u_forward_view(self):
+        model_adapter = RecordingSRTForwardAdapter()
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(model_adapter),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_u_decode_max_new_tokens=1,
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a boat")],
+            session_id="adapter-srt-forward",
+        )
+        runtime.decode_next_segment(handle)
+
+        self.assertEqual(
+            [request.request_id for request in model_adapter.srt_forward_requests],
+            ["adapter-srt-forward:u1", "adapter-srt-forward:d1"],
+        )
+        self.assertEqual(
+            [request.state for request in model_adapter.srt_forward_requests],
+            ["u_prefill", "u_decode"],
+        )
+        self.assertEqual(
+            [request.max_new_tokens for request in model_adapter.srt_forward_requests],
+            [0, 1],
+        )
+        self.assertEqual(model_adapter.srt_forward_requests[0].input_text, "draw a boat")
 
     def test_adapter_entrypoints_reuse_srt_session_context(self):
         tree_cache = FakeTreeCache()

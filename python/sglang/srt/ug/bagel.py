@@ -7,7 +7,7 @@ import importlib.util
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -18,12 +18,14 @@ from sglang.srt.ug.adapter import (
     UGModelAppendImageResult,
     UGModelPrefillResult,
 )
+from sglang.srt.ug.context import UGSRTRequestView
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
     UGLatentDecodeRequest,
     UGLatentPrepareRequest,
     UGLatentPrepareResult,
+    UGSegmentState,
     UGVelocityRequest,
 )
 
@@ -243,6 +245,40 @@ class BAGELSessionContext:
     prepared_denoise: BAGELPreparedDenoise | None = None
     decode_count: int = 0
     append_image_count: int = 0
+    srt_u_forward_results: dict[str, Any] = field(default_factory=dict)
+    srt_u_forward_events: list[tuple[str, str]] = field(default_factory=list)
+    srt_last_u_decode_output_ids: tuple[int, ...] = ()
+
+
+class BAGELUForwardBridge:
+    """Maps safe SRT request views onto official BAGEL U context updates."""
+
+    def observe(
+        self,
+        backend: "BAGELInterleaveContextBackend",
+        *,
+        session,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> None:
+        state = backend._state_for(session.handle.session_id)
+        state.srt_u_forward_events.append((request.state, request.request_id))
+
+        if request.state == UGSegmentState.U_PREFILL.value:
+            state.srt_u_forward_results[request.request_id] = (
+                backend._apply_prefill_interleaved(session=session, messages=messages)
+            )
+            return
+
+        if request.state == UGSegmentState.APPEND_IMAGE.value:
+            image = messages[0].content if messages else None
+            state.srt_u_forward_results[request.request_id] = (
+                backend._apply_append_generated_image(session=session, image=image)
+            )
+            return
+
+        if request.state == UGSegmentState.U_DECODE.value:
+            state.srt_last_u_decode_output_ids = request.output_ids
 
 
 class BAGELInterleaveContextBackend:
@@ -253,14 +289,38 @@ class BAGELInterleaveContextBackend:
         inferencer: Any,
         *,
         step_runner: BAGELDenoiseStepRunner | None = None,
+        u_forward_bridge: BAGELUForwardBridge | None = None,
         default_image_shape: tuple[int, int] = (1024, 1024),
     ) -> None:
         self.inferencer = inferencer
         self.step_runner = step_runner or BAGELDenoiseStepRunner()
+        self.u_forward_bridge = u_forward_bridge or BAGELUForwardBridge()
         self.default_image_shape = default_image_shape
         self.sessions: dict[str, BAGELSessionContext] = {}
 
+    def observe_srt_u_forward(
+        self,
+        *,
+        session,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> None:
+        self.u_forward_bridge.observe(
+            self,
+            session=session,
+            request=request,
+            messages=messages,
+        )
+
     def prefill_interleaved(
+        self, *, session, messages: list[UGInterleavedMessage]
+    ) -> UGModelPrefillResult:
+        cached = self._pop_srt_forward_result(session, UGModelPrefillResult)
+        if cached is not None:
+            return cached
+        return self._apply_prefill_interleaved(session=session, messages=messages)
+
+    def _apply_prefill_interleaved(
         self, *, session, messages: list[UGInterleavedMessage]
     ) -> UGModelPrefillResult:
         state = self._state_for(session.handle.session_id)
@@ -381,6 +441,14 @@ class BAGELInterleaveContextBackend:
     def append_generated_image(
         self, *, session, image: Any | None
     ) -> UGModelAppendImageResult:
+        cached = self._pop_srt_forward_result(session, UGModelAppendImageResult)
+        if cached is not None:
+            return cached
+        return self._apply_append_generated_image(session=session, image=image)
+
+    def _apply_append_generated_image(
+        self, *, session, image: Any | None
+    ) -> UGModelAppendImageResult:
         state = self._state_for(session.handle.session_id)
         image = self._prepare_image(image)
         with _bagel_autocast(self.inferencer.model):
@@ -395,6 +463,22 @@ class BAGELInterleaveContextBackend:
         state.append_image_count += 1
         state.prepared_denoise = None
         return UGModelAppendImageResult(added_tokens=2)
+
+    def _pop_srt_forward_result(self, session, result_type):
+        request_id = session.srt_last_request_id
+        if request_id is None:
+            return None
+        state = self._state_for(session.handle.session_id)
+        result = state.srt_u_forward_results.pop(request_id, None)
+        if result is None:
+            return None
+        if not isinstance(result, result_type):
+            raise BAGELAdapterError(
+                "BAGEL SRT U forward result type mismatch for "
+                f"{request_id}: expected {result_type.__name__}, got "
+                f"{type(result).__name__}"
+            )
+        return result
 
     def decode_latents_to_image(
         self, *, session, request: UGLatentDecodeRequest
@@ -507,6 +591,14 @@ class BAGELInterleaveContextBackend:
 
 
 class BAGELBackendProtocol(Protocol):
+    def observe_srt_u_forward(
+        self,
+        *,
+        session,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> None: ...
+
     def prefill_interleaved(
         self, *, session, messages: list[UGInterleavedMessage]
     ) -> UGModelPrefillResult: ...
@@ -554,6 +646,17 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
         self, *, session, messages: list[UGInterleavedMessage]
     ) -> UGModelPrefillResult:
         return self.backend.prefill_interleaved(session=session, messages=messages)
+
+    def observe_srt_u_forward(
+        self,
+        *,
+        session,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> None:
+        observe = getattr(self.backend, "observe_srt_u_forward", None)
+        if callable(observe):
+            observe(session=session, request=request, messages=messages)
 
     def decode_next_segment(self, *, session) -> UGDecodeResult:
         return self.backend.decode_next_segment(session=session)
@@ -648,6 +751,16 @@ class MockBAGELBackend:
             else:
                 raise ValueError(f"Unsupported BAGEL message type: {message.type}")
         return UGModelPrefillResult(added_tokens=token_count)
+
+    def observe_srt_u_forward(
+        self,
+        *,
+        session,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> None:
+        del messages
+        self.events.append((f"srt_{request.state}", session.handle.session_id))
 
     def decode_next_segment(self, *, session) -> UGDecodeResult:
         self._record("decode", session)

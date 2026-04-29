@@ -14,11 +14,17 @@ from sglang.srt.ug.bagel import (
     BAGELInterleaveContextBackend,
     BAGELPreparedDenoise,
     BAGELSessionContext,
+    BAGELUForwardBridge,
     BAGELUGModelAdapter,
     MockBAGELBackend,
     create_bagel_ug_model_adapter,
 )
-from sglang.srt.ug.context import UGContextBundle, UGContextHandle, UGSessionHandle
+from sglang.srt.ug.context import (
+    UGContextBundle,
+    UGContextHandle,
+    UGSRTRequestView,
+    UGSessionHandle,
+)
 from sglang.srt.ug.denoiser import (
     FakeUGDenoiserBridge,
     SRTBackedUGDenoiserBridge,
@@ -48,6 +54,7 @@ __all__ = [
     "BAGELInterleaveContextBackend",
     "BAGELPreparedDenoise",
     "BAGELSessionContext",
+    "BAGELUForwardBridge",
     "BAGELUGModelAdapter",
     "MockBAGELBackend",
     "SRTBackedUGDenoiserBridge",
@@ -61,6 +68,7 @@ __all__ = [
     "UGModelPrefillResult",
     "UGModelRunnerAdapter",
     "UGModelSessionView",
+    "UGSRTRequestView",
     "UGSegmentState",
     "UGSessionHandle",
     "UGSessionRuntime",

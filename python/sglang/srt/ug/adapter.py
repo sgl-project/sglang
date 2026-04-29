@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 import torch
 
-from sglang.srt.ug.context import UGSessionHandle
+from sglang.srt.ug.context import UGSRTRequestView, UGSessionHandle
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
@@ -45,6 +45,14 @@ class UGModelAppendImageResult:
 
 class UGModelAdapterProtocol(Protocol):
     """Model-side UG entrypoints that BAGEL-like models need to implement."""
+
+    def observe_srt_u_forward(
+        self,
+        *,
+        session: UGModelSessionView,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> None: ...
 
     def prefill_interleaved(
         self,
@@ -100,6 +108,22 @@ class UGModelRunnerAdapter:
             messages=messages,
         )
         return result.added_tokens
+
+    def observe_srt_u_forward(
+        self,
+        *,
+        record: UGSessionRecord,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> None:
+        observe = getattr(self.adapter, "observe_srt_u_forward", None)
+        if not callable(observe):
+            return
+        observe(
+            session=self._session_view(record),
+            request=request,
+            messages=messages,
+        )
 
     def decode_next_segment(self, *, record: UGSessionRecord) -> UGDecodeResult:
         return self.adapter.decode_next_segment(session=self._session_view(record))

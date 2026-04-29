@@ -21,6 +21,22 @@ class UGSessionHandle:
     context_version: int
 
 
+@dataclass(frozen=True, slots=True)
+class UGSRTRequestView:
+    """Safe view of a materialized SRT request exposed to UG model adapters."""
+
+    session: UGSessionHandle
+    state: str
+    request_id: str
+    origin_input_len: int
+    origin_input_ids: tuple[int, ...]
+    output_ids: tuple[int, ...] = ()
+    max_new_tokens: int = 0
+    input_text: str = ""
+    mm_offsets: tuple[tuple[int, int], ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass(slots=True)
 class UGContextHandle:
     request_id: str
