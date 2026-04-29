@@ -20,6 +20,7 @@ Layered design:
 
 import abc
 import logging
+import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -629,6 +630,158 @@ class ExpertBatchGatedHeterDispatch(HeterDispatchPolicy):
         return False
 
 
+class EfficiencyPromotionPolicy(HeterDispatchPolicy):
+    """Curve-driven dynamic-threshold dispatch.
+
+    Reads ``x_star_curve.csv`` (the ground-truth measurement-based optimum
+    per global batch size from kernel_profile/) at construction time. On
+    every dispatch:
+
+      1. Read M_global = ``token_selected_experts.shape[0]`` (host-known
+         under CUDA graph capture).
+      2. Look up ``x_runtime`` for this M_global from the curve.
+      3. Sort per-expert token counts descending; pick threshold
+         ``T = midpoint(counts[x_runtime - 1], counts[x_runtime])`` as a
+         GPU 0-d scalar.
+      4. ``is_promoted = counts >= T`` → those experts go to BF16.
+
+    When ``x_runtime == 0`` (small-M regime where pure-INT4 wins per
+    the curve), no promotion fires; the BF16 group is empty and the
+    runtime can skip the BF16 kernel via ``should_skip_group``.
+
+    All hot-path work is GPU-side after the host-known M-keyed branch,
+    so the policy is CUDA-graph capturable.
+    """
+
+    def __init__(
+        self,
+        num_experts: int,
+        group_size_ratios: List[float],
+        bf16_promotion_threshold: int,
+        device: Optional[torch.device] = None,
+        int4_only_mask: Optional[torch.Tensor] = None,
+        int4_group_idx: int = 0,
+        bf16_only_mask: Optional[torch.Tensor] = None,
+        bf16_group_idx: Optional[int] = None,
+        curve_file: Optional[str] = None,
+    ):
+        _bf16_gidx = (
+            bf16_group_idx if bf16_group_idx is not None
+            else (1 - int4_group_idx)
+        )
+        super().__init__(
+            num_experts, group_size_ratios,
+            bf16_promotion_threshold=bf16_promotion_threshold,
+            device=device,
+            int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
+            bf16_only_mask=bf16_only_mask, bf16_group_idx=_bf16_gidx,
+        )
+        # M_global → x_runtime lookup table, sorted by M ascending.
+        self._curve_M: List[int] = []
+        self._curve_x: List[int] = []
+        if curve_file is not None:
+            self._load_curve(curve_file)
+        # Cache of M_global → x_runtime (Python int) so repeated lookups
+        # at the same batch shape are O(1).
+        self._x_cache: dict = {}
+
+    def _load_curve(self, path: str) -> None:
+        """Parse x_star_curve.csv. Expected columns include ``M_global``
+        and ``winner_x`` (or ``x_star_meas``/``x_star``)."""
+        import csv
+        if not os.path.exists(path):
+            logger.warning(
+                "EfficiencyPromotionPolicy: curve file %s missing; "
+                "x_runtime will always be 0 (no promotion).", path)
+            return
+        with open(path) as f:
+            r = csv.reader(f)
+            header = next(r)
+            # Find x column: prefer winner_x, fall back to x_star_meas / x_star
+            x_col = None
+            for cand in ("winner_x", "x_star_meas", "x_star"):
+                if cand in header:
+                    x_col = header.index(cand)
+                    break
+            if x_col is None:
+                raise ValueError(
+                    f"curve {path} has no column named winner_x / "
+                    f"x_star_meas / x_star (header={header})")
+            m_col = header.index("M_global")
+            rows = []
+            for row in r:
+                M = int(row[m_col]); x = int(row[x_col])
+                rows.append((M, x))
+        rows.sort(key=lambda p: p[0])
+        self._curve_M = [p[0] for p in rows]
+        self._curve_x = [p[1] for p in rows]
+
+    def _lookup_x_runtime(self, M_global: int) -> int:
+        """Return x_runtime via nearest-M lookup. Cached per M."""
+        if M_global in self._x_cache:
+            return self._x_cache[M_global]
+        if not self._curve_M:
+            x = 0
+        else:
+            x = min(
+                range(len(self._curve_M)),
+                key=lambda i: abs(self._curve_M[i] - M_global),
+            )
+            x = self._curve_x[x]
+            x = max(0, min(x, self._num_experts))
+        self._x_cache[M_global] = x
+        return x
+
+    def _assign(self, token_counts, token_selected_experts, token_final_scales):
+        # Default everyone to INT4 (the policy decides nothing here; the
+        # dynamic-threshold step in dispatch promotes to BF16).
+        self._expert_to_group_buf.fill_(self._int4_group_idx)
+        return self._expert_to_group_buf
+
+    def dispatch(
+        self,
+        token_selected_experts: torch.Tensor,
+        token_final_scales: torch.Tensor,
+        sentinel: int = -1,
+    ) -> List[GroupDispatchTuple]:
+        token_counts = self._compute_token_counts(token_selected_experts)
+        policy_assignment = self._assign(
+            token_counts, token_selected_experts, token_final_scales,
+        )
+        scratch = self._dispatch_scratch
+        scratch.copy_(policy_assignment)
+
+        # Host-known M_global → host-known x_runtime → host-known branch.
+        # The Python ``if`` resolves at CUDA-graph capture time so the
+        # captured graph is shape-specific; replays at the same shape skip
+        # this branch entirely.
+        M_global = token_selected_experts.shape[0]
+        x_runtime = self._lookup_x_runtime(M_global)
+
+        if x_runtime > 0 and x_runtime < self._num_experts:
+            sorted_counts, _ = token_counts.sort(descending=True)
+            # T = midpoint as a GPU 0-d tensor; counts >= T then promotes
+            # exactly the top-x_runtime experts (modulo ties).
+            T = (sorted_counts[x_runtime - 1] + sorted_counts[x_runtime]) / 2
+            is_promoted = token_counts >= T
+            scratch[is_promoted] = self._bf16_group_idx
+        elif x_runtime >= self._num_experts:
+            scratch.fill_(self._bf16_group_idx)
+        # else x_runtime == 0: keep all-INT4
+
+        return self._dispatch_from_expert_to_group(
+            scratch, token_selected_experts, token_final_scales,
+            sentinel=sentinel)
+
+    def should_skip_group(self, group_idx: int, num_tokens: int) -> bool:
+        # When the curve says x*=0 at this M, no expert can be promoted —
+        # safe to skip the BF16 group entirely (also skips its kernel call).
+        if (group_idx == self._bf16_group_idx
+                and self._lookup_x_runtime(num_tokens) == 0):
+            return True
+        return False
+
+
 _POLICY_REGISTRY = {
     "expert_load": ExpertLoadHeterDispatch,
     "confidence": ConfidenceThresholdHeterDispatch,
@@ -636,6 +789,7 @@ _POLICY_REGISTRY = {
     "hessian_weighted_routing_weights": HessianWeightedRoutingWeightsDispatch,
     "random": RandomHeterDispatch,
     "expert_batch": ExpertBatchGatedHeterDispatch,
+    "efficiency_promotion": EfficiencyPromotionPolicy,
 }
 
 

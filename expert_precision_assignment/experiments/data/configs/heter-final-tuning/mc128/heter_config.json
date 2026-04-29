@@ -1,0 +1,20 @@
+{
+  "groups": [
+    {
+      "name": "cold",
+      "num_bits": 4,
+      "group_size": 128,
+      "checkpoint": "/data/huggingface/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441"
+    },
+    {
+      "name": "hot",
+      "num_bits": 16
+    }
+  ],
+  "policy": "expert_batch",
+  "policy_params": {},
+  "bf16_promotion_threshold": 72,
+  "int4_only_experts_file": "/data/huanchen/sglang/expert_precision_assignment/experiments/data/configs/heter-final-tuning/mc128/int4_only_experts.json",
+  "attention_num_bits": 16,
+  "expert_importance_file": "/data/huanchen/sglang/expert_precision_assignment/experiments/data/configs/heter-final-tuning/mc128/expert_importance.json"
+}
