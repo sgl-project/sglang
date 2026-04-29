@@ -337,7 +337,7 @@ class AITerImpl(AttentionImpl):
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
         return_softmax_lse: bool = False,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Performs attention using one of:
           - _mla_prefill_ps_attention (FP8, SGLANG_DIFFUSION_AITER_FP8_ATTN=1)
