@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""DeepEP Waterfill: shared expert as 9th TopK column, dispatched to least-loaded rank."""
+"""DeepEP Waterfill: shared expert as 9th routed expert, dispatched to least-loaded rank."""
 
 from typing import Optional, Tuple
 
@@ -349,7 +349,7 @@ def expand_topk_with_shared_expert(
 
 
 class DeepEPWaterfillBalancer:
-    """Waterfill load balancer for the fused shared expert TopK column."""
+    """Waterfill load balancer: shared expert fused as real routed expert (topk 8→9)."""
 
     MIN_BATCH_FOR_BALANCE = 64
 
@@ -420,7 +420,7 @@ class DeepEPWaterfillBalancer:
         routed_counts: Tensor,
         local_tokens_per_rank: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
-        """Expand routed topk [N, 8] to [N, 9] with waterfill-assigned shared expert."""
+        """Expand topk [N, 8] → [N, 9] with waterfill-assigned shared expert."""
         num_tokens = topk_ids.shape[0]
         if num_tokens == 0:
             return _empty_expanded(topk_ids, topk_weights)
@@ -471,13 +471,7 @@ class DeepEPWaterfillBalancer:
     def expand_topk(
         self, topk_output: StandardTopKOutput, num_tokens: int
     ) -> StandardTopKOutput:
-        """Replace the fused shared expert column with a waterfill-assigned one."""
-        if topk_output.topk_ids.shape[1] < 1:
-            raise ValueError("DeepEP waterfill expects a fused shared expert column.")
-        # Waterfill kernels assume contiguous [N, routed_topk] inputs. Slicing
-        # off the shared column from [N, routed_topk + 1] leaves row stride +1.
-        routed_topk_ids = topk_output.topk_ids[:, :-1].contiguous()
-        routed_topk_weights = topk_output.topk_weights[:, :-1].contiguous()
+        """Expand topk [N, 8] -> [N, 9] with waterfill-assigned shared expert."""
         if (
             self.static_rank_load is not None
             and num_tokens < self.MIN_BATCH_FOR_BALANCE
@@ -485,8 +479,8 @@ class DeepEPWaterfillBalancer:
             # Static EPLB low-batch path can use local expansion. Dynamic mode
             # always all-reduces so decode and extend have the same participation.
             expanded_ids, expanded_weights, _ = expand_topk_with_shared_expert(
-                routed_topk_ids,
-                routed_topk_weights,
+                topk_output.topk_ids,
+                topk_output.topk_weights,
                 self.num_routed_experts,
                 self.world_size,
                 self.rank,
@@ -503,7 +497,7 @@ class DeepEPWaterfillBalancer:
             moe_expert_parallel_all_reduce,
         )
 
-        local_routed_counts = self.count_local_routed(routed_topk_ids)
+        local_routed_counts = self.count_local_routed(topk_output.topk_ids)
         if self.static_rank_load is not None:
             global_routed_counts, local_tokens_per_rank = local_routed_counts, None
         else:
@@ -520,8 +514,8 @@ class DeepEPWaterfillBalancer:
             local_tokens_per_rank = buf[world:]
 
         expanded_ids, expanded_weights, _ = self.prepare_dispatch(
-            routed_topk_ids,
-            routed_topk_weights,
+            topk_output.topk_ids,
+            topk_output.topk_weights,
             global_routed_counts,
             local_tokens_per_rank=local_tokens_per_rank,
         )

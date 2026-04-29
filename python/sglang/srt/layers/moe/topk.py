@@ -149,7 +149,6 @@ class TopKConfig:
     num_expert_group: Optional[int] = None
     renormalize: bool = True
     num_fused_shared_experts: int = 0
-    enable_deepep_waterfill: bool = False
     custom_routing_function: Optional[Callable] = None
     correction_bias: Optional[torch.Tensor] = None
     torch_native: bool = False
@@ -285,6 +284,9 @@ class TopK(MultiPlatformOp):
                 raise ValueError("DeepEP waterfill TopK is only supported on CUDA.")
             if output_format not in (None, TopKOutputFormat.STANDARD):
                 raise ValueError("DeepEP waterfill requires STANDARD TopK output.")
+            # Waterfill appends the shared expert after routed TopK selection.
+            top_k -= num_fused_shared_experts
+            num_fused_shared_experts = 0
             output_format = TopKOutputFormat.STANDARD
 
         self.topk_config = TopKConfig(
@@ -294,7 +296,6 @@ class TopK(MultiPlatformOp):
             topk_group=topk_group,
             num_expert_group=num_expert_group,
             num_fused_shared_experts=num_fused_shared_experts,
-            enable_deepep_waterfill=enable_deepep_waterfill,
             custom_routing_function=custom_routing_function,
             correction_bias=correction_bias,
             routed_scaling_factor=routed_scaling_factor,
@@ -1050,7 +1051,6 @@ def _post_process_topk_ids(
     expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
 ) -> torch.Tensor:
     num_fused_shared_experts = topk_config.num_fused_shared_experts
-    enable_deepep_waterfill = topk_config.enable_deepep_waterfill
     fused_shared_experts_scaling_factor = (
         topk_config.fused_shared_experts_scaling_factor
     )
@@ -1098,11 +1098,7 @@ def _post_process_topk_ids(
 
     # DeepEP: remap to interleaved expert layout where each rank's shared
     # expert has a unique ID for dispatch routing.
-    if (
-        num_fused_shared_experts > 0
-        and is_deepep_class_backend()
-        and not enable_deepep_waterfill
-    ):
+    if num_fused_shared_experts > 0 and is_deepep_class_backend():
         topk_ids, topk_weights = _remap_topk_for_deepep(
             topk_ids,
             topk_weights,
@@ -1240,12 +1236,7 @@ def select_experts(
         expert_location_dispatch_info=expert_location_dispatch_info,
     )
 
-    recorder_topk_ids = topk_ids
-    if topk_config.enable_deepep_waterfill and num_fused_shared_experts > 0:
-        recorder_topk_ids = topk_ids[:, :-num_fused_shared_experts]
-    get_global_expert_distribution_recorder().on_select_experts(
-        topk_ids=recorder_topk_ids
-    )
+    get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
 
