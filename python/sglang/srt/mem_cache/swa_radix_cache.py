@@ -22,7 +22,6 @@ The radix tree data structure for managing the hybrid (full and SWA) KV cache.
 import heapq
 import time
 from collections import defaultdict
-from functools import partial
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -41,12 +40,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.radix_cache import (
-    RadixKey,
-    _key_match_page_size1,
-    _key_match_paged,
-    get_child_key,
-)
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.utils import convert_to_bigram_key
 
@@ -352,13 +346,6 @@ class SWARadixCache(BasePrefixCache):
             self.device = self.token_to_kv_pool_allocator.device
         else:
             self.device = torch.device("cpu")
-
-        if self.page_size == 1:
-            self.key_match_fn = _key_match_page_size1
-            self.get_child_key_fn = get_child_key
-        else:
-            self.key_match_fn = partial(_key_match_paged, page_size=self.page_size)
-            self.get_child_key_fn = partial(get_child_key, page_size=self.page_size)
 
         if self.is_eagle:
             self.key_convert_fn = convert_to_bigram_key
@@ -795,7 +782,7 @@ class SWARadixCache(BasePrefixCache):
         node is greater than or equal to the sliding window size.
         """
         node = self.root_node
-        child_key = self.get_child_key_fn(key)
+        child_key = key.child_key(self.page_size)
 
         value = []
         # for path connected to root without tombstone, always match, so set to inf
@@ -813,7 +800,7 @@ class SWARadixCache(BasePrefixCache):
                 # reset match_len_since_tombstone if we hit a tombstone node
                 match_len_since_tombstone = 0
 
-            prefix_len = self.key_match_fn(child.key, key)
+            prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 value.append(new_node.value)
@@ -829,7 +816,7 @@ class SWARadixCache(BasePrefixCache):
                 key = key[prefix_len:]
 
                 if len(key):
-                    child_key = self.get_child_key_fn(key)
+                    child_key = key.child_key(self.page_size)
 
         # handle best_value_len and best_last_node, for the case that last node is fully matched
         if match_len_since_tombstone >= self.sliding_window_size:
@@ -887,7 +874,7 @@ class SWARadixCache(BasePrefixCache):
     def _split_node(self, key: RadixKey, child: TreeNode, split_len: int) -> TreeNode:
         # new_node -> child
         new_node = TreeNode()
-        new_node.children = {self.get_child_key_fn(key[split_len:]): child}
+        new_node.children = {key[split_len:].child_key(self.page_size): child}
         new_node.parent = child.parent
         new_node.swa_tombstone = child.swa_tombstone
         new_node.full_lock_ref = child.full_lock_ref
@@ -909,7 +896,7 @@ class SWARadixCache(BasePrefixCache):
         child.key = child.key[split_len:]
         assert len(child.key) > 0, f"child.key should not be empty"
         child.value = child.value[split_len:].clone()
-        new_node.parent.children[self.get_child_key_fn(key)] = new_node
+        new_node.parent.children[key.child_key(self.page_size)] = new_node
 
         # insert the new node and child into the lru lists, insert
         # parent first so that parent is after child in the lru list
@@ -938,7 +925,7 @@ class SWARadixCache(BasePrefixCache):
         if len(key) == 0:
             return 0
 
-        child_key = self.get_child_key_fn(key)
+        child_key = key.child_key(self.page_size)
 
         total_prefix_length = 0
         while len(key) > 0 and child_key in node.children.keys():
@@ -947,7 +934,7 @@ class SWARadixCache(BasePrefixCache):
             self.full_lru_list.reset_node_mru(node)
             if not node.swa_tombstone:
                 self.swa_lru_list.reset_node_mru(node)
-            prefix_len = self.key_match_fn(node.key, key)
+            prefix_len = node.key.match(key, page_size=self.page_size)
 
             if prefix_len < len(node.key):
                 new_node = self._split_node(node.key, node, prefix_len)
@@ -1002,7 +989,7 @@ class SWARadixCache(BasePrefixCache):
             value = value[prefix_len:]
 
             if len(key):
-                child_key = self.get_child_key_fn(key)
+                child_key = key.child_key(self.page_size)
 
         if len(key):
             # Layout: |--- total_prefix_length ---|--- len(key) ---|
@@ -1055,7 +1042,7 @@ class SWARadixCache(BasePrefixCache):
         new_node.key = key
         new_node.value = value.clone()
         new_node.swa_tombstone = swa_tombstone
-        parent.children[self.get_child_key_fn(key)] = new_node
+        parent.children[key.child_key(self.page_size)] = new_node
         self.full_lru_list.insert_mru(new_node)
         self.full_evictable_size_ += len(value)
         if not swa_tombstone:
@@ -1091,7 +1078,7 @@ class SWARadixCache(BasePrefixCache):
             not node.swa_tombstone
         ), f"Invariant violated: leaf node is a tombstone, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
-        key = self.get_child_key_fn(node.key)
+        key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
         self.full_evictable_size_ -= len(node.key)
@@ -1107,7 +1094,7 @@ class SWARadixCache(BasePrefixCache):
             node.swa_tombstone
         ), f"Deleting a unexpected non-tombstone leaf node, {node.id=}"
         assert len(node.children) == 0, f"leaf node has children, {node.id=}"
-        key = self.get_child_key_fn(node.key)
+        key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node, f"parent does not have child key, {key}"
 
@@ -1152,9 +1139,9 @@ class SWARadixCache(BasePrefixCache):
             for key, child in current_node.children.items():
                 stack.append((child, current_indent + 2))
 
-                assert key == self.get_child_key_fn(
-                    child.key
-                ), f"{key=}, {self.get_child_key_fn(child.key)=}"
+                assert key == child.key.child_key(
+                    self.page_size
+                ), f"{key=}, {child.key.child_key(self.page_size)=}"
 
     def _total_size_helper(self) -> Tuple[int, int]:
         total_size = 0
