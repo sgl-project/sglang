@@ -35,6 +35,7 @@ import zmq
 import zmq.asyncio
 
 from sglang.srt.disaggregation.utils import DisaggregationMode, TransferBackend
+from sglang.srt.managers.communicator import FanOutCommunicator
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.io_struct import (
     BaseBatchReq,
@@ -43,7 +44,6 @@ from sglang.srt.managers.io_struct import (
     BatchStrOutput,
     BatchTokenIDOutput,
 )
-from sglang.srt.managers.tokenizer_communicator_mixin import _Communicator
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import kill_process_tree
@@ -125,8 +125,8 @@ def _handle_output_by_index(output, i):
         new_output = BatchTokenIDOutput(
             rids=[output.rids[i]],
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_accepted_tokens=_extract_field_by_index(
-                output, "spec_accepted_tokens", i
+            spec_accepted_drafts=_extract_field_by_index(
+                output, "spec_accepted_drafts", i
             ),
             spec_acceptance_histogram=_extract_field_by_index(
                 output, "spec_acceptance_histogram", i
@@ -213,8 +213,8 @@ def _handle_output_by_index(output, i):
         new_output = BatchStrOutput(
             rids=[output.rids[i]],
             spec_verify_ct=_extract_field_by_index(output, "spec_verify_ct", i),
-            spec_accepted_tokens=_extract_field_by_index(
-                output, "spec_accepted_tokens", i
+            spec_accepted_drafts=_extract_field_by_index(
+                output, "spec_accepted_drafts", i
             ),
             spec_acceptance_histogram=_extract_field_by_index(
                 output, "spec_acceptance_histogram", i
@@ -400,7 +400,7 @@ class TokenizerWorker(TokenizerManager):
             self.server_args.disaggregation_transfer_backend
         )
         # Communicator
-        self.register_multi_tokenizer_communicator = _Communicator(
+        self.register_multi_tokenizer_communicator = FanOutCommunicator(
             self.send_to_scheduler, 2
         )
 

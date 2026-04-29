@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     write_results_to_json,
 )
 
-register_cuda_ci(est_time=402, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=460, suite="stage-b-test-1-gpu-large")
 
 MODEL_SCORE_THRESHOLDS = {
     # Baselines observed with gsm8k 5-shot concatenated format via chat API,

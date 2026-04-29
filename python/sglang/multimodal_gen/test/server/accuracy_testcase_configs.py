@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from sglang.multimodal_gen.test.server.testcase_configs import (
+from sglang.multimodal_gen.test.server.gpu_cases import (
     ONE_GPU_CASES,
     TWO_GPU_CASES,
-    DiffusionTestCase,
 )
+from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
 
 
 def _select_accuracy_cases(
@@ -31,7 +31,6 @@ ACCURACY_ONE_GPU_CASE_IDS = (
     "flux_2_image_t2i_upscaling_4x",
     "mova_360p_1gpu",
     "wan2_1_t2v_1.3b",
-    "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
     "wan2_1_t2v_1.3b_teacache_enabled",
     "wan2_1_t2v_1.3b_frame_interp_2x",
     "wan2_1_t2v_1.3b_upscaling_4x",
