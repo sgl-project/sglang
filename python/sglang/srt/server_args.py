@@ -236,6 +236,9 @@ NSA_CHOICES = [
 HISPARSE_CUDA_NSA_BACKENDS = ("flashmla_sparse",)
 HISPARSE_ROCM_NSA_BACKENDS = ("tilelang",)
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
+HISPARSE_ROCM_RESOURCE_DEFAULT_GPU_MEM_CUTOFF = 220 * 1024
+HISPARSE_ROCM_DEFAULT_MAX_RUNNING_REQUESTS = 64
+HISPARSE_ROCM_DEFAULT_CUDA_GRAPH_MAX_BS = 64
 
 MAMBA_SCHEDULER_STRATEGY_CHOICES = ["auto", "no_buffer", "extra_buffer"]
 
@@ -821,6 +824,7 @@ class ServerArgs:
 
         # Get GPU memory capacity, which is a common dependency for several configuration steps.
         gpu_mem = get_device_memory_capacity(self.device)
+        self._handle_hisparse_rocm_resource_defaults(gpu_mem)
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
@@ -1662,6 +1666,36 @@ class ServerArgs:
             f"HiSparse requires one of {HISPARSE_KV_CACHE_DTYPES} KV cache dtypes, "
             f"but got --kv-cache-dtype={self.kv_cache_dtype}. Please use {choices}."
         )
+
+    def _handle_hisparse_rocm_resource_defaults(self, gpu_mem: Optional[int]):
+        if not self.enable_hisparse or not is_hip():
+            return
+        if (
+            gpu_mem is not None
+            and gpu_mem > HISPARSE_ROCM_RESOURCE_DEFAULT_GPU_MEM_CUTOFF
+        ):
+            return
+
+        updated = []
+        if self.max_running_requests is None:
+            self.max_running_requests = HISPARSE_ROCM_DEFAULT_MAX_RUNNING_REQUESTS
+            updated.append(
+                f"max_running_requests={HISPARSE_ROCM_DEFAULT_MAX_RUNNING_REQUESTS}"
+            )
+
+        if self.cuda_graph_max_bs is None and self.cuda_graph_bs is None:
+            self.cuda_graph_max_bs = HISPARSE_ROCM_DEFAULT_CUDA_GRAPH_MAX_BS
+            updated.append(
+                f"cuda_graph_max_bs={HISPARSE_ROCM_DEFAULT_CUDA_GRAPH_MAX_BS}"
+            )
+
+        if updated:
+            logger.warning(
+                "HiSparse on ROCm uses extra per-request buffers; setting %s by default "
+                "on this GPU memory class to avoid OOM during long-prompt serving. "
+                "You can override these with explicit CLI arguments.",
+                ", ".join(updated),
+            )
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import is_deepseek_nsa

@@ -132,6 +132,47 @@ class TestHiSparseNsaBackendPolicy(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"fp8_e4m3"):
             server_args._validate_hisparse_kv_cache_dtype()
 
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_rocm_defaults_cap_resource_hungry_settings(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._handle_hisparse_rocm_resource_defaults(gpu_mem=196608)
+
+        self.assertEqual(server_args.max_running_requests, 64)
+        self.assertEqual(server_args.cuda_graph_max_bs, 64)
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_rocm_defaults_preserve_explicit_settings(self, _mock_is_hip):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            max_running_requests=128,
+            cuda_graph_max_bs=32,
+        )
+
+        server_args._handle_hisparse_rocm_resource_defaults(gpu_mem=196608)
+
+        self.assertEqual(server_args.max_running_requests, 128)
+        self.assertEqual(server_args.cuda_graph_max_bs, 32)
+
+    @patch("sglang.srt.server_args.is_hip", return_value=True)
+    def test_hisparse_rocm_defaults_skip_larger_memory_gpu(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._handle_hisparse_rocm_resource_defaults(gpu_mem=288 * 1024)
+
+        self.assertIsNone(server_args.max_running_requests)
+        self.assertIsNone(server_args.cuda_graph_max_bs)
+
+    @patch("sglang.srt.server_args.is_hip", return_value=False)
+    def test_hisparse_resource_defaults_do_not_apply_on_cuda(self, _mock_is_hip):
+        server_args = ServerArgs(model_path="dummy", enable_hisparse=True)
+
+        server_args._handle_hisparse_rocm_resource_defaults(gpu_mem=196608)
+
+        self.assertIsNone(server_args.max_running_requests)
+        self.assertIsNone(server_args.cuda_graph_max_bs)
+
 
 class TestPortArgs(unittest.TestCase):
     @patch("sglang.srt.server_args.get_free_port")
