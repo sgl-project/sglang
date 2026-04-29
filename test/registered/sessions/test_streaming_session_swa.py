@@ -94,7 +94,7 @@ class TestStreamingSessionSWARetractLargePage(TestStreamingSession):
 
 
 class TestStreamingSessionSWARetractMixedChunk(TestStreamingSession):
-    """SWA under retract decode with --enable-mixed-chunk."""
+    """SWA under retract decode with --allow-mixed-prefill-decode-batch."""
 
     @classmethod
     def setUpClass(cls):
@@ -111,7 +111,7 @@ class TestStreamingSessionSWARetractMixedChunk(TestStreamingSession):
                     "--enable-streaming-session",
                     "--chunked-prefill-size",
                     "128",
-                    "--enable-mixed-chunk",
+                    "--allow-mixed-prefill-decode-batch",
                     *SWA_COMMON_ARGS,
                 ],
             )

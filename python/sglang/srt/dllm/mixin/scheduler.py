@@ -139,7 +139,7 @@ class SchedulerDllmMixin:
             self.new_token_ratio,
             self.max_prefill_tokens,
             self.chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            running_bs if self.allow_mixed_prefill_decode_batch else 0,
             self.priority_scheduling_preemption_threshold,
             prefill_max_requests=self.server_args.prefill_max_requests,
             dllm_config=self.dllm_config,

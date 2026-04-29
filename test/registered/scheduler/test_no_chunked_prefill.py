@@ -16,7 +16,9 @@ class TestNoChunkedPrefill(CustomTestCase):
 
     def test_no_chunked_prefill(self):
         run_mmlu_test(
-            disable_radix_cache=False, enable_mixed_chunk=False, chunked_prefill_size=-1
+            disable_radix_cache=False,
+            allow_mixed_prefill_decode_batch=False,
+            chunked_prefill_size=-1,
         )
 
     def test_no_chunked_prefill_without_radix_cache(self):

@@ -953,9 +953,9 @@ class Scheduler(
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
         self.chunked_req = None
-        self.is_mixed_chunk = (
+        self.allow_mixed_prefill_decode_batch = (
             self.chunked_prefill_size is not None
-            and self.server_args.enable_mixed_chunk
+            and self.server_args.allow_mixed_prefill_decode_batch
         )
 
         # Init the dynamic chunking predictor for PP
@@ -2504,7 +2504,7 @@ class Scheduler(
             self.new_token_ratio,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            running_bs if self.allow_mixed_prefill_decode_batch else 0,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
@@ -2661,13 +2661,13 @@ class Scheduler(
 
         # Mixed-style chunked prefill
         if (
-            self.is_mixed_chunk
+            self.allow_mixed_prefill_decode_batch
             and not self.running_batch.is_empty()
             and not (new_batch.return_logprob or self.running_batch.return_logprob)
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
         ):
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
+            # TODO (lianmin): support return_logprob + mixed prefill and decode batch
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()

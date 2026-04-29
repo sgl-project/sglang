@@ -375,7 +375,7 @@ The most important performance-related groups are:
   - `ep_size`
   - `load_balance_method`
   - `enable_dp_attention`
-  - `enable_mixed_chunk`
+  - `allow_mixed_prefill_decode_batch`
   - `disable_overlap_schedule`
 - Runtime / CUDA graph
   - keep CUDA graph enabled by default for performance benchmarking

@@ -1683,7 +1683,7 @@ def read_output(output_lines: List[str], filename: str = STDERR_FILENAME):
 def run_and_check_memory_leak(
     workload_func,
     disable_radix_cache,
-    enable_mixed_chunk,
+    allow_mixed_prefill_decode_batch,
     disable_overlap,
     chunked_prefill_size,
     assert_has_abort,
@@ -1697,8 +1697,8 @@ def run_and_check_memory_leak(
     ]
     if disable_radix_cache:
         other_args += ["--disable-radix-cache"]
-    if enable_mixed_chunk:
-        other_args += ["--enable-mixed-chunk"]
+    if allow_mixed_prefill_decode_batch:
+        other_args += ["--allow-mixed-prefill-decode-batch"]
     if disable_overlap:
         other_args += ["--disable-overlap-schedule"]
 
@@ -1784,7 +1784,7 @@ def run_command_and_capture_output(command, env: Optional[dict] = None):
 
 def run_mmlu_test(
     disable_radix_cache=False,
-    enable_mixed_chunk=False,
+    allow_mixed_prefill_decode_batch=False,
     disable_overlap=False,
     chunked_prefill_size=32,
 ):
@@ -1807,7 +1807,7 @@ def run_mmlu_test(
     run_and_check_memory_leak(
         workload_func,
         disable_radix_cache,
-        enable_mixed_chunk,
+        allow_mixed_prefill_decode_batch,
         disable_overlap,
         chunked_prefill_size,
         assert_has_abort=False,
@@ -1816,7 +1816,7 @@ def run_mmlu_test(
 
 def run_mulit_request_test(
     disable_radix_cache=False,
-    enable_mixed_chunk=False,
+    allow_mixed_prefill_decode_batch=False,
     enable_overlap=False,
     chunked_prefill_size=32,
 ):
@@ -1846,7 +1846,7 @@ def run_mulit_request_test(
     run_and_check_memory_leak(
         workload_func,
         disable_radix_cache,
-        enable_mixed_chunk,
+        allow_mixed_prefill_decode_batch,
         enable_overlap,
         chunked_prefill_size,
         assert_has_abort=False,

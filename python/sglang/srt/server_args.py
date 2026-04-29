@@ -643,7 +643,7 @@ class ServerArgs:
         default_factory=lambda: is_hip()
     )  # Pre-warm NCCL/RCCL to reduce P99 TTFT cold-start latency (default: True for AMD/HIP, False for others)
     disable_overlap_schedule: bool = False
-    enable_mixed_chunk: bool = False
+    allow_mixed_prefill_decode_batch: bool = False
     enable_dp_attention: bool = False
     enable_dp_attention_local_control_broadcast: bool = False
     enable_dp_lm_head: bool = False
@@ -2678,9 +2678,9 @@ class ServerArgs:
                 )
         if self.attention_backend == "dual_chunk_flash_attn":
             logger.warning(
-                "Mixed chunk and radix cache are disabled when using dual-chunk flash attention backend"
+                "Mixed prefill & decode batching and radix cache are disabled when using dual-chunk flash attention backend"
             )
-            self.enable_mixed_chunk = False
+            self.allow_mixed_prefill_decode_batch = False
             self.disable_radix_cache = True
 
     def _handle_kv4_compatibility(self):
@@ -3382,10 +3382,10 @@ class ServerArgs:
                 "Overlap scheduler is disabled when using DFLASH speculative decoding (spec v2 is not supported yet)."
             )
 
-            if self.enable_mixed_chunk:
-                self.enable_mixed_chunk = False
+            if self.allow_mixed_prefill_decode_batch:
+                self.allow_mixed_prefill_decode_batch = False
                 logger.warning(
-                    "Mixed chunked prefill is disabled because of using dflash speculative decoding."
+                    "Mixed prefill & decode batching is disabled because of using dflash speculative decoding."
                 )
 
         if self.speculative_algorithm in ("EAGLE", "EAGLE3", "STANDALONE"):
@@ -3423,10 +3423,10 @@ class ServerArgs:
                     "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler. "
                 )
 
-            if self.enable_mixed_chunk:
-                self.enable_mixed_chunk = False
+            if self.allow_mixed_prefill_decode_batch:
+                self.allow_mixed_prefill_decode_batch = False
                 logger.warning(
-                    "Mixed chunked prefill is disabled because of using "
+                    "Mixed prefill & decode batching is disabled because of using "
                     "eagle speculative decoding."
                 )
 
@@ -3508,7 +3508,7 @@ class ServerArgs:
                 )
 
             self.disable_overlap_schedule = True
-            self.enable_mixed_chunk = False
+            self.allow_mixed_prefill_decode_batch = False
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
                 self.speculative_num_draft_tokens = 12
@@ -3536,7 +3536,7 @@ class ServerArgs:
                         f"speculative_num_draft_tokens - 1 ({self.speculative_num_draft_tokens - 1})."
                     )
             logger.warning(
-                "The overlap scheduler and mixed chunked prefill are disabled because of "
+                "The overlap scheduler and mixed prefill & decode batching are disabled because of "
                 "using ngram speculative decoding."
             )
 
@@ -4041,11 +4041,11 @@ class ServerArgs:
             )
             self.disaggregation_mode = "null"
 
-        if self.enable_mixed_chunk:
+        if self.allow_mixed_prefill_decode_batch:
             logger.warning(
-                "Mixed chunked prefill is disabled because of using diffusion LLM inference."
+                "Mixed prefill & decode batching is disabled because of using diffusion LLM inference."
             )
-            self.enable_mixed_chunk = False
+            self.allow_mixed_prefill_decode_batch = False
 
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
@@ -5992,9 +5992,9 @@ class ServerArgs:
             help="Disable the overlap scheduler, which overlaps the CPU scheduler with GPU model worker.",
         )
         parser.add_argument(
-            "--enable-mixed-chunk",
+            "--allow-mixed-prefill-decode-batch",
             action="store_true",
-            help="Enabling mixing prefill and decode in a batch when using chunked prefill.",
+            help="Enable mixing prefill and decode in a batch when using chunked prefill.",
         )
         parser.add_argument(
             "--enable-dp-attention",
@@ -6705,8 +6705,8 @@ class ServerArgs:
         # Check speculative decoding
         if self.speculative_algorithm is not None:
             assert (
-                not self.enable_mixed_chunk
-            ), "enable_mixed_chunk is required for speculative decoding"
+                not self.allow_mixed_prefill_decode_batch
+            ), "allow_mixed_prefill_decode_batch is required for speculative decoding"
 
         # Check chunked prefill
         # Skip validation if chunked prefill is disabled (i.e., size <= 0).

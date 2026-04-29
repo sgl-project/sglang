@@ -22,7 +22,7 @@ class TestMixedChunkedPrefill(GSM8KMixin, CustomTestCase):
     gsm8k_accuracy_thres = 0.62
 
     extra_args = [
-        "--enable-mixed-chunk",
+        "--allow-mixed-prefill-decode-batch",
         "--chunked-prefill-size",
         "32",
     ]
@@ -44,7 +44,7 @@ class TestMixedChunkedPrefill(GSM8KMixin, CustomTestCase):
 
 class TestMixedChunkedPrefillNoRadixCache(TestMixedChunkedPrefill):
     extra_args = [
-        "--enable-mixed-chunk",
+        "--allow-mixed-prefill-decode-batch",
         "--chunked-prefill-size",
         "32",
         "--disable-radix-cache",

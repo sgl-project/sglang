@@ -55,7 +55,7 @@ def initialize_engine() -> sgl.Engine:
         attention_backend="dual_chunk_flash_attn",
         tp_size=4,
         disable_radix_cache=True,
-        enable_mixed_chunk=False,
+        allow_mixed_prefill_decode_batch=False,
         enable_torch_compile=False,
         chunked_prefill_size=131072,
         mem_fraction_static=0.6,

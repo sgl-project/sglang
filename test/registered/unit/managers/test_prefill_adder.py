@@ -352,7 +352,7 @@ class TestPrefillAdder(CustomTestCase):
         )  # 50 + 75 + 100 + 125 + 125 - 100 - 125 = 250
         self.assertEqual(running_batch.release_req.call_count, 2)
 
-    def test_mixed_chunk_prefill_budgets(self):
+    def test_allow_mixed_prefill_decode_batch_budgets(self):
         self.mock_token_allocator.available_size.return_value = 1000
 
         decode_reqs = [

@@ -59,7 +59,7 @@ class TestAbort(CustomTestCase):
         run_and_check_memory_leak(
             self.workload_func,
             disable_radix_cache=False,
-            enable_mixed_chunk=False,
+            allow_mixed_prefill_decode_batch=False,
             disable_overlap=False,
             chunked_prefill_size=8192,
             assert_has_abort=True,
@@ -103,7 +103,7 @@ class TestAbortWithApiKey(CustomTestCase):
         run_and_check_memory_leak(
             lambda base_url, model: self.workload_func(base_url, model, api_key),
             disable_radix_cache=False,
-            enable_mixed_chunk=False,
+            allow_mixed_prefill_decode_batch=False,
             disable_overlap=False,
             chunked_prefill_size=8192,
             assert_has_abort=True,

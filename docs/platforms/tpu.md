@@ -404,7 +404,7 @@ See the [Speculative Decoding documentation](https://github.com/sgl-project/sgla
 Enable mixed prefill-decode batching for better TPU utilization:
 
 ```bash
---chunked-prefill-size=2048 --enable-mixed-chunk
+--chunked-prefill-size=2048 --allow-mixed-prefill-decode-batch
 ```
 
 This allows the scheduler to mix prefill operations with decode operations in the same batch, improving overall throughput.

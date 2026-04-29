@@ -437,7 +437,7 @@ class TestPPMixedChunk(CustomTestCase):
                 2,
                 "--chunked-prefill-size",
                 256,
-                "--enable-mixed-chunk",
+                "--allow-mixed-prefill-decode-batch",
             ],
         )
 

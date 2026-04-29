@@ -518,7 +518,7 @@ class TestStreamingSession(CustomTestCase):
             health.status_code,
             200,
             "Server unhealthy after concurrent stress test — "
-            "likely a token leak from retract/mixed-chunk + streaming session.",
+            "likely a token leak from retract/allow-mixed-prefill-decode-batch + streaming session.",
         )
 
     def test_nth_mid_abort_recovery(self) -> None:
@@ -790,7 +790,7 @@ class TestStreamingSession(CustomTestCase):
 
 
 class TestStreamingSessionRetractMixedChunk(TestStreamingSession):
-    """Retract + --enable-mixed-chunk."""
+    """Retract + --allow-mixed-prefill-decode-batch."""
 
     @classmethod
     def setUpClass(cls):
@@ -807,7 +807,7 @@ class TestStreamingSessionRetractMixedChunk(TestStreamingSession):
                     "--enable-streaming-session",
                     "--chunked-prefill-size",
                     "128",
-                    "--enable-mixed-chunk",
+                    "--allow-mixed-prefill-decode-batch",
                 ],
             )
         cls.tokenizer = get_tokenizer(cls.model)

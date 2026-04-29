@@ -96,9 +96,11 @@ class AscendAttnMaskBuilder:
         mtp_mask_len = 2048
         self.mtp_mask = self.generate_mask_flag(mtp_mask_len).to(self.device)
 
-        # Initialize mixed chunk mask cache
+        # Initialize mixed prefill and decode batch mask cache
         mixed_mask_len = 2048
-        self.mixed_chunk_attn_mask = self.get_splitfuse_attn_mask(mixed_mask_len)
+        self.allow_mixed_prefill_decode_batch_attn_mask = self.get_splitfuse_attn_mask(
+            mixed_mask_len
+        )
 
         if use_mla:
             # Initialize RingMla mask
@@ -257,7 +259,7 @@ class AscendAttnBackend(AttentionBackend):
             self.ascend_attn_mask_builder.mask,
             self.ascend_attn_mask_builder.fia_mask,
             self.ascend_attn_mask_builder.mtp_mask,
-            self.ascend_attn_mask_builder.mixed_chunk_attn_mask,
+            self.ascend_attn_mask_builder.allow_mixed_prefill_decode_batch_attn_mask,
         )
         if self.use_mla:
             self.ringmla_mask = self.ascend_attn_mask_builder.ringmla_mask
@@ -2036,7 +2038,7 @@ class AscendAttnBackend(AttentionBackend):
             or (not self.use_fia and layer.qk_head_dim > 128)
         ):
             raise NotImplementedError(
-                "The 'enable-mixed-chunk' feature is currently unsupported in the following scenarios: "
+                "The 'allow-mixed-prefill-decode-batch' feature is currently unsupported in the following scenarios: "
                 "1. When using the MLA backend on Ascend NPU devices, "
                 "2. When using the deepseekv3.2 model on Ascend NPU devices, "
                 "3. When the environment variable ASCEND_USE_FIA is set to 0 and qk_head_dim exceeds 128 on Ascend NPU devices."
