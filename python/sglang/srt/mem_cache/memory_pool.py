@@ -872,7 +872,7 @@ class MHATokenToKVPool(KVCache):
     def _create_buffers(self):
         from sglang.srt.utils import get_bool_env_var
 
-        self._use_asm_attention = get_bool_env_var("SGLANG_USE_ASM_ATTENTION")
+        self._use_aiter_shuffle_attn = get_bool_env_var("SGLANG_USE_AITER_SHUFFLE_ATTN")
 
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -880,7 +880,7 @@ class MHATokenToKVPool(KVCache):
                 if self.enable_custom_mem_pool
                 else nullcontext()
             ):
-                if self._use_asm_attention:
+                if self._use_aiter_shuffle_attn:
                     asm_dtype = self.dtype
                     elem_size = torch.tensor([], dtype=asm_dtype).element_size()
                     raw_num_pages = (self.size + self.page_size) // self.page_size + 1
@@ -1067,7 +1067,7 @@ class MHATokenToKVPool(KVCache):
 
     def _get_key_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype and not getattr(
-            self, "_use_asm_attention", False
+            self, "_use_aiter_shuffle_attn", False
         ):
             return self.k_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.k_buffer[layer_id - self.start_layer]
@@ -1079,7 +1079,7 @@ class MHATokenToKVPool(KVCache):
 
     def _get_value_buffer(self, layer_id: int):
         if self.store_dtype != self.dtype and not getattr(
-            self, "_use_asm_attention", False
+            self, "_use_aiter_shuffle_attn", False
         ):
             return self.v_buffer[layer_id - self.start_layer].view(self.dtype)
         return self.v_buffer[layer_id - self.start_layer]

@@ -60,7 +60,7 @@ from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
-_use_asm_attention = get_bool_env_var("SGLANG_USE_ASM_ATTENTION")
+_use_aiter_shuffle_attn = get_bool_env_var("SGLANG_USE_AITER_SHUFFLE_ATTN")
 
 # Use aiter mla persist design for fp8-kv cache
 _use_mla_ps_kernel = get_bool_env_var("SGLANG_AITER_MLA_PERSIST", "True")
@@ -237,7 +237,7 @@ class AiterAttnBackend(AttentionBackend):
 
         self.forward_metadata: ForwardMetadata = None
 
-        if _use_asm_attention and not self.use_mla:
+        if _use_aiter_shuffle_attn and not self.use_mla:
             max_kv_pages = (self.max_context_len + self.page_size - 1) // self.page_size
             self._asm_block_tables_buf = torch.zeros(
                 (max_bs, max_kv_pages), dtype=torch.int32, device=self.device
@@ -711,26 +711,17 @@ class AiterAttnBackend(AttentionBackend):
                         self.req_to_token.stride(0),
                     )
 
-                    if _use_asm_attention and not self.use_mla:
+                    if _use_aiter_shuffle_attn and not self.use_mla:
                         page_size = self.page_size
                         max_kv_pages = (max_kv_len + page_size - 1) // page_size
                         bt_buf = self._asm_block_tables_buf
-                        bt_buf[:bs, :max_kv_pages].zero_()
-                        tmp_2d = torch.zeros(
-                            bs, max_kv_len, dtype=torch.int32, device=self.device
-                        )
-                        create_flashmla_kv_indices_triton[(bs,)](
-                            self.req_to_token,
-                            forward_batch.req_pool_indices,
-                            forward_batch.seq_lens,
-                            None,
-                            tmp_2d,
-                            self.req_to_token.stride(0),
-                            max_kv_len,
-                            1,
-                        )
-                        transformed = self._transform_table_1_to_real(tmp_2d)
-                        bt_buf[:bs, :max_kv_pages].copy_(transformed[:, :max_kv_pages])
+                        bt_buf.zero_()
+                        pi_asm = self.req_to_token[
+                            forward_batch.req_pool_indices[:bs], :max_kv_len
+                        ]
+                        tr_asm = self._transform_table_1_to_real(pi_asm)
+                        n_cols = min(tr_asm.shape[1], max_kv_pages, bt_buf.shape[1])
+                        bt_buf[:bs, :n_cols].copy_(tr_asm[:, :n_cols])
                         asm_block_tables = bt_buf
                 else:
                     max_q_len = 1
@@ -822,7 +813,9 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
                 run_graph=False,
                 swa_page_table=swa_page_table,
-                asm_block_tables=(asm_block_tables if _use_asm_attention else None),
+                asm_block_tables=(
+                    asm_block_tables if _use_aiter_shuffle_attn else None
+                ),
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -1351,14 +1344,16 @@ class AiterAttnBackend(AttentionBackend):
                         self.req_to_token.stride(0),
                     )
 
-                    if _use_asm_attention and not self.use_mla:
+                    if _use_aiter_shuffle_attn and not self.use_mla:
                         page_size_c = self.page_size
                         max_kv_pages_c = (max_kv_len + page_size_c - 1) // page_size_c
                         self._asm_block_tables_buf.zero_()
                         pi_c = self.req_to_token[req_pool_indices[:bs], :max_kv_len]
                         tr_c = self._transform_table_1_to_real(pi_c)
                         cols_c = min(
-                            max_kv_pages_c, self._asm_block_tables_buf.shape[1]
+                            tr_c.shape[1],
+                            max_kv_pages_c,
+                            self._asm_block_tables_buf.shape[1],
                         )
                         self._asm_block_tables_buf[:bs, :cols_c].copy_(tr_c[:, :cols_c])
                 else:
@@ -1744,14 +1739,14 @@ class AiterAttnBackend(AttentionBackend):
                         self.req_to_token.stride(0),
                     )
 
-                    if _use_asm_attention and not self.use_mla:
+                    if _use_aiter_shuffle_attn and not self.use_mla:
                         page_size = self.page_size
                         max_kv_pages = (max_kv_len + page_size - 1) // page_size
                         bt_buf = self._asm_block_tables_buf
                         bt_buf.zero_()
                         pi_asm = self.req_to_token[req_pool_indices[:bs], :max_kv_len]
                         tr_asm = self._transform_table_1_to_real(pi_asm)
-                        cols = min(max_kv_pages, bt_buf.shape[1])
+                        cols = min(tr_asm.shape[1], max_kv_pages, bt_buf.shape[1])
                         bt_buf[:bs, :cols].copy_(tr_asm[:, :cols])
                 else:
                     max_q_len = 1
@@ -2155,7 +2150,7 @@ class AiterAttnBackend(AttentionBackend):
                     )
                 elif self.use_mla:
                     forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
-                elif _use_asm_attention and hasattr(
+                elif _use_aiter_shuffle_attn and hasattr(
                     forward_batch.token_to_kv_pool, "set_kv_buffer_asm"
                 ):
                     forward_batch.token_to_kv_pool.set_kv_buffer_asm(
@@ -2449,7 +2444,7 @@ class AiterAttnBackend(AttentionBackend):
             bs0 = forward_batch.batch_size + 1
 
             if (
-                _use_asm_attention
+                _use_aiter_shuffle_attn
                 and k is not None
                 and self.forward_metadata.max_q_len == self.forward_metadata.max_kv_len
             ):
@@ -2574,7 +2569,7 @@ class AiterAttnBackend(AttentionBackend):
                     ),
                     forward_batch.out_cache_loc,
                 )
-            elif _use_asm_attention and hasattr(
+            elif _use_aiter_shuffle_attn and hasattr(
                 forward_batch.token_to_kv_pool, "set_kv_buffer_asm"
             ):
                 forward_batch.token_to_kv_pool.set_kv_buffer_asm(
@@ -2668,7 +2663,7 @@ class AiterAttnBackend(AttentionBackend):
                     v_descale=v_descale,
                     sinks=sinks,
                 )
-            elif _use_asm_attention and hasattr(self, "_asm_block_tables_buf"):
+            elif _use_aiter_shuffle_attn and hasattr(self, "_asm_block_tables_buf"):
                 block_tables = self._asm_block_tables_buf
                 max_qlen = self.forward_metadata.max_q_len or 1
                 k_scale_asm, v_scale_asm = (
