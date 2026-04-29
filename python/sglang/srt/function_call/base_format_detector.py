@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Literal, Union
 import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
-from xgrammar import StructuralTag, get_model_structural_tag
+from xgrammar import StructuralTag
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
@@ -367,61 +367,17 @@ class BaseFormatDetector(ABC):
         """Return True if this detector supports builtin structural tag format."""
         return False
 
-    def get_model_structural_tag_id(self) -> str:
-        """
-        Return the model ID for the builtin structural tag.
-        """
-        raise NotImplementedError()
-
-    def empty_thinking_as_non_thinking(self) -> bool:
-        """
-        It decides how to handle non-thinking mode. If True, non-thinking mode will force the
-        LLM output an empty thinking. If False, thinking tags like <think> or </think> are not
-        allowed and will not be output by the LLM.
-        """
-        return True
-
-    def get_xgrammar_model_structural_tag(
+    def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,
-        thinking_mode: bool = True,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = True,
     ) -> StructuralTag:
         """
         Return a XGrammar's model structural tag for the given tools and thinking mode.
         """
 
-        model_id = self.get_model_structural_tag_id()
-        empty_thinking_as_non_thinking = self.empty_thinking_as_non_thinking()
-        tool_choice_type = (
-            tool_choice.model_dump()
-            if isinstance(tool_choice, ToolChoice)
-            else tool_choice
+        raise NotImplementedError(
+            "Detectors with supports_model_structural_tag() == True must "
+            "override get_xgrammar_model_structural_tag()."
         )
-        tool_dicts = []
-
-        if isinstance(tool_choice, ToolChoice):
-            # Handle forced tool choice.
-            for tool in tools:
-                if tool.function.name == tool_choice.function.name:
-                    tool_dicts.append(tool.model_dump())
-        else:
-            for tool in tools:
-                tool_dicts.append(tool.model_dump())
-
-        if thinking_mode:
-            return get_model_structural_tag(
-                model=model_id,
-                tools=tool_dicts,
-                tool_choice=tool_choice_type,
-                reasoning=True,
-                force_empty_reasoning=False,
-            )
-        else:
-            return get_model_structural_tag(
-                model=model_id,
-                tools=tool_dicts,
-                tool_choice=tool_choice_type,
-                reasoning=not empty_thinking_as_non_thinking,
-                force_empty_reasoning=empty_thinking_as_non_thinking,
-            )

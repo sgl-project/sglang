@@ -1,10 +1,12 @@
 import json
 import logging
 import re
+from typing import List, Literal, Union
 
 from partial_json_parser.core.options import Allow
+from xgrammar import StructuralTag, get_model_structural_tag
 
-from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -355,5 +357,21 @@ class DeepSeekV32Detector(BaseFormatDetector):
     def supports_model_structural_tag(self) -> bool:
         return True
 
-    def get_model_structural_tag_id(self) -> str:
-        return "deepseek_v3_2"
+    def get_structural_tag(
+        self,
+        tools: Union[List[Tool], None] = None,
+        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
+        thinking_mode: bool = True,
+    ) -> StructuralTag:
+        converted_tools = [tool.model_dump() for tool in tools]
+        converted_tool_choice = (
+            tool_choice.model_dump()
+            if isinstance(tool_choice, ToolChoice)
+            else tool_choice
+        )
+        return get_model_structural_tag(
+            model="deepseek_v3_2",
+            tools=converted_tools,
+            tool_choice=converted_tool_choice,
+            reasoning=thinking_mode,
+        )

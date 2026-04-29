@@ -221,21 +221,28 @@ class FunctionCallParser:
             A tuple of (constraint_type, constraint_value) to be added to sampling parameters,
             or None if no constraint applies.
         """
+        is_required = tool_choice == "required" or isinstance(tool_choice, ToolChoice)
+        should_constrain_auto = tool_choice == "auto" and (
+            any(tool.function.strict for tool in self.tools)
+            or self.tool_strict_level >= ToolStrictLevel.FUNCTION
+        )
+
+        # Highest priority: detectors that implement model-native structural tag.
+        if self.detector.supports_model_structural_tag():
+            if is_required or should_constrain_auto:
+                structural_tag = self.detector.get_structural_tag(
+                    tools=self.tools,
+                    thinking_mode=thinking_mode,
+                    tool_choice=tool_choice,
+                )
+                return ("structural_tag", structural_tag)
+
         if self.detector.supports_structural_tag():
             # For "required"/named: always use structural_tag to preserve the
             # model's native tool call format. Schema is only included when
             # strict=True, per OpenAI protocol semantics.
             # For "auto": only constrain when strict is enabled.
-            is_required = tool_choice == "required" or isinstance(
-                tool_choice, ToolChoice
-            )
-            if is_required or (
-                tool_choice == "auto"
-                and (
-                    any(tool.function.strict for tool in self.tools)
-                    or self.tool_strict_level >= ToolStrictLevel.FUNCTION
-                )
-            ):
+            if is_required or should_constrain_auto:
                 tag = self.get_structure_tag(at_least_one=is_required)
                 return ("structural_tag", tag)
         elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
@@ -243,20 +250,3 @@ class FunctionCallParser:
                 self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
             )
             return ("json_schema", json_schema)
-        elif self.detector.supports_model_structural_tag():
-            is_required = tool_choice == "required" or isinstance(
-                tool_choice, ToolChoice
-            )
-            if is_required or (
-                tool_choice == "auto"
-                and (
-                    any(tool.function.strict for tool in self.tools)
-                    or self.tool_strict_level >= ToolStrictLevel.FUNCTION
-                )
-            ):
-                structural_tag = self.detector.get_xgrammar_model_structural_tag(
-                    tools=self.tools,
-                    thinking_mode=thinking_mode,
-                    tool_choice=tool_choice,
-                )
-                return ("structural_tag", structural_tag)
