@@ -105,12 +105,6 @@ class FrozenKVMTPWorker(TpModelWorker):
             "_resolve_speculative_algorithm_alias."
         )
 
-        if self.topk != 1:
-            raise ValueError(
-                "Frozen-KV MTP currently only supports speculative_eagle_topk=1 "
-                f"(got {self.topk}); tree fan-out is not yet implemented."
-            )
-
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
         backup_disable_cuda_graph = server_args.disable_cuda_graph
@@ -164,7 +158,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
 
-        self.draft_attn_backend = self.draft_model_runner.attn_backend
+        self.draft_attn_backend = self._init_draft_attn_backend()
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
         self.cuda_graph_runner = None
 
@@ -178,10 +172,32 @@ class FrozenKVMTPWorker(TpModelWorker):
         return self.model_runner
 
     def get_attn_backend(self):  # pragma: no cover - exposed for adaptive
-        return self.draft_model_runner.attn_backend
+        return self.draft_attn_backend
 
     def clear_cache_pool(self):
         pass
+
+    def _init_draft_attn_backend(self):
+        if self.topk == 1:
+            return self.draft_model_runner.attn_backend
+
+        if type(self.draft_model_runner.attn_backend).__name__ != "TritonAttnBackend":
+            raise ValueError(
+                "Frozen-KV MTP topk > 1 currently requires the triton attention "
+                f"backend, got {type(self.draft_model_runner.attn_backend).__name__}."
+            )
+
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+        max_bs = self.req_to_token_pool.size * self.topk
+        kv_indptr_buf = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=self.draft_model_runner.device
+        )
+        return TritonAttnBackend(
+            self.draft_model_runner,
+            skip_prefill=True,
+            kv_indptr_buf=kv_indptr_buf,
+        )
 
     def _bind_kv_context(self) -> None:
         try:
@@ -246,6 +262,51 @@ class FrozenKVMTPWorker(TpModelWorker):
             else:
                 forward_batch.positions = positions
 
+    def _expand_for_topk_draft(self, forward_batch: ForwardBatch) -> None:
+        """Repeat committed-prefix metadata for the active ``B * topk`` frontier.
+
+        The tree helper keeps exactly ``topk`` live branches per request after
+        the first expansion. Each branch probes the same frozen target prefix as
+        its parent request, so attention metadata must be built over repeated
+        request ids and sequence lengths rather than speculative KV slots.
+        """
+        if self.topk == 1 or forward_batch.batch_size == 0:
+            return
+
+        if forward_batch.batch_size != forward_batch.seq_lens.shape[0]:
+            raise RuntimeError(
+                "Frozen-KV MTP topk expansion expects an unexpanded forward "
+                "batch where batch_size == len(seq_lens)."
+            )
+
+        forward_batch.batch_size *= self.topk
+        forward_batch.req_pool_indices = (
+            forward_batch.req_pool_indices.repeat_interleave(self.topk, dim=0)
+        )
+        forward_batch.seq_lens = forward_batch.seq_lens.repeat_interleave(
+            self.topk, dim=0
+        )
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu.repeat_interleave(
+                self.topk, dim=0
+            )
+            forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
+        else:
+            forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
+
+        positions = torch.clamp(forward_batch.seq_lens - 1, min=0).to(torch.int64)
+        forward_batch.positions = positions
+        forward_batch.num_token_non_padded_cpu = positions.numel()
+        if forward_batch.num_token_non_padded is not None:
+            forward_batch.num_token_non_padded.fill_(positions.numel())
+        if (
+            forward_batch.mrope_positions is not None
+            and forward_batch.mrope_positions.shape[-1] * self.topk == positions.numel()
+        ):
+            forward_batch.mrope_positions = (
+                forward_batch.mrope_positions.repeat_interleave(self.topk, dim=-1)
+            )
+
     def _position_for_batch(self, batch: ScheduleBatch) -> torch.Tensor:
         return torch.clamp(batch.seq_lens - 1, min=0).to(torch.int64)
 
@@ -302,6 +363,13 @@ class FrozenKVMTPWorker(TpModelWorker):
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:
+            return
+        if self.topk != 1:
+            logger.info(
+                "Frozen-KV MTP draft CUDA graph currently supports topk=1 only; "
+                "running topk=%s draft loop eagerly.",
+                self.topk,
+            )
             return
         if self.target_worker.device != "cuda":
             logger.info(
@@ -586,6 +654,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             model_worker_batch, self.draft_model_runner
         )
         self._set_positions(forward_batch)
+        self._expand_for_topk_draft(forward_batch)
 
         can_run_cuda_graph = self.cuda_graph_runner and self.cuda_graph_runner.can_run(
             forward_batch
