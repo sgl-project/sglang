@@ -158,6 +158,10 @@ class TestUGSRTSchedulerExecutorLive(CustomTestCase):
             self.assertEqual(counters["decode_count"], 1)
             self.assertEqual(counters["srt_request_count"], 2)
             self.assertEqual(counters["srt_executed_request_count"], 2)
+            self.assertEqual(
+                counters["srt_model_runner_forward_request_ids"],
+                ["ug-live-scheduler-prefill:u1"],
+            )
             self.assertEqual(counters["srt_u_decode_request_count"], 1)
             self.assertEqual(
                 counters["srt_last_u_decode_request_id"],
