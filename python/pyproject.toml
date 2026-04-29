@@ -79,6 +79,7 @@ dependencies = [
   "xgrammar==0.1.32",
   "smg-grpc-servicer>=0.5.0",
   "kernels",
+  "grpcio>=1.71.2",
 ]
 
 [[tool.uv.index]]
