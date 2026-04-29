@@ -19,6 +19,14 @@ from sglang.srt.ug.bagel import (
     MockBAGELBackend,
     create_bagel_ug_model_adapter,
 )
+from sglang.srt.ug.bagel_cache import (
+    BAGELPagedKVCacheBacking,
+    BAGELSRTKVCache,
+    BAGELSRTKVCacheError,
+    BAGELSRTKVCacheFactory,
+    BAGELSRTKVCacheHandle,
+    InMemoryBAGELSRTKVCacheBacking,
+)
 from sglang.srt.ug.context import (
     UGContextBundle,
     UGContextHandle,
@@ -52,10 +60,16 @@ __all__ = [
     "BAGELDenoiseStepError",
     "BAGELDenoiseStepRunner",
     "BAGELInterleaveContextBackend",
+    "BAGELPagedKVCacheBacking",
     "BAGELPreparedDenoise",
+    "BAGELSRTKVCache",
+    "BAGELSRTKVCacheError",
+    "BAGELSRTKVCacheFactory",
+    "BAGELSRTKVCacheHandle",
     "BAGELSessionContext",
     "BAGELUForwardBridge",
     "BAGELUGModelAdapter",
+    "InMemoryBAGELSRTKVCacheBacking",
     "MockBAGELBackend",
     "SRTBackedUGDenoiserBridge",
     "UGContextBundle",

@@ -18,6 +18,7 @@ from sglang.srt.ug.adapter import (
     UGModelAppendImageResult,
     UGModelPrefillResult,
 )
+from sglang.srt.ug.bagel_cache import BAGELSRTKVCacheFactory
 from sglang.srt.ug.context import UGSRTRequestView
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
@@ -290,11 +291,13 @@ class BAGELInterleaveContextBackend:
         *,
         step_runner: BAGELDenoiseStepRunner | None = None,
         u_forward_bridge: BAGELUForwardBridge | None = None,
+        srt_kv_cache_factory: BAGELSRTKVCacheFactory | None = None,
         default_image_shape: tuple[int, int] = (1024, 1024),
     ) -> None:
         self.inferencer = inferencer
         self.step_runner = step_runner or BAGELDenoiseStepRunner()
         self.u_forward_bridge = u_forward_bridge or BAGELUForwardBridge()
+        self.srt_kv_cache_factory = srt_kv_cache_factory
         self.default_image_shape = default_image_shape
         self.sessions: dict[str, BAGELSessionContext] = {}
 
@@ -329,7 +332,11 @@ class BAGELInterleaveContextBackend:
         for message in messages:
             if message.type == "text":
                 text = str(message.content)
-                state.cfg_text_context = _clone_context(state.gen_context)
+                state.cfg_text_context = self._clone_context(
+                    state.gen_context,
+                    session_id=session.handle.session_id,
+                    role="cfg_text",
+                )
                 with _bagel_autocast(self.inferencer.model):
                     state.gen_context = self.inferencer.update_context_text(
                         text,
@@ -350,7 +357,11 @@ class BAGELInterleaveContextBackend:
                         vit=True,
                     )
                 state.image_shape = self._image_shape(image)
-                state.cfg_text_context = _clone_context(state.gen_context)
+                state.cfg_text_context = self._clone_context(
+                    state.gen_context,
+                    session_id=session.handle.session_id,
+                    role="cfg_text",
+                )
                 added_tokens += 2
             else:
                 raise ValueError(f"Unsupported BAGEL message type: {message.type}")
@@ -459,7 +470,11 @@ class BAGELInterleaveContextBackend:
                 vit=True,
             )
         state.image_shape = self._image_shape(image)
-        state.cfg_text_context = _clone_context(state.gen_context)
+        state.cfg_text_context = self._clone_context(
+            state.gen_context,
+            session_id=session.handle.session_id,
+            role="cfg_text",
+        )
         state.append_image_count += 1
         state.prepared_denoise = None
         return UGModelAppendImageResult(added_tokens=2)
@@ -505,20 +520,63 @@ class BAGELInterleaveContextBackend:
 
     def close_session(self, *, session_id: str) -> None:
         self.sessions.pop(session_id, None)
+        if self.srt_kv_cache_factory is not None:
+            self.srt_kv_cache_factory.release_session(session_id)
 
     def _state_for(self, session_id: str) -> BAGELSessionContext:
         state = self.sessions.get(session_id)
         if state is not None:
             return state
-        gen_context = self.inferencer.init_gen_context()
+        gen_context = self._init_context(session_id=session_id, role="full")
         state = BAGELSessionContext(
             gen_context=gen_context,
-            cfg_text_context=_clone_context(gen_context),
-            cfg_img_context=_clone_context(gen_context),
+            cfg_text_context=self._clone_context(
+                gen_context,
+                session_id=session_id,
+                role="cfg_text",
+            ),
+            cfg_img_context=self._clone_context(
+                gen_context,
+                session_id=session_id,
+                role="cfg_img",
+            ),
             image_shape=self.default_image_shape,
         )
         self.sessions[session_id] = state
         return state
+
+    def _init_context(self, *, session_id: str, role: str) -> dict[str, Any]:
+        context = self.inferencer.init_gen_context()
+        if self.srt_kv_cache_factory is None:
+            return context
+        context = dict(context)
+        context["past_key_values"] = self.srt_kv_cache_factory.create_cache(
+            session_id=session_id,
+            role=role,
+            template_cache=context["past_key_values"],
+        )
+        return context
+
+    def _clone_context(
+        self,
+        context: dict[str, Any],
+        *,
+        session_id: str,
+        role: str,
+    ) -> dict[str, Any]:
+        if self.srt_kv_cache_factory is None:
+            return _clone_context(context)
+        cloned = {
+            key: deepcopy(value)
+            for key, value in context.items()
+            if key != "past_key_values"
+        }
+        cloned["past_key_values"] = self.srt_kv_cache_factory.clone_cache(
+            context["past_key_values"],
+            session_id=session_id,
+            role=role,
+        )
+        return cloned
 
     def _prepare_denoise(
         self,

@@ -2,6 +2,7 @@
 
 import tempfile
 import unittest
+from dataclasses import fields
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -22,6 +23,12 @@ from sglang.srt.ug.bagel import (
     _build_official_bagel_inferencer,
     _ensure_bagel_transformers_compat,
     create_bagel_ug_model_adapter,
+)
+from sglang.srt.ug.bagel_cache import (
+    BAGELPagedKVCacheBacking,
+    BAGELSRTKVCache,
+    BAGELSRTKVCacheFactory,
+    InMemoryBAGELSRTKVCacheBacking,
 )
 from sglang.srt.ug.context import UGSessionHandle
 from sglang.srt.ug.runtime import (
@@ -272,6 +279,116 @@ class FakeBAGELInferencer:
             }
         )
         return FakeImage(size=(image_shape[1], image_shape[0]))
+
+
+class FakeNaiveBAGELCache:
+    def __init__(self, num_layers):
+        self.key_cache = {layer_id: None for layer_id in range(num_layers)}
+        self.value_cache = {layer_id: None for layer_id in range(num_layers)}
+
+    @property
+    def num_layers(self):
+        return len(self.key_cache)
+
+    @property
+    def seq_lens(self):
+        key = self.key_cache[0]
+        return 0 if key is None else key.shape[0]
+
+
+class FakeSRTCacheBAGELInferencer:
+    def __init__(self):
+        self.model = FakeContextBAGELModel()
+        self.new_token_ids = {"start_of_image": 1, "end_of_image": 2}
+        self.vae_transform = FakeBAGELImageTransform()
+        self.events = []
+
+    def init_gen_context(self):
+        self.events.append(("init",))
+        return {
+            "kv_lens": [0],
+            "ropes": [0],
+            "past_key_values": FakeNaiveBAGELCache(num_layers=2),
+        }
+
+    def update_context_text(self, text, gen_context):
+        token_count = len(text.split())
+        self.events.append(("text", text, gen_context["past_key_values"].seq_lens))
+        return self._append_cache_tokens(gen_context, token_count=token_count)
+
+    def update_context_image(self, image, gen_context, vae=True, vit=True):
+        del image, vae, vit
+        self.events.append(("image", gen_context["past_key_values"].seq_lens))
+        return self._append_cache_tokens(gen_context, token_count=2)
+
+    def gen_text(self, gen_context, **kwargs):
+        del kwargs
+        return f"srt_cache_text_{gen_context['past_key_values'].seq_lens}"
+
+    def decode_image(self, latent, image_shape):
+        del latent
+        return FakeImage(size=(image_shape[1], image_shape[0]))
+
+    @staticmethod
+    def _append_cache_tokens(gen_context, *, token_count):
+        cache = gen_context["past_key_values"]
+        old_len = cache.seq_lens
+        new_len = old_len + token_count
+        for layer_id in range(cache.num_layers):
+            key = torch.full(
+                (new_len, 1, 2),
+                float(layer_id + 1),
+                dtype=torch.float32,
+            )
+            value = torch.full(
+                (new_len, 1, 2),
+                float(layer_id + 101),
+                dtype=torch.float32,
+            )
+            old_key = cache.key_cache[layer_id]
+            old_value = cache.value_cache[layer_id]
+            if old_key is not None:
+                key[:old_len] = old_key
+            if old_value is not None:
+                value[:old_len] = old_value
+            cache.key_cache[layer_id] = key
+            cache.value_cache[layer_id] = value
+        gen_context["kv_lens"] = [new_len]
+        gen_context["ropes"] = [gen_context["ropes"][0] + 1]
+        return gen_context
+
+
+class FakePagedKVPool:
+    def __init__(self, *, size=32, num_layers=2):
+        self.key_buffers = [torch.zeros(size, 1, 2) for _ in range(num_layers)]
+        self.value_buffers = [torch.zeros(size, 1, 2) for _ in range(num_layers)]
+
+    def get_key_buffer(self, layer_id):
+        return self.key_buffers[layer_id]
+
+    def get_value_buffer(self, layer_id):
+        return self.value_buffers[layer_id]
+
+
+class FakePagedAllocator:
+    def __init__(self, *, page_size=4):
+        self.page_size = page_size
+        self.kv_cache = FakePagedKVPool()
+        self.next_index = 0
+        self.alloc_sizes = []
+        self.freed = []
+
+    def get_kvcache(self):
+        return self.kv_cache
+
+    def alloc(self, need_size):
+        self.alloc_sizes.append(need_size)
+        start = self.next_index
+        self.next_index += need_size
+        return torch.arange(start, start + need_size, dtype=torch.long)
+
+    def free(self, indices):
+        self.freed.append(indices.clone())
 
 
 def _write_required_checkpoint_files(checkpoint_dir: Path) -> None:
@@ -574,6 +691,114 @@ class TestBAGELRealLoader(unittest.TestCase):
                 )
 
 
+class TestBAGELSRTKVCacheAdapter(unittest.TestCase):
+    def test_in_memory_cache_matches_naive_cache_shape_without_kv_slots(self):
+        backing = InMemoryBAGELSRTKVCacheBacking()
+        factory = BAGELSRTKVCacheFactory(backing)
+        cache = factory.create_cache(
+            session_id="srt-cache-session",
+            role="full",
+            template_cache=FakeNaiveBAGELCache(num_layers=2),
+        )
+
+        key = torch.arange(6, dtype=torch.float32).reshape(3, 1, 2)
+        value = key + 100
+        cache.key_cache[0] = key
+        cache.value_cache[0] = value
+
+        self.assertEqual(cache.num_layers, 2)
+        self.assertEqual(cache.seq_lens, 3)
+        self.assertTrue(torch.equal(cache.key_cache[0], key))
+        self.assertTrue(torch.equal(cache.value_cache[0], value))
+        self.assertIsNone(cache.key_cache[1])
+
+        cloned = factory.clone_cache(
+            cache,
+            session_id="srt-cache-session",
+            role="cfg_text",
+        )
+        cache.key_cache[0] = torch.zeros_like(key)
+
+        self.assertEqual(cloned.handle.role, "cfg_text")
+        self.assertTrue(torch.equal(cloned.key_cache[0], key))
+        handle_fields = {field.name for field in fields(cache.handle)}
+        self.assertTrue(
+            handle_fields.isdisjoint({"kv_slot", "slot", "page", "allocator"})
+        )
+
+        factory.release_session("srt-cache-session")
+        self.assertEqual(backing.released_sessions, ["srt-cache-session"])
+
+    def test_paged_backing_uses_srt_allocator_pages_for_bagel_cache_tensors(self):
+        allocator = FakePagedAllocator(page_size=4)
+        backing = BAGELPagedKVCacheBacking(allocator)
+        factory = BAGELSRTKVCacheFactory(backing)
+        cache = factory.create_cache(
+            session_id="paged-cache-session",
+            role="full",
+            template_cache=FakeNaiveBAGELCache(num_layers=2),
+        )
+
+        key = torch.arange(6, dtype=torch.float32).reshape(3, 1, 2)
+        value = key + 10
+        cache.key_cache[0] = key
+        cache.value_cache[0] = value
+
+        self.assertEqual(allocator.alloc_sizes, [4])
+        self.assertTrue(torch.equal(cache.key_cache[0], key))
+        self.assertTrue(torch.equal(cache.value_cache[0], value))
+
+        bigger_key = torch.arange(10, dtype=torch.float32).reshape(5, 1, 2)
+        bigger_value = bigger_key + 20
+        cache.key_cache[0] = bigger_key
+        cache.value_cache[0] = bigger_value
+
+        self.assertEqual(allocator.alloc_sizes, [4, 8])
+        self.assertEqual(len(allocator.freed), 1)
+        self.assertEqual(tuple(allocator.freed[0].shape), (4,))
+        self.assertTrue(torch.equal(cache.key_cache[0], bigger_key))
+        self.assertTrue(torch.equal(cache.value_cache[0], bigger_value))
+
+        factory.release_session("paged-cache-session")
+        self.assertEqual(len(allocator.freed), 2)
+        self.assertEqual(tuple(allocator.freed[-1].shape), (8,))
+
+    def test_context_backend_can_replace_bagel_naive_cache_with_srt_cache(self):
+        backing = InMemoryBAGELSRTKVCacheBacking()
+        backend = BAGELInterleaveContextBackend(
+            FakeSRTCacheBAGELInferencer(),
+            srt_kv_cache_factory=BAGELSRTKVCacheFactory(backing),
+            default_image_shape=(32, 32),
+        )
+        adapter = BAGELUGModelAdapter("already-loaded-bagel", backend=backend)
+        runtime = UGSessionRuntime(model_runner=UGModelRunnerAdapter(adapter))
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw a red kite")],
+            session_id="bagel-srt-kv-cache",
+        )
+        state = backend.sessions["bagel-srt-kv-cache"]
+        gen_cache = state.gen_context["past_key_values"]
+        cfg_cache = state.cfg_text_context["past_key_values"]
+
+        self.assertIsInstance(gen_cache, BAGELSRTKVCache)
+        self.assertIsInstance(cfg_cache, BAGELSRTKVCache)
+        self.assertEqual(gen_cache.handle.role, "full")
+        self.assertEqual(cfg_cache.handle.role, "cfg_text")
+        self.assertNotEqual(gen_cache.handle.cache_id, cfg_cache.handle.cache_id)
+        self.assertEqual(gen_cache.seq_lens, 4)
+        self.assertEqual(cfg_cache.seq_lens, 0)
+        self.assertTrue(
+            torch.equal(
+                gen_cache.key_cache[1],
+                torch.full((4, 1, 2), 2.0),
+            )
+        )
+
+        runtime.close_session(handle)
+        self.assertEqual(backing.released_sessions, ["bagel-srt-kv-cache"])
+
+
 class TestBAGELInterleaveContextBackend(unittest.TestCase):
     def test_context_backend_consumes_prefill_and_append_from_srt_forward_view(self):
         inferencer = FakeBAGELInferencer()
@@ -597,7 +822,9 @@ class TestBAGELInterleaveContextBackend(unittest.TestCase):
             state.srt_u_forward_events,
             [("u_prefill", "bagel-srt-u-forward:u1")],
         )
-        self.assertEqual(len([event for event in inferencer.events if event[0] == "text"]), 2)
+        self.assertEqual(
+            len([event for event in inferencer.events if event[0] == "text"]), 2
+        )
         self.assertEqual(state.srt_u_forward_results, {})
 
         runtime.decode_next_segment(handle)
