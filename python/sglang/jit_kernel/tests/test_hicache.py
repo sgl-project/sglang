@@ -31,6 +31,7 @@ POOL_SIZE = PAGE_SIZE * 8
 MHA_ELEMENT_DIMS = [128, 256, 512, 1024]
 MLA_ELEMENT_DIMS = [576]
 LAYOUTS = ["layer_first", "page_first"]
+STAGED_WRITE_BACK_PAGE_COUNT = 67
 
 
 def _token_indices_for_pages(
@@ -231,6 +232,131 @@ def _run_transfer_roundtrip_mla(layout: str, element_dim: int) -> None:
             )
 
 
+def _run_page_first_staged_write_back_mha(layout: str, element_dim: int) -> None:
+    pool_size = PAGE_SIZE * (STAGED_WRITE_BACK_PAGE_COUNT + 8)
+    device_pool = MHATokenToKVPool(
+        size=pool_size,
+        page_size=PAGE_SIZE,
+        head_num=element_dim // 128,
+        head_dim=128,
+        dtype=torch.bfloat16,
+        layer_num=NUM_LAYERS,
+        device=DEVICE,
+        enable_memory_saver=False,
+    )
+    host_pool = _pinned_host_pool(
+        MHATokenToKVPoolHost,
+        device_pool=device_pool,
+        layout=layout,
+    )
+    assert host_pool.can_use_jit
+    assert 0 < host_pool.staging_page_capacity < STAGED_WRITE_BACK_PAGE_COUNT
+
+    for layer_id in range(NUM_LAYERS):
+        _copy_tensor_with_offset(device_pool.k_buffer[layer_id], layer_id)
+        _copy_tensor_with_offset(device_pool.v_buffer[layer_id], layer_id + 100)
+
+    device_pages = torch.arange(
+        2,
+        2 + STAGED_WRITE_BACK_PAGE_COUNT,
+        device=DEVICE,
+        dtype=torch.int64,
+    )
+    host_pages = torch.arange(
+        STAGED_WRITE_BACK_PAGE_COUNT,
+        0,
+        -1,
+        device=DEVICE,
+        dtype=torch.int64,
+    )
+    device_indices = _token_indices_for_pages(device_pages)
+    host_indices = _token_indices_for_pages(host_pages)
+
+    host_pool.backup_from_device_all_layer(
+        device_pool, host_indices, device_indices, "kernel"
+    )
+    torch.cuda.synchronize()
+
+    for layer_id in range(NUM_LAYERS):
+        for host_page, device_page in zip(host_pages.tolist(), device_pages.tolist()):
+            host_start = host_page * PAGE_SIZE
+            device_start = device_page * PAGE_SIZE
+            assert torch.equal(
+                host_pool.k_data_refs[layer_id][
+                    host_start : host_start + PAGE_SIZE
+                ].cpu(),
+                device_pool.k_buffer[layer_id][
+                    device_start : device_start + PAGE_SIZE
+                ].cpu(),
+            )
+            assert torch.equal(
+                host_pool.v_data_refs[layer_id][
+                    host_start : host_start + PAGE_SIZE
+                ].cpu(),
+                device_pool.v_buffer[layer_id][
+                    device_start : device_start + PAGE_SIZE
+                ].cpu(),
+            )
+
+
+def _run_page_first_staged_write_back_mla(layout: str, element_dim: int) -> None:
+    pool_size = PAGE_SIZE * (STAGED_WRITE_BACK_PAGE_COUNT + 8)
+    device_pool = MLATokenToKVPool(
+        size=pool_size,
+        page_size=PAGE_SIZE,
+        kv_lora_rank=element_dim - 64,
+        qk_rope_head_dim=64,
+        dtype=torch.bfloat16,
+        layer_num=NUM_LAYERS,
+        device=DEVICE,
+        enable_memory_saver=False,
+    )
+    host_pool = _pinned_host_pool(
+        MLATokenToKVPoolHost,
+        device_pool=device_pool,
+        layout=layout,
+    )
+    assert host_pool.can_use_jit
+    assert 0 < host_pool.staging_page_capacity < STAGED_WRITE_BACK_PAGE_COUNT
+
+    for layer_id in range(NUM_LAYERS):
+        _copy_tensor_with_offset(device_pool.kv_buffer[layer_id], layer_id)
+
+    device_pages = torch.arange(
+        2,
+        2 + STAGED_WRITE_BACK_PAGE_COUNT,
+        device=DEVICE,
+        dtype=torch.int64,
+    )
+    host_pages = torch.arange(
+        STAGED_WRITE_BACK_PAGE_COUNT,
+        0,
+        -1,
+        device=DEVICE,
+        dtype=torch.int64,
+    )
+    device_indices = _token_indices_for_pages(device_pages)
+    host_indices = _token_indices_for_pages(host_pages)
+
+    host_pool.backup_from_device_all_layer(
+        device_pool, host_indices, device_indices, "kernel"
+    )
+    torch.cuda.synchronize()
+
+    for layer_id in range(NUM_LAYERS):
+        for host_page, device_page in zip(host_pages.tolist(), device_pages.tolist()):
+            host_start = host_page * PAGE_SIZE
+            device_start = device_page * PAGE_SIZE
+            assert torch.equal(
+                host_pool.data_refs[layer_id][
+                    host_start : host_start + PAGE_SIZE
+                ].cpu(),
+                device_pool.kv_buffer[layer_id][
+                    device_start : device_start + PAGE_SIZE
+                ].cpu(),
+            )
+
+
 @pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize("element_dim", MHA_ELEMENT_DIMS)
 def test_hicache_transfer_mha(layout: str, element_dim: int) -> None:
@@ -241,6 +367,22 @@ def test_hicache_transfer_mha(layout: str, element_dim: int) -> None:
 @pytest.mark.parametrize("element_dim", MLA_ELEMENT_DIMS)
 def test_hicache_transfer_mla(layout: str, element_dim: int) -> None:
     _run_transfer_roundtrip_mla(layout, element_dim)
+
+
+@pytest.mark.parametrize("layout", ["page_first"])
+@pytest.mark.parametrize("element_dim", MHA_ELEMENT_DIMS)
+def test_hicache_page_first_staged_write_back_mha(
+    layout: str, element_dim: int
+) -> None:
+    _run_page_first_staged_write_back_mha(layout, element_dim)
+
+
+@pytest.mark.parametrize("layout", ["page_first"])
+@pytest.mark.parametrize("element_dim", MLA_ELEMENT_DIMS)
+def test_hicache_page_first_staged_write_back_mla(
+    layout: str, element_dim: int
+) -> None:
+    _run_page_first_staged_write_back_mla(layout, element_dim)
 
 
 if __name__ == "__main__":
