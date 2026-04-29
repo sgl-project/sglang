@@ -1177,6 +1177,22 @@ class SWARadixCache(BasePrefixCache):
                 child_key = self.get_child_key_fn(key)
 
         if len(key):
+            # Layout: |--- total_prefix_length ---|--- len(key) ---|
+            #         ^                           ^                ^
+            #         0              total_prefix_length     total_length
+            #
+            # Cases based on swa_evicted_seqlen position:
+            # 1. swa_evicted_seqlen <= total_prefix_length:
+            #    Already handled in the while loop above. All of len(key) is non-tombstone.
+            # 2. total_prefix_length < swa_evicted_seqlen < total_length:
+            #    Split: [total_prefix_length, swa_evicted_seqlen) as tombstone,
+            #           [swa_evicted_seqlen, total_length) as non-tombstone.
+            # 3. swa_evicted_seqlen == total_length:
+            #    All remaining tokens are evicted. Free value and return without
+            #    creating a node (leaf nodes must not be tombstone).
+            #    Note: the -page_size fix in _evict_swa prevents this case from
+            #    occurring in normal operation. This check is a defensive guard
+            #    against unexpected eviction states from other code paths.
             logger.debug(
                 f"Has Additional Node: len(key)={len(key)}, total_prefix_length={total_prefix_length}, swa_evicted_seqlen={swa_evicted_seqlen}, len(value)={len(value)}"
             )

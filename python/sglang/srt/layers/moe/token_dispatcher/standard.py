@@ -89,18 +89,21 @@ class StandardDispatcher(BaseDispatcher):
     def __init__(self, moe_runner_config: MoeRunnerConfig):
         super().__init__()
         self.moe_ep_size = get_moe_expert_parallel_world_size()
-        self.enable_flashinfer_cutlass_moe = (
-            get_moe_runner_backend().is_flashinfer_cutlass()
-        )
-        self.enable_flashinfer_mxfp4_moe = (
-            get_moe_runner_backend().is_flashinfer_mxfp4()
-        )
+        backend = get_moe_runner_backend()
+        self.enable_flashinfer_cutlass_moe = backend.is_flashinfer_cutlass()
+        self.enable_flashinfer_mxfp4_moe = backend.is_flashinfer_mxfp4()
+        self.enable_flashinfer_trtllm_routed_moe = backend.is_flashinfer_trtllm_routed()
+        # Skip local expert mapping when the backend handles EP with global expert IDs:
+        # - cutlass / cutedsl / trtllm_routed handle EP internally
+        # - mxfp4 opt-in via env when its dispatcher mapping is already global
         self.skip_local_expert_mapping = (
-            self.enable_flashinfer_mxfp4_moe
-            and envs.SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING.get()
-        )
-        self.enable_flashinfer_trtllm_routed_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            backend.is_flashinfer_cutlass()
+            or backend.is_flashinfer_cutedsl()
+            or backend.is_flashinfer_trtllm_routed()
+            or (
+                self.enable_flashinfer_mxfp4_moe
+                and envs.SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING.get()
+            )
         )
         self.num_experts = moe_runner_config.num_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
@@ -157,9 +160,7 @@ class StandardDispatcher(BaseDispatcher):
 
         if (
             self.moe_ep_size > 1
-            and not self.enable_flashinfer_cutlass_moe
             and not self.skip_local_expert_mapping
-            and not self.enable_flashinfer_trtllm_routed_moe
             and TopKOutputChecker.format_is_standard(topk_output)
         ):
             if self.local_expert_mapping is None:

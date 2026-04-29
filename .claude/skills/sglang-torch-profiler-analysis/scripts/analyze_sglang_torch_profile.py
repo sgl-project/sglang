@@ -1,4 +1,4 @@
-"""Unified entrypoint for SGLang torch-profiler analysis workflows."""
+"""Compact triage entrypoint for SGLang torch-profiler analysis."""
 
 from __future__ import annotations
 
@@ -8,58 +8,52 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-import analyze_sglang_llm_torch_profile as breakdown_cli
-import analyze_sglang_profiler_overlap as overlap_cli
+import triage_kernel_helpers as kernel_helpers
+import triage_overlap_helpers as overlap_helpers
 from profile_common import (
     discover_trace_targets,
     load_server_args,
     load_trace_json,
     parse_stage,
     run_profiler,
-    write_perfetto_compatible_trace,
 )
 
+MIN_RENDER_SHARE_PCT = 1.0
 
-def build_top_level_parser() -> argparse.ArgumentParser:
+
+def build_triage_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="analyze_sglang_torch_profile.py",
         description=(
-            "Unified torch-profiler entrypoint for SGLang. "
-            "Use `breakdown` for kernel/category share analysis, "
-            "`overlap` for two-trace overlap analysis, `triage` for the compact "
-            "three-table workflow, or `perfetto-fix` to rewrite a trace into a "
-            "more Perfetto-friendly form."
+            "Compact SGLang torch-profiler triage entrypoint. "
+            "This prints three tables: kernel mapping, overlap opportunities, "
+            "and fuse opportunities. "
+            "Use either a single trace/profile input or a mapping+formal two-trace pair."
         ),
     )
     parser.add_argument(
-        "command",
-        nargs="?",
-        choices=("breakdown", "overlap", "triage", "perfetto-fix"),
-        help="Subcommand to run.",
-    )
-    return parser
-
-
-def parse_perfetto_fix_args(argv: Sequence[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="analyze_sglang_torch_profile.py perfetto-fix",
-        description="Rewrite a trace so overlapping kernel lanes render more reliably in Perfetto.",
+        "--input",
+        type=str,
+        default=None,
+        help="Single trace file or profile directory to triage.",
     )
     parser.add_argument(
-        "--input", required=True, help="Input trace.json or trace.json.gz path."
+        "--url",
+        type=str,
+        default=None,
+        help="Running SGLang server URL for single-trace triage.",
     )
-    parser.add_argument("--output", default=None, help="Optional output path.")
-    return parser.parse_args(argv)
-
-
-def parse_triage_args(argv: Sequence[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="analyze_sglang_torch_profile.py triage",
-        description=(
-            "Run the compact SGLang torch-profiler triage workflow. "
-            "This prints three stage-aware tables: kernel mapping, overlap opportunities, "
-            "and fuse opportunities."
-        ),
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=None,
+        help="Trace output dir when using --url.",
+    )
+    parser.add_argument(
+        "--profile-prefix",
+        type=str,
+        default="triage-trace",
+        help="Profile prefix when generating a single trace from --url.",
     )
     parser.add_argument(
         "--mapping-input",
@@ -156,7 +150,34 @@ def parse_triage_args(argv: Sequence[str]) -> argparse.Namespace:
         default=0,
         help="How many overlap rows to print per stage. Use 0 for all kernels.",
     )
+    return parser
+
+
+def parse_triage_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = build_triage_parser()
     args = parser.parse_args(argv)
+
+    single_trace_mode = bool(args.input) or bool(args.url)
+    dual_trace_mode = any(
+        [
+            args.mapping_input,
+            args.mapping_url,
+            args.formal_input,
+            args.formal_url,
+        ]
+    )
+
+    if single_trace_mode and dual_trace_mode:
+        parser.error(
+            "Use either single-trace mode (--input/--url) or two-trace mode "
+            "(--mapping-* plus --formal-*), not both."
+        )
+
+    if single_trace_mode:
+        if bool(args.input) == bool(args.url):
+            parser.error("Provide exactly one of --input or --url.")
+        return args
+
     if bool(args.mapping_input) == bool(args.mapping_url):
         parser.error("Provide exactly one of --mapping-input or --mapping-url.")
     if bool(args.formal_input) == bool(args.formal_url):
@@ -201,26 +222,23 @@ def resolve_profile_targets(
 
 
 def build_mapping_kernel_map(trace_paths: Sequence[Path]) -> dict:
-    # The graph-off mapping trace is only used to learn stable
-    # kernel -> Python/CPU-op attribution. The final percentages still come from
-    # the formal trace.
     stage_site_stats = defaultdict(
-        lambda: defaultdict(lambda: defaultdict(breakdown_cli.MappingSiteAggregate))
+        lambda: defaultdict(lambda: defaultdict(kernel_helpers.MappingSiteAggregate))
     )
     stage_kernel_categories: Dict[str, Dict[str, str]] = defaultdict(dict)
     global_site_stats = defaultdict(
-        lambda: defaultdict(breakdown_cli.MappingSiteAggregate)
+        lambda: defaultdict(kernel_helpers.MappingSiteAggregate)
     )
     global_kernel_categories: Dict[str, str] = {}
 
     for trace_path in trace_paths:
         trace = load_trace_json(trace_path)
         kernels, cpu_ops, python_frames, launch_events, _, _ = (
-            breakdown_cli.extract_trace_data(trace)
+            kernel_helpers.extract_trace_data(trace)
         )
-        cpu_ops_by_external_id = breakdown_cli.build_cpu_op_index(cpu_ops)
-        launches_by_correlation = breakdown_cli.build_launch_index(launch_events)
-        local_site_stats = breakdown_cli.aggregate_kernel_sites(
+        cpu_ops_by_external_id = kernel_helpers.build_cpu_op_index(cpu_ops)
+        launches_by_correlation = kernel_helpers.build_launch_index(launch_events)
+        local_site_stats = kernel_helpers.aggregate_kernel_sites(
             kernels,
             cpu_ops_by_external_id,
             python_frames,
@@ -230,18 +248,18 @@ def build_mapping_kernel_map(trace_paths: Sequence[Path]) -> dict:
         kernel_categories = {
             kernel.canonical_name: kernel.category for kernel in kernels
         }
-        breakdown_cli.merge_site_stats(stage_site_stats[stage], local_site_stats)
-        breakdown_cli.merge_site_stats(global_site_stats, local_site_stats)
+        kernel_helpers.merge_site_stats(stage_site_stats[stage], local_site_stats)
+        kernel_helpers.merge_site_stats(global_site_stats, local_site_stats)
         stage_kernel_categories[stage].update(kernel_categories)
         global_kernel_categories.update(kernel_categories)
 
     stage_payloads = {
-        stage: breakdown_cli.build_stage_payload(
+        stage: kernel_helpers.build_stage_payload(
             dict(site_stats), stage_kernel_categories.get(stage, {})
         )
         for stage, site_stats in stage_site_stats.items()
     }
-    global_payload = breakdown_cli.build_stage_payload(
+    global_payload = kernel_helpers.build_stage_payload(
         dict(global_site_stats), global_kernel_categories
     )
     return {"stages": stage_payloads, "global": global_payload}
@@ -252,7 +270,7 @@ def stage_index(stage: str) -> int:
 
 
 def stage_display(stage: str) -> str:
-    return breakdown_cli.stage_label(stage)
+    return kernel_helpers.stage_label(stage)
 
 
 def pick_trace_for_stage(stage_to_trace: Dict[str, Path], stage: str) -> Optional[Path]:
@@ -282,14 +300,14 @@ def render_kernel_table(rows: Sequence[dict]) -> List[str]:
     for row in rows:
         lines.append(
             "| {stage} | {kernel} | {category} | {gpu_time} | {share:.1f}% | {launches} | {location} | {cpu_op} |".format(
-                stage=breakdown_cli.escape_md_cell(stage_display(row["stage"])),
-                kernel=breakdown_cli.escape_md_cell(row["kernel"]),
-                category=breakdown_cli.escape_md_cell(row["category"]),
-                gpu_time=breakdown_cli.format_ms(row["total_us"]),
+                stage=kernel_helpers.escape_md_cell(stage_display(row["stage"])),
+                kernel=kernel_helpers.escape_md_cell(row["kernel"]),
+                category=kernel_helpers.escape_md_cell(row["category"]),
+                gpu_time=kernel_helpers.format_ms(row["total_us"]),
                 share=row["share_pct"],
                 launches=row["launches"],
-                location=breakdown_cli.escape_md_cell(row["location"]),
-                cpu_op=breakdown_cli.escape_md_cell(row["cpu_op"]),
+                location=kernel_helpers.escape_md_cell(row["location"]),
+                cpu_op=kernel_helpers.escape_md_cell(row["cpu_op"]),
             )
         )
     return lines
@@ -300,6 +318,11 @@ def render_overlap_table(rows: Sequence[dict]) -> List[str]:
         "| Stage | Priority | Verdict | Kernel | Python scope | Formal signal | Dep risk | Recommendation |",
         "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
+    if not rows:
+        lines.append(
+            "| - | - | - | No actionable overlap rows. Use mapping/formal two-trace triage for stronger overlap conclusions. | - | - | - | - |"
+        )
+        return lines
     for row in rows:
         formal_signal = (
             f"{row['total_us']:.1f} us, share {row['share_pct']:.1f}%, "
@@ -309,13 +332,13 @@ def render_overlap_table(rows: Sequence[dict]) -> List[str]:
             "| "
             + " | ".join(
                 [
-                    breakdown_cli.escape_md_cell(stage_display(row["stage"])),
+                    kernel_helpers.escape_md_cell(stage_display(row["stage"])),
                     row["priority"],
                     row["verdict"],
-                    breakdown_cli.escape_md_cell(row["kernel"]),
-                    breakdown_cli.escape_md_cell(row["python_scope"]),
-                    breakdown_cli.escape_md_cell(formal_signal),
-                    overlap_cli.dependency_risk_label(row["dependency_signal"]),
+                    kernel_helpers.escape_md_cell(row["kernel"]),
+                    kernel_helpers.escape_md_cell(row["python_scope"]),
+                    kernel_helpers.escape_md_cell(formal_signal),
+                    overlap_helpers.dependency_risk_label(row["dependency_signal"]),
                     row["recommendation"],
                 ]
             )
@@ -337,39 +360,52 @@ def render_fuse_table(rows: Sequence[dict]) -> List[str]:
     for row in rows:
         lines.append(
             "| {stage} | {pattern} | {confidence} | {gpu_time} | {share:.1f}% | {evidence} | {current_locations} | {candidate_path} | {rationale} |".format(
-                stage=breakdown_cli.escape_md_cell(stage_display(row["stage"])),
-                pattern=breakdown_cli.escape_md_cell(row["pattern"]),
-                confidence=breakdown_cli.escape_md_cell(row["confidence"]),
-                gpu_time=breakdown_cli.format_ms(row["related_us"]),
+                stage=kernel_helpers.escape_md_cell(stage_display(row["stage"])),
+                pattern=kernel_helpers.escape_md_cell(row["pattern"]),
+                confidence=kernel_helpers.escape_md_cell(row["confidence"]),
+                gpu_time=kernel_helpers.format_ms(row["related_us"]),
                 share=row["share_pct"],
-                evidence=breakdown_cli.escape_md_cell(row["evidence"]),
-                current_locations=breakdown_cli.escape_md_cell(
+                evidence=kernel_helpers.escape_md_cell(row["evidence"]),
+                current_locations=kernel_helpers.escape_md_cell(
                     row["current_locations"]
                 ),
-                candidate_path=breakdown_cli.escape_md_cell(row["candidate_path"]),
-                rationale=breakdown_cli.escape_md_cell(row["rationale"]),
+                candidate_path=kernel_helpers.escape_md_cell(row["candidate_path"]),
+                rationale=kernel_helpers.escape_md_cell(row["rationale"]),
             )
         )
     return lines
 
 
 def run_triage(args: argparse.Namespace) -> int:
-    mapping_traces, mapping_server_args = resolve_profile_targets(
-        label="mapping",
-        input_path=args.mapping_input,
-        url=args.mapping_url,
-        output_dir=args.mapping_output_dir,
-        profile_prefix=args.mapping_profile_prefix,
-        args=args,
-    )
-    formal_traces, formal_server_args = resolve_profile_targets(
-        label="formal",
-        input_path=args.formal_input,
-        url=args.formal_url,
-        output_dir=args.formal_output_dir,
-        profile_prefix=args.formal_profile_prefix,
-        args=args,
-    )
+    single_trace_mode = bool(args.input) or bool(args.url)
+    if single_trace_mode:
+        formal_traces, formal_server_args = resolve_profile_targets(
+            label="input",
+            input_path=args.input,
+            url=args.url,
+            output_dir=args.output_dir,
+            profile_prefix=args.profile_prefix,
+            args=args,
+        )
+        mapping_traces = formal_traces
+        mapping_server_args = formal_server_args
+    else:
+        mapping_traces, mapping_server_args = resolve_profile_targets(
+            label="mapping",
+            input_path=args.mapping_input,
+            url=args.mapping_url,
+            output_dir=args.mapping_output_dir,
+            profile_prefix=args.mapping_profile_prefix,
+            args=args,
+        )
+        formal_traces, formal_server_args = resolve_profile_targets(
+            label="formal",
+            input_path=args.formal_input,
+            url=args.formal_url,
+            output_dir=args.formal_output_dir,
+            profile_prefix=args.formal_profile_prefix,
+            args=args,
+        )
 
     mapping_kernel_map = build_mapping_kernel_map(mapping_traces)
 
@@ -378,18 +414,18 @@ def run_triage(args: argparse.Namespace) -> int:
 
     for formal_trace in formal_traces:
         trace = load_trace_json(formal_trace)
-        kernels, _, _, _, _, _ = breakdown_cli.extract_trace_data(trace)
+        kernels, _, _, _, _, _ = kernel_helpers.extract_trace_data(trace)
         if not kernels:
             continue
         stage = parse_stage(formal_trace)
         total_us = sum(kernel.dur for kernel in kernels)
-        kernel_stats = breakdown_cli.aggregate(
+        kernel_stats = kernel_helpers.aggregate(
             kernels, key_fn=lambda item: item.canonical_name
         )
         kernel_categories = {
             kernel.canonical_name: kernel.category for kernel in kernels
         }
-        full_kernel_rows = breakdown_cli.build_kernel_rows(
+        full_kernel_rows = kernel_helpers.build_kernel_rows(
             stage=stage,
             kernel_stats=kernel_stats,
             kernel_categories=kernel_categories,
@@ -398,35 +434,41 @@ def run_triage(args: argparse.Namespace) -> int:
             ),
             external_kernel_map=mapping_kernel_map,
         )
-        visible_kernel_rows = breakdown_cli.limit_kernel_rows(
+        visible_kernel_rows = kernel_helpers.limit_kernel_rows(
             full_kernel_rows, args.kernel_table_limit
         )
         for row in visible_kernel_rows:
+            share_pct = kernel_helpers.pct(row.total_us, total_us)
+            if share_pct < MIN_RENDER_SHARE_PCT:
+                continue
             kernel_rows_rendered.append(
                 {
                     "stage": stage,
                     "kernel": row.name,
                     "category": row.category,
                     "total_us": row.total_us,
-                    "share_pct": breakdown_cli.pct(row.total_us, total_us),
+                    "share_pct": share_pct,
                     "launches": row.aggregate.count,
                     "location": row.location,
                     "cpu_op": row.cpu_op,
                 }
             )
-        for item in breakdown_cli.detect_fusion_opportunities(
+        for item in kernel_helpers.detect_fusion_opportunities(
             stage=stage,
             kernel_rows=full_kernel_rows,
             total_us=total_us,
             server_args=formal_server_args or mapping_server_args,
         ):
+            share_pct = kernel_helpers.pct(item.related_us, total_us)
+            if share_pct < MIN_RENDER_SHARE_PCT:
+                continue
             fuse_rows_rendered.append(
                 {
                     "stage": stage,
                     "pattern": item.pattern,
                     "confidence": item.confidence,
                     "related_us": item.related_us,
-                    "share_pct": breakdown_cli.pct(item.related_us, total_us),
+                    "share_pct": share_pct,
                     "evidence": item.evidence,
                     "current_locations": item.current_locations,
                     "candidate_path": item.candidate_path,
@@ -437,76 +479,86 @@ def run_triage(args: argparse.Namespace) -> int:
     mapping_stage_map = build_stage_trace_map(mapping_traces)
     formal_stage_map = build_stage_trace_map(formal_traces)
     overlap_rows_rendered: List[dict] = []
-    for stage in sorted(formal_stage_map, key=stage_index):
-        formal_trace = formal_stage_map[stage]
-        mapping_trace = pick_trace_for_stage(mapping_stage_map, stage)
-        if mapping_trace is None:
-            continue
-        mapping_trace_json = load_trace_json(mapping_trace)
-        mapping_events, mapping_pid = overlap_cli.extract_kernel_events(
-            mapping_trace_json, args.pid_substring
-        )
-        if not mapping_events:
-            continue
-        formal_trace_json = load_trace_json(formal_trace)
-        formal_events, formal_pid = overlap_cli.extract_kernel_events(
-            formal_trace_json, args.pid_substring
-        )
-        if not formal_events:
-            continue
-        mapping_bundle = overlap_cli.TraceBundle(
-            label=f"mapping-{stage}",
-            trace_path=mapping_trace,
-            server_args=mapping_server_args,
-            raw_events=mapping_trace_json.get(
-                "traceEvents",
-                mapping_trace_json if isinstance(mapping_trace_json, list) else [],
-            ),
-            events=mapping_events,
-            pid=mapping_pid,
-        )
-        formal_bundle = overlap_cli.TraceBundle(
-            label=f"formal-{stage}",
-            trace_path=formal_trace,
-            server_args=formal_server_args,
-            raw_events=formal_trace_json.get(
-                "traceEvents",
-                formal_trace_json if isinstance(formal_trace_json, list) else [],
-            ),
-            events=formal_events,
-            pid=formal_pid,
-        )
-        formal_bundle.overlap_stats = overlap_cli.analyze_overlap(formal_bundle.events)
-        aggregates = overlap_cli.aggregate_events(formal_bundle.events)
-        source_map = overlap_cli.build_kernel_source_map(mapping_bundle)
-        stage_rows = overlap_cli.build_action_rows(
-            aggregates,
-            source_map,
-            formal_bundle.events,
-            formal_bundle.overlap_stats["total_busy_us"],
-            table_limit=max(0, args.overlap_table_limit),
-        )
-        for row in stage_rows:
-            overlap_rows_rendered.append(
-                {
-                    "stage": stage,
-                    "priority": row.priority,
-                    "verdict": row.verdict,
-                    "kernel": row.kernel,
-                    "python_scope": row.python_scope,
-                    "total_us": row.total_us,
-                    "share_pct": row.share_pct,
-                    "exclusive_ratio": row.exclusive_ratio,
-                    "hidden_ratio": row.hidden_ratio,
-                    "dependency_signal": row.dependency_signal,
-                    "recommendation": row.recommendation,
-                }
+    if not single_trace_mode:
+        for stage in sorted(formal_stage_map, key=stage_index):
+            formal_trace = formal_stage_map[stage]
+            mapping_trace = pick_trace_for_stage(mapping_stage_map, stage)
+            if mapping_trace is None:
+                continue
+            mapping_trace_json = load_trace_json(mapping_trace)
+            mapping_events, mapping_pid = overlap_helpers.extract_kernel_events(
+                mapping_trace_json, args.pid_substring
             )
+            if not mapping_events:
+                continue
+            formal_trace_json = load_trace_json(formal_trace)
+            formal_events, formal_pid = overlap_helpers.extract_kernel_events(
+                formal_trace_json, args.pid_substring
+            )
+            if not formal_events:
+                continue
+            mapping_bundle = overlap_helpers.TraceBundle(
+                label=f"mapping-{stage}",
+                trace_path=mapping_trace,
+                server_args=mapping_server_args,
+                raw_events=mapping_trace_json.get(
+                    "traceEvents",
+                    mapping_trace_json if isinstance(mapping_trace_json, list) else [],
+                ),
+                events=mapping_events,
+                pid=mapping_pid,
+            )
+            formal_bundle = overlap_helpers.TraceBundle(
+                label=f"formal-{stage}",
+                trace_path=formal_trace,
+                server_args=formal_server_args,
+                raw_events=formal_trace_json.get(
+                    "traceEvents",
+                    formal_trace_json if isinstance(formal_trace_json, list) else [],
+                ),
+                events=formal_events,
+                pid=formal_pid,
+            )
+            formal_bundle.overlap_stats = overlap_helpers.analyze_overlap(
+                formal_bundle.events
+            )
+            aggregates = overlap_helpers.aggregate_events(formal_bundle.events)
+            source_map = overlap_helpers.build_kernel_source_map(mapping_bundle)
+            stage_rows = overlap_helpers.build_action_rows(
+                aggregates,
+                source_map,
+                formal_bundle.events,
+                formal_bundle.overlap_stats["total_busy_us"],
+                table_limit=max(0, args.overlap_table_limit),
+            )
+            for row in stage_rows:
+                if row.share_pct < MIN_RENDER_SHARE_PCT:
+                    continue
+                overlap_rows_rendered.append(
+                    {
+                        "stage": stage,
+                        "priority": row.priority,
+                        "verdict": row.verdict,
+                        "kernel": row.kernel,
+                        "python_scope": row.python_scope,
+                        "total_us": row.total_us,
+                        "share_pct": row.share_pct,
+                        "exclusive_ratio": row.exclusive_ratio,
+                        "hidden_ratio": row.hidden_ratio,
+                        "dependency_signal": row.dependency_signal,
+                        "recommendation": row.recommendation,
+                    }
+                )
 
     lines: List[str] = []
     lines.append("Triage View")
-    lines.append(f"Mapping traces: {', '.join(str(path) for path in mapping_traces)}")
-    lines.append(f"Formal traces: {', '.join(str(path) for path in formal_traces)}")
+    if single_trace_mode:
+        lines.append(f"Input traces: {', '.join(str(path) for path in formal_traces)}")
+    else:
+        lines.append(
+            f"Mapping traces: {', '.join(str(path) for path in mapping_traces)}"
+        )
+        lines.append(f"Formal traces: {', '.join(str(path) for path in formal_traces)}")
     if formal_server_args or mapping_server_args:
         server_args = formal_server_args or mapping_server_args
         model = server_args.get("model_path") or server_args.get("model")
@@ -527,32 +579,22 @@ def run_triage(args: argparse.Namespace) -> int:
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     argv = list(argv or sys.argv[1:])
-    top_parser = build_top_level_parser()
+    triage_parser = build_triage_parser()
 
     if not argv or argv[0] in {"-h", "--help"}:
-        top_parser.print_help()
+        triage_parser.print_help()
         return 0
 
-    command = argv[0]
-    remainder = argv[1:]
-
-    if command == "breakdown":
-        return breakdown_cli.main(remainder)
-    if command == "overlap":
-        return overlap_cli.main(remainder)
-    if command == "triage":
-        return run_triage(parse_triage_args(remainder))
-    if command == "perfetto-fix":
-        args = parse_perfetto_fix_args(remainder)
-        output_path = write_perfetto_compatible_trace(
-            input_path=Path(args.input),
-            output_path=Path(args.output).resolve() if args.output else None,
+    if argv[0] == "triage":
+        argv = argv[1:]
+    elif not argv[0].startswith("-"):
+        triage_parser.error(
+            "This skill now exposes only the compact triage workflow. "
+            "Use single-trace mode (--input/--url) or mapping+formal two-trace mode."
         )
-        print(f"Perfetto-friendly trace written to: {output_path}")
-        return 0
+        return 2
 
-    top_parser.error(f"Unknown command: {command}")
-    return 2
+    return run_triage(parse_triage_args(argv))
 
 
 if __name__ == "__main__":

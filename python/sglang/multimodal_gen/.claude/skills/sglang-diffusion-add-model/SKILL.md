@@ -586,6 +586,44 @@ Before submitting, verify:
 
 ## After Implementation: Tests and Performance Data
 
+### Component Accuracy When Adding a New Testcase Config
+
+If you add a new entry to `python/sglang/multimodal_gen/test/server/testcase_configs.py`, you must treat component accuracy as part of the model-adding workflow. Do not assume the new testcase will automatically fit the existing component-accuracy harness.
+
+The component-accuracy harness compares SGLang components against Diffusers/HF reference components. This is stricter than pipeline-level inference. New testcase configs commonly fail here for one of three reasons:
+
+1. **The model family needs explicit hook wiring** in `python/sglang/multimodal_gen/test/server/accuracy_hooks.py`.
+   - Add hook logic only when the harness cannot call the raw component correctly without it.
+   - Valid examples:
+     - required forward arguments are missing from the synthetic input bundle
+     - a known runtime execution context must be matched for the component to run at all, such as transformer autocast
+     - the reference and SGLang expose the same component contract, but the harness needs family-specific input preparation to reach it
+   - Invalid examples:
+     - changing the compared output mode just to make shapes or values line up
+     - adding a harness-side behavior override that changes the component contract instead of matching it
+
+2. **The component is already covered by another testcase with the same source component and topology**.
+   - In that case, do not add redundant component-accuracy coverage.
+   - Add a skip entry in `python/sglang/multimodal_gen/test/server/accuracy_config.py` with a concrete reason such as:
+     - `Representative VAE accuracy is already covered by ... for the same source component and topology`
+   - This is the preferred path for variant-only cases such as LoRA, cache-dit, upscaling, or other testcases that reuse the same underlying component weights and topology.
+
+3. **The HF/Diffusers reference component cannot be loaded or compared faithfully in the harness**.
+   - Add a skip entry in `python/sglang/multimodal_gen/test/server/accuracy_config.py` with the exact technical failure.
+   - Good reasons include:
+     - missing or unsupported HF component layout
+     - incomplete or partially initialized HF checkpoint
+     - unsupported raw component contract for trustworthy comparison
+     - proven divergence after matched weight transfer and matching output shape
+   - Keep the skip reason concrete and technical. Do not write vague reasons like "component accuracy flaky" or "needs investigation."
+
+When adding a new testcase config, make this decision explicitly:
+- if the model family needs minimal harness wiring, add the smallest possible change in `accuracy_hooks.py`
+- if the testcase is only a variant of an already covered source component and topology, add a skip in `accuracy_config.py`
+- if the HF/Diffusers reference component cannot be compared faithfully, add a skip in `accuracy_config.py`
+
+Do not add a new testcase config and wait for CI to discover missing component-accuracy wiring. Do not use `accuracy_hooks.py` to change the compared component contract just to make the test pass.
+
 Once the model is working and output quality is verified, **ask the user** whether they would like to:
 
 1. **Add tests** — Create unit tests and/or integration tests for the new model. Tests should cover:

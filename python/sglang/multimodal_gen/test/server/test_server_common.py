@@ -526,17 +526,15 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
 
         if not result.passed:
             failed_frames = []
-            video_gt_info = ""
-            if is_video:
-                gt_remote_files = get_consistency_gt_remote_files(
-                    case.id,
-                    num_gpus,
-                    is_video=True,
-                    output_format=output_format,
-                )
-                video_gt_info = "\n".join(
-                    f"    - {filename}: {url}" for filename, url in gt_remote_files
-                )
+            gt_remote_files = get_consistency_gt_remote_files(
+                case.id,
+                num_gpus,
+                is_video=is_video,
+                output_format=output_format,
+            )
+            gt_remote_info = "\n".join(
+                f"    - {filename}: {url}" for filename, url in gt_remote_files
+            )
             for metric in result.frame_metrics:
                 failed_metrics = []
                 if not metric.clip_passed:
@@ -568,11 +566,7 @@ Repository: https://github.com/sglang-bot/sglang-ci-data (path: diffusion-ci/con
                 f"mean_abs_diff<={result.thresholds.mean_abs_diff_threshold}\n"
                 f"  Failed frames:\n"
                 + "\n".join(failed_frames)
-                + (
-                    f"\n  Compared GT frame files and links:\n{video_gt_info}"
-                    if video_gt_info
-                    else ""
-                )
+                + f"\n  Compared GT files and links:\n{gt_remote_info}"
             )
 
         logger.info(

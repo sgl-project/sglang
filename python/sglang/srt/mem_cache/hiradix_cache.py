@@ -94,6 +94,8 @@ class HiRadixCache(RadixCache):
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
+        self.attn_cp_rank = params.attn_cp_rank
+        self.attn_cp_size = params.attn_cp_size
         self.enable_storage = server_args.hicache_storage_backend is not None
         self.enable_storage_metrics = self.enable_storage and params.enable_metrics
         self.extra_metric_labels = server_args.extra_metric_labels
@@ -126,6 +128,8 @@ class HiRadixCache(RadixCache):
             storage_backend_extra_config=extra_config,
             pp_rank=self.pp_rank,
             pp_size=self.pp_size,
+            attn_cp_rank=self.attn_cp_rank,
+            attn_cp_size=self.attn_cp_size,
             enable_storage_metrics=self.enable_storage_metrics,
         )
         self._apply_storage_runtime_config(
@@ -204,6 +208,8 @@ class HiRadixCache(RadixCache):
                 "dp_rank": self.cache_controller.dp_rank,
                 "pp_rank": self.cache_controller.pp_rank,
                 "pp_size": self.cache_controller.pp_size,
+                "attn_cp_rank": self.cache_controller.attn_cp_rank,
+                "attn_cp_size": self.cache_controller.attn_cp_size,
             }
             if extra_metric_labels:
                 labels.update(extra_metric_labels)

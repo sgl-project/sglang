@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -19,8 +20,12 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     model_parallel_is_initialized,
 )
 from sglang.multimodal_gen.runtime.layers.utils import get_group_rank, get_group_size
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import ServerArgs, get_global_server_args
 from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
+from sglang.multimodal_gen.runtime.utils.model_overlay import (
+    load_overlay_manifest_if_present,
+    resolve_model_overlay_target,
+)
 from sglang.multimodal_gen.test.server.accuracy_config import (
     DEFAULT_TEXT_ENCODER_VOCAB_SIZE,
     I2V_TEXT_ENCODER_DIM,
@@ -31,27 +36,6 @@ from sglang.multimodal_gen.test.server.accuracy_config import (
     ComponentType,
     get_threshold,
 )
-
-STAGED_1GPU_NATIVE_CASE_IDS = {
-    "flux_2_image_t2i",
-    "qwen_image_layered_i2i",
-    "flux_2_image_t2i_upscaling_4x",
-    "flux_2_ti2i",
-    "flux_2_t2i_customized_vae_path",
-    "flux_2_ti2i_multi_image_cache_dit",
-}
-
-# These case allowlists are accuracy-runner policy. They select the few 1-GPU
-# cases that need sequential SGLang/reference execution to stay within memory
-# limits during CI and local correctness runs.
-STAGED_1GPU_TEXT_ENCODER_CASE_IDS = {
-    "flux_2_image_t2i",
-    "flux_2_image_t2i_upscaling_4x",
-    "mova_360p_1gpu",
-    "flux_2_ti2i",
-    "flux_2_t2i_customized_vae_path",
-    "flux_2_ti2i_multi_image_cache_dit",
-}
 
 SOURCE_PREFIXES = (
     "module.",
@@ -81,9 +65,7 @@ class ComponentSelection:
     base_model_id: str
     base_model_root: str
     component_paths: Dict[str, str]
-    source_root: str
     source_path: str
-    source_subfolder: str
 
 
 @dataclass(frozen=True)
@@ -153,7 +135,7 @@ def _resolve_component_subfolder(
 
 def resolve_component_path(
     local_root: str, component: ComponentType, model_index_keys: Tuple[str, ...]
-) -> Tuple[str, str]:
+) -> str:
     model_index_path = os.path.join(local_root, "model_index.json")
     model_index = read_json_file(model_index_path)
 
@@ -169,13 +151,13 @@ def resolve_component_path(
                 candidate
             ):
                 continue
-            return candidate, subfolder
+            return candidate
 
     if has_component_files(local_root):
         if component != ComponentType.TEXT_ENCODER or is_text_encoder_config(
             local_root
         ):
-            return local_root, ""
+            return local_root
 
     raise FileNotFoundError(
         f"Could not resolve {component.value} from model_index.json under {local_root}"
@@ -230,37 +212,48 @@ def select_component_source(
     model_index_keys: Tuple[str, ...],
 ) -> ComponentSelection:
     component_paths = extract_component_path_overrides(extra_args)
-    base_model_root = maybe_download_model(model_id)
+    force_diffusers_model = resolve_model_overlay_target(model_id) is not None or (
+        os.path.exists(model_id)
+        and load_overlay_manifest_if_present(model_id) is not None
+    )
+    base_model_root = maybe_download_model(
+        model_id, force_diffusers_model=force_diffusers_model
+    )
     search_keys = [component.value]
     for key in model_index_keys:
         if key not in search_keys:
             search_keys.append(key)
 
-    source_root = base_model_root
-    component_key = component.value
     for key in search_keys:
         override_path = component_paths.get(key)
-        if override_path:
-            source_root = maybe_download_model(override_path)
-            component_key = key
-            break
+        if override_path is None:
+            continue
+        assert has_component_files(override_path), (
+            f"Component override for {component.value} must point directly to a "
+            f"component directory: {override_path}"
+        )
+        if component == ComponentType.TEXT_ENCODER:
+            assert is_text_encoder_config(override_path), (
+                f"Text encoder override must point to a text encoder directory: "
+                f"{override_path}"
+            )
+        return ComponentSelection(
+            base_model_id=model_id,
+            base_model_root=base_model_root,
+            component_paths=component_paths,
+            source_path=override_path,
+        )
 
-    ordered_keys = [component_key]
-    for key in search_keys:
-        if key not in ordered_keys:
-            ordered_keys.append(key)
-    source_path, source_subfolder = resolve_component_path(
-        source_root,
+    source_path = resolve_component_path(
+        base_model_root,
         component,
-        tuple(ordered_keys),
+        tuple(search_keys),
     )
     return ComponentSelection(
         base_model_id=model_id,
         base_model_root=base_model_root,
         component_paths=component_paths,
-        source_root=source_root,
         source_path=source_path,
-        source_subfolder=source_subfolder,
     )
 
 
@@ -680,16 +673,6 @@ def run_text_encoder_accuracy_pair(
     )
 
 
-def _should_stage_case(case: Any, component: ComponentType, num_gpus: int) -> bool:
-    if num_gpus == 2:
-        return True
-    if num_gpus != 1:
-        return False
-    if component == ComponentType.TEXT_ENCODER:
-        return case.id in STAGED_1GPU_TEXT_ENCODER_CASE_IDS
-    return case.id in STAGED_1GPU_NATIVE_CASE_IDS
-
-
 def _run_single_text_encoder_forward(
     model: nn.Module, input_ids: torch.Tensor, attention_mask: torch.Tensor
 ) -> torch.Tensor:
@@ -724,26 +707,55 @@ def _run_staged_native_component_accuracy_case(
             component,
             library,
             num_gpus,
+            materialize_sgl_on_device=(component != ComponentType.TRANSFORMER),
             materialize_ref_on_device=False,
         )
+        if component == ComponentType.TRANSFORMER:
+            sgl = sgl.to(device=device, dtype=torch.bfloat16).eval()
         profile = resolve_component_native_profile(component)
         inputs = profile.build_inputs(case, sgl, device, ref)
+        runtime_server_args = get_global_server_args()
+        use_transformer_autocast = (
+            component == ComponentType.TRANSFORMER
+            and not runtime_server_args.disable_autocast
+            and torch.device(device).type != "cpu"
+        )
 
         sgl_call = profile.prepare_sglang_call(sgl, inputs)
-        with torch.no_grad():
+        sgl_autocast = (
+            torch.autocast(
+                device_type=torch.device(device).type,
+                dtype=torch.bfloat16,
+                enabled=True,
+            )
+            if use_transformer_autocast
+            else nullcontext()
+        )
+        with torch.no_grad(), sgl_autocast:
             sgl_raw = engine_cls._execute_with_native_hook(sgl_call)
         sgl_out = profile.normalize_sglang_output(sgl_raw)
         sgl_out = engine_cls._apply_output_transforms(sgl_out, sgl_call).detach().cpu()
 
         del sgl_call
         del sgl_raw
+        if component == ComponentType.TRANSFORMER and num_gpus == 1:
+            engine_cls.prepare_component_for_release(sgl)
         del sgl
         sgl = None
         engine_cls.clear_memory()
 
         ref = ref.to(device=device, dtype=torch.bfloat16).eval()
         ref_call = profile.prepare_reference_call(ref, inputs)
-        with torch.no_grad():
+        ref_autocast = (
+            torch.autocast(
+                device_type=torch.device(device).type,
+                dtype=torch.bfloat16,
+                enabled=True,
+            )
+            if use_transformer_autocast
+            else nullcontext()
+        )
+        with torch.no_grad(), ref_autocast:
             ref_raw = engine_cls._execute_with_native_hook(ref_call)
         ref_out = profile.normalize_reference_output(ref_raw)
         ref_out = engine_cls._apply_output_transforms(ref_out, ref_call).detach().cpu()
@@ -758,6 +770,8 @@ def _run_staged_native_component_accuracy_case(
         )
     finally:
         if sgl is not None:
+            if component == ComponentType.TRANSFORMER and num_gpus == 1:
+                engine_cls.prepare_component_for_release(sgl)
             del sgl
         if ref is not None:
             del ref
@@ -823,58 +837,10 @@ def run_native_component_accuracy_case(
     library: str,
     num_gpus: int,
 ) -> None:
-    if _should_stage_case(case, component, num_gpus):
-        _run_staged_native_component_accuracy_case(
-            engine_cls, case, component, library, num_gpus
-        )
-        return
-    engine_cls.clear_memory()
-    sgl = None
-    ref = None
-    try:
-        sgl, ref, device = engine_cls.load_component_pair(
-            case, component, library, num_gpus
-        )
-        sgl_out, ref_out = engine_cls.run_component_pair_native(
-            case, component, sgl, ref, device
-        )
-        engine_cls.check_accuracy(
-            sgl_out,
-            ref_out,
-            f"{case.id}_{component.value}",
-            get_threshold(case.id, component),
-        )
-    finally:
-        if sgl is not None:
-            del sgl
-        if ref is not None:
-            del ref
-        engine_cls.reset_parallel_runtime()
-        engine_cls.clear_memory()
+    _run_staged_native_component_accuracy_case(
+        engine_cls, case, component, library, num_gpus
+    )
 
 
 def run_text_encoder_accuracy_case(engine_cls: Any, case: Any, num_gpus: int) -> None:
-    if _should_stage_case(case, ComponentType.TEXT_ENCODER, num_gpus):
-        _run_staged_text_encoder_accuracy_case(engine_cls, case, num_gpus)
-        return
-    engine_cls.clear_memory()
-    sgl = None
-    ref = None
-    try:
-        sgl, ref, _device = engine_cls.load_component_pair(
-            case, ComponentType.TEXT_ENCODER, "transformers", num_gpus
-        )
-        sgl_out, ref_out = run_text_encoder_accuracy_pair(sgl, ref)
-        engine_cls.check_accuracy(
-            sgl_out,
-            ref_out,
-            f"{case.id}_encoder",
-            get_threshold(case.id, ComponentType.TEXT_ENCODER),
-        )
-    finally:
-        if sgl is not None:
-            del sgl
-        if ref is not None:
-            del ref
-        engine_cls.reset_parallel_runtime()
-        engine_cls.clear_memory()
+    _run_staged_text_encoder_accuracy_case(engine_cls, case, num_gpus)

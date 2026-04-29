@@ -134,6 +134,13 @@ class TextEncodingStage(PipelineStage):
 
         return tok_kwargs
 
+    def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
+        if not getattr(text_encoder, "uses_sglang_forward_context", True):
+            return text_encoder(**encoder_forward_kwargs)
+
+        with set_forward_context(current_timestep=0, attn_metadata=None):
+            return text_encoder(**encoder_forward_kwargs)
+
     @torch.no_grad()
     def encode_text(
         self,
@@ -269,8 +276,9 @@ class TextEncodingStage(PipelineStage):
                 encoder_forward_kwargs["attention_mask"] = attention_mask
             if "use_cache" in inspect.signature(text_encoder.forward).parameters:
                 encoder_forward_kwargs["use_cache"] = False
-            with set_forward_context(current_timestep=0, attn_metadata=None):
-                outputs: BaseEncoderOutput = text_encoder(**encoder_forward_kwargs)
+            outputs: BaseEncoderOutput = self._forward_text_encoder(
+                text_encoder, encoder_forward_kwargs
+            )
             postprocess_sig = inspect.signature(postprocess_func)
 
             postprocess_kwargs = {}
@@ -279,14 +287,20 @@ class TextEncodingStage(PipelineStage):
                 postprocess_kwargs["pipeline_config"] = server_args.pipeline_config
             prompt_embeds = postprocess_func(outputs, text_inputs, **postprocess_kwargs)
             if dtype is not None:
-                prompt_embeds = prompt_embeds.to(dtype=dtype)
+                prompt_embeds = prompt_embeds.to(device=target_device, dtype=dtype)
+            else:
+                prompt_embeds = prompt_embeds.to(device=target_device)
 
             embeds_list.append(prompt_embeds)
-            if is_flux_v1:
-                pooled_embeds_list.append(outputs.pooler_output)
+            if is_flux_v1 and outputs.pooler_output is not None:
+                # FLUX.1 only consumes the pooled CLIP projection. The T5
+                # encoder in the same pipeline has no pooler output.
+                pooled_embeds_list.append(
+                    outputs.pooler_output.to(device=target_device)
+                )
             if return_attention_mask:
                 mask_to_store = (
-                    attention_mask
+                    attention_mask.to(device=target_device)
                     if attention_mask is not None
                     else torch.ones(input_ids.shape[:2], device=target_device)
                 )

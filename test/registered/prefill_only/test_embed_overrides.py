@@ -23,7 +23,7 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=5, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
 
 HIDDEN_DIM = 4
 

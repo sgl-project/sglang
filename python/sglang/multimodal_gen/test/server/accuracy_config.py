@@ -73,6 +73,14 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
             "HF reference transformer cannot be materialized from the video_dit repo layout"
         )
     },
+    "ltx_2.3_one_stage_ti2v": {
+        ComponentType.VAE: ComponentSkip(
+            "LTX-2.3 VAE component diverges from the HF reference after local overlay materialization; weight transfer matched 96/176 (54.55%), below the minimum threshold for trustworthy comparison"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "LTX-2.3 transformer component does not match the HF reference architecture after local overlay materialization; scale_shift_table parameters load as [9, ...] in the checkpoint but [6, ...] in the reference model"
+        ),
+    },
     "qwen_image_t2i_cache_dit_enabled": {
         ComponentType.VAE: ComponentSkip(
             "Representative VAE accuracy is already covered by qwen_image_t2i for the same source component and topology"
@@ -351,6 +359,11 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
     "flux_2_image_t2i_2_gpus": {
         ComponentType.TRANSFORMER: ComponentSkip(
             "2-GPU FLUX.2 transformer diverges strongly from Diffusers baseline (CosSim ~0.54) despite full weight transfer"
+        )
+    },
+    "ltx_2_two_stage_t2v": {
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "Transformer output shape mismatch after 100% matched weight transfer: SGL [1, 128, 4, 16, 16] vs Diffusers [1, 1024, 128]"
         )
     },
     "hunyuan3d_shape_gen": {

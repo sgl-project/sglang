@@ -193,7 +193,19 @@ class RocmPlatform(Platform):
 
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
-        """Replace nn.GroupNorm with AITer GroupNorm for improved ROCm VAE performance."""
+        """Apply ROCm-specific optimizations to VAE.
+
+        - Enable MIOpen benchmark mode so that the best convolution algorithm
+          is selected for each distinct input shape (benefits Conv3d-heavy VAE
+          decode).
+        - Replace nn.GroupNorm with AITer GroupNorm when available.
+        """
+        if envs.SGLANG_USE_ROCM_CUDNN_BENCHMARK and not torch.backends.cudnn.benchmark:
+            torch.backends.cudnn.benchmark = True
+            logger.info(
+                "Enabled cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers"
+            )
+
         if not envs.SGLANG_USE_ROCM_VAE:
             return vae
         try:

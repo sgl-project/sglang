@@ -787,11 +787,19 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        max_new = min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        # Reserve page_size for page-alignment overhead. The paged allocator
+        # may consume up to one extra page per request (see alloc_extend), and
+        # _update_prefill_budget already accounts for this in the deduction.
+        # Without this, admission is more optimistic than the actual budget
+        # deduction, allowing over-admission when the pool is nearly full.
+        total_tokens = (
+            req.extend_input_len
+            + min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            + self.page_size
         )
-        total_tokens = req.extend_input_len + max_new + self.page_size
 
         # adjusting the input_tokens based on host_hit_length and page_size
         real_input_tokens = req.extend_input_len - req.host_hit_length

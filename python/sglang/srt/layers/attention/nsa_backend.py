@@ -2129,11 +2129,9 @@ class NativeSparseAttnBackend(
             # disable for MTP
             self.nsa_kv_cache_store_fp8
             and self.nsa_prefill_impl == "flashmla_sparse"
+            and forward_mode == ForwardMode.EXTEND
         ):
             topk_transform_method = TopkTransformMethod.RAGGED
-
-            if forward_mode is not None and (forward_mode.is_decode_or_idle()):
-                topk_transform_method = TopkTransformMethod.PAGED
         else:
             topk_transform_method = TopkTransformMethod.PAGED
         return topk_transform_method

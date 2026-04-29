@@ -304,6 +304,7 @@ class ComposedPipelineBase(ABC):
                 component_model_path=component_model_path,
                 transformers_or_diffusers=transformers_or_diffusers,
                 server_args=server_args,
+                component_architecture=architecture,
             )
 
             self.memory_usages[load_module_name] = memory_usage

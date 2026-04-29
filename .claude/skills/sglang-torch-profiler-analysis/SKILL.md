@@ -1,58 +1,86 @@
 ---
 name: sglang-torch-profiler-analysis
-description: "Unified SGLang torch-profiler skill for trace generation, kernel/category breakdown, two-stage overlap analysis, and small Perfetto trace repair. Use when Codex should inspect an existing `trace.json(.gz)` or profile directory, trigger `sglang.profiler` against a live server, break down prefill/decode GPU time by kernel family, correlate a graph-off mapping trace with a graph-on formal trace to find overlap headroom tied back to Python code, or rewrite a trace so Perfetto renders overlapped events more reliably."
+description: "Compact SGLang torch-profiler triage skill. Use when Codex should inspect an existing `trace.json(.gz)` or profile directory, trigger `sglang.profiler` against a live server, and return one compact report with kernel, overlap-opportunity, and fuse-pattern tables. Single-trace triage is enough for quick diagnosis; mapping+formal two-trace triage gives stronger overlap conclusions."
 ---
 
 # SGLang Torch Profiler Analysis
 
 ## Overview
 
-Use this skill for all SGLang torch-profiler work. It replaces the old split between:
+Use this skill for SGLang `torch.profiler` analysis.
 
-- kernel/category breakdown
-- overlap-specific diagnosis
-- small trace post-processing
+There is only one public workflow:
 
-Prefer the unified entrypoint:
+- `triage`
+
+Use the unified entrypoint:
 
 - [scripts/analyze_sglang_torch_profile.py](scripts/analyze_sglang_torch_profile.py)
 
-This entrypoint exposes four subcommands:
-
-- `triage`: the default compact workflow that prints three main tables
-
-- `breakdown`: one-trace kernel/category share analysis
-- `overlap`: required two-trace overlap analysis with source mapping
-- `perfetto-fix`: rewrite a trace when Perfetto drops some overlapped lanes
-
-For normal use, prefer `triage`. It already collapses the result into three main tables:
+`triage` always prints the same three tables:
 
 - kernel table
 - overlap-opportunity table
-- fuse-opportunity table
+- fuse-pattern table
 
-Internal analyzers live here:
+By default, all three tables only render rows at or above `1.0%` cumulative GPU-time share.
+Treat anything below that as noise unless the user explicitly asks for a lower cutoff.
 
-- [scripts/analyze_sglang_llm_torch_profile.py](scripts/analyze_sglang_llm_torch_profile.py)
-- [scripts/analyze_sglang_profiler_overlap.py](scripts/analyze_sglang_profiler_overlap.py)
-- [scripts/profile_common.py](scripts/profile_common.py)
+The script-level fuse-pattern table should stay source-backed and deterministic.
+Do not build a fuzzy string-matching engine into the script for typo-tolerance.
+
+If exact/source-backed matching is weak but the agent judges that a cluster of kernels
+still looks semantically close to a known pattern, add a short AI note after the table
+with one of these labels:
+
+- `high`: very likely the same pattern family; naming drift or minor implementation reshaping is the main uncertainty
+- `medium`: several signals line up, but one important piece is still ambiguous
+- `low`: weak resemblance only; mention it only if it is still worth a human follow-up
 
 ## When To Use It
 
 - inspect an SGLang torch profiler trace or profile directory
 - profile a live SGLang server and immediately analyze the output
-- quantify which kernel families dominate prefill or decode
-- compare communication, attention, MoE, quantization, norm, or memory share
+- summarize which kernel families dominate prefill or decode
 - map kernels back to Python code paths
-- judge whether a kernel still has overlap headroom in production shape
-- get a text table and a small ASCII timeline without opening Perfetto first
-- repair a trace so Perfetto can render overlapping events more faithfully
+- judge whether a code path still has overlap headroom
+- check whether an already-known fusion or overlap path should have applied
 
-Do not use Nsight Systems as the default path for this workflow. This merged skill is torch-profiler-first.
+## Diffusion Backend Gate
 
-## Main Commands
+For diffusion benchmark or profiling work, only analyze traces produced by the native
+SGLang diffusion backend.
 
-### 1. Compact triage from existing trace directories
+If the run that generated the trace logs any of:
+- `Falling back to diffusers backend`
+- `Using diffusers backend`
+- `Loaded diffusers pipeline`
+
+stop the workflow instead of analyzing the trace. Treat it as a backend-selection issue,
+not as valid SGLang diffusion profiler evidence.
+
+## Main Flows
+
+### 1. Single-trace triage from an existing profile dir or trace
+
+```bash
+python3 scripts/analyze_sglang_torch_profile.py \
+  --input /path/to/profile_dir_or_trace.json.gz
+```
+
+Use this when you want the fastest read on kernel share and likely fused-kernel pattern matches.
+The overlap table stays conservative in single-trace mode and will tell you when a mapping/formal pair is needed.
+
+### 2. Single-trace triage from a running server
+
+```bash
+python3 scripts/analyze_sglang_torch_profile.py \
+  --url http://127.0.0.1:30000 \
+  --num-steps 5 \
+  --profile-by-stage
+```
+
+### 3. Two-trace triage from existing profile dirs or traces
 
 ```bash
 python3 scripts/analyze_sglang_torch_profile.py triage \
@@ -60,7 +88,9 @@ python3 scripts/analyze_sglang_torch_profile.py triage \
   --formal-input /path/to/graph_on_profile_dir
 ```
 
-### 2. Compact triage from running servers
+Use this when you need stronger overlap conclusions and cleaner kernel-to-source attribution.
+
+### 4. Two-trace triage from running servers
 
 ```bash
 python3 scripts/analyze_sglang_torch_profile.py triage \
@@ -70,50 +100,6 @@ python3 scripts/analyze_sglang_torch_profile.py triage \
   --profile-by-stage
 ```
 
-### 3. Breakdown from an existing trace or profile dir
-
-```bash
-python3 scripts/analyze_sglang_torch_profile.py breakdown \
-  --input /path/to/profile_dir
-```
-
-### 4. Breakdown from a running server
-
-```bash
-python3 scripts/analyze_sglang_torch_profile.py breakdown \
-  --url http://127.0.0.1:30000 \
-  --num-steps 5 \
-  --profile-by-stage \
-  --table-only
-```
-
-### 5. Two-stage overlap analysis
-
-```bash
-python3 scripts/analyze_sglang_torch_profile.py overlap \
-  --mapping-input /path/to/graph_off_profile_dir \
-  --formal-input /path/to/graph_on_profile_dir \
-  --table-only
-```
-
-Or profile both servers directly:
-
-```bash
-python3 scripts/analyze_sglang_torch_profile.py overlap \
-  --mapping-url http://127.0.0.1:31025 \
-  --formal-url http://127.0.0.1:31026 \
-  --num-steps 5
-```
-
-### 6. Perfetto-friendly trace rewrite
-
-```bash
-python3 scripts/analyze_sglang_torch_profile.py perfetto-fix \
-  --input /path/to/trace.json.gz
-```
-
-This small repair step is inspired by `torch_utils/src/convert_to_perfetto_compatible/convert_to_perfetto_compatible.py`.
-
 ## `profile_by_stage`
 
 `profile_by_stage` is not only for PD disaggregation.
@@ -122,75 +108,59 @@ This small repair step is inspired by `torch_utils/src/convert_to_perfetto_compa
 - On the current profile-v2 path inside SGLang, stage-based profiling is effectively the normal path.
 - PD-disaggregated serving adds one extra rule: prefill workers and decode workers must be profiled separately. That is stricter than ordinary `profile_by_stage`.
 
-## Which Mode To Choose
+## How To Choose The Triage Shape
 
-### `triage`
+### Single-trace triage
 
-Use when you want the lowest-friction output:
+Use when you want the lowest-friction report:
 
-- one kernel table
-- one overlap-opportunity table
-- one fuse-opportunity table
-- optional stage-aware rows when the trace directory includes both `EXTEND` and `DECODE`
+- one trace is already available
+- you mainly want kernel share and fusion clues
+- you are comparing two runs side by side by running triage once per trace
 
-This is the recommended default for final user-facing reports.
+This is the recommended default.
 
-### `breakdown`
-
-Use when you need:
-
-- category share such as attention, communication, MoE, norm, quantize, memory
-- top kernels by cumulative GPU time
-- stage-aware prefill vs decode summaries
-- kernel tables keep full kernel names and full Python locations, already joined with CPU ops
-- conservative source-backed fusion opportunities
-
-This mode works with one trace. A graph-off pre-pass plus `--kernel-map` is optional but recommended for the final polished report.
-
-### `overlap`
+### Two-trace triage
 
 Use when you need:
 
-- a strong answer about which code paths still have overlap headroom
-- a table that says which kernels are already hidden and low ROI, with full kernel names and Python scopes
-- dependency-risk hints near adjacent kernels
-- an ASCII timeline around the most actionable windows
-
-This mode requires two traces for a final answer:
+- a stronger answer about overlap headroom
+- graph-off source mapping plus graph-on final behavior
+- more trustworthy overlap recommendations in the middle table
 
 1. mapping trace with `--disable-cuda-graph --disable-piecewise-cuda-graph`
 2. formal trace with the real serving optimizations enabled
 
 Do not call the mapping pass a "fast profile". It exists to recover `kernel -> cpu_op -> python scope`.
 
-### `perfetto-fix`
-
-Use only when Perfetto fails to render obviously overlapping events cleanly. It is a post-processing utility, not the main analysis flow.
-
 ## Workflow
 
-### One-trace breakdown workflow
+### Single-trace workflow
 
-1. If the user only wants kernel/category share, one trace is enough.
+1. If the user only wants a quick diagnosis, one trace is enough.
 2. Prefer rank-local `TP-0` traces over merged traces.
 3. For a live server, this skill can call `sglang.profiler` and automatically send a small probe request.
 4. Prefer `--profile-by-stage` even on standard serving unless the user explicitly wants an all-stage mixed trace.
 
-### Two-trace overlap workflow
+### Two-trace workflow
 
 1. Produce a mapping trace first with graph disabled.
 2. Produce a formal trace second with graph enabled and the real serving flags kept on.
-3. Run `triage` for the compact three-table report, or `overlap` if you also want source context and ASCII timelines.
+3. Run `triage` for the compact three-table report.
 4. Read the results in this order:
    - kernel table
    - overlap-opportunity table
-   - fuse-opportunity table
+   - fuse-pattern table
 5. Before calling something a "new" optimization idea, compare the top rows against both [references/fuse-overlap-catalog.md](references/fuse-overlap-catalog.md) and [references/overlap-catalog.md](references/overlap-catalog.md). Always check the `PR-backed / in-flight` sections too. Prefer reporting:
    - an existing fused or overlap path that should already apply here
    - an existing path that appears disabled, unsupported, or regressed in this trace
    - an upstream PR-backed pattern that already exists but is not merged into the checked-out tree
    - a truly new opportunity only when no catalog entry fits
-6. Use the deeper `overlap` report only when you need source context or ASCII timelines beyond the compact three-table artifact.
+6. If no exact pattern fully matches but the trace still looks semantically close to a known family, add one flat `AI similarity judgment` note after the tables.
+   Use `high`, `medium`, or `low` only.
+   Base that note on the full pattern shape, not on one kernel name alone.
+   Prefer semantic cues such as producer-consumer chain, source locations, CPU op names, TP context, and model-specific structure.
+   Do not rewrite the script table itself to include these heuristic judgments.
 
 ## References
 
@@ -198,10 +168,6 @@ Load these only when needed:
 
 - [references/source-map.md](references/source-map.md)
   - upstream SGLang profiler entrypoints and trace-writing source paths
-- [references/validated-workflows.md](references/validated-workflows.md)
-  - validated two-pass examples for real SGLang models
-- [references/trace-workflow.md](references/trace-workflow.md)
-  - practical guidance for mapping vs formal traces
 - [references/heuristics.md](references/heuristics.md)
   - overlap labels, dependency-risk interpretation, and limits
 - [references/fuse-overlap-catalog.md](references/fuse-overlap-catalog.md)
@@ -211,13 +177,13 @@ Load these only when needed:
 
 ## Output Contract
 
-### For `breakdown`
-
 Return:
 
-- trace path
+- trace path or generated profile path
 - model/server args when available
-- top categories
-- top kernels
+- kernel table
+- overlap-opportunity table
+- fuse-pattern table
+- optional `AI similarity judgment` note with `high` / `medium` / `low` when exact matching is inconclusive
 - one short conclusion about what dominates the run
-- any source-backed fusion opportunities worth checking
+- whether the overlap conclusion came from single-trace triage or mapping/formal two-trace triage

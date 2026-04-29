@@ -66,7 +66,10 @@ class LoRAManager:
         lora_paths: Optional[List[LoRARef]] = None,
     ):
         self.base_model: torch.nn.Module = base_model
-        self.base_hf_config: AutoConfig = base_hf_config
+        if hasattr(base_hf_config, "get_text_config"):
+            self.base_hf_config: AutoConfig = base_hf_config.get_text_config()
+        else:
+            self.base_hf_config: AutoConfig = base_hf_config
         self.max_loras_per_batch: int = max_loras_per_batch
         self.load_config: LoadConfig = load_config
         self.dtype: torch.dtype = dtype
@@ -762,6 +765,25 @@ class LoRAManager:
                     lora_module = self.set_lora_module(module_name, module)
                     self.lm_head_module = lora_module
                     continue
+
+            # Handle DeepSeek MLA fused projection: set the boundary
+            # between q_a and kv_a output partitions so the LoRA layer
+            # can apply separate B projections for each.
+            if (
+                "fused_qkv_a_proj_with_mqa" in self.target_modules
+                and module_name.endswith("fused_qkv_a_proj_with_mqa")
+            ):
+                from sglang.srt.lora.layers import ReplicatedLinearWithLoRA
+
+                layer_id = get_layer_id(module_name)
+                if layer_id is None:
+                    continue
+                lora_module = self.set_lora_module(module_name, module)
+                if isinstance(lora_module, ReplicatedLinearWithLoRA):
+                    q_lora_rank = getattr(self.base_hf_config, "q_lora_rank", None) or 0
+                    lora_module.first_output_dim = q_lora_rank
+                self.lora_modules[layer_id][module_name] = lora_module
+                continue
 
             # The module should be converted if it is included in target_names
             if module_name.split(".")[-1] in self.target_modules:

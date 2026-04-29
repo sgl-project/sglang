@@ -352,6 +352,10 @@ class PipelineConfig:
     def postprocess_vae_encode(self, image_latents, vae):
         return image_latents
 
+    # called after postprocess_vae_encode, before generic scale/shift
+    def normalize_vae_encode(self, image_latents, vae):
+        return None
+
     # called after scale_and_shift, before vae decoding
     def preprocess_decoding(self, latents, server_args=None, vae=None):
         return latents

@@ -90,7 +90,7 @@ class NGRAMWorker:
     def remove_external_corpus(self, corpus_id: str) -> None:
         self.ngram_corpus.remove_external_corpus(corpus_id)
 
-    def list_external_corpora(self) -> list[str]:
+    def list_external_corpora(self) -> dict[str, int]:
         return self.ngram_corpus.list_external_corpora()
 
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):

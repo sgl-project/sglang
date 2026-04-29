@@ -1,11 +1,9 @@
-"""Analyze SGLang LLM torch profiler traces into kernel/category shares."""
+"""Internal kernel attribution helpers for triage-only torch-profiler analysis."""
 
 from __future__ import annotations
 
-import argparse
 import json
 import re
-import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -14,19 +12,16 @@ from typing import DefaultDict, Dict, Iterable, List, Optional, Sequence, Tuple
 from profile_common import (
     coerce_optional_int,
     contains_any_keyword,
-    discover_trace_targets,
     extract_trace_events,
     has_stream_marker,
     is_annotation_event,
     is_complete_duration_event,
     is_non_kernel_trace_category,
     is_trace_metadata_name,
-    load_trace_json,
     looks_like_python_scope_name,
     normalize_repo_relative_path,
     normalize_text,
     parse_stage,
-    run_profiler,
     select_heaviest_pid,
 )
 
@@ -197,16 +192,12 @@ NOISE_FRAME_PREFIXES = (
     "<string>(",
     "<built-in method ",
 )
-ALLREDUCE_FUSION_PATH = (
-    "python/sglang/srt/layers/layernorm.py:89 _forward_with_allreduce_fusion"
-    "<br>python/sglang/srt/distributed/communication_op.py:21 "
-    "tensor_model_parallel_fused_allreduce_rmsnorm"
-)
-QWEN3_QK_ROPE_FUSION_PATH = (
-    "python/sglang/srt/models/qwen3.py:141 forward_prepare_native"
-    "<br>python/sglang/srt/models/utils.py:230 apply_qk_norm"
-    "<br>python/sglang/jit_kernel/fused_qknorm_rope.py:34 fused_qk_norm_rope_out"
-    "<br>python/sglang/srt/models/qwen3_moe.py:592 apply_qk_norm_rope"
+
+LOW_LEVEL_FRAME_PREFIXES = (
+    "triton/runtime/",
+    "triton/backends/",
+    "torch/_ops.py",
+    "torch/nn/modules/module.py",
 )
 
 
@@ -295,12 +286,656 @@ class KernelRow:
 @dataclass
 class FusionOpportunity:
     pattern: str
+    status: str
     confidence: str
     related_us: float
     evidence: str
     current_locations: str
     candidate_path: str
     rationale: str
+    covered_row_keys: Tuple[Tuple[str, str, str], ...] = field(
+        default_factory=tuple, repr=False
+    )
+    pattern_span: int = field(default=1, repr=False)
+    has_active_match: bool = field(default=False, repr=False)
+    priority: int = field(default=0, repr=False)
+    subsumes: Tuple[str, ...] = field(default_factory=tuple, repr=False)
+
+
+@dataclass(frozen=True)
+class FusionPatternSpec:
+    pattern: str
+    candidate_path: str
+    active_keywords: Tuple[str, ...] = ()
+    split_groups: Tuple[Tuple[str, ...], ...] = ()
+    rationale_hint: str = ""
+    origin: str = "mainline"
+    model_include: Tuple[str, ...] = ()
+    model_exclude: Tuple[str, ...] = ()
+    min_tp_size: int = 1
+    require_tp: bool = False
+    min_share: float = 0.25
+    likely_share: float = 3.0
+    priority: int = 0
+    subsumes: Tuple[str, ...] = ()
+
+
+FUSION_PATTERN_REGISTRY: Tuple[FusionPatternSpec, ...] = (
+    FusionPatternSpec(
+        pattern="Fused residual add + RMSNorm",
+        candidate_path=(
+            "python/sglang/srt/layers/layernorm.py"
+            "<br>python/sglang/srt/layers/quantization/modelslim/modelslim.py"
+        ),
+        active_keywords=(
+            "fused_add_rmsnorm",
+            "gemma_fused_add_rmsnorm",
+            "npu_add_rms_norm",
+            "add_rmsnorm_bias",
+        ),
+        rationale_hint=(
+            "Residual add plus RMSNorm already has fused implementations across"
+            " several backends."
+        ),
+        min_share=0.1,
+        likely_share=1.0,
+    ),
+    FusionPatternSpec(
+        pattern="FlashInfer unified allreduce_fusion",
+        candidate_path=(
+            "python/sglang/srt/layers/flashinfer_comm_fusion.py"
+            "<br>python/sglang/srt/layers/layernorm.py"
+            "<br>python/sglang/srt/layers/communicator.py"
+        ),
+        active_keywords=(
+            "allreduce_fusion",
+            "fusedaddrmsnormkernel",
+            "flashinfer_comm_fusion.py",
+        ),
+        split_groups=(
+            (
+                "cross_device_reduce",
+                "allreduce",
+                "all_reduce",
+                "custom_all_reduce_ops.py",
+            ),
+            ("rmsnorm", "layernorm", "fused_add_rmsnorm", "layernorm.py"),
+        ),
+        rationale_hint=(
+            "FlashInfer already exposes a TP all-reduce plus residual/RMSNorm"
+            " fusion path."
+        ),
+        require_tp=True,
+        min_tp_size=2,
+        min_share=0.5,
+        likely_share=4.0,
+    ),
+    FusionPatternSpec(
+        pattern="AITER allreduce fusion",
+        candidate_path=(
+            "python/sglang/srt/distributed/communication_op.py"
+            "<br>python/sglang/srt/layers/communicator.py"
+            "<br>python/sglang/srt/layers/layernorm.py"
+        ),
+        active_keywords=(
+            "tensor_model_parallel_fused_allreduce_rmsnorm",
+            "apply_aiter_all_reduce_fusion",
+            "custom_fused_ar_rms",
+        ),
+        split_groups=(
+            ("allreduce", "all_reduce", "cross_device_reduce"),
+            ("rmsnorm", "layernorm"),
+        ),
+        rationale_hint=(
+            "ROCm already has an AITER fused all-reduce plus RMSNorm family."
+        ),
+        require_tp=True,
+        min_tp_size=2,
+        min_share=0.5,
+        likely_share=4.0,
+    ),
+    FusionPatternSpec(
+        pattern="Fused activation-and-mul (SwiGLU / GeGLU)",
+        candidate_path="python/sglang/srt/layers/activation.py",
+        active_keywords=("silu_and_mul", "gelu_and_mul", "npu_swiglu"),
+        rationale_hint=(
+            "Packed MLP activation and multiply already has dedicated fused ops."
+        ),
+        min_share=0.1,
+        likely_share=1.0,
+    ),
+    FusionPatternSpec(
+        pattern="In-place QK RMSNorm",
+        candidate_path=(
+            "python/sglang/srt/models/utils.py" "<br>python/sglang/jit_kernel/norm.py"
+        ),
+        active_keywords=("fused_inplace_qknorm", "minimaxm2rmsnormtp"),
+        split_groups=(("apply_qk_norm", "q_norm", "k_norm", "qknorm"),),
+        rationale_hint=(
+            "Q/K normalization already has in-place or model-specific fused"
+            " implementations."
+        ),
+        min_share=0.3,
+        likely_share=2.0,
+    ),
+    FusionPatternSpec(
+        pattern="Fused QK RMSNorm + RoPE",
+        candidate_path=(
+            "python/sglang/jit_kernel/fused_qknorm_rope.py"
+            "<br>python/sglang/srt/models/qwen3_moe.py"
+        ),
+        active_keywords=("fused_qknorm_rope", "fused_qk_norm_rope"),
+        split_groups=(
+            ("apply_qk_norm", "q_norm", "k_norm", "qknorm"),
+            ("apply_rope", "rotary", "rope", "mrope"),
+        ),
+        rationale_hint=(
+            "SGLang already ships a fused QK-norm plus RoPE kernel family."
+        ),
+        min_share=0.3,
+        likely_share=2.0,
+        priority=30,
+    ),
+    FusionPatternSpec(
+        pattern="Fused QK RoPE reshape + KV cache write",
+        candidate_path="python/sglang/srt/layers/attention/utils.py",
+        active_keywords=("fused_qk_rope_reshape_and_cache",),
+        split_groups=(
+            ("rotary", "rope", "mrope"),
+            ("reshape", "set_kv", "kv_cache", "cache write", "paged kv"),
+        ),
+        rationale_hint=(
+            "Attention prep already has a fused RoPE plus reshape plus cache"
+            " write path."
+        ),
+        min_share=0.4,
+        likely_share=2.0,
+        priority=40,
+        subsumes=("Fused RoPE + KV cache store",),
+    ),
+    FusionPatternSpec(
+        pattern="Fused RoPE + KV cache store",
+        candidate_path=(
+            "python/sglang/jit_kernel/rope.py" "<br>python/sglang/srt/models/utils.py"
+        ),
+        active_keywords=("fused_set_kv_buffer",),
+        split_groups=(
+            ("rotary", "rope", "mrope"),
+            ("set_kv_buffer", "kv cache write", "paged kv", "cache write"),
+        ),
+        rationale_hint=(
+            "RoPE application and KV cache storage already have fused fast"
+            " paths in several models."
+        ),
+        min_share=0.3,
+        likely_share=1.5,
+        priority=20,
+    ),
+    FusionPatternSpec(
+        pattern="Fused decode metadata setup",
+        candidate_path=("python/sglang/srt/layers/attention/flashattention_backend.py"),
+        active_keywords=(
+            "normal_decode_set_metadata",
+            "cache_seqlens_int32",
+            "cu_seqlens_k",
+            "swa_page_table",
+        ),
+        rationale_hint=(
+            "Decode metadata setup already has a fused Triton preparation path."
+        ),
+        min_share=0.05,
+        likely_share=0.5,
+    ),
+    FusionPatternSpec(
+        pattern="NSA fused metadata copy for graph replay",
+        candidate_path="python/sglang/jit_kernel/fused_metadata_copy.py",
+        active_keywords=(
+            "fused_metadata_copy",
+            "fused_metadata_copy_multi",
+            "fused_nsa_cache_seqlens",
+            "fused_flashmla_metadata",
+        ),
+        rationale_hint=(
+            "NSA replay metadata copies are already fused into one-kernel" " families."
+        ),
+        min_share=0.02,
+        likely_share=0.2,
+    ),
+    FusionPatternSpec(
+        pattern="DeepSeek MLA fused projection + norm + RoPE",
+        candidate_path=(
+            "python/sglang/srt/models/deepseek_common/attention_forward_methods/"
+            "forward_mla_fused_rope_cpu.py"
+            "<br>python/sglang/srt/models/deepseek_common/attention_forward_methods/"
+            "forward_mla_fused_rope_rocm.py"
+        ),
+        active_keywords=(
+            "qkv_proj_with_rope_fused_weight",
+            "fused_qkv_a_proj_with_mqa",
+            "forward_absorb_fused_mla_rope",
+        ),
+        split_groups=(
+            ("mla", "qkv_a_proj", "q_a_proj"),
+            ("qknorm", "rmsnorm", "apply_qk_norm"),
+            ("rope", "rotary"),
+        ),
+        rationale_hint=(
+            "DeepSeek MLA has backend-specific fused projection, norm, and"
+            " RoPE prep paths."
+        ),
+        model_include=("deepseek", "glm"),
+        min_share=0.4,
+        likely_share=2.0,
+        priority=80,
+        subsumes=("Fused QK RMSNorm + RoPE",),
+    ),
+    FusionPatternSpec(
+        pattern="Fused QK RoPE concat + MLA cache write",
+        candidate_path=(
+            "python/sglang/srt/layers/rocm_linear_utils.py"
+            "<br>python/sglang/srt/models/deepseek_common/attention_forward_methods/"
+            "forward_mla.py"
+        ),
+        active_keywords=("fused_qk_rope_cat_and_cache_mla", "set_mla_kv_buffer"),
+        split_groups=(
+            ("mla", "rope", "rotary"),
+            ("cache", "kv_buffer", "concat"),
+        ),
+        rationale_hint=(
+            "MLA RoPE packing and cache write already have fused backend paths."
+        ),
+        model_include=("deepseek", "glm"),
+        min_share=0.3,
+        likely_share=1.5,
+        priority=85,
+        subsumes=("Fused RoPE + KV cache store",),
+    ),
+    FusionPatternSpec(
+        pattern="Qwen3 decode fused QK norm + 3D mRoPE + KV cache write",
+        candidate_path="python/sglang/srt/models/qwen3.py",
+        active_keywords=("fused_qk_norm_mrope_3d_cache_pts_quant_shuffle",),
+        split_groups=(
+            ("apply_qk_norm", "q_norm", "k_norm", "qknorm"),
+            ("mrope", "3d rope", "rotary"),
+            ("cache", "kv_buffer", "paged kv", "cache write"),
+        ),
+        rationale_hint=(
+            "Qwen3-style decode already has a fused QK-norm plus 3D mRoPE plus"
+            " cache-write path."
+        ),
+        model_include=("qwen3",),
+        model_exclude=("qwen3.5", "qwen3_5"),
+        min_share=0.4,
+        likely_share=2.0,
+        priority=90,
+        subsumes=(
+            "Fused QK RMSNorm + RoPE",
+            "Fused QK RoPE reshape + KV cache write",
+            "Fused RoPE + KV cache store",
+        ),
+    ),
+    FusionPatternSpec(
+        pattern="Fused MoE router / top-k / softcapping",
+        candidate_path="python/sglang/srt/layers/moe/router.py",
+        active_keywords=("fusedmoerouter", "fused_moe_router"),
+        split_groups=(
+            ("router", "gate", "router logits"),
+            ("topk", "softmax", "softcap", "tanh"),
+        ),
+        rationale_hint=(
+            "MoE routing already has fused router, softcap, and top-k kernels."
+        ),
+        min_share=0.3,
+        likely_share=1.5,
+        priority=30,
+    ),
+    FusionPatternSpec(
+        pattern="Fused MoE grouped-topk / gate kernels",
+        candidate_path="python/sglang/srt/layers/moe/topk.py",
+        active_keywords=(
+            "fused_topk_deepseek",
+            "moe_fused_gate",
+            "aiter_fused_topk",
+            "kimi_k2_moe_fused_gate",
+        ),
+        split_groups=(
+            ("grouped_topk", "topk", "biased_grouped_topk"),
+            ("gate", "router", "renorm", "routed scaling"),
+        ),
+        rationale_hint=(
+            "Grouped-topk, bias handling, and routed scaling already have fused"
+            " gate kernels."
+        ),
+        min_share=0.3,
+        likely_share=1.5,
+        priority=50,
+        subsumes=("Fused MoE router / top-k / softcapping",),
+    ),
+    FusionPatternSpec(
+        pattern="Fused MoE sum + all-reduce",
+        candidate_path=("python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py"),
+        active_keywords=("fuse_sum_all_reduce", "enable_fused_moe_sum_all_reduce"),
+        split_groups=(
+            ("fused_moe", "expert", "moe"),
+            ("allreduce", "all_reduce", "cross_device_reduce"),
+        ),
+        rationale_hint=(
+            "The second MoE GEMM already has a fused sum-plus-all-reduce path."
+        ),
+        require_tp=True,
+        min_tp_size=2,
+        min_share=0.4,
+        likely_share=2.0,
+    ),
+    FusionPatternSpec(
+        pattern="Fused MoE activation + quant / re-quant",
+        candidate_path=(
+            "python/sglang/srt/layers/moe/ep_moe/kernels.py"
+            "<br>python/sglang/jit_kernel/nvfp4.py"
+            "<br>python/sglang/srt/layers/moe/cutlass_w4a8_moe.py"
+        ),
+        active_keywords=(
+            "silu_and_mul_scaled_fp4",
+            "npu_dequant_swiglu_quant",
+            "swiglu_quant",
+        ),
+        split_groups=(
+            ("silu", "gelu", "act_and_mul"),
+            ("quant", "fp8", "mxfp", "nvfp4", "dequant"),
+        ),
+        rationale_hint=(
+            "Quantized MoE backends already fuse activation with re-quantization."
+        ),
+        min_share=0.3,
+        likely_share=1.5,
+    ),
+    FusionPatternSpec(
+        pattern="DeepSeek comm-prep fused RMSNorm + quant / flatten-quant",
+        candidate_path=(
+            "python/sglang/srt/layers/communicator.py"
+            "<br>python/sglang/srt/models/deepseek_common/attention_forward_methods/"
+            "forward_mla.py"
+            "<br>python/sglang/srt/models/deepseek_common/attention_forward_methods/"
+            "forward_mha.py"
+        ),
+        active_keywords=(
+            "fused_rms_fp8_group_quant",
+            "fused_rms_mxfp4_quant",
+            "fused_flatten_fp8_group_quant",
+            "fused_flatten_mxfp4_quant",
+        ),
+        split_groups=(
+            ("rmsnorm", "layernorm", "flatten"),
+            ("fp8", "mxfp4", "quant"),
+        ),
+        rationale_hint=(
+            "DeepSeek comm preparation already fuses norm or flatten work with"
+            " quantization."
+        ),
+        model_include=("deepseek", "glm"),
+        min_share=0.3,
+        likely_share=1.5,
+    ),
+    FusionPatternSpec(
+        pattern="NSA fused top-k transform / page-table build",
+        candidate_path="python/sglang/srt/layers/attention/nsa_backend.py",
+        active_keywords=(
+            "fast_topk_transform_fused",
+            "fast_topk_transform_ragged_fused",
+        ),
+        rationale_hint=(
+            "NSA top-k metadata preparation already has fused transform kernels."
+        ),
+        min_share=0.05,
+        likely_share=0.3,
+    ),
+    FusionPatternSpec(
+        pattern="NSA fused quantize + indexed K-cache store",
+        candidate_path=(
+            "python/sglang/jit_kernel/fused_store_index_cache.py"
+            "<br>python/sglang/srt/layers/attention/nsa/nsa_indexer.py"
+        ),
+        active_keywords=("fused_store_index_k_cache",),
+        split_groups=(
+            ("act_quant", "quant", "scale_buffer"),
+            ("index_k", "cache", "store"),
+        ),
+        rationale_hint=(
+            "NSA already has a fused quantize-and-indexed-store kernel family."
+        ),
+        min_share=0.2,
+        likely_share=1.0,
+    ),
+    FusionPatternSpec(
+        pattern="Fused sampling temperature + softmax",
+        candidate_path=(
+            "python/sglang/srt/layers/fused_sampling.py"
+            "<br>python/sglang/srt/layers/sampler.py"
+        ),
+        active_keywords=("fused_temperature_softmax",),
+        split_groups=(
+            ("temperature", "temp_scale"),
+            ("softmax", "sampling"),
+        ),
+        rationale_hint=(
+            "Decode-time sampling already has fused temperature and softmax" " kernels."
+        ),
+        min_share=0.05,
+        likely_share=0.5,
+    ),
+    FusionPatternSpec(
+        pattern="Fused logit softcap",
+        candidate_path=(
+            "python/sglang/srt/layers/elementwise.py"
+            "<br>python/sglang/srt/layers/logits_processor.py"
+        ),
+        active_keywords=("fused_softcap", "final_logit_softcapping"),
+        rationale_hint=(
+            "Logit softcap math already has dedicated fused elementwise kernels."
+        ),
+        min_share=0.02,
+        likely_share=0.2,
+    ),
+    FusionPatternSpec(
+        pattern="PR #20667 Qwen3.5 fused QK norm + RoPE + KV cache write",
+        candidate_path=(
+            "PR #20667"
+            "<br>python/sglang/srt/models/qwen3_5.py"
+            "<br>python/sglang/srt/models/utils.py"
+        ),
+        active_keywords=(
+            "fused_qk_norm_rope_cache_pts_quant_shuffle",
+            "fused_qk_norm_mrope_3d_cache_pts_quant_shuffle",
+        ),
+        split_groups=(
+            ("apply_qk_norm", "qknorm", "q_norm", "k_norm"),
+            ("rotary", "rope", "mrope"),
+            ("cache", "kv_buffer", "cache write"),
+        ),
+        rationale_hint=(
+            "An open SGLang ROCm PR already wires a fused QK-norm plus RoPE"
+            " plus KV-cache family for Qwen3.5."
+        ),
+        origin="inflight",
+        model_include=("qwen3.5", "qwen3_5"),
+        min_share=0.4,
+        likely_share=2.0,
+        priority=100,
+        subsumes=(
+            "Fused QK RMSNorm + RoPE",
+            "Fused QK RoPE reshape + KV cache write",
+            "Fused RoPE + KV cache store",
+        ),
+    ),
+    FusionPatternSpec(
+        pattern="PR #22392 CUTLASS FP8 scaled MM replacing nvjet",
+        candidate_path=(
+            "PR #22392"
+            "<br>sgl-kernel/python/sgl_kernel/gemm.py"
+            "<br>python/sglang/srt/layers/quantization/fp8_utils.py"
+        ),
+        active_keywords=("cutlass_scaled_mm", "fp8_scaled_mm"),
+        split_groups=(
+            ("nvjet", "_scaled_mm"),
+            ("memset", "memcpy128"),
+        ),
+        rationale_hint=(
+            "An open SGLang PR already replaces nvjet FP8 GEMM with CUTLASS to"
+            " remove memset bubbles and extra copies."
+        ),
+        origin="inflight",
+        min_share=0.2,
+        likely_share=1.0,
+        priority=90,
+    ),
+    FusionPatternSpec(
+        pattern="vLLM-origin Attention + Quantization",
+        candidate_path=(
+            "vllm/compilation/passes/fusion/attn_quant_fusion.py"
+            "<br>vllm/docs/design/fusions.md"
+        ),
+        active_keywords=(
+            "merge_attn_states",
+            "attn_quant_fusion",
+            "output_group_scale",
+        ),
+        split_groups=(
+            ("attention", "flash_attn", "flashattention", "mla"),
+            ("quant", "fp8", "nvfp4", "group_scale"),
+        ),
+        rationale_hint=(
+            "vLLM already treats attention-epilogue quantization as a reusable"
+            " fused family."
+        ),
+        origin="upstream",
+        min_share=0.3,
+        likely_share=1.5,
+    ),
+    FusionPatternSpec(
+        pattern="vLLM-origin RMSNorm + Quantization",
+        candidate_path=(
+            "vllm/compilation/passes/fusion/rms_quant_fusion.py"
+            "<br>vllm/docs/design/fusions.md"
+        ),
+        active_keywords=(
+            "fused_add_rms_norm_static_fp8_quant",
+            "rms_quant_fusion",
+            "norm_quant",
+        ),
+        split_groups=(
+            ("rmsnorm", "layernorm", "fused_add_rms_norm"),
+            ("quant", "fp8", "fp4", "per-group"),
+        ),
+        rationale_hint=(
+            "vLLM already has a compile-time norm-plus-quant fusion family."
+        ),
+        origin="upstream",
+        min_share=0.3,
+        likely_share=1.5,
+    ),
+    FusionPatternSpec(
+        pattern="vLLM-origin SiLU+Mul + Quantization",
+        candidate_path=(
+            "vllm/compilation/passes/fusion/act_quant_fusion.py"
+            "<br>vllm/docs/design/fusions.md"
+        ),
+        active_keywords=(
+            "silu_mul_quant_fp4",
+            "fused_silu_mul_block_quant",
+            "act_quant_fusion",
+        ),
+        split_groups=(
+            ("silu", "gelu", "act_and_mul"),
+            ("quant", "fp8", "fp4", "block_quant"),
+        ),
+        rationale_hint=(
+            "vLLM already treats activation-plus-quant as a reusable fusion" " family."
+        ),
+        origin="upstream",
+        min_share=0.3,
+        likely_share=1.5,
+    ),
+    FusionPatternSpec(
+        pattern="vLLM-origin DSV3 router GEMM",
+        candidate_path=(
+            "vllm/model_executor/layers/fused_moe/router/gate_linear.py"
+            "<br>vllm/csrc/moe/dsv3_router_gemm_entry.cu"
+        ),
+        active_keywords=("dsv3_router_gemm", "fp32_router_gemm"),
+        split_groups=(
+            ("router", "gate", "router logits"),
+            ("gemm", "matmul", "cublas", "cutlass"),
+        ),
+        rationale_hint=(
+            "vLLM already has a specialized DeepSeek router GEMM family for"
+            " small decode batches."
+        ),
+        origin="upstream",
+        min_share=0.3,
+        likely_share=1.5,
+    ),
+    FusionPatternSpec(
+        pattern="vLLM-origin DeepSeek min-latency fused QKV-A projection",
+        candidate_path=(
+            "vllm/model_executor/models/deepseek_v2.py"
+            "<br>vllm/csrc/dsv3_fused_a_gemm.cu"
+        ),
+        active_keywords=("dsv3_fused_a_gemm", "fused_qkv_a_proj"),
+        split_groups=(
+            ("q_a_proj", "kv_a_proj", "weights_proj"),
+            ("gemm", "matmul", "cutlass", "cublas"),
+        ),
+        rationale_hint=(
+            "vLLM already has a fused DeepSeek QKV-A projection family for"
+            " decode-latency reduction."
+        ),
+        origin="upstream",
+        model_include=("deepseek", "glm"),
+        min_share=0.3,
+        likely_share=1.5,
+    ),
+    FusionPatternSpec(
+        pattern="PR #38621 fused QK norm + RoPE + cache + quant",
+        candidate_path=(
+            "PR #38621"
+            "<br>vllm/csrc/fused_qk_norm_rope_cache_quant.cu"
+            "<br>vllm/compilation/passes/fusion/qk_norm_rope_cache_quant_fusion.py"
+        ),
+        active_keywords=("fused_qk_norm_rope_cache_quant",),
+        split_groups=(
+            ("qknorm", "q_norm", "k_norm"),
+            ("rope", "rotary", "mrope"),
+            ("cache", "kv_buffer", "cache write"),
+            ("quant", "fp8", "nvfp4"),
+        ),
+        rationale_hint=(
+            "An open vLLM PR already treats QK-norm plus RoPE plus cache plus"
+            " quant as a concrete in-flight fusion family."
+        ),
+        origin="inflight",
+        min_share=0.4,
+        likely_share=2.0,
+        priority=100,
+        subsumes=("vLLM-origin Attention + Quantization",),
+    ),
+    FusionPatternSpec(
+        pattern="PR #37045 MiniMax allreduce_rms kernels",
+        candidate_path=("PR #37045" "<br>vllm/model_executor/models/minimax_m2.py"),
+        active_keywords=("minimax_allreduce_rms", "minimax_allreduce_rmsnorm"),
+        split_groups=(
+            ("q_norm", "k_norm", "rmsnorm", "minimax"),
+            ("allreduce", "all_reduce", "cross_device_reduce"),
+        ),
+        rationale_hint=(
+            "An open vLLM PR already ports TRTLLM MiniMax allreduce-plus-RMSNorm"
+            " kernels."
+        ),
+        origin="inflight",
+        model_include=("minimax",),
+        min_share=0.3,
+        likely_share=1.5,
+    ),
+)
 
 
 def short_name(name: str, max_len: int = 96) -> str:
@@ -432,20 +1067,33 @@ def choose_best_location(locations: Dict[str, MappingSiteAggregate]) -> str:
 
 
 def frame_priority(frame_name: str) -> int:
-    text = str(frame_name).strip()
-    if text.startswith(NOISE_FRAME_PREFIXES):
+    raw_text = str(frame_name).strip()
+    normalized_text = normalize_source_location(raw_text)
+    if raw_text.startswith(NOISE_FRAME_PREFIXES):
         return -20
-    if text.startswith("/data/") or text.startswith("/Users/"):
-        if "/sglang/" in text:
+    if normalized_text.startswith("python/sglang/"):
+        return 300
+    if normalized_text.startswith("sglang/"):
+        return 290
+    if normalized_text.startswith("sgl_kernel/"):
+        return 260
+    if normalized_text.startswith("triton_kernels/"):
+        return 220
+    if normalized_text.startswith(LOW_LEVEL_FRAME_PREFIXES):
+        return 0
+    if raw_text.startswith("/data/") or raw_text.startswith("/Users/"):
+        if "/sglang/" in raw_text:
             return 120
         return 100
-    if ".py(" in text and "/sglang/" in text:
+    if ".py(" in raw_text and "/sglang/" in raw_text:
         return 110
-    if ".py(" in text and ("site-packages" in text or text.startswith("torch/")):
+    if ".py:" in normalized_text and (
+        "site-packages" in raw_text or normalized_text.startswith("torch/")
+    ):
         return 45
-    if ".py(" in text:
+    if ".py:" in normalized_text:
         return 35
-    if text.startswith("<built-in method "):
+    if raw_text.startswith("<built-in method "):
         return -10
     return 0
 
@@ -903,6 +1551,43 @@ def relaxed_kernel_entry_lookup(
         if score > best_score:
             best_key = candidate_key
             best_score = score
+    if best_key:
+        return kernels.get(best_key)
+
+    # Long auto-generated kernels such as CUTLASS / FlashAttention templates can
+    # differ in the middle of the symbol while still sharing the same high-level
+    # family. Fall back to a conservative common-prefix match so we can still
+    # recover the higher-level Python callsite from the mapping trace.
+    lowered_compact = normalize_match_text(kernel_name)
+    if len(lowered_compact) < 96:
+        return None
+
+    def common_prefix_len(left: str, right: str) -> int:
+        count = 0
+        for left_ch, right_ch in zip(left, right):
+            if left_ch != right_ch:
+                break
+            count += 1
+        return count
+
+    best_key = None
+    best_score = -1
+    for candidate_key in kernels:
+        candidate_compact = normalize_match_text(candidate_key)
+        if len(candidate_compact) < 96:
+            continue
+        prefix_len = common_prefix_len(lowered_compact, candidate_compact)
+        shorter_len = min(len(lowered_compact), len(candidate_compact))
+        if prefix_len < 64 or prefix_len < int(shorter_len * 0.4):
+            continue
+        score = prefix_len
+        if lowered_compact.startswith(
+            "voidcutlassdevicekernelflash"
+        ) and candidate_compact.startswith("voidcutlassdevicekernelflash"):
+            score += 32
+        if score > best_score:
+            best_key = candidate_key
+            best_score = score
     return kernels.get(best_key) if best_key else None
 
 
@@ -1036,9 +1721,21 @@ def format_location_for_fusion_display(location: str) -> str:
     return f"{match.group('func')} @ {match.group('path')}:{match.group('line')}"
 
 
+def normalize_match_text(text: object) -> str:
+    return re.sub(r"[^0-9A-Za-z]+", "", normalize_text(text)).lower()
+
+
 def row_matches(row: KernelRow, *needles: str) -> bool:
     lowered = " ".join([row.name, row.location, row.cpu_op]).lower()
-    return any(needle in lowered for needle in needles)
+    lowered_compact = normalize_match_text(lowered)
+    for needle in needles:
+        needle_lowered = needle.lower()
+        if needle_lowered in lowered:
+            return True
+        needle_compact = normalize_match_text(needle)
+        if needle_compact and needle_compact in lowered_compact:
+            return True
+    return False
 
 
 def summarize_text(values: Iterable[str], limit: int = 4) -> str:
@@ -1055,11 +1752,19 @@ def summarize_locations(values: Iterable[str], limit: int = 4) -> str:
 
 
 def summarize_evidence(
-    rows: Sequence[KernelRow], total_us: float, limit: int = 3
+    rows: Sequence[KernelRow],
+    total_us: float,
+    limit: int = 3,
+    min_share_pct: float = 1.0,
 ) -> str:
     items = []
-    for row in rows[:limit]:
-        items.append(f"{row.name} ({pct(row.total_us, total_us):.1f}%)")
+    for row in rows:
+        share = pct(row.total_us, total_us)
+        if share < min_share_pct:
+            continue
+        items.append(f"{row.name} ({share:.1f}%)")
+        if len(items) >= limit:
+            break
     return "<br>".join(items) if items else "-"
 
 
@@ -1067,6 +1772,150 @@ def model_path_from_server_args(server_args: Optional[dict]) -> str:
     if not isinstance(server_args, dict):
         return ""
     return str(server_args.get("model_path") or server_args.get("model") or "")
+
+
+def matching_rows_for_keywords(
+    kernel_rows: Sequence[KernelRow],
+    keywords: Sequence[str],
+) -> List[KernelRow]:
+    if not keywords:
+        return []
+    return [row for row in kernel_rows if row_matches(row, *keywords)]
+
+
+def row_identity(row: KernelRow) -> Tuple[str, str, str]:
+    return (row.name, row.location, row.cpu_op)
+
+
+def merge_kernel_rows(*groups: Sequence[KernelRow]) -> List[KernelRow]:
+    output: List[KernelRow] = []
+    seen = set()
+    for group in groups:
+        for row in group:
+            row_key = row_identity(row)
+            if row_key in seen:
+                continue
+            seen.add(row_key)
+            output.append(row)
+    return output
+
+
+def pattern_model_matches(spec: FusionPatternSpec, model_path: str) -> bool:
+    if spec.model_include and not any(
+        token in model_path for token in spec.model_include
+    ):
+        return False
+    if spec.model_exclude and any(token in model_path for token in spec.model_exclude):
+        return False
+    return True
+
+
+def pattern_status(spec: FusionPatternSpec, has_active_match: bool) -> str:
+    if spec.origin == "mainline":
+        return "active fused path" if has_active_match else "split candidate"
+    if spec.origin == "upstream":
+        return "upstream precedent" if has_active_match else "upstream split precedent"
+    return "in-flight precedent" if has_active_match else "in-flight split precedent"
+
+
+def build_pattern_rationale(
+    spec: FusionPatternSpec,
+    has_active_match: bool,
+    related_us: float,
+    total_us: float,
+) -> str:
+    share = pct(related_us, total_us)
+    if spec.origin == "mainline":
+        if has_active_match:
+            return (
+                f"This trace already hits the `{spec.pattern}` family directly at {share:.1f}% related GPU time. "
+                f"{spec.rationale_hint}"
+            )
+        return (
+            f"Related split kernels occupy {share:.1f}% of cumulative GPU time, and the checked-out SGLang tree "
+            f"already exposes this fusion family. {spec.rationale_hint}"
+        )
+    if spec.origin == "upstream":
+        return (
+            f"This trace matches a reusable upstream vLLM precedent at {share:.1f}% related GPU time. "
+            f"{spec.rationale_hint}"
+        )
+    return (
+        f"This trace matches a PR-backed / in-flight pattern at {share:.1f}% related GPU time. "
+        f"{spec.rationale_hint}"
+    )
+
+
+def pattern_span(spec: FusionPatternSpec) -> int:
+    return max(len(spec.split_groups), 1 if spec.active_keywords else 0)
+
+
+def fusion_priority_key(item: FusionOpportunity) -> Tuple[int, int, int, float]:
+    return (
+        item.priority,
+        item.pattern_span,
+        len(item.covered_row_keys),
+        item.related_us,
+    )
+
+
+def detect_pattern_match(
+    spec: FusionPatternSpec,
+    kernel_rows: Sequence[KernelRow],
+    total_us: float,
+    model_path: str,
+    tp_size: int,
+) -> Optional[FusionOpportunity]:
+    if total_us <= 0:
+        return None
+    if spec.require_tp and tp_size < spec.min_tp_size:
+        return None
+    if not pattern_model_matches(spec, model_path):
+        return None
+
+    active_rows = matching_rows_for_keywords(kernel_rows, spec.active_keywords)
+    split_groups = [
+        matching_rows_for_keywords(kernel_rows, keywords)
+        for keywords in spec.split_groups
+    ]
+    has_active_match = bool(active_rows)
+    has_split_match = bool(split_groups) and all(split_groups)
+    if not has_active_match and not has_split_match:
+        return None
+
+    related_rows = merge_kernel_rows(active_rows, *split_groups)
+    related_us = sum(row.total_us for row in related_rows)
+    if related_us <= 0:
+        return None
+    if not has_active_match and pct(related_us, total_us) < spec.min_share:
+        return None
+
+    return FusionOpportunity(
+        pattern=spec.pattern,
+        status=pattern_status(spec, has_active_match),
+        confidence=(
+            "Likely"
+            if has_active_match or pct(related_us, total_us) >= spec.likely_share
+            else "Conditional"
+        ),
+        related_us=related_us,
+        evidence=summarize_evidence(related_rows, total_us),
+        current_locations=summarize_locations(
+            location for row in related_rows for location in kernel_row_locations(row)
+        ),
+        candidate_path=spec.candidate_path,
+        rationale=build_pattern_rationale(
+            spec=spec,
+            has_active_match=has_active_match,
+            related_us=related_us,
+            total_us=total_us,
+        ),
+        covered_row_keys=tuple(row_identity(row) for row in related_rows),
+        pattern_span=pattern_span(spec),
+        has_active_match=has_active_match,
+        priority=spec.priority,
+        subsumes=spec.subsumes,
+    )
 
 
 def detect_fusion_opportunities(
@@ -1084,106 +1933,31 @@ def detect_fusion_opportunities(
     if isinstance(server_args, dict):
         tp_size = int(server_args.get("tp_size") or 1)
 
-    comm_rows = [
-        row
-        for row in kernel_rows
-        if row.category == "communication"
-        and (
-            row_matches(
-                row,
-                "cross_device_reduce",
-                "allreduce",
-                "all_reduce",
-                "custom_all_reduce_ops.py",
-            )
+    raw_matches: List[FusionOpportunity] = []
+    for spec in FUSION_PATTERN_REGISTRY:
+        opportunity = detect_pattern_match(
+            spec=spec,
+            kernel_rows=kernel_rows,
+            total_us=total_us,
+            model_path=model_path,
+            tp_size=tp_size,
         )
-    ]
-    comm_us = sum(row.total_us for row in comm_rows)
-    if comm_rows and (
-        tp_size > 1
-        or any(row_matches(row, "custom_all_reduce_ops.py") for row in comm_rows)
-    ):
-        opportunities.append(
-            FusionOpportunity(
-                pattern="TP all-reduce + residual/RMSNorm",
-                confidence="Likely" if pct(comm_us, total_us) >= 4.0 else "Conditional",
-                related_us=comm_us,
-                evidence=summarize_evidence(comm_rows, total_us),
-                current_locations=summarize_locations(
-                    location
-                    for row in comm_rows
-                    for location in kernel_row_locations(row)
-                ),
-                candidate_path=ALLREDUCE_FUSION_PATH,
-                rationale=(
-                    f"TP communication already consumes {pct(comm_us, total_us):.1f}% of cumulative GPU kernel "
-                    "time, and SGLang already exposes a fused allreduce+RMSNorm path for the residual/norm "
-                    "boundary."
-                ),
-            )
-        )
+        if opportunity is not None:
+            raw_matches.append(opportunity)
 
-    is_qwen3_dense = (
-        "qwen3" in model_path
-        and "moe" not in model_path
-        and "qwen3-next" not in model_path
-    )
-    qwen3_qk_rows = [
-        row
-        for row in kernel_rows
-        if row_matches(
-            row,
-            "apply_qk_norm",
-            "fused_inplace_qknorm",
-            "qknorm",
-        )
-    ]
-    qwen3_rope_rows = [
-        row
-        for row in kernel_rows
-        if row_matches(
-            row,
-            "apply_rope",
-            "rope.py",
-            "rope_inplace",
-            "rotary",
-        )
-    ]
-    qwen3_rows: List[KernelRow] = []
-    seen_qwen3_keys = set()
-    for row in qwen3_qk_rows + qwen3_rope_rows:
-        row_key = (row.name, row.location, row.cpu_op)
-        if row_key in seen_qwen3_keys:
+    raw_matches.sort(key=fusion_priority_key, reverse=True)
+    consumed_row_keys = set()
+    blocked_patterns = set()
+    for opportunity in raw_matches:
+        if opportunity.pattern in blocked_patterns:
             continue
-        seen_qwen3_keys.add(row_key)
-        qwen3_rows.append(row)
-    qwen3_related_us = sum(row.total_us for row in qwen3_rows)
-    if (
-        is_qwen3_dense
-        and qwen3_qk_rows
-        and qwen3_rope_rows
-        and pct(qwen3_related_us, total_us) >= 1.0
-    ):
-        opportunities.append(
-            FusionOpportunity(
-                pattern="Q/K RMSNorm + RoPE before attention",
-                confidence="Conditional",
-                related_us=qwen3_related_us,
-                evidence=summarize_evidence(qwen3_rows, total_us),
-                current_locations=summarize_locations(
-                    location
-                    for row in qwen3_rows
-                    for location in kernel_row_locations(row)
-                ),
-                candidate_path=QWEN3_QK_ROPE_FUSION_PATH,
-                rationale=(
-                    "Dense Qwen3 still prepares Q/K with `apply_qk_norm` and then `rotary_emb` in separate source "
-                    "steps, while SGLang already ships a fused QK-norm+RoPE kernel path in its JIT/MoE stack."
-                ),
-            )
-        )
-
-    opportunities.sort(key=lambda item: item.related_us, reverse=True)
+        if any(
+            row_key in consumed_row_keys for row_key in opportunity.covered_row_keys
+        ):
+            continue
+        opportunities.append(opportunity)
+        consumed_row_keys.update(opportunity.covered_row_keys)
+        blocked_patterns.update(opportunity.subsumes)
     return opportunities
 
 
@@ -1242,7 +2016,7 @@ def generate_takeaways(
     if fusion_opportunities:
         top_pattern = fusion_opportunities[0]
         takeaways.append(
-            f"The strongest source-backed fuse candidate is `{top_pattern.pattern}` with {pct(top_pattern.related_us, total_us):.1f}% related GPU time in this stage."
+            f"The strongest source-backed fuse-pattern match is `{top_pattern.pattern}` ({top_pattern.status}) with {pct(top_pattern.related_us, total_us):.1f}% related GPU time in this stage."
         )
     return takeaways
 
@@ -1281,20 +2055,21 @@ def print_fusion_opportunity_table(
     opportunities: Sequence[FusionOpportunity],
     total_us: float,
 ) -> None:
-    print("\nKernel fuse opportunities (Markdown):")
+    print("\nKernel fuse pattern matches (Markdown):")
     print(
-        "| Pattern | Confidence | Related GPU time | Share | Evidence kernels | Current kernel Python location | Candidate fused Python path | Rationale |"
+        "| Pattern | Status | Confidence | Related GPU time | Share | Evidence kernels | Current kernel Python location | Reference path | Why it matters |"
     )
-    print("| --- | --- | ---: | ---: | --- | --- | --- | --- |")
+    print("| --- | --- | --- | ---: | ---: | --- | --- | --- | --- |")
     if not opportunities:
         print(
-            "| No medium-confidence source-backed fusion opportunity matched this trace. | - | - | - | - | - | - | - |"
+            "| No source-backed fuse pattern matched this trace. | - | - | - | - | - | - | - | - |"
         )
         return
     for item in opportunities:
         print(
-            "| {pattern} | {confidence} | {gpu_time} | {share:.1f}% | {evidence} | {current_locations} | {candidate_path} | {rationale} |".format(
+            "| {pattern} | {status} | {confidence} | {gpu_time} | {share:.1f}% | {evidence} | {current_locations} | {candidate_path} | {rationale} |".format(
                 pattern=escape_md_cell(item.pattern),
+                status=escape_md_cell(item.status),
                 confidence=escape_md_cell(item.confidence),
                 gpu_time=format_ms(item.related_us),
                 share=pct(item.related_us, total_us),
@@ -1406,177 +2181,3 @@ def print_report(
         ):
             print(f"  - {takeaway}")
         print()
-
-
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Analyze SGLang LLM torch profiler traces into kernel/category shares."
-    )
-    parser.add_argument("--input", type=str, help="Trace file or profile directory.")
-    parser.add_argument("--url", type=str, help="Running SGLang server URL.")
-    parser.add_argument(
-        "--output-dir", type=str, default=None, help="Output root for live profiling."
-    )
-    parser.add_argument(
-        "--num-steps", type=int, default=5, help="Profiler steps for live mode."
-    )
-    parser.add_argument(
-        "--profile-by-stage", action=argparse.BooleanOptionalAction, default=True
-    )
-    parser.add_argument(
-        "--merge-profiles", action=argparse.BooleanOptionalAction, default=False
-    )
-    parser.add_argument("--profile-prefix", type=str, default=None)
-    parser.add_argument("--probe-requests", type=int, default=1)
-    parser.add_argument(
-        "--probe-prompt",
-        type=str,
-        default="Explain what tensor parallelism is in one short paragraph.",
-    )
-    parser.add_argument("--probe-max-new-tokens", type=int, default=96)
-    parser.add_argument("--probe-delay", type=float, default=1.0)
-    parser.add_argument(
-        "--top-k",
-        type=int,
-        default=12,
-        help="How many top kernels to summarize above the tables.",
-    )
-    parser.add_argument(
-        "--kernel-table-limit",
-        type=int,
-        default=0,
-        help="How many kernels to include in the Markdown kernel table. Use 0 for all kernels.",
-    )
-    parser.add_argument(
-        "--kernel-map",
-        type=str,
-        default=None,
-        help="Existing kernel_map.json from a no-CUDA-graph torch pre-pass.",
-    )
-    parser.add_argument(
-        "--export-kernel-map",
-        type=str,
-        default=None,
-        help="Write kernel-to-Python mapping JSON to this file.",
-    )
-    parser.add_argument(
-        "--all-traces",
-        action="store_true",
-        help="Analyze every matching trace in the selected run directory.",
-    )
-    parser.add_argument(
-        "--table-only",
-        action="store_true",
-        help="Print the trace header plus the kernel and fuse-opportunity tables only.",
-    )
-    return parser.parse_args(argv)
-
-
-def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = parse_args(argv)
-    if not args.input and not args.url:
-        raise SystemExit("Provide either --input or --url.")
-
-    input_path = Path(args.input).resolve() if args.input else None
-    if args.url:
-        profile_dir = run_profiler(
-            url=args.url,
-            output_dir=args.output_dir,
-            num_steps=args.num_steps,
-            profile_by_stage=args.profile_by_stage,
-            merge_profiles=args.merge_profiles,
-            profile_prefix=args.profile_prefix,
-            probe_requests=args.probe_requests,
-            probe_prompt=args.probe_prompt,
-            probe_max_new_tokens=args.probe_max_new_tokens,
-            probe_delay=args.probe_delay,
-            start_step=None,
-        )
-        print(f"Generated profile directory: {profile_dir}\n")
-        input_path = profile_dir
-
-    external_kernel_map = (
-        load_kernel_map(Path(args.kernel_map).resolve()) if args.kernel_map else None
-    )
-    traces, server_args = discover_trace_targets(input_path, all_traces=args.all_traces)
-
-    stage_site_stats: DefaultDict[
-        str, DefaultDict[str, DefaultDict[str, MappingSiteAggregate]]
-    ] = defaultdict(lambda: defaultdict(lambda: defaultdict(MappingSiteAggregate)))
-    stage_kernel_categories: DefaultDict[str, Dict[str, str]] = defaultdict(dict)
-    global_site_stats: DefaultDict[str, DefaultDict[str, MappingSiteAggregate]] = (
-        defaultdict(lambda: defaultdict(MappingSiteAggregate))
-    )
-    global_kernel_categories: Dict[str, str] = {}
-    reports = []
-
-    for trace_path in traces:
-        trace = load_trace_json(trace_path)
-        kernels, cpu_ops, python_frames, launch_events, chosen_pid, window_us = (
-            extract_trace_data(trace)
-        )
-        cpu_ops_by_external_id = build_cpu_op_index(cpu_ops)
-        launches_by_correlation = build_launch_index(launch_events)
-        local_site_stats = aggregate_kernel_sites(
-            kernels,
-            cpu_ops_by_external_id,
-            python_frames,
-            launches_by_correlation=launches_by_correlation,
-        )
-        stage = parse_stage(trace_path)
-        kernel_categories = {
-            kernel.canonical_name: kernel.category for kernel in kernels
-        }
-
-        merge_site_stats(stage_site_stats[stage], local_site_stats)
-        merge_site_stats(global_site_stats, local_site_stats)
-        stage_kernel_categories[stage].update(kernel_categories)
-        global_kernel_categories.update(kernel_categories)
-        reports.append(
-            (trace_path, kernels, chosen_pid, window_us, stage, kernel_categories)
-        )
-
-    stage_payloads = {
-        stage: build_stage_payload(
-            dict(site_stats), stage_kernel_categories.get(stage, {})
-        )
-        for stage, site_stats in stage_site_stats.items()
-    }
-    global_payload = build_stage_payload(
-        dict(global_site_stats), global_kernel_categories
-    )
-
-    if args.export_kernel_map:
-        export_path = Path(args.export_kernel_map).resolve()
-        export_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "version": 2,
-            "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "generated_from": str(input_path),
-            "notes": "Kernel-to-Python mapping extracted from torch profiler traces. Prefer generating this from a --disable-cuda-graph --disable-piecewise-cuda-graph pre-pass.",
-            "server_args": server_args,
-            "stages": stage_payloads,
-            "global": global_payload,
-        }
-        with open(export_path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle, indent=2, ensure_ascii=False)
-        print(f"Exported kernel map: {export_path}\n")
-
-    for trace_path, kernels, chosen_pid, window_us, stage, _ in reports:
-        print_report(
-            trace_path=trace_path,
-            server_args=server_args,
-            kernels=kernels,
-            chosen_pid=chosen_pid,
-            window_us=window_us,
-            local_stage_payload=stage_payloads.get(stage, {"kernels": {}}),
-            external_kernel_map=external_kernel_map,
-            top_k=args.top_k,
-            kernel_table_limit=args.kernel_table_limit,
-            table_only=args.table_only,
-        )
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

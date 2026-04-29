@@ -19,7 +19,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.model_loader.loader import ModelOptModelLoader
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-large")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 # Note: PYTHONPATH=python should be set when running tests

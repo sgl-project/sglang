@@ -83,7 +83,7 @@ jobs:
           version=${{ steps.version.outputs.version }}
 
           docker buildx build \
-            --target framework \
+            --target framework_final \
             --platform linux/amd64 \
             --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
@@ -106,7 +106,7 @@ jobs:
           version=${{ steps.version.outputs.version }}
 
           docker buildx build \
-            --target framework \
+            --target framework_final \
             --platform linux/amd64 \
             --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
@@ -180,7 +180,7 @@ jobs:
           version=${{ steps.version.outputs.version }}
 
           docker buildx build \
-            --target framework \
+            --target framework_final \
             --platform linux/arm64 \
             --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \
@@ -203,7 +203,7 @@ jobs:
           version=${{ steps.version.outputs.version }}
 
           docker buildx build \
-            --target framework \
+            --target framework_final \
             --platform linux/arm64 \
             --output type=image,name=lmsysorg/sglang,push-by-digest=true,name-canonical=true,push=true \
             -f docker/Dockerfile \

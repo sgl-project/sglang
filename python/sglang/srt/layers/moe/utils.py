@@ -254,6 +254,12 @@ def is_sbo_enabled() -> bool:
     return IS_SBO_ENABLED
 
 
+def is_deepep_class_backend() -> bool:
+    """Check if the MoE backend is DeepEP-family (DeepEP, Mooncake, or Mori)."""
+    b = get_moe_a2a_backend()
+    return b.is_deepep() or b.is_mooncake() or b.is_mori()
+
+
 def get_tbo_token_distribution_threshold() -> float:
     global TBO_TOKEN_DISTRIBUTION_THRESHOLD
     if TBO_TOKEN_DISTRIBUTION_THRESHOLD is None:
