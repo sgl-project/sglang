@@ -96,5 +96,9 @@ def fused_topk_npu(
         layer_id=layer_id,
         topk_ids=topk_ids,
     )
+    get_global_experts_capturer().capture_weights(
+        layer_id=layer_id,
+        topk_weights=topk_weights,
+    )
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

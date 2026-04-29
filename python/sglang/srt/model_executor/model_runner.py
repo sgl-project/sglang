@@ -799,6 +799,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 num_tokens=self.max_total_num_tokens + self.page_size,
                 max_running_requests=self.max_running_requests,
                 device=self.device,
+                enable_weights=get_global_server_args().enable_return_routed_expert_weights,
             )
         )
 

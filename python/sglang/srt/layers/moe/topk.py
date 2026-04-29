@@ -1053,6 +1053,10 @@ def _post_process_topk_ids(
         layer_id=layer_id,
         topk_ids=topk_ids,
     )
+    get_global_experts_capturer().capture_weights(
+        layer_id=layer_id,
+        topk_weights=topk_weights,
+    )
     if _is_cuda:
         # When shared experts are fused (appended as extra columns in topk_ids),
         # EPLB dispatch must only remap the routed expert columns.
