@@ -121,6 +121,7 @@ class UGSessionRecord:
     srt_executed_request_count: int = 0
     srt_last_executed_request_id: str | None = None
     srt_last_executed_state: str | None = None
+    srt_model_runner_forward_request_ids: set[str] = field(default_factory=set)
     closed: bool = False
 
     def handle(self) -> UGSessionHandle:
@@ -263,6 +264,13 @@ class UGSessionRuntime:
         self.vocab_size = vocab_size
         self.srt_u_decode_max_new_tokens = srt_u_decode_max_new_tokens
         self._records: dict[str, UGSessionRecord] = {}
+        register_observer = getattr(
+            self.srt_request_executor,
+            "set_ug_u_forward_observer",
+            None,
+        )
+        if callable(register_observer):
+            register_observer(self._observe_srt_u_forward_from_model_runner)
 
     @staticmethod
     def normalize_messages(
@@ -457,6 +465,9 @@ class UGSessionRuntime:
             "srt_executed_request_count": record.srt_executed_request_count,
             "srt_last_executed_request_id": record.srt_last_executed_request_id,
             "srt_last_executed_state": record.srt_last_executed_state,
+            "srt_model_runner_forward_request_ids": sorted(
+                record.srt_model_runner_forward_request_ids
+            ),
             "srt_mm_features_released": self._srt_mm_features_released(record),
         }
 
@@ -510,8 +521,15 @@ class UGSessionRuntime:
             SessionController.adjust_mm_offsets(recv_req, req, mm_inputs)
             req.extend_image_inputs(mm_inputs)
 
-        self._execute_srt_req(record, req, state=record.state)
         self._record_srt_req(record, req, request_id=request_id)
+        self._attach_srt_u_forward_metadata(
+            record,
+            req,
+            state=record.state,
+            input_text=input_text,
+            messages=messages,
+        )
+        self._execute_srt_req(record, req, state=record.state)
         self._notify_srt_u_forward(
             record,
             req,
@@ -530,8 +548,15 @@ class UGSessionRuntime:
             mm_inputs=None,
             max_new_tokens=self.srt_u_decode_max_new_tokens,
         )
-        self._execute_srt_req(record, req, state=UGSegmentState.U_DECODE)
         self._record_srt_req(record, req, request_id=request_id)
+        self._attach_srt_u_forward_metadata(
+            record,
+            req,
+            state=UGSegmentState.U_DECODE,
+            input_text="",
+            messages=[],
+        )
+        self._execute_srt_req(record, req, state=UGSegmentState.U_DECODE)
         record.srt_u_decode_request_count += 1
         record.srt_last_u_decode_request_id = request_id
         record.srt_last_u_decode_origin_input_len = len(req.origin_input_ids)
@@ -598,6 +623,30 @@ class UGSessionRuntime:
             )
         return req, recv_req
 
+    @staticmethod
+    def _attach_srt_u_forward_metadata(
+        record: UGSessionRecord,
+        req: Any,
+        *,
+        state: UGSegmentState,
+        input_text: str,
+        messages: list[UGInterleavedMessage],
+    ) -> None:
+        req.ug_u_forward_metadata = {
+            "session": record.handle(),
+            "state": state.value,
+            "request_id": req.rid,
+            "origin_input_len": len(req.origin_input_ids),
+            "origin_input_ids": tuple(req.origin_input_ids),
+            "output_ids": tuple(req.output_ids[: req.sampling_params.max_new_tokens]),
+            "max_new_tokens": req.sampling_params.max_new_tokens,
+            "input_text": input_text,
+            "mm_offsets": tuple(
+                UGSessionRuntime._collect_mm_offsets(req.multimodal_inputs)
+            ),
+            "messages": tuple(messages),
+        }
+
     def _execute_srt_req(
         self,
         record: UGSessionRecord,
@@ -648,6 +697,11 @@ class UGSessionRuntime:
         observe = getattr(self.model_runner, "observe_srt_u_forward", None)
         if not callable(observe):
             return
+        if (
+            req.rid in record.srt_model_runner_forward_request_ids
+            and state != UGSegmentState.U_DECODE
+        ):
+            return
         output_ids = tuple(req.output_ids[: req.sampling_params.max_new_tokens])
         observe(
             record=record,
@@ -665,6 +719,21 @@ class UGSessionRuntime:
             ),
             messages=messages,
         )
+
+    def _observe_srt_u_forward_from_model_runner(
+        self,
+        *,
+        request: UGSRTRequestView,
+        messages: list[UGInterleavedMessage],
+    ) -> None:
+        record = self._records.get(request.session.session_id)
+        if record is None or record.closed:
+            return
+        observe = getattr(self.model_runner, "observe_srt_u_forward", None)
+        if not callable(observe):
+            return
+        observe(record=record, request=request, messages=messages)
+        record.srt_model_runner_forward_request_ids.add(request.request_id)
 
     def _srt_request_view_metadata(
         self,

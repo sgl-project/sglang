@@ -2575,6 +2575,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             dllm_block_offsets=[req.dllm_block_offset for req in self.reqs],
             dllm_config=self.dllm_config,
             reqs=self.reqs,
+            ug_u_forward_metadata=[
+                getattr(req, "ug_u_forward_metadata", None) for req in self.reqs
+            ],
             has_grammar=self.has_grammar,
             mamba_track_indices=self.mamba_track_indices,
             mamba_track_mask=self.mamba_track_mask,
@@ -2781,6 +2784,7 @@ class ModelWorkerBatch:
     # For constrained decoding
     # FIXME(lsyin): remove this after fully overlap grammar
     reqs: Optional[List[Req]] = None
+    ug_u_forward_metadata: Optional[List[Dict[str, Any]]] = None
     has_grammar: bool = False
 
     # For hidden states before normal

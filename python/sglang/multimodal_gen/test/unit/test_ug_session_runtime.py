@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import torch
 
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.ug.context import UGSessionHandle
+from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.ug.context import UGSRTKVTokenBinding, UGSRTRequestView, UGSessionHandle
 from sglang.srt.ug.runtime import (
     FakeUGModelRunner,
     UGInterleavedMessage,
@@ -49,6 +50,59 @@ class RecordingSRTRequestExecutor:
                 "max_new_tokens": req.sampling_params.max_new_tokens,
                 "output_ids": list(req.output_ids),
             }
+        )
+
+
+class RecordingUGModelRunner(FakeUGModelRunner):
+    def __init__(self):
+        self.srt_u_forward_events = []
+
+    def observe_srt_u_forward(self, *, record, request, messages):
+        self.srt_u_forward_events.append(
+            {
+                "session_id": record.session_id,
+                "state": request.state,
+                "request_id": request.request_id,
+                "messages": list(messages),
+                "has_token_binding": "srt_kv_token_binding" in request.metadata,
+            }
+        )
+
+
+class ModelRunnerObserverSRTExecutor(RecordingSRTRequestExecutor):
+    def __init__(self):
+        super().__init__()
+        self.observer = None
+
+    def set_ug_u_forward_observer(self, observer):
+        self.observer = observer
+
+    def execute_ug_request(self, *, record, req, state):
+        super().execute_ug_request(record=record, req=req, state=state)
+        if self.observer is None or state == UGSegmentState.U_DECODE:
+            return
+        metadata = req.ug_u_forward_metadata
+        self.observer(
+            request=UGSRTRequestView(
+                session=metadata["session"],
+                state=metadata["state"],
+                request_id=metadata["request_id"],
+                origin_input_len=metadata["origin_input_len"],
+                origin_input_ids=metadata["origin_input_ids"],
+                output_ids=metadata["output_ids"],
+                max_new_tokens=metadata["max_new_tokens"],
+                input_text=metadata["input_text"],
+                mm_offsets=metadata["mm_offsets"],
+                metadata={
+                    "srt_kv_token_binding": UGSRTKVTokenBinding(
+                        session_id=record.session_id,
+                        request_id=req.rid,
+                        token_count=len(req.origin_input_ids),
+                        token_indices=torch.arange(len(req.origin_input_ids)),
+                    )
+                },
+            ),
+            messages=list(metadata["messages"]),
         )
 
 
@@ -232,6 +286,89 @@ class TestUGSessionRuntime(unittest.TestCase):
             debug["srt_last_executed_request_id"], handle.anchor_request_id
         )
         self.assertEqual(debug["srt_last_executed_state"], "append_image")
+
+    def test_model_runner_observer_can_own_srt_u_forward_notification(self):
+        executor = ModelRunnerObserverSRTExecutor()
+        model_runner = RecordingUGModelRunner()
+        runtime = UGSessionRuntime(
+            model_runner=model_runner,
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="hello model runner")],
+            session_id="srt-model-runner-observer",
+        )
+
+        self.assertEqual(
+            model_runner.srt_u_forward_events,
+            [
+                {
+                    "session_id": "srt-model-runner-observer",
+                    "state": "u_prefill",
+                    "request_id": "srt-model-runner-observer:u1",
+                    "messages": [
+                        UGInterleavedMessage(type="text", content="hello model runner")
+                    ],
+                    "has_token_binding": True,
+                }
+            ],
+        )
+        self.assertEqual(
+            runtime.get_debug_counters(handle)["srt_model_runner_forward_request_ids"],
+            ["srt-model-runner-observer:u1"],
+        )
+
+    def test_model_runner_builds_ug_request_view_from_forward_batch(self):
+        observed = []
+        runner = object.__new__(ModelRunner)
+        runner.ug_u_forward_observer = lambda *, request, messages: observed.append(
+            (request, messages)
+        )
+        forward_batch = SimpleNamespace(
+            ug_u_forward_metadata=[
+                {
+                    "session": UGSessionHandle(
+                        session_id="forward-batch-session",
+                        anchor_request_id="forward-batch-session:u1",
+                        context_length=0,
+                        context_version=0,
+                    ),
+                    "state": "u_prefill",
+                    "request_id": "forward-batch-session:u1",
+                    "origin_input_len": 3,
+                    "origin_input_ids": (1, 2, 3),
+                    "output_ids": (),
+                    "max_new_tokens": 0,
+                    "input_text": "hello",
+                    "mm_offsets": (),
+                    "messages": (UGInterleavedMessage(type="text", content="hello"),),
+                }
+            ],
+            req_pool_indices=torch.tensor([1], dtype=torch.long),
+            seq_lens=torch.tensor([3], dtype=torch.long),
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.tensor(
+                    [
+                        [0, 0, 0, 0],
+                        [9, 10, 11, 0],
+                    ],
+                    dtype=torch.long,
+                )
+            ),
+        )
+
+        ModelRunner._notify_ug_u_forward_observer(runner, forward_batch)
+
+        request, messages = observed[0]
+        self.assertEqual(request.request_id, "forward-batch-session:u1")
+        self.assertEqual(messages, [UGInterleavedMessage(type="text", content="hello")])
+        binding = request.metadata["srt_kv_token_binding"]
+        self.assertEqual(binding.session_id, "forward-batch-session")
+        self.assertEqual(binding.request_id, "forward-batch-session:u1")
+        self.assertEqual(binding.token_count, 3)
+        self.assertTrue(torch.equal(binding.token_indices, torch.tensor([9, 10, 11])))
 
     def test_u_decode_can_materialize_srt_session_decode_request(self):
         executor = RecordingSRTRequestExecutor()

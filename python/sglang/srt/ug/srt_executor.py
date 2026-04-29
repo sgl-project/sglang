@@ -50,14 +50,28 @@ class UGSRTSchedulerExecutor:
         self.events: list[tuple[str, str, int]] = []
         self.token_bindings: list[UGSRTKVTokenBinding] = []
         self._request_token_bindings: dict[str, UGSRTKVTokenBinding] = {}
+        self.ug_u_forward_observer = None
         self.sync_step_count = 0
 
     @property
     def session_controller(self):
         return self.scheduler.session_controller
 
+    def set_ug_u_forward_observer(self, observer) -> None:
+        self.ug_u_forward_observer = observer
+        model_runner = self._model_runner()
+        if model_runner is None:
+            return
+        setter = getattr(model_runner, "set_ug_u_forward_observer", None)
+        if callable(setter):
+            setter(observer)
+        else:
+            model_runner.ug_u_forward_observer = observer
+
     def execute_ug_request(self, *, record, req, state) -> None:
         del record
+        if self.ug_u_forward_observer is not None:
+            self.set_ug_u_forward_observer(self.ug_u_forward_observer)
         self._check_scheduler_idle(req)
         self.events.append((state.value, req.rid, len(req.origin_input_ids)))
         if hasattr(self.scheduler, "init_req_max_new_tokens"):
@@ -160,6 +174,14 @@ class UGSRTSchedulerExecutor:
             "UG synchronous scheduler execution requires an idle scheduler before "
             f"enqueuing request {req.rid}"
         )
+
+    def _model_runner(self) -> Any | None:
+        model_worker = getattr(self.scheduler, "model_worker", None)
+        model_runner = getattr(model_worker, "model_runner", None)
+        if model_runner is not None:
+            return model_runner
+        tp_worker = getattr(self.scheduler, "tp_worker", None)
+        return getattr(tp_worker, "model_runner", None)
 
     def _request_token_indices(self, record: Any, req: Any) -> torch.Tensor | None:
         tree_cache = getattr(self.scheduler, "tree_cache", None)
