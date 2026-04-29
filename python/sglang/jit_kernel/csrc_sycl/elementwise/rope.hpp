@@ -131,10 +131,11 @@ public:
             const int64_t head_id = idx % num_q_and_k_heads;
             const auto pos = params_.positions[token_id];
             const auto load_q = head_id < params_.num_qo_heads;
+            const int64_t kv_head_id = head_id - params_.num_qo_heads;
             
             DType* input = load_q 
                 ? params_.q_ptr + token_id * params_.q_stride + head_id * params_.head_stride
-                : params_.k_ptr + token_id * params_.k_stride + head_id * params_.head_stride;
+                : params_.k_ptr + token_id * params_.k_stride + kv_head_id * params_.head_stride;
             
             const float* cos_ptr = cos_cache_ptr + pos * kRopeDim;
             const float* sin_ptr = sin_cache_ptr + pos * kRopeDim;
