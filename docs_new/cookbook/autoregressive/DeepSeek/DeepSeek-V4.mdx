@@ -1,7 +1,7 @@
 ---
 title: DeepSeek-V4
 metatags:
-    description: "Deploy DeepSeek-V4 with SGLang — a next-generation MoE model from DeepSeek. Blackwell deployments use the FP4 checkpoint; Hopper deployments use the FP8 checkpoint."
+    description: "Deploy DeepSeek-V4 with SGLang — a next-generation MoE model from DeepSeek."
 tag: NEW
 ---
 
@@ -35,7 +35,7 @@ tag: NEW
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro">DeepSeek-V4-Pro</a></strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>1.6T</strong></td>
       <td style={{padding: "9px 12px", textAlign: "right", backgroundColor: "rgba(255,255,255,0.02)"}}>49B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>high-capacity: B200 8 GPU / GB200 8 GPU (2 nodes) / GB300 4 GPU / H200 16 GPU (2 nodes)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>high-capacity: B200 8 GPU / GB200 8 GPU (2 nodes) / GB300 4 GPU / H200 8 GPU(fp4)/16 GPU(fp8)</td>
     </tr>
   </tbody>
 </table>
@@ -153,9 +153,9 @@ The generator currently picks values on the **conservative** side (mirroring an 
 
 **Hopper (H200) note**
 
-H200 image (`lmsysorg/sglang:deepseek-v4-hopper`) and FP8 checkpoints
-(`sgl-project/DeepSeek-V4-Flash-FP8`, `sgl-project/DeepSeek-V4-Pro-FP8`) are
-publicly available.
+We provide two different options for running DeepSeek-V4 models on Hopper devices (H200)
+- Original FP4 checkpoints: To run original FP4 checkpoints, apply the w4a16 MoE kernels (marlin) as in interactive command generator. For this option we only support TP method. Complete Pro model can be run on a single H200 node with this option.
+- Converted FP8 checkpoints: We also provide pre-converted FP8 checkpoints (`sgl-project/DeepSeek-V4-Flash-FP8`, `sgl-project/DeepSeek-V4-Pro-FP8`), which support more parallelism and features.
 
 PD-Disagg recipes on H200 may require `docker run --privileged --ulimit memlock=-1`
 (or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) so mooncake

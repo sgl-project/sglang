@@ -579,8 +579,11 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.plan_stream
             )
 
-        if forward_batch.spec_info.accept_length is None:
-            forward_batch.spec_info.accept_length = batch_result.accept_lens
+        if forward_batch.spec_info.num_accepted_drafts is None:
+            # `batch_result.accept_lens` already includes the bonus token, so use it
+            # directly for `num_accepted_tokens` and subtract 1 for `num_accepted_drafts`.
+            forward_batch.spec_info.num_accepted_drafts = batch_result.accept_lens - 1
+            forward_batch.spec_info.num_accepted_tokens = batch_result.accept_lens
 
         # Run draft extend batch in the main compute stream
         can_cuda_graph = (
@@ -720,7 +723,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
-                    hidden_size=self.target_worker.model_config.hidden_size,
+                    hidden_size=self.target_worker.model_config.spec_hidden_size,
                     dtype=self.target_worker.model_config.dtype,
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -838,10 +841,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
-            accept_length,
+            accept_lens,
             accept_index,
         ) = verify_input.sample(batch, logits_output, vocab_mask)
-        new_seq_lens = batch.seq_lens + accept_length
+        new_seq_lens = batch.seq_lens + accept_lens
 
         # Update mamba state for hybrid GDN models after verification
         if (
@@ -849,7 +852,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             or self.target_worker.model_runner.mamba2_config is not None
         ):
             self._mamba_verify_update(
-                batch, verify_input, accept_length, accept_index, bs
+                batch, verify_input, accept_lens, accept_index, bs
             )
 
         verify_done = torch.get_device_module(self.device).Event()
@@ -857,10 +860,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_length, dtype=torch.int32)
+            verified_id = torch.empty_like(accept_lens, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
                 all_verified_id,
-                accept_length,
+                accept_lens,
                 verified_id,
                 self.speculative_num_draft_tokens,
             )
@@ -884,7 +887,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             next_token_ids=predict,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            accept_lens=accept_length,
+            accept_lens=accept_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
         )
 
@@ -892,14 +895,13 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         batch: ModelWorkerBatch,
         verify_input: EagleVerifyInput,
-        accept_length: torch.Tensor,
+        accept_lens: torch.Tensor,
         accept_index: torch.Tensor,
         bs: int,
     ):
         """Update mamba state for hybrid GDN models after verification."""
-        # Calculate accepted_steps for mamba state update
-        # Include the bonus token (+1)
-        accepted_length_with_bonus = accept_length
+        # `accept_lens` already includes the bonus token (drafts + 1 per req).
+        accepted_length_with_bonus = accept_lens
         if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
             if verify_input.topk != 1:
                 raise ValueError("Spec v2 currently only supports topk = 1.")
@@ -956,7 +958,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self,
         batch: ModelWorkerBatch,
         accept_index: torch.Tensor,
-        accept_length: torch.Tensor,
+        num_accepted_drafts: torch.Tensor,
     ):
         """
         Move accepted tokens to the target KV cache.
@@ -964,7 +966,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         Args:
             batch: The batch to run.
             accept_index: The index of the accepted tokens.
-            accept_length: The length of the accepted tokens.
+            num_accepted_drafts: The length of the accepted tokens.
         """
         bs = len(batch.seq_lens)
         size = bs * self.speculative_num_draft_tokens
@@ -981,7 +983,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
             batch.req_pool_indices,
             self.req_to_token_pool.req_to_token,
             batch.seq_lens,
-            batch.seq_lens + accept_length,
+            batch.seq_lens + num_accepted_drafts,
             tgt_cache_loc,
             self.req_to_token_pool.req_to_token.shape[1],
             next_power_of_2(bs),
