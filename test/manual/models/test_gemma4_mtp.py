@@ -338,7 +338,7 @@ class TestGemma4MTP26BA4BGSM8K(Gemma4MTPGSM8KMixin, CustomTestCase):
     model_pair = ModelPair(
         name="26B-A4B",
         target_path="google/gemma-4-26B-A4B-it",
-        assistant_path="gg-hf-am/gemma-4-26B-it-assistant",
+        assistant_path="gg-hf-am/gemma-4-26B-A4B-it-assistant",
         accept_length_threshold=None,
         server_cuda_visible_devices="0,1",
         tensor_parallel_size=2,
