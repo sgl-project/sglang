@@ -647,6 +647,13 @@ class NativeSparseAttnBackend(
                     )
                     else cache_seqlens_int32
                 )
+                # Use 2D seqlens for nextn=2 optimization in target_verify
+                if (
+                    forward_batch.forward_mode.is_target_verify()
+                    and self.speculative_num_draft_tokens % 2 == 0
+                    and self.speculative_num_draft_tokens >= 2
+                ):
+                    seqlens_32 = seqlens_32.reshape(-1, 2)
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
@@ -932,6 +939,13 @@ class NativeSparseAttnBackend(
                     )
                     else cache_seqlens_int32
                 )
+                # Use 2D seqlens for nextn=2 optimization in target_verify
+                if (
+                    forward_mode.is_target_verify()
+                    and self.speculative_num_draft_tokens % 2 == 0
+                    and self.speculative_num_draft_tokens >= 2
+                ):
+                    seqlens_32 = seqlens_32.reshape(-1, 2)
                 paged_mqa_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )
@@ -1081,6 +1095,13 @@ class NativeSparseAttnBackend(
                     )
                     else metadata.cache_seqlens_int32
                 )
+                # Use 2D seqlens for nextn=2 optimization in target_verify
+                if (
+                    forward_mode.is_target_verify()
+                    and self.speculative_num_draft_tokens % 2 == 0
+                    and self.speculative_num_draft_tokens >= 2
+                ):
+                    seqlens_32 = seqlens_32.reshape(-1, 2)
                 new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
                     seqlens_32, 64, deep_gemm.get_num_sms()
                 )

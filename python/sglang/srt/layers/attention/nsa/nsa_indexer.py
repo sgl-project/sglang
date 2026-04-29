@@ -453,14 +453,25 @@ class Indexer(MultiPlatformOp):
         # Reuse pre-computed schedule metadata if available (from init_forward_metadata),
         # otherwise fall back to computing it here.
         schedule_metadata = getattr(metadata, "paged_mqa_schedule_metadata", None)
+
+        # Determine if nextn=2 optimization can be used (CUDA target_verify only)
+        use_nextn2 = (
+            _is_cuda
+            and forward_batch.forward_mode.is_target_verify()
+            and forward_batch.attn_backend.speculative_num_draft_tokens % 2 == 0
+            and forward_batch.attn_backend.speculative_num_draft_tokens >= 2
+        )
+
         if _is_cuda:
             if schedule_metadata is None:
+                seqlens_for_metadata = (
+                    seqlens_32.reshape(-1, 2) if use_nextn2 else seqlens_32
+                )
                 schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
-                    seqlens_32, blocksize, self.sm_count
+                    seqlens_for_metadata, blocksize, self.sm_count
                 )
 
         assert len(q_fp8.shape) == 3
-        q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
         block_kv = 1 if _is_hip else 64
         num_heads_kv = 1
@@ -482,6 +493,7 @@ class Indexer(MultiPlatformOp):
         if _is_hip:
             from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
+            q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
             batch_size, next_n, heads, _ = q_fp8.shape
             logits = torch.full(
                 (batch_size * next_n, max_seq_len),
@@ -500,7 +512,23 @@ class Indexer(MultiPlatformOp):
                 Preshuffle=False,
                 KVBlockSize=block_kv,
             )
+        elif use_nextn2:
+            # nextn=2: pair consecutive draft tokens for better kernel efficiency
+            q_fp8_input = q_fp8[:q_offset].reshape(-1, 2, *q_fp8.shape[1:])
+            seqlens_input = seqlens_32.reshape(-1, 2)
+            block_tables_input = block_tables[::2]
+            logits = deep_gemm.fp8_paged_mqa_logits(
+                q_fp8_input,
+                kv_cache_fp8,
+                weights[:q_offset],
+                seqlens_input,
+                block_tables_input,
+                schedule_metadata,
+                max_seq_len,
+                clean_logits=False,
+            )
         else:
+            q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8[:q_offset],
                 kv_cache_fp8,
