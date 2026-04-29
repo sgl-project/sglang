@@ -151,6 +151,52 @@ class TestEmbeddingModels(CustomTestCase):
                     matryoshka_dim=128,
                 )
 
+    def test_pooler_should_normalize_false(self):
+        """Verify pooler_should_normalize=False emits unnormalized embeddings:
+        manually L2-normalizing SRT output matches the HF reference (direction
+        is preserved), and SRT magnitude is not unit-length (L2 step skipped).
+        """
+        model_path = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
+        prompts = self._truncate_prompts(DEFAULT_PROMPTS, model_path)
+        torch_dtype = torch.float16
+
+        with HFRunner(
+            model_path, torch_dtype=torch_dtype, model_type="embedding"
+        ) as hf_runner:
+            hf_outputs = hf_runner.forward(prompts)
+
+        attention_backend = "triton" if is_in_amd_ci() else None
+        with SRTRunner(
+            model_path,
+            tp_size=1,
+            torch_dtype=torch_dtype,
+            model_type="embedding",
+            attention_backend=attention_backend,
+            pooler_should_normalize=False,
+        ) as srt_runner:
+            srt_outputs = srt_runner.forward(prompts)
+
+        for i in range(len(prompts)):
+            srt_vec = torch.tensor(srt_outputs.embed_logits[i])
+            hf_vec = torch.tensor(hf_outputs.embed_logits[i])
+
+            srt_normalized = torch.nn.functional.normalize(srt_vec, p=2, dim=-1)
+            similarity = get_similarities(srt_normalized, hf_vec)
+            self.assertGreater(
+                similarity,
+                0.99,
+                f"prompt[{i}] direction diverged from HF reference: "
+                f"cosine={similarity:.4f}",
+            )
+
+            l2 = srt_vec.norm(p=2).item()
+            self.assertGreater(
+                abs(l2 - 1.0),
+                0.1,
+                f"prompt[{i}] expected non-unit-norm with "
+                f"pooler_should_normalize=False, got L2={l2:.4f}",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

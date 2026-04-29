@@ -588,6 +588,7 @@ class SRTRunner:
         lora_eviction_policy: str = "lru",
         enable_deterministic_inference: bool = False,
         lora_drain_wait_threshold: float = 0.0,
+        pooler_should_normalize: Optional[bool] = None,
     ):
         self.model_type = model_type
         self.is_generation = model_type == "generation"
@@ -650,6 +651,7 @@ class SRTRunner:
             lora_eviction_policy=lora_eviction_policy,
             enable_deterministic_inference=enable_deterministic_inference,
             lora_drain_wait_threshold=lora_drain_wait_threshold,
+            pooler_should_normalize=pooler_should_normalize,
             **spec_kwargs,
         )
 
