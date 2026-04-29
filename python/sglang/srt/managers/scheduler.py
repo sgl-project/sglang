@@ -168,6 +168,7 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.relaykv.memory import estimate_kv_memory_for_plan
 from sglang.srt.relaykv.metrics import log_shadow_plan, should_log
 from sglang.srt.relaykv.planner import make_shadow_plan
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
@@ -2711,15 +2712,22 @@ class Scheduler(
                     self._relaykv_logged_prefill_rids.discard(stale_rid)
 
             seq_len = len(req.origin_input_ids) + len(req.output_ids)
+            plan = make_shadow_plan(
+                seq_len=seq_len,
+                config=config,
+                page_size=1,
+                request_id=req.rid,
+            )
+            memory_estimate = estimate_kv_memory_for_plan(
+                plan,
+                model_config=self.model_config,
+                kv_dtype=getattr(self.tp_worker.model_runner, "kv_cache_dtype", None),
+            )
             log_shadow_plan(
-                make_shadow_plan(
-                    seq_len=seq_len,
-                    config=config,
-                    page_size=1,
-                    request_id=req.rid,
-                ),
+                plan,
                 prefix=f"relaykv_shadow_plan_{phase}",
-                extra=self.relaykv_model_profile.to_log_dict(),
+                extra=self.relaykv_model_profile.to_log_dict()
+                | memory_estimate.to_log_dict(),
             )
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:

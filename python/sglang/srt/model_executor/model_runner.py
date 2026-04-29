@@ -156,6 +156,7 @@ from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
+from sglang.srt.relaykv.memory import estimate_kv_memory_for_plan
 from sglang.srt.relaykv import RelayKVConfig, make_shadow_plan
 from sglang.srt.relaykv.metrics import log_shadow_plan
 from sglang.srt.relaykv.profile import infer_model_profile
@@ -810,15 +811,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if seq_len <= 0:
             return
 
+        plan = make_shadow_plan(
+            seq_len=seq_len,
+            config=config,
+            page_size=1,
+            request_id=f"startup:tp{self.tp_rank}:pp{self.pp_rank}",
+        )
+        memory_estimate = estimate_kv_memory_for_plan(
+            plan,
+            model_config=self.model_config,
+            kv_dtype=getattr(self, "kv_cache_dtype", None),
+        )
         log_shadow_plan(
-            make_shadow_plan(
-                seq_len=seq_len,
-                config=config,
-                page_size=1,
-                request_id=f"startup:tp{self.tp_rank}:pp{self.pp_rank}",
-            ),
+            plan,
             prefix="relaykv_shadow_plan_startup",
-            extra=model_profile.to_log_dict(),
+            extra=model_profile.to_log_dict() | memory_estimate.to_log_dict(),
         )
 
     def init_routed_experts_capturer(self):
