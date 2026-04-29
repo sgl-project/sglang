@@ -30,6 +30,7 @@ from sglang.srt.distributed import (
 from sglang.srt.layers.gemma4_fused_ops import gemma_rmsnorm_residual_scalar
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -206,6 +207,7 @@ class Gemma4Attention(nn.Module):
         config: Gemma4TextConfig,
         head_dim: int,
         max_position_embeddings: int,
+        kv_shared_layer_index: Optional[int],
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -244,15 +246,31 @@ class Gemma4Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
 
-        self.qkv_proj = QKVParallelLinear(
-            hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=config.attention_bias,
-            quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
+        self.kv_shared_layer_index = kv_shared_layer_index
+        self.is_kv_shared_layer = kv_shared_layer_index is not None
+
+        # KV-shared layers reuse another layer's K/V cache, so we only need to
+        # project Q.  Non-shared layers use the fused QKV projection.
+        if self.is_kv_shared_layer:
+            self.qkv_proj = None
+            self.q_proj = ColumnParallelLinear(
+                hidden_size,
+                self.total_num_heads * self.head_dim,
+                bias=config.attention_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("q_proj", prefix),
+            )
+        else:
+            self.q_proj = None
+            self.qkv_proj = QKVParallelLinear(
+                hidden_size,
+                self.head_dim,
+                self.total_num_heads,
+                self.total_num_kv_heads,
+                bias=config.attention_bias,
+                quant_config=quant_config,
+                prefix=add_prefix("qkv_proj", prefix),
+            )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
@@ -265,13 +283,21 @@ class Gemma4Attention(nn.Module):
             self.head_dim,
             eps=config.rms_norm_eps,
         )
-        self.k_norm = Gemma4RMSNorm(
-            self.head_dim,
-            eps=config.rms_norm_eps,
-        )
-        self.v_norm = Gemma4RMSNorm(
-            self.head_dim, eps=config.rms_norm_eps, scale_shift=0.0, with_scale=False
-        )
+        # K/V norms are only needed for layers that actually project K and V.
+        if self.is_kv_shared_layer:
+            self.k_norm = None
+            self.v_norm = None
+        else:
+            self.k_norm = Gemma4RMSNorm(
+                self.head_dim,
+                eps=config.rms_norm_eps,
+            )
+            self.v_norm = Gemma4RMSNorm(
+                self.head_dim,
+                eps=config.rms_norm_eps,
+                scale_shift=0.0,
+                with_scale=False,
+            )
 
         if layer_type in config.rope_parameters:
             rope_parameters = dict(config.rope_parameters[layer_type])
@@ -279,27 +305,6 @@ class Gemma4Attention(nn.Module):
             rope_parameters = dict(
                 rope_type="default",
                 rope_theta=10000.0,
-            )
-
-        # KV sharing logic
-        num_kv_shared_layers = getattr(config, "num_kv_shared_layers", 0)
-        first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared_layers
-        self.is_kv_shared_layer = (
-            layer_id >= first_kv_shared_layer_idx and num_kv_shared_layers > 0
-        )
-
-        self.kv_shared_layer_index = None
-        if num_kv_shared_layers > 0 and self.layer_id >= first_kv_shared_layer_idx:
-            prev_layers = config.layer_types[:first_kv_shared_layer_idx]
-            current_layer_type = config.layer_types[self.layer_id]
-            if current_layer_type not in prev_layers:
-                raise ValueError(
-                    f"KV sharing layer {self.layer_id} has type '{current_layer_type}' "
-                    f"but no matching type found in layers 0..{first_kv_shared_layer_idx - 1}. "
-                    f"Available types: {set(prev_layers)}"
-                )
-            self.kv_shared_layer_index = (
-                len(prev_layers) - 1 - prev_layers[::-1].index(current_layer_type)
             )
 
         self.rotary_emb = get_rope(
@@ -333,29 +338,27 @@ class Gemma4Attention(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs,
     ):
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # KV-shared layers project only Q; K/V are pulled from another layer's
+        # cache by RadixAttention.  Non-shared layers use the fused QKV proj.
+        if self.is_kv_shared_layer:
+            q, _ = self.q_proj(hidden_states)
+            k = None
+            v = None
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         q = q.unflatten(-1, (self.num_heads, self.head_dim))
         q = self.q_norm(q)
         q = q.flatten(-2, -1)
 
-        # Check if we should use shared KV cache
-        if self.is_kv_shared_layer and self.kv_shared_layer_index is not None:
-            # For KV shared layers, we skip K/V computation and normalization
-            # The RadixAttention will handle retrieving shared KV from cache
-            k = None
-            v = None
-        else:
+        if k is not None:
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
-            k = self.k_norm(k)
+            k = self.k_norm(k).flatten(-2, -1)
 
             v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
             v = self.v_norm(v)
 
-        # Apply rotary embedding
-        if k is not None:
-            k = k.flatten(-2, -1)
             q, k = self.rotary_emb(positions, q, k)
             k = k.unflatten(-1, (self.num_kv_heads, self.head_dim))
         else:
@@ -402,19 +405,39 @@ class Gemma4DecoderLayer(nn.Module):
         else:
             head_dim = getattr(config, "swa_head_dim", config.head_dim)
 
+        # KV sharing config: the last `num_kv_shared_layers` layers reuse an
+        # earlier layer's KV cache (matched by layer_type).  Resolved once
+        # here and the resulting source-layer index is forwarded to
+        # Gemma4Attention.
+        num_kv_shared_layers = getattr(config, "num_kv_shared_layers", 0)
+        first_kv_shared_layer_idx = config.num_hidden_layers - num_kv_shared_layers
+        is_kv_shared_layer = (
+            num_kv_shared_layers > 0 and self.layer_id >= first_kv_shared_layer_idx
+        )
+        kv_shared_layer_index: Optional[int] = None
+        if is_kv_shared_layer:
+            prev_layer_types = config.layer_types[:first_kv_shared_layer_idx]
+            if layer_type not in prev_layer_types:
+                raise ValueError(
+                    f"KV sharing layer {self.layer_id} has type '{layer_type}' "
+                    f"but no matching type found in layers 0..{first_kv_shared_layer_idx - 1}. "
+                    f"Available types: {set(prev_layer_types)}"
+                )
+            # Use the most recent prior layer of the same type as the source.
+            kv_shared_layer_index = (
+                len(prev_layer_types) - 1 - prev_layer_types[::-1].index(layer_type)
+            )
+
         self.self_attn = Gemma4Attention(
             layer_id=layer_id,
             config=config,
             max_position_embeddings=config.max_position_embeddings,
             head_dim=head_dim,
+            kv_shared_layer_index=kv_shared_layer_index,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
         )
 
-        first_kv_shared_layer_idx = config.num_hidden_layers - getattr(
-            config, "num_kv_shared_layers", 0
-        )
-        is_kv_shared_layer = self.layer_id >= first_kv_shared_layer_idx > 0
         use_double_wide_mlp = (
             getattr(config, "use_double_wide_mlp", False) and is_kv_shared_layer
         )
