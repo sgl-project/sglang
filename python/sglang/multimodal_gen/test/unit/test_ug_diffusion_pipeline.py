@@ -110,6 +110,79 @@ class TestUGDiffusionPipeline(unittest.TestCase):
             [session.session_id],
         )
 
+    def test_experimental_interleaved_api_runs_fake_ug_pipeline(self):
+        server_args = _make_server_args()
+        with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
+            pipeline = UGPipeline(
+                "sglang-internal/fake-ug",
+                server_args,
+                executor=SyncExecutor(server_args),
+            )
+
+        segments = pipeline.forward_interleaved(
+            [
+                {"type": "image", "image": Image.new("RGB", (16, 16), "white")},
+                {"type": "text", "text": "draw a small lamp and describe it"},
+            ],
+            UGSamplingParams(
+                width=32,
+                height=32,
+                seed=123,
+                num_inference_steps=2,
+                suppress_logs=True,
+            ),
+            server_args,
+        )
+
+        self.assertEqual([segment["type"] for segment in segments], ["image", "text"])
+        self.assertIsInstance(segments[0]["image"], Image.Image)
+        self.assertEqual(segments[0]["image"].size, (32, 32))
+        self.assertEqual(segments[1]["text"], "generated_text_after_image")
+        bridge = pipeline.get_module("ug_bridge")
+        self.assertEqual(
+            len(bridge.runtime.session_controller.tree_cache.released_sessions),
+            1,
+        )
+
+    def test_experimental_interleaved_api_can_return_text_image_text(self):
+        server_args = _make_server_args()
+        bridge = RecordingUGBridge(
+            pre_image_segments=[{"type": "text", "text": "text_before_image"}]
+        )
+        with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
+            pipeline = UGPipeline(
+                "recording-ug",
+                server_args,
+                loaded_modules={"ug_bridge": bridge},
+                executor=SyncExecutor(server_args),
+            )
+
+        segments = pipeline.forward_interleaved(
+            [
+                {"type": "image", "image": Image.new("RGB", (16, 16), "white")},
+                {"type": "text", "text": "draw then explain"},
+            ],
+            UGSamplingParams(
+                width=32,
+                height=32,
+                seed=123,
+                num_inference_steps=2,
+                suppress_logs=True,
+            ),
+            server_args,
+        )
+
+        self.assertEqual(
+            [segment["type"] for segment in segments], ["text", "image", "text"]
+        )
+        self.assertEqual(segments[0]["text"], "text_before_image")
+        self.assertIsInstance(segments[1]["image"], Image.Image)
+        self.assertEqual(segments[2]["text"], "after_image")
+        self.assertEqual(
+            [message.type for message in bridge.interleaved_messages],
+            ["image", "text"],
+        )
+
     def test_fake_pipeline_can_use_injected_srt_scheduler_executor(self):
         server_args = _make_server_args()
         scheduler = RecordingSRTScheduler()
@@ -269,16 +342,29 @@ class TestUGDiffusionPipeline(unittest.TestCase):
 
 
 class RecordingUGBridge:
-    def __init__(self, prepared_latents=None):
+    def __init__(self, prepared_latents=None, pre_image_segments=None):
         self.prepared_latents = prepared_latents
+        self.pre_image_segments = pre_image_segments or []
         self.prepare_latents_seed = None
         self.appended_image = None
         self.velocity_calls = 0
+        self.interleaved_messages = []
 
     def build_contexts(self, *, prompt, image):
         del prompt, image
+        return self._make_contexts()
+
+    def build_contexts_from_messages(self, *, messages):
+        self.interleaved_messages = list(messages)
+        return self._make_contexts()
+
+    def _make_contexts(self):
         return UGContextBundle(
-            full=UGContextHandle("full", 1),
+            full=UGContextHandle(
+                "full",
+                1,
+                metadata={"pre_image_segments": list(self.pre_image_segments)},
+            ),
             text_cfg=UGContextHandle("text_cfg", 0),
             image_cfg=UGContextHandle("image_cfg", 1),
         )

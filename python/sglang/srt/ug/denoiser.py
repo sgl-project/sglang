@@ -10,6 +10,7 @@ from sglang.srt.ug.context import UGContextBundle, UGContextHandle
 from sglang.srt.ug.runtime import (
     FakeUGModelRunner,
     UGDecodeResult,
+    UGInterleavedMessage,
     UGLatentDecodeRequest,
     UGLatentPrepareRequest,
     UGLatentPrepareResult,
@@ -21,6 +22,10 @@ from sglang.srt.ug.runtime import (
 class UGDenoiserBridge(Protocol):
     def build_contexts(
         self, *, prompt: str | list[str] | None, image: Any | None
+    ) -> UGContextBundle: ...
+
+    def build_contexts_from_messages(
+        self, *, messages: list[UGInterleavedMessage | dict[str, Any]]
     ) -> UGContextBundle: ...
 
     def predict_velocity(
@@ -62,9 +67,19 @@ class FakeUGDenoiserBridge:
     def build_contexts(
         self, *, prompt: str | list[str] | None, image: Any | None
     ) -> UGContextBundle:
-        prompt_text = " ".join(prompt) if isinstance(prompt, list) else prompt or ""
-        text_tokens = len(prompt_text.split())
-        image_tokens = 2 if image is not None else 0
+        messages = UGSessionRuntime.normalize_messages(prompt=prompt, image=image)
+        return self.build_contexts_from_messages(messages=messages)
+
+    def build_contexts_from_messages(
+        self, *, messages: list[UGInterleavedMessage | dict[str, Any]]
+    ) -> UGContextBundle:
+        normalized = normalize_ug_interleaved_messages(messages)
+        text_tokens = sum(
+            len(str(message.content).split())
+            for message in normalized
+            if message.type == "text"
+        )
+        image_tokens = sum(2 for message in normalized if message.type == "image")
         return UGContextBundle(
             full=UGContextHandle("full", text_tokens + image_tokens),
             text_cfg=UGContextHandle("text_cfg", image_tokens),
@@ -127,22 +142,38 @@ class SRTBackedUGDenoiserBridge:
         self, *, prompt: str | list[str] | None, image: Any | None
     ) -> UGContextBundle:
         messages = self.runtime.normalize_messages(prompt=prompt, image=image)
+        return self.build_contexts_from_messages(messages=messages)
+
+    def build_contexts_from_messages(
+        self, *, messages: list[UGInterleavedMessage | dict[str, Any]]
+    ) -> UGContextBundle:
+        messages = normalize_ug_interleaved_messages(messages)
         session = self.runtime.prefill_interleaved(messages)
-        segment = self.runtime.decode_next_segment(session)
-        if segment.type != "image_marker":
+        pre_image_segments: list[dict[str, Any]] = []
+        while True:
+            segment = self.runtime.decode_next_segment(session)
+            if segment.type == "image_marker":
+                break
+            if segment.type == "text":
+                pre_image_segments.append({"type": "text", "text": segment.text or ""})
+                continue
             raise ValueError(
                 "UG denoise bridge expected U decode to request an image segment, "
                 f"got {segment.type}"
             )
 
-        prompt_text = " ".join(prompt) if isinstance(prompt, list) else prompt or ""
-        text_tokens = len(prompt_text.split())
-        image_tokens = 2 if image is not None else 0
+        text_tokens = sum(
+            len(str(message.content).split())
+            for message in messages
+            if message.type == "text"
+        )
+        image_tokens = sum(2 for message in messages if message.type == "image")
         return UGContextBundle(
             full=UGContextHandle(
                 session.anchor_request_id,
                 session.context_length,
                 session=session,
+                metadata={"pre_image_segments": pre_image_segments},
             ),
             text_cfg=UGContextHandle(
                 f"{session.anchor_request_id}:text_cfg",
@@ -237,3 +268,30 @@ class SRTBackedUGDenoiserBridge:
         if contexts.full.session is None:
             raise ValueError("SRT-backed UG contexts require a session handle")
         return self.runtime.decode_next_segment(contexts.full.session)
+
+
+def normalize_ug_interleaved_messages(
+    messages: list[UGInterleavedMessage | dict[str, Any]],
+) -> list[UGInterleavedMessage]:
+    normalized: list[UGInterleavedMessage] = []
+    for message in messages:
+        if isinstance(message, UGInterleavedMessage):
+            normalized.append(message)
+            continue
+        if not isinstance(message, dict):
+            raise TypeError(
+                f"UG message must be a dict or UGInterleavedMessage: {message!r}"
+            )
+        message_type = message.get("type")
+        if message_type == "text":
+            content = message.get("text", message.get("content"))
+        elif message_type == "image":
+            content = message.get("image", message.get("content"))
+        else:
+            raise ValueError(f"Unsupported UG message type: {message_type!r}")
+        if content is None:
+            raise ValueError(f"UG {message_type} message is missing content")
+        normalized.append(UGInterleavedMessage(type=message_type, content=content))
+    if not normalized:
+        raise ValueError("UG interleaved messages must not be empty")
+    return normalized

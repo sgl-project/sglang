@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Literal
 
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
     UGContextStage,
     UGDecodeStage,
@@ -136,6 +137,31 @@ class UGPipeline(ComposedPipelineBase):
         self.add_stage(UGLatentStage(bridge))
         self.add_stage(UGDenoiseStage(bridge))
         self.add_stage(UGDecodeStage(bridge))
+
+    def forward_interleaved(
+        self,
+        messages: list[dict[str, Any]],
+        sampling_params,
+        server_args: ServerArgs,
+    ) -> list[dict[str, Any]]:
+        """Experimental UG interleaved API.
+
+        This is intentionally Python-only and internal for now. It accepts a
+        single interleaved request and returns ordered output segments without
+        promising OpenAI-compatible request or response shapes.
+        """
+
+        batch = Req(
+            sampling_params=sampling_params,
+            extra={"ug_interleaved_messages": messages},
+        )
+        try:
+            result = self.forward(batch, server_args)
+            return list(result.extra["ug_output_segments"])
+        finally:
+            contexts = batch.extra.get("ug_contexts")
+            if contexts is not None:
+                self.get_module("ug_bridge").release_contexts(contexts)
 
 
 EntryClass = UGPipeline

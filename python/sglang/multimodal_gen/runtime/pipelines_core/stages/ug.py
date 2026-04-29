@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.ug.denoiser import UGDenoiserBridge
+from sglang.srt.ug.runtime import UGInterleavedMessage
 
 
 class UGContextStage(PipelineStage):
@@ -38,6 +39,18 @@ class UGContextStage(PipelineStage):
         if batch.width is None:
             batch.width = pipeline_config.default_width
 
+        interleaved_messages = batch.extra.get("ug_interleaved_messages")
+        if interleaved_messages is not None:
+            messages = _normalize_pipeline_interleaved_messages(interleaved_messages)
+            batch.extra["ug_interleaved_messages"] = messages
+            batch.extra["ug_contexts"] = self.bridge.build_contexts_from_messages(
+                messages=messages
+            )
+            batch.extra["ug_pre_image_segments"] = batch.extra[
+                "ug_contexts"
+            ].full.metadata.get("pre_image_segments", [])
+            return batch
+
         if batch.condition_image is None and batch.image_path is not None:
             if isinstance(batch.image_path, list):
                 if len(batch.image_path) != 1:
@@ -57,6 +70,9 @@ class UGContextStage(PipelineStage):
             prompt=batch.prompt,
             image=batch.condition_image,
         )
+        batch.extra["ug_pre_image_segments"] = batch.extra[
+            "ug_contexts"
+        ].full.metadata.get("pre_image_segments", [])
         return batch
 
 
@@ -201,6 +217,11 @@ class UGDecodeStage(PipelineStage):
             batch.extra["ug_post_image_segment"] = self.bridge.decode_next_segment(
                 contexts=contexts
             )
+            batch.extra["ug_output_segments"] = _build_ug_output_segments(
+                pre_image_segments=batch.extra.get("ug_pre_image_segments", []),
+                image=image_for_append,
+                post_image_segment=batch.extra["ug_post_image_segment"],
+            )
         return batch
 
 
@@ -214,3 +235,50 @@ def _image_to_numpy_batch(image) -> np.ndarray:
     if array.dtype != np.uint8:
         array = np.clip(array, 0, 255).astype(np.uint8)
     return array
+
+
+def _normalize_pipeline_interleaved_messages(messages) -> list[UGInterleavedMessage]:
+    normalized = []
+    for message in messages:
+        if isinstance(message, UGInterleavedMessage):
+            normalized.append(message)
+            continue
+        if not isinstance(message, dict):
+            raise TypeError(f"UG interleaved message must be a dict: {message!r}")
+        message_type = message.get("type")
+        if message_type == "text":
+            content = message.get("text", message.get("content"))
+        elif message_type == "image":
+            content = message.get("image", message.get("content"))
+            if content is None:
+                raise ValueError("UG image message is missing content")
+            if not isinstance(content, Image.Image):
+                content = load_image(content)
+        else:
+            raise ValueError(
+                f"Unsupported UG interleaved message type: {message_type!r}"
+            )
+        if content is None:
+            raise ValueError(f"UG {message_type} message is missing content")
+        normalized.append(UGInterleavedMessage(type=message_type, content=content))
+    if not normalized:
+        raise ValueError("UG interleaved messages must not be empty")
+    return normalized
+
+
+def _build_ug_output_segments(
+    *,
+    pre_image_segments,
+    image: Image.Image,
+    post_image_segment,
+) -> list[dict]:
+    output_segments = list(pre_image_segments)
+    output_segments.append({"type": "image", "image": image})
+    if post_image_segment.type == "text":
+        output_segments.append({"type": "text", "text": post_image_segment.text or ""})
+    elif post_image_segment.type != "done":
+        raise ValueError(
+            "UG interleaved output expected text or done after generated image, "
+            f"got {post_image_segment.type}"
+        )
+    return output_segments
