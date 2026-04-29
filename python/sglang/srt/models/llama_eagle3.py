@@ -174,7 +174,7 @@ class LlamaModel(nn.Module):
                     [embeds[:-1], self.embed_tokens(input_ids[-1].unsqueeze(0))]
                 )
             if embeds is None:
-                embeds = self.embed_tokens(input_ids) * self.embed_scale
+                embeds = self.embed_tokens(input_ids)
         else:
             embeds = input_embeds
 
