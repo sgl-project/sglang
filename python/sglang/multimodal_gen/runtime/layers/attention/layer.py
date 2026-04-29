@@ -666,8 +666,8 @@ class USPAttention(nn.Module):
         Called when ring > 1 and replicated tokens are present.
         """
         sp_group = get_sp_group()
-        total_sp_size = sp_group.world_size
-        sp_rank = sp_group.rank_in_group
+        total_sp_size = get_sp_world_size()
+        sp_rank = get_sp_parallel_rank()
         num_rep = num_replicated_prefix or num_replicated_suffix
         is_suffix = num_replicated_suffix > 0
 
