@@ -573,6 +573,7 @@ class Engine(EngineScoreMixin, EngineBase):
                         server_args, tp_rank
                     )
 
+                    physical_gpu_id = gpu_id
                     with maybe_reindex_device_id(gpu_id) as gpu_id:
                         proc = mp.Process(
                             target=run_scheduler_process_func,
@@ -589,8 +590,14 @@ class Engine(EngineScoreMixin, EngineBase):
                                 writer,
                             ),
                         )
-                        with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
-                            server_args, gpu_id
+                        with (
+                            memory_saver_adapter.configure_subprocess(),
+                            numa_utils.configure_subprocess(
+                                server_args,
+                                gpu_id,
+                                manual_numa_index=len(scheduler_procs),
+                                physical_gpu_id=physical_gpu_id,
+                            ),
                         ):
                             proc.start()
 

@@ -503,6 +503,7 @@ class DataParallelController:
                     )
                 )
 
+                physical_gpu_id = gpu_id
                 with self.env_lock, maybe_reindex_device_id(gpu_id) as gpu_id:
                     proc = mp.Process(
                         target=self.run_scheduler_process_func,
@@ -519,8 +520,14 @@ class DataParallelController:
                             writer,
                         ),
                     )
-                    with memory_saver_adapter.configure_subprocess(), numa_utils.configure_subprocess(
-                        server_args, gpu_id
+                    with (
+                        memory_saver_adapter.configure_subprocess(),
+                        numa_utils.configure_subprocess(
+                            server_args,
+                            gpu_id,
+                            manual_numa_index=len(self.scheduler_procs),
+                            physical_gpu_id=physical_gpu_id,
+                        ),
                     ):
                         proc.start()
                 self.scheduler_procs.append(proc)
