@@ -495,8 +495,10 @@ class DefaultModelLoader(BaseModelLoader):
                 hf_weights_files,
             )
         elif use_safetensors:
-            weight_loader_disable_mmap = (
-                get_global_server_args().weight_loader_disable_mmap
+            server_args = get_global_server_args()
+            weight_loader_disable_mmap = server_args.weight_loader_disable_mmap
+            weight_loader_drop_cache_after_load = (
+                server_args.weight_loader_drop_cache_after_load
             )
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
@@ -510,10 +512,13 @@ class DefaultModelLoader(BaseModelLoader):
                         "num_threads", self.DEFAULT_NUM_THREADS
                     ),
                     disable_mmap=weight_loader_disable_mmap,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
             else:
                 weights_iterator = safetensors_weights_iterator(
-                    hf_weights_files, disable_mmap=weight_loader_disable_mmap
+                    hf_weights_files,
+                    disable_mmap=weight_loader_disable_mmap,
+                    drop_cache_after_load=weight_loader_drop_cache_after_load,
                 )
 
         else:

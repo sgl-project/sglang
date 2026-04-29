@@ -541,12 +541,14 @@ class ChatCompletionRequest(BaseModel):
     )  # noqa
     return_hidden_states: bool = False
     return_routed_experts: bool = False
-    reasoning_effort: Optional[Literal["low", "medium", "high"]] = Field(
+    reasoning_effort: Optional[Literal["low", "medium", "high", "max"]] = Field(
         default="medium",
         description="Constrains effort on reasoning for reasoning models. "
-        "'low' is the least effort, 'high' is the most effort. Reducing reasoning effort can "
-        "result in faster responses and fewer tokens used on reasoning in a response. "
-        "Currently only supported for OpenAI models in the harmony path, i.e GPT-OSS models.",
+        "'low' is the least effort, 'high' is the most effort. Reducing reasoning "
+        "effort can result in faster responses and fewer tokens used on reasoning "
+        "in a response. 'max' is an sglang extension to the OpenAI schema for "
+        "models that expose a maximum-effort tier above 'high'; models that don't "
+        "support it treat it the same as 'high'.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
