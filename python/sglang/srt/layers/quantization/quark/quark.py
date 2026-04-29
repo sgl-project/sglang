@@ -386,6 +386,13 @@ class QuarkConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
+    def can_fuse_shared_expert(self) -> bool:
+        return not any(
+            "shared_expert" in layer
+            and "shared_expert_gate" not in layer
+            and not layer.startswith("mtp.")
+            for layer in self.exclude_layers
+        )
 
 class QuarkLinearMethod(LinearMethodBase):
 

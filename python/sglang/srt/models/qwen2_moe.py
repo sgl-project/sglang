@@ -123,18 +123,10 @@ def can_fuse_shared_expert(
     ):
         return False
 
-    # If the shared expert is excluded from quantization (stored as FP32 in the
-    # checkpoint), fusing it into the quantized MoE weight tensor requires online
-    # quantization which is not supported. Disable fusion in this case.
-    if quant_config is not None:
-        exclude_layers = getattr(quant_config, "exclude_layers", [])
-        if any(
-            "shared_expert" in layer
-            and "shared_expert_gate" not in layer
-            and not layer.startswith("mtp.")
-            for layer in exclude_layers
-        ):
-            return False
+    # If shared experts have a different quantization spec than routed MoE
+    # experts (e.g. unquantized BF16 vs MXFP4), fusion is not supported.
+    if quant_config is not None and not quant_config.can_fuse_shared_expert():
+        return False
 
     return True
 
