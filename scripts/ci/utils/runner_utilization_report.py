@@ -263,6 +263,11 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
     # Track runners seen in jobs (for labels not in API or when API unavailable)
     job_label_runners = defaultdict(set)
     label_jobs = defaultdict(list)  # label -> list of job_info
+    # Per-host accumulation: each physical machine appears once regardless of
+    # how many overlapping labels it advertises. This is what we use for the
+    # "Per Host Utilization" section (the source-of-truth view).
+    host_jobs = defaultdict(list)  # runner_name -> list of job_info
+    host_labels = defaultdict(set)  # runner_name -> set of labels it ran jobs under
 
     # Fetch jobs for all runs in parallel
     total_runs = len(runs)
@@ -313,6 +318,9 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
             "runner_name": runner_name,
         }
 
+        # Per-host: every job on this physical machine, regardless of label.
+        host_jobs[runner_name].append(job_info)
+
         # Use job labels directly (available in job data)
         job_labels = job.get("labels", [])
         for label in job_labels:
@@ -321,6 +329,7 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
                 continue
             job_label_runners[label].add(runner_name)
             label_jobs[label].append(job_info)
+            host_labels[runner_name].add(label)
 
     # Merge API runners and job-observed runners
     # Prefer API count (online runners) when available
@@ -404,10 +413,38 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
             }
         )
 
-    return results
+    # Per-host metrics: each physical machine once, with its true busy time
+    # against window capacity. Overlapping labels do not multiply the
+    # denominator here (unlike the per-label view).
+    host_results = []
+    for host, jobs in host_jobs.items():
+        if runner_filter and not any(runner_filter in lbl for lbl in host_labels[host]):
+            continue
+        # Clamp each job to the window before summing — a job spanning the
+        # window edge should only contribute the portion inside the window.
+        busy_seconds = 0.0
+        for j in jobs:
+            clamped_start = max(j["start"], window_start)
+            clamped_end = min(j["end"], window_end)
+            if clamped_end > clamped_start:
+                busy_seconds += (clamped_end - clamped_start).total_seconds()
+        host_results.append(
+            {
+                "host": host,
+                "labels": sorted(host_labels[host]),
+                "num_jobs": len(jobs),
+                "busy_hours": busy_seconds / 3600,
+                "utilization_pct": (
+                    busy_seconds / window_seconds * 100 if window_seconds > 0 else 0
+                ),
+            }
+        )
+    host_results.sort(key=lambda r: -r["utilization_pct"])
+
+    return results, host_results
 
 
-def format_report(results: list[dict], hours: int) -> str:
+def format_report(results: list[dict], host_results: list[dict], hours: int) -> str:
     """Format results as markdown report."""
     lines = [
         "# Runner Utilization Report",
@@ -415,11 +452,40 @@ def format_report(results: list[dict], hours: int) -> str:
         f"**Time window:** Last {hours} hours",
         f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         "",
-        "## Concurrency Analysis",
+        "## Per Host Utilization",
         "",
-        "| Label | Runners (API/Effective) | Peak Concurrent | Avg Concurrent | Saturation Time | Peak Queue |",
-        "|-------|-------------------------|-----------------|----------------|-----------------|------------|",
+        "Each physical runner machine is counted once, regardless of how many "
+        "overlapping labels it advertises (e.g. a single B200 host advertises "
+        "`4-gpu-b200`, `4-gpu-b200-kernel`, `4-gpu-b200-low-disk`, "
+        "`4-gpu-b200-kernel-low-disk` — but only one job runs on it at a time). "
+        "**This is the source-of-truth view of capacity utilization.** "
+        "If you want per-class numbers, see the Per Label section below, but "
+        "note those denominators are inflated when labels share hosts.",
+        "",
+        "| Host | Jobs | Busy (hrs) | Utilization | Labels |",
+        "|------|------|------------|-------------|--------|",
     ]
+    for h in host_results:
+        bar = "█" * int(h["utilization_pct"] / 10) + "░" * (
+            10 - int(h["utilization_pct"] / 10)
+        )
+        labels_str = ", ".join(h["labels"]) if h["labels"] else "—"
+        lines.append(
+            f"| {h['host']} | {h['num_jobs']} | "
+            f"{h['busy_hours']:.1f} | "
+            f"{h['utilization_pct']:.1f}% {bar} | "
+            f"{labels_str} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Concurrency Analysis",
+            "",
+            "| Label | Runners (API/Effective) | Peak Concurrent | Avg Concurrent | Saturation Time | Peak Queue |",
+            "|-------|-------------------------|-----------------|----------------|-----------------|------------|",
+        ]
+    )
 
     for r in results:
         effective = r["effective_runners"]
@@ -477,6 +543,15 @@ def format_report(results: list[dict], hours: int) -> str:
             "",
             "## Summary by Runner Label",
             "",
+            "Note: hosts often advertise multiple labels (e.g. one B200 host "
+            "carries `4-gpu-b200`, `4-gpu-b200-kernel`, `4-gpu-b200-low-disk`, "
+            "`4-gpu-b200-kernel-low-disk`; one H100 GPU pair carries "
+            "`2-gpu-runner`, `2-gpu-large`, `2-gpu-h100`, `1-gpu-h100-h200`). "
+            "Each label below is shown against its own `num_runners × window` "
+            "denominator, which double-counts capacity when labels share "
+            "hosts and makes per-label utilization look low. **Use the Per "
+            "Host Utilization table above for actual host utilization.**",
+            "",
             "| Label | Runners | Jobs | Active (hrs) | Utilization | Avg Queue | Max Queue |",
             "|-------|---------|------|--------------|-------------|-----------|-----------|",
         ]
@@ -506,8 +581,8 @@ def main():
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
     args = parser.parse_args()
 
-    results = calculate_utilization(args.repo, args.hours, args.filter)
-    report = format_report(results, args.hours)
+    results, host_results = calculate_utilization(args.repo, args.hours, args.filter)
+    report = format_report(results, host_results, args.hours)
 
     if args.output:
         with open(args.output, "w") as f:
