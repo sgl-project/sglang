@@ -281,5 +281,58 @@ class TestCudaGraphCompatibility:
         assert (hot_out_ids == -1).all()
 
 
+class TestDynamoCompatibility:
+    """4. torch._dynamo / torch.compile compatibility — production sglang's
+    piecewise CUDA graph compiles model.forward through dynamo, which
+    does NOT tolerate Python builtins like min(..., key=lambda) inside
+    the traced region. This is the failure mode we hit at e2e:
+
+      torch._dynamo.exc.Unsupported: invalid call to builtin op handler
+      Encountered TypeError when trying to handle op min
+      invalid args to BuiltinVariable._call_min_max:
+        [RangeVariable()] {'key': NestedUserFunctionVariable()}
+
+    These tests trace the policy's lookups + dispatch through dynamo
+    with fullgraph=True. Any graph-break raises and fails the test.
+
+    Runs on CPU — no CUDA needed for dynamo tracing.
+    """
+
+    def test_lookup_x_runtime_traceable(self, curve_path):
+        """_lookup_x_runtime must be dynamo-traceable (no min(..., key=))."""
+        p = _make_policy(curve_path, num_experts=64,
+                         device=torch.device("cpu"))
+
+        @torch.compile(fullgraph=True, dynamic=False, backend="eager")
+        def call(M_int):
+            return p._lookup_x_runtime(M_int)
+
+        # If the underlying lookup uses min(..., key=lambda), dynamo
+        # raises Unsupported on the FIRST invocation.
+        assert call(1024) == 16
+        assert call(32) == 0
+        assert call(4096) == 32
+
+    def test_lookup_sparse_tile_dispatch_traceable(self, curve_path):
+        """The full dispatch path (which calls _lookup_x_runtime + sort +
+        gpu-side compare) must trace cleanly under dynamo with the
+        ``eager`` backend (which is what dynamo defaults to inside
+        sglang's piecewise CUDA graph compile)."""
+        p = _make_policy(curve_path, num_experts=64,
+                         device=torch.device("cpu"))
+        N, K = 1024, 8
+        ids = torch.randint(0, 64, (N, K), dtype=torch.long)
+        scales = torch.ones(N, K, dtype=torch.float32)
+
+        @torch.compile(fullgraph=False, dynamic=False, backend="eager")
+        def call(ids, scales):
+            return p.dispatch(ids, scales, sentinel=-1)
+
+        # Dynamo will graph-break-or-error on min(...,key=lambda).
+        result = call(ids, scales)
+        assert len(result) == 2  # cold + hot
+        assert result[0][0].shape == (N, K)
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

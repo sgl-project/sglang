@@ -61,7 +61,9 @@ def _parse_heter_config(config_path: str) -> Dict[str, Any]:
     # NOTE: ``group_size`` on INT4 groups is the GPTQ quantization group
     # size (e.g. 128 scales per K), unrelated to the precision groups.
     policy = cfg.get("policy", "expert_load")
-    if policy == "expert_batch":
+    # Policies that don't need static size_ratios (decide hot/cold at
+    # runtime from token counts / curve lookup).
+    if policy in ("expert_batch", "efficiency_promotion"):
         for g in groups:
             g.setdefault("size_ratio", 0.0)
     else:
@@ -359,13 +361,23 @@ class HeterFusedMoE(nn.Module):
         self, m_per_expert: int
     ) -> Optional[Tuple[Dict, Dict]]:
         """Nearest-bse lookup in the precomputed row. None if no autotune
-        artifact is loaded."""
+        artifact is loaded.
+
+        Manual argmin loop instead of ``min(..., key=lambda)`` — dynamo
+        traces the forward path and rejects the ``key=`` kwarg form (see
+        EfficiencyPromotionPolicy._lookup_x_runtime for context).
+        """
         if not self._sparse_tile_by_bse:
             return None
-        bse_match = min(
-            self._sparse_tile_bse_keys, key=lambda b: abs(b - m_per_expert)
-        )
-        return self._sparse_tile_by_bse[bse_match]
+        keys = self._sparse_tile_bse_keys
+        best_idx = 0
+        best_dist = abs(keys[0] - m_per_expert)
+        for i in range(1, len(keys)):
+            d = abs(keys[i] - m_per_expert)
+            if d < best_dist:
+                best_dist = d
+                best_idx = i
+        return self._sparse_tile_by_bse[keys[best_idx]]
 
     def _init_group_weights(self) -> None:
         """Create weight containers for groups specified in the config.
@@ -862,14 +874,23 @@ class HeterFusedMoE(nn.Module):
                     remapped = self._bf16_id_remap[safe_ids]
                     group_ids = torch.where(group_ids >= 0, remapped, group_ids)
                 # Pin autotuned tile if the kernel-profile artifact was loaded.
-                # m_per_expert = mean tokens per BF16 expert this step. Single
-                # .item() sync; cheap relative to the kernel call below.
+                # m_per_expert is computed from host-known shapes only — no
+                # GPU→host sync (a .item() would break CUDA-graph capture
+                # since the kernel call below runs inside the captured graph).
+                # Approximation: under uniform routing each token's K slots
+                # spread across self._num_bf16_experts, so per-expert load is
+                # M_global * top_k / num_bf16_experts. Real Zipf concentrates
+                # on a subset, but the autotune is hierarchical-nearest in
+                # bse, so an order-of-magnitude approximation is sufficient.
                 tile_pair = None
-                if self._sparse_tile_by_bse is not None:
-                    routed = (group_ids >= 0).sum().item()
-                    if routed > 0:
-                        m_per_expert = int(routed / max(self._num_bf16_experts, 1))
-                        tile_pair = self._lookup_sparse_tile(m_per_expert)
+                if self._sparse_tile_by_bse is not None and self._num_bf16_experts > 0:
+                    M_global = hidden_states.shape[0]   # host-known
+                    top_k = group_ids.shape[1]          # host-known
+                    m_per_expert = max(
+                        1,
+                        (M_global * top_k) // self._num_bf16_experts,
+                    )
+                    tile_pair = self._lookup_sparse_tile(m_per_expert)
                 if tile_pair is not None:
                     from sglang.srt.layers.moe.fused_moe_triton import (
                         override_split_config,

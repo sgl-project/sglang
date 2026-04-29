@@ -717,18 +717,33 @@ class EfficiencyPromotionPolicy(HeterDispatchPolicy):
         self._curve_x = [p[1] for p in rows]
 
     def _lookup_x_runtime(self, M_global: int) -> int:
-        """Return x_runtime via nearest-M lookup. Cached per M."""
+        """Return x_runtime via nearest-M lookup. Cached per M.
+
+        Implementation note: avoids ``min(..., key=lambda)`` which torch's
+        dynamo does NOT support inside a traced graph
+        (https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0193.html).
+        Production sglang's piecewise CUDA graph runs the model forward
+        through ``torch.compile``; the dispatch path is traced. A manual
+        argmin loop using only scalar comparisons is dynamo-safe.
+        """
         if M_global in self._x_cache:
             return self._x_cache[M_global]
         if not self._curve_M:
             x = 0
         else:
-            x = min(
-                range(len(self._curve_M)),
-                key=lambda i: abs(self._curve_M[i] - M_global),
-            )
-            x = self._curve_x[x]
-            x = max(0, min(x, self._num_experts))
+            best_idx = 0
+            best_dist = abs(self._curve_M[0] - M_global)
+            for i in range(1, len(self._curve_M)):
+                d = abs(self._curve_M[i] - M_global)
+                if d < best_dist:
+                    best_dist = d
+                    best_idx = i
+            x = self._curve_x[best_idx]
+            # Two-arg min/max (no key=) is dynamo-supported.
+            if x < 0:
+                x = 0
+            if x > self._num_experts:
+                x = self._num_experts
         self._x_cache[M_global] = x
         return x
 
