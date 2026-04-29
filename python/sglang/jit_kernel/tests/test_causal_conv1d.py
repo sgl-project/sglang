@@ -165,7 +165,8 @@ def _tol(dtype: torch.dtype):
 # Total: ~14 cases.
 # ---------------------------------------------------------------------------
 
-# 5 fwd configs: cover all 3 widths, all 3 dtypes, bias/init/silu on+off, large dim, long seqlen.
+# 7 fwd configs: cover all 3 widths, all 3 dtypes, bias/init/silu on+off, large dim,
+# long seqlen, batch=2 + non-aligned, seqlen < width edge case.
 # (batch, dim, seqlen, width, has_bias, has_initial, silu, dtype)
 FWD_CONFIGS = [
     (1, 64, 128, 4, True, False, True, torch.float16),       # baseline (w=4, fp16)
@@ -173,6 +174,8 @@ FWD_CONFIGS = [
     (1, 64, 1025, 2, False, False, False, torch.float32),    # w=2, fp32, non-aligned, no bias, no silu
     (1, 64, 4096, 4, True, False, True, torch.bfloat16),     # long seqlen, bf16
     (1, 4096, 128, 4, True, False, True, torch.float16),     # large dim
+    (2, 64, 1025, 4, True, False, True, torch.float16),      # batch=2 + non-aligned (kIsVecLoad=false)
+    (1, 64, 2, 4, True, True, True, torch.float16),          # seqlen < width-1 (state pad edge case)
 ]
 
 
@@ -442,7 +445,8 @@ def test_varlen(with_padding, dtype):
                 ),
             )
         )
-    out_ref_tensor = torch.cat([t[0] for t in out_ref_b], dim=2)
+    # out is 2D (dim, seqlen); ref segments are 3D (1, dim, seg_len), so squeeze for shape match.
+    out_ref_tensor = torch.cat([t[0] for t in out_ref_b], dim=2).squeeze(0)
 
     unpadded_out = out[:, : out_ref_tensor.shape[-1]]
     torch.testing.assert_close(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
