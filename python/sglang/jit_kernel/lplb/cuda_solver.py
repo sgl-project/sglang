@@ -92,17 +92,22 @@ def solve_ipm(
     b: torch.Tensor,
     c: torch.Tensor,
     num_iters: int = DEFAULT_NUM_ITERS,
+    result: "torch.Tensor | None" = None,
 ) -> torch.Tensor:
     """Drop-in replacement for ``torch_solver._solve_ipm_torch``.
 
-    Runs the fused single-SM IPM kernel (cuBLASDx GEMM + cuSolverDx Cholesky)
-    with the dispatch path described in the module docstring.
+    Runs the fused single-SM IPM kernel (cuBLASDx GEMM + hand-written
+    Cholesky) with the dispatch path described in the module docstring.
 
     Args:
         A: Constraint matrix, shape ``(NC, NV)``, float32, on CUDA.
         b: RHS vector, shape ``(NC,)``, float32, on CUDA.
         c: Objective coefficients, shape ``(NV,)``, float32, on CUDA.
         num_iters: Number of barrier iterations (default 5).
+        result: Optional pre-allocated ``(NV,)`` float32 CUDA buffer to write
+            into. When omitted the kernel allocates a fresh result tensor
+            (~20 µs of CPU overhead). Passing in a long-lived buffer skips
+            that alloc on every solve.
 
     Returns:
         x: Solution vector, shape ``(NV,)``, float32. The kernel writes 0.5
@@ -115,6 +120,86 @@ def solve_ipm(
     assert c.shape == (nv,), f"c shape mismatch: {c.shape} vs ({nv},)"
 
     module = _ipm_module(nc, nv, DEFAULT_BLOCK_DIM, num_iters, _sm_ver())
-    result = torch.empty(nv, dtype=torch.float32, device=A.device)
+    if result is None:
+        result = torch.empty(nv, dtype=torch.float32, device=A.device)
     module.ipm_solve(A, b, c, result)
     return result
+
+
+@cache_once
+def _prep_module(
+    nc: int,
+    nv: int,
+    num_single: int,
+    num_red_log: int,
+    num_gpus: int,
+    block_dim: int,
+) -> "Module":
+    args = make_cpp_args(nc, nv, num_single, num_red_log, num_gpus, block_dim)
+    return load_jit(
+        "lplb_lp_prep",
+        *args,
+        cuda_files=["lplb/lp_prep.cuh"],
+        cuda_wrappers=[("lp_prep", f"lp_prep<{args}>")],
+    )
+
+
+def prep_lp_inputs(
+    A_full: torch.Tensor,
+    b: torch.Tensor,
+    t1: torch.Tensor,
+    global_counts: torch.Tensor,
+    log_single: torch.Tensor,
+    log_replicated: torch.Tensor,
+    B1: torch.Tensor,
+    A_base_row_sum: torch.Tensor,
+) -> None:
+    """Replace the 8 torch ops that built the IPM inputs with one CUDA kernel.
+
+    Writes into the caller-provided ``A_full`` (last column only), ``b``,
+    and ``t1`` buffers. ``A_full``'s first ``NV-1`` columns must already
+    hold ``A_base.copy_()`` from solver init — this kernel does not touch
+    them.
+    """
+    nc, nv = A_full.shape
+    num_single = log_single.shape[0]
+    num_red_log = log_replicated.shape[0]
+    num_gpus, _ns = B1.shape
+    module = _prep_module(nc, nv, num_single, num_red_log, num_gpus, DEFAULT_BLOCK_DIM)
+    module.lp_prep(A_full, b, t1, global_counts, log_single, log_replicated, B1, A_base_row_sum)
+
+
+@cache_once
+def _post_module(
+    num_logical: int,
+    max_copies: int,
+    num_single: int,
+    num_red_phy: int,
+    block_dim: int,
+) -> "Module":
+    args = make_cpp_args(num_logical, max_copies, num_single, num_red_phy, block_dim)
+    return load_jit(
+        "lplb_lp_post",
+        *args,
+        cuda_files=["lplb/lp_post.cuh"],
+        cuda_wrappers=[("lp_post", f"lp_post<{args}>")],
+    )
+
+
+def extract_log2phy_prob(
+    log2phy_prob: torch.Tensor,
+    x: torch.Tensor,
+    t1: torch.Tensor,
+    phy_single: torch.Tensor,
+    phy_replicated: torch.Tensor,
+    log2phy: torch.Tensor,
+) -> None:
+    """Replace the 5 torch ops that turned the IPM output into log2phy_prob
+    with one CUDA kernel. Writes into the caller-provided ``log2phy_prob``
+    buffer of shape ``(num_logical, max_copies)``.
+    """
+    num_logical, max_copies = log2phy_prob.shape
+    num_single = phy_single.shape[0]
+    num_red_phy = phy_replicated.shape[0]
+    module = _post_module(num_logical, max_copies, num_single, num_red_phy, DEFAULT_BLOCK_DIM)
+    module.lp_post(log2phy_prob, x, t1, phy_single, phy_replicated, log2phy)

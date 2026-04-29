@@ -187,10 +187,22 @@ class LPLBSolver:
         except Exception as e:  # pragma: no cover
             logger.warning(f"LPLB IPM warmup skipped: {e}")
 
-        # Pre-compute A_base row sum (used in every _solve_torch call). Larger
-        # buffer reuse via strided ``out=`` writes triggered CUDA asserts under
-        # high concurrency, so we keep other allocations local in the hot path.
+        # Pre-compute A_base row sum (used in every prep call).
         self._A_base_row_sum = self.A_base.sum(dim=1).contiguous()  # (NC,)
+
+        # Pre-allocate the buffers the JIT CUDA prep / IPM / post kernels write
+        # into. All writes are contiguous full-tensor stores (no strided
+        # ``out=`` semantics), so the reuse is safe under high concurrency.
+        # Constructed lazily on the first solve() call (we don't know the
+        # device-side log2phy_prob shape until then) — see _solve_torch.
+        self._A_full = torch.empty(nc, nv, dtype=torch.float32, device=device)
+        self._A_full[:, : nv - 1].copy_(self.A_base)
+        self._b = torch.empty(nc, dtype=torch.float32, device=device)
+        self._t1 = torch.empty(self.num_single, dtype=torch.float32, device=device)
+        self._x = torch.empty(nv, dtype=torch.float32, device=device)
+        self._log2phy_prob = torch.empty(
+            log2phy.shape, dtype=torch.float32, device=device
+        )
 
     def solve(self, topk_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -243,6 +255,48 @@ class LPLBSolver:
         return log2phy_prob
 
     def _solve_torch(self, global_counts: torch.Tensor) -> torch.Tensor:
+        """Three CUDA kernel launches replace ~14 torch ops.
+
+        Pipeline (all writes go into pre-allocated buffers from __init__):
+            prep_lp_inputs → solve_ipm → extract_log2phy_prob
+        Falls back to the all-torch reference path when the JIT CUDA backend
+        is unavailable (e.g. CPU host or missing Math-DX).
+        """
+        from sglang.jit_kernel.lplb import torch_solver
+
+        torch_solver._init_fused_backend()
+        if torch_solver._FUSED_AVAILABLE:
+            try:
+                from sglang.jit_kernel.lplb import cuda_solver
+
+                cuda_solver.prep_lp_inputs(
+                    self._A_full,
+                    self._b,
+                    self._t1,
+                    global_counts,
+                    self.log_single,
+                    self.log_replicated,
+                    self.B1,
+                    self._A_base_row_sum,
+                )
+                cuda_solver.solve_ipm(
+                    self._A_full, self._b, self.c_vec, result=self._x
+                )
+                cuda_solver.extract_log2phy_prob(
+                    self._log2phy_prob,
+                    self._x,
+                    self._t1,
+                    self.phy_single,
+                    self.phy_replicated,
+                    self.log2phy,
+                )
+                return self._log2phy_prob
+            except Exception as e:  # pragma: no cover
+                logger.warning(
+                    f"LPLB JIT prep/post path failed ({e!r}); falling back to torch."
+                )
+
+        # Torch reference fallback (also used on CPU / non-Hopper GPUs).
         from sglang.jit_kernel.lplb.torch_solver import solve_ipm
 
         # Clamp denominator on-device to keep the all-zero case finite without
