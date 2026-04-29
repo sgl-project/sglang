@@ -26,14 +26,14 @@ register_cuda_ci(est_time=5, suite="stage-b-kernel-benchmark-1-gpu-large")
 PAD_SLOT_ID = -1
 WIDTH = 4
 
-# Forward-kernel sweep: typical mamba prefill workloads.
+# Forward sweep — varlen format (dim, total_tokens) used by both kernels.
 fwd_batch_sizes = get_benchmark_range(full_range=[1, 4, 16, 64], ci_range=[16])
 fwd_seqlens = get_benchmark_range(
     full_range=[128, 512, 1024, 2048, 4096], ci_range=[1024]
 )
 fwd_dim_range = get_benchmark_range(full_range=[1024, 2048, 4096], ci_range=[2048])
 
-# Update-kernel sweep: typical mamba decode (seqlen == 1).
+# Update sweep — single-step decode (seqlen == 1).
 upd_batch_sizes = get_benchmark_range(full_range=[1, 4, 16, 64, 256], ci_range=[16])
 upd_dim_range = get_benchmark_range(full_range=[1024, 2048, 4096], ci_range=[2048])
 
@@ -46,15 +46,26 @@ PROVIDER_STYLES = [("red", "-"), ("blue", "-")]
 
 
 def _make_fwd_inputs(batch, dim, seqlen, dtype):
-    """Allocate the forward-kernel inputs (no varlen, no cache)."""
-    x = torch.randn(batch, dim, seqlen, device=DEFAULT_DEVICE, dtype=dtype).contiguous()
+    """Allocate forward-kernel inputs in **varlen** format (the format both kernels accept).
+
+    Returns ``(x_varlen, weight, bias, conv_states, query_start_loc, seq_lens_cpu)``
+    where ``x_varlen`` has shape ``(dim, batch*seqlen)`` and ``query_start_loc``
+    splits it into ``batch`` equal-length sequences.
+    """
+    total_tokens = batch * seqlen
+    x_varlen = torch.randn(dim, total_tokens, device=DEFAULT_DEVICE, dtype=dtype).contiguous()
     weight = torch.randn(dim, WIDTH, device=DEFAULT_DEVICE, dtype=dtype)
     bias = torch.randn(dim, device=DEFAULT_DEVICE, dtype=dtype)
-    return x, weight, bias
+    conv_states = torch.zeros(batch, dim, WIDTH - 1, device=DEFAULT_DEVICE, dtype=dtype)
+    query_start_loc = torch.tensor(
+        [i * seqlen for i in range(batch + 1)], dtype=torch.int32, device=DEFAULT_DEVICE
+    )
+    seq_lens_cpu = [seqlen] * batch
+    return x_varlen, weight, bias, conv_states, query_start_loc, seq_lens_cpu
 
 
 def _make_update_inputs(batch, dim, dtype):
-    """Allocate the update-kernel inputs (single-step decode)."""
+    """Allocate update-kernel inputs (single-step decode)."""
     x = torch.randn(batch, dim, 1, device=DEFAULT_DEVICE, dtype=dtype)
     conv_state = torch.randn(batch, dim, WIDTH - 1, device=DEFAULT_DEVICE, dtype=dtype)
     weight = torch.randn(dim, WIDTH, device=DEFAULT_DEVICE, dtype=dtype)
@@ -78,20 +89,36 @@ def _make_update_inputs(batch, dim, dtype):
 def benchmark_fwd(batch_size, dim, seqlen, provider):
     """Benchmark a single mamba forward (prefill) call across kernel implementations."""
     dtype = DEFAULT_DTYPE
-    x, weight, bias = _make_fwd_inputs(batch_size, dim, seqlen, dtype)
+    x, weight, bias, conv_states, qsl, seq_lens_cpu = _make_fwd_inputs(
+        batch_size, dim, seqlen, dtype
+    )
 
     if provider == "jit":
-        # Note: causal_conv1d_fwd writes the result back into x in place.
+        # JIT writes back into x in place; clone each iteration so the benchmark stays stable.
         def fn():
             xx = x.clone()
+            cs = conv_states.clone()
             causal_conv1d_fwd(
-                xx, weight, bias, None, None, None, None, True, PAD_SLOT_ID
+                xx, weight, bias, cs, qsl, None, None, True, PAD_SLOT_ID
             )
 
     elif provider == "triton":
 
         def fn():
-            triton_causal_conv1d_fn(x, weight, bias, activation="silu")
+            xx = x.clone()
+            cs = conv_states.clone()
+            triton_causal_conv1d_fn(
+                xx,
+                weight,
+                bias,
+                cs,
+                qsl,
+                seq_lens_cpu,
+                cache_indices=None,
+                has_initial_state=None,
+                activation="silu",
+                pad_slot_id=PAD_SLOT_ID,
+            )
 
     else:
         raise ValueError(f"unknown provider: {provider}")
@@ -129,8 +156,10 @@ def benchmark_update(batch_size, dim, provider):
     elif provider == "triton":
 
         def fn():
+            xx = x.clone()
+            cs = conv_state.clone()
             triton_causal_conv1d_update(
-                x.clone(), conv_state.clone(), weight, bias=bias, activation="silu"
+                xx, cs, weight, bias=bias, activation="silu", pad_slot_id=PAD_SLOT_ID
             )
 
     else:
