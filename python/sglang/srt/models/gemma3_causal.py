@@ -892,9 +892,6 @@ class Gemma3ForCausalLM(PreTrainedModel):
         return loaded_params
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        # if not self.pp_group.is_last_rank:
-        #     return
-
         if layer_ids is None:
             self.capture_aux_hidden_states = True
             num_layers = self.config.num_hidden_layers
