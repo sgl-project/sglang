@@ -32,7 +32,7 @@ Qwen-Image is a text-to-image model. The recommended launch configurations vary 
 
 ### 3.2 Configuration Tips
 
-Current supported optimization all listed [here](../../../docs/sglang-diffusion/attention-backends#platform-support-matrix).
+Current supported optimization all listed [here](../../../docs/sglang-diffusion/attention_backends#platform-support-matrix).
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus`: Number of GPUs to use
@@ -45,7 +45,7 @@ Current supported optimization all listed [here](../../../docs/sglang-diffusion/
 
 ## 4. API Usage
 
-For complete API documentation, please refer to the [official API usage guide](../../../docs/sglang-diffusion/api/openai-api).
+For complete API documentation, please refer to the [official API usage guide](../../../docs/sglang-diffusion/api/openai_api).
 
 ### 4.1 Generate an Image
 
@@ -72,7 +72,7 @@ with open("output.png", "wb") as f:
 
 #### 4.2.1 Cache-DiT Acceleration
 
-SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to 7.4x inference speedup with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](../../../docs/sglang-diffusion/cache-dit).
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to 7.4x inference speedup with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](../../../docs/sglang-diffusion/cache_dit).
 
 **Basic Usage**
 

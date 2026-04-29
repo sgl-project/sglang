@@ -21,7 +21,7 @@ from sglang.srt.managers.schedule_batch import (
     ScheduleBatch,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.server_args import get_global_server_args
+from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import (
@@ -33,7 +33,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_FORCE_STREAM_INTERVAL = 50
+# How often (in decoded tokens) the scheduler force-flushes an intermediate
+# output batch for non-streaming requests.
+DEFAULT_FORCE_STREAM_INTERVAL = envs.SGLANG_FORCE_STREAM_INTERVAL.get()
 
 
 class SchedulerOutputProcessorMixin:
@@ -133,6 +135,9 @@ class SchedulerOutputProcessorMixin:
         if self.is_generation:
             if result.copy_done is not None:
                 result.copy_done.synchronize()
+            if result.routed_experts_output is not None:
+                result.routed_experts_output.finalize()
+                result.routed_experts_output = None
 
             (
                 logits_output,
@@ -352,7 +357,7 @@ class SchedulerOutputProcessorMixin:
 
         next_token_ids = result.next_token_ids.tolist()
         accept_lens = result.accept_lens.tolist()
-        result.num_accepted_tokens = sum(accept_lens) - len(batch.reqs)
+        result.num_accepted_drafts = sum(accept_lens) - len(batch.reqs)
         result.accept_length_per_req_cpu = [x - 1 for x in accept_lens]
 
         predict_tokens = []
@@ -367,7 +372,7 @@ class SchedulerOutputProcessorMixin:
             req.spec_verify_ct += 1
 
             accepted_draft_tokens = result.accept_length_per_req_cpu[i]
-            req.spec_accepted_tokens += accepted_draft_tokens
+            req.spec_accepted_drafts += accepted_draft_tokens
             req.update_spec_acceptance_histogram(accepted_draft_tokens)
 
         return predict_tokens
@@ -391,6 +396,9 @@ class SchedulerOutputProcessorMixin:
     ):
         if result.copy_done is not None:
             result.copy_done.synchronize()
+        if result.routed_experts_output is not None:
+            result.routed_experts_output.finalize()
+            result.routed_experts_output = None
 
         logits_output, next_token_ids, can_run_cuda_graph = (
             result.logits_output,
@@ -424,7 +432,7 @@ class SchedulerOutputProcessorMixin:
 
         self.num_generated_tokens += len(batch.reqs)
         if not batch.spec_algorithm.is_none():
-            self.update_spec_metrics(batch.batch_size(), result.num_accepted_tokens)
+            self.update_spec_metrics(batch.batch_size(), result.num_accepted_drafts)
         if self.enable_metrics:
             self.metrics_collector.increment_decode_cuda_graph_pass(
                 value=can_run_cuda_graph
@@ -537,7 +545,7 @@ class SchedulerOutputProcessorMixin:
         self.report_decode_stats(
             can_run_cuda_graph,
             running_batch=batch,
-            num_accepted_tokens=result.num_accepted_tokens,
+            num_accepted_drafts=result.num_accepted_drafts,
         )
 
     def _handle_finished_req(
@@ -629,13 +637,12 @@ class SchedulerOutputProcessorMixin:
 
         # Process logprob indices based on scoring type
         if is_multi_item_scoring:
-            # Multi-item scoring: only include delimiter token positions
-            relevant_tokens = req.origin_input_ids[req.logprob_start_len :]
-            input_token_logprobs_idx = [
-                token_id
-                for token_id in relevant_tokens
-                if token_id == self.server_args.multi_item_scoring_delimiter
-            ]
+            # MIS scores come from input_token_ids_logprobs, not input_token_logprobs.
+            # But the shared pipeline requires input_token_logprobs_idx to be the same
+            # length as input_token_logprobs_val (validated at line 816). We fill with
+            # MIS_DELIMITER_TOKEN_ID as a dummy — score_request() ignores this field.
+            delimiter_count = len(req.multi_item_delimiter_indices)
+            input_token_logprobs_idx = [MIS_DELIMITER_TOKEN_ID] * delimiter_count
         else:
             # Regular request: include all tokens from logprob_start_len onwards
             input_token_logprobs_idx = req.origin_input_ids[req.logprob_start_len :]
@@ -714,18 +721,11 @@ class SchedulerOutputProcessorMixin:
         For regular requests, all positions from logprob_start_len onwards have logprobs.
         """
         is_multi_item_scoring = self._is_multi_item_scoring(req)
-        relevant_tokens = req.origin_input_ids[req.logprob_start_len :]
 
         if is_multi_item_scoring:
-            # Multi-item scoring: count delimiter tokens from logprob_start_len onwards
-            return sum(
-                1
-                for token_id in relevant_tokens
-                if token_id == self.server_args.multi_item_scoring_delimiter
-            )
+            return len(req.multi_item_delimiter_indices)
         else:
-            # Regular request: all tokens from logprob_start_len onwards
-            return len(relevant_tokens)
+            return len(req.origin_input_ids[req.logprob_start_len :])
 
     def _calculate_num_input_logprobs(
         self: Scheduler, req: Req, extend_input_len: int, extend_logprob_start_len: int
@@ -738,14 +738,11 @@ class SchedulerOutputProcessorMixin:
         is_multi_item_scoring = self._is_multi_item_scoring(req)
 
         if is_multi_item_scoring:
-            # Multi-item scoring: count delimiter tokens in the relevant portion
-            relevant_tokens = req.origin_input_ids[
-                extend_logprob_start_len:extend_input_len
-            ]
+            # Count pre-computed delimiter indices within the extend range
             return sum(
                 1
-                for token_id in relevant_tokens
-                if token_id == self.server_args.multi_item_scoring_delimiter
+                for idx in req.multi_item_delimiter_indices
+                if extend_logprob_start_len <= idx < extend_input_len
             )
         else:
             # Regular request: all tokens in the range
@@ -758,7 +755,11 @@ class SchedulerOutputProcessorMixin:
         token is configured. In this mode, only positions containing the
         delimiter token receive logprobs.
         """
-        return req.is_prefill_only and self.server_args.multi_item_scoring_delimiter
+        return (
+            self.server_args.enable_mis
+            and req.is_prefill_only
+            and req.multi_item_delimiter_indices is not None
+        )
 
     def add_input_logprob_return_values(
         self: Scheduler,
@@ -961,7 +962,7 @@ class SchedulerOutputProcessorMixin:
         cached_tokens = []
         cached_tokens_details = []  # Detailed breakdown by cache source
         spec_verify_ct = []
-        spec_accepted_tokens = []
+        spec_accepted_drafts = []
         spec_acceptance_histogram = []
         retraction_counts = []
         output_hidden_states = None
@@ -1070,7 +1071,7 @@ class SchedulerOutputProcessorMixin:
 
                 if not self.spec_algorithm.is_none():
                     spec_verify_ct.append(req.spec_verify_ct)
-                    spec_accepted_tokens.append(req.spec_accepted_tokens)
+                    spec_accepted_drafts.append(req.spec_accepted_drafts)
                     spec_acceptance_histogram.append(req.spec_acceptance_histogram)
 
                 if return_logprob:
@@ -1175,7 +1176,7 @@ class SchedulerOutputProcessorMixin:
                     rids=rids,
                     http_worker_ipcs=http_worker_ipcs,
                     spec_verify_ct=spec_verify_ct,
-                    spec_accepted_tokens=spec_accepted_tokens,
+                    spec_accepted_drafts=spec_accepted_drafts,
                     spec_acceptance_histogram=spec_acceptance_histogram,
                     time_stats=time_stats,
                     finished_reasons=finished_reasons,

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import datetime
 import gc
 import inspect
@@ -74,7 +75,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.elastic_ep.elastic_ep import (
+    ElasticEPStateManager,
+    join_process_groups,
+    try_recover_ranks,
+)
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
@@ -86,6 +91,7 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
@@ -110,6 +116,7 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    RoutedExpertsOutput,
     get_global_experts_capturer,
     set_global_experts_capturer,
 )
@@ -122,6 +129,9 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.schedule_batch import sanity_check_mm_pad_shift_value
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.breakable_cuda_graph_runner import (
+    BreakableCudaGraphRunner,
+)
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_runner import (
     CudaGraphRunner,
@@ -160,6 +170,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    broadcast_pyobj,
     cpu_has_amx_support,
     dynamic_import,
     empty_context,
@@ -287,6 +298,7 @@ class ModelRunnerOutput:
     logits_output: Union[LogitsProcessorOutput, PPProxyTensors]
     can_run_graph: bool
     expert_distribution_metrics: Optional[ExpertDistributionMetrics] = None
+    routed_experts_output: Optional[RoutedExpertsOutput] = None
 
 
 class ModelRunner(ModelRunnerKVCacheMixin):
@@ -357,6 +369,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.remote_instance_transfer_engine = None
         self.remote_instance_transfer_engine_session_id = ""
         self.remote_instance_transfer_engine_weight_info = None
+
+        self.msprobe_debugger = None
+        if server_args.msprobe_dump_config is not None:
+            self.init_msprobe()
+
         # auxiliary hidden capture mode. TODO: expose this to server args?
         self.eagle_use_aux_hidden_state = False
         self.dflash_use_aux_hidden_state = False
@@ -482,6 +499,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.initialize(pre_model_load_memory)
         self.check_quantized_moe_compatibility()
 
+        if (
+            self.server_args.elastic_ep_backend is not None
+            and self.server_args.elastic_ep_rejoin
+        ):
+            join_process_groups()
+            broadcast_global_expert_location_metadata(
+                src_rank=self._get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=True
+                )
+            )
+            ElasticEPStateManager.instance().reset()
+
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
 
@@ -507,6 +536,21 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             model_path=model_path,
             model_revision=model_revision,
             is_draft_model=is_draft_model,
+        )
+
+    def init_msprobe(self):
+        # Init the msprobe
+        try:
+            from msprobe.pytorch import PrecisionDebugger, seed_all
+        except ImportError:
+            logger.warning(
+                "Please install msprobe for tensor data dump: pip install mindstudio-probe --pre, "
+                "see https://gitcode.com/Ascend/msprobe for details."
+            )
+            return
+        seed_all(mode=True)
+        self.msprobe_debugger = PrecisionDebugger(
+            config_path=self.server_args.msprobe_dump_config
         )
 
     def init_mindspore_runner(self):
@@ -1055,6 +1099,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
+                recovered_rank=self.server_args.elastic_ep_rejoin,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
@@ -1065,6 +1110,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
+                recovered_rank=self.server_args.elastic_ep_rejoin,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -1353,9 +1399,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
         if self.server_args.debug_tensor_dump_output_folder is not None:
+            dump_folder = self.server_args.debug_tensor_dump_output_folder
+            if self.spec_algorithm.is_eagle():
+                role = "draft" if self.is_draft_worker else "target"
+                dump_folder = os.path.join(dump_folder, role)
             register_forward_hook_for_model(
                 self.model,
-                self.server_args.debug_tensor_dump_output_folder,
+                dump_folder,
                 self.server_args.debug_tensor_dump_layers,
                 self.tp_size,
                 self.tp_rank,
@@ -1433,6 +1483,66 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
+
+    def maybe_recover_ep_ranks(self):
+        # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
+        # synchronization, and this function is on the forward-path.
+        # This check only runs when `--elastic-ep-backend` is enabled, so the
+        # synchronization overhead does not propagate to other configs.
+        # Leave for future optimization of the elastic EP path.
+        if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
+            return
+
+        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
+        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
+        tp_active_ranks &= tp_active_ranks_cpu
+        # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
+        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
+        # tp-group index is the same as the global rank index.
+        ranks_to_recover = [
+            i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
+        ]
+
+        # try_recover_ranks polls peer state via Mooncake EP backend.
+        # Mooncake's internal semantics guarantee that all ranks observe
+        # consistent peer readiness state, so collective operations below
+        # are safe even though polling appears local.
+        if ranks_to_recover and try_recover_ranks(ranks_to_recover):
+            self.forward_pass_id = 0
+            self.eplb_manager.reset_generator()
+            broadcast_global_expert_location_metadata(
+                src_rank=self._get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=False
+                )
+            )
+            ElasticEPStateManager.instance().reset()
+
+            broadcast_pyobj(
+                [self.server_args.random_seed],
+                get_world_group().rank,
+                get_world_group().cpu_group,
+                src=get_world_group().ranks[0],
+            )
+            logger.info(f"recover ranks {ranks_to_recover} done")
+
+    def _get_healthy_expert_location_src_rank(
+        self, invoked_in_elastic_ep_rejoin_path: bool
+    ) -> int:
+        world_group = get_world_group()
+        # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
+        # A rank that was started as a rejoin rank may later act as a healthy
+        # rank in a subsequent recovery cycle.
+        local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
+        gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
+
+        for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
+            if not is_rejoin_rank:
+                return world_group.ranks[rank_in_group]
+
+        raise RuntimeError(
+            "No healthy rank found for broadcasting expert location metadata. "
+            "All ranks are marked as elastic_ep_rejoin."
+        )
 
     def update_weights_from_disk(
         self,
@@ -2390,10 +2500,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         draft_token=None,
                         custom_mask=buffers.custom_mask,
                         positions=None,
-                        retrive_index=None,
-                        retrive_next_token=None,
-                        retrive_next_sibling=None,
-                        retrive_cum_len=None,
+                        retrieve_index=None,
+                        retrieve_next_token=None,
+                        retrieve_next_sibling=None,
+                        retrieve_cum_len=None,
                         spec_steps=self.server_args.speculative_num_steps,
                         topk=self.server_args.speculative_eagle_topk,
                         draft_token_num=self.server_args.speculative_num_draft_tokens,
@@ -2424,9 +2534,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     draft_token=None,
                     tree_mask=buffers.custom_mask,
                     positions=None,
-                    retrive_index=None,
-                    retrive_next_token=None,
-                    retrive_next_sibling=None,
+                    retrieve_index=None,
+                    retrieve_next_token=None,
+                    retrieve_next_sibling=None,
                     draft_token_num=num_tokens_per_bs,
                 )
                 spec_info.capture_hidden_mode = CaptureHiddenMode.NULL
@@ -2723,7 +2833,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"Capture piecewise CUDA graph begin. avail mem={before_mem:.2f} GB"
         )
 
-        self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
+        if self.server_args.enable_breakable_cuda_graph:
+            # Experimental feature
+            self.piecewise_cuda_graph_runner = BreakableCudaGraphRunner(self)
+        else:
+            self.piecewise_cuda_graph_runner = PiecewiseCudaGraphRunner(self)
 
         after_mem = get_available_gpu_memory(self.device, self.gpu_id)
         mem_usage = before_mem - after_mem
@@ -2783,6 +2897,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         if not skip_attn_backend_init:
+            if hasattr(self.model, "prepare_forward_batch"):
+                # Prepare model-specific attention metadata before planning,
+                # e.g. Moss-VL's prefill cross-attention custom mask.
+                self.model.prepare_forward_batch(forward_batch)
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
                 forward_batch.attn_backend = self.decode_attn_backend
@@ -2838,6 +2956,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if not skip_attn_backend_init:
+            if hasattr(self.model, "prepare_forward_batch"):
+                # Prepare model-specific attention metadata before planning,
+                # e.g. Moss-VL's prefill cross-attention custom mask.
+                self.model.prepare_forward_batch(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
 
         return (
@@ -2900,10 +3022,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
-        with get_global_expert_distribution_recorder().with_forward_pass(
-            self.forward_pass_id,
-            forward_batch,
-        ) as recorder_outputs:
+        if self.msprobe_debugger is not None:
+            rank_id = (
+                self.gpu_id if self.dp_size is not None and self.dp_size > 1 else None
+            )
+            self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
+
+        step_span_ctx = (
+            torch.profiler.record_function(_build_step_span_name(forward_batch))
+            if torch.autograd._profiler_enabled()
+            else contextlib.nullcontext()
+        )
+        with (
+            step_span_ctx,
+            get_global_expert_distribution_recorder().with_forward_pass(
+                self.forward_pass_id,
+                forward_batch,
+            ) as recorder_outputs,
+        ):
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -2934,11 +3070,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
-        # Copy cached routing experts' buffers back to CPU cache
-        get_global_experts_capturer().on_forward_end(
+        no_copy_to_cpu = not self.server_args.disable_overlap_schedule
+        output.routed_experts_output = get_global_experts_capturer().on_forward_end(
             forward_batch=forward_batch,
             can_run_graph=output.can_run_graph,
             cuda_graph_batch=getattr(self.graph_runner, "bs", None),
+            no_copy_to_cpu=no_copy_to_cpu,
         )
 
         if self.eplb_manager is not None:
@@ -2946,6 +3083,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         if dumper.may_enable:
             dumper.step()
+
+        if self.msprobe_debugger is not None:
+            self.msprobe_debugger.stop()
+            self.msprobe_debugger.step()
+
+        if self.server_args.elastic_ep_backend is not None:
+            self.maybe_recover_ep_ranks()
 
         return output
 
@@ -3206,6 +3350,39 @@ def _unwrap_tensor(tensor, tp_rank, device):
     if isinstance(tensor, LocalSerializedTensor):
         tensor = tensor.get(tp_rank)
     return tensor.to(device)
+
+
+def _build_step_span_name(forward_batch: ForwardBatch) -> str:
+    """Build a profile-trace span name for one forward step.
+
+    Format:
+      step[decode bs=N]                   — decode-only batch
+      step[prefill bs=N toks=T]           — extend-only (prefill) batch
+      step[mixed bs=N ext=T dec=D]        — extend+decode mixed batch
+      step[idle]                          — idle/padding step
+      step[<MODE> bs=N]                   — other modes (target-verify, etc.)
+
+    Used by ModelRunner.forward to wrap each step in a torch.profile
+    record_function so Chrome traces show labeled step boundaries.
+    """
+    mode = forward_batch.forward_mode
+    bs = forward_batch.batch_size
+    if mode.is_idle():
+        return "step[idle]"
+    if mode.is_decode():
+        return f"step[decode bs={bs}]"
+    if mode.is_extend():
+        ext_toks = forward_batch.extend_num_tokens or 0
+        ext_seqs = (
+            forward_batch.extend_seq_lens.shape[0]
+            if forward_batch.extend_seq_lens is not None
+            else bs
+        )
+        dec_seqs = bs - ext_seqs
+        if dec_seqs > 0:
+            return f"step[mixed bs={bs} ext={ext_toks} dec={dec_seqs}]"
+        return f"step[prefill bs={bs} toks={ext_toks}]"
+    return f"step[{mode.name} bs={bs}]"
 
 
 @dataclass
