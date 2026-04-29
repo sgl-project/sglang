@@ -137,16 +137,22 @@ def _topk_ids_logical_to_physical_probability(
     info: ExpertLocationDispatchInfo,
     log2phy_prob: torch.Tensor,
 ) -> torch.Tensor:
-    """Select physical experts based on LP-computed probability distribution."""
+    """Select physical experts based on LP-computed probability distribution.
+
+    Sync-free: the previous form had ``if zero_rows.any():`` which forced a
+    GPU->host sync via aten::is_nonzero on every forward pass. Replace with
+    a torch.where that always evaluates the fallback (a cheap mask op) and
+    selects between it and the LP probabilities row-wise on-device.
+    """
     topk_ids_original_shape = topk_ids.shape
     topk_ids = topk_ids.flatten()
     log2phy_map = info.partial_logical_to_all_physical_map
     topk_probs = log2phy_prob[topk_ids].float()
-    row_sums = topk_probs.sum(dim=-1)
-    zero_rows = row_sums <= 0
-    if zero_rows.any():
-        valid_mask = (log2phy_map[topk_ids[zero_rows]] >= 0).float()
-        topk_probs[zero_rows] = valid_mask
+    # Row-wise fallback: for any row where all LP probs are zero, sample
+    # uniformly over the valid physical copies (mask of log2phy != -1).
+    row_sums = topk_probs.sum(dim=-1, keepdim=True)
+    fallback = (log2phy_map[topk_ids] >= 0).float()
+    topk_probs = torch.where(row_sums > 0, topk_probs, fallback)
     chosen = torch.multinomial(topk_probs, 1).flatten()
     topk_ids = log2phy_map[topk_ids, chosen]
     return topk_ids.view(topk_ids_original_shape)
