@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
+from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
@@ -141,8 +142,9 @@ class UGPipeline(ComposedPipelineBase):
     def forward_interleaved(
         self,
         messages: list[dict[str, Any]],
-        sampling_params,
-        server_args: ServerArgs,
+        sampling_params: UGSamplingParams | dict[str, Any] | None = None,
+        server_args: ServerArgs | None = None,
+        **sampling_kwargs: Any,
     ) -> list[dict[str, Any]]:
         """Experimental UG interleaved API.
 
@@ -151,6 +153,12 @@ class UGPipeline(ComposedPipelineBase):
         promising OpenAI-compatible request or response shapes.
         """
 
+        server_args = server_args or self.server_args
+        if server_args is None:
+            raise ValueError("UG interleaved API requires server_args")
+        sampling_params = _normalize_interleaved_sampling_params(
+            sampling_params, sampling_kwargs
+        )
         batch = Req(
             sampling_params=sampling_params,
             extra={"ug_interleaved_messages": messages},
@@ -165,3 +173,21 @@ class UGPipeline(ComposedPipelineBase):
 
 
 EntryClass = UGPipeline
+
+
+def _normalize_interleaved_sampling_params(
+    sampling_params: UGSamplingParams | dict[str, Any] | None,
+    sampling_kwargs: dict[str, Any],
+) -> UGSamplingParams:
+    if sampling_params is None:
+        return UGSamplingParams(**sampling_kwargs)
+    if isinstance(sampling_params, dict):
+        values = dict(sampling_params)
+        values.update(sampling_kwargs)
+        return UGSamplingParams(**values)
+    if sampling_kwargs:
+        raise ValueError(
+            "UG interleaved sampling keyword overrides require sampling_params "
+            "to be omitted or passed as a dict"
+        )
+    return sampling_params

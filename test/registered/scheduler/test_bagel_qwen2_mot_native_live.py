@@ -503,6 +503,121 @@ class TestBAGELQwen2MoTNativeLive(CustomTestCase):
                     dist.destroy_process_group()
                 torch.cuda.empty_cache()
 
+    def test_forward_interleaved_api_runs_full_native_pipeline(self):
+        import importlib.util
+
+        import torch
+        import torch.distributed as dist
+        from PIL import Image
+
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is required for the BAGEL interleaved API smoke")
+
+        _maybe_add_official_bagel_repo_to_path()
+        if importlib.util.find_spec("inferencer") is None:
+            self.skipTest(
+                "Set SGLANG_TEST_BAGEL_OFFICIAL_REPO to the official BAGEL repo "
+                "for the BAGEL interleaved API smoke"
+            )
+
+        from sglang.multimodal_gen.runtime.pipelines.ug import UGPipeline
+        from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (
+            SyncExecutor,
+        )
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.server_args import (
+            PortArgs,
+            ServerArgs,
+            set_global_server_args_for_scheduler,
+        )
+
+        checkpoint_dir = Path(os.environ[_MODEL_ENV])
+        scheduler = None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = _write_language_model_view(checkpoint_dir, Path(tmpdir))
+            server_args = ServerArgs(
+                model_path=str(model_path),
+                tokenizer_path=str(checkpoint_dir),
+                trust_remote_code=True,
+                dtype="bfloat16",
+                tp_size=1,
+                pp_size=1,
+                dp_size=1,
+                disable_cuda_graph=True,
+                disable_piecewise_cuda_graph=True,
+                disable_overlap_schedule=True,
+                skip_server_warmup=True,
+                mem_fraction_static=float(
+                    os.getenv("SGLANG_TEST_BAGEL_QWEN2_MOT_MEM_FRACTION", "0.35")
+                ),
+                chunked_prefill_size=int(
+                    os.getenv("SGLANG_TEST_BAGEL_QWEN2_MOT_CHUNKED_PREFILL", "256")
+                ),
+                log_level="error",
+            )
+            server_args.check_server_args()
+            set_global_server_args_for_scheduler(server_args)
+
+            scheduler = Scheduler(
+                server_args,
+                PortArgs.init_new(server_args),
+                gpu_id=int(os.getenv("SGLANG_TEST_BAGEL_QWEN2_MOT_GPU_ID", "0")),
+                tp_rank=0,
+                moe_ep_rank=0,
+                pp_rank=0,
+                attn_cp_rank=0,
+                moe_dp_rank=0,
+                dp_rank=None,
+            )
+            _replace_sender_with_noop(scheduler, "send_to_tokenizer")
+            _replace_sender_with_noop(scheduler, "send_to_detokenizer")
+
+            try:
+                diffusion_args = _make_ug_pipeline_server_args(scheduler)
+                with patch(_GLOBAL_ARGS_PATCH, return_value=diffusion_args):
+                    pipeline = UGPipeline(
+                        str(checkpoint_dir),
+                        diffusion_args,
+                        executor=SyncExecutor(diffusion_args),
+                    )
+
+                segments = pipeline.forward_interleaved(
+                    [
+                        {
+                            "type": "image",
+                            "image": Image.new("RGB", (16, 16), color="white"),
+                        },
+                        {
+                            "type": "text",
+                            "text": "draw a small lantern, then describe it",
+                        },
+                    ],
+                    {
+                        "width": 32,
+                        "height": 32,
+                        "seed": 123,
+                        "num_inference_steps": 3,
+                        "cfg_text_scale": 1.0,
+                        "cfg_img_scale": 1.0,
+                        "cfg_interval": [0.0, 1.0],
+                        "suppress_logs": True,
+                    },
+                )
+
+                self.assertEqual(
+                    [segment["type"] for segment in segments],
+                    ["image", "text"],
+                )
+                self.assertIsInstance(segments[0]["image"], Image.Image)
+                self.assertEqual(segments[0]["image"].size, (32, 32))
+                self.assertIsInstance(segments[1]["text"], str)
+                self.assertTrue(scheduler.is_fully_idle())
+                self.assertEqual(scheduler.session_controller.sessions, {})
+            finally:
+                if dist.is_available() and dist.is_initialized():
+                    dist.destroy_process_group()
+                torch.cuda.empty_cache()
+
 
 if __name__ == "__main__":
     unittest.main()

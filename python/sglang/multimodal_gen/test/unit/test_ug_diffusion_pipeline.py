@@ -183,6 +183,55 @@ class TestUGDiffusionPipeline(unittest.TestCase):
             ["image", "text"],
         )
 
+    def test_experimental_interleaved_api_accepts_dict_sampling_params(self):
+        server_args = _make_server_args()
+        with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
+            pipeline = UGPipeline(
+                "sglang-internal/fake-ug",
+                server_args,
+                executor=SyncExecutor(server_args),
+            )
+
+        segments = pipeline.forward_interleaved(
+            [
+                {"type": "image", "image": Image.new("RGB", (16, 16), "white")},
+                {"type": "text", "text": "draw a small lamp and describe it"},
+            ],
+            {
+                "width": 32,
+                "height": 32,
+                "seed": 123,
+                "num_inference_steps": 2,
+                "suppress_logs": True,
+            },
+        )
+
+        self.assertEqual([segment["type"] for segment in segments], ["image", "text"])
+        self.assertIsInstance(segments[0]["image"], Image.Image)
+        self.assertEqual(segments[0]["image"].size, (32, 32))
+        self.assertEqual(segments[1]["text"], "generated_text_after_image")
+
+    def test_experimental_interleaved_api_rejects_kwargs_with_params_object(self):
+        server_args = _make_server_args()
+        with patch(_GLOBAL_ARGS_PATCH, return_value=server_args):
+            pipeline = UGPipeline(
+                "sglang-internal/fake-ug",
+                server_args,
+                executor=SyncExecutor(server_args),
+            )
+
+        with self.assertRaisesRegex(ValueError, "keyword overrides"):
+            pipeline.forward_interleaved(
+                [{"type": "text", "text": "draw"}],
+                UGSamplingParams(
+                    width=32,
+                    height=32,
+                    num_inference_steps=2,
+                    suppress_logs=True,
+                ),
+                width=64,
+            )
+
     def test_fake_pipeline_can_use_injected_srt_scheduler_executor(self):
         server_args = _make_server_args()
         scheduler = RecordingSRTScheduler()
