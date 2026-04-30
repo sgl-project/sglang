@@ -198,7 +198,7 @@ class SWAKVPool(KVCache):
         src_loc_swa = self.translate_loc_from_full_to_swa(src_loc)
         self.swa_kv_pool.move_kv_cache(tgt_loc_swa, src_loc_swa)
 
-    def get_cpu_copy(self, indices):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         # For SWA, we need to copy KV cache from both full and SWA pools
         # The indices are for the full pool, and we use mapping to get SWA indices
         full_kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
@@ -213,7 +213,7 @@ class SWAKVPool(KVCache):
 
         return {"full": full_kv_cpu, "swa": swa_kv_cpu}
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         # Load KV cache back from CPU to both full and SWA pools
         # Note: indices here are NEW indices (newly allocated), different from get_cpu_copy indices
         full_kv_cpu = kv_cache_cpu["full"]
@@ -484,8 +484,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.is_not_in_free_group = True
         self.free_group = []
 
-    def get_cpu_copy(self, indices):
-        return self._kvcache.get_cpu_copy(indices)
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
 
-    def load_cpu_copy(self, kv_cache_cpu, indices):
-        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices)
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        return self._kvcache.load_cpu_copy(
+            kv_cache_cpu, indices, mamba_indices=mamba_indices
+        )

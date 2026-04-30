@@ -91,7 +91,7 @@ jobs:
       # Match pr-test-jit-kernel workflow for consistent JIT warmup behavior
       SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
       # Allow maintenance bypass on default branch (same semantics as PR JIT workflow)
-      SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+      PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -121,7 +121,7 @@ jobs:
     env:
       SGLANG_JIT_KERNEL_RUN_FULL_TESTS: "1"
       SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
-      SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+      PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4

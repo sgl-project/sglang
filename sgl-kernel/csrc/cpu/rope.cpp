@@ -794,7 +794,6 @@ void apply_multidimensional_rope_kernel_impl(
 // standard rotary embedding to each independently (in-place on query and key).
 std::tuple<at::Tensor, at::Tensor>
 apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
-  RECORD_FUNCTION("sgl-kernel::apply_multidimensional_rope_cpu", std::vector<c10::IValue>({query, key}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
   CHECK_INPUT(cos);
@@ -873,7 +872,6 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
     int64_t head_size,
     at::Tensor& cos_sin_cache,
     bool is_neox) {
-  RECORD_FUNCTION("sgl-kernel::rotary_embedding_cpu", std::vector<c10::IValue>({query, key}));
   CHECK_DIM(1, positions);
   const auto input_dim = query.dim();
   const auto input_dtype = query.scalar_type();
@@ -1028,7 +1026,6 @@ std::tuple<at::Tensor, at::Tensor> rotary_embedding_cpu(
 // sin: [num_tokens, head_size]
 std::tuple<at::Tensor, at::Tensor>
 apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin) {
-  RECORD_FUNCTION("sgl-kernel::apply_rotary_pos_emb_cpu", std::vector<c10::IValue>({query, key}));
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(query);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(key);
   CHECK_INPUT(cos);
@@ -1098,7 +1095,6 @@ void multimodal_rotary_embedding_cpu(
     const std::optional<std::vector<int64_t>>& mrope_section,
     bool mrope_interleaved,
     bool is_neox) {
-  RECORD_FUNCTION("sgl-kernel::multimodal_rotary_embedding_cpu", std::vector<c10::IValue>({query, key}));
   TORCH_CHECK(positions.dim() == 1 || positions.dim() == 2, "positions must be a 1D or 2D tensor");
   CHECK_DIM(2, query);
   CHECK_DIM(2, key);

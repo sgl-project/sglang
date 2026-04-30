@@ -227,6 +227,16 @@ class LoRAMemoryPool:
             or 1
         )
 
+    @staticmethod
+    def _has_moe_module(base_model: torch.nn.Module) -> bool:
+        # Config-only detection isn't reliable: some dense configs (e.g.
+        # `Qwen3_5TextConfig`) inherit `num_experts > 1` from an MoE parent.
+        # Walk the loaded model for an actual FusedMoE instance before we
+        # commit to allocating 4D per-expert LoRA buffers.
+        from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+
+        return any(isinstance(m, FusedMoE) for m in base_model.modules())
+
     def _get_num_local_experts(self, base_model: torch.nn.Module) -> int:
         """Experts owned by this rank. Equals the global count when EP is
         off, the runner keeps global IDs, or the split isn't even (all
@@ -285,7 +295,7 @@ class LoRAMemoryPool:
         input_dim, _ = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        c = get_stacked_multiply(module_name)
+        c = get_stacked_multiply(module_name, base_model)
         if self.tp_size > 1 and module_name in ROW_PARALLELISM_LINEAR_LORA_NAMES:
             input_dim = divide(input_dim, self.tp_size)
         return (self.max_loras_per_batch, max_lora_dim * c, input_dim)
@@ -307,7 +317,7 @@ class LoRAMemoryPool:
         input_dim, _ = get_hidden_dim(
             module_name, self.base_hf_config, base_model, layer_idx
         )
-        c = get_stacked_multiply(module_name)
+        c = get_stacked_multiply(module_name, base_model)
         # MoE modules shard along `moe_tp_size`, not the outer `tp_size`.
         effective_tp_size = (
             self.moe_tp_size if self.is_moe_module(module_name) else self.tp_size
@@ -411,6 +421,7 @@ class LoRAMemoryPool:
         )
 
     def init_buffers(self, base_model: torch.nn.Module):
+        self.base_model = base_model
         device = next(base_model.parameters()).device
 
         # Cached once so the per-expert load path doesn't re-walk the HF
@@ -429,7 +440,7 @@ class LoRAMemoryPool:
                 hasattr(cfg, "shared_expert_intermediate_size")
                 and cfg.shared_expert_intermediate_size > 0
             ) or (getattr(cfg, "n_shared_experts", 0) or 0) > 0
-            has_moe = self._get_num_experts(base_model) > 1
+            has_moe = self._has_moe_module(base_model)
 
             # Shape functions automatically handle both 3D (standard) and 4D (MoE)
             target_modules = target_modules - set(EMBEDDING_NAMES)
@@ -786,7 +797,7 @@ class LoRAMemoryPool:
                 )
 
             for name, weights in temp_A_buffer.items():
-                c = get_stacked_multiply(name)
+                c = get_stacked_multiply(name, self.base_model)
                 max_r = self.max_lora_rank
                 target_buffer = self.A_buffer[name][layer_id]
 
@@ -1005,7 +1016,20 @@ class LoRAMemoryPool:
                         :lora_rank,
                     ]
                     load_lora_weight_tensor(buffer_view, lora_b_weights)
-                elif target_module == "lm_head" and "lm_head" in name:
+                elif (
+                    target_module == "lm_head"
+                    and "lm_head" in name
+                    and (
+                        "lora_embedding_A" in name
+                        or "lora_A" in name
+                        or "lora_embedding_B" in name
+                        or "lora_B" in name
+                    )
+                ):
+                    # Only assert for genuine LoRA A/B deltas. Non-LoRA adapter
+                    # entries (e.g. `base_layer.weight` emitted by PEFT for
+                    # tied-embedding lm_head) fall through and are handled by
+                    # the base weight loader, mirroring embed_tokens behavior.
                     # Non-last PP stages do not own lm_head, so adapters can
                     # legitimately contain lm_head LoRA weights with no local
                     # module to load them into, otherwise we should have been able to load this weight.
