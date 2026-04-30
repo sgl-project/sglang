@@ -124,9 +124,6 @@ class HashTopK(nn.Module):
             input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
-        if envs.SGLANG_HACK_FORCE_TID2EID_ZERO.get():
-            self.tid2eid.zero_()
-
         if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
             from sglang.jit_kernel.deepseek_v4 import hash_topk
 
