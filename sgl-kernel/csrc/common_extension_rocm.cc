@@ -47,9 +47,6 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "topk_indices_offset, Tensor ? row_starts) -> ()");
   m.impl("fast_topk_transform_ragged_fused", torch::kCUDA, &fast_topk_transform_ragged_interface);
 
-  // DeepSeek-V4 indexer top-k transform (TopK = 512). ROCm-only AOT path,
-  // mirrors the NV-side JIT module TopK512Kernel::transform from
-  // sglang/jit_kernel/csrc/deepseek_v4/topk.cuh.
   m.def(
       "deepseek_v4_topk_transform_512(Tensor scores, Tensor seq_lens, Tensor page_table, Tensor! "
       "page_indices, int page_size, Tensor!? raw_indices) -> ()");
