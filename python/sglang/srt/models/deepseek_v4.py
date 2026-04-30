@@ -885,7 +885,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
-        self.is_nextn = is_nextn
         self.self_attn = MQALayer(
             config=config,
             layer_id=layer_id,
