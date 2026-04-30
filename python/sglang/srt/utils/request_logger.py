@@ -237,12 +237,6 @@ class RequestLogger:
             target.info(msg)
 
 
-# TODO remove this?
-@lru_cache(maxsize=2)
-def disable_request_logging() -> bool:
-    return get_bool_env_var("SGLANG_DISABLE_REQUEST_LOGGING")
-
-
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
 def _dataclass_to_string_truncated(
     data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
