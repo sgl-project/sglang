@@ -177,7 +177,7 @@ class PipelineStage(StageDedupMixin, ABC):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        """Declares component uses for residency scheduling."""
+        """Declares component uses of current stage for unified residency scheduling."""
         return []
 
     # Default role affinity: ENCODER. Override in subclasses for DENOISING/DECODER.

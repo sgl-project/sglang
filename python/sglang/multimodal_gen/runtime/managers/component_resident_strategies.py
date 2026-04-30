@@ -26,10 +26,17 @@ logger = init_logger(__name__)
 def _module_to_local_device(
     module: nn.Module, *, dtype: torch.dtype | None = None
 ) -> None:
+    device = get_local_torch_device()
+    tensor = next(module.parameters(), None)
+    if tensor is None:
+        tensor = next(module.buffers(), None)
+    if tensor is not None and tensor.device == device:
+        if dtype is None or tensor.dtype == dtype:
+            return
     if dtype is None:
-        module.to(get_local_torch_device(), non_blocking=True)
+        module.to(device, non_blocking=True)
     else:
-        module.to(get_local_torch_device(), dtype=dtype, non_blocking=True)
+        module.to(device, dtype=dtype, non_blocking=True)
 
 
 class ComponentResidencyStrategy:

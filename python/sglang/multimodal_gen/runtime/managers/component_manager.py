@@ -468,6 +468,14 @@ class ComponentResidencyManager:
             module = self.get_module(component_name)
             if module is None:
                 continue
+            if self.state.batch_is_warmup and use.keep_ready_after_warmup:
+                self._trace(
+                    "request_keep_warmup",
+                    use,
+                    self.strategy_for(component_name, module),
+                    module,
+                )
+                continue
             preferred = component_name in preferred_uses
             if not preferred and self._should_keep_single_dit(component_name):
                 self._trace(
