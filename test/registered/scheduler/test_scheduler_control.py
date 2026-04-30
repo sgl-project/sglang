@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     run_and_check_memory_leak,
 )
 
-register_cuda_ci(est_time=360, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=367, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -318,8 +318,6 @@ class TestAbortWithWaitingTimeout(WaitingTimeoutMixin, CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=[
                     "--max-running-requests=1",
-                    # Disable PCG to avoid padding in flashinfer backend. Ref: https://github.com/sgl-project/sglang/pull/21452
-                    "--disable-piecewise-cuda-graph",
                 ],
             )
 

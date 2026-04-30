@@ -21,6 +21,10 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import speculative_moe_backend_context
 from sglang.srt.layers.utils.logprob import compute_spec_v2_logprobs
+from sglang.srt.managers.io_struct import (
+    UpdateWeightFromDiskReqInput,
+    UpdateWeightsFromIPCReqInput,
+)
 from sglang.srt.managers.schedule_batch import ModelWorkerBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -244,9 +248,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         (
             tree_mask,
             position,
-            retrive_index,
-            retrive_next_token,
-            retrive_next_sibling,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
             draft_tokens,
         ) = build_tree_kernel_efficient(
             draft_input.verified_id,
@@ -267,10 +271,10 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
-            retrive_index=retrive_index,
-            retrive_next_token=retrive_next_token,
-            retrive_next_sibling=retrive_next_sibling,
-            retrive_cum_len=None,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
             spec_steps=self.speculative_num_steps,
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
@@ -394,6 +398,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
         topk_p_list = []
         topk_index_list = []
         for step in range(self.speculative_num_steps):
+            forward_batch.req_to_token_pool = self.draft_runner_list[
+                step
+            ].req_to_token_pool
             output: ModelRunnerOutput = self.draft_runner_list[step].forward(
                 forward_batch
             )
@@ -498,6 +505,9 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
                     draft_logits_output.topk_index,
                 )
             else:
+                forward_batch.req_to_token_pool = self.draft_runner_list[
+                    step
+                ].req_to_token_pool
                 draft_logits_output = self.draft_runner_list[step].forward(
                     forward_batch, skip_attn_backend_init=True
                 )
@@ -528,20 +538,28 @@ class MultiLayerEagleDraftWorker(BaseDraftWorker):
 
         # Update req_to_hidden_states_pool for KV Cache reversion
         if (
-            self.cuda_graph_runner_for_draft_extend is not None
-            and forward_batch.extend_seq_lens is not None
+            forward_batch.extend_seq_lens is not None
+            and self.cuda_graph_runner_for_draft_extend is not None
         ):
-            last_cuda_graph_runner = (
-                self.cuda_graph_runner_for_draft_extend.get_last_runner()
-            )
+            if can_cuda_graph:
+                last_runner = self.cuda_graph_runner_for_draft_extend.get_last_runner()
+                hidden_states = last_runner.buffers.hidden_states
+                req_pool_indices = last_runner.buffers.req_pool_indices
+                extend_seq_lens = last_runner.buffers.extend_seq_lens
+                extend_start_loc = last_runner.buffers.extend_start_loc
+            else:
+                hidden_states = draft_logits_output.logits_output.hidden_states
+                req_pool_indices = forward_batch.req_pool_indices
+                extend_seq_lens = forward_batch.extend_seq_lens
+                extend_start_loc = forward_batch.extend_start_loc
             assign_hidden_states_pool_triton(
-                last_cuda_graph_runner.buffers.hidden_states,
-                last_cuda_graph_runner.buffers.req_pool_indices,
+                hidden_states,
+                req_pool_indices,
                 self.req_to_hidden_states_pool,
                 self.speculative_num_steps - 1,
                 forward_batch.batch_size,
-                last_cuda_graph_runner.buffers.extend_seq_lens,
-                last_cuda_graph_runner.buffers.extend_start_loc,
+                extend_seq_lens,
+                extend_start_loc,
             )
 
         # Reorganize the spec info for the next batch
@@ -658,7 +676,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
-                    hidden_size=self.target_worker.model_config.hidden_size,
+                    hidden_size=self.target_worker.model_config.spec_hidden_size,
                     dtype=self.target_worker.model_config.dtype,
                     topk=self.topk * self.speculative_num_steps,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -666,6 +684,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
             assert verify_input.is_verify_input()
+            # Record a CUDA event after draft() GPU work is dispatched.
+            if self.plan_stream:
+                self._draft_done_event = torch.get_device_module(self.device).Event()
+                self._draft_done_event.record()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
@@ -689,6 +711,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
+            # Wait for the draft CUDA graph to finish before plan_stream
+            # begins its work.
+            if self.plan_stream and hasattr(self, "_draft_done_event"):
+                self.plan_stream.wait_event(self._draft_done_event)
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,
@@ -727,19 +753,19 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
-            accept_length,
+            accept_lens,
             accept_index,
         ) = verify_input.sample(batch, logits_output)
-        new_seq_lens = batch.seq_lens + accept_length
+        new_seq_lens = batch.seq_lens + accept_lens
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_length, dtype=torch.int32)
+            verified_id = torch.empty_like(accept_lens, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
                 all_verified_id,
-                accept_length,
+                accept_lens,
                 verified_id,
                 self.speculative_num_draft_tokens,
             )
@@ -762,5 +788,28 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             next_token_ids=predict,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            accept_lens=accept_length,
+            accept_lens=accept_lens,
+            routed_experts_output=forward_batch_output.routed_experts_output,
         )
+
+    def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
+        for i in range(self.speculative_num_steps):
+            success, message = self._draft_worker.draft_runner_list[
+                i
+            ].update_weights_from_disk(
+                recv_req.model_path,
+                recv_req.load_format,
+                recapture_cuda_graph=recv_req.recapture_cuda_graph,
+            )
+            if not success:
+                return success, message
+        return True, "Succeeded to update model weights."
+
+    def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
+        for i in range(self.speculative_num_steps):
+            success, message = self._draft_worker.draft_runner_list[
+                i
+            ].update_weights_from_ipc(recv_req)
+            if not success:
+                return success, message
+        return True, "Succeeded to update model weights."

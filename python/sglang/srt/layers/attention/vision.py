@@ -749,6 +749,7 @@ class VisionAttention(nn.Module):
         num_heads: int,
         projection_size: int,
         use_qkv_parallel: bool,
+        head_size: Optional[int] = None,
         qkv_backend: Optional[str] = None,
         quant_config: Optional[QuantizationConfig] = None,
         dropout: float = 0.0,
@@ -775,7 +776,7 @@ class VisionAttention(nn.Module):
         self.tp_size = 1 if use_data_parallel else get_attention_tp_size()
         self.tp_rank = 0 if use_data_parallel else get_attention_tp_rank()
         self.dropout = dropout
-        self.head_size = embed_dim // num_heads
+        self.head_size = head_size if head_size is not None else embed_dim // num_heads
         self.hidden_size_per_attention_head = dist_utils.divide(
             projection_size, num_heads
         )

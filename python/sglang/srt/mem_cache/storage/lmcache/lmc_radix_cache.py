@@ -188,13 +188,16 @@ class LMCRadixCache(RadixCache):
 
         if num_retrieved > 0:
             fetched = num_retrieved - prefix_pad
+            access_time = self.get_access_time()
             new_node = TreeNode(priority=last_node.priority)
+            new_node.last_access_time = access_time
+            new_node.creation_time = access_time
             start = value.numel()
             end = start + fetched
             new_node.key = key[start:end]
             new_node.value = token_slots[:fetched]
             new_node.parent = last_node
-            last_node.children[self.get_child_key_fn(new_node.key)] = new_node
+            last_node.children[new_node.key.child_key(self.page_size)] = new_node
             last_node = new_node
 
             value = torch.cat([value, token_slots[:fetched]])
