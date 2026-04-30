@@ -119,7 +119,6 @@ if _is_cuda:
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
 
-use_vllm_cutlass_w8a8_fp8_kernel = get_bool_env_var("USE_VLLM_CUTLASS_W8A8_FP8_KERNEL")
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 
 # Input scaling factors are no longer optional in _scaled_mm starting
