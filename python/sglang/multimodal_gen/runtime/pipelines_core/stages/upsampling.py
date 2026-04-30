@@ -1,3 +1,5 @@
+from typing import Protocol
+
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device

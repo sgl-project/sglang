@@ -98,9 +98,6 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
             batch.latents = latents
             batch.audio_latents = audio_latents
 
-        if self._component_residency_manager is not None:
-            self._component_residency_manager.finish_active_use()
-
 
 class LTX2RefinementStage(LTX2AVDenoisingStage):
     """Stage-2 refinement wrapper that re-noises distilled LTX latents once."""

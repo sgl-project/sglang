@@ -651,8 +651,7 @@ class MOVADenoisingStage(PipelineStage):
                     if not is_warmup and hasattr(self, "step_profile"):
                         self.step_profile()
 
-        if self._component_residency_manager is not None:
-            self._component_residency_manager.finish_active_use()
+        self._finish_active_component_use()
 
         return batch
 

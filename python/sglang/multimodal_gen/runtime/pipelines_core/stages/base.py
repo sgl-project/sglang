@@ -110,6 +110,10 @@ class PipelineStage(StageDedupMixin, ABC):
     def set_component_residency_manager(self, manager) -> None:
         self._component_residency_manager = manager
 
+    def _finish_active_component_use(self) -> None:
+        if self._component_residency_manager is not None:
+            self._component_residency_manager.finish_active_use()
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:

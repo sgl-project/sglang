@@ -979,8 +979,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 torch.mps.current_allocated_memory(),
             )
 
-        self._component_residency_manager.finish_active_use()
-
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
         if get_sp_world_size() <= 1:
@@ -1217,6 +1215,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "average time per step: %.4f seconds",
                 (denoising_end_time - denoising_start_time) / len(ctx.timesteps),
             )
+
+        self._finish_active_component_use()
 
         # Rollout postprocessing must run BEFORE _finalize_denoising_loop so
         # the final scheduler.step output (ctx.latents) is still SP-sharded and
