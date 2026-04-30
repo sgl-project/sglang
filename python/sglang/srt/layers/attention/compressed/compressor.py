@@ -16,9 +16,6 @@ from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
-from sglang.srt.layers.attention.nsa.utils import (
-    assert_tensor_identical_across_cp_ranks,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.metadata import DeepseekV4Metadata
@@ -120,12 +117,6 @@ class CompressorBackend:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch)
-        if envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get():
-            assert_tensor_identical_across_cp_ranks(
-                new_compressed_kv,
-                tag=f"compressor(ratio={compressor.ratio}) layer_id={layer_id}",
-                forward_batch=forward_batch,
-            )
         core_metadata = self.forward_metadata.core_metadata
         out_loc = (
             core_metadata.c4_out_loc
@@ -157,12 +148,6 @@ class CompressorBackend:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch)
-        if envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get():
-            assert_tensor_identical_across_cp_ranks(
-                new_compressed_kv,
-                tag=f"indexer_compressor(ratio={compressor.ratio}) layer_id={layer_id}",
-                forward_batch=forward_batch,
-            )
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,

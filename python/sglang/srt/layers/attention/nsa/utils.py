@@ -230,39 +230,3 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
         return False
 
 
-def assert_tensor_identical_across_cp_ranks(
-    t: torch.Tensor, tag: str, forward_batch
-) -> None:
-    """Debug assert: tensor ``t`` must be identical across all CP ranks.
-
-    No-op when CP is not enabled or cp_size <= 1.  Raises with diff stats
-    if any rank's value disagrees with rank 0.
-    """
-    if not (is_nsa_enable_prefill_cp() and nsa_use_prefill_cp(forward_batch)):
-        return
-    cp_size = get_attention_cp_size()
-    if cp_size <= 1:
-        return
-
-    t_contig = t.contiguous()
-    gathered = t_contig.new_empty(t_contig.shape[0] * cp_size, *t_contig.shape[1:])
-    attn_cp_all_gather_into_tensor(gathered, t_contig)
-    chunks = gathered.view(cp_size, *t_contig.shape)
-    rank0 = chunks[0]
-    for r in range(1, cp_size):
-        if torch.equal(rank0, chunks[r]):
-            continue
-        rank0_f = rank0.float()
-        chunks_r_f = chunks[r].float()
-        both_nan = torch.isnan(rank0_f) & torch.isnan(chunks_r_f)
-        diff = (rank0_f - chunks_r_f).abs()
-        diff = torch.where(both_nan, torch.zeros_like(diff), diff)
-        if torch.equal(diff, torch.zeros_like(diff)):
-            continue
-        raise AssertionError(
-            f"[CP rank consistency] {tag}: rank {r} disagrees with rank 0. "
-            f"max_abs_diff={diff.max().item():.3e}, "
-            f"mean_abs_diff={diff.mean().item():.3e}, "
-            f"shape={tuple(t_contig.shape)}, dtype={t_contig.dtype}, "
-            f"my_rank={get_attention_cp_rank()}"
-        )
