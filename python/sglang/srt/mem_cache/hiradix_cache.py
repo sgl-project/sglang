@@ -1528,12 +1528,12 @@ class HiRadixCache(RadixCache):
             return 0
 
         node.last_access_time = time.monotonic()
-        child_key = self.get_child_key_fn(key)
+        child_key = key.child_key(self.page_size)
         matched_length = 0
         while len(key) > 0 and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
-            prefix_len = self.key_match_fn(node.key, key)
+            prefix_len = node.key.match(key, page_size=self.page_size)
             key = key[prefix_len:]
             value = value[prefix_len:]
             hash_value = hash_value[prefix_len // self.page_size :]
@@ -1543,7 +1543,7 @@ class HiRadixCache(RadixCache):
                 node = self._split_node(node.key, node, prefix_len)
 
             if len(key):
-                child_key = self.get_child_key_fn(key)
+                child_key = key.child_key(self.page_size)
 
         if len(key):
             new_node = TreeNode(priority=node.priority)
