@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import get_bool_env_var
 
 if TYPE_CHECKING:
@@ -45,6 +46,7 @@ class PrefillDelayer:
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
         device: Optional["torch.device"] = "cpu",
+        device_group=None,
     ):
         self._max_delay_passes = max_delay_passes
         self._token_usage_low_watermark = token_usage_low_watermark
@@ -58,12 +60,26 @@ class PrefillDelayer:
         self.dp_size = dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
         dp_size_dim = dp_size if self.enable_dp_attention else 1
+
+        use_nccl = (
+            server_args.disable_overlap_schedule
+            or envs.SGLANG_NCCL_ALL_GATHER_IN_OVERLAP_SCHEDULER_SYNC_BATCH.get()
+        )
+        if use_nccl:
+            assert (
+                device_group is not None
+            ), "device_group is required when using NCCL for PrefillDelayer all-gather"
+            self._gather_group = device_group
+            self._gather_device = device
+        else:
+            self._gather_group = cpu_group
+            self._gather_device = "cpu"
+
         self._global_info_buffer = torch.empty(
             (dp_size_dim, attn_tp_size, 4),
             dtype=torch.int64,
-            device=device,
+            device=self._gather_device,
         )
-        self._cpu_group = cpu_group
 
         self._metrics_collector = metrics_collector
 
@@ -219,13 +235,13 @@ class PrefillDelayer:
                 kwargs.get("running_batch", 0),
                 kwargs.get("max_prefill_bs", 0),
             ],
-            device="cpu",
+            device=self._gather_device,
             dtype=torch.int64,
         )
         torch.distributed.all_gather_into_tensor(
             self._global_info_buffer.flatten(),
             local_info,
-            group=self._cpu_group,
+            group=self._gather_group,
         )
         tp0_info = self._global_info_buffer[:, 0, :]
         return tp0_info
