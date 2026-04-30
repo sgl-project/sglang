@@ -199,6 +199,7 @@ jobs:
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-h200"
           IS_H200: "1"
+          SGLANG_TEST_METRICS_OUTPUT: test-metrics
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=18000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
@@ -248,6 +249,15 @@ jobs:
           name: metrics-8gpu-h200-partition-${{ matrix.partition }}
           path: test/metrics-8gpu-h200-partition-${{ matrix.partition }}.json
           retention-days: 5
+          if-no-files-found: ignore
+
+      - name: Upload test metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-metrics-8gpu-h200-partition-${{ matrix.partition }}
+          path: test/test-metrics.*.jsonl
+          retention-days: 90
           if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
@@ -311,6 +321,7 @@ jobs:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "8-gpu-b200"
+          SGLANG_TEST_METRICS_OUTPUT: test-metrics
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-8-gpu-common --nightly --timeout-per-file=12000 --continue-on-error --auto-partition-id=${{ matrix.partition }} --auto-partition-size=4
@@ -354,6 +365,15 @@ jobs:
           retention-days: 5
           if-no-files-found: ignore
 
+      - name: Upload test metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-metrics-8gpu-b200-partition-${{ matrix.partition }}
+          path: test/test-metrics.*.jsonl
+          retention-days: 90
+          if-no-files-found: ignore
+
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
         with:
@@ -377,9 +397,20 @@ jobs:
 
       - name: Run eval test for text models
         timeout-minutes: 120
+        env:
+          SGLANG_TEST_METRICS_OUTPUT: test-metrics
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-eval-text-2-gpu --nightly --continue-on-error --timeout-per-file 4500
+
+      - name: Upload test metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-metrics-text-accuracy-2gpu
+          path: test/test-metrics.*.jsonl
+          retention-days: 90
+          if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -406,10 +437,20 @@ jobs:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "2-gpu-h100"
+          SGLANG_TEST_METRICS_OUTPUT: test-metrics
         run: |
           cd test
           rm -rf performance_profiles_text_models/
           python3 run_suite.py --hw cuda --suite nightly-perf-text-2-gpu --nightly --continue-on-error --timeout-per-file 3600
+
+      - name: Upload test metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-metrics-text-perf-2gpu
+          path: test/test-metrics.*.jsonl
+          retention-days: 90
+          if-no-files-found: ignore
 
       - name: Publish traces to storage repo
         env:
@@ -440,9 +481,20 @@ jobs:
 
       - name: Run eval test for VLM models (fixed MMMU-100)
         timeout-minutes: 240
+        env:
+          SGLANG_TEST_METRICS_OUTPUT: test-metrics
         run: |
           cd test
           python3 run_suite.py --hw cuda --suite nightly-eval-vlm-2-gpu --nightly --continue-on-error --timeout-per-file 9000
+
+      - name: Upload test metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-metrics-vlm-accuracy-2gpu
+          path: test/test-metrics.*.jsonl
+          retention-days: 90
+          if-no-files-found: ignore
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
@@ -469,10 +521,20 @@ jobs:
           TRACE_BASE_URL: https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/traces/${{ github.run_id }}
           PERFETTO_RELAY_URL: ${{ vars.PERFETTO_RELAY_URL }}
           GPU_CONFIG: "2-gpu-h100"
+          SGLANG_TEST_METRICS_OUTPUT: test-metrics
         run: |
           cd test
           rm -rf performance_profiles_vlms/
           python3 run_suite.py --hw cuda --suite nightly-perf-vlm-2-gpu --nightly --continue-on-error --timeout-per-file 3600
+
+      - name: Upload test metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-metrics-vlm-perf-2gpu
+          path: test/test-metrics.*.jsonl
+          retention-days: 90
+          if-no-files-found: ignore
 
       - name: Publish traces to storage repo
         env:
@@ -728,6 +790,10 @@ jobs:
       - nightly-test-general-8-gpu-b200
       - nightly-test-multimodal-server-1-gpu
       - nightly-test-multimodal-server-2-gpu
+      - nightly-test-text-accuracy-2-gpu-h100
+      - nightly-test-text-perf-2-gpu-h100
+      - nightly-test-vlm-accuracy-2-gpu-h100
+      - nightly-test-vlm-perf-2-gpu-h100
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -744,8 +810,11 @@ jobs:
 
       - name: List downloaded metrics
         run: |
-          echo "Downloaded metrics files:"
-          find metrics/ -name "*.json" -type f 2>/dev/null || echo "No metrics files found"
+          echo "=== Benchmark metrics (JSON) ==="
+          find metrics/ -name "*.json" -type f 2>/dev/null || echo "No JSON files found"
+          echo ""
+          echo "=== Test metrics (JSONL from dump_metric) ==="
+          find metrics/ -name "*.jsonl" -type f 2>/dev/null || echo "No JSONL files found"
 
       - name: Merge metrics
         run: |
@@ -756,6 +825,15 @@ jobs:
             --commit-sha ${{ github.sha }} \
             --branch ${{ github.ref_name }}
 
+      - name: Consolidate JSONL test metrics
+        run: |
+          find metrics/ -name "*.jsonl" -type f -exec cat {} + > test-metrics-${{ github.run_id }}.jsonl 2>/dev/null || true
+          if [ -s test-metrics-${{ github.run_id }}.jsonl ]; then
+            echo "Consolidated $(wc -l < test-metrics-${{ github.run_id }}.jsonl) metric lines"
+          else
+            echo "No JSONL test metrics found"
+          fi
+
       - name: Upload consolidated metrics
         uses: actions/upload-artifact@v4
         with:
@@ -763,6 +841,31 @@ jobs:
           path: consolidated-metrics-${{ github.run_id }}.json
           retention-days: 90
           if-no-files-found: warn
+
+      - name: Upload consolidated test metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-metrics-${{ github.run_id }}
+          path: test-metrics-${{ github.run_id }}.jsonl
+          retention-days: 90
+          if-no-files-found: ignore
+
+      - name: Upload all metrics to S3
+        if: always()
+        continue-on-error: true
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.CI_METRICS_AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.CI_METRICS_AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-west-1
+        run: |
+          python3 scripts/ci/utils/upload_metrics_to_s3.py \
+            --consolidated-json consolidated-metrics-${{ github.run_id }}.json \
+            --test-metrics-jsonl test-metrics-${{ github.run_id }}.jsonl \
+            --run-id ${{ github.run_id }} \
+            --commit-sha ${{ github.sha }} \
+            --bucket rdxa-eng-json-logs-05354378 \
+            --prefix ci-metrics/nightly
 
   # Final check job
   check-all-jobs:
