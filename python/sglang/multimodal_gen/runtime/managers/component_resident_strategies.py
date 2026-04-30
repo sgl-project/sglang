@@ -389,7 +389,7 @@ class VanillaD2HStrategy(ComponentResidencyStrategy):
     def exit(self, module: nn.Module, next_module: nn.Module | None = None) -> None:
         param = next(module.parameters(), None)
         if param is not None and param.device.type == "cuda":
-            module.to("cpu")
+            module.to("cpu", non_blocking=True)
 
     def finish_request(
         self,
