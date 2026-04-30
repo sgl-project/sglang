@@ -926,10 +926,9 @@ class SchedulerMetricsMixin:
             yield
             return
 
-        category = "forward_" + batch.forward_mode.name.lower()
         with self.forward_pass_device_timer.wrap(
             metadata=dict(
-                category=category,
+                category="forward_" + batch.forward_mode.name.lower(),
                 dp_cooperation_info=batch.dp_cooperation_info,
             ),
         ):
