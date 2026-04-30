@@ -2005,6 +2005,12 @@ class TokenizerManager(TokenizerCommunicatorMixin, TokenizerManagerMultiItemMixi
                 cached_tokens_details,
             )
 
+            # Observe number of images per request
+            num_images = 0
+            if hasattr(state.obj, "image_data") and state.obj.image_data is not None:
+                num_images = len(state.obj.image_data)
+            self.metrics_collector.observe_num_images(labels, num_images)
+
     def dump_requests(self, state: ReqState, out_dict: dict):
         self.dump_request_list.append(
             (state.obj, out_dict, state.created_time, time.time())

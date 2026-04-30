@@ -1312,6 +1312,79 @@ class TokenizerMetricsCollector:
             ],
         )
 
+        # Actual extend length per request: the actual number of tokens sent to
+        # the prefill kernel excluding the prefix cache hit part.
+        self.actual_extend_len = Histogram(
+            name="sglang:actual_extend_len",
+            documentation="Histogram of actual extend length per request (prompt tokens minus cached tokens).",
+            labelnames=labels.keys(),
+            buckets=[
+                1,
+                10,
+                50,
+                100,
+                300,
+                500,
+                700,
+                1000,
+                1500,
+                2000,
+                3000,
+                4000,
+                5000,
+                6000,
+                7000,
+                8000,
+                9000,
+                10000,
+                12000,
+                15000,
+                20000,
+                25000,
+                30000,
+                40000,
+                66000,
+                99000,
+                132000,
+                300000,
+                600000,
+                900000,
+                1100000,
+            ],
+        )
+
+        # Number of images per request in multimodal models.
+        self.num_images_per_request = Histogram(
+            name="sglang:num_images_per_request",
+            documentation="Histogram of number of images per request.",
+            labelnames=labels.keys(),
+            buckets=[
+                0,
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8,
+                10,
+                12,
+                16,
+                20,
+                25,
+                30,
+                40,
+                50,
+                75,
+                100,
+                150,
+                200,
+                300,
+                500,
+            ],
+        )
+
     def observe_one_finished_request(
         self,
         labels: Dict[str, str],
@@ -1361,6 +1434,13 @@ class TokenizerMetricsCollector:
                 float(generation_tokens)
             )
         self.num_retractions.labels(**labels).observe(retraction_count)
+
+        # Actual extend length: prompt tokens that were NOT cached
+        actual_extend = max(0, prompt_tokens - cached_tokens)
+        self.actual_extend_len.labels(**labels).observe(actual_extend)
+
+    def observe_num_images(self, labels: Dict[str, str], num_images: int):
+        self.num_images_per_request.labels(**labels).observe(num_images)
 
     def observe_time_to_first_token(self, labels: Dict[str, str], value: float):
         self.histogram_time_to_first_token.labels(**labels).observe(value)
