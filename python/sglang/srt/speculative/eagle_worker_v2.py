@@ -756,20 +756,28 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                verify_input: EagleVerifyInput = self.draft_worker.draft(
-                    model_worker_batch
-                )
+            if self.speculative_num_steps == 0:
+                # Drafting disabled. Build a trivial 1-node verify whose root
+                # is the previous batch's bonus token; the existing verify
+                # path runs against the steps=0 target graph (1 token per req)
+                # and draft_extend afterwards keeps draft KV in sync so we can
+                # switch back to drafting at any time.
+                verify_input = self._build_trivial_verify_input(model_worker_batch)
+            else:
+                with self.draft_worker.draft_tp_context(
+                    self.draft_worker.draft_runner.tp_group
+                ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+                    verify_input: EagleVerifyInput = self.draft_worker.draft(
+                        model_worker_batch
+                    )
+                # Record a CUDA event after draft() GPU work is dispatched.
+                # This event will be waited on by plan_stream in verify()
+                # to ensure draft CUDA graph kernels finish before plan_stream
+                # begins metadata preparation.
+                if self.plan_stream:
+                    self._draft_done_event = torch.get_device_module(self.device).Event()
+                    self._draft_done_event.record()
             assert verify_input.is_verify_input()
-            # Record a CUDA event after draft() GPU work is dispatched.
-            # This event will be waited on by plan_stream in verify()
-            # to ensure draft CUDA graph kernels finish before plan_stream
-            # begins metadata preparation.
-            if self.plan_stream:
-                self._draft_done_event = torch.get_device_module(self.device).Event()
-                self._draft_done_event.record()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
             with self.draft_worker.draft_tp_context(
@@ -780,6 +788,55 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
 
             return batch_output
+
+    def _build_trivial_verify_input(
+        self, batch: ModelWorkerBatch
+    ) -> "EagleVerifyInput":
+        """Build a 1-node EagleVerifyInput rooted at the previous bonus token.
+
+        Used when ``speculative_num_steps == 0`` to skip drafting while still
+        routing through the existing TARGET_VERIFY graph captured at
+        ``draft_token_num=1``: the kernel always accepts the root and samples
+        one new bonus token from target logits — functionally a plain decode.
+        """
+        draft_input: EagleDraftInput = batch.spec_info
+        bs = batch.seq_lens.shape[0]
+        device = self.device
+        seq_lens_sum = (
+            batch.seq_lens_sum
+            if batch.seq_lens_sum is not None
+            else int(torch.sum(batch.seq_lens).item())
+        )
+
+        retrieve_index = torch.arange(bs, dtype=torch.long, device=device).unsqueeze(1)
+        retrieve_next_token = torch.full(
+            (bs, 1), -1, dtype=torch.long, device=device
+        )
+        retrieve_next_sibling = torch.full(
+            (bs, 1), -1, dtype=torch.long, device=device
+        )
+        # FULL_MASK layout for verify: seq_lens_sum * num_verify + num_verify^2 * bs.
+        # With num_verify == 1 this collapses to seq_lens_sum + bs, all True.
+        custom_mask = torch.ones(
+            seq_lens_sum + bs, dtype=torch.bool, device=device
+        )
+        positions = batch.seq_lens.to(torch.int64)
+
+        return EagleVerifyInput(
+            draft_token=draft_input.verified_id,
+            custom_mask=custom_mask,
+            positions=positions,
+            retrieve_index=retrieve_index,
+            retrieve_next_token=retrieve_next_token,
+            retrieve_next_sibling=retrieve_next_sibling,
+            retrieve_cum_len=None,
+            spec_steps=0,
+            topk=self.topk,
+            draft_token_num=1,
+            capture_hidden_mode=CaptureHiddenMode.FULL,
+            seq_lens_sum=None,
+            seq_lens_cpu=None,
+        )
 
     def on_verify_complete_cpu(self, accepted_draft_tokens: list[int]) -> None:
         ctrl = getattr(self, "adaptive_controller", None)
