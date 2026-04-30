@@ -1133,7 +1133,6 @@ class DeepseekV4Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
