@@ -118,7 +118,7 @@ class SchedulerMetricsMixin:
         self.enable_metrics = self.server_args.enable_metrics
         self.is_stats_logging_rank = self.attn_tp_rank == 0
         self.current_scheduler_metrics_enabled = self.enable_metrics and (
-            self.attn_tp_rank == 0 or self.server_args.enable_metrics_for_all_schedulers
+            self.is_stats_logging_rank == 0 or self.server_args.enable_metrics_for_all_schedulers
         )
         if self.enable_metrics:
             engine_type = DisaggregationMode.to_engine_type(
@@ -424,7 +424,6 @@ class SchedulerMetricsMixin:
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
-            self.stats.max_total_num_tokens = self.max_total_num_tokens
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
@@ -603,7 +602,6 @@ class SchedulerMetricsMixin:
 
             # Memory pool usage ratios / Absolute token counts
             pool_stats.update_scheduler_stats(self.stats)
-            self.stats.max_total_num_tokens = self.max_total_num_tokens
 
             # Speculative decoding
             self.stats.spec_accept_length = spec_accept_length

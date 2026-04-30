@@ -744,10 +744,10 @@ class Scheduler(
         set_random_seed(self.random_seed)
 
         # Print debug info
+        avail_mem = get_available_gpu_memory(
+            self.device, self.gpu_id, empty_cache=False
+        )
         if self.tp_rank == 0:
-            avail_mem = get_available_gpu_memory(
-                self.device, self.gpu_id, empty_cache=False
-            )
             logger.info(
                 f"max_total_num_tokens={self.max_total_num_tokens}, "
                 f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
@@ -758,8 +758,15 @@ class Scheduler(
             )
 
         if self.enable_metrics and hasattr(self, "metrics_collector"):
-            self.metrics_collector.emit_cache_config_info(
-                self.page_size, self.max_total_num_tokens // self.page_size
+            self.metrics_collector.emit_constants(
+                max_total_num_tokens=self.max_total_num_tokens,
+                max_running_requests_under_SLO=self.stats.max_running_requests_under_SLO,
+                engine_startup_time=0.0,
+                engine_load_weights_time=0.0,
+                page_size=self.page_size,
+                num_pages=self.max_total_num_tokens // self.page_size,
+                context_len=self.model_config.context_len,
+                available_gpu_memory_gb=avail_mem,
             )
 
     def init_cache_with_memory_pool(self):
