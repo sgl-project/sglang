@@ -23,6 +23,8 @@ def _get_free_port():
 
 
 def _run_rank(rank, world_size, port, scenario, result_q):
+    held = None
+    cuda_driver = None
     try:
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = str(port)
@@ -54,8 +56,6 @@ def _run_rank(rank, world_size, port, scenario, result_q):
             cpu_group=cpu_group,
         )
 
-        held = None
-        cuda_driver = None
         if scenario == "rank0_starved" and rank == 0:
             cuda_driver = get_cuda_driver_bindings()
             prop = _make_flashinfer_workspace_allocation_prop(cuda_driver)
@@ -75,16 +75,13 @@ def _run_rank(rank, world_size, port, scenario, result_q):
             err, held = cuda_driver.cuMemCreate(aligned, prop, 0)
             assert err == cuda_driver.CUresult.CUDA_SUCCESS, (err, aligned)
 
-        try:
-            decision = _preflight_check_workspace_memory(**probe_kwargs)
-        finally:
-            if held is not None:
-                cuda_driver.cuMemRelease(held)
-
+        decision = _preflight_check_workspace_memory(**probe_kwargs)
         result_q.put((rank, "ok", bool(decision)))
     except Exception as e:  # pragma: no cover - debug path
         result_q.put((rank, "err", repr(e)))
     finally:
+        if held is not None:
+            cuda_driver.cuMemRelease(held)
         try:
             import torch.distributed as dist
 
@@ -107,14 +104,20 @@ def _spawn_and_collect(scenario, world_size=WORLD_SIZE):
         proc.start()
         procs.append(proc)
 
-    results = {}
-    for _ in range(world_size):
-        rank, status, payload = q.get(timeout=300)
-        results[rank] = (status, payload)
+    try:
+        results = {}
+        for _ in range(world_size):
+            rank, status, payload = q.get(timeout=300)
+            results[rank] = (status, payload)
 
-    for proc in procs:
-        proc.join(timeout=60)
-        assert proc.exitcode == 0, f"rank exited with {proc.exitcode}"
+        for proc in procs:
+            proc.join(timeout=60)
+            assert proc.exitcode == 0, f"rank exited with {proc.exitcode}"
+    finally:
+        for proc in procs:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=10)
 
     return results
 
