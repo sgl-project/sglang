@@ -901,11 +901,10 @@ class MQALayer(nn.Module):
             o = torch.einsum("tgd,grd->tgr", o, wo_a)
 
         o, _ = self.wo_b(o.flatten(1))
-        if self.tp_size > 1:
-            o = attn_tp_all_reduce(o)
-
         if self.tp_size > 1 and self.tp_size < get_tensor_model_parallel_world_size():
             o = attn_tp_all_reduce(o)
+            
+        return o
 
 class DeepseekV4DecoderLayer(nn.Module):
     def __init__(
