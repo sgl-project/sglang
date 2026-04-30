@@ -1,8 +1,6 @@
 import json
 import unittest
 
-import xgrammar as xgr
-
 from sglang.srt.entrypoints.openai.protocol import (
     Function,
     Tool,
@@ -12,9 +10,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
-from sglang.srt.function_call.deepseekv4_detector import (
-    DeepSeekV32Detector as DeepSeekV4Detector,
-)
+from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.gemma4_detector import (
     Gemma4Detector,
@@ -1646,6 +1642,8 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         self.assertIsNotNone(self.detector.get_structural_tag)
 
     def test_get_model_structural_tag(self):
+        import xgrammar as xgr
+
         structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=True
         )
@@ -2072,6 +2070,8 @@ class TestDeepSeekV4Detector(unittest.TestCase):
         self.assertIsNotNone(self.detector.get_structural_tag)
 
     def test_get_model_structural_tag(self):
+        import xgrammar as xgr
+
         structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=True
         )
@@ -2479,6 +2479,8 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertIsNotNone(self.detector.get_structural_tag)
 
     def test_get_model_structural_tag(self):
+        import xgrammar as xgr
+
         structural_tag = self.detector.get_structural_tag(
             self.tools, thinking_mode=True
         )
