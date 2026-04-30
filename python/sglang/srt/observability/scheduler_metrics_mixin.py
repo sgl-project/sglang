@@ -121,7 +121,8 @@ class SchedulerMetricsMixin:
         self.enable_metrics = self.server_args.enable_metrics
         self.is_stats_logging_rank = self.attn_tp_rank == 0
         self.current_scheduler_metrics_enabled = self.enable_metrics and (
-            self.is_stats_logging_rank or self.server_args.enable_metrics_for_all_schedulers
+            self.is_stats_logging_rank
+            or self.server_args.enable_metrics_for_all_schedulers
         )
         self.enable_mfu_metrics = False
 
@@ -157,24 +158,27 @@ class SchedulerMetricsMixin:
                 self._mfu_log_read_bytes = 0.0
                 self._mfu_log_write_bytes = 0.0
 
-            if ENABLE_METRICS_DEVICE_TIMER:
-                self._device_timer_log_execution_s = 0.0
-                self._device_timer_log_bubble_s = 0.0
+        if ENABLE_METRICS_DEVICE_TIMER:
+            self._device_timer_window_execution_s = 0.0
+            self._device_timer_window_start = time.perf_counter()
+            self._device_timer_window_batch_count = 0
+            self._device_timer_gpu_busy_pct = 0.0
 
-                def _wrap_execution_reporter(**kwargs):
-                    self._device_timer_log_execution_s += kwargs["t"]
+            def _wrap_execution_reporter(**kwargs):
+                self._device_timer_window_execution_s += kwargs["t"]
+                if self.enable_metrics:
                     self.metrics_collector.increment_gpu_execution_seconds(**kwargs)
 
-                def _wrap_bubble_reporter(**kwargs):
-                    self._device_timer_log_bubble_s += kwargs["t"]
+            def _wrap_bubble_reporter(**kwargs):
+                if self.enable_metrics:
                     self.metrics_collector.increment_gpu_overlap_wait_seconds(**kwargs)
 
-                self.forward_pass_device_timer = DeviceTimer(
-                    reporter=_wrap_execution_reporter,
-                )
-                self.bubble_timer = GapTimer(
-                    reporter=_wrap_bubble_reporter,
-                )
+            self.forward_pass_device_timer = DeviceTimer(
+                reporter=_wrap_execution_reporter,
+            )
+            self.bubble_timer = GapTimer(
+                reporter=_wrap_bubble_reporter,
+            )
 
         self.init_kv_events(self.server_args.kv_events_config)
 
@@ -394,6 +398,9 @@ class SchedulerMetricsMixin:
             tflops_per_s = flops / gap_latency / 1e12
             msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
+        if ENABLE_METRICS_DEVICE_TIMER:
+            msg += f", GPU busy: {self._device_timer_gpu_busy_pct:.1f}%"
+
         if self.is_stats_logging_rank:
             logger.info(msg)
         if self.current_scheduler_metrics_enabled:
@@ -582,11 +589,8 @@ class SchedulerMetricsMixin:
             self._mfu_log_read_bytes = 0.0
             self._mfu_log_write_bytes = 0.0
 
-        if ENABLE_METRICS_DEVICE_TIMER and gap_latency > 0:
-            gpu_util_pct = self._device_timer_log_execution_s / gap_latency * 100
-            msg += f", GPU util: {gpu_util_pct:.1f}%"
-            self._device_timer_log_execution_s = 0.0
-            self._device_timer_log_bubble_s = 0.0
+        if ENABLE_METRICS_DEVICE_TIMER:
+            msg += f", GPU busy: {self._device_timer_gpu_busy_pct:.1f}%"
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -925,7 +929,7 @@ class SchedulerMetricsMixin:
 
     @contextmanager
     def record_forward_metrics(self: Scheduler, batch: ScheduleBatch):
-        if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
+        if not ENABLE_METRICS_DEVICE_TIMER:
             yield
             return
 
@@ -938,9 +942,21 @@ class SchedulerMetricsMixin:
         ):
             yield
 
+        self._device_timer_window_batch_count += 1
+        now = time.perf_counter()
+        elapsed = now - self._device_timer_window_start
+        if elapsed > 0:
+            self._device_timer_gpu_busy_pct = (
+                self._device_timer_window_execution_s / elapsed * 100
+            )
+        if self._device_timer_window_batch_count >= 10:
+            self._device_timer_window_execution_s = 0.0
+            self._device_timer_window_start = now
+            self._device_timer_window_batch_count = 0
+
     @contextmanager
     def record_bubble_metrics(self: Scheduler, batch: ScheduleBatch):
-        if not (self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER):
+        if not ENABLE_METRICS_DEVICE_TIMER:
             yield
             return
 
@@ -954,5 +970,5 @@ class SchedulerMetricsMixin:
             yield
 
     def cancel_bubble_timer(self: Scheduler):
-        if self.enable_metrics and ENABLE_METRICS_DEVICE_TIMER:
+        if ENABLE_METRICS_DEVICE_TIMER:
             self.bubble_timer.cancel()
