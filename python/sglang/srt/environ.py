@@ -242,6 +242,7 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
+    SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS = EnvStr("{}")
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     # Extra slots in req_to_token_pool for decode workers (only effective when
     # max_num_reqs > 32). Increases pool capacity so more KV cache transfers
