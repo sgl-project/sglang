@@ -380,7 +380,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
-        self.debug_dump_hook: Optional[Callable] = None
         self.swa_page_size = 128
         assert model_runner.page_size is not None
         assert model_runner.req_to_token_pool is not None
@@ -744,8 +743,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
         self.forward_metadata = metadata
-        if h := self.debug_dump_hook:
-            h("init_forward_metadata_output", metadata)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.decode_cuda_graph_shared_data = _DecodeCudaGraphSharedData()
