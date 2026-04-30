@@ -17,6 +17,8 @@ accumulation noise, no e2e regression expected (verify with
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
@@ -24,6 +26,10 @@ from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
     fp8_native_block_mean_pooling_interface,
     fp8_native_block_sparse_mqa_attn_return_logits_interface,
     pool_mqa_attn_return_logits_fp8_interface,
+)
+from sglang.srt.layers.attention.nsa.hisa.fast_topk_runtime import (
+    MAX_TOPK as _FAST_TOPK_MAX,
+    fast_topk_runtime,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
     batch_decode_pool_mqa_triton,
@@ -34,6 +40,62 @@ from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
     ragged_pool_mqa_triton,
     sparse_paged_mqa_triton,
 )
+
+
+# Stage-3 fast_topk dispatch.
+#   prefill K∈{16,32}  → -3 to -6% e2e at production block_topk = 8192//K
+#                        (test_e2e_simulated.py, ctx=128K). Stage 4 is huge
+#                        per-call so CPU launch latency overlaps cleanly.
+#   prefill K∈{64,128} → loses kernel-side at small block_topk; stays on
+#                        torch.topk(bf16).
+#   decode all K       → kernel wins ~4× in isolation; eager-pipeline
+#                        bench shows ~3-6 μs/step regression because
+#                        stage-3 GPU (9 μs) is shorter than stage-4
+#                        launch latency (CUDA-graph A/B confirms it: under
+#                        capture+replay, fast_topk wins ~25 μs/step).
+#                        Wired live for production A/B — sglang's
+#                        piecewise-graph behavior may differ from our
+#                        eager bench. Toggle off via env var if it
+#                        regresses real-world.
+# Output i32 — both downstream wrappers accept it (no .to() cast).
+_FAST_TOPK_DISABLE = os.environ.get("SGLANG_HISA_FAST_TOPK_DISABLE", "0") == "1"
+
+
+def _stage3_topk_prefill(
+    score_2d: torch.Tensor, block_topk: int, k_block_size: int,
+) -> torch.Tensor:
+    """Prefill stage 3: [seq, L] f32 → [seq, topk] (i32 fast / i64 torch).
+
+    ``topk = min(block_topk, L)`` enforces fast_topk's ``L >= topk`` contract
+    on short prefill chunks (where ``L < block_topk``). Stage 2 already writes
+    -inf at invalid block positions, so the radix select picks correctly
+    without per-row lengths.
+    """
+    topk = min(block_topk, score_2d.shape[-1])
+    if _FAST_TOPK_DISABLE or k_block_size not in (16, 32) or topk > _FAST_TOPK_MAX:
+        # bf16 path: ~40% faster than f32 torch.topk on long rows.
+        return torch.topk(
+            score_2d.bfloat16(), k=topk, dim=-1, sorted=False,
+        ).indices
+    return fast_topk_runtime(score_2d, topk)
+
+
+def _stage3_topk_decode(
+    score_3d: torch.Tensor, block_topk: int,
+) -> torch.Tensor:
+    """Decode stage 3: [B, 1, L] f32 → [B, 1, topk] (i32 fast / i64 torch).
+
+    ``topk = min(block_topk, L)`` enforces fast_topk's ``L >= topk`` contract.
+    In decode L is the fixed pool buffer width (max_pool_pages * pool_page_size),
+    so the clamp is a no-op in production. Stage 2 (``_batch_decode_pool_mqa_kernel``)
+    writes -inf at all ``pool_idx >= context_lens_pool``, so the radix select
+    picks correctly over the full row.
+    """
+    topk = min(block_topk, score_3d.shape[-1])
+    if _FAST_TOPK_DISABLE or topk > _FAST_TOPK_MAX:
+        return torch.topk(score_3d, k=topk, dim=-1, sorted=False).indices
+    B, S, L = score_3d.shape
+    return fast_topk_runtime(score_3d.view(B * S, L), topk).view(B, S, topk)
 
 
 def fp8_native_hierarchy_paged_mqa_logits(
@@ -68,12 +130,8 @@ def fp8_native_hierarchy_paged_mqa_logits(
         pool_page_size=pool_page_size,
     )  # [B, 1, max_pool_pages * pool_page_size] f32
 
-    # 3) Top-k over pool blocks — torch native.
-    topk_block_indices = torch.topk(
-        block_k_indexer_score,
-        k=min(block_topk, block_k_indexer_score.shape[-1]),
-        dim=-1, sorted=False,
-    ).indices
+    # 3) Top-k over pool blocks.
+    topk_block_indices = _stage3_topk_decode(block_k_indexer_score, block_topk)
 
     # 4) Sparse paged MQA — triton port of the decode hotspot.
     block_sparse_k_indexer_score = sparse_paged_mqa_triton(
@@ -138,11 +196,7 @@ def fp8_native_hierarchy_paged_mqa_logits_no_pool_cache(
     )  # [B, 1, max_num_pool] f32
 
     # 3) Top-k over pool blocks.
-    topk_block_indices = torch.topk(
-        block_k_indexer_score,
-        k=min(block_topk, block_k_indexer_score.shape[-1]),
-        dim=-1, sorted=False,
-    ).indices  # [B, 1, topk] int64
+    topk_block_indices = _stage3_topk_decode(block_k_indexer_score, block_topk)
 
     # 4) Sparse paged MQA on the chosen K-blocks.
     block_sparse_k_indexer_score = sparse_paged_mqa_triton(
@@ -238,15 +292,12 @@ def fp8_native_hierarchy_mqa_logits(
         cu_seqlen_blocked_ke=cu_seqlen_blocked_ke,
     )
 
-    # 3) Top-k over pool blocks. bf16 + sorted=False matches the tilelang
-    # path (~40% faster than f32 on long row, ordering doesn't matter for
-    # downstream sparse-MQA).
-    topk_actual = min(block_topk, block_k_indexer_score.shape[-1])
-    topk_block_indices = torch.topk(
-        block_k_indexer_score.bfloat16(),
-        k=topk_actual,
-        dim=-1, sorted=False,
-    ).indices  # [seq, topk_actual] int64
+    # 3) Top-k over pool blocks. fast_topk_runtime at K∈{16,32} (1.45-1.83×),
+    # torch.topk(bf16) at K∈{64,128} (fast_topk's setup tax > sort savings
+    # at small topk). Helper above hides the dispatch and the L>=topk clamp.
+    topk_block_indices = _stage3_topk_prefill(
+        block_k_indexer_score, block_topk, k_block_size,
+    )  # [seq, min(block_topk, L)] int32 (fast_topk) or int64 (torch.topk)
 
     # 4) Sparse-MQA on raw K — split dispatch by K (sweep at sq=8192,
     # skv∈{8K,16K,32K,64K}, test_stage4_full_ab.py):
@@ -268,7 +319,7 @@ def fp8_native_hierarchy_mqa_logits(
             weights=weights,
             cu_seqlen_ks=cu_seqlen_ks,
             cu_seqlen_ke=cu_seqlen_ke,
-        )  # [seq, topk_actual * k_block_size] f32
+        )  # [seq, min(block_topk, L) * k_block_size] f32
     else:
         block_sparse_logits = block_sparse_mqa_triton(
             q_fp8=q_fp8,

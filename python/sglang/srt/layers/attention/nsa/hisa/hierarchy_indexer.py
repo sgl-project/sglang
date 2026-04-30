@@ -73,6 +73,32 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+_SGL_KERNEL_TOPK_WARMED = False
+
+
+def _warmup_sgl_kernel_fast_topk_once() -> None:
+    # sgl_kernel.fast_topk_v2 calls cudaFuncSetAttribute on first invocation
+    # via set_up_kernel_once(). That API is illegal during stream capture,
+    # so the kernel must run eagerly at least once before sglang's cuda graph
+    # capture phase — otherwise capture aborts with
+    # "set_up_kernel_once failed: an illegal memory access was encountered".
+    # HisaIndexer __init__ runs during model build (before init_device_graphs),
+    # which is the right hook point.
+    global _SGL_KERNEL_TOPK_WARMED
+    if _SGL_KERNEL_TOPK_WARMED or not _is_cuda:
+        return
+    from sgl_kernel import fast_topk_v2
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        score = torch.randn(1, 4096, device="cuda", dtype=torch.float32)
+        lengths = torch.tensor([4096], device="cuda", dtype=torch.int32)
+        fast_topk_v2(score, lengths, 2048)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    _SGL_KERNEL_TOPK_WARMED = True
+
+
 class BaseIndexerMetadata(ABC):
     @abstractmethod
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -183,6 +209,7 @@ class HisaIndexer(MultiPlatformOp):
         hisa_block_topk: int,
     ):
         super().__init__()
+        _warmup_sgl_kernel_fast_topk_once()
         # ---- hisa-specific ----
         self.hisa_k_block_size = hisa_k_block_size
         self.hisa_block_topk = hisa_block_topk

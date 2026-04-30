@@ -39,7 +39,8 @@ PREFILL_CHUNK = 8192
 N_PREFILL_CHUNKS = 16
 N_DECODE_STEPS = 256
 CTX = N_PREFILL_CHUNKS * PREFILL_CHUNK  # 128K
-BLOCK_TOPK = 2048
+BLOCK_TOPK_FORMULA = 8192  # Production: block_topk = BLOCK_TOPK_FORMULA // K
+                            # → K=16:512, K=32:256, K=64:128, K=128:64
 
 
 # ---------------------------------------------------------------------------
@@ -130,13 +131,14 @@ def bench_prefill(K):
     Frees per-chunk inputs before next chunk to keep peak memory ~1.5GB
     (one chunk's intermediates).
     """
+    block_topk = BLOCK_TOPK_FORMULA // K
     times = []
     for chunk_i in range(N_PREFILL_CHUNKS):
         skv = (chunk_i + 1) * PREFILL_CHUNK
         sq = PREFILL_CHUNK
         q, kv, w, cu_ks, cu_ke = make_prefill_inputs(sq, skv)
         t = cuda_bench(lambda: fp8_native_hierarchy_mqa_logits(
-            q, kv, w, cu_ks, cu_ke, K, BLOCK_TOPK,
+            q, kv, w, cu_ks, cu_ke, K, block_topk,
         ))
         times.append(t)
         del q, kv, w, cu_ks, cu_ke
@@ -145,12 +147,13 @@ def bench_prefill(K):
 
 
 def bench_decode_step(K, B, ctx):
+    block_topk = BLOCK_TOPK_FORMULA // K
     inputs = make_decode_inputs(K, B, ctx)
     q, kv, pp, ppt, w, ctxl, bt = inputs
     t = cuda_bench(lambda: fp8_native_hierarchy_paged_mqa_logits(
         q_fp8=q, kv_cache_fp8=kv, pool_k_pages=pp, pool_page_tables=ppt,
         weights=w, context_lens=ctxl, block_tables=bt,
-        k_block_size=K, pool_page_size=POOL_PAGE, block_topk=BLOCK_TOPK,
+        k_block_size=K, pool_page_size=POOL_PAGE, block_topk=block_topk,
     ))
     del q, kv, pp, ppt, w, ctxl, bt
     torch.cuda.empty_cache()

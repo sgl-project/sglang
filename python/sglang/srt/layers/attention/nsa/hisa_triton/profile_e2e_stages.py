@@ -1,12 +1,20 @@
-"""Per-stage profile for e2e-simulated workload.
+"""Per-stage profile for the e2e-simulated workload.
 
-Mirrors the orchestrator logic from ``hisa_triton/orchestrator.py`` but
-times each stage individually with CUDA events. Outputs a breakdown of
-prefill / decode wall-time per stage at K ∈ {16, 32}, B ∈ {1, 4} on the
-production-shape workload (ctx=128K, prefill_chunk=8K, decode_steps=256,
-layers=61).
+Faithful to ``orchestrator.py`` dispatch:
+  prefill stage 3: fast_topk_runtime for K∈{16,32}, torch.topk(bf16) otherwise
+  prefill stage 4: tilelang vanilla for K=128, triton grouped (K_CHUNKS=16
+                   persistent for K∈{16,32}) for K<128
+  decode  stage 1: skipped (force_maintain in stage 2)
+  decode  stage 3: torch.topk
+  decode  stage 4: sparse_paged_mqa_triton
 
-Read-only — does NOT modify any production kernels.
+Production-shape workload: ctx=128K, prefill_chunk=8K (16 chunks),
+decode_steps=256, layers=61, block_topk = 8192 // k_block_size.
+
+Reports per-stage μs (per chunk / per step), % share, and aggregated to
+e2e ms (× LAYERS × B for prefill, × N_DECODE_STEPS × LAYERS for decode).
+
+Read-only — does not modify production kernels.
 """
 from __future__ import annotations
 
@@ -15,7 +23,12 @@ import torch
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
     fp8_native_block_mean_pooling_grouped_interface,
     fp8_native_block_mean_pooling_interface,
+    fp8_native_block_sparse_mqa_attn_return_logits_interface,
     pool_mqa_attn_return_logits_fp8_interface,
+)
+from sglang.srt.layers.attention.nsa.hisa.fast_topk_runtime import (
+    MAX_TOPK as _FAST_TOPK_MAX,
+    fast_topk_runtime,
 )
 from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
     batch_decode_pool_mqa_triton,
@@ -33,11 +46,10 @@ PREFILL_CHUNK = 8192
 N_PREFILL_CHUNKS = 16
 N_DECODE_STEPS = 256
 CTX = N_PREFILL_CHUNKS * PREFILL_CHUNK  # 128K
-BLOCK_TOPK = 2048
 
 
 # ---------------------------------------------------------------------------
-# Per-stage prefill (mirrors fp8_native_hierarchy_mqa_logits)
+# Stage runners (faithful to orchestrator.py dispatch)
 # ---------------------------------------------------------------------------
 
 def prefill_stage1(k_fp8, k_scales, K):
@@ -60,14 +72,24 @@ def prefill_stage2(q_fp8, blocked_k_fp8, blocked_k_scale, K, weights, cu_ks, cu_
     )
 
 
-def prefill_stage3(score, block_topk):
-    topk_actual = min(block_topk, score.shape[-1])
-    return torch.topk(
-        score.bfloat16(), k=topk_actual, dim=-1, sorted=False,
-    ).indices
+def prefill_stage3(score, K, block_topk):
+    """Match orchestrator: fast_topk for K∈{16,32}, torch.topk(bf16) otherwise."""
+    topk = min(block_topk, score.shape[-1])
+    if K in (16, 32) and topk <= _FAST_TOPK_MAX:
+        return fast_topk_runtime(score, topk)
+    return torch.topk(score.bfloat16(), k=topk, dim=-1, sorted=False).indices
 
 
 def prefill_stage4(q_fp8, k_fp8, k_scales, topk_idx, K, weights, cu_ks, cu_ke):
+    """Match orchestrator: tilelang for K=128, triton grouped (persistent
+    K_CHUNKS=16 for K∈{16,32}) otherwise."""
+    if K == 128:
+        return fp8_native_block_sparse_mqa_attn_return_logits_interface(
+            q=q_fp8, k=k_fp8, k_scale=k_scales,
+            topk_block_index=topk_idx,
+            kv_block_size=K, weights=weights,
+            cu_seqlen_ks=cu_ks, cu_seqlen_ke=cu_ke,
+        )
     return block_sparse_mqa_triton(
         q_fp8=q_fp8, k_fp8=k_fp8, k_scale=k_scales,
         topk_block_index=topk_idx,
@@ -75,10 +97,6 @@ def prefill_stage4(q_fp8, k_fp8, k_scales, topk_idx, K, weights, cu_ks, cu_ke):
         cu_seqlen_ks=cu_ks, cu_seqlen_ke=cu_ke,
     )
 
-
-# ---------------------------------------------------------------------------
-# Per-stage decode (mirrors fp8_native_hierarchy_paged_mqa_logits, post-#1)
-# ---------------------------------------------------------------------------
 
 def decode_stage2(q_fp8, pool_k_pages, pool_page_tables, weights,
                   num_pool_blocks_per_req):
@@ -180,45 +198,41 @@ def cuda_bench(fn, warmup=10, iters=50):
     return s.elapsed_time(e) * 1e3 / iters  # μs
 
 
-# ---------------------------------------------------------------------------
-# Per-stage timing per chunk / step
-# ---------------------------------------------------------------------------
-
-def profile_prefill_chunk(K, sq, skv):
-    """Return (s1, s2, s3, s4) μs for a single chunk."""
+def profile_prefill_chunk(K, sq, skv, block_topk):
+    """Returns (s1, s2, s3, s4) μs for one chunk."""
     q, k_fp8, k_scale, w, cu_ks, cu_ke = make_prefill_inputs(sq, skv)
 
-    # Run stage 1 once to get its outputs (needed for stage 2/4 inputs).
     blocked_k_fp8, blocked_k_scale = prefill_stage1(k_fp8, k_scale, K)
     s2_score = prefill_stage2(q, blocked_k_fp8, blocked_k_scale, K, w, cu_ks, cu_ke)
-    s3_topk_idx = prefill_stage3(s2_score, BLOCK_TOPK)
+    s3_topk_idx = prefill_stage3(s2_score, K, block_topk)
 
     s1 = cuda_bench(lambda: prefill_stage1(k_fp8, k_scale, K))
     s2 = cuda_bench(lambda: prefill_stage2(
         q, blocked_k_fp8, blocked_k_scale, K, w, cu_ks, cu_ke,
     ))
-    s3 = cuda_bench(lambda: prefill_stage3(s2_score, BLOCK_TOPK))
+    s3 = cuda_bench(lambda: prefill_stage3(s2_score, K, block_topk))
     s4 = cuda_bench(lambda: prefill_stage4(
         q, k_fp8, k_scale, s3_topk_idx, K, w, cu_ks, cu_ke,
     ))
 
     del q, k_fp8, k_scale, w, cu_ks, cu_ke
     del blocked_k_fp8, blocked_k_scale, s2_score, s3_topk_idx
+    del s_lengths, s_indices
     torch.cuda.empty_cache()
     return s1, s2, s3, s4
 
 
-def profile_decode_step(K, B, ctx):
+def profile_decode_step(K, B, ctx, block_topk):
+    """Returns (s1, s2, s3, s4) μs for one step. s1==0 (tail skipped)."""
     inp = make_decode_inputs(K, B, ctx)
     q, kv, pp, ppt, w, ctxl, bt, num_pool_per_req = inp
 
-    # Stage 1 (tail) is skipped per #1 — measure 0.
     s1 = 0.0
     s2_score = decode_stage2(q, pp, ppt, w, num_pool_per_req)
-    s3_topk_idx = decode_stage3(s2_score, BLOCK_TOPK)
+    s3_topk_idx = decode_stage3(s2_score, block_topk)
 
     s2 = cuda_bench(lambda: decode_stage2(q, pp, ppt, w, num_pool_per_req))
-    s3 = cuda_bench(lambda: decode_stage3(s2_score, BLOCK_TOPK))
+    s3 = cuda_bench(lambda: decode_stage3(s2_score, block_topk))
     s4 = cuda_bench(lambda: decode_stage4(q, kv, s3_topk_idx, K, w, ctxl, bt))
 
     del q, kv, pp, ppt, w, ctxl, bt, num_pool_per_req, s2_score, s3_topk_idx
@@ -230,59 +244,124 @@ def profile_decode_step(K, B, ctx):
 # Reporting
 # ---------------------------------------------------------------------------
 
-def main():
+def _row(stages_us, total_us, label_w=18):
+    """Format: stage1_us (%) | stage2_us (%) | ... | total_us"""
+    parts = []
+    for s in stages_us:
+        pct = (s / total_us * 100) if total_us > 0 else 0.0
+        parts.append(f"{s:>9.1f} ({pct:>4.1f}%)")
+    parts.append(f"{total_us:>9.1f}")
+    return "  ".join(parts)
+
+
+def main(K_list=(16, 128)):
     print("=" * 110)
-    print(f"Per-stage profile  ctx={CTX//1024}K  prefill_chunk={PREFILL_CHUNK}  "
-          f"decode_steps={N_DECODE_STEPS}  layers={LAYERS}")
+    print(f"Per-stage e2e profile  ctx={CTX//1024}K  prefill_chunk={PREFILL_CHUNK}  "
+          f"decode_steps={N_DECODE_STEPS}  layers={LAYERS}  block_topk=8192/K")
     print("=" * 110)
 
-    for K in (16, 32):
-        # Profile prefill chunks at the 3 representative skv values:
-        # (early=8K, mid=64K, late=128K). 16 chunks span 8K..128K.
-        # Sum across all 16 chunks by interpolation: assume linear so we
-        # just measure all 16 to be precise (sums fast).
-        print(f"\n--- K={K}  PREFILL chunks (per-chunk μs) ---")
-        print(f"{'chunk':>5} {'skv':>7} | {'stage1':>7} {'stage2':>7} "
-              f"{'stage3':>7} {'stage4':>7} | {'total':>7}")
-        prefill_per_chunk = []
+    # Single decode B for reporting (B=1 is the per-request shape).
+    DECODE_B = 1
+
+    # Collect all results first, then print compact tables.
+    results = {}  # K → {prefill: (s1..s4 sum, μs), decode: (s1..s4, μs)}
+    for K in K_list:
+        block_topk = 8192 // K
+        # ---- Prefill: sum across 16 chunks ----
+        chunk_breakdowns = []
         for i in range(N_PREFILL_CHUNKS):
             skv = (i + 1) * PREFILL_CHUNK
-            s1, s2, s3, s4 = profile_prefill_chunk(K, PREFILL_CHUNK, skv)
+            chunk_breakdowns.append(
+                profile_prefill_chunk(K, PREFILL_CHUNK, skv, block_topk)
+            )
+        pf_s1 = sum(c[0] for c in chunk_breakdowns)
+        pf_s2 = sum(c[1] for c in chunk_breakdowns)
+        pf_s3 = sum(c[2] for c in chunk_breakdowns)
+        pf_s4 = sum(c[3] for c in chunk_breakdowns)
+
+        # ---- Decode: one step ----
+        d1, d2, d3, d4 = profile_decode_step(K, DECODE_B, CTX, block_topk)
+
+        results[K] = {
+            "block_topk": block_topk,
+            "prefill_chunk_sum_us": (pf_s1, pf_s2, pf_s3, pf_s4),
+            "decode_step_us": (d1, d2, d3, d4),
+            "chunks": chunk_breakdowns,
+        }
+
+    # ---- Report ----
+    for K in K_list:
+        r = results[K]
+        print()
+        print(f"K = {K}    block_topk = {r['block_topk']}")
+        print("-" * 110)
+        # Per-chunk breakdown for prefill
+        print(f"PREFILL — per-chunk μs (16 chunks, skv = (i+1)*8K):")
+        print(f"  {'chunk':>5} {'skv':>7} | {'stage1':>8} {'stage2':>8} "
+              f"{'stage3':>8} {'stage4':>8} | {'total':>8}")
+        for i, (s1, s2, s3, s4) in enumerate(r["chunks"]):
             tot = s1 + s2 + s3 + s4
-            prefill_per_chunk.append((s1, s2, s3, s4, tot))
-            print(f"{i:>5} {skv:>7} | {s1:>7.0f} {s2:>7.0f} {s3:>7.0f} "
-                  f"{s4:>7.0f} | {tot:>7.0f}")
+            print(f"  {i:>5} {(i+1)*PREFILL_CHUNK:>7} | "
+                  f"{s1:>8.1f} {s2:>8.1f} {s3:>8.1f} {s4:>8.1f} | {tot:>8.1f}")
 
-        sum_s1 = sum(c[0] for c in prefill_per_chunk)
-        sum_s2 = sum(c[1] for c in prefill_per_chunk)
-        sum_s3 = sum(c[2] for c in prefill_per_chunk)
-        sum_s4 = sum(c[3] for c in prefill_per_chunk)
-        sum_tot = sum_s1 + sum_s2 + sum_s3 + sum_s4
-        print(f"{'sum':>5} {'all':>7} | {sum_s1:>7.0f} {sum_s2:>7.0f} "
-              f"{sum_s3:>7.0f} {sum_s4:>7.0f} | {sum_tot:>7.0f}")
-        print(f"    %share        | "
-              f"{sum_s1/sum_tot*100:>6.1f}% {sum_s2/sum_tot*100:>6.1f}% "
-              f"{sum_s3/sum_tot*100:>6.1f}% {sum_s4/sum_tot*100:>6.1f}%")
+        # Aggregated prefill (sum across 16 chunks; per-request, B=1)
+        pf = r["prefill_chunk_sum_us"]
+        pf_tot = sum(pf)
+        print(f"\nPREFILL — sum across 16 chunks (per-request, μs):")
+        print(f"  {'stage1':>14}  {'stage2':>14}  {'stage3':>14}  {'stage4':>14}  "
+              f"| {'total':>9}")
+        print(f"  {_row(pf, pf_tot)}")
 
-        for B in (1, 4):
-            print(f"\n--- K={K}  B={B}  DECODE step (μs) ---")
-            print(f"{'stage1':>7} {'stage2':>7} {'stage3':>7} {'stage4':>7} | "
-                  f"{'total':>7}")
-            d1, d2, d3, d4 = profile_decode_step(K, B, ctx=CTX)
-            d_tot = d1 + d2 + d3 + d4
-            print(f"{d1:>7.0f} {d2:>7.0f} {d3:>7.0f} {d4:>7.0f} | {d_tot:>7.0f}")
-            print(f"%share: 0%, {d2/d_tot*100:.1f}%, "
-                  f"{d3/d_tot*100:.1f}%, {d4/d_tot*100:.1f}%")
+        # Decode (one step)
+        d = r["decode_step_us"]
+        d_tot = sum(d)
+        print(f"\nDECODE — one step (B={DECODE_B}, μs):")
+        print(f"  {'stage1':>14}  {'stage2':>14}  {'stage3':>14}  {'stage4':>14}  "
+              f"| {'total':>9}")
+        print(f"  {_row(d, d_tot)}")
 
-            # E2E aggregate per (K, B)
-            prefill_total_ms = sum_tot * LAYERS * B / 1e3
-            decode_total_ms = d_tot * N_DECODE_STEPS * LAYERS / 1e3
-            e2e_ms = prefill_total_ms + decode_total_ms
-            print(f"e2e (K={K} B={B}): "
-                  f"prefill={prefill_total_ms:.1f}ms ({prefill_total_ms/e2e_ms*100:.1f}%)  "
-                  f"decode={decode_total_ms:.1f}ms ({decode_total_ms/e2e_ms*100:.1f}%)  "
-                  f"total={e2e_ms:.1f}ms")
+        # Aggregated to e2e ms (per-request, B=1)
+        prefill_ms = pf_tot * LAYERS / 1e3
+        decode_ms = d_tot * N_DECODE_STEPS * LAYERS / 1e3
+        e2e_ms = prefill_ms + decode_ms
+        print(f"\nE2E (per-request, B=1):")
+        print(f"  prefill = {prefill_ms:>8.1f} ms  ({prefill_ms/e2e_ms*100:>4.1f}%)")
+        print(f"  decode  = {decode_ms:>8.1f} ms  ({decode_ms/e2e_ms*100:>4.1f}%)")
+        print(f"  total   = {e2e_ms:>8.1f} ms")
+        print()
+
+    # ---- Cross-K summary table: stage % of e2e per K ----
+    print("=" * 110)
+    print(f"E2E STAGE BREAKDOWN — per-request (B={DECODE_B}, layers={LAYERS}, "
+          f"prefill_chunks=16, decode_steps={N_DECODE_STEPS})")
+    print("=" * 110)
+    print(f"{'K':>4} | "
+          + "  ".join(f"{f'pf_s{i}':>7}" for i in range(1, 5))
+          + "  | "
+          + "  ".join(f"{f'dc_s{i}':>7}" for i in range(1, 5))
+          + "  | " + f"{'e2e ms':>8}")
+    print(f"{'':>4} | "
+          + "  ".join("μs    %  ".rjust(7) for _ in range(4))
+          + "  | "
+          + "  ".join("μs    %  ".rjust(7) for _ in range(4))
+          + "  | ")
+    print("-" * 110)
+    for K in K_list:
+        r = results[K]
+        pf_us = list(r["prefill_chunk_sum_us"])
+        d_us = list(r["decode_step_us"])
+        # Convert to e2e ms
+        pf_ms = [s * LAYERS / 1e3 for s in pf_us]
+        d_ms = [s * N_DECODE_STEPS * LAYERS / 1e3 for s in d_us]
+        e2e = sum(pf_ms) + sum(d_ms)
+        cells = []
+        for ms in pf_ms:
+            cells.append(f"{ms:>5.0f}({ms/e2e*100:>4.1f}%)")
+        for ms in d_ms:
+            cells.append(f"{ms:>5.0f}({ms/e2e*100:>4.1f}%)")
+        print(f"{K:>4} | " + "  ".join(cells[:4]) + "  | "
+              + "  ".join(cells[4:]) + f"  | {e2e:>8.1f}")
 
 
 if __name__ == "__main__":
-    main()
+    main(K_list=(16, 128))

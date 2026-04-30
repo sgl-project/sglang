@@ -656,7 +656,10 @@ def sparse_paged_mqa_triton(
     assert _ == 1 and DPlus4 == D + 4
     max_blocks = int(block_tables.shape[-1])
 
-    assert topk_block_index.dtype == torch.int64
+    # i32 or i64 — Triton load does .to(tl.int32) internally either way.
+    # Accepting i32 lets us route fast_topk_runtime output through without
+    # a redundant 64→32 cast.
+    assert topk_block_index.dtype in (torch.int32, torch.int64)
     assert context_lens.dtype == torch.int32
     assert block_tables.dtype == torch.int32
     assert kv_block_size in (8, 16, 32, 64, 128), (
