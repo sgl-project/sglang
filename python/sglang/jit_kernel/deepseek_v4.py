@@ -834,142 +834,6 @@ def create_paged_compress_data_kernel(
         tl.store(base + 0 * stride_out_1_1, v0, mask=mask)
 
 
-_mmap_dumper = None
-
-
-def _get_mmap_dumper():
-    global _mmap_dumper
-    if _mmap_dumper is None:
-        from sglang.srt.debug_utils.mmap_dumper import MmapDumper
-        from sglang.srt.environ import envs
-
-        dump_dir = envs.SGLANG_HACK_DEBUG_DUMP_CREATE_PAGED_COMPRESS_DATA.get()
-        _mmap_dumper = MmapDumper(dump_dir or None)
-    return _mmap_dumper
-
-
-_dumped_static_meta_once = False
-
-
-def _maybe_dump_create_paged_compress_data_inputs(
-    *,
-    compress_ratio: int,
-    is_overlap: bool,
-    swa_page_size: int,
-    ring_size: int,
-    req_pool_indices: torch.Tensor,
-    seq_lens: torch.Tensor,
-    extend_seq_lens: torch.Tensor,
-    req_to_token: torch.Tensor,
-    full_to_swa_index_mapping: torch.Tensor,
-    block: int,
-) -> None:
-    d = _get_mmap_dumper()
-    if not d.is_active():
-        return
-
-    # Print static config (constant after server init) once per process.
-    global _dumped_static_meta_once
-    if not _dumped_static_meta_once:
-        print(
-            f"[c128_dump_static] swa_page_size={swa_page_size} ring_size={ring_size} "
-            f"block={block} req_to_token_shape={tuple(req_to_token.shape)} "
-            f"full_to_swa_shape={tuple(full_to_swa_index_mapping.shape)}",
-            flush=True,
-        )
-        _dumped_static_meta_once = True
-
-    # Per-ratio dump (small): req_pool_indices / seq_lens / extend_seq_lens.
-    # These are forward_batch fields, identical across c4 and c128 within the
-    # same forward — but small (KB-level) so dumping twice is cheap.
-    p = f"c{compress_ratio}_plan"
-    d.dump(
-        {
-            f"{p}_compress_ratio": compress_ratio,
-            f"{p}_is_overlap": is_overlap,
-            f"{p}_req_pool_indices": req_pool_indices,
-            f"{p}_seq_lens": seq_lens,
-            f"{p}_extend_seq_lens": extend_seq_lens,
-        }
-    )
-
-    # Global tensors shared between c4 and c128 (multi-MB-GB). Only dump on
-    # the first call per forward to avoid 2x GPU->CPU copy (~184 MB + ~33 MB).
-    # Backends call create_paged_compressor_data with c4 first, then c128
-    # (deepseek_v4_backend_radix.py:457-458), so dump on c4 only.
-    if compress_ratio == 4:
-        cols = min(10000, req_to_token.shape[1])
-        req_to_token_partial = req_to_token[:, :cols].contiguous()
-        d.dump(
-            {
-                "global_req_to_token_dumped_cols": cols,
-                "global_req_to_token_partial": req_to_token_partial,
-                "global_full_to_swa_index_mapping": full_to_swa_index_mapping,
-            }
-        )
-
-
-def _maybe_dump_create_paged_compress_data_outputs(
-    *,
-    compress_ratio: int,
-    out_0: torch.Tensor,
-    out_1: torch.Tensor,
-) -> None:
-    d = _get_mmap_dumper()
-    if not d.is_active():
-        return
-    p = f"c{compress_ratio}_plan"
-    d.dump(
-        {
-            f"{p}_out_0": out_0,
-            f"{p}_out_1": out_1,
-            f"{p}_out_0_shape": list(out_0.shape),
-            f"{p}_out_1_shape": list(out_1.shape),
-        }
-    )
-
-
-_printed_buffer_shape_once: dict = {}
-
-
-def maybe_dump_compress_metadata_extras(
-    *,
-    compress_ratio: int,
-    kv_score_buffer_shape: Tuple[int, ...],
-    kv_score_buffer_dtype: torch.dtype,
-    plan_compress_plan: torch.Tensor,
-    plan_write_plan: torch.Tensor,
-) -> None:
-    """Public helper to be called from compressor.py at metadata-prepare time
-    (once per forward per ratio, not per layer). Dumps the prefill kernel's
-    real bound (kv_score_buffer.shape) plus the actual plan tensors that get
-    fed to flash_c{ratio}_prefill.
-    """
-    d = _get_mmap_dumper()
-    if not d.is_active():
-        return
-
-    # Print kv_score_buffer.shape once per ratio (constant after init).
-    if compress_ratio not in _printed_buffer_shape_once:
-        print(
-            f"[c128_dump_static] c{compress_ratio} "
-            f"kv_score_buffer_shape={tuple(kv_score_buffer_shape)} "
-            f"dtype={kv_score_buffer_dtype}",
-            flush=True,
-        )
-        _printed_buffer_shape_once[compress_ratio] = True
-
-    p = f"c{compress_ratio}_meta"
-    d.dump(
-        {
-            f"{p}_plan_compress_plan": plan_compress_plan,
-            f"{p}_plan_write_plan": plan_write_plan,
-            f"{p}_plan_compress_count": int(plan_compress_plan.shape[0]),
-            f"{p}_plan_write_count": int(plan_write_plan.shape[0]),
-        }
-    )
-
-
 def triton_create_paged_compress_data(
     *,
     compress_ratio: int,
@@ -983,22 +847,6 @@ def triton_create_paged_compress_data(
     full_to_swa_index_mapping: torch.Tensor,
     block: int = 128,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    _should_dump = bool(envs.SGLANG_HACK_DEBUG_DUMP_CREATE_PAGED_COMPRESS_DATA.get())
-    if _should_dump:
-        torch.cuda.synchronize()
-        _maybe_dump_create_paged_compress_data_inputs(
-            compress_ratio=compress_ratio,
-            is_overlap=is_overlap,
-            swa_page_size=swa_page_size,
-            ring_size=ring_size,
-            req_pool_indices=req_pool_indices,
-            seq_lens=seq_lens,
-            extend_seq_lens=extend_seq_lens,
-            req_to_token=req_to_token,
-            full_to_swa_index_mapping=full_to_swa_index_mapping,
-            block=block,
-        )
-
     batch_size = req_pool_indices.shape[0]
     out_dim = 4 if is_overlap else 1
     device_args: dict = dict(device=req_pool_indices.device, dtype=torch.int32)
@@ -1024,12 +872,6 @@ def triton_create_paged_compress_data(
         ring_size=ring_size,
         BLOCK=block,
     )
-
-    if _should_dump:
-        torch.cuda.synchronize()
-        _maybe_dump_create_paged_compress_data_outputs(
-            compress_ratio=compress_ratio, out_0=out_0, out_1=out_1
-        )
 
     if not is_overlap:
         out_1.squeeze_(1)

@@ -618,7 +618,6 @@ class Envs:
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
     SGLANG_FIX_DSV4_BASE_MODEL_LOAD = EnvBool(False)
     SGLANG_HANDLE_C128_PREFILL_KERNEL = EnvBool(False)
-    SGLANG_HACK_DEBUG_DUMP_CREATE_PAGED_COMPRESS_DATA = EnvStr("")
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
 
     # Dangerous untested flagas
