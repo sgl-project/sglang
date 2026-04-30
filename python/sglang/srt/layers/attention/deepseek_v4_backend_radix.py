@@ -32,9 +32,6 @@ from sglang.srt.layers.attention.compressed.metadata import (
     PagedIndexerMetadata,
     maybe_copy_inplace,
 )
-from sglang.srt.layers.attention.debug_flash_mla_adapter import (
-    flash_mla_with_kvcache_entrypoint,
-)
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
@@ -1091,7 +1088,9 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            input_dict = dict(
+            import flash_mla
+
+            o = flash_mla.flash_mla_with_kvcache(
                 q=q,
                 k_cache=swa_k_cache,
                 head_dim_v=self.head_dim_v,
@@ -1106,9 +1105,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 extra_k_cache=extra_k_cache,
                 extra_indices_in_kvcache=extra_indices,
                 extra_topk_length=extra_topk_lengths,
-            )
-
-            o = flash_mla_with_kvcache_entrypoint(**input_dict, backend="kernel")[0]
+            )[0]
 
             o = o.squeeze(1)
             return o
