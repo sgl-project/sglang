@@ -488,6 +488,7 @@ main() {
     setup_pip_toolchain
     uninstall_stale_flashinfer
     install_sglang
+    setup_ld_library_path
     install_sglang_kernel
     install_sglang_router
     download_flashinfer_cache
@@ -496,7 +497,6 @@ main() {
     fix_nvidia_deps
     install_test_tools
     prepare_runner
-    setup_ld_library_path
     verify_imports
 }
 
