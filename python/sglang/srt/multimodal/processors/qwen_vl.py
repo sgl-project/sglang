@@ -23,6 +23,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForConditionalGeneration,
     Qwen3_5MoeForConditionalGeneration,
 )
+from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
@@ -246,6 +247,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Qwen3VLMoeForConditionalGeneration,
         Qwen3_5ForConditionalGeneration,
         Qwen3_5MoeForConditionalGeneration,
+        Qwen3_5ForCausalLMMTP,
         Qwen3OmniMoeForConditionalGeneration,
     ]
 
@@ -466,7 +468,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 embedding_start : embedding_start + num_tokens
             ]
             consumed_per_modality[modality] = embedding_start + num_tokens
-            logger.info(f"Get embedding slice for {modality}, num_tokens={num_tokens}")
             mm_items.append(
                 MultimodalDataItem(
                     modality=modality,
