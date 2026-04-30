@@ -5,35 +5,32 @@ Each sibling ``test_<hardware>_<model_size>.py`` declares ONE
 and contains one ``CustomTestCase`` subclass per recipe
 (Low-Latency / Balanced / Max-Throughput / CP, where supported).
 
-Each subclass launches the server with the cookbook's exact flags,
-runs the AIME25 evaluation by invoking the corresponding subcommands
-of ``scripts/bench_gpqa_aime.py`` (``run-aime25`` then
-``regrade-aime25``), and asserts the recovered metrics file appeared.
+Each subclass launches the server with the cookbook's exact flags and
+runs the AIME25 evaluation by shelling out to ``sgl-eval run aime25``
+(https://github.com/sgl-project/sgl-eval). sgl-eval bundles the AIME25
+dataset and uses ``math_verify`` for grading, so no nemo-skills setup
+is required and there is no separate ``regrade`` pass — the relaxed
+extractor is built in.
 
 Cookbook reference:
     https://docs.sglang.io/cookbook/autoregressive/DeepSeek/DeepSeek-V4
 
-These are MANUAL tests (not CI). They expect the documented
-container layout: nemo-skills venv at ``/sgl-workspace/ns-venv`` and
-log dir at ``/sgl-workspace/logs``. ``setup-ns`` is invoked once per
-process if the venv is missing.
+These are MANUAL tests (not CI). ``sgl-eval`` must be on PATH.
 
 Per-variant defaults (set on the Flash/Pro intermediate base classes):
-    Flash recipes -> AIME25 score threshold 0.93, no regrade
-    Pro   recipes -> AIME25 score threshold 0.95, regrade enabled
-                    (the bench script's ``regrade-aime25`` step reruns a
-                    relaxed extractor for Pro generations that finish with
-                    prose like "**Answer:** 336" instead of ``\\boxed{}``)
+    Flash recipes -> AIME25 score threshold 0.93
+    Pro   recipes -> AIME25 score threshold 0.95
 
 AIME25 knobs (env vars):
-    DSV4_AIME25_NUM_REPEATS       (default 16)
-    DSV4_AIME25_TEMPERATURE       (default 1.0)
-    DSV4_AIME25_MAX_TOKENS        (default 400000)
-    DSV4_AIME25_MAX_CONCURRENCY   (default 512)
-    DSV4_AIME25_TIMEOUT_SEC       (default 21600)
+    DSV4_AIME25_NUM_REPEATS       (default 16  -> --n-repeats)
+    DSV4_AIME25_TEMPERATURE       (default 1.0 -> --temperature)
+    DSV4_AIME25_TOP_P             (default 1.0 -> --top-p)
+    DSV4_AIME25_MAX_TOKENS        (default 65536 -> --max-tokens)
+    DSV4_AIME25_NUM_THREADS       (default 512 -> --num-threads)
+    DSV4_AIME25_OUT_DIR           (default /tmp/sgl-eval-out -> --out-dir)
+    DSV4_AIME25_SCORE_METRIC      (default "pass@1"; key in sgl-eval JSON to assert on)
     DSV4_AIME25_SCORE_THRESHOLD   (default 0; >0 overrides the per-variant default)
-    DSV4_AIME25_SKIP_SETUP_NS     (default 0; 1 to skip setup-ns even if venv is missing)
-    DSV4_BENCH_SCRIPT             (override path to bench_gpqa_aime.py)
+    DSV4_SGL_EVAL_BIN             (default "sgl-eval"; override path to the CLI)
 
 Multi-node knobs (only consumed by multi-node test classes; if either
 is unset, those classes ``SkipTest``):
@@ -41,11 +38,10 @@ is unset, those classes ``SkipTest``):
     DSV4_DIST_INIT_ADDR           (e.g. 10.0.0.1:20000 for --dist-init-addr)
 """
 
-import glob
 import json
 import os
+import shutil
 import subprocess
-import time
 import unittest
 from pathlib import Path
 from typing import ClassVar, Dict, List, Optional
@@ -58,20 +54,16 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-REPO_ROOT = Path(__file__).resolve().parents[4]
-DEFAULT_BENCH_SCRIPT = REPO_ROOT / "scripts" / "bench_gpqa_aime.py"
-BENCH_SCRIPT = Path(os.environ.get("DSV4_BENCH_SCRIPT", str(DEFAULT_BENCH_SCRIPT)))
-
-LOG_DIR = "/sgl-workspace/logs"
-NS_VENV = "/sgl-workspace/ns-venv"
+SGL_EVAL_BIN = os.environ.get("DSV4_SGL_EVAL_BIN", "sgl-eval")
 
 AIME25_NUM_REPEATS = int(os.environ.get("DSV4_AIME25_NUM_REPEATS", "16"))
 AIME25_TEMPERATURE = float(os.environ.get("DSV4_AIME25_TEMPERATURE", "1.0"))
-AIME25_MAX_TOKENS = int(os.environ.get("DSV4_AIME25_MAX_TOKENS", "400000"))
-AIME25_MAX_CONCURRENCY = int(os.environ.get("DSV4_AIME25_MAX_CONCURRENCY", "512"))
-AIME25_TIMEOUT_SEC = int(os.environ.get("DSV4_AIME25_TIMEOUT_SEC", "21600"))
+AIME25_TOP_P = float(os.environ.get("DSV4_AIME25_TOP_P", "1.0"))
+AIME25_MAX_TOKENS = int(os.environ.get("DSV4_AIME25_MAX_TOKENS", "65536"))
+AIME25_NUM_THREADS = int(os.environ.get("DSV4_AIME25_NUM_THREADS", "512"))
+AIME25_OUT_DIR = os.environ.get("DSV4_AIME25_OUT_DIR", "/tmp/sgl-eval-out")
+AIME25_SCORE_METRIC = os.environ.get("DSV4_AIME25_SCORE_METRIC", "pass@1")
 AIME25_SCORE_THRESHOLD = float(os.environ.get("DSV4_AIME25_SCORE_THRESHOLD", "0.0"))
-AIME25_SKIP_SETUP_NS = os.environ.get("DSV4_AIME25_SKIP_SETUP_NS", "0") == "1"
 
 # DeepEP "large SMS" config — appears as `--deepep-config '{...}'` in every
 # DeepEP recipe except multi-node ones (where it is gated off in the JSX).
@@ -107,22 +99,15 @@ class Dsv4Aime25TestBase(CustomTestCase):
     """Subclass via ``Dsv4FlashAime25TestBase`` or ``Dsv4ProAime25TestBase``,
     not directly. Per-recipe subclasses set MODEL / OTHER_ARGS / EXTRA_ENV.
 
-    Subclasses also set ``SCORE_THRESHOLD`` and ``REGRADE`` via the Flash/Pro
-    intermediate base classes:
-    - Flash: threshold 0.93, no regrade (``\\boxed{}`` extractor is enough)
-    - Pro:   threshold 0.95, regrade (Pro generations sometimes finish with
-             prose like "**Answer:** 336" instead of ``\\boxed{}``; the
-             ``regrade-aime25`` step in scripts/bench_gpqa_aime.py reruns a
-             relaxed extractor so those don't get scored as no-answer)
+    SCORE_THRESHOLD is set by the Flash/Pro intermediate base classes:
+    Flash 0.93, Pro 0.95.
     """
 
     MODEL: ClassVar[str] = ""
     OTHER_ARGS: ClassVar[List[str]] = []
     EXTRA_ENV: ClassVar[Dict[str, str]] = {}
 
-    # Set by Flash/Pro intermediate bases below.
     SCORE_THRESHOLD: ClassVar[float] = 0.0
-    REGRADE: ClassVar[bool] = False
 
     _BASE_CLASSES: ClassVar[set] = set()
 
@@ -148,122 +133,95 @@ class Dsv4Aime25TestBase(CustomTestCase):
             kill_process_tree(cls.process.pid)
 
     def test_aime25(self):
-        if not BENCH_SCRIPT.exists():
-            self.skipTest(f"bench script not found at {BENCH_SCRIPT}")
+        if shutil.which(SGL_EVAL_BIN) is None:
+            self.skipTest(f"{SGL_EVAL_BIN!r} not found on PATH")
 
-        bench_env = self._bench_env()
-        self._setup_ns_if_needed(bench_env)
+        out_dir = Path(AIME25_OUT_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        before = set(out_dir.glob("sgl_eval_aime25_*.json"))
 
-        before = self._snapshot_log_folders()
-        self._run_bench(
-            [
-                "run-aime25",
-                "--num-repeats",
-                str(AIME25_NUM_REPEATS),
-                "--temperature",
-                str(AIME25_TEMPERATURE),
-                "--max-tokens",
-                str(AIME25_MAX_TOKENS),
-                "--max-concurrency",
-                str(AIME25_MAX_CONCURRENCY),
-            ],
-            bench_env,
-        )
-        log_folder = self._wait_for_new_log_folder(before)
-        print(f"[{type(self).__name__}] AIME25 log folder: {log_folder}", flush=True)
+        cmd = [
+            SGL_EVAL_BIN,
+            "run",
+            "aime25",
+            "--base-url",
+            f"{self.base_url}/v1",
+            "--n-repeats",
+            str(AIME25_NUM_REPEATS),
+            "--temperature",
+            str(AIME25_TEMPERATURE),
+            "--top-p",
+            str(AIME25_TOP_P),
+            "--max-tokens",
+            str(AIME25_MAX_TOKENS),
+            "--num-threads",
+            str(AIME25_NUM_THREADS),
+            "--out-dir",
+            str(out_dir),
+        ]
+        print(f"[{type(self).__name__}] + {' '.join(cmd)}", flush=True)
+        subprocess.run(cmd, check=True)
 
-        metrics_path = self._wait_for_metrics(log_folder)
-        if self.REGRADE:
-            self._run_bench(["regrade-aime25", log_folder], bench_env)
-
-        with open(metrics_path) as f:
-            metrics = json.load(f)
+        new = sorted(set(out_dir.glob("sgl_eval_aime25_*.json")) - before)
+        if not new:
+            self.fail(f"sgl-eval produced no new results JSON in {out_dir}")
+        result_path = new[-1]
+        with open(result_path) as f:
+            result = json.load(f)
         print(
-            f"[{type(self).__name__}] AIME25 metrics: "
-            f"{json.dumps(metrics, indent=2)}",
+            f"[{type(self).__name__}] sgl-eval result ({result_path.name}): "
+            f"{json.dumps(result, indent=2)}",
             flush=True,
         )
 
-        score = self._extract_score(metrics)
-        # DSV4_AIME25_SCORE_THRESHOLD env override wins when > 0.
+        score = self._extract_score(result, AIME25_SCORE_METRIC)
         threshold = (
             AIME25_SCORE_THRESHOLD
             if AIME25_SCORE_THRESHOLD > 0
             else self.SCORE_THRESHOLD
         )
         if threshold > 0:
-            self.assertGreaterEqual(score, threshold)
-
-    def _bench_env(self):
-        _, host, port = self.base_url.split(":")
-        host = host[2:]
-        env = os.environ.copy()
-        env["HOST"] = host
-        env["PORT"] = port
-        return env
-
-    def _run_bench(self, args, env):
-        cmd = ["python", str(BENCH_SCRIPT), *args]
-        print(f"[{type(self).__name__}] + {' '.join(cmd)}", flush=True)
-        subprocess.run(cmd, check=True, env=env)
-
-    def _setup_ns_if_needed(self, env):
-        if AIME25_SKIP_SETUP_NS or Path(NS_VENV).exists():
-            return
-        self._run_bench(["setup-ns"], env)
+            self.assertGreaterEqual(
+                score,
+                threshold,
+                f"{AIME25_SCORE_METRIC}={score} below threshold {threshold}",
+            )
 
     @staticmethod
-    def _snapshot_log_folders():
-        return set(glob.glob(f"{LOG_DIR}/aime25_logs/*"))
+    def _extract_score(result, metric):
+        """Find ``metric`` (e.g. "pass@1") anywhere in the sgl-eval JSON tree."""
 
-    def _wait_for_new_log_folder(self, before):
-        deadline = time.time() + 120
-        while time.time() < deadline:
-            new = sorted(self._snapshot_log_folders() - before)
-            if new:
-                return new[-1]
-            time.sleep(2)
-        self.fail("run-aime25 did not produce a new log folder within 120s")
-
-    def _wait_for_metrics(self, folder):
-        metrics_path = Path(folder) / "eval-results" / "aime25" / "metrics.json"
-        deadline = time.time() + AIME25_TIMEOUT_SEC
-        while time.time() < deadline:
-            if metrics_path.exists():
-                return metrics_path
-            time.sleep(30)
-        self.fail(
-            f"AIME25 eval did not finish in {AIME25_TIMEOUT_SEC}s "
-            f"({metrics_path} missing)"
-        )
-
-    @staticmethod
-    def _extract_score(metrics):
         def walk(o):
             if isinstance(o, dict):
-                if "symbolic_correct" in o:
-                    return o["symbolic_correct"]
+                if metric in o and isinstance(o[metric], (int, float)):
+                    return float(o[metric])
                 for v in o.values():
+                    s = walk(v)
+                    if s is not None:
+                        return s
+            elif isinstance(o, list):
+                for v in o:
                     s = walk(v)
                     if s is not None:
                         return s
             return None
 
-        return walk(metrics) or 0.0
+        score = walk(result)
+        if score is None:
+            raise AssertionError(f"metric {metric!r} not found in sgl-eval result JSON")
+        return score
 
 
 class Dsv4FlashAime25TestBase(Dsv4Aime25TestBase):
-    """Base for DeepSeek-V4-Flash recipes: threshold 0.93, no regrade."""
+    """Base for DeepSeek-V4-Flash recipes: AIME25 threshold 0.93."""
 
     SCORE_THRESHOLD = 0.93
-    REGRADE = False
 
 
 class Dsv4ProAime25TestBase(Dsv4Aime25TestBase):
-    """Base for DeepSeek-V4-Pro recipes: threshold 0.95, regrade enabled."""
+    """Base for DeepSeek-V4-Pro recipes: AIME25 threshold 0.95."""
 
     SCORE_THRESHOLD = 0.95
-    REGRADE = True
 
 
 Dsv4Aime25TestBase._BASE_CLASSES = {
