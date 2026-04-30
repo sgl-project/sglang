@@ -9,6 +9,7 @@ import triton.language as tl
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -149,10 +150,15 @@ def topk_transform_512(
     ver: Literal[1, 2] = 1,
 ) -> None:
     """Output to page_indices tensor, optionally also output raw abs position indices"""
-    module = _jit_topk_v2_module() if ver == 2 else _jit_topk_module()
-    module.topk_transform(
-        scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
-    )
+    if is_hip_runtime():
+        torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
+            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        )
+    else:
+        module = _jit_topk_v2_module() if ver == 2 else _jit_topk_module()
+        module.topk_transform(
+            scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices
+        )
 
 
 def hash_topk(
