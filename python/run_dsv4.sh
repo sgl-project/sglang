@@ -44,7 +44,6 @@ python3 -m sglang.launch_server \
     --chunked-prefill-size 8192 \
     --port 8000 \
     --disable-shared-experts-fusion \
-    --disable-cuda-graph \
     --tool-call-parser deepseekv4 \
     --reasoning-parser deepseek-v4
 
