@@ -113,6 +113,7 @@ class PipelineStage(StageDedupMixin, ABC):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
+        """Declares component uses for residency scheduling."""
         del server_args, stage_name
         return []
 

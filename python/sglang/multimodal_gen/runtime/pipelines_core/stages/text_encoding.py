@@ -183,8 +183,6 @@ class TextEncodingStage(PipelineStage):
 
     def _manage_text_encoder_use(self, encoder_index: int) -> None:
         manager = self._component_residency_manager
-        if manager is None:
-            return
         use = ComponentUse(
             stage_name=manager.state.stage_name or self.__class__.__name__,
             component_name=(

@@ -46,10 +46,7 @@ from sglang.multimodal_gen.runtime.models.dits.mova_video_dit import (
 # Create aliases for backward compatibility
 video_sinusoidal_embedding_1d = sinusoidal_embedding_1d
 audio_sinusoidal_embedding_1d = sinusoidal_embedding_1d
-from sglang.multimodal_gen.runtime.managers.component_manager import (
-    MOVA_VIDEO_DIT_HANDOFF_SLOT,
-    ComponentUse,
-)
+from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -167,10 +164,31 @@ class MOVADenoisingStage(PipelineStage):
     ) -> list[ComponentUse]:
         del server_args
         stage_name = stage_name or self.__class__.__name__
-        return [
-            ComponentUse(stage_name, "audio_dit"),
-            ComponentUse(stage_name, "dual_tower_bridge"),
+        uses = [
+            ComponentUse(
+                stage_name,
+                "video_dit",
+                phase="video_dit",
+                preferred_ready_after_request=True,
+                memory_intensive=True,
+            )
         ]
+        if self.video_dit_2 is not None:
+            uses.append(
+                ComponentUse(
+                    stage_name,
+                    "video_dit_2",
+                    phase="video_dit_2",
+                    memory_intensive=True,
+                )
+            )
+        uses.extend(
+            [
+                ComponentUse(stage_name, "audio_dit"),
+                ComponentUse(stage_name, "dual_tower_bridge"),
+            ]
+        )
+        return uses
 
     @property
     def parallelism_type(self) -> StageParallelismType:
@@ -402,8 +420,9 @@ class MOVADenoisingStage(PipelineStage):
             component_name=component_name,
             phase=component_name,
             preferred_ready_after_request=component_name == "video_dit",
+            memory_intensive=True,
         )
-        manager.switch_use(use, handoff_slot=MOVA_VIDEO_DIT_HANDOFF_SLOT)
+        manager.begin_use(use)
         return True
 
     def _ensure_shared_models_on_device(self, server_args: ServerArgs):
@@ -633,9 +652,7 @@ class MOVADenoisingStage(PipelineStage):
                         self.step_profile()
 
         if self._component_residency_manager is not None:
-            self._component_residency_manager.finish_handoff_slot(
-                MOVA_VIDEO_DIT_HANDOFF_SLOT
-            )
+            self._component_residency_manager.finish_active_use()
 
         return batch
 

@@ -60,10 +60,7 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
 )
-from sglang.multimodal_gen.runtime.managers.component_manager import (
-    DIT_HANDOFF_SLOT,
-    ComponentUse,
-)
+from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -197,6 +194,41 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        del server_args
+        stage_name = stage_name or self.__class__.__name__
+        uses: list[ComponentUse] = []
+        for default_name, module in (
+            ("transformer", self.transformer),
+            ("transformer_2", self.transformer_2),
+        ):
+            if module is None:
+                continue
+            component_name = self._component_name_for_stage_module(module, default_name)
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name=component_name,
+                    phase=component_name,
+                    preferred_ready_after_request=component_name == "transformer",
+                    memory_intensive=True,
+                )
+            )
+        return uses
+
+    def _component_name_for_stage_module(
+        self, module: nn.Module | None, default_name: str
+    ) -> str:
+        pipeline = self.pipeline() if self.pipeline else None
+        if pipeline is None or module is None:
+            return default_name
+        for name, candidate in pipeline.modules.items():
+            if candidate is module:
+                return name
+        return default_name
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -947,8 +979,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 torch.mps.current_allocated_memory(),
             )
 
-        if self._component_residency_manager is not None:
-            self._component_residency_manager.finish_handoff_slot(DIT_HANDOFF_SLOT)
+        self._component_residency_manager.finish_active_use()
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
@@ -1028,7 +1059,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         batch: Req,
     ) -> None:
         """
-        manage dit's residency by switching the use
+        manage dit's residency by reporting the active sequential use
         Args:
             current_model: the next active dit, transformer_1 or transformer_2
         """
@@ -1043,8 +1074,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             component_name=component_name,
             phase=phase,
             preferred_ready_after_request=component_name == "transformer",
+            memory_intensive=True,
         )
-        manager.switch_use(use, handoff_slot=DIT_HANDOFF_SLOT)
+        manager.begin_use(use)
 
     def _select_and_manage_model(
         self,

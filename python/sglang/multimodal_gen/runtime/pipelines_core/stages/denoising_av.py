@@ -2,7 +2,7 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import is_ltx23_native_variant
-from sglang.multimodal_gen.runtime.managers.component_manager import DIT_HANDOFF_SLOT
+from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
     clone_scheduler_runtime,
 )
@@ -27,6 +27,21 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
             transformer=transformer, scheduler=scheduler, vae=vae, **kwargs
         )
         self.audio_vae = audio_vae
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        del server_args
+        stage_name = stage_name or self.__class__.__name__
+        return [
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="transformer",
+                phase="stage1",
+                preferred_ready_after_request=True,
+                memory_intensive=True,
+            )
+        ]
 
     def _post_denoising_loop(
         self,
@@ -84,7 +99,7 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
             batch.audio_latents = audio_latents
 
         if self._component_residency_manager is not None:
-            self._component_residency_manager.finish_handoff_slot(DIT_HANDOFF_SLOT)
+            self._component_residency_manager.finish_active_use()
 
 
 class LTX2RefinementStage(LTX2AVDenoisingStage):
@@ -109,6 +124,24 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
             sampler_name=sampler_name,
         )
         self.distilled_sigmas = torch.tensor(distilled_sigmas)
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        del server_args
+        stage_name = stage_name or self.__class__.__name__
+        component_name = "transformer_2"
+        pipeline = self.pipeline() if self.pipeline else None
+        if pipeline is not None and "transformer_2" not in pipeline.modules:
+            component_name = "transformer"
+        return [
+            ComponentUse(
+                stage_name=stage_name,
+                component_name=component_name,
+                phase="stage2",
+                memory_intensive=True,
+            )
+        ]
 
     @staticmethod
     def _randn_like_with_batch_generators(

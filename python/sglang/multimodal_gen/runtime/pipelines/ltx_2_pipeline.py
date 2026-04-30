@@ -20,7 +20,9 @@ from sglang.multimodal_gen.runtime.managers.component_manager import (
     ComponentResidencyStrategy,
     ComponentUse,
     ResidencyState,
-    SnapshotModuleResidency,
+)
+from sglang.multimodal_gen.runtime.managers.component_resident_strategies import (
+    SnapshotStrategy,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
@@ -400,12 +402,6 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
         """wait for the preparation to be ready"""
         del phase
 
-    def prefetch_stage2_after_stage1(self) -> None:
-        pass
-
-    def prepare_upsample_after_stage1(self) -> bool:
-        return False
-
     def _ensure_on_gpu(self, module_name: str) -> None:
         module = self.pipeline.get_module(module_name)
         if module is None:
@@ -445,7 +441,7 @@ class LTX2ResidentResidencyStrategy(LTX2TwoStageResidencyStrategy):
 
 class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
     """
-    Snapshot mode keeps CPU snapshots and prefetches the target DiT with async H2D. (ltx two-stage pipeline with pre-merged lora)
+    Snapshot mode keeps CPU snapshots and prefetches the target DiT with async H2D. (only with pre-merged lora enabled)
 
     The DiT_1 will always be kept a replica in CPU.
     - default snapshot behavior: allow stage1/stage2 overlap by prefetching
@@ -462,7 +458,7 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
 
     def __init__(self, manager: "LTX2TwoStageResidencyController") -> None:
         super().__init__(manager)
-        self._snapshot_residency = SnapshotModuleResidency(
+        self._snapshot_strategy = SnapshotStrategy(
             pin_cpu_memory=manager.server_args.pin_cpu_memory,
             enable_async_prefetch=manager.server_args.dit_cpu_offload,
         )
@@ -525,28 +521,19 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
             if self._snapshot_low_vram_mode:
                 # Trade a bit of phase-switch latency for lower peak VRAM:
                 # evict stage-1 before stage-2 H2D.
-                if phase == "stage2" and not self._snapshot_residency.is_ready(
+                if phase == "stage2" and not self._snapshot_strategy.is_ready(
                     target_module_name
                 ):
                     self._release_stage1_for_low_vram()
 
             # make sure the component is pre-fetched
-            if not self._snapshot_residency.is_ready(target_module_name):
+            if not self._snapshot_strategy.is_ready(target_module_name):
                 if self._module_is_on_gpu(target_module):
                     self._record_component_ready(target_module_name)
                 else:
-                    self._schedule_component_prefetch(target_module_name, target_module)
-
-            # Stage-2 is only consumed after stage-1 denoising + upsample.
-            # Kick off the prefetch(H2D) early in stage-1 to overlap transfer with compute.
-            if (
-                phase == "stage1"
-                and not self._snapshot_residency.is_ready("transformer_2")
-                and not self._snapshot_low_vram_mode
-            ):
-                self._schedule_component_prefetch(
-                    "transformer_2", self.pipeline.get_module("transformer_2")
-                )
+                    self._snapshot_strategy.prefetch_component(
+                        target_module_name, target_module
+                    )
         else:
             component_name = self._module_name_for_phase(phase)
             if component_name is not None:
@@ -570,73 +557,48 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
             target_module = self.pipeline.get_module("transformer")
             if self._module_is_on_gpu(target_module):
                 self._record_component_ready("transformer")
-            elif not self._snapshot_residency.is_ready("transformer"):
-                self._schedule_component_prefetch("transformer", target_module)
+            elif not self._snapshot_strategy.is_ready("transformer"):
+                self._snapshot_strategy.prefetch_component("transformer", target_module)
         else:
             self._record_component_ready("transformer")
         self.manager._sync_refinement_stage_transformer("stage1")
         self.manager._active_phase = "stage1"
 
-    def exit_phase(self, phase: str | None, next_phase: str | None = None) -> None:
-        del next_phase
-        if phase == "stage2":
-            self._release_premerged_transformers()
-
-    def prefetch_stage2_after_stage1(self) -> None:
-        """Kick off stage-2 H2D right after stage-1 denoising to hide switch latency."""
-        if not self.server_args.dit_cpu_offload:
-            return
-
-        if self._snapshot_residency.is_ready("transformer_2"):
-            return
-        if self._snapshot_low_vram_mode:
-            self._release_stage1_for_low_vram()
-
-        self._schedule_component_prefetch(
-            "transformer_2", self.pipeline.get_module("transformer_2")
-        )
-
-    def prepare_upsample_after_stage1(self) -> bool:
-        if not self.server_args.dit_cpu_offload or not self._snapshot_low_vram_mode:
-            return False
-        if self._snapshot_residency.is_ready("transformer_2"):
-            return False
-        self._release_stage1_for_low_vram()
-        return True
+    def finish_use(
+        self,
+        module: torch.nn.Module,
+        use: ComponentUse,
+        state: ResidencyState,
+    ) -> None:
+        del state
+        phase = self._phase(use)
+        if self.server_args.dit_cpu_offload:
+            # release cuda storage
+            self._snapshot_strategy.release_component(use.component_name, module)
+        if (
+            phase == "stage2"
+            and self._snapshot_release_empty_cache
+            and torch.get_device_module().is_available()
+        ):
+            torch.get_device_module().empty_cache()
 
     def ensure_phase_ready(self, phase: str | None) -> None:
         component_name = self._module_name_for_phase(phase)
         if component_name is None:
             return
-        self._snapshot_residency.wait_ready(component_name)
-
-    def _release_premerged_transformers(self) -> None:
-        # Prefer keeping stage-1 resident across requests so the next request can
-        # start denoising while stage-2 is prefetched in the background. In
-        # low-VRAM mode stage-1 may already have been released before stage-2 H2D.
-        for module_name in ("transformer_2",):
-            module = self.pipeline.get_module(module_name)
-            param = next(module.parameters(), None) if module is not None else None
-            if param is not None and param.device.type == "cuda":
-                self._release_module_to_cpu_snapshot(module_name)
-        if (
-            self._snapshot_release_empty_cache
-            and torch.get_device_module().is_available()
-        ):
-            torch.get_device_module().empty_cache()
-        self._record_component_ready("transformer")
+        self._snapshot_strategy.wait_component_ready(component_name)
 
     def _capture_module_cpu_snapshot(self, module_name: str) -> None:
         module = self.pipeline.get_module(module_name)
         if module is None:
             raise ValueError(f"Module {module_name} is not available.")
-        self._snapshot_residency.capture(module_name, module)
+        self._snapshot_strategy.capture(module_name, module)
 
     def _release_module_to_cpu_snapshot(self, module_name: str) -> None:
         module = self.pipeline.get_module(module_name)
         if module is None:
             return
-        self._snapshot_residency.release_to_snapshot(module_name, module)
+        self._snapshot_strategy.release_component(module_name, module)
 
     def _release_stage1_for_low_vram(self) -> None:
         stage1_module = self.pipeline.get_module("transformer")
@@ -649,14 +611,28 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
             self._release_module_to_cpu_snapshot("transformer")
 
     def _record_component_ready(self, module_name: str) -> None:
-        self._snapshot_residency.record_ready(
+        self._snapshot_strategy.record_ready(
             module_name, self.pipeline.get_module(module_name)
         )
 
-    def _schedule_component_prefetch(
-        self, module_name: str, module: torch.nn.Module | None
-    ) -> None:
-        self._snapshot_residency.prefetch_to_device(module_name, module)
+    def prefetch_for_use(
+        self,
+        module: torch.nn.Module,
+        use: ComponentUse,
+        state: ResidencyState,
+    ) -> bool:
+        if not self.server_args.dit_cpu_offload:
+            return True
+        phase = self._phase(use)
+        if phase == "stage2":
+            if self._snapshot_strategy.is_ready("transformer_2"):
+                return True
+            if self._snapshot_low_vram_mode and state.current_use is not None:
+                return False
+            if self._snapshot_low_vram_mode:
+                self._release_stage1_for_low_vram()
+        self._snapshot_strategy.prefetch_component(use.component_name, module)
+        return True
 
     def _pin_stage1_transformer_if_beneficial(self) -> None:
         """Optionally pin stage-1 DiT on GPU to remove first-stage cold H2D stall.
@@ -689,7 +665,7 @@ class LTX2TwoStageResidencyController:
     """
     LTX-2.3 two-stage residency controller.
     It builds the selected LTX2 ComponentResidencyStrategy and keeps the
-    thin stage adapter methods that are specific to two-stage upsample/LoRA flow.
+    thin stage adapter methods that are specific to two-stage LoRA flow.
 
     Modes:
     - resident: keep both DiTs on GPU; phase switch is pointer rebinding only.
@@ -756,26 +732,6 @@ class LTX2TwoStageResidencyController:
         if phase == self._active_phase:
             return True
         return self._strategy.enter_phase(phase)
-
-    def exit_phase(self, phase: str | None, next_phase: str | None = None) -> None:
-        if not self.should_use_premerged:
-            return
-        self._strategy.exit_phase(phase, next_phase)
-
-    def prefetch_stage2_after_stage1(self) -> None:
-        if not self.should_use_premerged:
-            return
-        self._strategy.prefetch_stage2_after_stage1()
-
-    def prepare_upsample_after_stage1(self) -> bool:
-        if not self.should_use_premerged:
-            return False
-        return self._strategy.prepare_upsample_after_stage1()
-
-    def ensure_phase_ready(self, phase: str | None) -> None:
-        if not self.should_use_premerged:
-            return
-        self._strategy.ensure_phase_ready(phase)
 
     def _sync_refinement_stage_transformer(self, phase: str) -> None:
         """Keep stage-2 refinement bound to the expected DiT for current phase."""
@@ -879,12 +835,6 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
             "snapshot",
             "resident",
         )
-
-    def prefetch_ltx2_stage2_after_stage1(self) -> None:
-        self._ltx2_residency.prefetch_stage2_after_stage1()
-
-    def prepare_ltx2_upsample_after_stage1(self) -> bool:
-        return self._ltx2_residency.prepare_upsample_after_stage1()
 
     def _get_stage_distilled_lora_strength(
         self, phase: str, batch: Req | None

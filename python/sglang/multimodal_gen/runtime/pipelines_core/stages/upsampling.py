@@ -1,5 +1,3 @@
-from typing import Protocol
-
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -16,12 +14,6 @@ class LTX2LoRAPipeline(Protocol):
     def should_skip_ltx2_lora_switch_stage(self) -> bool: ...
 
     def switch_lora_phase(self, phase: str, batch: Req | None = None) -> None: ...
-
-
-class LTX2UpsamplePipeline(Protocol):
-    def prepare_ltx2_upsample_after_stage1(self) -> bool: ...
-
-    def prefetch_ltx2_stage2_after_stage1(self) -> None: ...
 
 
 class LTX2HalveResolutionStage(PipelineStage):
@@ -75,7 +67,7 @@ class LTX2UpsampleStage(PipelineStage):
         spatial_upsampler,
         vae,
         audio_vae=None,
-        pipeline: LTX2UpsamplePipeline | None = None,
+        pipeline=None,
     ):
         super().__init__()
         self.spatial_upsampler = spatial_upsampler
@@ -144,16 +136,8 @@ class LTX2UpsampleStage(PipelineStage):
         )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        delay_stage2_prefetch = False
-        if self.pipeline is not None:
-            delay_stage2_prefetch = self.pipeline.prepare_ltx2_upsample_after_stage1()
-        if self.pipeline is not None and not delay_stage2_prefetch:
-            self.pipeline.prefetch_ltx2_stage2_after_stage1()
-
         device = get_local_torch_device()
         latents = self._upsample_video_latents(batch.latents, server_args, device)
-        if self.pipeline is not None and delay_stage2_prefetch:
-            self.pipeline.prefetch_ltx2_stage2_after_stage1()
         logger.info("Upsampled video latents: %s", list(latents.shape))
         self._restore_full_resolution(batch)
         batch.image_latent = None

@@ -1,28 +1,31 @@
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Mapping, MutableMapping, Protocol, Sequence
+from typing import Mapping, MutableMapping, Protocol, Sequence, TypeVar
 
-import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.component_resident_strategies import (
+    ComponentResidencyStrategy,
+    LayerwiseOffloadStrategy,
+    ResidentStrategy,
+    StageManagedStrategy,
+    VanillaD2HStrategy,
+)
 from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-# local handoff slots for sequential active-use handoff
-DIT_HANDOFF_SLOT = "dit"
-MOVA_VIDEO_DIT_HANDOFF_SLOT = "mova_video_dit"
+_T = TypeVar("_T")
 
 
 @dataclass(slots=True)
 class ComponentUse:
     """Describes one stage/use-site access to a pipeline component."""
 
-    # Logical stage that declares or triggers this use.
     stage_name: str
     # Pipeline module key: transformer / video_dit / text_encoder / ...
     component_name: str
@@ -32,6 +35,9 @@ class ComponentUse:
     preferred_ready_after_request: bool = False
     # Whether cross-stage prefetch may prepare this use before the use-site.
     allow_prefetch: bool = True
+    # Whether this use is expensive enough that earlier timeline prefetch matters.
+    # TODO: judge by parameter size and precision
+    memory_intensive: bool = False
 
 
 @dataclass(slots=True)
@@ -45,7 +51,7 @@ class ResidencyState:
     stage_name: str | None = None
     next_stage_name: str | None = None
     current_use: ComponentUse | None = None
-    # the ComponentUses from the following stages
+    # the ComponentUses of the preceding stages
     future_uses: tuple[ComponentUse, ...] = ()
     batch_is_warmup: bool = False
     manager_mode: str = "static"
@@ -66,293 +72,6 @@ class ComponentResidencyPipeline(Protocol):
     modules: Mapping[str, object]
     _stage_name_mapping: Mapping[str, ComponentResidencyStage]
     component_residency_strategies: MutableMapping[str, "ComponentResidencyStrategy"]
-
-
-class ComponentResidencyStrategy:
-    """Baseclass for describing how a component should be treated (regarding where its weights locates)
-
-    e.g., a LayerwiseOffloadStrategy would override:
-        enter: to prefetch some layers before DiT is used, and
-        exits: to release GPU weight snapshot after DiT is used
-    to achieve desired behavior
-
-    """
-
-    name = "resident"
-
-    def prepare_for_use(
-        self,
-        module: nn.Module,
-        use: ComponentUse,
-        state: ResidencyState,
-    ) -> None:
-        """hook called"""
-        self.enter(module)
-
-    def wait_for_use(
-        self,
-        module: nn.Module,
-        use: ComponentUse,
-        state: ResidencyState,
-    ) -> None:
-        """Wait for the preparation to be ready"""
-        pass
-
-    def finish_use(
-        self,
-        module: nn.Module,
-        use: ComponentUse,
-        state: ResidencyState,
-    ) -> None:
-        self.exit(module)
-
-    def prepare_after_request(
-        self,
-        module: nn.Module,
-        use: ComponentUse,
-        state: ResidencyState,
-    ) -> None:
-        del module, use, state
-
-    def finish_request(
-        self,
-        module: nn.Module,
-        use: ComponentUse,
-        state: ResidencyState,
-        *,
-        preferred: bool,
-    ) -> None:
-        if preferred:
-            self.prepare_for_use(module, use, state)
-            self.wait_for_use(module, use, state)
-        else:
-            self.finish_use(module, use, state)
-
-    def enter(self, module: nn.Module) -> None:
-        pass
-
-    def exit(self, module: nn.Module, next_module: nn.Module | None = None) -> None:
-        pass
-
-
-class ResidentStrategy(ComponentResidencyStrategy):
-    name = "resident"
-
-
-class StageManagedStrategy(ComponentResidencyStrategy):
-    """No-op strategy for components with existing stage-local device lifecycle."""
-
-    name = "stage_managed"
-
-
-class SnapshotModuleResidency:
-    """Reusable snapshot-based module residency primitive.
-
-    This helper only knows how to:
-    - keep CPU parameter/buffer snapshots,
-    - prefetch a module (H2D) to the local device on a CUDA side stream
-    - release a module by rebinding tensors to those snapshots,
-    - track and wait for readiness events.
-
-    It deliberately does not know about pipeline stages, phases, or model-specific
-    ordering. Strategy subclasses decide when each primitive is called.
-    """
-
-    def __init__(self, *, pin_cpu_memory: bool, enable_async_prefetch: bool) -> None:
-        self.pin_cpu_memory = pin_cpu_memory
-        self.enable_async_prefetch = enable_async_prefetch
-        self._cpu_param_snapshots: dict[str, dict[str, torch.Tensor]] = {}
-        self._cpu_buffer_snapshots: dict[str, dict[str, torch.Tensor]] = {}
-        self._prefetch_stream: object | None = None
-        self._ready_events: dict[str, object] = {}
-
-    @staticmethod
-    def is_on_gpu(module: nn.Module | None) -> bool:
-        if module is None:
-            return False
-        param = next(module.parameters(), None)
-        return param is not None and param.device.type == "cuda"
-
-    def is_ready(self, component_name: str) -> bool:
-        return component_name in self._ready_events
-
-    def wait_ready(self, component_name: str) -> None:
-        """wait for the (H2D) stream to be ready"""
-        ready_event = self._ready_events.get(component_name)
-        if ready_event is None or not current_platform.is_cuda():
-            return
-        torch.get_device_module().current_stream().wait_event(ready_event)
-
-    def record_ready(self, component_name: str, module: nn.Module | None) -> None:
-        if not current_platform.is_cuda():
-            self._ready_events.pop(component_name, None)
-            return
-        if not self.is_on_gpu(module):
-            self._ready_events.pop(component_name, None)
-            return
-        event = torch.get_device_module().Event()
-        event.record(torch.get_device_module().current_stream())
-        self._ready_events[component_name] = event
-
-    @staticmethod
-    def _clone_cpu_tensor_snapshot(
-        tensor: torch.Tensor, *, pin_memory: bool
-    ) -> torch.Tensor:
-        snapshot = tensor.detach()
-        if snapshot.device.type == "cpu":
-            if pin_memory and not snapshot.is_pinned():
-                return snapshot.pin_memory()
-            return snapshot
-
-        cpu_tensor = snapshot.to("cpu")
-        if pin_memory:
-            return cpu_tensor.pin_memory()
-        return cpu_tensor
-
-    def _should_pin_memory(self) -> bool:
-        return bool(self.pin_cpu_memory and torch.get_device_module().is_available())
-
-    def capture(self, component_name: str, module: nn.Module) -> None:
-        """Capture a CPU snapshot for a component"""
-        if component_name in self._cpu_param_snapshots:
-            return
-
-        pin_memory = self._should_pin_memory()
-        self._cpu_param_snapshots[component_name] = {
-            name: self._clone_cpu_tensor_snapshot(param.data, pin_memory=pin_memory)
-            for name, param in module.named_parameters()
-        }
-        self._cpu_buffer_snapshots[component_name] = {
-            name: self._clone_cpu_tensor_snapshot(buffer.data, pin_memory=pin_memory)
-            for name, buffer in module.named_buffers()
-        }
-
-    def release_to_snapshot(self, component_name: str, module: nn.Module) -> None:
-        """Release CUDA storages by rebinding tensors to cached CPU snapshots.
-
-        This does not call `module.to("cpu")`. Instead, parameter and buffer
-        storages are rebound to pre-captured CPU tensors so CUDA storages can be
-        released by the allocator without an explicit D2H transfer.
-        """
-        param_snapshots = self._cpu_param_snapshots.get(component_name)
-        buffer_snapshots = self._cpu_buffer_snapshots.get(component_name)
-        if param_snapshots is None or buffer_snapshots is None:
-            module.to("cpu")
-            self._ready_events.pop(component_name, None)
-            return
-
-        pin_memory = self._should_pin_memory()
-        for name, param in module.named_parameters():
-            snapshot = param_snapshots.get(name)
-            if snapshot is None:
-                snapshot = self._clone_cpu_tensor_snapshot(
-                    param.data, pin_memory=pin_memory
-                )
-                param_snapshots[name] = snapshot
-            param.data = snapshot
-
-        for name, buffer in module.named_buffers():
-            snapshot = buffer_snapshots.get(name)
-            if snapshot is None:
-                snapshot = self._clone_cpu_tensor_snapshot(
-                    buffer.data, pin_memory=pin_memory
-                )
-                buffer_snapshots[name] = snapshot
-            # Preserve runtime-updated buffers (e.g., lazily built caches) when
-            # releasing back to CPU snapshots.
-            if buffer.device.type == "cuda":
-                snapshot.copy_(buffer.detach().to(device="cpu", dtype=snapshot.dtype))
-            elif buffer.device.type == "cpu":
-                snapshot.copy_(buffer.detach().to(dtype=snapshot.dtype))
-            buffer.data = snapshot
-
-        self._ready_events.pop(component_name, None)
-
-    def _supports_async_prefetch(self) -> bool:
-        return self.enable_async_prefetch and current_platform.is_cuda()
-
-    def _get_prefetch_stream(self):
-        """returns a stream is async-prefetch is enabled"""
-        if not self._supports_async_prefetch():
-            return None
-        if self._prefetch_stream is None:
-            self._prefetch_stream = torch.get_device_module().Stream(
-                device=get_local_torch_device()
-            )
-        return self._prefetch_stream
-
-    def prefetch_to_device(self, component_name: str, module: nn.Module | None) -> None:
-        if module is None:
-            self._ready_events.pop(component_name, None)
-            return
-        prefetch_stream = self._get_prefetch_stream()
-        if prefetch_stream is None:
-            # if the async prefetching is disabled
-            module.to(get_local_torch_device(), non_blocking=True)
-            self.record_ready(component_name, module)
-            return
-        with torch.get_device_module().stream(prefetch_stream):
-            module.to(get_local_torch_device(), non_blocking=True)
-            event = torch.get_device_module().Event()
-            event.record(prefetch_stream)
-        self._ready_events[component_name] = event
-
-
-class VanillaD2HStrategy(ComponentResidencyStrategy):
-    """A strategy that performs native torch D2H and H2D"""
-
-    name = "vanilla"
-
-    def enter(self, module: nn.Module) -> None:
-        param = next(module.parameters(), None)
-        if param is not None and param.device.type == "cpu":
-            module.to(get_local_torch_device(), non_blocking=True)
-
-    def exit(self, module: nn.Module, next_module: nn.Module | None = None) -> None:
-        del next_module
-        param = next(module.parameters(), None)
-        if param is not None and param.device.type == "cuda":
-            module.to("cpu")
-
-    def finish_request(
-        self,
-        module: nn.Module,
-        use: ComponentUse,
-        state: ResidencyState,
-        *,
-        preferred: bool,
-    ) -> None:
-        if preferred and state.batch_is_warmup:
-            self.prepare_for_use(module, use, state)
-            self.wait_for_use(module, use, state)
-            return
-        if not preferred:
-            self.finish_use(module, use, state)
-
-
-class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
-    """A wrapper around LayerwiseOffloadManager to fit in a ComponentResidencyStrategy"""
-
-    name = "layerwise"
-
-    def enter(self, module: nn.Module) -> None:
-        if isinstance(module, OffloadableDiTMixin):
-            module.prepare_for_next_req()
-
-    def exit(self, module: nn.Module, next_module: nn.Module | None = None) -> None:
-        del next_module
-        if not isinstance(module, OffloadableDiTMixin):
-            return
-        for manager in module.layerwise_offload_managers:
-            manager.release_all()
-
-    def prepare_after_request(
-        self,
-        module: nn.Module,
-        use: ComponentUse,
-        state: ResidencyState,
-    ) -> None:
-        self.prepare_for_use(module, use, state)
 
 
 def build_dit_residency_strategy(
@@ -419,14 +138,14 @@ class ComponentResidencyManager:
     """Executor-owned component lifecycle coordinator. Provide hooks for a PipelineExecutor
 
     Hooks are called around executor progress:
-        before request: collect stage-declared uses and reset request state.
+        before request: collect a flat ordered ComponentUse timeline.
         before stage: update current/next stage context only.
-        before usage: make the required component ready at its use-site.
-        after usage: finish or keep the component after a use-site.
-        after stage: finish declared stage uses and optionally prefetch the next stage.
-        finish request: finish active handoff slots and schedule preferred next-request prefetch.
+        begin use: finish previous active use, prepare current use, wait until ready.
+        end use: finish or keep current use, then prefetch the next heavy timeline use.
+        finish request: finish active use and schedule preferred next-request prefetch.
 
     The manager instance is global and rebound to the active pipeline before request execution.
+    This manager is designed only for sequential execution order for now
     """
 
     def __init__(
@@ -440,18 +159,13 @@ class ComponentResidencyManager:
         )
         self._stage_names_by_id: dict[int, str] = {}
         self._stage_uses_by_index: list[tuple[ComponentUse, ...]] = []
+        self._ordered_uses: tuple[ComponentUse, ...] = ()
+        self._current_use_index: int = -1
+        self._active_use: ComponentUse | None = None
+        self._prefetched_use_keys: set[tuple[str, str, str | None]] = set()
         self._custom_strategies: dict[str, ComponentResidencyStrategy] = dict(
             pipeline.component_residency_strategies
         )
-        # marks the active use of a handoff slot
-        # a handoff slot is a local handoff domain for sequential components,
-        # e.g. transformer_1 and transformer_2.
-        # if a `switch_use` is called within a same handoff slot, manager will try to:
-        # 1. finish prev active use
-        # 2. prepare/wait for next use
-        # 3. make active
-        # while for cross-handoff-slot components, manager doesn't handle them internally now
-        self._active_uses_by_handoff_slot: dict[str, ComponentUse] = {}
         self._uses_seen: dict[str, ComponentUse] = {}
 
     @property
@@ -462,8 +176,10 @@ class ComponentResidencyManager:
         custom_strategies = dict(pipeline.component_residency_strategies)
         if pipeline is not self.pipeline:
             self.strategy_for.cache_clear()
-            self._active_uses_by_handoff_slot.clear()
+            self._should_keep_single_dit.cache_clear()
+            self._active_use = None
             self._uses_seen.clear()
+            self._prefetched_use_keys.clear()
         elif custom_strategies != self._custom_strategies:
             self.strategy_for.cache_clear()
         self.pipeline = pipeline
@@ -498,16 +214,25 @@ class ComponentResidencyManager:
             manager_mode=server_args.component_residency_manager,
             trace_enabled=server_args.component_residency_trace,
         )
-        self._active_uses_by_handoff_slot.clear()
+        self._active_use = None
+        self._current_use_index = -1
+        self._prefetched_use_keys.clear()
         self._uses_seen.clear()
         if self.enabled:
             self._stage_uses_by_index = [
                 tuple(stage.component_uses(server_args, self.stage_name(stage)))
                 for stage in stages
             ]
+            self._ordered_uses = tuple(
+                use for uses in self._stage_uses_by_index for use in uses
+            )
         else:
             self._stage_uses_by_index = []
-        self._trace("request_start", detail=f"stages={len(stages)}")
+            self._ordered_uses = ()
+        self._trace(
+            "request_start",
+            detail=f"stages={len(stages)} uses={len(self._ordered_uses)}",
+        )
 
     def before_stage(
         self,
@@ -524,55 +249,102 @@ class ComponentResidencyManager:
         self.state.stage_index = stage_index
         self.state.stage_name = self.stage_name(stage)
         self.state.next_stage_name = self._next_stage_name(stage_index)
-        self.state.future_uses = self._future_uses(stage_index + 1)
         self._trace("stage_enter", detail=f"index={stage_index}")
 
     def after_stage(self, stage_index: int) -> None:
         """called after stage exits"""
         if not self.enabled:
             return
-        for use in self._stage_uses(stage_index):
-            self.after_use(use)
         self._trace("stage_exit", detail=f"index={stage_index}")
-        # Automatic cross-stage prefetch only looks at the next future stage
-        # that declares component uses. Explicit sequential component handoff
-        # inside a stage is handled by use-site hooks such as switch_use().
-        self.prefetch_next_stage_uses(stage_index + 1)
 
     def before_use(self, use: ComponentUse) -> None:
         """component use-site starts"""
         if not self.enabled:
             return
+        self.begin_use(use)
+
+    def begin_use(self, use: ComponentUse) -> None:
+        """Begin one sequential component use interval.
+
+        1. Finish the previous active use if this is a different timeline use.
+        2. Prepare the current component.
+        3. Wait until the current component is ready, then prefetch the next heavy use.
+        """
+        if self._active_use is not None and self._same_use(self._active_use, use):
+            return
+        if self._active_use is not None:
+            # finish previous active use
+            self._finish_use(self._active_use, keep_on_warmup=False)
+            self._active_use = None
+            self.state.current_use = None
+        self._mark_current_use(use)
         self._prepare_forward_use(use)
+        self._active_use = use
+        self._prefetch_next_memory_intensive_use()
+
+    def end_use(self, use: ComponentUse) -> None:
+        """End one sequential component use interval.
+
+        1. Finish or keep the current component.
+        2. Clear it as the active use.
+        3. Prefetch the next memory-intensive use without waiting.
+        """
+        if self._active_use is None or not self._same_use(self._active_use, use):
+            return
+        self._finish_use(self._active_use, keep_on_warmup=False)
+        self._active_use = None
+        self.state.current_use = None
+        self._prefetch_next_memory_intensive_use()
+
+    @contextmanager
+    def use_component(
+        self, use: ComponentUse, module: nn.Module | None = None
+    ) -> Iterator[nn.Module | None]:
+        self.begin_use(use)
+        try:
+            yield module if module is not None else self.get_module(use.component_name)
+        finally:
+            self.end_use(use)
+
+    def call_component(
+        self,
+        use: ComponentUse,
+        module: Callable[..., _T],
+        *args,
+        **kwargs,
+    ) -> _T:
+        with self.use_component(use):
+            return module(*args, **kwargs)
 
     def prefetch_use(self, use: ComponentUse) -> None:
-        """prepare for next stage by prefetching"""
+        """Prepare a future use without blocking the current use."""
         if not self.enabled:
             return
         self._prefetch_use(use)
 
-    def switch_use(self, use: ComponentUse, handoff_slot: str | None = None) -> None:
-        """Trigger an explicit intra-stage use-site change. (e.g., dual-dit in denoising stage)
+    def prefetch_checkpoint(self, anchor: ComponentUse | None = None) -> None:
+        """Give the manager a timeline overlap point.
 
-        This path always enforces readiness; disabled mode only disables
-        cross-stage scheduling, not required intra-stage component switching.
+        1. Locate the anchor or current use in the ordered timeline.
+        2. Find the next prefetchable memory-intensive use.
+        3. Prepare it opportunistically without waiting.
         """
-        key = handoff_slot or use.component_name
-        prev_active_use = self._active_uses_by_handoff_slot.get(key)
-        if prev_active_use is not None and self._same_use(prev_active_use, use):
+        if not self.enabled:
             return
-        if prev_active_use is not None:
-            # finish the previously active use
-            self._finish_use(prev_active_use, keep_on_warmup=False)
-        # prepare for the upcoming use
-        self._prepare_forward_use(use)
-        self._active_uses_by_handoff_slot[key] = use
+        if anchor is not None:
+            self._mark_current_use(anchor)
+        self._prefetch_next_memory_intensive_use()
 
-    def finish_handoff_slot(self, handoff_slot: str) -> None:
-        """Finish the current explicit intra-stage use-site for a handoff slot."""
-        active_use = self._active_uses_by_handoff_slot.pop(handoff_slot, None)
-        if active_use is not None:
-            self._finish_use(active_use, keep_on_warmup=False)
+    def finish_active_use(self, *, prefetch_next: bool = True) -> None:
+        """Finish the currently active sequential use, if any."""
+        if self._active_use is None:
+            return
+        active_use = self._active_use
+        self._finish_use(active_use, keep_on_warmup=False)
+        self._active_use = None
+        self.state.current_use = None
+        if prefetch_next:
+            self._prefetch_next_memory_intensive_use()
 
     def _prepare_forward_use(self, use: ComponentUse) -> None:
         """Prepare a component that is about to run and wait until it is ready."""
@@ -589,7 +361,12 @@ class ComponentResidencyManager:
         strategy.wait_for_use(module, use, self.state)
 
     def _prefetch_use(self, use: ComponentUse) -> None:
-        """Prepare a future component opportunistically without waiting."""
+        """Prepare a future component opportunistically without waiting.
+
+        This is called when the component is memory-intensive so it may takes a long time to prefetch.
+
+        manager will perform the prefetch at some checkpoints, if necessary
+        """
         if not use.allow_prefetch:
             return
         module = self.get_module(use.component_name)
@@ -603,12 +380,13 @@ class ComponentResidencyManager:
 
         self._uses_seen[use.component_name] = use
         self._trace("prefetch", use, strategy, module)
-        strategy.prepare_for_use(module, use, self.state)
+        if strategy.prefetch_for_use(module, use, self.state):
+            self._prefetched_use_keys.add(self._use_key(use))
 
     def after_use(self, use: ComponentUse) -> None:
         if not self.enabled:
             return
-        self._finish_use(use, keep_on_warmup=True)
+        self.end_use(use)
 
     def _finish_use(self, use: ComponentUse, *, keep_on_warmup: bool) -> None:
         """finish a specific use by keeping them resident or call finish_use hook"""
@@ -632,15 +410,13 @@ class ComponentResidencyManager:
         strategy.finish_use(module, use, self.state)
 
     def finish_request(self) -> None:
-        if (
-            not self.enabled
-            and not self._uses_seen
-            and not self._active_uses_by_handoff_slot
-        ):
+        if not self.enabled and not self._uses_seen and self._active_use is None:
             return
-        for handoff_slot in tuple(self._active_uses_by_handoff_slot):
-            self.finish_handoff_slot(handoff_slot)
+        # 1. Close the currently active sequential use.
+        self.finish_active_use(prefetch_next=False)
+        # 2. Pick components that should be ready for the next request.
         preferred_uses = self._preferred_request_end_uses()
+        # 3. Finish everything else, or prepare preferred uses for request tail.
         for component_name, use in list(self._uses_seen.items()):
             module = self.get_module(component_name)
             if module is None:
@@ -665,22 +441,6 @@ class ComponentResidencyManager:
                 strategy.finish_request(module, use, self.state, preferred=preferred)
         self._trace("request_end")
 
-    def prefetch_next_stage_uses(self, start_index: int) -> None:
-        """Prefetch uses declared by the next future stage with component needs.
-
-        TODO: this is temporary and conservative. Broader lookahead requires a
-        real dependency graph, otherwise prefetch can over-reserve VRAM.
-        """
-        if not self.enabled:
-            return
-        for index in range(start_index, len(self._stage_uses_by_index)):
-            uses = self._stage_uses(index)
-            if not uses:
-                continue
-            for use in uses:
-                self.prefetch_use(use)
-            return
-
     def stage_name(self, stage: ComponentResidencyStage) -> str:
         return self._stage_names_by_id.get(id(stage), stage.__class__.__name__)
 
@@ -700,7 +460,7 @@ class ComponentResidencyManager:
     def strategy_for(
         self, component_name: str, module: nn.Module
     ) -> ComponentResidencyStrategy:
-        """Return the strategy for a specific component"""
+        """Return the pre-registered strategy for a specific component"""
         custom_strategy = self._custom_strategies.get(component_name)
         if custom_strategy is not None:
             return custom_strategy
@@ -720,12 +480,32 @@ class ComponentResidencyManager:
             return None
         return self.stage_name(self.state.stages[next_index])
 
-    def _future_uses(self, start_stage_index: int) -> tuple[ComponentUse, ...]:
-        """Returns the component uses in the future stages"""
-        uses: list[ComponentUse] = []
-        for index in range(start_stage_index, len(self._stage_uses_by_index)):
-            uses.extend(self._stage_uses_by_index[index])
-        return tuple(uses)
+    def _mark_current_use(self, use: ComponentUse) -> None:
+        index = self._locate_use_index(use)
+        if index is None:
+            self._current_use_index = len(self._ordered_uses)
+            self.state.future_uses = ()
+            return
+        self._current_use_index = index
+        self.state.future_uses = self._ordered_uses[index + 1 :]
+
+    def _locate_use_index(self, use: ComponentUse) -> int | None:
+        for index in range(self._current_use_index + 1, len(self._ordered_uses)):
+            if self._same_use(self._ordered_uses[index], use):
+                return index
+        for index, candidate in enumerate(self._ordered_uses):
+            if self._same_use(candidate, use):
+                return index
+        return None
+
+    def _prefetch_next_memory_intensive_use(self) -> None:
+        for use in self._ordered_uses[self._current_use_index + 1 :]:
+            if not use.memory_intensive:
+                continue
+            if self._use_key(use) in self._prefetched_use_keys:
+                return
+            self.prefetch_use(use)
+            return
 
     def _should_keep_after_use(self, use: ComponentUse) -> bool:
         future_component_names = {
@@ -774,6 +554,10 @@ class ComponentResidencyManager:
     @staticmethod
     def _same_use(lhs: ComponentUse, rhs: ComponentUse) -> bool:
         return lhs.component_name == rhs.component_name and lhs.phase == rhs.phase
+
+    @staticmethod
+    def _use_key(use: ComponentUse) -> tuple[str, str, str | None]:
+        return (use.stage_name, use.component_name, use.phase)
 
     def _trace(
         self,
