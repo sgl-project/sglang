@@ -48,20 +48,9 @@ configure_environment() {
     esac
     echo "USE_VENV=${USE_VENV} (input: ${USE_VENV_RAW})"
 
-    # ------------------------------------------------------------------------------
-    # Self-heal dangling flashinfer/tvm_ffi symlinks in system site-packages
-    # ------------------------------------------------------------------------------
-    # An earlier revision of the "Stabilize FlashInfer JIT cache paths" block below
-    # symlinked `<site-packages>/{tvm_ffi/include,flashinfer/data}` into
-    # `~/.cache/flashinfer/_stable_src/` without asserting the resolved path was
-    # inside the venv. Under USE_VENV=false (and on a buggy branch where the guard
-    # was missing), `python3 -c "import tvm_ffi"` returned the system path, so the
-    # symlink replaced the real headers in /usr/local/lib/python3.*/dist-packages/.
-    # A later job's `rm -rf "$STABLE_FI_DIR"` (on a flashinfer version bump) then
-    # left the symlink dangling, and every subsequent job failed with
-    #   tvm_ffi.libinfo.find_include_path() -> RuntimeError: Cannot find include path.
-    # until the runner was hand-patched. The guard added to the stabilize block
-    # below prevents re-planting, but runners still carrying old damage need repair.
+    # Repair dangling tvm_ffi/flashinfer symlinks in system site-packages
+    # (left by stabilize_flashinfer_jit_paths runs that escaped the venv).
+    # No-op when clean.
     SYSTEM_SITE=$(/usr/bin/python3 -c 'import site; print(site.getsitepackages()[0])' 2>/dev/null || true)
     if [ -n "$SYSTEM_SITE" ]; then
         for pair in "tvm_ffi/include apache-tvm-ffi" "flashinfer/data flashinfer-python"; do
@@ -72,8 +61,6 @@ configure_environment() {
             if [ -L "$link" ] && [ ! -e "$link" ]; then
                 echo "::warning::Self-heal: dangling symlink ${link} -> $(readlink "$link"). Removing and force-reinstalling ${pkg}."
                 rm -f "$link"
-                # Use system pip explicitly — the venv (if any) doesn't exist yet,
-                # and we want the reinstall to target SYSTEM_SITE regardless.
                 /usr/bin/python3 -m pip install --force-reinstall --no-deps "$pkg" --root-user-action=ignore >/dev/null 2>&1 || true
             fi
         done
@@ -87,26 +74,14 @@ configure_environment() {
     SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 
     if [ "$USE_VENV" = "1" ]; then
-        # Stable path (no run/job id). Rationale: deep_gemm bakes the
-        # site-packages include path into nvcc flags, which then get MD5'd into
-        # the JIT cache key (DeepGEMM/csrc/jit/compiler.hpp:
-        # `-I{library_include_path}` is part of `flags` in the
-        # `{name}$${signature}$${flags}$${code}` signature). A per-job path
-        # would change every run, so the host-mounted cache at
-        # ~/.cache/deep_gemm/cache/ would accumulate unreachable entries.
-        # Holding the path constant lets cached kernels carry across runs.
-        #
-        # Freshness is guaranteed by wiping and recreating the dir at the start
-        # of each job — equivalent isolation to a per-job path, minus the cache
-        # churn. Assumes one job per runner container at a time (current SGLang
-        # CI); a second concurrent job here would have its `rm -rf` pull the
-        # venv out from under the first.
+        # Stable path: deep_gemm MD5s `-I<site-packages>/deep_gemm/include`
+        # into its JIT cache key, so a per-job path rotates the key every run
+        # and ~/.cache/deep_gemm fills with unreachable entries. Assumes one
+        # job per runner container; concurrent jobs would race the rm -rf.
         UV_VENV="/tmp/sglang-ci-venv"
         rm -rf "$UV_VENV"
-        # `rm -rf` can exit 0 while leaving contents behind in edge cases (bind
-        # mounts, chattr +i, busy files on distributed fs). If the wipe is
-        # incomplete, `uv venv --seed` would layer onto stale files and the job
-        # would fail obscurely later. Assert cleanliness up front.
+        # rm -rf can exit 0 with content still present (chattr +i, bind
+        # mounts); uv venv --seed would silently layer onto stale state.
         [ ! -e "$UV_VENV" ] || { echo "FATAL: $UV_VENV still exists after rm -rf"; ls -la "$UV_VENV" || true; exit 1; }
         uv venv "$UV_VENV" --python "python${SYS_PYTHON_VER}" --seed
         # shellcheck disable=SC1091
@@ -398,13 +373,9 @@ stabilize_flashinfer_jit_paths() {
     FI_DATA=$(python3 -c "import flashinfer, os; print(os.path.join(os.path.dirname(flashinfer.__file__), 'data'))")
     TVM_INC=$(python3 -c "import tvm_ffi, os; print(os.path.join(os.path.dirname(tvm_ffi.__file__), 'include'))")
 
-    # Refuse to clobber paths outside the venv. If python3 here ever resolves
-    # to system site-packages (misconfigured PATH, --system-site-packages,
-    # explicit /usr/bin/python3, or venv activation silently failing), the
-    # `rm -rf` + `ln -s` below would wipe system-installed headers and leave
-    # a dangling symlink once $STABLE_FI_DIR gets rebuilt on a version bump.
-    # That exact bug corrupted every persistent CI runner on 2026-04-19 and
-    # required hand-repair via the self-heal block at the top of this script.
+    # Guard against python3 resolving outside the venv (broken activation,
+    # --system-site-packages): rm -rf + ln -s below would clobber system
+    # headers and dangle on the next $STABLE_FI_DIR rebuild.
     for p in "$FI_DATA" "$TVM_INC"; do
         case "$p" in
             "$UV_VENV"/*) ;;
