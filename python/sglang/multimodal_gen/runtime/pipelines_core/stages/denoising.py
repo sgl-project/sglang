@@ -198,9 +198,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        del server_args
         stage_name = stage_name or self.__class__.__name__
         uses: list[ComponentUse] = []
+        if self.vae is not None:
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name="vae",
+                    target_dtype=torch.bfloat16,
+                )
+            )
         for default_name, module in (
             ("transformer", self.transformer),
             ("transformer_2", self.transformer_2),
@@ -607,13 +614,20 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # TI2V specific preparations - before SP sharding
         if should_preprocess_for_wan_ti2v:
-            seq_len, z, reserved_frames_masks = prepare_wan_ti2v_latents(
-                self.vae,
-                latents,
-                target_dtype,
-                batch,
-                server_args,
-            )
+            with self.use_declared_component(
+                component_name="vae",
+                module=self.vae,
+                target_dtype=target_dtype,
+            ) as vae:
+                assert vae is not None
+                self.vae = vae
+                seq_len, z, reserved_frames_masks = prepare_wan_ti2v_latents(
+                    self.vae,
+                    latents,
+                    target_dtype,
+                    batch,
+                    server_args,
+                )
         else:
             seq_len, z, reserved_frames_masks = (
                 None,
@@ -800,7 +814,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, batch: Req
     ) -> Callable[[Any], bool] | list[Callable[[Any], bool]]:
         """Return the prompt-embedding validator used by verify_input."""
-        del batch
         return V.list_not_empty
 
     def _get_negative_prompt_embeds_validator(
@@ -1083,7 +1096,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         server_args: ServerArgs,
         batch: Req,
     ):
-        del server_args
         if boundary_timestep is None or t_int >= boundary_timestep:
             # High-noise stage
             current_model = self.transformer

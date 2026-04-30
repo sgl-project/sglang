@@ -80,7 +80,6 @@ class LTX2UpsampleStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        del server_args
         stage_name = stage_name or self.__class__.__name__
         uses = [
             ComponentUse(stage_name, "spatial_upsampler"),

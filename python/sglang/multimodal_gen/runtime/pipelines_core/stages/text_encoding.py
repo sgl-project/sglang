@@ -72,7 +72,6 @@ class TextEncodingStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        del server_args
         stage_name = stage_name or self.__class__.__name__
         return [
             ComponentUse(
@@ -183,15 +182,14 @@ class TextEncodingStage(PipelineStage):
 
     def _manage_text_encoder_use(self, encoder_index: int) -> None:
         manager = self._component_residency_manager
-        use = ComponentUse(
-            stage_name=manager.state.stage_name or self.__class__.__name__,
-            component_name=(
-                "text_encoder"
-                if encoder_index == 0
-                else f"text_encoder_{encoder_index + 1}"
-            ),
-            preferred_ready_after_request=encoder_index == 0,
+        if manager is None:
+            return
+        component_name = (
+            "text_encoder"
+            if encoder_index == 0
+            else f"text_encoder_{encoder_index + 1}"
         )
+        use = self._declared_component_use(component_name=component_name)
         manager.before_use(use)
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):

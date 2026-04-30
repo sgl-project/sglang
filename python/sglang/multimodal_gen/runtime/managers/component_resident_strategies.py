@@ -23,6 +23,15 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _module_to_local_device(
+    module: nn.Module, *, dtype: torch.dtype | None = None
+) -> None:
+    if dtype is None:
+        module.to(get_local_torch_device(), non_blocking=True)
+    else:
+        module.to(get_local_torch_device(), dtype=dtype, non_blocking=True)
+
+
 class ComponentResidencyStrategy:
     """Baseclass for describing how a component should be treated (regarding where its weights locates)
 
@@ -69,7 +78,7 @@ class ComponentResidencyStrategy:
         state: ResidencyState,
     ) -> None:
         """Called after a request is finished, to prepare for the upcoming request"""
-        del module, use, state
+        pass
 
     def finish_request(
         self,
@@ -104,11 +113,14 @@ class ComponentResidencyStrategy:
 class ResidentStrategy(ComponentResidencyStrategy):
     name = "resident"
 
-
-class StageManagedStrategy(ComponentResidencyStrategy):
-    """No-op strategy for components with existing stage-local device lifecycle."""
-
-    name = "stage_managed"
+    def prepare_for_use(
+        self,
+        module: nn.Module,
+        use: ComponentUse,
+        state: ResidencyState,
+    ) -> None:
+        if use.target_dtype is not None:
+            _module_to_local_device(module, dtype=use.target_dtype)
 
 
 class SnapshotModuleResidency:
@@ -322,7 +334,6 @@ class SnapshotStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        del state
         self.prefetch_component(use.component_name, module)
 
     def wait_for_use(
@@ -331,7 +342,6 @@ class SnapshotStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        del module, state
         self.wait_component_ready(use.component_name)
 
     def finish_use(
@@ -340,7 +350,6 @@ class SnapshotStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        del state
         self.release_component(use.component_name, module)
 
     def prepare_after_request(
@@ -357,13 +366,20 @@ class VanillaD2HStrategy(ComponentResidencyStrategy):
 
     name = "vanilla"
 
+    def prepare_for_use(
+        self,
+        module: nn.Module,
+        use: ComponentUse,
+        state: ResidencyState,
+    ) -> None:
+        _module_to_local_device(module, dtype=use.target_dtype)
+
     def enter(self, module: nn.Module) -> None:
         param = next(module.parameters(), None)
         if param is not None and param.device.type == "cpu":
-            module.to(get_local_torch_device(), non_blocking=True)
+            _module_to_local_device(module)
 
     def exit(self, module: nn.Module, next_module: nn.Module | None = None) -> None:
-        del next_module
         param = next(module.parameters(), None)
         if param is not None and param.device.type == "cuda":
             module.to("cpu")
@@ -394,7 +410,6 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
             module.prepare_for_next_req()
 
     def exit(self, module: nn.Module, next_module: nn.Module | None = None) -> None:
-        del next_module
         if not isinstance(module, OffloadableDiTMixin):
             return
         for manager in module.layerwise_offload_managers:

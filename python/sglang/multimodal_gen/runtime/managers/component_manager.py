@@ -4,13 +4,13 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Mapping, MutableMapping, Protocol, Sequence, TypeVar
 
+import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.managers.component_resident_strategies import (
     ComponentResidencyStrategy,
     LayerwiseOffloadStrategy,
     ResidentStrategy,
-    StageManagedStrategy,
     VanillaD2HStrategy,
 )
 from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
@@ -38,6 +38,11 @@ class ComponentUse:
     # Whether this use is expensive enough that earlier timeline prefetch matters.
     # TODO: judge by parameter size and precision
     memory_intensive: bool = False
+    # Optional module dtype required by this use-site.
+    target_dtype: torch.dtype | None = None
+    # Some components are intentionally kept ready between warmup and the first
+    # real request to avoid measuring a cold H2D in the user-visible request.
+    keep_ready_after_warmup: bool = False
 
 
 @dataclass(slots=True)
@@ -110,7 +115,9 @@ def build_component_residency_strategy(
     }:
         return build_dit_residency_strategy(module, server_args)
 
-    if component_name.startswith("text_encoder"):
+    if component_name.startswith("text_encoder") or component_name.endswith(
+        "text_encoder"
+    ):
         if (
             server_args.text_encoder_cpu_offload
             and not server_args.use_fsdp_inference
@@ -120,7 +127,9 @@ def build_component_residency_strategy(
         return ResidentStrategy()
 
     if component_name == "image_encoder":
-        return StageManagedStrategy()
+        if server_args.image_encoder_cpu_offload and not server_args.use_fsdp_inference:
+            return VanillaD2HStrategy()
+        return ResidentStrategy()
 
     if component_name in {
         "vae",
@@ -128,8 +137,11 @@ def build_component_residency_strategy(
         "audio_vae",
         "vocoder",
         "spatial_upsampler",
+        "condition_image_encoder",
     }:
-        return StageManagedStrategy()
+        if server_args.vae_cpu_offload and not server_args.use_fsdp_inference:
+            return VanillaD2HStrategy()
+        return ResidentStrategy()
 
     return ResidentStrategy()
 
@@ -162,6 +174,7 @@ class ComponentResidencyManager:
         self._ordered_uses: tuple[ComponentUse, ...] = ()
         self._current_use_index: int = -1
         self._active_use: ComponentUse | None = None
+        self._active_use_module: nn.Module | None = None
         self._prefetched_use_keys: set[tuple[str, str, str | None]] = set()
         self._custom_strategies: dict[str, ComponentResidencyStrategy] = dict(
             pipeline.component_residency_strategies
@@ -178,6 +191,7 @@ class ComponentResidencyManager:
             self.strategy_for.cache_clear()
             self._should_keep_single_dit.cache_clear()
             self._active_use = None
+            self._active_use_module = None
             self._uses_seen.clear()
             self._prefetched_use_keys.clear()
         elif custom_strategies != self._custom_strategies:
@@ -215,6 +229,7 @@ class ComponentResidencyManager:
             trace_enabled=server_args.component_residency_trace,
         )
         self._active_use = None
+        self._active_use_module = None
         self._current_use_index = -1
         self._prefetched_use_keys.clear()
         self._uses_seen.clear()
@@ -244,7 +259,6 @@ class ComponentResidencyManager:
         """called after stage starts"""
         if not self.enabled:
             return
-        del batch, server_args
         # update state before entering the stage
         self.state.stage_index = stage_index
         self.state.stage_name = self.stage_name(stage)
@@ -263,7 +277,7 @@ class ComponentResidencyManager:
             return
         self.begin_use(use)
 
-    def begin_use(self, use: ComponentUse) -> None:
+    def begin_use(self, use: ComponentUse, module: nn.Module | None = None) -> None:
         """Begin one sequential component use interval.
 
         1. Finish the previous active use if this is a different timeline use.
@@ -274,15 +288,21 @@ class ComponentResidencyManager:
             return
         if self._active_use is not None:
             # finish previous active use
-            self._finish_use(self._active_use, keep_on_warmup=False)
+            self._finish_use(
+                self._active_use,
+                module=self._active_use_module,
+                keep_on_warmup=self._active_use.keep_ready_after_warmup,
+            )
             self._active_use = None
+            self._active_use_module = None
             self.state.current_use = None
         self._mark_current_use(use)
-        self._prepare_forward_use(use)
+        self._prepare_forward_use(use, module=module)
         self._active_use = use
+        self._active_use_module = module
         self._prefetch_next_memory_intensive_use()
 
-    def end_use(self, use: ComponentUse) -> None:
+    def end_use(self, use: ComponentUse, module: nn.Module | None = None) -> None:
         """End one sequential component use interval.
 
         1. Finish or keep the current component.
@@ -291,8 +311,13 @@ class ComponentResidencyManager:
         """
         if self._active_use is None or not self._same_use(self._active_use, use):
             return
-        self._finish_use(self._active_use, keep_on_warmup=False)
+        self._finish_use(
+            self._active_use,
+            module=self._active_use_module or module,
+            keep_on_warmup=self._active_use.keep_ready_after_warmup,
+        )
         self._active_use = None
+        self._active_use_module = None
         self.state.current_use = None
         self._prefetch_next_memory_intensive_use()
 
@@ -300,11 +325,11 @@ class ComponentResidencyManager:
     def use_component(
         self, use: ComponentUse, module: nn.Module | None = None
     ) -> Iterator[nn.Module | None]:
-        self.begin_use(use)
+        self.begin_use(use, module=module)
         try:
             yield module if module is not None else self.get_module(use.component_name)
         finally:
-            self.end_use(use)
+            self.end_use(use, module=module)
 
     def call_component(
         self,
@@ -321,6 +346,12 @@ class ComponentResidencyManager:
         if not self.enabled:
             return
         self._prefetch_use(use)
+
+    def ensure_ready(self, use: ComponentUse, module: nn.Module | None = None) -> None:
+        """Prepare a shared component and wait without making it the active use."""
+        if not self.enabled:
+            return
+        self._prepare_forward_use(use, module=module)
 
     def prefetch_checkpoint(self, anchor: ComponentUse | None = None) -> None:
         """Give the manager a timeline overlap point.
@@ -340,15 +371,22 @@ class ComponentResidencyManager:
         if self._active_use is None:
             return
         active_use = self._active_use
-        self._finish_use(active_use, keep_on_warmup=False)
+        self._finish_use(
+            active_use,
+            module=self._active_use_module,
+            keep_on_warmup=active_use.keep_ready_after_warmup,
+        )
         self._active_use = None
+        self._active_use_module = None
         self.state.current_use = None
         if prefetch_next:
             self._prefetch_next_memory_intensive_use()
 
-    def _prepare_forward_use(self, use: ComponentUse) -> None:
+    def _prepare_forward_use(
+        self, use: ComponentUse, module: nn.Module | None = None
+    ) -> None:
         """Prepare a component that is about to run and wait until it is ready."""
-        module = self.get_module(use.component_name)
+        module = module or self.get_module(use.component_name)
         if module is None:
             self._trace("skip_missing", use)
             return
@@ -388,9 +426,15 @@ class ComponentResidencyManager:
             return
         self.end_use(use)
 
-    def _finish_use(self, use: ComponentUse, *, keep_on_warmup: bool) -> None:
+    def _finish_use(
+        self,
+        use: ComponentUse,
+        *,
+        module: nn.Module | None = None,
+        keep_on_warmup: bool,
+    ) -> None:
         """finish a specific use by keeping them resident or call finish_use hook"""
-        module = self.get_module(use.component_name)
+        module = module or self.get_module(use.component_name)
         if module is None:
             self._trace("skip_missing", use)
             return

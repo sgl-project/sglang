@@ -358,7 +358,6 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        del module, state
         phase = self._phase(use)
         if phase != self.manager._active_phase:
             self.enter_phase(phase)
@@ -369,7 +368,6 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        del module, state
         self.ensure_phase_ready(self._phase(use))
 
     def finish_use(
@@ -378,7 +376,6 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        del module, state
         self.exit_phase(self._phase(use))
 
     def prepare_after_request(
@@ -387,21 +384,19 @@ class LTX2TwoStageResidencyStrategy(ComponentResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        del module, state
         phase = self._phase(use)
         if phase != self.manager._active_phase:
             self.enter_phase(phase)
 
     def enter_phase(self, phase: str) -> bool:
-        del phase
         return False
 
     def exit_phase(self, phase: str | None, next_phase: str | None = None) -> None:
-        del phase, next_phase
+        pass
 
     def ensure_phase_ready(self, phase: str | None) -> None:
         """wait for the preparation to be ready"""
-        del phase
+        pass
 
     def _ensure_on_gpu(self, module_name: str) -> None:
         module = self.pipeline.get_module(module_name)
@@ -550,7 +545,6 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        del module, state
         phase = self._phase(use)
         if phase != "stage1":
             return
@@ -571,7 +565,6 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
-        del state
         phase = self._phase(use)
         if self.server_args.dit_cpu_offload:
             # release cuda storage

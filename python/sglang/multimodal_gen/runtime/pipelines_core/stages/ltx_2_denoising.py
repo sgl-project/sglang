@@ -1182,7 +1182,6 @@ class LTX2DenoisingStage(DenoisingStage):
     ):
         """Preserve the legacy LTX-2 attention-metadata contract."""
         # Legacy LTX-2 paths used the plain attention-metadata builder call here.
-        del ctx, t_int, timesteps_cpu
         return self._build_attn_metadata(step_index, batch, server_args)
 
     def _run_denoising_step(
@@ -1980,7 +1979,6 @@ class LTX2DenoisingStage(DenoisingStage):
 
     def _get_prompt_embeds_validator(self, batch: Req):
         """Allow either tensor or list prompt embeddings for LTX-2 prompts."""
-        del batch
         return lambda x: V.is_tensor(x) or V.list_not_empty(x)
 
     def _get_negative_prompt_embeds_validator(self, batch: Req):

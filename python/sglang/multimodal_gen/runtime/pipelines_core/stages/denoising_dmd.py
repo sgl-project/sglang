@@ -240,7 +240,6 @@ class DmdDenoisingStage(DenoisingStage):
             current_guidance_scale = batch.guidance_scale_2
             current_phase = "transformer_2"
 
-        del server_args
         self._manage_dit_use_site(current_model, current_phase, batch)
 
         assert current_model is not None, "The model for the current step is not set."

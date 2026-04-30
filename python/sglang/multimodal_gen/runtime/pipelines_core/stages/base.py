@@ -9,6 +9,9 @@ composed to create complete diffusion pipelines.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import replace
 from enum import Enum, auto
 
 import torch
@@ -114,11 +117,67 @@ class PipelineStage(StageDedupMixin, ABC):
         if self._component_residency_manager is not None:
             self._component_residency_manager.finish_active_use()
 
+    @contextmanager
+    def _use_component(
+        self,
+        use: ComponentUse,
+        module=None,
+    ) -> Iterator[object | None]:
+        if self._component_residency_manager is None:
+            yield module
+            return
+        with self._component_residency_manager.use_component(use, module) as component:
+            yield component
+
+    def _declared_component_use(
+        self,
+        *,
+        component_name: str,
+        phase: str | None = None,
+        target_dtype: torch.dtype | None = None,
+    ) -> ComponentUse:
+        manager = self._component_residency_manager
+        stage_name = (
+            manager.state.stage_name
+            if manager is not None and manager.state.stage_name is not None
+            else self.__class__.__name__
+        )
+        server_args = manager.server_args if manager is not None else self.server_args
+        for use in self.component_uses(server_args, stage_name):
+            if use.component_name != component_name:
+                continue
+            if phase is not None and use.phase != phase:
+                continue
+            if target_dtype is not None:
+                return replace(use, target_dtype=target_dtype)
+            return use
+        raise ValueError(
+            f"{self.__class__.__name__} did not declare component use: "
+            f"{component_name}"
+        )
+
+    @contextmanager
+    def use_declared_component(
+        self,
+        *,
+        component_name: str,
+        module=None,
+        phase: str | None = None,
+        target_dtype: torch.dtype | None = None,
+    ) -> Iterator[object | None]:
+        """reference a component already declared in `component_uses`"""
+        use = self._declared_component_use(
+            component_name=component_name,
+            phase=phase,
+            target_dtype=target_dtype,
+        )
+        with self._use_component(use, module) as component:
+            yield component
+
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         """Declares component uses for residency scheduling."""
-        del server_args, stage_name
         return []
 
     # Default role affinity: ENCODER. Override in subclasses for DENOISING/DECODER.
