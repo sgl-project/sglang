@@ -1,6 +1,16 @@
 name: Release Docker Images Nightly ROCm7.2 (AMD)
 on:
   workflow_dispatch:
+    inputs:
+      job_select:
+        description: 'Select which release job to run'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - publish
+          - publish_dsv4
   schedule:
     - cron: '0 12 * * *'
 
@@ -14,7 +24,7 @@ concurrency:
 
 jobs:
   publish:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish')
     runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
@@ -123,7 +133,7 @@ jobs:
   # of publish failed; legs without an artifact will fail at download and be
   # the only ones marked red.
   push_local_registry:
-    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' }}
+    if: ${{ !cancelled() && github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish') }}
     runs-on: linux-mi300-1gpu-sglang
     environment: 'prod'
     needs: publish
@@ -162,7 +172,7 @@ jobs:
           docker push "${dst}"
 
   publish_dsv4:
-    if: github.repository == 'sgl-project/sglang'
+    if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish_dsv4')
     runs-on: linux-mi300-8gpu-sglang
     environment: 'prod'
     strategy:
