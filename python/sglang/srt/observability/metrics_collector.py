@@ -97,7 +97,6 @@ class SchedulerStats:
 
     # Utilization
     utilization: float = 0.0
-    max_running_requests_under_SLO: Optional[int] = None
 
     # Scheduler policy
     new_token_ratio: float = 0.0
