@@ -157,6 +157,84 @@ def parse_time(time_str: str) -> datetime:
     return datetime.fromisoformat(time_str.replace("Z", "+00:00"))
 
 
+def calculate_concurrency_metrics(
+    jobs: list,
+    window_start: datetime,
+    window_end: datetime,
+    num_runners: int,
+) -> dict:
+    """Sweep-line algorithm: peak/avg concurrent, saturation time, peak queue."""
+    if not jobs:
+        return {
+            "peak_concurrent": 0,
+            "avg_concurrent": 0.0,
+            "saturation_seconds": 0,
+            "saturation_pct": 0.0,
+            "peak_queue": 0,
+        }
+    window_seconds = (window_end - window_start).total_seconds()
+    if window_seconds <= 0:
+        return {
+            "peak_concurrent": 0,
+            "avg_concurrent": 0.0,
+            "saturation_seconds": 0,
+            "saturation_pct": 0.0,
+            "peak_queue": 0,
+        }
+    running_events = []
+    for job in jobs:
+        start, end = job["start"], job["end"]
+        if end < window_start or start > window_end:
+            continue
+        running_events.append((max(start, window_start), 1))
+        running_events.append((min(end, window_end), -1))
+    queue_events = []
+    for job in jobs:
+        created_at = job.get("created_at")
+        started_at = job["start"]
+        if created_at and created_at < started_at:
+            if started_at < window_start or created_at > window_end:
+                continue
+            queue_events.append((max(created_at, window_start), 1))
+            queue_events.append((min(started_at, window_end), -1))
+    running_events.sort(key=lambda e: (e[0], e[1] == 1))
+    current_running = 0
+    peak_running = 0
+    prev_time = window_start
+    total_running_seconds = 0.0
+    saturation_seconds = 0.0
+    for event_time, delta in running_events:
+        td = (event_time - prev_time).total_seconds()
+        if td > 0:
+            total_running_seconds += current_running * td
+            if current_running >= num_runners:
+                saturation_seconds += td
+        current_running += delta
+        peak_running = max(peak_running, current_running)
+        prev_time = event_time
+    if prev_time < window_end:
+        td = (window_end - prev_time).total_seconds()
+        total_running_seconds += current_running * td
+        if current_running >= num_runners:
+            saturation_seconds += td
+    queue_events.sort(key=lambda e: (e[0], e[1] == 1))
+    current_queued = 0
+    peak_queue = 0
+    for _, delta in queue_events:
+        current_queued += delta
+        peak_queue = max(peak_queue, current_queued)
+    avg_concurrent = total_running_seconds / window_seconds if window_seconds > 0 else 0
+    return {
+        "peak_concurrent": peak_running,
+        "avg_concurrent": avg_concurrent,
+        "saturation_seconds": saturation_seconds,
+        "saturation_pct": (
+            (saturation_seconds / window_seconds * 100) if window_seconds > 0 else 0
+        ),
+        "peak_queue": peak_queue,
+    }
+
+
 _NON_GPU_WORKFLOW_HINTS = (
     "lint",
     "deploy",
@@ -375,15 +453,37 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
         avg_queue = sum(queue_times) / len(queue_times) if queue_times else 0
         max_queue = max(queue_times) if queue_times else 0
 
+        # Concurrency / saturation / queue-depth metrics. Use observed
+        # peak as effective capacity if it's lower than the API count
+        # (e.g. for autoscaling pools where most listeners sit idle).
+        conc_initial = calculate_concurrency_metrics(
+            jobs, window_start, window_end, num_runners
+        )
+        effective_runners = (
+            min(num_runners, conc_initial["peak_concurrent"]) or num_runners
+        )
+        if effective_runners < num_runners and effective_runners > 0:
+            conc = calculate_concurrency_metrics(
+                jobs, window_start, window_end, effective_runners
+            )
+        else:
+            conc = conc_initial
+
         results.append(
             {
                 "label": label,
                 "num_runners": num_runners,
+                "effective_runners": effective_runners,
                 "num_jobs": len(jobs),
                 "total_active_hours": active_seconds / 3600,
                 "utilization_pct": utilization,
                 "avg_queue_min": avg_queue / 60,
                 "max_queue_min": max_queue / 60,
+                "peak_concurrent": conc_initial["peak_concurrent"],
+                "avg_concurrent": conc["avg_concurrent"],
+                "saturation_hours": conc["saturation_seconds"] / 3600,
+                "saturation_pct": conc["saturation_pct"],
+                "peak_queue": conc["peak_queue"],
             }
         )
 
@@ -434,6 +534,64 @@ def format_report(
             f"{r['utilization_pct']:.1f}% {bar} | "
             f"{r['avg_queue_min']:.1f}m | {r['max_queue_min']:.1f}m |"
         )
+
+    # Concurrency Analysis section
+    lines.extend(
+        [
+            "",
+            "## Concurrency Analysis",
+            "",
+            "| Label | Runners (API/Effective) | Peak Concurrent | Avg Concurrent | Saturation Time | Peak Queue |",
+            "|-------|-------------------------|-----------------|----------------|-----------------|------------|",
+        ]
+    )
+    for r in results:
+        effective = r["effective_runners"]
+        avg_pct = (r["avg_concurrent"] / effective * 100) if effective > 0 else 0
+        runner_str = (
+            f"{r['num_runners']}/{effective}"
+            if effective != r["num_runners"]
+            else str(r["num_runners"])
+        )
+        lines.append(
+            f"| {r['label']} | {runner_str} | "
+            f"{r['peak_concurrent']} | "
+            f"{r['avg_concurrent']:.1f} ({avg_pct:.0f}%) | "
+            f"{r['saturation_hours']:.1f}h ({r['saturation_pct']:.0f}%) | "
+            f"{r['peak_queue']} jobs |"
+        )
+
+    # Recommendations
+    lines.extend(["", "## Recommendations", ""])
+    has_recs = False
+    for r in results:
+        label = r["label"]
+        sat_pct = r["saturation_pct"]
+        peak_q = r["peak_queue"]
+        effective = r["effective_runners"]
+        avg_pct = (r["avg_concurrent"] / effective * 100) if effective > 0 else 0
+        if sat_pct > 50 or peak_q > 5:
+            lines.append(
+                f"⚠️ **{label}**: High saturation ({sat_pct:.0f}%) "
+                f"with queue buildup ({peak_q} jobs). Consider adding runners."
+            )
+            has_recs = True
+        elif sat_pct > 20 or peak_q > 0:
+            lines.append(
+                f"📊 **{label}**: Moderate saturation ({sat_pct:.0f}%), "
+                f"peak queue {peak_q} jobs. Monitor for trends."
+            )
+            has_recs = True
+        elif avg_pct < 30 and r["num_jobs"] > 0:
+            lines.append(
+                f"💡 **{label}**: Low average utilization ({avg_pct:.0f}%). "
+                f"Runner pool may be oversized."
+            )
+            has_recs = True
+        else:
+            lines.append(f"✓ **{label}**: Healthy utilization with minimal queueing.")
+    if not has_recs and results:
+        lines.append("All runner pools have healthy utilization.")
 
     return "\n".join(lines)
 
