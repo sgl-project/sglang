@@ -40,10 +40,6 @@ def grouped_gemm_nt_f8f8bf16_masked(
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
-    if envs.SGLANG_HACK_SKIP_FP4_FP8_GEMM.get():
-        out.zero_()
-        return
-
     lhs = _ensure_cuda(lhs)
     rhs = _ensure_cuda(rhs)
 
@@ -105,9 +101,6 @@ def grouped_gemm_nt_f8f8bf16_contig(
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
 
-    if envs.SGLANG_HACK_SKIP_FP4_FP8_GEMM.get():
-        out.zero_()
-        return
     fp4_kwargs = (
         dict(recipe_a=(1, 128), recipe_b=(1, 32))
         if envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
