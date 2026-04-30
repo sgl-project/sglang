@@ -27,7 +27,7 @@ AIME25 knobs (env vars):
     DSV4_AIME25_TOP_P             (default 1.0   -> --top-p)
     DSV4_AIME25_MAX_TOKENS        (default 65536 -> --max-tokens)
     DSV4_AIME25_NUM_THREADS       (default 512   -> --num-threads)
-    DSV4_AIME25_SCORE_METRIC      (default "pass@1")
+    DSV4_AIME25_SCORE_METRIC      (default "score"; sgl-eval JSON key under "aggregate")
     DSV4_AIME25_SCORE_THRESHOLD   (default 0; >0 overrides per-variant default)
 
 GSM8K smoke knobs (env vars):
@@ -37,15 +37,18 @@ GSM8K smoke knobs (env vars):
     DSV4_GSM8K_TOP_P              (default 0.95  -> --top-p)
     DSV4_GSM8K_MAX_TOKENS         (default 8192  -> --max-tokens)
     DSV4_GSM8K_NUM_THREADS        (default 64    -> --num-threads)
-    DSV4_GSM8K_SCORE_METRIC       (default "pass@1")
+    DSV4_GSM8K_SCORE_METRIC       (default "score"; sgl-eval JSON key under "aggregate")
     DSV4_GSM8K_SCORE_THRESHOLD    (default 0.93; set to 0 to skip the assertion)
 
 Shared knobs:
     DSV4_SGL_EVAL_OUT_DIR         (default /tmp/sgl-eval-out -> --out-dir)
     DSV4_SGL_EVAL_BIN             (default "sgl-eval"; override path to the CLI)
-    DSV4_SERVER_LAUNCH_TIMEOUT    (default 1800s; the sglang 600s default is
+    DSV4_SERVER_LAUNCH_TIMEOUT    (default 3600s; the sglang 600s default is
                                    too short for DSv4 model load + DeepGEMM
-                                   warmup. Bump on first-run downloads.)
+                                   warmup. 1800s is also tight for the heavier
+                                   recipes (DP-attn + DeepEP); 3600s is the
+                                   safe default. Bump again for first-run
+                                   model downloads if needed.)
 
 Multi-node knobs (only consumed by multi-node test classes; if either
 is unset, those classes ``SkipTest``):
@@ -74,14 +77,14 @@ SGL_EVAL_OUT_DIR = os.environ.get("DSV4_SGL_EVAL_OUT_DIR", "/tmp/sgl-eval-out")
 # DSv4 server launch needs more than the 600s sglang default: model load alone
 # can take 5+ min and DeepGEMM warmup another ~5 min. First-run model download
 # adds ~10-30 min on top. 1800s covers steady-state; bump via env for downloads.
-SERVER_LAUNCH_TIMEOUT = int(os.environ.get("DSV4_SERVER_LAUNCH_TIMEOUT", "1800"))
+SERVER_LAUNCH_TIMEOUT = int(os.environ.get("DSV4_SERVER_LAUNCH_TIMEOUT", "3600"))
 
 AIME25_NUM_REPEATS = int(os.environ.get("DSV4_AIME25_NUM_REPEATS", "16"))
 AIME25_TEMPERATURE = float(os.environ.get("DSV4_AIME25_TEMPERATURE", "1.0"))
 AIME25_TOP_P = float(os.environ.get("DSV4_AIME25_TOP_P", "1.0"))
 AIME25_MAX_TOKENS = int(os.environ.get("DSV4_AIME25_MAX_TOKENS", "65536"))
 AIME25_NUM_THREADS = int(os.environ.get("DSV4_AIME25_NUM_THREADS", "512"))
-AIME25_SCORE_METRIC = os.environ.get("DSV4_AIME25_SCORE_METRIC", "pass@1")
+AIME25_SCORE_METRIC = os.environ.get("DSV4_AIME25_SCORE_METRIC", "score")
 AIME25_SCORE_THRESHOLD = float(os.environ.get("DSV4_AIME25_SCORE_THRESHOLD", "0.0"))
 
 GSM8K_NUM_EXAMPLES = int(os.environ.get("DSV4_GSM8K_NUM_EXAMPLES", "50"))
@@ -90,7 +93,7 @@ GSM8K_TEMPERATURE = float(os.environ.get("DSV4_GSM8K_TEMPERATURE", "0.6"))
 GSM8K_TOP_P = float(os.environ.get("DSV4_GSM8K_TOP_P", "0.95"))
 GSM8K_MAX_TOKENS = int(os.environ.get("DSV4_GSM8K_MAX_TOKENS", "8192"))
 GSM8K_NUM_THREADS = int(os.environ.get("DSV4_GSM8K_NUM_THREADS", "64"))
-GSM8K_SCORE_METRIC = os.environ.get("DSV4_GSM8K_SCORE_METRIC", "pass@1")
+GSM8K_SCORE_METRIC = os.environ.get("DSV4_GSM8K_SCORE_METRIC", "score")
 GSM8K_SCORE_THRESHOLD = float(os.environ.get("DSV4_GSM8K_SCORE_THRESHOLD", "0.93"))
 
 # DeepEP "large SMS" config — appears as `--deepep-config '{...}'` in every
