@@ -233,6 +233,18 @@ def pytest_collection_modifyitems(
     else:
         logger.info("Scanned worker requirements: (none)")
 
+    # TEMPORARY: skip all e2e tests until upstream kernels publishes a release
+    # without `import_name: str | None`. The CI runner installs kernels==0.13.0
+    # with huggingface_hub>=1.9.0, whose strict-dataclass validator rejects the
+    # PEP 604 union and crashes transformers.integrations.hub_kernels at import,
+    # taking down sglang.launch_server. See huggingface/trl#5528.
+    skip_marker = pytest.mark.skip(
+        reason="e2e tests disabled: kernels==0.13.0 + huggingface_hub strict dataclass crash"
+    )
+    for item in items:
+        if item.get_closest_marker("e2e") is not None:
+            item.add_marker(skip_marker)
+
 
 # ---------------------------------------------------------------------------
 # Pool requirements

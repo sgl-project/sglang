@@ -5,11 +5,17 @@ on:
     branches: [ main ]
     paths:
       - "sgl-model-gateway/**"
+      - ".github/workflows/pr-test-rust.yml"
+      - "scripts/ci/cuda/ci_install_dependency.sh"
+      - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened, labeled]
     paths:
       - "sgl-model-gateway/**"
+      - ".github/workflows/pr-test-rust.yml"
+      - "scripts/ci/cuda/ci_install_dependency.sh"
+      - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
   workflow_dispatch:
 
 concurrency:
