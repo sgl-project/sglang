@@ -35,13 +35,14 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarStats,
     InvalidGrammarObject,
 )
-from sglang.srt.constrained.torch_ops.bitmask_ops import (
-    apply_token_bitmask_inplace_torch,
-)
 from sglang.srt.constrained.utils import is_legacy_structural_tag
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import is_hip, is_npu
 
 _is_hip = is_hip()
+_is_npu = is_npu()
+if _is_npu:
+    import sgl_kernel_npu  # noqa: F401
+
 if _is_hip:
     from sgl_kernel import apply_token_bitmask_inplace_cuda
 else:
@@ -114,7 +115,7 @@ class XGrammarGrammar(BaseGrammarObject):
             else:
                 apply_token_bitmask_inplace_triton(logits, vocab_mask)
         elif logits.device.type == "npu":
-            apply_token_bitmask_inplace_torch(logits, vocab_mask)
+            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
         else:
             raise RuntimeError(f"Unsupported device: {logits.device.type}")
 
