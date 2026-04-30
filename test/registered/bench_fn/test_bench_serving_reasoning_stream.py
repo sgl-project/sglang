@@ -156,6 +156,18 @@ class TestBenchServingReasoningStream(CustomTestCase):
         self.assertGreater(out.ttft, 0.0)
         self.assertEqual(out.output_len, 2)
 
+    def test_usage_only_stream_chunk_does_not_break(self):
+        chunks = [
+            _make_chunk(reasoning_content="thinking"),
+            {"choices": [], "usage": {"completion_tokens": 1}},
+        ]
+        out = self._run(chunks)
+
+        self.assertTrue(out.success, msg=f"request failed: {out.error}")
+        self.assertEqual(out.generated_text, "thinking")
+        self.assertGreater(out.ttft, 0.0)
+        self.assertEqual(out.output_len, 1)
+
     def test_content_only_stream_unchanged(self):
         chunks = [
             _make_chunk(content="hi "),
