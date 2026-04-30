@@ -25,13 +25,9 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.utils import (
     assert_tensor_identical_across_cp_ranks,
-    can_cp_split,
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
+    can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
-    prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
 from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
@@ -55,6 +51,12 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
@@ -73,6 +75,7 @@ from sglang.srt.utils import (
     make_layers,
     maybe_torch_compile,
 )
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
@@ -450,7 +453,7 @@ class MQALayer(nn.Module):
             assert self.head_dim == config.v_head_dim
         assert config.num_key_value_heads == 1
 
-        rope_scaling = config.rope_scaling
+        rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
@@ -458,9 +461,7 @@ class MQALayer(nn.Module):
             assert (
                 config.compress_rope_theta == 160000
             ), f"{config.compress_rope_theta=}"
-        rope_base = (
-            config.compress_rope_theta if self.compress_ratio else config.rope_theta
-        )
+        rope_base = config.compress_rope_theta if self.compress_ratio else rope_theta
 
         self.rotary_emb = get_rope_wrapper(
             head_size=self.rope_head_dim,
@@ -494,7 +495,6 @@ class MQALayer(nn.Module):
         else:
             original_seq_len = rope_scaling["original_max_position_embeddings"]
 
-        rope_scaling = config.rope_scaling
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
             seqlen=config.max_position_embeddings,
@@ -1453,8 +1453,8 @@ class DeepseekV4ForCausalLM(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.nsa_enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, True, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+            if can_nsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,

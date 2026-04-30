@@ -1223,7 +1223,7 @@ impl RouterTrait for PDRouter {
     async fn get_server_info(&self, _req: Request<Body>) -> Response {
         // Get info from the first decode server to match sglang's server info format
         // Note: We use decode workers for server info to match expected format
-        self.proxy_to_first_prefill_worker("get_server_info", None)
+        self.proxy_to_first_prefill_worker("server_info", None)
             .await
     }
 

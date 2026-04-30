@@ -304,8 +304,8 @@ class WanDistCausalConv3d(nn.Conv3d):
         x = F.pad(x, padding)
 
         x = (
-            x.to(self.weight.dtype) if current_platform.is_mps() else x
-        )  # casting needed for mps since amp isn't supported
+            x if current_platform.is_amp_supported() else x.to(self.weight.dtype)
+        )  # casting needed if amp isn't supported
 
         x_padded, self._halo_recv_top_buf, self._halo_recv_bottom_buf = halo_exchange(
             x,

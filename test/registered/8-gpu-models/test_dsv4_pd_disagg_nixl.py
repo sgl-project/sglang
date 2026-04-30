@@ -1,17 +1,10 @@
-"""DSv4 Flash PD-disaggregation test with NIXL transfer backend.
-
-Topology (1 H200 node, 8 GPUs total):
-  - Prefill: GPU 0-3, tp=4 (pure TP, no DP attention) — optimized for
-    throughput on long prompts.
-  - Decode:  GPU 4-7, tp=4 dp=4 enable-dp-attention — optimized for
-    latency, each DP rank serves one stream.
-  - Mini load balancer fronting both.
-
-Both sides use the same DSv4 Flash FP8 weights and the same DSv4 envs as
-`run_flash_dp4.sh`. Transfer backend is NIXL (the focus of recent
-nixl/conn.py forward-delta work; this test is the e2e check that the
-generic `send_state` / shared buffer-pool changes do not break PD).
-"""
+"""DSv4 Flash PD-disagg with NIXL backend. Both sides run dp-attention
++ deepep + EAGLE MTP so attn_tp_size and the V4 state pool layout are
+fully symmetric: same SWA item_len under matching attn_tp, and same
+NSA c4/c128 indexer ring buffer size under matching spec status. nixl
+`send_state` is page-by-index and has no V4 TP-slice / spec-asymmetric
+path, so any layout mismatch would trip the item_len assert in
+`nixl/conn.py`."""
 
 import unittest
 from types import SimpleNamespace
@@ -33,26 +26,11 @@ DSV4_FLASH_MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
 
 DSV4_FLASH_ENV = {
     "SGLANG_DSV4_FP4_EXPERTS": "0",
+    # MTP num_draft_tokens=4 scales dispatch by ~4x; 256 overflows at bs=128.
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
-    "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
 }
 
 DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":96}}'
-
-# Symmetric across P and D for buffer / cuda-graph parameters.
-COMMON_ARGS = [
-    "--trust-remote-code",
-    "--moe-a2a-backend",
-    "deepep",
-    "--cuda-graph-max-bs",
-    "128",
-    "--max-running-requests",
-    "256",
-    "--deepep-config",
-    DEEPEP_CONFIG,
-    "--mem-fraction-static",
-    "0.7",
-]
 
 
 class TestDSv4FlashPDDisaggNIXL(PDDisaggregationServerBase):
@@ -72,19 +50,34 @@ class TestDSv4FlashPDDisaggNIXL(PDDisaggregationServerBase):
 
     @classmethod
     def start_prefill(cls):
-        # Prefill: pure TP=4, no DP attention. Tell prefill the decode
-        # topology (tp=4 dp=4) so it can ship state pages correctly.
         prefill_args = [
-            *COMMON_ARGS,
+            "--trust-remote-code",
             "--disaggregation-mode",
             "prefill",
             "--base-gpu-id",
             "0",
             "--tp",
             "4",
-            "--disaggregation-decode-tp",
+            "--dp",
             "4",
-            "--disaggregation-decode-dp",
+            "--enable-dp-attention",
+            "--moe-a2a-backend",
+            "deepep",
+            "--deepep-config",
+            DEEPEP_CONFIG,
+            "--cuda-graph-max-bs",
+            "128",
+            "--max-running-requests",
+            "256",
+            "--mem-fraction-static",
+            "0.7",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
             "4",
             *cls.transfer_backend,
             *cls.rdma_devices,
@@ -99,9 +92,8 @@ class TestDSv4FlashPDDisaggNIXL(PDDisaggregationServerBase):
 
     @classmethod
     def start_decode(cls):
-        # Decode: TP=4 + DP=4 attention.
         decode_args = [
-            *COMMON_ARGS,
+            "--trust-remote-code",
             "--disaggregation-mode",
             "decode",
             "--base-gpu-id",
@@ -111,6 +103,24 @@ class TestDSv4FlashPDDisaggNIXL(PDDisaggregationServerBase):
             "--dp",
             "4",
             "--enable-dp-attention",
+            "--moe-a2a-backend",
+            "deepep",
+            "--deepep-config",
+            DEEPEP_CONFIG,
+            "--cuda-graph-max-bs",
+            "128",
+            "--max-running-requests",
+            "256",
+            "--mem-fraction-static",
+            "0.7",
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "3",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "4",
             *cls.transfer_backend,
             *cls.rdma_devices,
         ]
@@ -135,7 +145,7 @@ class TestDSv4FlashPDDisaggNIXL(PDDisaggregationServerBase):
         )
         metrics = run_gsm8k_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["accuracy"], 0.6)
+        self.assertGreater(metrics["accuracy"], 0.95)
 
 
 if __name__ == "__main__":

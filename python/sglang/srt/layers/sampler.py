@@ -16,7 +16,12 @@ from sglang.srt.layers.utils.logprob import get_token_ids_logprobs, get_top_logp
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
 from sglang.srt.server_args import get_global_server_args
-from sglang.srt.utils.common import crash_on_warnings, get_bool_env_var, is_cuda, is_npu
+from sglang.srt.utils.common import (
+    crash_on_warnings,
+    get_bool_env_var,
+    is_cuda,
+    is_npu,
+)
 
 if is_cuda():
     from flashinfer.sampling import (
@@ -27,6 +32,7 @@ if is_cuda():
         top_k_renorm_prob,
         top_p_renorm_prob,
     )
+
 if is_npu():
     import torch_npu
 
@@ -327,13 +333,15 @@ class Sampler(nn.Module):
             (
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums)
+            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
 
         if any(x is not None for x in token_ids_logprobs):
             (
                 logits_output.next_token_token_ids_logprobs_val,
                 logits_output.next_token_token_ids_logprobs_idx,
-            ) = get_token_ids_logprobs(logprobs, token_ids_logprobs)
+            ) = get_token_ids_logprobs(
+                logprobs, token_ids_logprobs, no_copy_to_cpu=True
+            )
 
         logits_output.next_token_logprobs = logprobs[
             torch.arange(len(batch_next_token_ids), device=sampling_info.device),
@@ -397,7 +405,7 @@ class Sampler(nn.Module):
             (
                 logits_output.next_token_top_logprobs_val,
                 logits_output.next_token_top_logprobs_idx,
-            ) = get_top_logprobs(logprobs, top_logprobs_nums)
+            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
 
         # Handle token_ids logprobs if requested
         if needs_token_ids_logprobs:

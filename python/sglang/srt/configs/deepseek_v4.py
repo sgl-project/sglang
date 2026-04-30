@@ -24,7 +24,7 @@ class DeepSeekV4Config(PretrainedConfig):
     intermediate_size: int = 2048
     kv_lora_rank: int = 512
     max_position_embeddings: int = 65536
-    model_type: str = "deepseek_ref"
+    model_type: str = "deepseek_v4"
     moe_intermediate_size: int = 2048
     moe_layer_freq: int = 1
     n_group: int = 8

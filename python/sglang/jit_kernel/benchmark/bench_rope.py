@@ -10,6 +10,9 @@ from sglang.jit_kernel.benchmark.utils import (
     get_benchmark_range,
     run_benchmark,
 )
+from sglang.test.ci.ci_register import register_cuda_ci
+
+register_cuda_ci(est_time=6, suite="stage-b-kernel-benchmark-1-gpu-large")
 
 MAX_SEQ_LEN = 131072
 ROPE_BASE = 10000.0
@@ -64,13 +67,13 @@ def flashinfer_rope(
     )
 
 
-def sglang_rope_v0(
+def sglang_pos_enc_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    from sglang.jit_kernel.pos_enc import rotary_embedding_with_key
+    from sglang.jit_kernel.rope import rotary_embedding_with_key
 
     head_size = q.shape[-1]
     rotary_embedding_with_key(
@@ -83,26 +86,7 @@ def sglang_rope_v0(
     )
 
 
-def sglang_rope_v1(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    positions: torch.Tensor,
-    is_neox: bool,
-) -> None:
-    from sgl_kernel import apply_rope_with_cos_sin_cache_inplace
-
-    head_size = q.shape[-1]
-    apply_rope_with_cos_sin_cache_inplace(
-        positions=positions,
-        query=q.view(q.shape[0], -1),
-        key=k.view(k.shape[0], -1),
-        head_size=head_size,
-        cos_sin_cache=COS_SIN_CACHE,
-        is_neox=is_neox,
-    )
-
-
-def sglang_rope_v2(
+def sglang_fused_rope(
     q: torch.Tensor,
     k: torch.Tensor,
     positions: torch.Tensor,
@@ -118,7 +102,7 @@ def sglang_rope_v2(
 # ---------------------------------------------------------------------------
 
 
-def rope_v0_store(
+def jit_rope_then_store(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -150,38 +134,7 @@ def rope_v0_store(
     )
 
 
-def rope_v1_store(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    positions: torch.Tensor,
-    out_loc: torch.Tensor,
-    is_neox: bool,
-) -> None:
-    from sgl_kernel import FusedSetKVBufferArg, apply_rope_with_cos_sin_cache_inplace
-
-    head_size = q.shape[-1]
-    apply_rope_with_cos_sin_cache_inplace(
-        positions=positions,
-        query=q.view(q.shape[0], -1),
-        key=k.view(k.shape[0], -1),
-        head_size=head_size,
-        cos_sin_cache=COS_SIN_CACHE,
-        is_neox=is_neox,
-        fused_set_kv_buffer_arg=FusedSetKVBufferArg(
-            value=v.view(v.shape[0], -1),
-            k_buffer=k_cache,
-            v_buffer=v_cache,
-            k_scale=None,
-            v_scale=None,
-            cache_loc=out_loc,
-        ),
-    )
-
-
-def rope_v2_store(
+def jit_fused_rope_store(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -221,9 +174,13 @@ IS_NEOX_RANGE = get_benchmark_range(
 # Benchmark 1: RoPE only
 # ---------------------------------------------------------------------------
 
-ROPE_LINE_VALS = ["fi", "rope_v0", "rope_v1", "rope_v2"]
-ROPE_LINE_NAMES = ["FlashInfer", "SGL RoPE v0", "SGL RoPE v1", "SGL RoPE v2"]
-ROPE_STYLES = [("green", "-."), ("red", "-"), ("orange", "-"), ("blue", "--")]
+ROPE_LINE_VALS = ["flashinfer", "jit_pos_enc", "jit_fused_rope"]
+ROPE_LINE_NAMES = [
+    "FlashInfer",
+    "SGL JIT PosEnc",
+    "SGL JIT Fused RoPE",
+]
+ROPE_STYLES = [("green", "-."), ("red", "-"), ("blue", "--")]
 
 rope_configs = list(itertools.product(QK_HEAD_RANGE, IS_NEOX_RANGE, BS_RANGE))
 
@@ -263,10 +220,9 @@ def benchmark(batch_size: int, num_q_k_heads: str, is_neox: bool, provider: str)
     torch.cuda.synchronize()
 
     FN_MAP = {
-        "fi": flashinfer_rope,
-        "rope_v0": sglang_rope_v0,
-        "rope_v1": sglang_rope_v1,
-        "rope_v2": sglang_rope_v2,
+        "flashinfer": flashinfer_rope,
+        "jit_pos_enc": sglang_pos_enc_rope,
+        "jit_fused_rope": sglang_fused_rope,
     }
     fn = lambda: FN_MAP[provider](q, k, positions, is_neox)
     return run_benchmark(fn)
@@ -276,9 +232,12 @@ def benchmark(batch_size: int, num_q_k_heads: str, is_neox: bool, provider: str)
 # Benchmark 2: RoPE + KV cache store
 # ---------------------------------------------------------------------------
 
-STORE_LINE_VALS = ["rope_v0_store", "rope_v1_store", "rope_v2_store"]
-STORE_LINE_NAMES = ["SGL RoPE v0 + Store", "SGL RoPE v1 + Store", "SGL RoPE v2 + Store"]
-STORE_STYLES = [("red", "-"), ("orange", "-"), ("blue", "--")]
+STORE_LINE_VALS = ["jit_rope_then_store", "jit_fused_store"]
+STORE_LINE_NAMES = [
+    "SGL JIT RoPE + Store",
+    "SGL JIT Fused RoPE + Store",
+]
+STORE_STYLES = [("red", "-"), ("blue", "--")]
 
 store_configs = list(itertools.product(QK_HEAD_RANGE, IS_NEOX_RANGE, BS_RANGE))
 
@@ -333,9 +292,8 @@ def benchmark_store(batch_size: int, num_q_k_heads: str, is_neox: bool, provider
     torch.cuda.synchronize()
 
     FN_MAP = {
-        "rope_v0_store": rope_v0_store,
-        "rope_v1_store": rope_v1_store,
-        "rope_v2_store": rope_v2_store,
+        "jit_rope_then_store": jit_rope_then_store,
+        "jit_fused_store": jit_fused_rope_store,
     }
     fn = lambda: FN_MAP[provider](
         q, k, v, k_cache, v_cache, positions, out_loc, is_neox

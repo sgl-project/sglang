@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
@@ -41,6 +41,7 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.hf_transformers_utils import (
@@ -49,10 +50,12 @@ from sglang.srt.utils.hf_transformers_utils import (
     get_tokenizer_from_processor,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +87,7 @@ class BaseTpWorker(ABC):
     def get_pad_input_ids_func(self):
         return getattr(self.model_runner.model, "pad_input_ids", None)
 
-    def get_memory_pool(self):
+    def get_memory_pool(self) -> Tuple[ReqToTokenPool, BaseTokenToKVPoolAllocator]:
         return (
             self.model_runner.req_to_token_pool,
             self.model_runner.token_to_kv_pool_allocator,
@@ -187,7 +190,17 @@ class BaseTpWorker(ABC):
     ):
         # The LoRA code handles TP sharding internally using slice_lora_a_weights
         # and slice_lora_b_weights methods (see lora/layers.py:46-49, mem_pool.py:437-440).
-        tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
+        if recv_req.load_format == "flattened_bucket":
+            flattened_data = MultiprocessingSerializer.deserialize(
+                recv_req.serialized_tensors
+            )
+            bucket = FlattenedTensorBucket(
+                flattened_tensor=flattened_data["flattened_tensor"],
+                metadata=flattened_data["metadata"],
+            )
+            tensors = dict(bucket.reconstruct_tensors())
+        else:
+            tensors = MultiprocessingSerializer.deserialize(recv_req.serialized_tensors)
         result = self.model_runner.load_lora_adapter_from_tensors(
             recv_req.to_ref(),
             tensors,
@@ -198,9 +211,8 @@ class BaseTpWorker(ABC):
 
     def forward_batch_embedding(self, model_worker_batch: ModelWorkerBatch):
         forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
-        logits_output = self.model_runner.forward(forward_batch).logits_output
-        embeddings = logits_output.embeddings
-        return embeddings
+        output = self.model_runner.forward(forward_batch).logits_output
+        return output  # Returns EmbeddingPoolerOutput
 
 
 class TpModelWorker(BaseTpWorker):
@@ -220,6 +232,7 @@ class TpModelWorker(BaseTpWorker):
         is_draft_worker: bool = False,
         req_to_token_pool: Optional[ReqToTokenPool] = None,
         token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator] = None,
+        memory_pool_config: Optional[MemoryPoolConfig] = None,
         is_multi_layer_eagle: bool = False,
     ):
         # Parse args
@@ -239,6 +252,8 @@ class TpModelWorker(BaseTpWorker):
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.attn_cp_rank = attn_cp_rank
         self.moe_dp_rank = moe_dp_rank
+        # Draft worker: target's resolved MemoryPoolConfig (forwarded to ModelRunner).
+        self.memory_pool_config = memory_pool_config
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -260,6 +275,7 @@ class TpModelWorker(BaseTpWorker):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -268,6 +284,7 @@ class TpModelWorker(BaseTpWorker):
                     tokenizer_mode=server_args.tokenizer_mode,
                     trust_remote_code=server_args.trust_remote_code,
                     revision=server_args.revision,
+                    tokenizer_backend=server_args.tokenizer_backend,
                 )
         self.device = self.model_runner.device
 
@@ -343,6 +360,7 @@ class TpModelWorker(BaseTpWorker):
             is_draft_worker=self.is_draft_worker,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            memory_pool_config=self.memory_pool_config,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
         )
 
@@ -368,6 +386,7 @@ class TpModelWorker(BaseTpWorker):
                     is_draft_worker=self.is_draft_worker,
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                    memory_pool_config=self.memory_pool_config,
                     draft_model_idx=i,
                 )
             )
@@ -425,12 +444,6 @@ class TpModelWorker(BaseTpWorker):
             can_run_cuda_graph=can_run_cuda_graph,
         )
 
-    def get_remote_instance_transfer_engine_info(self):
-        return (
-            self.model_runner.remote_instance_transfer_engine_session_id,
-            self.model_runner.remote_instance_transfer_engine_weight_info,
-        )
-
     def forward_batch_generation(
         self,
         model_worker_batch: ModelWorkerBatch,
@@ -466,6 +479,7 @@ class TpModelWorker(BaseTpWorker):
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                routed_experts_output=out.routed_experts_output,
             )
 
             if is_verify:

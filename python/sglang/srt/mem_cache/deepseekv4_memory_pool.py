@@ -567,6 +567,13 @@ class DeepSeekV4TokenToKVPool(KVCache):
 
         return self.full_to_swa_index_mapping[kv_indices].to(torch.int32)
 
+    def set_swa_loc(self, loc: torch.Tensor) -> None:
+        # No-op: SWAKVPool's set_swa_loc precomputes SWA-translated loc once per
+        # forward batch for set_kv_buffer to read via self.swa_loc. DSv4 has its
+        # own equivalent cache via `_should_cache_swa + cached_loc` (in
+        # set_swa_key_buffer_radix_fused), so we ignore main's precomputed loc.
+        pass
+
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
         data_lens: List[int] = []

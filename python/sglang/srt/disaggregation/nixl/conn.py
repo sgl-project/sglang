@@ -20,7 +20,10 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.common.utils import group_concurrent_contiguous
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.utils import (
+    DisaggregationMode,
+    filter_kv_indices_for_cp_rank,
+)
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
@@ -476,25 +479,35 @@ class NixlKVManager(CommonKVManager):
         # Get configuration from kv_args
         local_tp_rank_in_group = self.kv_args.engine_rank % prefill_tp_size
         dst_tp_rank_in_group = decode_tp_rank % decode_tp_size
-        num_kv_heads = self.kv_args.kv_head_num
-
-        # Calculate head distribution
-        src_heads_per_rank = num_kv_heads
-        dst_heads_per_rank = num_kv_heads * prefill_tp_size // decode_tp_size
 
         src_kv_item_len = self.kv_args.kv_item_lens[0]
         page_size = self.kv_args.page_size
 
+        # Use total KV head count (not per-rank) for correct head distribution.
+        # Per-rank kv_head_num is max(1, total//tp) which loses info when total < tp.
+        total_kv_heads = getattr(self.kv_args, "total_kv_head_num", 0)
+        if total_kv_heads <= 0:
+            total_kv_heads = self.kv_args.kv_head_num * prefill_tp_size
+
+        src_heads_per_rank = max(1, total_kv_heads // prefill_tp_size)
+        dst_heads_per_rank = max(1, total_kv_heads // decode_tp_size)
+
         bytes_per_head_slice_to_send = (
             dst_kv_item_len // page_size // dst_heads_per_rank
         )
+
+        # GQA replication: how many prefill ranks share the same KV head
+        src_replication = max(1, prefill_tp_size // total_kv_heads)
 
         # Determine which heads to send
         if prefill_tp_size > decode_tp_size:
             # Multiple prefill ranks to one decode rank
             src_head_start_offset = 0
             num_heads_to_send = src_heads_per_rank
-            dst_head_start_offset = local_tp_rank_in_group * src_heads_per_rank
+            unique_head_idx = local_tp_rank_in_group // src_replication
+            dst_head_start_offset = (
+                unique_head_idx * src_heads_per_rank
+            ) % dst_heads_per_rank
         else:
             # Send KVCache from 1 prefill instance to multiple decode instances
             src_head_start_offset = (
@@ -722,7 +735,9 @@ class NixlKVManager(CommonKVManager):
             assert len(chunked_dst_kv_indice) == len(kv_indices)
             assert req.agent_name in self.decode_kv_args_table
 
-            notif = f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.pp_rank}"
+            notif = (
+                f"{req.room}_kv_{chunk_id}_{int(is_last)}_{self.kv_args.engine_rank}"
+            )
             decode_tp_size = self.decode_kv_args_table[req.agent_name].decode_tp_size
 
             if self.is_mla_backend or (decode_tp_size == self.attn_tp_size):
@@ -902,6 +917,20 @@ class NixlKVSender(CommonKVSender):
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
 
+        # Special handling for cp
+        if self.kv_mgr.enable_all_cp_ranks_for_transfer:
+            kv_indices, index_slice = filter_kv_indices_for_cp_rank(
+                self.kv_mgr,
+                kv_indices,
+                index_slice,
+            )
+        elif self.kv_mgr.is_dummy_cp_rank:
+            if not is_last:
+                return
+            else:
+                self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
+                return
+
         new_xfer_handles = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
@@ -937,20 +966,18 @@ class NixlKVReceiver(CommonKVReceiver):
         mgr: NixlKVManager,
         bootstrap_addr: str,
         bootstrap_room: Optional[int] = None,
-        prefill_dp_rank: Optional[int] = None,
     ):
         self.started_transfer = False
-        self.conclude_state = None
-        super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
-
-        # Track this room with its bootstrap address for heartbeat monitoring
-        if hasattr(self.kv_mgr, "addr_to_rooms_tracker"):
-            self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].add(
-                self.bootstrap_room
-            )
+        super().__init__(mgr, bootstrap_addr, bootstrap_room)
         self.init_time = None
 
     def init(
+        self,
+        prefill_dp_rank: int,
+    ):
+        super().init(prefill_dp_rank)
+
+    def send_metadata(
         self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
@@ -1015,7 +1042,7 @@ class NixlKVReceiver(CommonKVReceiver):
             self.conclude_state = status
             return status
         if not self.started_transfer:
-            return KVPoll.WaitingForInput  # type: ignore
+            return status
 
         now = time.time()
         elapsed = now - self.init_time
@@ -1075,7 +1102,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         packed_kv_data_ptrs,
                         packed_aux_data_ptrs,
                         str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
-                        str(self.kv_mgr.kv_args.decode_tp_size).encode("ascii"),
+                        str(self.kv_mgr.attn_tp_size).encode("ascii"),
                         str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
                         packed_state_data_ptrs,

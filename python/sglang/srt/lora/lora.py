@@ -46,7 +46,6 @@ class LoRALayer(nn.Module):
 
 
 class LoRAAdapter(nn.Module):
-
     def __init__(
         self,
         uid: str,
@@ -129,16 +128,19 @@ class LoRAAdapter(nn.Module):
             # added/extra token emb
             self.added_tokens_embeddings[name] = loaded_weight.cpu()
             assert loaded_weight.shape[0] == self.config.lora_added_tokens_size, (
-                f"LoRA adapter {self.uid} has extra_vocab_size {self.config.extra_vocab_size} specified in the config, "
-                f"but the loaded weight has {loaded_weight.shape[0]} extra vocab size"
+                f"LoRA adapter {self.uid} has lora_added_tokens_size {self.config.lora_added_tokens_size} specified in the config, "
+                f"but the loaded weight '{name}' has shape {loaded_weight.shape[0]} in first dimension"
             )
 
     def _normalize_weights(self):
-        # normalize kv_proj and gate_up_proj
         for layer in self.layers:
             weight_names = list(layer.weights.keys())
             self.normalize_qkv_proj(weight_names, layer.weights)
+            self._rename_expert_w_to_proj(layer.weights)
+            weight_names = list(layer.weights.keys())
             self.normalize_gate_up_proj(weight_names, layer.weights)
+            weight_names = list(layer.weights.keys())
+            self.normalize_fused_qkv_a_proj(weight_names, layer.weights)
 
     def normalize_qkv_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
@@ -193,6 +195,23 @@ class LoRAAdapter(nn.Module):
                     weights[qkv_name] = weights[qkv_name].repeat(3, 1)
                 # else: no-op as LoRA B weight is already stacked.
 
+    def _rename_expert_w_to_proj(self, weights: Dict[str, torch.Tensor]):
+        """Rename w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj so that
+        normalize_gate_up_proj can stack them into gate_up_proj."""
+        renames = {}
+        for name in list(weights.keys()):
+            new_name = name
+            if ".w1." in name:
+                new_name = name.replace(".w1.", ".gate_proj.")
+            elif ".w3." in name:
+                new_name = name.replace(".w3.", ".up_proj.")
+            elif ".w2." in name:
+                new_name = name.replace(".w2.", ".down_proj.")
+            if new_name != name:
+                renames[name] = new_name
+        for old_name, new_name in renames.items():
+            weights[new_name] = weights.pop(old_name)
+
     def normalize_gate_up_proj(
         self, weight_names: List[str], weights: Dict[str, torch.Tensor]
     ):
@@ -207,8 +226,9 @@ class LoRAAdapter(nn.Module):
                         f"Received backend: {self.lora_backend.name}. Please verify your backend configuration "
                         f"or consider implementing custom initialization logic for other backends."
                     )
+                cat_dim = weights[weight_name].dim() - 2
                 weights[gate_up_name] = torch.cat(
-                    (weights[weight_name], weights[up_name]), 0
+                    (weights[weight_name], weights[up_name]), cat_dim
                 )
                 weights.pop(weight_name)
                 if up_name in weights:
@@ -217,8 +237,38 @@ class LoRAAdapter(nn.Module):
                 # If gate_up_proj is already stacked, we normalize it following the SGL convention
                 gate_up_name = weight_name
                 if "lora_A" in weight_name:
-                    weights[gate_up_name] = weights[gate_up_name].repeat(2, 1)
+                    ndim = weights[gate_up_name].dim()
+                    repeat_dims = [1] * ndim
+                    repeat_dims[ndim - 2] = 2
+                    weights[gate_up_name] = weights[gate_up_name].repeat(*repeat_dims)
                 # else: no-op as LoRA B weight is already stacked.
+
+    def normalize_fused_qkv_a_proj(
+        self, weight_names: List[str], weights: Dict[str, torch.Tensor]
+    ):
+        """Fuse separate q_a_proj and kv_a_proj_with_mqa LoRA weights into
+        a single fused_qkv_a_proj_with_mqa entry (concat along dim 0 for
+        both A and B), matching the DeepSeek MLA fused projection layout."""
+        for weight_name in weight_names:
+            if "q_a_proj" not in weight_name:
+                continue
+            if "fused_qkv_a_proj_with_mqa" in weight_name:
+                continue
+
+            q_a_name = weight_name
+            kv_a_name = weight_name.replace("q_a_proj", "kv_a_proj_with_mqa")
+            fused_name = weight_name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
+
+            kv_a_weight = (
+                weights[kv_a_name]
+                if kv_a_name in weights
+                else torch.zeros_like(weights[q_a_name])
+            )
+
+            weights[fused_name] = torch.cat((weights[q_a_name], kv_a_weight), dim=0)
+            weights.pop(q_a_name)
+            if kv_a_name in weights:
+                weights.pop(kv_a_name)
 
     def pin_weights_in_cpu(self):
         for layer in self.layers:

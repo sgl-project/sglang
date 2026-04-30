@@ -118,12 +118,20 @@ def create_mm_data_row(
         prompt_str = f"<image>{text_prompt}"
 
     # Calculate total tokens (text + vision)
-    prompt_len = processor(
-        text=[prompt_str],
-        images=images,
-        padding=False,
-        return_tensors="pt",
-    )["input_ids"].numel()
+    if type(processor).__name__ == "KimiK25Processor":
+        medias = [{"type": "image", "image": img} for img in images]
+        prompt_len = processor(
+            text=prompt_str,
+            medias=medias,
+            return_tensors="pt",
+        )["input_ids"].numel()
+    else:
+        prompt_len = processor(
+            text=[prompt_str],
+            images=images,
+            padding=False,
+            return_tensors="pt",
+        )["input_ids"].numel()
 
     # Calculate text-only tokens
     try:
@@ -148,15 +156,18 @@ def create_mm_data_row(
     # Vision tokens = total tokens - text tokens
     vision_prompt_len = prompt_len - text_prompt_len
 
-    use_raw_prompt = backend in [
-        "sglang",
-        "sglang-oai",
-        "sglang-oai-chat",
-        "vllm",
-        "vllm-chat",
-        "lmdeploy",
-        "lmdeploy-chat",
-    ]
+    supported_backends = ["sglang", "sglang-native", "sglang-oai-chat"]
+    if backend not in supported_backends:
+        raise ValueError(
+            f"Image dataset only supports backends: {supported_backends}, "
+            f"got '{backend}'."
+        )
+
+    # sglang-oai-chat: server's chat handler applies chat template, so send raw text.
+    # sglang/sglang-native: /generate does not apply chat template, so send prompt_str
+    #         which contains image placeholder tokens needed by the multimodal processor.
+    use_raw_prompt = backend == "sglang-oai-chat"
+
     return DatasetRow(
         prompt=text_prompt if use_raw_prompt else prompt_str,
         prompt_len=prompt_len,

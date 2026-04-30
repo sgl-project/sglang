@@ -1,0 +1,55 @@
+name: Release Docker Runtime Images
+#
+# Builds and publishes runtime Docker images (production-optimized, ~50% smaller):
+#   - lmsysorg/sglang:v{version}-runtime, lmsysorg/sglang:latest-runtime
+#   - lmsysorg/sglang:v{version}-cu130-runtime, lmsysorg/sglang:latest-cu130-runtime
+#
+on:
+  push:
+    tags:
+      - "v[0-9]+.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without v prefix, e.g., 0.5.7)"
+        required: true
+      image_repo:
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        required: false
+        default: "lmsysorg/sglang"
+
+jobs:
+  resolve-version:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$VERSION" ] || ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "::error::Invalid version: $VERSION (expected: X.Y.Z)"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+  build-and-publish:
+    needs: resolve-version
+    uses: ./.github/workflows/_docker-build-and-publish.yml
+    with:
+      docker_target: runtime
+      sgl_version: ${{ needs.resolve-version.outputs.version }}
+      use_environment: prod
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
+      tag_config: |
+        [
+          {"cuda": "cu129", "tags": ["v${{ needs.resolve-version.outputs.version }}-runtime", "latest-runtime"]},
+          {"cuda": "cu130", "tags": ["v${{ needs.resolve-version.outputs.version }}-cu130-runtime", "latest-cu130-runtime"]}
+        ]
+    secrets: inherit
