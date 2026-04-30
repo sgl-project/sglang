@@ -73,7 +73,6 @@ enum class CPUActMethod : int {
   gelu_and_mul = 2,
 };
 
-
 enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3, MXFP4 = 4 };
 
 constexpr bool operator==(CPUQuantMethod a, int64_t b) {

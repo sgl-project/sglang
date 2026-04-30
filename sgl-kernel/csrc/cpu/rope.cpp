@@ -694,8 +694,7 @@ inline void store_fvec<at::BFloat16>(at::BFloat16* ptr, const at::vec::Vectorize
 template <>
 inline void store_fvec<at::Half>(at::Half* ptr, const at::vec::Vectorized<float>& v) {
   _mm256_storeu_si256(
-      reinterpret_cast<__m256i*>(ptr),
-      _mm512_cvtps_ph(__m512(v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+      reinterpret_cast<__m256i*>(ptr), _mm512_cvtps_ph(__m512(v), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
 }
 #endif
 
