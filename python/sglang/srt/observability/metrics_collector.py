@@ -743,14 +743,6 @@ class SchedulerMetricsCollector:
             ),
             labelnames=list(labels.keys()) + ["category"],
         )
-        self.gpu_overlap_wait_seconds_total = Counter(
-            name="sglang:gpu_overlap_wait_seconds_total",
-            documentation=(
-                "Total time that GPU forward stream was idle waiting for "
-                "the CPU schedule stream (overlap bubble)."
-            ),
-            labelnames=list(labels.keys()) + ["category"],
-        )
         self.estimated_flops_per_gpu_total = Counter(
             name="sglang:estimated_flops_per_gpu_total",
             documentation=(
@@ -1021,16 +1013,6 @@ class SchedulerMetricsCollector:
                     **dp_cooperation_info.to_labels(),
                 ).inc(delta)
 
-    def increment_gpu_overlap_wait_seconds(
-        self,
-        category: str,
-        t: float,
-        dp_cooperation_info: Optional[DPCooperationInfo],
-    ):
-        self.gpu_overlap_wait_seconds_total.labels(
-            **self.labels, category=category
-        ).inc(t)
-
     def increment_gpu_execution_seconds(
         self,
         category: str,
@@ -1246,23 +1228,24 @@ class TokenizerMetricsCollector:
             8000,
             9000,
             10000,
-            12000,
+            12500,
             15000,
-            18000,
+            17500,
             20000,
-            22000,
+            22500,
             25000,
-            28000,
+            27500,
             30000,
             35000,
             40000,
             60000,
-            90000,
+            80000,
             100000,
             200000,
             300000,
+            400000,
             600000,
-            900000,
+            800000,
             1000000,
             1100000,
         ]

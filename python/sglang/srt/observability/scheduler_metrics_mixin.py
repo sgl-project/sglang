@@ -28,7 +28,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
-from sglang.srt.utils.device_timer import DeviceTimer, GapTimer
+from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
 
 if TYPE_CHECKING:
@@ -169,15 +169,8 @@ class SchedulerMetricsMixin:
                 if self.enable_metrics:
                     self.metrics_collector.increment_gpu_execution_seconds(**kwargs)
 
-            def _wrap_bubble_reporter(**kwargs):
-                if self.enable_metrics:
-                    self.metrics_collector.increment_gpu_overlap_wait_seconds(**kwargs)
-
             self.forward_pass_device_timer = DeviceTimer(
                 reporter=_wrap_execution_reporter,
-            )
-            self.bubble_timer = GapTimer(
-                reporter=_wrap_bubble_reporter,
             )
 
         self.init_kv_events(self.server_args.kv_events_config)
@@ -953,22 +946,3 @@ class SchedulerMetricsMixin:
             self._device_timer_window_execution_s = 0.0
             self._device_timer_window_start = now
             self._device_timer_window_batch_count = 0
-
-    @contextmanager
-    def record_bubble_metrics(self: Scheduler, batch: ScheduleBatch):
-        if not ENABLE_METRICS_DEVICE_TIMER:
-            yield
-            return
-
-        category = "forward_" + batch.forward_mode.name.lower()
-        with self.bubble_timer.wrap(
-            metadata=dict(
-                category=category,
-                dp_cooperation_info=batch.dp_cooperation_info,
-            ),
-        ):
-            yield
-
-    def cancel_bubble_timer(self: Scheduler):
-        if ENABLE_METRICS_DEVICE_TIMER:
-            self.bubble_timer.cancel()
