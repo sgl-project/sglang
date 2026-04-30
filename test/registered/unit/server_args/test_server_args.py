@@ -33,6 +33,16 @@ class TestPrepareServerArgs(CustomTestCase):
             {"rope_scaling": {"factor": 2.0, "rope_type": "linear"}},
         )
 
+    def test_prepare_server_args_disable_multimodal(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
+                "--no-enable-multimodal",
+            ]
+        )
+        self.assertFalse(server_args.enable_multimodal)
+
 
 class TestLoadBalanceMethod(unittest.TestCase):
     def test_non_pd_defaults_to_round_robin(self):

@@ -259,6 +259,7 @@ class ModelConfig:
 
         self.hf_config.encoder_only = encoder_only
         self.hf_config.language_only = language_only
+        self.hf_config.enable_multimodal = enable_multimodal
 
         # matryoshka embeddings
         self.matryoshka_dimensions = getattr(

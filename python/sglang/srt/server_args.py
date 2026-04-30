@@ -4191,8 +4191,8 @@ class ServerArgs:
         parser.add_argument(
             "--enable-multimodal",
             default=ServerArgs.enable_multimodal,
-            action="store_true",
-            help="Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
+            action=argparse.BooleanOptionalAction,
+            help="Enable or disable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
         )
         parser.add_argument(
             "--revision",

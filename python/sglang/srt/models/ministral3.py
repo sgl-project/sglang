@@ -1,9 +1,14 @@
 from typing import Any, Dict, Optional
 
 import torch
+from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import (
     LlamaAttention,
@@ -122,9 +127,20 @@ class Ministral3Model(LlamaModel):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        # Override layer creation to use Ministral3Attention
-        super().__init__(config, quant_config, prefix)
-
+        nn.Module.__init__(self)
+        self.config = config
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+        self.pp_group = get_pp_group()
+        if self.pp_group.is_first_rank:
+            self.embed_tokens = VocabParallelEmbedding(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                prefix=add_prefix("embed_tokens", prefix),
+            )
+        else:
+            self.embed_tokens = PPMissingLayer()
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Ministral3DecoderLayer(
@@ -134,6 +150,11 @@ class Ministral3Model(LlamaModel):
             pp_size=self.pp_group.world_size,
             prefix="model.layers",
         )
+        if self.pp_group.is_last_rank:
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        else:
+            self.norm = PPMissingLayer(return_tuple=True)
+        self.layers_to_capture = []
 
 
 class Ministral3ForCausalLM(LlamaForCausalLM):

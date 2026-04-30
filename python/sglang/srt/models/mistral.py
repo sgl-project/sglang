@@ -92,6 +92,20 @@ class Mistral3ForConditionalGeneration:
     MULTIMODAL_PROJECTOR_TYPE = Mistral3MultiModalProjector
 
     def __init__(self, **kwargs):
+        self.text_only = (
+            getattr(kwargs["config"], "language_only", False)
+            or getattr(kwargs["config"], "enable_multimodal", None) is False
+        )
+        if self.text_only:
+            from sglang.srt.models.ministral3 import Ministral3ForCausalLM
+
+            self.inner = Ministral3ForCausalLM(
+                kwargs["config"].text_config,
+                quant_config=kwargs.get("quant_config"),
+                prefix=kwargs.get("prefix", ""),
+            )
+            return
+
         # lazy load inner class
         # to bypass circular import
         from sglang.srt.models.llava import LlavaForConditionalGeneration
@@ -173,7 +187,16 @@ class Mistral3ForConditionalGeneration:
           lm_head.X                -> language_model.lm_head.X
         """
 
-        def normalize(ws):
+        def normalize_text_only(ws):
+            for name, w in ws:
+                if name.startswith("language_model."):
+                    yield name[len("language_model.") :], w
+                elif name.startswith("model.language_model."):
+                    yield "model." + name[len("model.language_model.") :], w
+                elif name.startswith("lm_head."):
+                    yield name, w
+
+        def normalize_multimodal(ws):
             for name, w in ws:
                 if name.startswith("model.language_model."):
                     rest = name[len("model.language_model.") :]
@@ -189,7 +212,9 @@ class Mistral3ForConditionalGeneration:
                     name = "language_model." + name
                 yield name, w
 
-        return self.inner.load_weights(normalize(weights))
+        if self.text_only:
+            return self.inner.load_weights(normalize_text_only(weights))
+        return self.inner.load_weights(normalize_multimodal(weights))
 
 
 EntryClass = [MistralForCausalLM, Mistral3ForConditionalGeneration]
