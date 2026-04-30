@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Dict, Tuple
+from typing import TYPE_CHECKING, Dict, List, Tuple
 
 import torch
 
@@ -30,12 +30,7 @@ if TYPE_CHECKING:
 
 
 class CpDecodeAttnTpContext:
-    """Context for managing CP-mode decode attention TP partitioning.
-
-    This class encapsulates the logic for determining whether decode attention TP
-    should be enabled, and provides utilities for slicing weights and computing
-    local dimensions.
-    """
+    """Slices replicated attention weights across CP ranks during decode."""
 
     def __init__(self):
         dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
@@ -50,175 +45,128 @@ class CpDecodeAttnTpContext:
             self.decode_tp_size = None
             logger.info("Disable CP decode attention TP")
 
-        # State for current forward: whether to use attention TP
         self.use_decode_attn_tp = False
-
-        # Per-linear cache for sliced state.
-        # Keyed by id(linear_instance).
-        self._slice_cache: Dict[int, dict] = {}
+        self._slice_cache: Dict = {}
 
     @property
     def is_enabled(self) -> bool:
-        """Check if CP decode attention TP is enabled (has valid rank and size)."""
         return self.decode_tp_size is not None and self.decode_tp_size > 1
 
-    def set_decode_attn_tp(self, forward_batch: "ForwardBatch"):
-        """Set whether to use attention TP for current forward.
-
-        Attention TP is used when:
-        1. CP mode is enabled (tp_size=1, weights repeated)
-        2. We're not in CP prefill mode (which needs all heads)
-        """
+    def set_decode_attn_tp(self, forward_batch: ForwardBatch):
         if not self.is_enabled:
             self.use_decode_attn_tp = False
             return
-
         self.use_decode_attn_tp = not dsa_use_prefill_cp(forward_batch)
 
+    def _slice(self, tensor: torch.Tensor, dim: int) -> torch.Tensor:
+        assert dim in (0, 1)
+        chunk = tensor.shape[dim] // self.decode_tp_size
+        sliced = tensor.narrow(dim, self.decode_tp_rank * chunk, chunk)
+        return sliced if dim == 0 else sliced.contiguous()
+
+    # ==================== Unified activate/restore ====================
+
+    def _activate(self, obj, attr_name: str, dim: int):
+        """Replace obj.attr_name with its TP-sliced version. No-op if attr is None."""
+        tensor = getattr(obj, attr_name, None)
+        if tensor is None:
+            return
+        is_param = isinstance(tensor, torch.nn.Parameter)
+        raw = tensor.data if is_param else tensor
+        assert isinstance(raw, torch.Tensor) and raw.dim() > dim, (
+            f"CP decode attn TP: {type(obj).__name__}.{attr_name} is not sliceable "
+            f"(type={type(tensor).__name__}, dim={raw.dim()}, required_dim>{dim})"
+        )
+        assert raw.shape[dim] % self.decode_tp_size == 0, (
+            f"CP decode attn TP: {type(obj).__name__}.{attr_name}.shape[{dim}]={raw.shape[dim]} "
+            f"not divisible by decode_tp_size={self.decode_tp_size}"
+        )
+
+        cache_key = (id(obj), attr_name)
+        cache = self._slice_cache.get(cache_key)
+        if cache is None:
+            cache = (raw, self._slice(raw, dim), is_param)
+            self._slice_cache[cache_key] = cache
+
+        if cache[2]:
+            tensor.data = cache[1]
+        else:
+            setattr(obj, attr_name, cache[1])
+
+    def _restore(self, obj, attr_name: str):
+        cache = self._slice_cache.get((id(obj), attr_name))
+        if cache is None:
+            return
+        orig, _, is_param = cache
+        if is_param:
+            getattr(obj, attr_name).data = orig
+        else:
+            setattr(obj, attr_name, orig)
+
+    # ==================== Linear helpers ====================
+
+    def _get_linear_attrs(self, linear_instance) -> List[Tuple]:
+        """Return (obj, attr_name, dim) list for a linear layer."""
+        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
+
+        if isinstance(linear_instance, RowParallelLinear):
+            dim = 1
+        elif isinstance(linear_instance, ColumnParallelLinear):
+            dim = 0
+        else:
+            return []
+
+        attrs = [(linear_instance, "weight", dim)]
+        for scale_name in ("weight_scale_inv", "weight_scale"):
+            if getattr(linear_instance, scale_name, None) is not None:
+                attrs.append((linear_instance, scale_name, dim))
+        return attrs
+
+    # ==================== Context manager ====================
+
     @contextmanager
-    def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch, modules):
+    def maybe_use_decode_attn_tp(
+        self,
+        forward_batch: ForwardBatch,
+        modules: list,
+        tensor_attrs: List[Tuple] = None,
+    ):
+        """Activate decode attention TP for the duration of the block.
+
+        Args:
+            modules: Linear layers (ColumnParallel/RowParallel) to slice.
+            tensor_attrs: (obj, attr_name, dim) tuples for absorbed weights.
+        """
         self.set_decode_attn_tp(forward_batch)
         if not self.use_decode_attn_tp:
             yield
             return
 
-        activated = []
+        all_attrs = []  # (obj, attr_name) pairs to restore
+        size_overrides = []  # (linear, size_attr, orig_size)
         try:
-            for module in modules:
-                self.activate(module)
-                activated.append(module)
+            for linear in modules:
+                for obj, attr_name, dim in self._get_linear_attrs(linear):
+                    self._activate(obj, attr_name, dim)
+                    all_attrs.append((obj, attr_name))
+                from sglang.srt.layers.linear import RowParallelLinear
+
+                size_attr = (
+                    "input_size_per_partition"
+                    if isinstance(linear, RowParallelLinear)
+                    else "output_size_per_partition"
+                )
+                orig_size = getattr(linear, size_attr)
+                setattr(linear, size_attr, orig_size // self.decode_tp_size)
+                size_overrides.append((linear, size_attr, orig_size))
+
+            if tensor_attrs:
+                for obj, attr_name, dim in tensor_attrs:
+                    self._activate(obj, attr_name, dim)
+                    all_attrs.append((obj, attr_name))
             yield
         finally:
-            for module in reversed(activated):
-                self.restore(module)
-
-    # ============== Unified initialization for Linear layers ==============
-
-    def init_slices(
-        self,
-        linear_instance,
-        dim: int,  # 0 for column, 1 for row
-    ) -> Tuple[torch.Tensor, int, Dict[str, torch.Tensor]]:
-        """Initialize sliced weight and scales.
-
-        Args:
-            linear_instance: The Linear instance (to get weight and scales).
-            dim: 0=column (slice dim 0), 1=row (slice dim 1)
-
-        Returns:
-            Tuple of (sliced_weight, sliced_size, scales)
-        """
-        assert dim in (0, 1), f"dim must be 0 or 1, but got {dim}"
-        weight = linear_instance.weight.data
-        if not self.is_enabled:
-            if dim == 0:
-                return weight, weight.shape[0], {}
-            else:
-                return weight, weight.shape[1], {}
-
-        rank, size = self.decode_tp_rank, self.decode_tp_size
-
-        assert (
-            weight.shape[dim] % size == 0
-        ), f"weight shape {weight.shape} {dim=} is not divisible by {size}"
-        if dim == 0:
-            # Column parallel: slice along dim 0
-            chunk = weight.shape[0] // size
-            start, end = rank * chunk, (rank + 1) * chunk
-            sliced_weight = weight[start:end]
-            sliced_size = sliced_weight.shape[0]
-        else:
-            # Row parallel: slice along dim 1
-            chunk = weight.shape[1] // size
-            start, end = rank * chunk, (rank + 1) * chunk
-            sliced_weight = weight[:, start:end].contiguous()
-            sliced_size = sliced_weight.shape[1]
-
-        # Slice scales (independently compute chunk size from the scale's own shape,
-        # may have different shapes, e.g. block quantization)
-        scales = {}
-        for attr in ("weight_scale_inv", "weight_scale"):
-            s = getattr(linear_instance, attr, None)
-            if s is not None:
-                s = s.data
-                assert (
-                    s.shape[dim] % size == 0
-                ), f"scale {attr} shape {s.shape} {dim=} is not divisible by {size}"
-                if dim == 0:
-                    sc = s.shape[0] // size
-                    scales[attr] = s[rank * sc : (rank + 1) * sc]
-                else:
-                    sc = s.shape[1] // size
-                    scales[attr] = s[:, rank * sc : (rank + 1) * sc].contiguous()
-
-        return sliced_weight, sliced_size, scales
-
-    def activate(
-        self,
-        linear_instance,
-    ):
-        """Activate attention TP for a linear layer.
-
-        Lazily initializes sliced weight/scales on first call for each linear,
-        then replaces weight.data and scale .data with sliced versions.
-        The caller must call restore() after the GEMM to revert to originals.
-
-        Args:
-            linear_instance: The Linear layer instance (ColumnParallelLinear or
-                RowParallelLinear). Dim is inferred from the type.
-        """
-        if not self.use_decode_attn_tp:
-            return
-        from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
-
-        if isinstance(linear_instance, RowParallelLinear):
-            dim = 1
-            assert linear_instance.cp_decode_tp_ctx is not None
-        elif isinstance(linear_instance, ColumnParallelLinear):
-            dim = 0
-        else:
-            return
-
-        cache_key = id(linear_instance)
-        cache = self._slice_cache.get(cache_key)
-
-        # First time init: compute slices and save originals
-        if cache is None:
-            size_attr = (
-                "output_size_per_partition" if dim == 0 else "input_size_per_partition"
-            )
-            sliced_weight, sliced_size, scales = self.init_slices(linear_instance, dim)
-            cache = {
-                "orig_weight": linear_instance.weight.data,
-                "orig_size": getattr(linear_instance, size_attr),
-                "orig_scales": {
-                    attr: getattr(linear_instance, attr).data for attr in scales.keys()
-                },
-                "sliced_weight": sliced_weight,
-                "sliced_size": sliced_size,
-                "sliced_scales": scales,
-                "size_attr": size_attr,
-            }
-            self._slice_cache[cache_key] = cache
-
-        # Activate: replace weight.data and size with sliced versions
-        linear_instance.weight.data = cache["sliced_weight"]
-        setattr(linear_instance, cache["size_attr"], cache["sliced_size"])
-        for attr, sliced in cache["sliced_scales"].items():
-            getattr(linear_instance, attr).data = sliced
-
-    def restore(self, linear_instance):
-        """Restore original weights after attention TP mode.
-
-        Must be called after activate() once the GEMM is done.
-        No-op if attention TP is not active or was never activated for this linear.
-        """
-        if not self.use_decode_attn_tp:
-            return
-        cache = self._slice_cache.get(id(linear_instance))
-        if cache is None:
-            return
-        linear_instance.weight.data = cache["orig_weight"]
-        setattr(linear_instance, cache["size_attr"], cache["orig_size"])
-        for attr, orig in cache["orig_scales"].items():
-            getattr(linear_instance, attr).data = orig
+            for linear, size_attr, orig_size in reversed(size_overrides):
+                setattr(linear, size_attr, orig_size)
+            for obj, attr_name in reversed(all_attrs):
+                self._restore(obj, attr_name)

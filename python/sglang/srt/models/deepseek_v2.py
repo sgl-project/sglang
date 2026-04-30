@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -120,6 +120,7 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.cp_decode_attn_tp import CpDecodeAttnTpContext
 from sglang.srt.layers.utils.cp_utils import (
     can_cp_split,
     cp_all_gather_rerange_output,
@@ -1524,7 +1525,7 @@ class DeepseekV2AttentionMLA(
             self.cp_size = get_attention_cp_size()
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
-        self.num_local_heads = num_heads // attn_tp_size
+        self._num_local_heads = num_heads // attn_tp_size
         self.scaling = self.qk_head_dim**-0.5
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
@@ -1644,6 +1645,8 @@ class DeepseekV2AttentionMLA(
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
         )
+        self.cp_decode_tp_ctx = CpDecodeAttnTpContext()
+
         # O projection.
         self.o_proj = RowParallelLinear(
             self.num_heads * self.v_head_dim,
@@ -1654,6 +1657,7 @@ class DeepseekV2AttentionMLA(
             prefix=add_prefix("o_proj", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            cp_decode_tp_ctx=self.cp_decode_tp_ctx,
         )
         self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
 
@@ -1733,6 +1737,40 @@ class DeepseekV2AttentionMLA(
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
+
+    @property
+    def num_local_heads(self) -> int:
+        if self.cp_decode_tp_ctx.use_decode_attn_tp:
+            return self.num_heads // self.cp_decode_tp_ctx.decode_tp_size
+        return self._num_local_heads
+
+    @num_local_heads.setter
+    def num_local_heads(self, value):
+        self._num_local_heads = value
+
+    @contextmanager
+    def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
+        if self.q_lora_rank is None:
+            yield
+            return
+        tensor_attrs = [
+            (self, "w_kc", 0),
+            (self, "w_vc", 0),
+            (self, "w_scale_k", 0),
+            (self, "w_scale_v", 0),
+        ]
+        with self.cp_decode_tp_ctx.maybe_use_decode_attn_tp(
+            forward_batch, [self.q_b_proj, self.o_proj], tensor_attrs=tensor_attrs
+        ):
+            if self.cp_decode_tp_ctx.use_decode_attn_tp:
+                orig_tp_q = self.attn_mqa.tp_q_head_num
+                self.attn_mqa.tp_q_head_num = self.num_local_heads
+                try:
+                    yield
+                finally:
+                    self.attn_mqa.tp_q_head_num = orig_tp_q
+            else:
+                yield
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
@@ -2142,15 +2180,16 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
         )
 
-        hidden_states = self.self_attn(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-            zero_allocator=zero_allocator,
-            llama_4_scaling=llama_4_scaling,
-            layer_scatter_modes=self.layer_scatter_modes,
-            prev_topk_indices=prev_topk_indices,
-        )
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                llama_4_scaling=llama_4_scaling,
+                layer_scatter_modes=self.layer_scatter_modes,
+                prev_topk_indices=prev_topk_indices,
+            )
         if isinstance(hidden_states, tuple):
             hidden_states, topk_indices = hidden_states
         else:
