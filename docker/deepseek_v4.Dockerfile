@@ -1,7 +1,7 @@
+# B200 / H200
 FROM lmsysorg/sglang:v0.5.7
 
 # need: cu12.9, x86_64 docker
-# Same dependency set as H200 (preset.py treats H200/B200 as one flavor).
 
 RUN mkdir -p /workspace && cd /workspace && rm -rf sglang && \
     git clone -b deepseek_v4 https://github.com/sgl-project/sglang.git
