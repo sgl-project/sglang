@@ -1006,7 +1006,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q = q.view(bs, -1, layer.tp_q_head_num, layer.head_dim)
                 needs_unpad = False
             else:
-                # draft_extend: handle varying accept_lengths. If total_tokens % bs == 0,
+                # draft_extend: handle varying num_accepted_drafts_per_req. If total_tokens % bs == 0,
                 # we can directly reshape q; otherwise, pad to max_seq_len_q.
                 total_tokens = q.shape[0]
                 tokens_per_seq = total_tokens // bs if bs > 0 else 0
