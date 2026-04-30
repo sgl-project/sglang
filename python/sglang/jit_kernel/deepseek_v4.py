@@ -9,6 +9,7 @@ import triton.language as tl
 from sglang.jit_kernel.utils import (
     cache_once,
     is_arch_support_pdl,
+    is_hip_runtime,
     load_jit,
     make_cpp_args,
 )
@@ -148,7 +149,25 @@ def topk_transform_512(
     out_raw_indices: Optional[torch.Tensor] = None,
     ver: Literal[1, 2] = 1,
 ) -> None:
-    """Output to page_indices tensor, optionally also output raw abs position indices"""
+    """Output to page_indices tensor, optionally also output raw abs position indices.
+
+    On NVIDIA this dispatches to the JIT'd ``TopK512Kernel::transform`` from
+    ``deepseek_v4/topk{,_v2}.cuh``. On ROCm the JIT path needs a runtime CUDA
+    toolchain (which AMD hosts typically do not have), so we instead dispatch
+    to the AOT build registered as ``torch.ops.sgl_kernel.deepseek_v4_topk_transform_512``.
+    The AOT kernel mirrors the v1 ``topk.cuh`` algorithm (``ver`` is therefore
+    ignored on ROCm).
+    """
+    if is_hip_runtime():
+        torch.ops.sgl_kernel.deepseek_v4_topk_transform_512(
+            scores,
+            seq_lens,
+            page_tables,
+            out_page_indices,
+            page_size,
+            out_raw_indices,
+        )
+        return
     module = _jit_topk_v2_module() if ver == 2 else _jit_topk_module()
     module.topk_transform(
         scores, seq_lens, page_tables, out_page_indices, page_size, out_raw_indices

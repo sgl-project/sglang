@@ -110,6 +110,7 @@ from sgl_kernel.version import __version__
 
 if torch.version.hip is not None:
     from sgl_kernel.elementwise import gelu_quick
+    from sgl_kernel.top_k import deepseek_v4_topk_transform_512
 
 
 _DEBUG_EXPORT_NAMES = [
@@ -180,6 +181,7 @@ _DEBUG_EXPORT_NAMES = [
 
 if torch.version.hip is not None:
     _DEBUG_EXPORT_NAMES.append("gelu_quick")
+    _DEBUG_EXPORT_NAMES.append("deepseek_v4_topk_transform_512")
 
 for _name in _DEBUG_EXPORT_NAMES:
     if _name in globals():
