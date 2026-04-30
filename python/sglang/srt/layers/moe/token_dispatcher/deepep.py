@@ -620,9 +620,13 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         input_global_scale = self.quant_config.get("input_global_scale", None)
         if input_global_scale is not None:
             use_nvfp4 = True
-        elif not get_moe_runner_backend().is_flashinfer_cutedsl():
+        elif not get_moe_runner_backend().is_flashinfer_cutedsl() and (
+            not _is_npu or not envs.SGLANG_DEEPEP_BF16_DISPATCH.get()
+        ):
             # flashinfer_cutedsl expects BF16 dispatch when NVFP4 dispatch is
             # off; its kernel quantizes to NVFP4 internally.
+            # SGLANG_DEEPEP_BF16_DISPATCH forces BF16 dispatch for NPU
+            # where INT8 input + BF16 weight GMM is not supported.
             use_fp8 = True
 
         # round_scale / use_ue8m0 are FP8-DeepGEMM specific; they cause DeepEP

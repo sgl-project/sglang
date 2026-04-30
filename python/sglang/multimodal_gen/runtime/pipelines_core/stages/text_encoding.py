@@ -317,7 +317,14 @@ class TextEncodingStage(PipelineStage):
             if "pipeline_config" in postprocess_sig.parameters:
                 # required by models like LTX
                 postprocess_kwargs["pipeline_config"] = server_args.pipeline_config
+            if "return_attention_mask" in postprocess_sig.parameters:
+                postprocess_kwargs["return_attention_mask"] = return_attention_mask
             prompt_embeds = postprocess_func(outputs, text_inputs, **postprocess_kwargs)
+            has_postprocessed_attention_mask = False
+            postprocessed_attention_mask = None
+            if isinstance(prompt_embeds, tuple):
+                prompt_embeds, postprocessed_attention_mask = prompt_embeds
+                has_postprocessed_attention_mask = True
             if dtype is not None:
                 prompt_embeds = prompt_embeds.to(device=target_device, dtype=dtype)
             else:
@@ -332,11 +339,18 @@ class TextEncodingStage(PipelineStage):
                 pooled_embeds_list.append(pooled_output.to(device=target_device))
 
             if return_attention_mask:
-                mask_to_store = (
-                    attention_mask.to(device=target_device)
-                    if attention_mask is not None
-                    else torch.ones(input_ids.shape[:2], device=target_device)
-                )
+                if has_postprocessed_attention_mask:
+                    mask_to_store = (
+                        postprocessed_attention_mask.to(device=target_device)
+                        if postprocessed_attention_mask is not None
+                        else None
+                    )
+                elif attention_mask is not None:
+                    mask_to_store = attention_mask.to(device=target_device)
+                else:
+                    mask_to_store = torch.ones(
+                        input_ids.shape[:2], device=target_device
+                    )
                 attn_masks_list.append(mask_to_store)
 
         # Shape results according to return_type

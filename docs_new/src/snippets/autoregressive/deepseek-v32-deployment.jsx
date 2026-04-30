@@ -174,7 +174,7 @@ export const DeepSeekV32Deployment = () => {
     // NVFP4: fixed config
     if (isNvfp4) {
       let cmd = 'sglang serve \\\n';
-      cmd += `  --model ${modelName}`;
+      cmd += `  --model-path ${modelName}`;
       cmd += ' \\\n  --tp 4';
       cmd += ' \\\n  --quantization modelopt_fp4';
       cmd += ' \\\n  --moe-runner-backend flashinfer_trtllm';
@@ -184,14 +184,14 @@ export const DeepSeekV32Deployment = () => {
     // MXFP4: fixed config for AMD
     if (isMxfp4) {
       let cmd = 'sglang serve \\\n';
-      cmd += `  --model ${modelName}`;
+      cmd += `  --model-path ${modelName}`;
       cmd += ' \\\n  --tp 8';
       cmd += ' \\\n  --trust-remote-code';
       return cmd;
     }
 
     let cmd = 'sglang serve \\\n';
-    cmd += `  --model ${modelName}`;
+    cmd += `  --model-path ${modelName}`;
 
     // Hardware platform specific parameters
     if (isAMD) {
