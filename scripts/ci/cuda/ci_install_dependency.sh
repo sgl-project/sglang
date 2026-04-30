@@ -160,11 +160,8 @@ clean_site_packages() {
         set -x
     fi
 
-    # Install protoc
-    bash "${SCRIPT_DIR}/../utils/install_protoc.sh"
-
-    # Install Rust toolchain (needed by setuptools-rust, e.g. the native gRPC extension)
-    bash "${SCRIPT_DIR}/../utils/install_rustup.sh"
+    # Install protoc + Rust toolchain (needed by setuptools-rust, e.g. the native gRPC extension)
+    bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 
     mark_step_done "${FUNCNAME[0]}"

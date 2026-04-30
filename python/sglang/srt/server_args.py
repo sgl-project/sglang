@@ -1980,11 +1980,6 @@ class ServerArgs:
                 logger.info(
                     "Enable multi-layer EAGLE speculative decoding for MiMoV2 model."
                 )
-                if not envs.SGLANG_ENABLE_SPEC_V2.get():
-                    envs.SGLANG_ENABLE_SPEC_V2.set(True)
-                    logger.warning(
-                        "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
-                    )
 
             if self.enable_hierarchical_cache:
                 self.swa_full_tokens_ratio = 1.0
@@ -2001,11 +1996,6 @@ class ServerArgs:
                 logger.info(
                     "Enable multi-layer EAGLE speculative decoding for Step3p5ForCausalLM model."
                 )
-                if not envs.SGLANG_ENABLE_SPEC_V2.get():
-                    envs.SGLANG_ENABLE_SPEC_V2.set(True)
-                    logger.warning(
-                        "Spec v2 is enabled for multi-layer EAGLE speculative decoding."
-                    )
             if self.enable_hierarchical_cache:
                 self.swa_full_tokens_ratio = 1.0
                 logger.warning(
@@ -3412,26 +3402,29 @@ class ServerArgs:
                     "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
                 )
 
+            spec_v1_reason = None
             if (
-                self.speculative_algorithm in ["EAGLE", "EAGLE3", "STANDALONE"]
-                and envs.SGLANG_ENABLE_SPEC_V2.get()
+                self.speculative_eagle_topk is not None
+                and self.speculative_eagle_topk > 1
+                and not self.disable_overlap_schedule
             ):
-                self.disable_overlap_schedule = False
-                logger.warning(
-                    "Spec v2 is enabled for eagle/eagle3 speculative decoding and overlap schedule is turned on."
-                )
-                if (
-                    self.speculative_eagle_topk is not None
-                    and self.speculative_eagle_topk > 1
-                ):
-                    raise ValueError(
-                        "Spec v2 currently only supports topk = 1 for speculative decoding."
-                    )
-            else:
                 self.disable_overlap_schedule = True
+                spec_v1_reason = "spec v2 currently only supports topk = 1"
+            elif (
+                not envs.SGLANG_ENABLE_SPEC_V2.get()
+                and not self.disable_overlap_schedule
+            ):
+                self.disable_overlap_schedule = True
+                spec_v1_reason = "SGLANG_ENABLE_SPEC_V2=False"
+
+            if self.disable_overlap_schedule:
                 logger.warning(
-                    "Overlap scheduler is disabled when spec v2 is off or using unsupported speculative algorithm. "
-                    "You can set env SGLANG_ENABLE_SPEC_V2=True to enable the experimental overlap scheduler. "
+                    "Spec v1 is used for eagle/eagle3/standalone speculative decoding because %s.",
+                    spec_v1_reason or "overlap schedule is disabled",
+                )
+            else:
+                logger.warning(
+                    "Spec v2 is enabled by default for eagle/eagle3/standalone speculative decoding."
                 )
 
             if self.enable_mixed_chunk:
@@ -3716,6 +3709,12 @@ class ServerArgs:
             else:
                 self.disable_radix_cache = True
                 logger.warning("KV cache is forced as chunk cache for decode server")
+                if self.enable_mamba_extra_buffer():
+                    logger.warning(
+                        "Mamba extra_buffer is disabled because decode disaggregation "
+                        "currently forces chunk cache. Falling back to no_buffer."
+                    )
+                    self.mamba_scheduler_strategy = "no_buffer"
 
         elif self.disaggregation_mode == "prefill":
             assert (
@@ -7147,7 +7146,10 @@ class ServerArgs:
         if self.remote_instance_weight_loader_start_seed_via_transfer_engine:
             return True
         # ModelExpress source mode needs TransferEngine init only if transport is transfer_engine.
-        if self.modelexpress_source and self.modelexpress_transport == "transfer_engine":
+        if (
+            self.modelexpress_source
+            and self.modelexpress_transport == "transfer_engine"
+        ):
             return True
         # Use TransferEngine as client backend.
         elif (
