@@ -9,7 +9,9 @@ Reports idle time, active time, and utilization percentage per runner label.
 import argparse
 import json
 import os
+import random
 import subprocess
+import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -19,16 +21,51 @@ DEFAULT_LABELS_TO_IGNORE = {"self-hosted", "Linux", "X64", "ARM64"}
 GITHUB_HOSTED_LABELS = {"ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04"}
 
 
-def run_gh_command(args: list[str]) -> dict:
-    """Run gh CLI command and return JSON result."""
-    result = subprocess.run(
-        ["gh", "api"] + args,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise Exception(f"gh api failed: {result.stderr}")
-    return json.loads(result.stdout)
+def run_gh_command(args: list[str], max_retries: int = 5) -> dict:
+    """Run gh CLI command and return JSON result.
+
+    Retries on transient failures (5xx, secondary rate limits, network
+    blips) with exponential backoff. The previous fail-fast behavior
+    combined with `except Exception: return None` in the threadpool
+    callers caused entire workflow runs to be silently dropped from
+    the utilization numerator whenever GH API hiccuped, severely
+    undercounting busy time on busy days.
+    """
+    last_err = ""
+    for attempt in range(max_retries):
+        result = subprocess.run(
+            ["gh", "api"] + args,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            return json.loads(result.stdout)
+        last_err = result.stderr or "(no stderr)"
+        # Detect retryable conditions: HTTP 5xx, secondary rate limit, abuse
+        # detection, network resets. 4xx other than 429 are non-retryable.
+        retryable = any(
+            s in last_err
+            for s in (
+                "rate limit",
+                "abuse",
+                "Internal Server Error",
+                "502",
+                "503",
+                "504",
+                "Bad Gateway",
+                "Gateway Time-out",
+                "connection reset",
+                "Connection reset",
+                "EOF",
+                "timeout",
+            )
+        )
+        if not retryable:
+            break
+        # Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s
+        delay = (2**attempt) + random.uniform(0, 1)
+        time.sleep(delay)
+    raise Exception(f"gh api failed after {max_retries} attempts: {last_err[:300]}")
 
 
 def get_workflow_runs(repo: str, hours: int = 24) -> list[dict]:
@@ -152,30 +189,50 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
     host_jobs = defaultdict(list)  # runner_name -> list of job_info
     host_labels = defaultdict(set)  # runner_name -> set of labels it ran jobs under
 
-    # Fetch jobs for all runs in parallel
+    # Fetch jobs for all runs in parallel. Cap concurrency lower than the
+    # GH API secondary rate-limit threshold to avoid bursts that silently
+    # drop runs even with retries.
     total_runs = len(runs)
     print(f"Fetching jobs for {total_runs} runs in parallel...")
 
     def fetch_jobs_for_run(run):
-        """Fetch jobs for a single run, returning (run_id, jobs) or (run_id, None) on error."""
+        """Fetch jobs for a single run.
+
+        Returns (run_id, jobs, error_msg). `error_msg` is None on success.
+        We surface failures rather than silently dropping the run so the
+        caller can report how many runs' jobs are missing — silently
+        dropping previously caused 4-gpu-b200 (and every other label) to
+        report wildly different numbers depending on transient API hiccups.
+        """
         try:
-            return (run["id"], get_jobs_for_run(repo, run["id"]))
-        except Exception:
-            return (run["id"], None)
+            return (run["id"], get_jobs_for_run(repo, run["id"]), None)
+        except Exception as e:
+            return (run["id"], None, str(e)[:200])
 
     all_jobs = []
-    with ThreadPoolExecutor(max_workers=20) as executor:
+    failed_runs = []
+    with ThreadPoolExecutor(max_workers=10) as executor:
         futures = [executor.submit(fetch_jobs_for_run, run) for run in runs]
         completed = 0
         for future in as_completed(futures):
             completed += 1
             if completed % 50 == 0:
                 print(f"Fetched jobs for {completed}/{total_runs} runs...")
-            run_id, jobs = future.result()
-            if jobs:
+            run_id, jobs, err = future.result()
+            if err:
+                failed_runs.append((run_id, err))
+            elif jobs:
                 all_jobs.extend(jobs)
 
     print(f"Processing {len(all_jobs)} jobs...")
+    if failed_runs:
+        print(
+            f"WARNING: {len(failed_runs)}/{total_runs} runs failed to fetch "
+            f"after retries. Utilization will be undercounted. "
+            f"First few errors:"
+        )
+        for rid, err in failed_runs[:5]:
+            print(f"  run {rid}: {err}")
 
     for job in all_jobs:
         runner_name = job.get("runner_name")
