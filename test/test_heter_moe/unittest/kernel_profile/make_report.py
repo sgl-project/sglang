@@ -102,13 +102,18 @@ with open(csv_path, "w", newline="") as f:
         "winner_tile",
     ]
     w.writerow(header)
+
+    def _signed_ratio(s):
+        # +0.241 = heter 24.1% faster ; -0.277 = heter 27.7% slower
+        return f"{s - 1.0:+.3f}"
+
     for r in report_rows:
         row_out = [r["M_global"]]
         for n in N_ACTIVE_COLS:
-            row_out.append(f"{r['speedups'].get(n, float('nan')):.3f}")
+            row_out.append(_signed_ratio(r['speedups'].get(n, float('nan'))))
         row_out.extend([
             r["winner_x"], r["T_star_snapped"],
-            f"{r['best_speedup']:.3f}",
+            _signed_ratio(r['best_speedup']),
             f"{r['t_int4_ms']:.4f}", f"{r['t_winner_ms']:.4f}",
             r["winner_tile"],
         ])
@@ -139,15 +144,20 @@ with open(md_path, "w") as f:
     f.write("| " + " | ".join(cells) + " |\n")
     f.write("|" + "---:|" * len(cells) + "\n")
 
+    def _signed(s):
+        d = (s - 1.0) * 100
+        sign = "+" if d >= 0 else "-"
+        return f"{sign}{abs(d):.1f}%"
+
     for r in report_rows:
         cells = [str(r["M_global"])]
         for n in N_ACTIVE_COLS:
             s = r["speedups"].get(n, float("nan"))
-            cells.append(f"{s:.3f}")
+            cells.append(_signed(s))
         cells.extend([
             f"**{r['winner_x']}**",
             f"**{r['T_star_snapped']}**",
-            f"**{r['best_speedup']:.3f}×**",
+            f"**{_signed(r['best_speedup'])}**",
             f"{r['t_int4_ms']:.4f}",
             f"{r['t_winner_ms']:.4f}",
         ])

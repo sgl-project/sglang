@@ -631,26 +631,32 @@ class ExpertBatchGatedHeterDispatch(HeterDispatchPolicy):
 
 
 class EfficiencyPromotionPolicy(HeterDispatchPolicy):
-    """Curve-driven dynamic-threshold dispatch.
+    """Pure dict-lookup dispatch driven by a pre-built per-M lookup JSON.
 
-    Reads ``x_star_curve.csv`` (the ground-truth measurement-based optimum
-    per global batch size from kernel_profile/) at construction time. On
-    every dispatch:
+    The JSON (``efficiency_promotion_lookup.json``, produced by
+    ``test/test_heter_moe/unittest/kernel_profile/build_promotion_lookup.py``)
+    maps each M_global captured in the kernel-profile sweep to:
 
-      1. Read M_global = ``token_selected_experts.shape[0]`` (host-known
-         under CUDA graph capture).
-      2. Look up ``x_runtime`` for this M_global from the curve.
-      3. Sort per-expert token counts descending; pick threshold
-         ``T = midpoint(counts[x_runtime - 1], counts[x_runtime])`` as a
-         GPU 0-d scalar.
-      4. ``is_promoted = counts >= T`` → those experts go to BF16.
+        {
+          "x_runtime":   int,   # number of BF16 experts to promote
+          "T":           int,   # per-expert-load threshold
+          "m_per_expert":int,   # bse used for tile lookup (info-only)
+          "tile_key":    str,   # identifier (info-only)
+          "up_tile":     dict,  # autotuned BF16 up tile
+          "down_tile":   dict,  # autotuned BF16 down tile
+        }
 
-    When ``x_runtime == 0`` (small-M regime where pure-INT4 wins per
-    the curve), no promotion fires; the BF16 group is empty and the
-    runtime can skip the BF16 kernel via ``should_skip_group``.
+    Per dispatch the policy does ONE host-side dict access on
+    ``M_global = token_selected_experts.shape[0]`` (which is a captured
+    constant under torch.compile) and then runs the same single-compare
+    promotion rule as ``ExpertBatchGatedHeterDispatch``:
 
-    All hot-path work is GPU-side after the host-known M-keyed branch,
-    so the policy is CUDA-graph capturable.
+        is_promoted = counts >= T_for_this_M
+
+    No GPU sort, no scatter, no monkey-patching during dispatch. Tile
+    pinning is handled by HeterFusedMoE (which reads the same JSON).
+
+    For M_global not in the JSON, falls back to nearest-M.
     """
 
     def __init__(
@@ -663,7 +669,7 @@ class EfficiencyPromotionPolicy(HeterDispatchPolicy):
         int4_group_idx: int = 0,
         bf16_only_mask: Optional[torch.Tensor] = None,
         bf16_group_idx: Optional[int] = None,
-        curve_file: Optional[str] = None,
+        lookup_file: Optional[str] = None,
     ):
         _bf16_gidx = (
             bf16_group_idx if bf16_group_idx is not None
@@ -676,80 +682,55 @@ class EfficiencyPromotionPolicy(HeterDispatchPolicy):
             int4_only_mask=int4_only_mask, int4_group_idx=int4_group_idx,
             bf16_only_mask=bf16_only_mask, bf16_group_idx=_bf16_gidx,
         )
-        # M_global → x_runtime lookup table, sorted by M ascending.
-        self._curve_M: List[int] = []
-        self._curve_x: List[int] = []
-        if curve_file is not None:
-            self._load_curve(curve_file)
-        # Cache of M_global → x_runtime (Python int) so repeated lookups
-        # at the same batch shape are O(1).
-        self._x_cache: dict = {}
+        # M_global → T for the per-shape threshold lookup. Sorted M list
+        # used for nearest-M fallback when an unseen batch shape arrives.
+        self._lookup_M_to_T: dict = {}
+        self._lookup_M_sorted: List[int] = []
+        self._lookup_default_T = bf16_promotion_threshold
+        if lookup_file is not None:
+            self._load_lookup(lookup_file)
+        # Cache of M → resolved T (host-side int) for repeat shapes.
+        self._T_cache: dict = {}
 
-    def _load_curve(self, path: str) -> None:
-        """Parse x_star_curve.csv. Expected columns include ``M_global``
-        and ``winner_x`` (or ``x_star_meas``/``x_star``)."""
-        import csv
+    def _load_lookup(self, path: str) -> None:
+        import json as _json
         if not os.path.exists(path):
             logger.warning(
-                "EfficiencyPromotionPolicy: curve file %s missing; "
-                "x_runtime will always be 0 (no promotion).", path)
+                "EfficiencyPromotionPolicy: lookup file %s missing; "
+                "T defaults to %d (no per-M tuning)",
+                path, self._lookup_default_T)
             return
         with open(path) as f:
-            r = csv.reader(f)
-            header = next(r)
-            # Find x column: prefer winner_x, fall back to x_star_meas / x_star
-            x_col = None
-            for cand in ("winner_x", "x_star_meas", "x_star"):
-                if cand in header:
-                    x_col = header.index(cand)
-                    break
-            if x_col is None:
-                raise ValueError(
-                    f"curve {path} has no column named winner_x / "
-                    f"x_star_meas / x_star (header={header})")
-            m_col = header.index("M_global")
-            rows = []
-            for row in r:
-                M = int(row[m_col]); x = int(row[x_col])
-                rows.append((M, x))
-        rows.sort(key=lambda p: p[0])
-        self._curve_M = [p[0] for p in rows]
-        self._curve_x = [p[1] for p in rows]
+            data = _json.load(f)
+        for M_str, entry in data.items():
+            self._lookup_M_to_T[int(M_str)] = int(entry["T"])
+        self._lookup_M_sorted = sorted(self._lookup_M_to_T.keys())
 
-    def _lookup_x_runtime(self, M_global: int) -> int:
-        """Return x_runtime via nearest-M lookup. Cached per M.
-
-        Implementation note: avoids ``min(..., key=lambda)`` which torch's
-        dynamo does NOT support inside a traced graph
-        (https://meta-pytorch.github.io/compile-graph-break-site/gb/gb0193.html).
-        Production sglang's piecewise CUDA graph runs the model forward
-        through ``torch.compile``; the dispatch path is traced. A manual
-        argmin loop using only scalar comparisons is dynamo-safe.
-        """
-        if M_global in self._x_cache:
-            return self._x_cache[M_global]
-        if not self._curve_M:
-            x = 0
+    def _T_for(self, M_global: int) -> int:
+        """Pure host-side lookup. Returns Python int (becomes a captured
+        constant under torch.compile). No GPU ops."""
+        if M_global in self._T_cache:
+            return self._T_cache[M_global]
+        if M_global in self._lookup_M_to_T:
+            T = self._lookup_M_to_T[M_global]
+        elif not self._lookup_M_sorted:
+            T = self._lookup_default_T
         else:
-            best_idx = 0
-            best_dist = abs(self._curve_M[0] - M_global)
-            for i in range(1, len(self._curve_M)):
-                d = abs(self._curve_M[i] - M_global)
-                if d < best_dist:
-                    best_dist = d
-                    best_idx = i
-            x = self._curve_x[best_idx]
-            # Two-arg min/max (no key=) is dynamo-supported.
-            if x < 0:
-                x = 0
-            if x > self._num_experts:
-                x = self._num_experts
-        self._x_cache[M_global] = x
-        return x
+            # Nearest-M fallback (manual argmin, no min(..., key=)).
+            best = self._lookup_M_sorted[0]
+            best_d = abs(best - M_global)
+            for m in self._lookup_M_sorted[1:]:
+                d = abs(m - M_global)
+                if d < best_d:
+                    best_d = d
+                    best = m
+            T = self._lookup_M_to_T[best]
+        self._T_cache[M_global] = T
+        return T
 
     def _assign(self, token_counts, token_selected_experts, token_final_scales):
-        # Default everyone to INT4 (the policy decides nothing here; the
-        # dynamic-threshold step in dispatch promotes to BF16).
+        # Default everyone to INT4. Universal promotion rule in dispatch()
+        # then promotes counts >= T to BF16 (T comes from the JSON).
         self._expert_to_group_buf.fill_(self._int4_group_idx)
         return self._expert_to_group_buf
 
@@ -759,40 +740,28 @@ class EfficiencyPromotionPolicy(HeterDispatchPolicy):
         token_final_scales: torch.Tensor,
         sentinel: int = -1,
     ) -> List[GroupDispatchTuple]:
+        # Host-side dict lookup → Python int. Becomes a captured constant
+        # in the per-shape graph; no GPU sync, dynamo-safe.
+        M_global = token_selected_experts.shape[0]
+        T = self._T_for(M_global)
+
         token_counts = self._compute_token_counts(token_selected_experts)
         policy_assignment = self._assign(
-            token_counts, token_selected_experts, token_final_scales,
-        )
+            token_counts, token_selected_experts, token_final_scales)
         scratch = self._dispatch_scratch
         scratch.copy_(policy_assignment)
-
-        # Host-known M_global → host-known x_runtime → host-known branch.
-        # The Python ``if`` resolves at CUDA-graph capture time so the
-        # captured graph is shape-specific; replays at the same shape skip
-        # this branch entirely.
-        M_global = token_selected_experts.shape[0]
-        x_runtime = self._lookup_x_runtime(M_global)
-
-        if x_runtime > 0 and x_runtime < self._num_experts:
-            sorted_counts, _ = token_counts.sort(descending=True)
-            # T = midpoint as a GPU 0-d tensor; counts >= T then promotes
-            # exactly the top-x_runtime experts (modulo ties).
-            T = (sorted_counts[x_runtime - 1] + sorted_counts[x_runtime]) / 2
-            is_promoted = token_counts >= T
-            scratch[is_promoted] = self._bf16_group_idx
-        elif x_runtime >= self._num_experts:
-            scratch.fill_(self._bf16_group_idx)
-        # else x_runtime == 0: keep all-INT4
-
+        # Single GPU compare — same shape as ExpertBatchGated.dispatch.
+        is_promoted = token_counts >= T
+        scratch[is_promoted] = self._bf16_group_idx
         return self._dispatch_from_expert_to_group(
             scratch, token_selected_experts, token_final_scales,
             sentinel=sentinel)
 
     def should_skip_group(self, group_idx: int, num_tokens: int) -> bool:
-        # When the curve says x*=0 at this M, no expert can be promoted —
-        # safe to skip the BF16 group entirely (also skips its kernel call).
-        if (group_idx == self._bf16_group_idx
-                and self._lookup_x_runtime(num_tokens) == 0):
+        # When T is "effectively infinity" (the JSON marks small-M regimes
+        # with T=10**9), no expert can be promoted — safe to skip the BF16
+        # kernel entirely under CUDA graph capture.
+        if group_idx == self._bf16_group_idx and self._T_for(num_tokens) >= 10**8:
             return True
         return False
 

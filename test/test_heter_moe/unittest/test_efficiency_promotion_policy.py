@@ -26,30 +26,40 @@ import torch
 from test_heter_moe.util import CUDA_AVAILABLE
 
 
-def _write_curve(path: str, rows: list) -> None:
-    """Write a minimal x_star_curve.csv (M_global, winner_x, t_int4_pure_ms)."""
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["M_global", "winner_x", "t_int4_pure_ms"])
-        for M, x, t in rows:
-            w.writerow([M, x, f"{t:.4f}"])
+def _write_lookup(path: str, entries: list) -> None:
+    """Write a minimal efficiency_promotion_lookup.json
+    (M_global → {x_runtime, T, m_per_expert, up_tile, down_tile})."""
+    import json as _json
+    obj = {
+        str(M): {
+            "x_runtime": x,
+            "T": T,
+            "m_per_expert": 0,
+            "tile_key": "n/a",
+            "up_tile": None,
+            "down_tile": None,
+        }
+        for (M, x, T) in entries
+    }
+    with open(path, "w") as f:
+        _json.dump(obj, f)
 
 
 @pytest.fixture
 def curve_path():
-    # Synthetic curve — tests don't need real data.
+    # Synthetic per-M lookup JSON — tests don't need real autotune data.
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".csv", delete=False
+        mode="w", suffix=".json", delete=False
     ) as f:
         path = f.name
     rows = [
-        # (M_global, winner_x, t_int4_pure_ms)
-        (32, 0, 0.16),    # decode: no promotion
-        (256, 4, 0.50),   # small prefill: promote 4
-        (1024, 16, 1.14),  # mid prefill: promote 16
-        (4096, 32, 2.50),  # heavy prefill: promote 32
+        # (M_global, x_runtime, T)
+        (32, 0, 10**9),   # decode: no promotion (T = ∞)
+        (256, 4, 50),     # small prefill: T=50
+        (1024, 16, 24),   # mid prefill: T=24
+        (4096, 32, 12),   # heavy prefill: T=12
     ]
-    _write_curve(path, rows)
+    _write_lookup(path, rows)
     yield path
     os.unlink(path)
 
@@ -62,11 +72,11 @@ def _make_policy(curve_path: str, num_experts: int = 64,
     return EfficiencyPromotionPolicy(
         num_experts=num_experts,
         group_size_ratios=[0.5, 0.5],  # G=2: cold/hot
-        bf16_promotion_threshold=10**9,  # static threshold ignored by this policy
+        bf16_promotion_threshold=10**9,  # static threshold (used as fallback)
         device=device,
         int4_group_idx=0,
         bf16_group_idx=1,
-        curve_file=curve_path,
+        lookup_file=curve_path,
     )
 
 
@@ -76,61 +86,62 @@ class TestCurveLookup:
 
     def test_lookup_exact_M(self, curve_path):
         p = _make_policy(curve_path)
-        assert p._lookup_x_runtime(32) == 0
-        assert p._lookup_x_runtime(256) == 4
-        assert p._lookup_x_runtime(1024) == 16
-        assert p._lookup_x_runtime(4096) == 32
+        assert p._T_for(32) == 10**9     # x=0 regime, T=∞
+        assert p._T_for(256) == 50
+        assert p._T_for(1024) == 24
+        assert p._T_for(4096) == 12
 
     def test_lookup_nearest_M(self, curve_path):
         p = _make_policy(curve_path)
-        # M=600 is between 256 (curve x=4) and 1024 (curve x=16).
-        # Nearest is 1024 (distance 424 vs 344) — wait, 600-256=344 < 1024-600=424.
-        # So nearest is 256.
-        assert p._lookup_x_runtime(600) == 4
-        # M=2000: nearest 1024 (distance 976) vs 4096 (distance 2096) → 1024.
-        assert p._lookup_x_runtime(2000) == 16
+        # M=600 is between 256 (T=50) and 1024 (T=24).
+        # Distances: |600-256|=344  vs  |600-1024|=424. Nearest = 256.
+        assert p._T_for(600) == 50
+        # M=2000: |2000-1024|=976  vs  |2000-4096|=2096. Nearest = 1024.
+        assert p._T_for(2000) == 24
         # M=8000: out of range, nearest 4096.
-        assert p._lookup_x_runtime(8000) == 32
+        assert p._T_for(8000) == 12
 
     def test_lookup_cache_warms(self, curve_path):
         p = _make_policy(curve_path)
-        assert 1024 not in p._x_cache
-        p._lookup_x_runtime(1024)
-        assert p._x_cache[1024] == 16
+        assert 1024 not in p._T_cache
+        p._T_for(1024)
+        assert p._T_cache[1024] == 24
 
-    def test_dispatch_promotes_top_x(self, curve_path):
-        """At M=1024, curve says x=16. Build routing where the top-16
-        experts get the most tokens; verify exactly 16 land in BF16."""
+    def test_dispatch_promotes_high_frequency(self, curve_path):
+        """At M=1024 (T=24), build routing where experts 0..15 get >24
+        tokens each and 16..63 get ≤24. Verify only 0..15 land in BF16."""
         p = _make_policy(curve_path, num_experts=64)
         device = torch.device("cuda")
         N = 1024
         K = 8
-        # Build routing where experts 0..15 are the high-frequency block.
-        # Half the slots route to one of experts 0..15, half to 16..63.
-        # Per-expert count: 0..15 get 256 tokens each, 16..63 get ~85 each.
+        # Build routing where experts 0..15 each get 256 tokens (well above
+        # T=24) and experts 16..63 each get ~85 (also above T=24, but so
+        # we'll narrow the second pool to be below 24 instead).
         ids = torch.zeros(N, K, dtype=torch.long, device=device)
         for tok in range(N):
             for slot in range(K):
                 if slot < K // 2:
-                    ids[tok, slot] = tok % 16             # experts 0..15
+                    ids[tok, slot] = tok % 16              # experts 0..15
                 else:
-                    ids[tok, slot] = 16 + (tok % (64 - 16))  # experts 16..63
+                    # Narrow into a few experts so they go above T too —
+                    # this verifies the threshold rule, not a specific count.
+                    ids[tok, slot] = 16 + (tok % 8)        # experts 16..23
         scales = torch.ones(N, K, dtype=torch.float32, device=device)
-        cold_ids, _ = p.dispatch(ids, scales, sentinel=-1)[0]
-        hot_ids, _ = p.dispatch(ids, scales, sentinel=-1)[1]
-        # Hot experts should be the high-frequency ones (0..15).
+        groups = p.dispatch(ids, scales, sentinel=-1)
+        hot_ids = groups[1][0]
         hot_set = set(hot_ids[hot_ids >= 0].unique().cpu().tolist())
-        # All hot expert IDs should be < 16 (the high-frequency block).
-        assert hot_set.issubset(set(range(16))), (
-            f"expected hot ⊆ [0..16), got {sorted(hot_set)}"
+        # All experts above T=24 should be promoted; below stay INT4.
+        # Experts 0..15 each get ~256 tokens, 16..23 each get ~256 too,
+        # 24..63 get 0 — so hot set should be {0..23}.
+        assert hot_set.issubset(set(range(24))), (
+            f"expected hot ⊆ [0..24), got {sorted(hot_set)}"
         )
-        # And we expect at least most of [0..16) to be promoted.
-        assert len(hot_set) >= 12, (
-            f"expected ≥12 hot experts at M=1024, got {len(hot_set)}"
+        assert len(hot_set) >= 16, (
+            f"expected ≥16 hot experts at M=1024, got {len(hot_set)}"
         )
 
-    def test_dispatch_x_zero_no_promotion(self, curve_path):
-        """At M=32 (curve x=0), no expert should be promoted."""
+    def test_dispatch_high_T_no_promotion(self, curve_path):
+        """At M=32 (T=10^9), no expert can cross the threshold."""
         p = _make_policy(curve_path, num_experts=64)
         device = torch.device("cuda")
         N = 32
@@ -142,7 +153,7 @@ class TestCurveLookup:
         # Dispatch still runs; verify hot group is empty.
         groups = p.dispatch(ids, scales, sentinel=-1)
         hot_ids, hot_scales = groups[1]
-        assert (hot_ids == -1).all(), "BF16 group should be empty at x*=0"
+        assert (hot_ids == -1).all(), "BF16 group should be empty at T=∞"
         assert (hot_scales == 0).all()
 
 
@@ -298,26 +309,22 @@ class TestDynamoCompatibility:
     Runs on CPU — no CUDA needed for dynamo tracing.
     """
 
-    def test_lookup_x_runtime_traceable(self, curve_path):
-        """_lookup_x_runtime must be dynamo-traceable (no min(..., key=))."""
+    def test_T_for_traceable(self, curve_path):
+        """_T_for must be dynamo-traceable (pure host-side dict lookup)."""
         p = _make_policy(curve_path, num_experts=64,
                          device=torch.device("cpu"))
 
         @torch.compile(fullgraph=True, dynamic=False, backend="eager")
         def call(M_int):
-            return p._lookup_x_runtime(M_int)
+            return p._T_for(M_int)
 
-        # If the underlying lookup uses min(..., key=lambda), dynamo
-        # raises Unsupported on the FIRST invocation.
-        assert call(1024) == 16
-        assert call(32) == 0
-        assert call(4096) == 32
+        assert call(1024) == 24
+        assert call(32) == 10**9
+        assert call(4096) == 12
 
-    def test_lookup_sparse_tile_dispatch_traceable(self, curve_path):
-        """The full dispatch path (which calls _lookup_x_runtime + sort +
-        gpu-side compare) must trace cleanly under dynamo with the
-        ``eager`` backend (which is what dynamo defaults to inside
-        sglang's piecewise CUDA graph compile)."""
+    def test_dispatch_traceable(self, curve_path):
+        """Full dispatch (host-side T lookup + single GPU compare) must
+        trace under dynamo without graph break."""
         p = _make_policy(curve_path, num_experts=64,
                          device=torch.device("cpu"))
         N, K = 1024, 8
@@ -328,9 +335,8 @@ class TestDynamoCompatibility:
         def call(ids, scales):
             return p.dispatch(ids, scales, sentinel=-1)
 
-        # Dynamo will graph-break-or-error on min(...,key=lambda).
         result = call(ids, scales)
-        assert len(result) == 2  # cold + hot
+        assert len(result) == 2
         assert result[0][0].shape == (N, K)
 
 

@@ -1,0 +1,23 @@
+{
+  "groups": [
+    {
+      "name": "cold",
+      "num_bits": 4,
+      "group_size": 128,
+      "checkpoint": "/data/huggingface/hub/models--Qwen--Qwen3-30B-A3B-GPTQ-Int4/snapshots/9b534e4318b7ebc3c961a839f13eb18b1833f441"
+    },
+    {
+      "name": "hot",
+      "num_bits": 16
+    }
+  ],
+  "policy": "efficiency_promotion",
+  "policy_params": {
+    "lookup_file": "/data/huanchen/sglang/test/test_heter_moe/unittest/kernel_profile/results/efficiency_promotion_lookup.json"
+  },
+  "bf16_promotion_threshold": 72,
+  "int4_only_experts_file": "/data/huanchen/sglang/expert_precision_assignment/experiments/data/configs/heter-final-tuning/mc64/int4_only_experts.json",
+  "attention_num_bits": 16,
+  "pin_autotuned_tiles": true,
+  "sparse_tile_path": "/data/huanchen/sglang/test/test_heter_moe/unittest/kernel_profile/results/bf16_sparse_configs_sep.json"
+}
