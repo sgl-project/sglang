@@ -221,7 +221,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.layer_transfer_counter = None
         self._init_mamba_pool(
             size=effective_mamba_size,
-            mamba_spec_state_size=size + pre_alloc_size,
+            mamba_spec_state_size=size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
             device=device,
