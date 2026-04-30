@@ -51,8 +51,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
-    should_use_dp_reduce_scatterv,
-    should_use_flashinfer_cutlass_moe_fp4_allgather,
+    should_skip_post_experts_all_reduce,
 )
 from sglang.srt.layers.moe.ep_moe.layer import DeepEPMoE, get_moe_impl_class
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
@@ -77,7 +76,7 @@ from sglang.srt.utils import (
     make_layers,
 )
 
-MiMoV2FlashConfig = None
+MiMoV2Config = None
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +178,7 @@ class MiMoV2MoE(nn.Module):
 
     def __init__(
         self,
-        config: MiMoV2FlashConfig,
+        config: MiMoV2Config,
         layer_id: int,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -298,12 +297,10 @@ class MiMoV2MoE(nn.Module):
 
         final_hidden_states = self.experts(hidden_states, topk_output)
 
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
-            and not should_use_dp_reduce_scatterv()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
 
@@ -565,7 +562,7 @@ class MiMoV2Attention(nn.Module):
 class MiMoV2DecoderLayer(nn.Module):
     def __init__(
         self,
-        config: MiMoV2FlashConfig,
+        config: MiMoV2Config,
         layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -585,7 +582,11 @@ class MiMoV2DecoderLayer(nn.Module):
             and rope_scaling.get("rope_type") == "default"
         ):
             rope_scaling = None
-        max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
+        max_position_embeddings = getattr(
+            config,
+            "context_len",
+            getattr(config, "max_position_embeddings", 32768),
+        )
 
         if self.is_swa_layer():
             self.self_attn = MiMoV2Attention(
@@ -795,7 +796,7 @@ class MiMoV2DecoderLayer(nn.Module):
 class MiMoV2Model(nn.Module):
     def __init__(
         self,
-        config: MiMoV2FlashConfig,
+        config: MiMoV2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         decoder_layer_type: type[nn.Module] = MiMoV2DecoderLayer,
@@ -946,7 +947,7 @@ class MiMoV2Model(nn.Module):
                 )
 
 
-class MiMoV2FlashForCausalLM(nn.Module):
+class MiMoV2ForCausalLM(nn.Module):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -968,7 +969,7 @@ class MiMoV2FlashForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: MiMoV2FlashConfig,
+        config: MiMoV2Config,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
@@ -1102,6 +1103,16 @@ class MiMoV2FlashForCausalLM(nn.Module):
             if "mtp" in name:
                 continue
 
+            # Support fused qkv_proj checkpoint (Pro format)
+            if "qkv_proj" in name:
+                if name in params_dict:
+                    tp_size = get_attention_tp_size()
+                    tp_rank = get_attention_tp_rank()
+                    param = params_dict[name]
+                    loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
+                    default_weight_loader(param, loaded_weight)
+                continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -1176,4 +1187,9 @@ class MiMoV2FlashForCausalLM(nn.Module):
         )
 
 
-EntryClass = MiMoV2FlashForCausalLM
+# Keep the old Flash architecture name loadable while new configs use MiMoV2ForCausalLM.
+class MiMoV2FlashForCausalLM(MiMoV2ForCausalLM):
+    pass
+
+
+EntryClass = [MiMoV2ForCausalLM, MiMoV2FlashForCausalLM]

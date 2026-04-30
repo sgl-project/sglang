@@ -75,7 +75,11 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
-from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
+from sglang.srt.elastic_ep.elastic_ep import (
+    ElasticEPStateManager,
+    join_process_groups,
+    try_recover_ranks,
+)
 from sglang.srt.elastic_ep.expert_backup_client import ExpertBackupClient
 from sglang.srt.environ import envs
 from sglang.srt.eplb.eplb_manager import EPLBManager
@@ -87,6 +91,7 @@ from sglang.srt.eplb.expert_distribution import (
 )
 from sglang.srt.eplb.expert_location import (
     ExpertLocationMetadata,
+    broadcast_global_expert_location_metadata,
     compute_initial_expert_location_metadata,
     get_global_expert_location_metadata,
     set_global_expert_location_metadata,
@@ -165,6 +170,7 @@ from sglang.srt.server_args import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     MultiprocessingSerializer,
+    broadcast_pyobj,
     cpu_has_amx_support,
     dynamic_import,
     empty_context,
@@ -492,6 +498,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Initialize the model runner
         self.initialize(pre_model_load_memory)
         self.check_quantized_moe_compatibility()
+
+        if (
+            self.server_args.elastic_ep_backend is not None
+            and self.server_args.elastic_ep_rejoin
+        ):
+            join_process_groups()
+            broadcast_global_expert_location_metadata(
+                src_rank=self._get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=True
+                )
+            )
+            ElasticEPStateManager.instance().reset()
 
         if self.is_multimodal:
             sanity_check_mm_pad_shift_value(self.model_config.vocab_size)
@@ -866,7 +884,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
     def _publish_modelexpress_metadata(self):
-        """Publish TransferEngine metadata to ModelExpress server (seed mode)."""
+        """Publish metadata to ModelExpress server (seed mode).
+
+        Supports two transport backends:
+        - transfer_engine: publishes TransferEngine session_id (Mooncake)
+        - nixl: creates NIXL agent, registers tensors, publishes nixl_metadata
+        """
         try:
             from modelexpress import p2p_pb2
             from modelexpress.client import MxClient
@@ -880,15 +903,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.server_args.modelexpress_model_name or self.server_args.model_path
         )
         mx_url = self.server_args.modelexpress_url
-        session_id = self.remote_instance_transfer_engine_session_id
-        weight_info = self.remote_instance_transfer_engine_weight_info
-
-        if not session_id or weight_info is None:
-            logger.warning(
-                "ModelExpress source: skipping publish -- "
-                "TransferEngine not initialized or no weight info"
-            )
-            return
+        transport = self.server_args.modelexpress_transport
 
         # Build SourceIdentity for this instance
         identity = p2p_pb2.SourceIdentity(
@@ -901,23 +916,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             quantization=self.server_args.quantization or "",
         )
 
-        # Build tensor descriptors from weight_info dict
-        tensors = []
-        for name, (addr, numel, element_size) in weight_info.items():
-            tensors.append(
-                p2p_pb2.TensorDescriptor(
-                    name=name,
-                    addr=addr,
-                    size=numel * element_size,
-                    device_id=self.gpu_id,
-                )
-            )
-
-        worker = p2p_pb2.WorkerMetadata(
-            worker_rank=self.tp_rank,
-            transfer_engine_session_id=session_id,
-            tensors=tensors,
-        )
+        if transport == "nixl":
+            worker, tensor_count = self._build_nixl_worker_metadata(p2p_pb2)
+        else:
+            worker, tensor_count = self._build_transfer_engine_worker_metadata(p2p_pb2)
+            if worker is None:
+                return
 
         # Generate a unique worker_id for this running instance
         worker_id = str(uuid.uuid4())
@@ -925,12 +929,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         mx_client = MxClient(server_url=mx_url)
         try:
             logger.info(
-                "ModelExpress source: publishing metadata for model=%s, "
-                "tp_rank=%d, session=%s, %d tensors, worker_id=%s",
+                "ModelExpress source [%s]: publishing metadata for model=%s, "
+                "tp_rank=%d, %d tensors, worker_id=%s",
+                transport,
                 model_name,
                 self.tp_rank,
-                session_id,
-                len(tensors),
+                tensor_count,
                 worker_id,
             )
             mx_source_id = mx_client.publish_metadata(identity, worker, worker_id)
@@ -949,6 +953,84 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
         finally:
             mx_client.close()
+
+    def _build_transfer_engine_worker_metadata(self, p2p_pb2):
+        """Build WorkerMetadata using TransferEngine session_id."""
+        session_id = self.remote_instance_transfer_engine_session_id
+        weight_info = self.remote_instance_transfer_engine_weight_info
+
+        if not session_id or weight_info is None:
+            logger.warning(
+                "ModelExpress source: skipping publish -- "
+                "TransferEngine not initialized or no weight info"
+            )
+            return None, 0
+
+        tensors = []
+        for name, (addr, numel, element_size) in weight_info.items():
+            tensors.append(
+                p2p_pb2.TensorDescriptor(
+                    name=name,
+                    addr=addr,
+                    size=numel * element_size,
+                    device_id=self.gpu_id,
+                )
+            )
+
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.tp_rank,
+            transfer_engine_session_id=session_id,
+            tensors=tensors,
+        )
+        return worker, len(tensors)
+
+    def _build_nixl_worker_metadata(self, p2p_pb2):
+        """Build WorkerMetadata using NIXL agent for RDMA transfers."""
+        from modelexpress.nixl_transfer import NixlTransferManager
+
+        agent_name = f"sglang-seed-rank{self.tp_rank}-{uuid.uuid4().hex[:8]}"
+        nixl_mgr = NixlTransferManager(agent_name, self.gpu_id)
+        nixl_mgr.initialize()
+
+        # Collect model tensors for NIXL registration
+        model_tensors = {}
+        for name, param in self.model.named_parameters():
+            t = param.data
+            if t.is_contiguous():
+                model_tensors[name] = t
+            else:
+                # Non-contiguous tensors: register underlying storage as byte view
+                sv = torch.empty(0, dtype=torch.uint8, device=t.device).set_(
+                    t.untyped_storage()
+                )
+                if sv.data_ptr() not in {v.data_ptr() for v in model_tensors.values()}:
+                    model_tensors[f"{name}.__storage"] = sv
+
+        nixl_metadata = nixl_mgr.register_tensors(model_tensors)
+
+        # Build tensor descriptors from registered tensors
+        tensors = []
+        for td in nixl_mgr.tensor_descriptors:
+            tensors.append(
+                p2p_pb2.TensorDescriptor(
+                    name=td.name,
+                    addr=td.addr,
+                    size=td.size,
+                    device_id=td.device_id,
+                    dtype=td.dtype,
+                )
+            )
+
+        worker = p2p_pb2.WorkerMetadata(
+            worker_rank=self.tp_rank,
+            nixl_metadata=nixl_metadata,
+            tensors=tensors,
+        )
+
+        # Keep reference alive so NIXL agent isn't garbage collected
+        self._nixl_manager = nixl_mgr
+
+        return worker, len(tensors)
 
     def model_specific_adjustment(self):
         server_args = self.server_args
@@ -1081,6 +1163,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 distributed_init_method=dist_init_method,
                 timeout=self.server_args.dist_timeout,
                 moe_a2a_backend=self.server_args.moe_a2a_backend,
+                recovered_rank=self.server_args.elastic_ep_rejoin,
             )
             initialize_model_parallel(
                 tensor_model_parallel_size=self.tp_size,
@@ -1091,6 +1174,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_data_model_parallel_size=self.moe_dp_size,
                 duplicate_tp_group=self.server_args.enable_pdmux,
                 enable_symm_mem=self.server_args.enable_symm_mem,
+                recovered_rank=self.server_args.elastic_ep_rejoin,
             )
             initialize_dp_attention(
                 server_args=self.server_args,
@@ -1241,6 +1325,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             modelexpress_ep_size=self.server_args.ep_size,
             modelexpress_dtype=self.server_args.dtype,
             modelexpress_quantization=self.server_args.quantization or "",
+            modelexpress_transport=self.server_args.modelexpress_transport,
             modelopt_config=modelopt_config,
             rl_quant_profile=self.server_args.rl_quant_profile,
             draft_model_idx=self.draft_model_idx,
@@ -1379,9 +1464,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             f"mem usage={self.weight_load_mem_usage:.2f} GB."
         )
         if self.server_args.debug_tensor_dump_output_folder is not None:
+            dump_folder = self.server_args.debug_tensor_dump_output_folder
+            if self.spec_algorithm.is_eagle():
+                role = "draft" if self.is_draft_worker else "target"
+                dump_folder = os.path.join(dump_folder, role)
             register_forward_hook_for_model(
                 self.model,
-                self.server_args.debug_tensor_dump_output_folder,
+                dump_folder,
                 self.server_args.debug_tensor_dump_layers,
                 self.tp_size,
                 self.tp_rank,
@@ -1459,6 +1548,66 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     get_global_server_args().load_format,
                     weight_name_filter=weight_name_filter,
                 )
+
+    def maybe_recover_ep_ranks(self):
+        # TODO(perf): `active_ranks.all()` on a CUDA tensor triggers host-device
+        # synchronization, and this function is on the forward-path.
+        # This check only runs when `--elastic-ep-backend` is enabled, so the
+        # synchronization overhead does not propagate to other configs.
+        # Leave for future optimization of the elastic EP path.
+        if self.tp_group.active_ranks.all() and self.tp_group.active_ranks_cpu.all():
+            return
+
+        tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
+        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
+        tp_active_ranks &= tp_active_ranks_cpu
+        # NOTE: `ranks_to_recover` uses indices in `tp_group`. For the current
+        # Mooncake elastic EP implementation we assume `--pp-size=1`, so the
+        # tp-group index is the same as the global rank index.
+        ranks_to_recover = [
+            i for i in range(len(tp_active_ranks)) if not tp_active_ranks[i]
+        ]
+
+        # try_recover_ranks polls peer state via Mooncake EP backend.
+        # Mooncake's internal semantics guarantee that all ranks observe
+        # consistent peer readiness state, so collective operations below
+        # are safe even though polling appears local.
+        if ranks_to_recover and try_recover_ranks(ranks_to_recover):
+            self.forward_pass_id = 0
+            self.eplb_manager.reset_generator()
+            broadcast_global_expert_location_metadata(
+                src_rank=self._get_healthy_expert_location_src_rank(
+                    invoked_in_elastic_ep_rejoin_path=False
+                )
+            )
+            ElasticEPStateManager.instance().reset()
+
+            broadcast_pyobj(
+                [self.server_args.random_seed],
+                get_world_group().rank,
+                get_world_group().cpu_group,
+                src=get_world_group().ranks[0],
+            )
+            logger.info(f"recover ranks {ranks_to_recover} done")
+
+    def _get_healthy_expert_location_src_rank(
+        self, invoked_in_elastic_ep_rejoin_path: bool
+    ) -> int:
+        world_group = get_world_group()
+        # NOTE: do not key off `self.server_args.elastic_ep_rejoin` here.
+        # A rank that was started as a rejoin rank may later act as a healthy
+        # rank in a subsequent recovery cycle.
+        local_rejoin_flag = bool(invoked_in_elastic_ep_rejoin_path)
+        gathered_rejoin_flags = world_group.all_gather_object(local_rejoin_flag)
+
+        for rank_in_group, is_rejoin_rank in enumerate(gathered_rejoin_flags):
+            if not is_rejoin_rank:
+                return world_group.ranks[rank_in_group]
+
+        raise RuntimeError(
+            "No healthy rank found for broadcasting expert location metadata. "
+            "All ranks are marked as elastic_ep_rejoin."
+        )
 
     def update_weights_from_disk(
         self,
@@ -3003,6 +3152,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if self.msprobe_debugger is not None:
             self.msprobe_debugger.stop()
             self.msprobe_debugger.step()
+
+        if self.server_args.elastic_ep_backend is not None:
+            self.maybe_recover_ep_ranks()
 
         return output
 
