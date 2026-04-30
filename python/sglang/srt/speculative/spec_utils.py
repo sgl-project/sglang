@@ -486,6 +486,7 @@ def _select_top_k_tokens_first(
     return input_ids, hidden_states, topk_p, tree_info
 
 
+@torch.compile(dynamic=True, disable=_is_npu)
 def _select_top_k_tokens_later(
     i: int,
     topk_p: torch.Tensor,
