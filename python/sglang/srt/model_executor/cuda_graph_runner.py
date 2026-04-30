@@ -1123,15 +1123,23 @@ class CudaGraphRunner:
             return self._can_compile_replay_prepare_cache
         result = (
             envs.SGLANG_TORCH_COMPILE_REPLAY_PREPARE.get()
+            # We need combo scheduling to achieve good perf
             and hasattr(torch._inductor.config, "combo_kernels")
             and self._get_replay_attn_backend().supports_compiled_replay_prepare()
         )
         if result:
-            # Avoid graph breaks from .item() calls (e.g. seq_lens_cpu.max().item())
-            # by capturing them as unbacked symbolic ints in the FX graph. Without
-            # this, dynamo splits the compiled region into multiple sub-graphs.
             try:
+                # Avoid graph breaks from .item() calls (e.g. seq_lens_cpu.max().item())
+                # by capturing them as unbacked symbolic ints in the FX graph. Without
+                # this, dynamo splits the compiled region into multiple sub-graphs.
                 torch._dynamo.config.capture_scalar_outputs = True
+
+                torch._dynamo.config.accumulated_cache_size_limit = max(
+                    torch._dynamo.config.accumulated_cache_size_limit, 1024
+                )
+                torch._dynamo.config.cache_size_limit = max(
+                    torch._dynamo.config.cache_size_limit, 1024
+                )
             except Exception:
                 result = False
         self._can_compile_replay_prepare_cache = result
@@ -1192,7 +1200,7 @@ class CudaGraphRunner:
             seq_lens_cpu=buffers.seq_lens_cpu[:bs],
         )
 
-    @torch.compile(fullgraph=True, options={"combo_kernels": True, "cpp_wrapper": True if envs.SGLANG_TORCH_COMPILE_CPP_WRAPPER.get() else False})
+    @torch.compile(fullgraph=True, dynamic=True, options={"combo_kernels": True, "cpp_wrapper": True if (envs.SGLANG_TORCH_COMPILE_CPP_WRAPPER.get() and hasattr(torch._inductor.config, "cpp_wrapper")) else False})
     def _populate_from_forward_batch_and_init_attn_backend_compiled(
         self,
         forward_batch: ForwardBatch,
