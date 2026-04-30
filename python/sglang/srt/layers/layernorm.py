@@ -200,6 +200,10 @@ class RMSNorm(MultiPlatformOp):
         )
         if _use_aiter:
             self._forward_method = self.forward_aiter
+        # if get_bool_env_var("SGLANG_USE_NATIVE_LAYERNORM"):
+        #    self._forward_method = self.forward_native
+        # elif _use_aiter:
+        #    self._forward_method = self.forward_aiter
 
     def forward_cuda(
         self,
@@ -284,6 +288,14 @@ class RMSNorm(MultiPlatformOp):
         residual: Optional[torch.Tensor] = None,
         post_residual_addition: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+
+        # Fix dsv4 dp attenton issue
+        # the symptom is torch.AcceleratorError: HIP error: invalid configuration argument
+        if x.shape[0] == 0:
+            if residual is not None:
+                return x, residual
+            return x
+
         # Aiter's RMSNorm kernels expect 2D contiguous inputs. Keep the
         # already-safe layout as a zero-copy path, and only normalize strided or
         # higher-rank views such as Q/K slices from packed QKV projections.
@@ -293,6 +305,7 @@ class RMSNorm(MultiPlatformOp):
             x = x.contiguous().reshape(-1, original_shape[-1])
         elif not x.is_contiguous():
             x = x.contiguous()
+
         if residual is not None:
             residual_out = torch.empty_like(x)
             output = torch.empty_like(x)
