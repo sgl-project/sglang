@@ -74,16 +74,16 @@ class PrefillStats:
         )
 
 
+@dataclasses.dataclass
 class KvMetrics:
-    def __init__(self):
-        self.request_active_slots = None
-        self.request_total_slots = None
-        self.kv_active_blocks = None
-        self.kv_total_blocks = None
-        self.num_requests_waiting = None
-        self.gpu_cache_usage_perc = None
-        self.gpu_prefix_cache_hit_rate = None
-        self.data_parallel_rank = None
+    request_active_slots: int = 0
+    request_total_slots: int = 0
+    kv_active_blocks: int = 0
+    kv_total_blocks: int = 0
+    num_requests_waiting: int = 0
+    gpu_cache_usage_perc: float = 0.0
+    gpu_prefix_cache_hit_rate: float = 0.0
+    data_parallel_rank: int = 0
 
 
 class SchedulerMetricsMixin:
@@ -98,6 +98,12 @@ class SchedulerMetricsMixin:
         self.last_gen_throughput: float = 0.0
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
+        self.stats = SchedulerStats()
+        self._graph_backend_label = {
+            "cpu": "cpu graph",
+            "npu": "npu graph",
+            "musa": "musa graph",
+        }.get(getattr(self, "device", ""), "cuda graph")
 
         # Cumulative spec-decoding counters (reset every decode_log_interval).
         # Each update adds (num_accepted_drafts + bs, bs).
@@ -111,15 +117,14 @@ class SchedulerMetricsMixin:
         self.kv_transfer_speed_gb_s: float = 0.0
         self.kv_transfer_latency_ms: float = 0.0
 
-        self.stats = SchedulerStats()
-
         # Metrics
-        self.enable_mfu_metrics = False
         self.enable_metrics = self.server_args.enable_metrics
         self.is_stats_logging_rank = self.attn_tp_rank == 0
         self.current_scheduler_metrics_enabled = self.enable_metrics and (
-            self.is_stats_logging_rank == 0 or self.server_args.enable_metrics_for_all_schedulers
+            self.is_stats_logging_rank or self.server_args.enable_metrics_for_all_schedulers
         )
+        self.enable_mfu_metrics = False
+
         if self.enable_metrics:
             engine_type = DisaggregationMode.to_engine_type(
                 self.server_args.disaggregation_mode
@@ -145,7 +150,7 @@ class SchedulerMetricsMixin:
                 enable_streaming_session=self.server_args.enable_streaming_session,
                 server_args=self.server_args,
             )
-            self.enable_mfu_metrics = bool(self.server_args.enable_mfu_metrics)
+            self.enable_mfu_metrics = self.server_args.enable_mfu_metrics
             if self.enable_mfu_metrics:
                 self._init_estimated_perf_constants()
                 self._mfu_log_flops = 0.0
@@ -380,16 +385,8 @@ class SchedulerMetricsMixin:
             and self.server_args.encoder_transfer_backend == "zmq_to_scheduler"
         ):
             msg += f"waiting-image-req: {len(self.mm_receiver.waiting_list)}, "
-        graph_backend = defaultdict(
-            lambda: "cuda graph",
-            {
-                "cpu": "cpu graph",
-                "npu": "npu graph",
-                "musa": "musa graph",
-            },
-        )
 
-        msg += f"{graph_backend[self.device]}: {can_run_cuda_graph}, "
+        msg += f"{self._graph_backend_label}: {can_run_cuda_graph}, "
         msg += f"input throughput (token/s): {self.last_input_throughput:.2f}"
 
         if self.enable_mfu_metrics and gap_latency > 0:
@@ -399,7 +396,6 @@ class SchedulerMetricsMixin:
 
         if self.is_stats_logging_rank:
             logger.info(msg)
-
         if self.current_scheduler_metrics_enabled:
             self.metrics_collector.increment_prefill_cuda_graph_pass(
                 value=can_run_cuda_graph
@@ -564,16 +560,8 @@ class SchedulerMetricsMixin:
         ):
             msg += f"waiting-image-req: {len(self.mm_receiver.waiting_list)}, "
 
-        graph_backend = defaultdict(
-            lambda: "cuda graph",
-            {
-                "cpu": "cpu graph",
-                "npu": "npu graph",
-                "musa": "musa graph",
-            },
-        )
         msg += (
-            f"{graph_backend[self.device]}: {can_run_cuda_graph}, "
+            f"{self._graph_backend_label}: {can_run_cuda_graph}, "
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}"
         )
@@ -650,15 +638,17 @@ class SchedulerMetricsMixin:
             self.stats.streaming_session_held_tokens = self._session_held_tokens()
 
             # Routing key metrics
-            running_routing_keys = [r.routing_key for r in batch.reqs]
-            waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
-            (
-                self.stats.num_unique_running_routing_keys,
-                self.stats.routing_key_running_req_counts,
-            ) = compute_routing_key_stats(running_routing_keys)
-            _, self.stats.routing_key_all_req_counts = compute_routing_key_stats(
-                running_routing_keys + waiting_routing_keys
-            )
+            # (to reduce the overhead, we only compute this when all requests have routing_key)
+            if all(r.routing_key is not None for r in batch.reqs):
+                running_routing_keys = [r.routing_key for r in batch.reqs]
+                waiting_routing_keys = [r.routing_key for r in self.waiting_queue]
+                (
+                    self.stats.num_unique_running_routing_keys,
+                    self.stats.routing_key_running_req_counts,
+                ) = compute_routing_key_stats(running_routing_keys)
+                _, self.stats.routing_key_all_req_counts = compute_routing_key_stats(
+                    running_routing_keys + waiting_routing_keys
+                )
 
             # Utilization / LoRA / HiCache
             self.calculate_utilization()
