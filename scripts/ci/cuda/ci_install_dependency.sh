@@ -55,9 +55,12 @@ configure_environment() {
             link="${SYSTEM_SITE}/$1"
             pkg="$2"
             if [ -L "$link" ] && [ ! -e "$link" ]; then
-                echo "::warning::Self-heal: dangling symlink ${link} -> $(readlink "$link"). Removing and force-reinstalling ${pkg}."
+                # Uninstall (not force-reinstall) so install_sglang restores
+                # via pyproject.toml — no version pin to maintain here. No
+                # `|| true`: a failed uninstall fails the install loudly.
+                echo "::warning::Self-heal: dangling symlink ${link} -> $(readlink "$link"). Uninstalling ${pkg}; install_sglang will restore it."
                 rm -f "$link"
-                /usr/bin/python3 -m pip install --force-reinstall --no-deps "$pkg" --root-user-action=ignore >/dev/null 2>&1 || true
+                /usr/bin/python3 -m pip uninstall -y "$pkg" --root-user-action=ignore
             fi
         done
     fi
