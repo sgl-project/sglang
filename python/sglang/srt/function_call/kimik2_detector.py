@@ -61,8 +61,9 @@ class KimiK2Detector(BaseFormatDetector):
             re.DOTALL,
         )
 
+        # Non-greedy match stops at the next tool call boundary; \Z anchors to end of string
         self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)",
+            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[\w.\-]+:\d+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*?(?=<\|tool_call_begin\|>|\Z))",
             re.DOTALL,
         )
 
@@ -139,7 +140,10 @@ class KimiK2Detector(BaseFormatDetector):
         )
 
         if not has_tool_call:
-            self._buffer = ""
+            if self.eot_token in new_text:
+                self._reset_streaming_state()
+            else:
+                self._buffer = ""
             normal_text = _strip_special_tokens(new_text)
             return StreamingParseResult(normal_text=normal_text)
 
@@ -231,9 +235,12 @@ class KimiK2Detector(BaseFormatDetector):
                             self._buffer = ""
 
                         result = StreamingParseResult(normal_text="", calls=calls)
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
+                        if self.eot_token in self._buffer:
+                            self._reset_streaming_state()
+                        else:
+                            self.current_tool_id += 1
+                            self._last_arguments = ""
+                            self.current_tool_name_sent = False
                         return result
 
             return StreamingParseResult(normal_text="", calls=calls)
@@ -241,6 +248,17 @@ class KimiK2Detector(BaseFormatDetector):
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
             return StreamingParseResult(normal_text=_strip_special_tokens(current_text))
+
+    def _reset_streaming_state(self) -> None:
+        """Reset all streaming state to prevent cross-request state pollution."""
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
+        self.prev_tool_call_arr = []
+        self.streamed_args_for_tool = []
+        self._last_arguments = ""
+        self._buffer = ""
+        if hasattr(self, "_tool_indices"):
+            del self._tool_indices
 
     def structure_info(self) -> _GetInfoFunc:
         """Return function that creates StructureInfo for guided generation."""
