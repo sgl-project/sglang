@@ -3,7 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import logging
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import (
     TYPE_CHECKING,
     Iterable,
@@ -75,6 +75,7 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.cp_decode_attn_tp import DecodeAttnTpContext
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_round_robin_input_ids,
@@ -313,22 +314,22 @@ class MQALayer(nn.Module):
         compress_ratio_override: Optional[int] = None,
     ) -> None:
         super().__init__()
-        self.tp_rank = attn_tp_rank = get_attention_tp_rank()
-        self.tp_size = attn_tp_size = get_attention_tp_size()
+        self._tp_rank = attn_tp_rank = get_attention_tp_rank()
+        self._tp_size = attn_tp_size = get_attention_tp_size()
         self.dsa_enable_prefill_cp = is_dsa_enable_prefill_cp()
         if self.dsa_enable_prefill_cp:
             self.cp_size = get_attention_cp_size()
-            self.tp_rank = attn_tp_rank = 0
-            self.tp_size = attn_tp_size = 1
+            self._tp_rank = attn_tp_rank = 0
+            self._tp_size = attn_tp_size = 1
         self.layer_id = layer_id
         self.dim = config.hidden_size
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.qk_nope_head_dim = config.head_dim - config.qk_rope_head_dim
         self.head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
         self.n_heads = config.num_attention_heads
-        self.n_local_heads = self.n_heads // attn_tp_size
+        self._n_local_heads = self.n_heads // attn_tp_size
         self.n_groups = config.o_groups
-        self.n_local_groups = self.n_groups // attn_tp_size
+        self._n_local_groups = self.n_groups // attn_tp_size
         self.rope_head_dim = config.qk_rope_head_dim
         self.softmax_scale = self.head_dim**-0.5
         self.hidden_size = config.hidden_size
@@ -450,6 +451,10 @@ class MQALayer(nn.Module):
                 prefix=add_prefix("wkv", prefix),
             )
         self.q_norm = RMSNorm(self.q_lora_rank, eps=self.eps)
+
+        # Create decode attention TP context for CP-mode weight partitioning
+        self.decode_attn_tp_ctx = DecodeAttnTpContext()
+
         self.wq_b = ColumnParallelLinear(
             self.q_lora_rank,
             self.n_heads * self.head_dim,
@@ -484,10 +489,11 @@ class MQALayer(nn.Module):
             prefix=add_prefix("wo_b", prefix),
             tp_rank=attn_tp_rank,
             tp_size=attn_tp_size,
+            decode_attn_tp_ctx=self.decode_attn_tp_ctx,
         )
 
         self.attn_mqa = RadixAttention(
-            self.n_local_heads,
+            self._n_local_heads,
             self.head_dim,
             self.softmax_scale,
             num_kv_heads=1,
@@ -503,6 +509,41 @@ class MQALayer(nn.Module):
         # KV cache write is always fused into the K kernel
         # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
         # has no effect here -- the fused path is on by default.
+
+    @property
+    def n_local_heads(self) -> int:
+        """Number of local attention heads, accounting for decode attn TP mode."""
+        if self.decode_attn_tp_ctx.use_decode_attn_tp:
+            return self.n_heads // self.decode_attn_tp_ctx.decode_tp_size
+        return self._n_local_heads
+
+    @property
+    def n_local_groups(self) -> int:
+        """Number of local output groups, accounting for decode attn TP mode."""
+        if self.decode_attn_tp_ctx.use_decode_attn_tp:
+            return self.n_groups // self.decode_attn_tp_ctx.decode_tp_size
+        return self._n_local_groups
+
+    @property
+    def tp_rank(self) -> int:
+        """Current tensor parallel rank, accounting for decode attn TP mode."""
+        if self.decode_attn_tp_ctx.use_decode_attn_tp:
+            return self.decode_attn_tp_ctx.decode_tp_rank
+        return self._tp_rank
+
+    @property
+    def tp_size(self) -> int:
+        """Current tensor parallel size, accounting for decode attn TP mode."""
+        if self.decode_attn_tp_ctx.use_decode_attn_tp:
+            return self.decode_attn_tp_ctx.decode_tp_size
+        return self._tp_size
+
+    @contextmanager
+    def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
+        with self.decode_attn_tp_ctx.maybe_use_decode_attn_tp(
+            forward_batch, [self.wq_b, self.wo_a, self.wo_b]
+        ):
+            yield
 
     def _compute_q_a(
         self,
@@ -1403,12 +1444,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             else:
                 x_quant = None
 
-        hidden_states = self.self_attn(
-            x=hidden_states,
-            positions=positions,
-            forward_batch=forward_batch,
-            x_quant=x_quant,
-        )
+        with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            hidden_states = self.self_attn(
+                x=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+                x_quant=x_quant,
+            )
 
         if use_fused:
             fused_mhc = try_fused_hc_post_pre(

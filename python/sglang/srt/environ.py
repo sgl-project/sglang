@@ -579,6 +579,9 @@ class Envs:
     SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
 
+    # CP-mode decode: partition attention weights across CP ranks (TP-style)
+    SGLANG_CP_DECODE_ATTN_TP = EnvBool(False)
+
     # sgl-kernel
     SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK = EnvBool(False)
 
