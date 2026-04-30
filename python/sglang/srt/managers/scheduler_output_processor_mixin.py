@@ -44,6 +44,18 @@ class SchedulerOutputProcessorMixin:
     We put them into a separate file to make the `scheduler.py` shorter.
     """
 
+    def _cache_unfinished_req_after_prefill(
+        self: Scheduler, batch: ScheduleBatch, req: Req
+    ) -> None:
+        # NGRAM target verify can keep using these KV slots across the next
+        # decode/cancel step. Do not publish them for shared-prefix reuse yet.
+        if (
+            batch.spec_algorithm is not None
+            and batch.spec_algorithm.is_ngram()
+        ):
+            return
+        self.tree_cache.cache_unfinished_req(req)
+
     def _get_storage_backend_type(self) -> str:
         """Get storage backend type from tree_cache."""
         storage_backend_type = "none"
@@ -199,7 +211,7 @@ class SchedulerOutputProcessorMixin:
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        self.tree_cache.cache_unfinished_req(req)
+                        self._cache_unfinished_req_after_prefill(batch, req)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
 
