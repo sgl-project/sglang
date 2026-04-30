@@ -7,15 +7,10 @@
 set +e
 set -u
 
-# Same parse as ci_install_dependency.sh.
-USE_VENV_RAW="${USE_VENV:-true}"
-case "$(printf '%s' "$USE_VENV_RAW" | tr '[:upper:]' '[:lower:]')" in
-    1 | true | yes) ;;
-    *)
-        echo "USE_VENV=${USE_VENV_RAW}: skipping venv cleanup"
-        exit 0
-        ;;
-esac
+if [ "${USE_VENV:-false}" != "true" ]; then
+    echo "USE_VENV=${USE_VENV:-false}: skipping venv cleanup"
+    exit 0
+fi
 
 # Fall back to the hardcoded default if the install step crashed before
 # exporting SGLANG_CI_VENV_PATH via GITHUB_ENV.

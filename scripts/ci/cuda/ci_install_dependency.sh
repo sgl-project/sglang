@@ -39,14 +39,10 @@ configure_environment() {
     NVIDIA_NVSHMEM_VERSION="3.4.5"
     OPTIONAL_DEPS="${1:-}"
 
-    # Match ci_cleanup_venv.sh parsing — install and cleanup must agree on
-    # what USE_VENV=true means, or one runs while the other skips.
-    USE_VENV_RAW="${USE_VENV:-0}"
-    case "$(printf '%s' "$USE_VENV_RAW" | tr '[:upper:]' '[:lower:]')" in
-        1 | true | yes) USE_VENV=1 ;;
-        *)              USE_VENV=0 ;;
-    esac
-    echo "USE_VENV=${USE_VENV} (input: ${USE_VENV_RAW})"
+    # Set via job/workflow env in pr-test.yml; YAML booleans serialize as
+    # "true"/"false". Anything else is treated as off.
+    USE_VENV="${USE_VENV:-false}"
+    echo "USE_VENV=${USE_VENV}"
 
     # Repair dangling tvm_ffi/flashinfer symlinks in system site-packages
     # (left by stabilize_flashinfer_jit_paths runs that escaped the venv).
@@ -73,7 +69,7 @@ configure_environment() {
 
     SYS_PYTHON_VER=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")
 
-    if [ "$USE_VENV" = "1" ]; then
+    if [ "$USE_VENV" = "true" ]; then
         # Stable path: deep_gemm MD5s `-I<site-packages>/deep_gemm/include`
         # into its JIT cache key, so a per-job path rotates the key every run
         # and ~/.cache/deep_gemm fills with unreachable entries. Assumes one
@@ -99,7 +95,7 @@ configure_environment() {
             echo "$UV_VENV/bin" >> "$GITHUB_PATH"
         fi
     else
-        echo "USE_VENV=${USE_VENV} (input: ${USE_VENV_RAW}): skipping uv venv creation, installing into system Python"
+        echo "USE_VENV=${USE_VENV}: skipping uv venv creation, installing into system Python"
         UV_VENV=""
     fi
 
@@ -201,7 +197,7 @@ clean_site_packages() {
 setup_pip_toolchain() {
     python3 -m pip install --upgrade pip
 
-    if [ "$USE_VENV" != "1" ]; then
+    if [ "$USE_VENV" != "true" ]; then
         export UV_SYSTEM_PYTHON=1
     fi
 
@@ -348,7 +344,7 @@ stabilize_flashinfer_jit_paths() {
     # In venv mode, FlashInfer JIT writes build.ninja with hardcoded -isystem
     # paths. Per-job venvs get unique paths, but the JIT cache is shared on the
     # host mount. Fix by symlinking venv copies to a stable host-mounted path.
-    if [ "$USE_VENV" != "1" ]; then
+    if [ "$USE_VENV" != "true" ]; then
         return
     fi
 
@@ -497,7 +493,7 @@ setup_ld_library_path() {
     VENV_LD="${NVIDIA_LIBS}${TORCH_LIB}"
     export LD_LIBRARY_PATH="${VENV_LD}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
-    if [ "$USE_VENV" = "1" ] && [ -n "$UV_VENV" ]; then
+    if [ "$USE_VENV" = "true" ] && [ -n "$UV_VENV" ]; then
         echo "export LD_LIBRARY_PATH=\"$LD_LIBRARY_PATH\"" >> "$UV_VENV/env.sh"
     fi
     if [ -n "${GITHUB_ENV:-}" ]; then
