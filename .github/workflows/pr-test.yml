@@ -69,6 +69,8 @@ env:
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   # TEMP: forced to 'true' for torch-211-merge PR only — revert before merging to main.
   SKIP_STAGE_HEALTH_CHECK: 'true'
+  # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
+  FORCE_REBUILD_DEEPEP: '1'
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
