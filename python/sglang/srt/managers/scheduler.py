@@ -1462,12 +1462,24 @@ class Scheduler(
 
                 should_block_for_paused_rpc = True
                 if self.server_args.enable_dp_attention:
-                    # In DP-attention mode, control requests are broadcast via
-                    # tp_group below. Only the tp_group source should wait on
-                    # the RPC socket while paused; the other ranks must enter
-                    # the broadcast as receivers. If they block on ZMQ here,
-                    # pause/flush can deadlock the control broadcast.
-                    should_block_for_paused_rpc = self.tp_group.is_first_rank
+                    if self.server_args.enable_dp_attention_local_control_broadcast:
+                        # Under local_control_broadcast, the DP controller
+                        # fans control messages out to every DP-leader
+                        # (attn_tp_rank=0, attn_cp_rank=0); each leader
+                        # receives its own RPC via ZMQ. Non-leaders within
+                        # the attn_tp/attn_cp group still rely on the local
+                        # broadcast and must enter it as receivers, so only
+                        # leaders should block on the RPC socket here.
+                        should_block_for_paused_rpc = (
+                            self.attn_tp_rank == 0 and self.attn_cp_rank == 0
+                        )
+                    else:
+                        # Default DP-attention: only tp_group rank-0 receives
+                        # control messages via ZMQ; other ranks rely on the
+                        # tp_cpu_group broadcast below and must enter it as
+                        # receivers. Blocking on ZMQ here would deadlock the
+                        # control broadcast.
+                        should_block_for_paused_rpc = self.tp_group.is_first_rank
 
                 if (
                     self._engine_paused
