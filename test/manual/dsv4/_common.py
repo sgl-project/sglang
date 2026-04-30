@@ -43,6 +43,9 @@ GSM8K smoke knobs (env vars):
 Shared knobs:
     DSV4_SGL_EVAL_OUT_DIR         (default /tmp/sgl-eval-out -> --out-dir)
     DSV4_SGL_EVAL_BIN             (default "sgl-eval"; override path to the CLI)
+    DSV4_SERVER_LAUNCH_TIMEOUT    (default 1800s; the sglang 600s default is
+                                   too short for DSv4 model load + DeepGEMM
+                                   warmup. Bump on first-run downloads.)
 
 Multi-node knobs (only consumed by multi-node test classes; if either
 is unset, those classes ``SkipTest``):
@@ -60,7 +63,6 @@ from typing import ClassVar, Dict, List, Optional
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
-    DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
     popen_launch_server,
@@ -68,6 +70,11 @@ from sglang.test.test_utils import (
 
 SGL_EVAL_BIN = os.environ.get("DSV4_SGL_EVAL_BIN", "sgl-eval")
 SGL_EVAL_OUT_DIR = os.environ.get("DSV4_SGL_EVAL_OUT_DIR", "/tmp/sgl-eval-out")
+
+# DSv4 server launch needs more than the 600s sglang default: model load alone
+# can take 5+ min and DeepGEMM warmup another ~5 min. First-run model download
+# adds ~10-30 min on top. 1800s covers steady-state; bump via env for downloads.
+SERVER_LAUNCH_TIMEOUT = int(os.environ.get("DSV4_SERVER_LAUNCH_TIMEOUT", "1800"))
 
 AIME25_NUM_REPEATS = int(os.environ.get("DSV4_AIME25_NUM_REPEATS", "16"))
 AIME25_TEMPERATURE = float(os.environ.get("DSV4_AIME25_TEMPERATURE", "1.0"))
@@ -143,7 +150,7 @@ class Dsv4Aime25TestBase(CustomTestCase):
         cls.process = popen_launch_server(
             cls.MODEL,
             cls.base_url,
-            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            timeout=SERVER_LAUNCH_TIMEOUT,
             other_args=list(cls.OTHER_ARGS),
             env=env,
         )
