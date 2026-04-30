@@ -50,11 +50,34 @@ class SpecRuntimeState:
 
 
 class AdaptiveSpecWorker(Protocol):
-    """Protocol that a worker must implement to use AdaptiveController."""
+    """Protocol that a worker must implement to use AdaptiveController.
+
+    Algorithm-specific formulas (the draft pool size at a given number of
+    steps, and the per-tier ``speculative_num_draft_tokens``) live on the
+    worker so the controller stays generic across speculative algorithms.
+    """
 
     speculative_num_steps: int
     speculative_num_draft_tokens: int
     topk: int
+
+    def get_draft_pool_size(self, num_steps: int) -> int:
+        """Number of draft candidates produced for tier=*num_steps*.
+
+        The controller checks this against ``speculative_num_draft_tokens``
+        before activating any tier; raise / return 0 for unsupported step
+        values (e.g. step=0).
+        """
+        ...
+
+    def get_num_draft_tokens(self, num_steps: int) -> int:
+        """``speculative_num_draft_tokens`` to use when this tier is active.
+
+        Chain-shape workers typically tie this to ``num_steps``; tree-shape
+        workers usually hold it constant across tiers and let the user pick
+        the verifier graph size directly.
+        """
+        ...
 
     def build_adaptive_runtime_state(
         self, speculative_num_steps: int, speculative_num_draft_tokens: int
@@ -84,42 +107,35 @@ class AdaptiveController:
             config=cfg,
         )
         self._states: dict[int, SpecRuntimeState] = {}
-        self._validate_candidate_steps_against_topk()
+        self._validate_candidate_steps()
 
-    def _validate_candidate_steps_against_topk(self) -> None:
-        """For topk>1, ensure the smallest candidate step yields enough draft
-        candidates to satisfy speculative_num_draft_tokens.
+    def _validate_candidate_steps(self) -> None:
+        """Ensure the smallest candidate step yields enough draft candidates
+        to satisfy that tier's ``num_draft_tokens``.
 
-        EAGLE draft_forward (eagle_worker.py) builds a score pool via
-        select_top_k_tokens (spec_utils.py):
-          - step i=0: appends `topk` scores
-          - step i>=1: appends `topk * topk` scores per step
-        organize_draft_results (eagle_utils.py) then selects
-        (num_draft_tokens - 1) entries from this pool.
-
-        Pool size at num_steps=s, topk=k (s >= 1):
-            pool(s, k) = k + (s - 1) * k**2
-
-        For topk=1 the existing server_args post-init already enforces
-        num_draft_tokens = num_steps + 1, so no check is needed there.
+        Both formulas are algorithm-specific and live on the worker (see
+        ``AdaptiveSpecWorker.get_draft_pool_size`` /
+        ``get_num_draft_tokens``); the controller only enforces the generic
+        invariant ``pool_size >= num_draft_tokens - 1`` for the smallest
+        tier. Bigger tiers have at least as much pool as the smallest one,
+        so a single check is sufficient when the per-tier budget is
+        non-decreasing in ``num_steps`` (true for both EAGLE chain and tree
+        policies).
         """
-        topk = self.worker.topk
-        if topk == 1:
-            return
-        num_draft_tokens = self.worker.speculative_num_draft_tokens
         min_step = min(self.params.candidate_steps)
         if min_step < 1:
             raise ValueError(
-                "adaptive candidate_steps must be >= 1 for topk>1 "
+                "adaptive candidate_steps must be >= 1 "
                 f"(got min={min_step}); step=0 support is tracked separately."
             )
-        pool_size = topk + (min_step - 1) * topk * topk
+        num_draft_tokens = self.worker.get_num_draft_tokens(min_step)
+        pool_size = self.worker.get_draft_pool_size(min_step)
         if pool_size < num_draft_tokens - 1:
             raise ValueError(
-                f"adaptive candidate_steps min={min_step} with topk={topk} "
-                f"yields a draft pool of only {pool_size} candidates, but "
-                f"speculative_num_draft_tokens={num_draft_tokens} requires "
-                f">= {num_draft_tokens - 1}. "
+                f"adaptive candidate_steps min={min_step} yields a draft "
+                f"pool of only {pool_size} candidates, but the tier needs "
+                f"speculative_num_draft_tokens={num_draft_tokens} "
+                f"(>= {num_draft_tokens - 1}). "
                 "Increase the smallest candidate step or lower "
                 "speculative_num_draft_tokens."
             )
@@ -141,19 +157,9 @@ class AdaptiveController:
         for steps in self.params.candidate_steps:
             if steps in self._states:
                 continue
-            # Chain (topk=1): num_draft_tokens is always num_steps + 1
-            # (server_args enforces this in post-init).
-            # Tree (topk>1): num_draft_tokens is the user-specified tree
-            # budget; build_tree_kernel selects top-N from the score pool.
-            # Hold it constant across tiers so the user retains direct
-            # control over the verifier graph size.
-            if self.worker.topk == 1:
-                draft_tokens = steps + 1
-            else:
-                draft_tokens = self.worker.speculative_num_draft_tokens
             state = self.worker.build_adaptive_runtime_state(
                 speculative_num_steps=steps,
-                speculative_num_draft_tokens=draft_tokens,
+                speculative_num_draft_tokens=self.worker.get_num_draft_tokens(steps),
             )
             self._states[steps] = state
         self._activate(self.params.current_steps)

@@ -229,14 +229,25 @@ class TestAdaptiveUnsupportedReason(unittest.TestCase):
 class _StubWorker:
     """Minimal AdaptiveSpecWorker implementer for controller-construction tests.
 
-    Only the validation path runs in __init__, so build/apply are stubbed but
-    must exist to satisfy the Protocol's structural shape.
+    Mirrors EAGLEWorker's pool / num_draft_tokens formulas so the controller
+    sees realistic values without touching real GPU paths. build/apply are
+    stubbed but must exist to satisfy the Protocol's structural shape.
     """
 
     def __init__(self, *, speculative_num_steps, speculative_num_draft_tokens, topk):
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = speculative_num_draft_tokens
         self.topk = topk
+
+    def get_draft_pool_size(self, num_steps):
+        if num_steps < 1:
+            return 0
+        return self.topk + (num_steps - 1) * self.topk * self.topk
+
+    def get_num_draft_tokens(self, num_steps):
+        if self.topk == 1:
+            return num_steps + 1
+        return self.speculative_num_draft_tokens
 
     def build_adaptive_runtime_state(
         self, speculative_num_steps, speculative_num_draft_tokens
@@ -249,7 +260,7 @@ class _StubWorker:
         raise NotImplementedError
 
 
-class TestValidateCandidateStepsAgainstTopk(unittest.TestCase):
+class TestValidateCandidateSteps(unittest.TestCase):
     def _make_config(self, candidate_steps):
         f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
         json.dump({"candidate_steps": candidate_steps, "warmup_batches": 1}, f)
@@ -257,13 +268,25 @@ class TestValidateCandidateStepsAgainstTopk(unittest.TestCase):
         self.addCleanup(os.unlink, f.name)
         return f.name
 
-    def test_topk_one_skips_validation(self):
-        # server_args already enforces num_draft_tokens = num_steps + 1 at topk=1,
-        # so the controller must not raise even if numbers look mismatched.
+    def test_topk_one_passes_validation(self):
+        # server_args enforces num_draft_tokens = num_steps + 1 at topk=1,
+        # so the per-tier budget always matches that tier's pool size.
         worker = _StubWorker(
             speculative_num_steps=1, speculative_num_draft_tokens=2, topk=1
         )
         cfg = self._make_config([1, 3])
+        AdaptiveController(worker, config_path=cfg)  # must not raise
+
+    def test_topk_one_default_candidate_steps_passes(self):
+        # Regression: at topk=1 with the default candidate_steps=[1, 3, 7],
+        # the smallest tier (s=1) must validate against its own
+        # num_draft_tokens (=2 by the chain rule), not against the worker's
+        # initial num_draft_tokens (which tracks the user's --speculative-num-steps
+        # and could be much larger).
+        worker = _StubWorker(
+            speculative_num_steps=3, speculative_num_draft_tokens=4, topk=1
+        )
+        cfg = self._make_config([1, 3, 7])
         AdaptiveController(worker, config_path=cfg)  # must not raise
 
     def test_undersized_pool_raises(self):
