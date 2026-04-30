@@ -9,9 +9,9 @@ It is designed for workloads whose accept length changes over time, where one st
 
 ## Current support
 
-- Only `--speculative-algorithm EAGLE`
-- Only `--speculative-eagle-topk 1`
-- If either condition is not met, SGLang falls back to static speculative settings
+- Only `--speculative-algorithm EAGLE` / `EAGLE3`
+- Both `--speculative-eagle-topk 1` (chain) and `> 1` (tree) are supported. For tree mode, the smallest tier in `candidate_steps` must produce a draft pool of at least `--speculative-num-draft-tokens - 1` candidates, where pool size is `topk + (num_steps - 1) * topk^2`. The default `candidate_steps = [1, 3, 7]` does not satisfy typical tree budgets — pass `{"candidate_steps": [2, 3]}` (or similar) for `topk > 1`.
+- If the algorithm condition is not met, SGLang falls back to static speculative settings
 
 ## Why adaptive steps help
 
