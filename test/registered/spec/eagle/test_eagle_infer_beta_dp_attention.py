@@ -65,13 +65,9 @@ class TestEagleDPAttnServerSmall(CustomTestCase):
             "--speculative-num-draft-tokens",
             "4",
         ]
-        with envs.SGLANG_ENABLE_SPEC_V2.override(
+        with envs.SGLANG_SPEC_NAN_DETECTION.override(
             True
-        ), envs.SGLANG_SPEC_NAN_DETECTION.override(
-            True
-        ), envs.SGLANG_SPEC_OOB_DETECTION.override(
-            True
-        ):
+        ), envs.SGLANG_SPEC_OOB_DETECTION.override(True):
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,

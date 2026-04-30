@@ -210,6 +210,23 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
         self.assertEqual(server_args.pipeline_config.resolution, 768)
 
+    def test_disable_autocast_is_preserved_after_pipeline_config_resolution(self):
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "Qwen/Qwen-Image-Layered",
+            "--disable-autocast",
+            "true",
+        ]
+
+        with patch.object(sys, "argv", ["sglang"] + argv):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertTrue(server_args.pipeline_config.disable_autocast)
+        self.assertTrue(server_args.disable_autocast)
+
 
 if __name__ == "__main__":
     unittest.main()

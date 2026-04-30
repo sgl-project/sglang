@@ -42,7 +42,6 @@ CASE_THRESHOLDS: Dict[str, Dict[ComponentType, float]] = {
     "flux_2_image_t2i": {ComponentType.TRANSFORMER: 0.99},
     "flux_2_image_t2i_layerwise_offload": {ComponentType.TRANSFORMER: 0.99},
     "flux_2_image_t2i_2_gpus": {ComponentType.TRANSFORMER: 0.99},
-    "flux_2_klein_ti2i_2_gpus": {ComponentType.TRANSFORMER: 0.975},
     "flux_2_ti2i": {ComponentType.TRANSFORMER: 0.99},
     "flux_2_t2i_customized_vae_path": {ComponentType.TRANSFORMER: 0.99},
     "fast_hunyuan_video": {ComponentType.TRANSFORMER: 0.99},

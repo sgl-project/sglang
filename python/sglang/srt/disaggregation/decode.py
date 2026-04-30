@@ -197,18 +197,26 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.mamba_ping_pong_track_buffer_size = 2 if enable_overlap_schedule else 1
         self.enable_mamba_extra_buffer = enable_mamba_extra_buffer
         self.enable_memory_saver = enable_memory_saver
+        # Each request needs 1 main mamba slot + ping-pong slots when extra_buffer is enabled.
+        # Cap the pool at max concurrent requests * slots_per_req to avoid allocating failed.
+        slots_per_req = 1 + (
+            self.mamba_ping_pong_track_buffer_size if enable_mamba_extra_buffer else 0
+        )
+        max_slots_needed = (size + pre_alloc_size) * slots_per_req
         if mamba_size is not None:
-            effective_mamba_size = min(mamba_size, size + pre_alloc_size)
-            if mamba_size > size + pre_alloc_size:
+            effective_mamba_size = max(mamba_size, max_slots_needed)
+            if mamba_size < max_slots_needed:
                 logger.warning(
-                    "mamba_size (%d) exceeds size + pre_alloc_size (%d), "
-                    "capping effective_mamba_size to %d",
+                    "mamba_size (%d) is less than decode side's max_slots_needed (%d = %d reqs * %d slots/req), "
+                    "raising effective_mamba_size to %d",
                     mamba_size,
+                    max_slots_needed,
                     size + pre_alloc_size,
+                    slots_per_req,
                     effective_mamba_size,
                 )
         else:
-            effective_mamba_size = size + pre_alloc_size
+            effective_mamba_size = max_slots_needed
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
@@ -369,6 +377,18 @@ class DecodePreallocQueue:
                     )
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
                 kv_args.state_type = "nsa"
+                if self.draft_token_to_kv_pool is not None and isinstance(
+                    self.draft_token_to_kv_pool, NSATokenToKVPool
+                ):
+                    (
+                        draft_state_data_ptrs,
+                        draft_state_data_lens,
+                        draft_state_item_lens,
+                    ) = self.draft_token_to_kv_pool.get_state_buf_infos()
+                    kv_args.state_data_ptrs += draft_state_data_ptrs
+                    kv_args.state_data_lens += draft_state_data_lens
+                    kv_args.state_item_lens += draft_state_item_lens
+
             else:
                 kv_args.state_type = "none"
         else:
