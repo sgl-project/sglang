@@ -66,15 +66,14 @@ class SchedulerStats:
     # Absolute token counts for the full-attention KV cache pool.
     # Invariant: kv_available_tokens + kv_evictable_tokens + kv_used_tokens <= max_total_num_tokens
     # (the gap accounts for protected/session-held tokens not exposed here).
+    # max_total_num_tokens is emitted once at startup via emit_constants.
     #
-    # max_total_num_tokens: total capacity of the full-attention KV cache pool.
     # kv_available_tokens:  free (unallocated) slots in the pool.
     # kv_evictable_tokens:  slots holding radix-cached KV data that can be evicted for new requests.
     # kv_used_tokens:       actively used slots (locked by running requests). Equals full_num_used.
     # num_used_tokens:      max(full_num_used, swa_num_used) for hybrid-SWA models, else full_num_used.
     #                       Does NOT include the mamba pool.
     num_used_tokens: int = 0
-    max_total_num_tokens: int = 0
     kv_available_tokens: int = 0
     kv_evictable_tokens: int = 0
     kv_used_tokens: int = 0
@@ -99,10 +98,6 @@ class SchedulerStats:
     # Utilization
     utilization: float = 0.0
     max_running_requests_under_SLO: Optional[int] = None
-
-    # Engine startup
-    engine_startup_time: float = 0.0
-    engine_load_weights_time: float = 0.0
 
     # Scheduler policy
     new_token_ratio: float = 0.0
@@ -257,12 +252,6 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        self.max_total_num_tokens = Gauge(
-            name="sglang:max_total_num_tokens",
-            documentation="Maximum total number of tokens in the KV cache pool.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
         self.kv_available_tokens = Gauge(
             name="sglang:kv_available_tokens",
             documentation="Number of free token slots in the KV cache pool.",
@@ -414,28 +403,6 @@ class SchedulerMetricsCollector:
         self.utilization = Gauge(
             name="sglang:utilization",
             documentation="The utilization.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.max_running_requests_under_SLO = Gauge(
-            name="sglang:max_running_requests_under_SLO",
-            documentation="The maximum number of running requests under SLO.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-
-        # =================================================================
-        # Engine startup
-        # =================================================================
-        self.engine_startup_time = Gauge(
-            name="sglang:engine_startup_time",
-            documentation="The time taken for the engine to start up.",
-            labelnames=labels.keys(),
-            multiprocess_mode="mostrecent",
-        )
-        self.engine_load_weights_time = Gauge(
-            name="sglang:engine_load_weights_time",
-            documentation="The time taken for the engine to load weights.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
@@ -854,15 +821,54 @@ class SchedulerMetricsCollector:
         )
 
         # =================================================================
-        # Other
+        # Constants (set once at startup via emit_constants)
         # =================================================================
-        # This is a work-around Info metric since Info metrics are not supported in Prometheus.
-        # Similar to vLLM, https://github.com/vllm-project/vllm/blob/main/vllm/v1/metrics/loggers.py
-        # If more Info metrics are needed, we can create a common _log_info function.
-        self.cache_config_info = Gauge(
-            name="sglang:cache_config_info",
-            documentation="Cache configuration information.",
-            labelnames=["page_size", "num_pages"],
+        self.max_total_num_tokens = Gauge(
+            name="sglang:max_total_num_tokens",
+            documentation="Maximum total number of tokens in the KV cache pool.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.max_running_requests_under_SLO = Gauge(
+            name="sglang:max_running_requests_under_SLO",
+            documentation="The maximum number of running requests under SLO.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.engine_startup_time = Gauge(
+            name="sglang:engine_startup_time",
+            documentation="The time taken for the engine to start up.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.engine_load_weights_time = Gauge(
+            name="sglang:engine_load_weights_time",
+            documentation="The time taken for the engine to load weights.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.page_size = Gauge(
+            name="sglang:page_size",
+            documentation="KV cache page size in tokens.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.num_pages = Gauge(
+            name="sglang:num_pages",
+            documentation="Number of KV cache pages.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.context_len = Gauge(
+            name="sglang:context_len",
+            documentation="Maximum context length.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.available_gpu_memory_gb = Gauge(
+            name="sglang:available_gpu_memory_gb",
+            documentation="Available GPU memory in GB at startup.",
+            labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
 
@@ -1057,7 +1063,6 @@ class SchedulerMetricsCollector:
 
         # Absolute token counts
         self._log_gauge(self.num_used_tokens, stats.num_used_tokens)
-        self._log_gauge(self.max_total_num_tokens, stats.max_total_num_tokens)
         self._log_gauge(self.kv_available_tokens, stats.kv_available_tokens)
         self._log_gauge(self.kv_evictable_tokens, stats.kv_evictable_tokens)
         self._log_gauge(self.kv_used_tokens, stats.kv_used_tokens)
@@ -1089,18 +1094,6 @@ class SchedulerMetricsCollector:
 
         # Utilization
         self._log_gauge(self.utilization, stats.utilization)
-        if stats.max_running_requests_under_SLO is not None:
-            self._log_gauge(
-                self.max_running_requests_under_SLO,
-                stats.max_running_requests_under_SLO,
-            )
-
-        # Engine startup
-        self._log_gauge(self.engine_startup_time, stats.engine_startup_time)
-        if stats.engine_load_weights_time is not None:
-            self._log_gauge(
-                self.engine_load_weights_time, stats.engine_load_weights_time
-            )
 
         # Scheduler policy
         self._log_gauge(self.new_token_ratio, stats.new_token_ratio)
@@ -1168,8 +1161,28 @@ class SchedulerMetricsCollector:
             )
         self.num_grammar_total.labels(**self.labels).inc(1)
 
-    def emit_cache_config_info(self, page_size: int, num_pages: int) -> None:
-        self.cache_config_info.labels(page_size=page_size, num_pages=num_pages).set(1)
+    def emit_constants(
+        self,
+        max_total_num_tokens: int,
+        max_running_requests_under_SLO: Optional[int],
+        engine_startup_time: float,
+        engine_load_weights_time: float,
+        page_size: int,
+        num_pages: int,
+        context_len: int,
+        available_gpu_memory_gb: float,
+    ) -> None:
+        self._log_gauge(self.max_total_num_tokens, max_total_num_tokens)
+        if max_running_requests_under_SLO is not None:
+            self._log_gauge(
+                self.max_running_requests_under_SLO, max_running_requests_under_SLO
+            )
+        self._log_gauge(self.engine_startup_time, engine_startup_time)
+        self._log_gauge(self.engine_load_weights_time, engine_load_weights_time)
+        self._log_gauge(self.page_size, page_size)
+        self._log_gauge(self.num_pages, num_pages)
+        self._log_gauge(self.context_len, context_len)
+        self._log_gauge(self.available_gpu_memory_gb, available_gpu_memory_gb)
 
 
 class TokenizerMetricsCollector:
