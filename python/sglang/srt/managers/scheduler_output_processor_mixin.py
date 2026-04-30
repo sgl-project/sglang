@@ -20,6 +20,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.utils import batch_convert_tensors_to_lists
 from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.server_args import MIS_DELIMITER_TOKEN_ID, get_global_server_args
 
@@ -169,11 +170,13 @@ class SchedulerOutputProcessorMixin:
                     logits_output.next_token_top_logprobs_idx = [
                         x.tolist() for x in logits_output.next_token_top_logprobs_idx
                     ]
+                # Batch-sync to avoid N individual GPU→CPU syncs (one per req).
                 if logits_output.next_token_token_ids_logprobs_val:
-                    logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
-                        for v in logits_output.next_token_token_ids_logprobs_val
-                    ]
+                    logits_output.next_token_token_ids_logprobs_val = (
+                        batch_convert_tensors_to_lists(
+                            logits_output.next_token_token_ids_logprobs_val
+                        )
+                    )
 
             hidden_state_offset = 0
 
@@ -307,7 +310,7 @@ class SchedulerOutputProcessorMixin:
                 if isinstance(embeddings, torch.Tensor):
                     embeddings = embeddings.tolist()
                 else:
-                    embeddings = [tensor.tolist() for tensor in embeddings]
+                    embeddings = batch_convert_tensors_to_lists(embeddings)
 
             if phs is not None:
                 if isinstance(phs, list):
@@ -424,11 +427,13 @@ class SchedulerOutputProcessorMixin:
                         x.tolist() for x in logits_output.next_token_top_logprobs_idx
                     ]
 
+                # Batch-sync to avoid N individual GPU→CPU syncs (one per req).
                 if logits_output.next_token_token_ids_logprobs_val:
-                    logits_output.next_token_token_ids_logprobs_val = [
-                        v.tolist()
-                        for v in logits_output.next_token_token_ids_logprobs_val
-                    ]
+                    logits_output.next_token_token_ids_logprobs_val = (
+                        batch_convert_tensors_to_lists(
+                            logits_output.next_token_token_ids_logprobs_val
+                        )
+                    )
         # else: Spec V1 — output_ids, check_finished, grammar, and reasoning tokens
         # are already handled in the verify phase (eagle_info.py / ngram_info.py).
 

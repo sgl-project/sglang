@@ -150,6 +150,35 @@ def validate_input_length(
     return None
 
 
+def batch_convert_tensors_to_lists(tensors: List) -> List:
+    """Convert a list of per-request GPU tensors to (nested) Python lists
+    with a single GPU→CPU sync.
+
+    Concatenates along dim 0, does one ``.tolist()``, then splits back by
+    per-tensor ``shape[0]``. Works for 1D tensors of varying length
+    (``shape[0] == numel()``) and for ND tensors with a matching trailing
+    shape (e.g. per-request 2D outputs with a uniform last dim).
+
+    Falls back to per-tensor ``.tolist()`` when trailing shapes differ
+    (mixed dims, non-uniform last dim). Returns the input unchanged when
+    the first entry is not a tensor (already-converted lists).
+    """
+    if not tensors or not isinstance(tensors[0], torch.Tensor):
+        return tensors
+
+    trailing = tensors[0].shape[1:]
+    if not all(t.shape[1:] == trailing for t in tensors):
+        return [t.tolist() for t in tensors]
+
+    sizes = [t.shape[0] for t in tensors]
+    flat = torch.cat(tensors, dim=0).tolist()
+    out, offset = [], 0
+    for n in sizes:
+        out.append(flat[offset : offset + n])
+        offset += n
+    return out
+
+
 def get_logprob_dict_from_result(result: GenerationBatchResult) -> dict:
 
     logits_output = result.logits_output
