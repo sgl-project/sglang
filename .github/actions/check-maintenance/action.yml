@@ -26,10 +26,21 @@ runs:
           exit 0
         fi
 
-        # Fetch issue state and body (fail-open: if API errors, allow CI to proceed).
-        ISSUE_JSON=$(gh issue view "$MAINTENANCE_ISSUE" --repo "$REPO" --json state,body 2>/dev/null || echo "")
+        # Fetch issue state and body. Capture stderr to a temp file so a
+        # silent failure doesn't get swallowed — earlier observed the action
+        # falsely reporting "no MIN_BASE_SHA" because gh failed and we hid
+        # the error with `2>/dev/null`. Fail-open is preserved (CI proceeds
+        # if we can't read the issue), but the cause is now visible in logs.
+        GH_STDERR_FILE=$(mktemp)
+        ISSUE_JSON=$(gh issue view "$MAINTENANCE_ISSUE" --repo "$REPO" --json state,body 2>"$GH_STDERR_FILE" || true)
+        if [[ -z "$ISSUE_JSON" ]]; then
+          echo "⚠️  gh issue view returned empty. stderr was:"
+          cat "$GH_STDERR_FILE" || true
+        fi
+        rm -f "$GH_STDERR_FILE"
         ISSUE_STATE=$(printf '%s' "$ISSUE_JSON" | jq -r '.state // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
         ISSUE_BODY=$(printf '%s' "$ISSUE_JSON" | jq -r '.body // ""' 2>/dev/null || echo "")
+        echo "DEBUG: ISSUE_STATE=$ISSUE_STATE  body_length=${#ISSUE_BODY}"
 
         # Parse optional `MIN_BASE_SHA: <sha>` directive from the issue body
         # (first occurrence wins). Whenever this directive is present, the
