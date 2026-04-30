@@ -42,8 +42,10 @@ def update_wheel_index(
     whl_repo_dir = pathlib.Path("sgl-whl")
 
     if not dist_dir.exists():
-        print(f"Warning: {dist_dir} does not exist, skipping index update")
-        return
+        raise FileNotFoundError(
+            f"{dist_dir} does not exist — the download-artifact step did not "
+            f"populate it; refusing to silently no-op the index update"
+        )
 
     # Format CUDA version with 'cu' prefix if not already present
     if not cuda_version.startswith("cu"):
@@ -87,23 +89,21 @@ def update_wheel_index(
     # Generate new links for current wheels
     new_links = []
     for wheel_path in sorted(dist_dir.glob("*.whl")):
-        try:
-            filename = wheel_path.name
-            sha256 = compute_sha256(wheel_path)
+        filename = wheel_path.name
+        sha256 = compute_sha256(wheel_path)
 
-            # URL format: {base_url}/{release_tag}/{filename}#sha256={hash}
-            wheel_url = f"{base_url}/{release_tag}/{filename}#sha256={sha256}"
-            link = f'<a href="{wheel_url}">{filename}</a><br>'
+        # URL format: {base_url}/{release_tag}/{filename}#sha256={hash}
+        wheel_url = f"{base_url}/{release_tag}/{filename}#sha256={sha256}"
+        link = f'<a href="{wheel_url}">{filename}</a><br>'
 
-            new_links.append(link)
-            print(f"  Added: {filename}")
-        except Exception as e:
-            print(f"  Error processing {wheel_path.name}: {e}")
-            continue
+        new_links.append(link)
+        print(f"  Added: {filename}")
 
     if not new_links:
-        print("  No new wheels to add")
-        return
+        raise RuntimeError(
+            f"No wheels found in {dist_dir} — index update for {cuda_version} "
+            f"would be a no-op; failing loudly instead of pushing an empty change"
+        )
 
     # Combine existing and new links (new links first for latest)
     all_links = new_links + existing_links
