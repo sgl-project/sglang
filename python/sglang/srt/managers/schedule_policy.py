@@ -646,9 +646,8 @@ class PrefillAdder:
             return AddReqResult.NO_TOKEN
 
         def add_req_state(r, insert_sort=False):
-            new_token_ratio = (
-                1.0 if r.sampling_params.ignore_eos else self.new_token_ratio
-            )
+            # for decoupled-spec benchmark, enqueue requests as early as possible
+            new_token_ratio = self.new_token_ratio
             tokens_left = r.sampling_params.max_new_tokens * new_token_ratio - len(
                 r.output_ids
             )
@@ -708,7 +707,10 @@ class PrefillAdder:
             self._update_prefill_budget(
                 0,
                 req.extend_input_len,
-                min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
+                int(
+                    min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
+                    * self.new_token_ratio
+                ),
             )
         else:
             if self.rem_chunk_tokens <= 0:
@@ -751,9 +753,13 @@ class PrefillAdder:
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
-        total_tokens = req.extend_input_len + min(
-            max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
-            CLIP_MAX_NEW_TOKENS,
+        # for decoupled-spec, enqueue as many requests as possible
+        total_tokens = req.extend_input_len + int(
+            min(
+                max(req.sampling_params.max_new_tokens - len(req.output_ids), 0),
+                CLIP_MAX_NEW_TOKENS,
+            )
+            * self.new_token_ratio
         )
 
         # adjusting the input_tokens based on host_hit_length and page_size
@@ -808,9 +814,12 @@ class PrefillAdder:
                 self._update_prefill_budget(
                     prefix_len,
                     input_tokens,
-                    min(
-                        req.sampling_params.max_new_tokens,
-                        CLIP_MAX_NEW_TOKENS,
+                    int(
+                        min(
+                            req.sampling_params.max_new_tokens,
+                            CLIP_MAX_NEW_TOKENS,
+                        )
+                        * self.new_token_ratio
                     ),
                 )
             else:

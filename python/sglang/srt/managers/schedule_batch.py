@@ -1911,7 +1911,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else [self.reqs[i] for i in selected_indices]
         )
 
-        if self.spec_algorithm.is_none():
+        if self.spec_algorithm.is_none() or self.spec_algorithm.is_decoupled_draft():
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
             return new_pages * page_size
 
@@ -1951,6 +1951,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self, server_args: ServerArgs
     ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
+        # for debug & performance benchmark, no retract is allowed
+        assert False, "some requests are to be retracted"
+
         sorted_indices = list(range(len(self.reqs)))
 
         # TODO(lsyin): improve retraction policy for radix cache
@@ -2077,7 +2080,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             draft_input: EagleDraftInput = self.spec_info
             draft_input.prepare_for_decode(self)
 
-        if not self.spec_algorithm.is_none():
+        if not (
+            self.spec_algorithm.is_none()
+            or self.spec_algorithm.is_decoupled_draft()
+        ):
             # if spec decoding is used, the decode batch is prepared inside
             # `forward_batch_speculative_generation` after running draft models.
             return

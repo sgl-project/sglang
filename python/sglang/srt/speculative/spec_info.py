@@ -19,6 +19,8 @@ class SpeculativeAlgorithm(Enum):
     EAGLE3 = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    DECOUPLED_VERIFY = auto()
+    DECOUPLED_DRAFT = auto()
     NONE = auto()
 
     @classmethod
@@ -45,6 +47,12 @@ class SpeculativeAlgorithm(Enum):
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
+
+    def is_decoupled_verify(self) -> bool:
+        return self == SpeculativeAlgorithm.DECOUPLED_VERIFY
+
+    def is_decoupled_draft(self) -> bool:
+        return self == SpeculativeAlgorithm.DECOUPLED_DRAFT
 
     def supports_spec_v2(self) -> bool:
         return self.is_eagle() or self.is_standalone()
@@ -101,6 +109,19 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_decoupled_verify():
+            if enable_overlap:
+                raise ValueError(
+                    "decoupled_verify does not support overlap worker creation."
+                )
+
+            from sglang.srt.speculative.decoupled_verify_worker import VerifyWorker
+
+            return VerifyWorker
+        elif self.is_decoupled_draft():
+            raise ValueError(
+                "decoupled_draft uses the normal TP worker instead of create_worker()."
+            )
 
         raise ValueError("Unreachable code path in create_worker.")
 

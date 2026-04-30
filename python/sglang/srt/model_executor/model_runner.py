@@ -2087,6 +2087,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_decoupled_verify()
         ):
             return not self.is_draft_worker
 
@@ -2121,6 +2122,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.spec_algorithm.is_eagle()
             or self.spec_algorithm.is_standalone()
             or self.spec_algorithm.is_ngram()
+            or self.spec_algorithm.is_decoupled_verify()
         ):
             if self.is_draft_worker:
                 raise RuntimeError("This should not happen")
@@ -2248,7 +2250,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         def get_spec_info():
             spec_info = None
-            if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
+            if (
+                self.spec_algorithm.is_eagle()
+                or self.spec_algorithm.is_standalone()
+                or self.spec_algorithm.is_decoupled_verify()
+            ):
                 from sglang.srt.speculative.eagle_info import EagleVerifyInput
 
                 if self.is_draft_worker:
