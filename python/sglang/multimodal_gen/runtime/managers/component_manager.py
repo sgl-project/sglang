@@ -39,7 +39,10 @@ class ComponentUse:
     # Whether cross-stage prefetch may prepare this use before the use-site.
     allow_prefetch: bool = True
     # Whether this use is expensive enough that earlier timeline prefetch matters.
-    # TODO: judge by parameter size and precision
+    # TODO: Replace this boolean hint with a budget-aware lookahead planner:
+    # estimate memory/load cost and reuse distance, keep small and early-request
+    # components resident within budget, prefetch as soon as VRAM slack appears,
+    # and release completed components only when the budget requires it.
     memory_intensive: bool = False
     # Optional module dtype required by this use-site.
     target_dtype: torch.dtype | None = None
