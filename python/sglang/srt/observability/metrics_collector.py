@@ -864,8 +864,8 @@ class SchedulerMetricsCollector:
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
-        self.available_gpu_memory_gb = Gauge(
-            name="sglang:available_gpu_memory_gb",
+        self.startup_available_gpu_memory_gb = Gauge(
+            name="sglang:startup_available_gpu_memory_gb",
             documentation="Available GPU memory in GB at startup.",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
@@ -1017,7 +1017,6 @@ class SchedulerMetricsCollector:
         t: float,
         dp_cooperation_info: Optional[DPCooperationInfo],
     ):
-        logger.debug(f"GPU execution seconds: {category=} {t=:.3f}")
         self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(t)
         if dp_cooperation_info is not None:
             self.dp_cooperation_gpu_execution_seconds_total.labels(
@@ -1169,7 +1168,7 @@ class SchedulerMetricsCollector:
         page_size: int,
         num_pages: int,
         context_len: int,
-        available_gpu_memory_gb: float,
+        startup_available_gpu_memory_gb: float,
     ) -> None:
         self._log_gauge(self.max_total_num_tokens, max_total_num_tokens)
         if max_running_requests_under_SLO is not None:
@@ -1181,7 +1180,7 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.page_size, page_size)
         self._log_gauge(self.num_pages, num_pages)
         self._log_gauge(self.context_len, context_len)
-        self._log_gauge(self.available_gpu_memory_gb, available_gpu_memory_gb)
+        self._log_gauge(self.startup_available_gpu_memory_gb, startup_available_gpu_memory_gb)
 
 
 class TokenizerMetricsCollector:
