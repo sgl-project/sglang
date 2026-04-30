@@ -534,7 +534,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     video_data,
                     audio_data,
                     modalities,
-                    use_dpsk_v32_encoding=self.use_dpsk_v32_encoding,
+                    use_dpsk_v32_encoding=self.chat_encoding_spec == "dsv32",
                 )
                 msg.update(processed_msg)
 
