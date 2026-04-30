@@ -63,13 +63,21 @@ def get_workflow_runs(repo: str, hours: int = 24) -> list[dict]:
 
 
 def get_jobs_for_run(repo: str, run_id: int) -> list[dict]:
-    """Get all jobs for a workflow run."""
+    """Get all jobs for a workflow run, including all retry attempts.
+
+    `filter=all` is required so that re-run attempts of the same job
+    appear separately. Each attempt consumed host time on the runner
+    pool, so for utilization we want them all summed in. The default
+    (`filter=latest`) only returns the most recent attempt and silently
+    hides time spent on prior retries.
+    """
     jobs = []
     page = 1
     while True:
         data = run_gh_command(
             [
-                f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100&page={page}",
+                f"repos/{repo}/actions/runs/{run_id}/jobs"
+                f"?per_page=100&page={page}&filter=all",
             ]
         )
         jobs.extend(data.get("jobs", []))
