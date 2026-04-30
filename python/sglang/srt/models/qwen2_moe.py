@@ -126,8 +126,10 @@ def can_fuse_shared_expert(
 
     # If shared experts have a different quantization spec than routed MoE
     # experts (e.g. unquantized BF16 vs MXFP4), fusion is not supported.
-    if quant_config is not None and not quant_config.can_fuse_shared_expert():
-        return False
+    if quant_config is not None:
+        can_fuse_shared_expert = getattr(quant_config, "can_fuse_shared_expert", None)
+        if can_fuse_shared_expert is not None and not can_fuse_shared_expert():
+            return False
 
     return True
 
