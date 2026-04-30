@@ -200,9 +200,9 @@ class UGSRTSchedulerExecutor:
                 "UG G forward requires SRT token indices on the U context binding"
             )
         prefix_len = int(getattr(binding, "token_count", 0) or 0)
-        if prefix_len <= 0:
+        if prefix_len < 0:
             raise UGSRTSchedulerExecutorError(
-                "UG G forward requires a non-empty U context binding"
+                "UG G forward binding token_count cannot be negative"
             )
         if int(prefix_indices.numel()) < prefix_len:
             raise UGSRTSchedulerExecutorError(
@@ -526,10 +526,15 @@ class UGSRTSchedulerExecutor:
         req_to_token = req_to_token_pool.req_to_token
         pool_device = req_to_token.device
         pool_dtype = req_to_token.dtype
-        req_to_token_pool.write(
-            (req_pool_idx, slice(0, prefix_len)),
-            prefix_indices.to(device=pool_device, dtype=pool_dtype, non_blocking=True),
-        )
+        if prefix_len > 0:
+            req_to_token_pool.write(
+                (req_pool_idx, slice(0, prefix_len)),
+                prefix_indices.to(
+                    device=pool_device,
+                    dtype=pool_dtype,
+                    non_blocking=True,
+                ),
+            )
         req_to_token_pool.write(
             (req_pool_idx, slice(prefix_len, seq_len)),
             out_cache_loc.to(device=pool_device, dtype=pool_dtype, non_blocking=True),

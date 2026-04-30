@@ -9,7 +9,6 @@ python3 test/registered/scheduler/test_bagel_qwen2_mot_native_live.py
 
 import json
 import os
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,7 +28,6 @@ register_cuda_ci(
 )
 
 _MODEL_ENV = "SGLANG_TEST_BAGEL_QWEN2_MOT_MODEL"
-_OFFICIAL_REPO_ENV = "SGLANG_TEST_BAGEL_OFFICIAL_REPO"
 _GLOBAL_ARGS_PATCH = (
     "sglang.multimodal_gen.runtime.pipelines_core.stages.base." "get_global_server_args"
 )
@@ -110,24 +108,6 @@ def _write_language_model_view(checkpoint_dir: Path, output_dir: Path) -> Path:
     return output_dir
 
 
-def _maybe_add_official_bagel_repo_to_path() -> None:
-    candidates = []
-    configured = os.getenv(_OFFICIAL_REPO_ENV)
-    if configured:
-        candidates.append(Path(configured))
-    candidates.append(Path("/data/BAGEL"))
-
-    for candidate in candidates:
-        if not candidate.exists():
-            continue
-        if not (candidate / "inferencer.py").exists():
-            continue
-        candidate_str = str(candidate)
-        if candidate_str not in sys.path:
-            sys.path.insert(0, candidate_str)
-        return
-
-
 def _make_ug_pipeline_server_args(scheduler) -> SimpleNamespace:
     from sglang.multimodal_gen.configs.pipeline_configs.ug import UGPipelineConfig
     from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -153,20 +133,11 @@ def _make_ug_pipeline_server_args(scheduler) -> SimpleNamespace:
 @unittest.skipUnless(os.getenv(_MODEL_ENV), f"Set {_MODEL_ENV} for live smoke")
 class TestBAGELQwen2MoTNativeLive(CustomTestCase):
     def test_real_bagel_language_weights_run_srt_u_forward(self):
-        import importlib.util
-
         import torch
         import torch.distributed as dist
 
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for the BAGEL native live smoke")
-
-        _maybe_add_official_bagel_repo_to_path()
-        if importlib.util.find_spec("inferencer") is None:
-            self.skipTest(
-                "Set SGLANG_TEST_BAGEL_OFFICIAL_REPO to the official BAGEL repo "
-                "for the BAGEL visual feature extractor live smoke"
-            )
 
         from sglang.srt.managers.scheduler import Scheduler
         from sglang.srt.models.bagel_qwen2_mot import (
@@ -353,21 +324,12 @@ class TestBAGELQwen2MoTNativeLive(CustomTestCase):
                 torch.cuda.empty_cache()
 
     def test_full_ug_pipeline_uses_native_srt_g_velocity(self):
-        import importlib.util
-
         import torch
         import torch.distributed as dist
         from PIL import Image
 
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for the BAGEL native pipeline live smoke")
-
-        _maybe_add_official_bagel_repo_to_path()
-        if importlib.util.find_spec("inferencer") is None:
-            self.skipTest(
-                "Set SGLANG_TEST_BAGEL_OFFICIAL_REPO to the official BAGEL repo "
-                "for the full BAGEL pipeline smoke"
-            )
 
         from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
         from sglang.multimodal_gen.runtime.pipelines.ug import UGPipeline
@@ -504,21 +466,12 @@ class TestBAGELQwen2MoTNativeLive(CustomTestCase):
                 torch.cuda.empty_cache()
 
     def test_forward_interleaved_api_runs_full_native_pipeline(self):
-        import importlib.util
-
         import torch
         import torch.distributed as dist
         from PIL import Image
 
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for the BAGEL interleaved API smoke")
-
-        _maybe_add_official_bagel_repo_to_path()
-        if importlib.util.find_spec("inferencer") is None:
-            self.skipTest(
-                "Set SGLANG_TEST_BAGEL_OFFICIAL_REPO to the official BAGEL repo "
-                "for the BAGEL interleaved API smoke"
-            )
 
         from sglang.multimodal_gen.runtime.pipelines.ug import UGPipeline
         from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import (

@@ -1,0 +1,91 @@
+roadmap: ug-official-alignment
+created: 2026-04-29
+
+items:
+  - slug: ug-official-parity-harness
+    description: 建一个官方 BAGEL 与 SGLang UG 的离线对齐 harness，固定同 checkpoint、seed、prompt、image、sampling 参数和中间张量 dump
+    depends_on: []
+    status: done
+    feature: 2026-04-29-ug-official-parity-harness
+    minimal_loop: false
+    notes: Acceptance 已完成；live harness probe 在 /tmp/ug-parity-phase1-codex-20260430 通过，官方代码只允许在测试/对照脚本中使用，不能进入 runtime import 链
+
+  - slug: ug-vlm-official-parity
+    description: 对齐 image+text 到 text 的 VLM 路径，证明 SRT U forward 的短 greedy generated token ids/text 与官方框架一致
+    depends_on: [ug-official-parity-harness]
+    status: done
+    feature: 2026-04-30-ug-vlm-official-parity
+    minimal_loop: true
+    notes: "完成 VLM text/token parity 收口：root cause 是 SRT U decode 没按官方 BAGEL do_sample=False 走 greedy，而是沿用默认 sampling；修复后远端真权重 /tmp/ug-vlm-align-greedy 通过，official/SGLang token_ids 和 text 均为 Audrey Hepburn in a red。完整 logits parity 暂不要求。"
+
+  - slug: ug-vlm-entrypoint-official-smoke
+    description: 用真权重跑通 experimental Python API、HTTP /v1/ug/vlm 和 CLI 的 VLM-only smoke
+    depends_on: [ug-vlm-official-parity]
+    status: done
+    feature: 2026-04-30-ug-vlm-entrypoint-official-smoke
+    minimal_loop: false
+    notes: 入口 contract、Python API、HTTP /v1/ug/vlm、CLI --ug-vlm-input、pipeline/worker VLM-only 分流已实现；diffusion worker 现在会为 real BAGEL UGPipeline 自动创建并注入 native SRT Scheduler。远端 CPU 单测 21 tests OK；2026-04-30 真权重 Python API、CLI、HTTP server 均输出 Audrey Hepburn in a red，token_ids 与官方短 greedy exact match，且 prefill_count=1、velocity_count=0、append_image_count=0。
+
+  - slug: ug-sampling-cfg-parity
+    description: 对齐 BAGEL denoise sampling 语义，包括 timestep shift、CFG text/img branch、cfg interval 和 renorm
+    depends_on: [ug-vlm-entrypoint-official-smoke]
+    status: done
+    feature: 2026-04-30-ug-sampling-cfg-parity
+    minimal_loop: false
+    notes: "完成 BAGEL sampling/CFG 语义收口：抽出 official shifted denoise schedule 和 effective CFG scale helper，UGDenoiseStage/native BAGEL executor/opt-in G parity harness 共用；CPU 单测覆盖 timestep、interval、image CFG gating、text_channel renorm。2026-04-30 远端 GPU2 真权重 2-step 256x256 T2I+Edit G parity probe 通过，输出目录 /tmp/ug-phase4-g-parity。"
+
+  - slug: ug-t2i-official-parity
+    description: 对齐 text-to-image 路径，证明 init latent、多步 velocity、VAE decode 和最终图像与官方框架匹配
+    depends_on: [ug-vlm-official-parity, ug-sampling-cfg-parity]
+    status: done
+    feature: 2026-04-30-ug-t2i-official-parity
+    minimal_loop: false
+    notes: "完成 T2I official parity：harness 可通过 SGLANG_TEST_BAGEL_G_TASKS=text_to_image 单独运行 T2I；补齐 SGLang counter 断言。2026-04-30 远端 GPU2 真权重 512x512/50-step report passed、diffs=0，输出图落在 /Users/bytedance/Desktop/ug-t2i-official-parity。过程中修复 native SRT G velocity 手动 forward 未关闭 autograd 导致长步数 OOM。"
+
+  - slug: ug-edit-official-parity
+    description: 对齐 image-edit 路径，证明输入图像理解、编辑 prompt、G denoise 和 append image 的结果与官方框架匹配
+    depends_on: [ug-t2i-official-parity]
+    status: done
+    feature: 2026-04-30-ug-edit-official-parity
+    minimal_loop: false
+    notes: "完成 image-edit official parity：harness 可通过 SGLANG_TEST_BAGEL_G_TASKS=image_edit 单独运行 edit，并补齐 SGLang artifact/counter 验收。2026-04-30 远端 GPU2 真权重 1024x800/50-step report passed、diffs=0；counter 显示 prefill_count=1、velocity_count=49、srt_sidecar_request_count=1、context_length=7065，证明图像条件进入 SRT-owned session 且 cfg_img sidecar 由 SRT 准备。输出图落在 /Users/bytedance/Desktop/ug-edit-official-parity。"
+
+  - slug: ug-interleaved-official-parity
+    description: 对齐多轮 interleave 流程，覆盖 image -> text -> image -> text 的官方结果顺序和 session 状态
+    depends_on: [ug-vlm-official-parity, ug-edit-official-parity]
+    status: done
+    feature: 2026-04-30-ug-interleaved-official-parity
+    minimal_loop: false
+    notes: "完成 interleave official parity：G parity harness 新 task 名为 SGLANG_TEST_BAGEL_G_TASKS=interleave（保留 interleaved 读入 alias），官方和 SGLang 都记录 generated_image 与 post_image_text/token ids。2026-04-30 远端 GPU2 真权重 1024x800/50-step report passed、diffs=0；post_image_text token_ids=[151644,13708,766,397] exact match，text='<think>\\n' exact match；counter 显示同一 session_id=bagel-g-parity-interleave、prefill_count=1、velocity_count=49、append_image_count=1、srt_u_decode_request_count=4。2026-05-01 远端 GPU2 2-step SGLANG_TEST_BAGEL_G_TASKS=interleave smoke 复验 OK。"
+
+  - slug: ug-entrypoint-official-smoke
+    description: 用真权重跑通 experimental Python API、HTTP /v1/ug/interleave 和 CLI 的 VLM/生图/编辑/interleave smoke
+    depends_on: [ug-interleaved-official-parity]
+    status: done
+    feature: 2026-04-30-ug-entrypoint-official-smoke
+    minimal_loop: false
+    notes: "完成 explicit mode entrypoint true-weight smoke：新增/更新 opt-in test_bagel_ug_entrypoint_official_smoke.py，Python API 覆盖 t2i、edit、interleave、vlm、think_t2i 五个 case；CLI 使用 --ug-interleave-input/--ug-interleave-output，HTTP 使用 POST /v1/ug/interleave，旧 interleaved 名称保留 alias。2026-05-01 远端 GPU2 Python 五 case OK：T2I/Edit 只返回 image，Interleave 返回 image+text，VLM 只返回 text 且 velocity_count=0，think_t2i 是 mode=t2i + think 开关而非独立模式；CLI/HTTP interleave 单 case OK。"
+
+  - slug: ug-native-model-hardening
+    description: 基于 parity 证据继续收敛 BAGEL/Qwen2-MoT native model path，清理临时 shell/observer 边界并补齐 loader/权重映射
+    depends_on: [ug-entrypoint-official-smoke]
+    status: done
+    feature: 2026-04-30-ug-native-model-hardening
+    minimal_loop: false
+    notes: "完成：1) post-image U decode 改为 SRT-owned BAGEL decode loop，文本由 SRT tokenizer decode 后通过 SRT metadata 返回；2) BAGEL logical kv_len/rope 通过 UGSessionRuntime ug_model_state 保存和传播，BAGEL native helpers 在 text/image/denoise 前从 SRT-owned state resync；3) CFG text/img logical context、token_count、sidecar marker 也进入 ug_model_state，prepare_latents/predict_velocity 从 session view resync CFG state，同时 full KV length 仍来自 SRT token binding。CPU runtime+BAGEL 56 tests、adapter+diffusion 29 tests 均通过；远端 GPU2 真权重 Python entry smoke 输出 image+text，text 为 '<think>\\n'，stats 为 prefill_count=1、velocity_count=3、append_image_count=1、srt_u_decode_request_count=5。下一步进入 ug-single-card-batching-guards。"
+
+  - slug: ug-single-card-batching-guards
+    description: 产品化单卡 multi-session 基础隔离和 batch guard，保证 UG non-causal/G segment 不污染普通 SRT 请求
+    depends_on: [ug-native-model-hardening]
+    status: done
+    feature: 2026-04-30-ug-single-card-batching-guards
+    minimal_loop: false
+    notes: "完成单卡正确性 guard 收口：保留现有 scheduler/ScheduleBatch compatibility key 作为边界，新增测试证明 mixed ordinary causal + UG non-causal-query extend batch 在分配前早失败；新增带 sidecar 的两 UG session close/release 隔离测试，关闭一个 session 只释放 owner 和自己的 sidecar，另一个 session 可继续 prefill。远端 CPU test_ug_session_runtime.py 22 tests、test_ug_diffusion_pipeline.py 24 tests、test_prefill_adder.py 11 tests 通过；未触发 scheduler 重写、KV 暴露或 official runtime import stop signal。"
+
+  - slug: ug-regression-and-docs
+    description: 固化官方对齐回归、真权重 opt-in 测试、开发文档和 roadmap/feature acceptance 回写
+    depends_on: [ug-entrypoint-official-smoke, ug-single-card-batching-guards]
+    status: done
+    feature: null
+    minimal_loop: false
+    notes: "2026-05-01 完成当前回写：entrypoint smoke 显式覆盖 t2i/edit/interleave/vlm/think_t2i；G parity harness task 名切到 interleave 并保留 legacy alias；roadmap/items 记录最新真权重复验命令与状态。后续若要把这些 opt-in smoke 接成 CI gate，应另起 feature，避免把大权重依赖塞进默认 per-commit。"

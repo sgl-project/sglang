@@ -12,6 +12,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
     UGDecodeStage,
     UGDenoiseStage,
     UGLatentStage,
+    _normalize_pipeline_interleaved_messages,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -22,6 +23,7 @@ from sglang.srt.ug.interleaved import (
     UGInterleavedRequest,
     UGInterleavedResponse,
     UGRuntimeStats,
+    normalize_ug_generation_mode,
 )
 from sglang.srt.ug.runtime import FakeUGModelRunner, UGSessionRuntime
 from sglang.srt.ug.srt_executor import (
@@ -164,9 +166,19 @@ class UGPipeline(ComposedPipelineBase):
         request = _normalize_interleaved_request(
             messages, sampling_params, sampling_kwargs
         )
+        metadata = dict(request.metadata)
+        metadata["mode"] = normalize_ug_generation_mode(
+            metadata.get("mode"), default="interleave"
+        )
+        if metadata["mode"] == "vlm":
+            return self.forward_vlm(request, server_args=server_args)
         batch = Req(
             sampling_params=request.sampling_params,
-            extra={"ug_interleaved_messages": request.to_legacy_segments()},
+            extra={
+                "ug_interleaved_messages": request.to_legacy_segments(),
+                "ug_request_metadata": metadata,
+                "ug_mode": metadata["mode"],
+            },
         )
         try:
             result = self.forward(batch, server_args)
@@ -177,7 +189,7 @@ class UGPipeline(ComposedPipelineBase):
             return UGInterleavedResponse.from_legacy_segments(
                 list(result.extra["ug_output_segments"]),
                 stats=stats,
-                metadata=dict(request.metadata),
+                metadata=metadata,
             )
         finally:
             contexts = batch.extra.get("ug_contexts")
@@ -200,6 +212,77 @@ class UGPipeline(ComposedPipelineBase):
         return [
             self.forward_interleaved(request, server_args=server_args)
             for request in requests
+        ]
+
+    def forward_vlm(
+        self,
+        messages: UGInterleavedRequest | list[Any],
+        sampling_params: UGSamplingParams | dict[str, Any] | None = None,
+        server_args: ServerArgs | None = None,
+        max_new_tokens: int | None = None,
+        **sampling_kwargs: Any,
+    ) -> UGInterleavedResponse:
+        """Experimental VLM-only UG API.
+
+        This path runs only SRT-owned U prefill and U text decode. It must not
+        enter latent preparation, G denoise, VAE decode, or append-image stages.
+        """
+
+        server_args = server_args or self.server_args
+        if server_args is None:
+            raise ValueError("UG VLM API requires server_args")
+        request = _normalize_interleaved_request(
+            messages, sampling_params, sampling_kwargs
+        )
+        max_new_tokens = _resolve_vlm_max_new_tokens(
+            request.metadata,
+            explicit_max_new_tokens=max_new_tokens,
+        )
+        bridge = self.get_module("ug_bridge")
+        generate_vlm_text = getattr(bridge, "generate_vlm_text", None)
+        if not callable(generate_vlm_text):
+            raise RuntimeError(
+                f"{bridge.__class__.__name__} does not support UG VLM text generation"
+            )
+
+        result = generate_vlm_text(
+            messages=_normalize_pipeline_interleaved_messages(request),
+            max_new_tokens=max_new_tokens,
+        )
+        runtime = getattr(bridge, "runtime", None)
+        try:
+            stats = _collect_runtime_stats_from_session(bridge, result.session)
+            segment_metadata: dict[str, Any] = {}
+            if result.token_ids:
+                segment_metadata["token_ids"] = list(result.token_ids)
+            if result.next_token_ids:
+                segment_metadata["next_token_ids"] = list(result.next_token_ids)
+            if result.position_ids:
+                segment_metadata["position_ids"] = list(result.position_ids)
+            metadata = dict(request.metadata)
+            metadata["mode"] = "vlm"
+            return UGInterleavedResponse.from_legacy_segments(
+                [
+                    {
+                        "type": "text",
+                        "text": result.text,
+                        "metadata": segment_metadata,
+                    }
+                ],
+                stats=stats,
+                metadata=metadata,
+            )
+        finally:
+            if runtime is not None:
+                runtime.close_session(result.session)
+
+    def forward_vlm_batch(
+        self,
+        requests: list[UGInterleavedRequest],
+        server_args: ServerArgs | None = None,
+    ) -> list[UGInterleavedResponse]:
+        return [
+            self.forward_vlm(request, server_args=server_args) for request in requests
         ]
 
 
@@ -257,6 +340,20 @@ def _normalize_interleaved_sampling_params(
     return sampling_params
 
 
+def _resolve_vlm_max_new_tokens(
+    metadata: dict[str, Any],
+    *,
+    explicit_max_new_tokens: int | None = None,
+) -> int:
+    value = explicit_max_new_tokens
+    if value is None:
+        value = metadata.get("max_new_tokens", metadata.get("max_length", 8))
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"UG VLM max_new_tokens must be positive, got {value}")
+    return value
+
+
 def _collect_interleaved_runtime_stats(
     bridge: UGDenoiserBridge,
     contexts: Any | None,
@@ -269,3 +366,15 @@ def _collect_interleaved_runtime_stats(
     return UGRuntimeStats.from_debug_counters(
         runtime.get_debug_counters(contexts.full.session)
     )
+
+
+def _collect_runtime_stats_from_session(
+    bridge: UGDenoiserBridge,
+    session: Any | None,
+) -> UGRuntimeStats | None:
+    if session is None:
+        return None
+    runtime = getattr(bridge, "runtime", None)
+    if runtime is None:
+        return None
+    return UGRuntimeStats.from_debug_counters(runtime.get_debug_counters(session))

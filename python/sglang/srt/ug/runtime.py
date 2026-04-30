@@ -11,9 +11,9 @@ from typing import Any, Literal, Protocol
 import torch
 
 from sglang.srt.ug.context import (
+    UGSessionHandle,
     UGSRTKVTokenBinding,
     UGSRTRequestView,
-    UGSessionHandle,
 )
 
 
@@ -75,6 +75,8 @@ class UGSRTPreparedInput:
     bagel_text_token_indices: list[int] | None = None
     bagel_vae_token_indices: list[int] | None = None
     mm_inputs: Any | None = None
+    srt_sidecar_role: str | None = None
+    srt_sidecar_session_id: str | None = None
     adapter_metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -120,6 +122,24 @@ class UGDecodeResult:
     text: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class UGTextDecodeResult:
+    session: UGSessionHandle
+    output_ids: tuple[int, ...]
+    text: str
+    input_ids: tuple[int, ...] = ()
+    position_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class UGVLMTextGenerationResult:
+    session: UGSessionHandle
+    text: str
+    token_ids: tuple[int, ...] = ()
+    next_token_ids: tuple[int, ...] = ()
+    position_ids: tuple[int, ...] = ()
+
+
 @dataclass(slots=True)
 class UGSessionRecord:
     session_id: str
@@ -139,12 +159,16 @@ class UGSessionRecord:
     srt_last_u_decode_request_id: str | None = None
     srt_last_u_decode_origin_input_len: int = 0
     srt_last_u_decode_output_ids: list[int] = field(default_factory=list)
+    srt_last_u_decode_text: str = ""
     srt_mm_offsets: list[tuple[int, int]] = field(default_factory=list)
     srt_mm_inputs: _UGSessionMMInputs | None = None
     srt_executed_request_count: int = 0
     srt_last_executed_request_id: str | None = None
     srt_last_executed_state: str | None = None
     srt_model_runner_forward_request_ids: set[str] = field(default_factory=set)
+    srt_sidecar_session_ids: set[str] = field(default_factory=set)
+    srt_sidecar_request_count: int = 0
+    ug_model_state: dict[str, Any] = field(default_factory=dict)
     closed: bool = False
 
     def handle(self) -> UGSessionHandle:
@@ -243,6 +267,21 @@ class FakeUGModelRunner:
         if record.append_image_count > 0 and record.decode_count == 1:
             return UGDecodeResult(type="text", text="generated_text_after_image")
         return UGDecodeResult(type="done")
+
+    def decode_vlm_text(
+        self,
+        *,
+        runtime: Any,
+        session: UGSessionHandle,
+        max_new_tokens: int,
+    ) -> UGVLMTextGenerationResult:
+        del runtime
+        token_ids = tuple(range(1, max(1, int(max_new_tokens)) + 1))
+        return UGVLMTextGenerationResult(
+            session=session,
+            text="generated_text",
+            token_ids=token_ids,
+        )
 
     def predict_velocity_from_session(
         self, *, request: UGVelocityRequest, record: UGSessionRecord
@@ -390,9 +429,15 @@ class UGSessionRuntime:
                 f"Cannot decode U segment from state {record.state} "
                 f"for UG session {handle.session_id}"
             )
-        if self.srt_u_decode_max_new_tokens > 0:
-            self._append_srt_u_decode_request(record)
-        result = self.model_runner.decode_next_segment(record=record)
+        decode_from_runtime = getattr(
+            self.model_runner, "decode_next_segment_from_runtime", None
+        )
+        if callable(decode_from_runtime):
+            result = decode_from_runtime(runtime=self, record=record)
+        else:
+            if self.srt_u_decode_max_new_tokens > 0:
+                self._append_srt_u_decode_request(record, greedy=True)
+            result = self.model_runner.decode_next_segment(record=record)
         record.decode_count += 1
         if result.type == "image_marker":
             record.state = UGSegmentState.G_DENOISE
@@ -401,6 +446,41 @@ class UGSessionRuntime:
         else:
             record.state = UGSegmentState.U_DECODE
         return result
+
+    def decode_text(
+        self,
+        handle: UGSessionHandle,
+        *,
+        max_new_tokens: int | None = None,
+        start_token_id: int | None = None,
+        position_ids: list[int] | tuple[int, ...] | None = None,
+        drop_previous_output: bool = False,
+        greedy: bool = False,
+        model_state_updates: dict[str, Any] | None = None,
+    ) -> UGTextDecodeResult:
+        record = self._record_for(handle)
+        if record.state != UGSegmentState.U_DECODE:
+            raise ValueError(
+                f"Cannot decode U text from state {record.state} "
+                f"for UG session {handle.session_id}"
+            )
+        input_ids = [] if start_token_id is None else [int(start_token_id)]
+        output_ids = self._append_srt_u_decode_request(
+            record,
+            max_new_tokens=max_new_tokens,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            drop_previous_output=drop_previous_output,
+            greedy=greedy,
+            model_state_updates=model_state_updates,
+        )
+        return UGTextDecodeResult(
+            session=record.handle(),
+            input_ids=tuple(input_ids),
+            output_ids=tuple(output_ids),
+            position_ids=tuple(int(position) for position in (position_ids or ())),
+            text=record.srt_last_u_decode_text,
+        )
 
     def predict_velocity(self, request: UGVelocityRequest) -> UGVelocityResponse:
         record = self._record_for(request.session)
@@ -478,8 +558,13 @@ class UGSessionRuntime:
         if record is not None:
             record.closed = True
             record.state = UGSegmentState.DONE
+            sidecar_session_ids = set(record.srt_sidecar_session_ids)
+        else:
+            sidecar_session_ids = set()
         self.model_runner.close_session(session_id=session_id)
         self._close_srt_session(session_id)
+        for sidecar_session_id in sorted(sidecar_session_ids):
+            self._close_srt_session(sidecar_session_id)
 
     def get_state(self, handle_or_session_id: UGSessionHandle | str) -> UGSegmentState:
         return self._record_for(handle_or_session_id).state
@@ -497,6 +582,9 @@ class UGSessionRuntime:
             "append_image_count": record.append_image_count,
             "decode_count": record.decode_count,
             "srt_request_count": record.srt_request_count,
+            "srt_sidecar_request_count": record.srt_sidecar_request_count,
+            "srt_sidecar_session_ids": sorted(record.srt_sidecar_session_ids),
+            "ug_model_state": self._copy_ug_model_state(record.ug_model_state),
             "srt_last_request_id": record.srt_last_request_id,
             "srt_last_origin_input_len": record.srt_last_origin_input_len,
             "srt_last_origin_input_ids": record.srt_last_origin_input_ids,
@@ -506,6 +594,7 @@ class UGSessionRuntime:
                 record.srt_last_u_decode_origin_input_len
             ),
             "srt_last_u_decode_output_ids": record.srt_last_u_decode_output_ids,
+            "srt_last_u_decode_text": record.srt_last_u_decode_text,
             "srt_mm_offsets": record.srt_mm_offsets,
             "srt_executed_request_count": record.srt_executed_request_count,
             "srt_last_executed_request_id": record.srt_last_executed_request_id,
@@ -557,12 +646,19 @@ class UGSessionRuntime:
             messages,
             state=record.state,
         )
-        total_inputs = len(prepared_inputs)
-        for input_index, prepared in enumerate(prepared_inputs):
+        total_inputs = sum(
+            1 for prepared in prepared_inputs if prepared.srt_sidecar_role is None
+        )
+        main_input_index = 0
+        for prepared in prepared_inputs:
+            if prepared.srt_sidecar_role is not None:
+                self._append_srt_sidecar_request(record, prepared)
+                continue
+            main_input_index += 1
             segment_request_id = (
-                request_id if total_inputs == 1 else f"{request_id}:s{input_index + 1}"
+                request_id if total_inputs == 1 else f"{request_id}:s{main_input_index}"
             )
-            is_final_segment = input_index == total_inputs - 1
+            is_final_segment = main_input_index == total_inputs
             input_ids = prepared.input_ids
             input_text = prepared.input_text
             mm_inputs = prepared.mm_inputs
@@ -581,6 +677,7 @@ class UGSessionRuntime:
 
             adapter_metadata = self._apply_prepared_srt_input(
                 req,
+                record=record,
                 recv_req=recv_req,
                 prepared=prepared,
                 is_final_segment=is_final_segment,
@@ -603,6 +700,65 @@ class UGSessionRuntime:
                 input_text=input_text,
                 messages=prepared.messages,
             )
+
+    def _append_srt_sidecar_request(
+        self,
+        owner_record: UGSessionRecord,
+        prepared: UGSRTPreparedInput,
+    ) -> None:
+        role = prepared.srt_sidecar_role
+        if not role:
+            raise RuntimeError("UG SRT sidecar request requires a sidecar role")
+        sidecar_session_id = (
+            prepared.srt_sidecar_session_id or f"{owner_record.session_id}:{role}"
+        )
+        owner_record.srt_sidecar_session_ids.add(sidecar_session_id)
+        self._ensure_srt_session(sidecar_session_id)
+        request_id = (
+            f"{owner_record.session_id}:sidecar:{role}:"
+            f"{owner_record.context_version + 1}:"
+            f"{owner_record.srt_sidecar_request_count + 1}"
+        )
+        sidecar_record = UGSessionRecord(
+            session_id=sidecar_session_id,
+            state=owner_record.state,
+            anchor_request_id=request_id,
+        )
+        req, recv_req = self._create_srt_session_req(
+            sidecar_record,
+            request_id=request_id,
+            input_ids=prepared.input_ids,
+            input_text=prepared.input_text,
+            mm_inputs=prepared.mm_inputs,
+            max_new_tokens=0,
+        )
+        adapter_metadata = self._apply_prepared_srt_input(
+            req,
+            record=owner_record,
+            recv_req=recv_req,
+            prepared=prepared,
+            is_final_segment=True,
+        )
+        adapter_metadata["ug_srt_owner_session_id"] = owner_record.session_id
+        adapter_metadata["ug_srt_sidecar_role"] = role
+        self._record_srt_req(sidecar_record, req, request_id=request_id)
+        self._attach_srt_u_forward_metadata(
+            sidecar_record,
+            req,
+            state=owner_record.state,
+            input_text=prepared.input_text,
+            messages=prepared.messages,
+            adapter_metadata=adapter_metadata,
+        )
+        self._execute_srt_req(sidecar_record, req, state=owner_record.state)
+        self._notify_srt_u_forward(
+            sidecar_record,
+            req,
+            state=owner_record.state,
+            input_text=prepared.input_text,
+            messages=prepared.messages,
+        )
+        owner_record.srt_sidecar_request_count += 1
 
     def _prepare_srt_u_inputs(
         self,
@@ -673,6 +829,7 @@ class UGSessionRuntime:
         self,
         req: Any,
         *,
+        record: UGSessionRecord,
         recv_req: Any,
         prepared: UGSRTPreparedInput,
         is_final_segment: bool,
@@ -685,6 +842,13 @@ class UGSessionRuntime:
         adapter_metadata = dict(prepared.adapter_metadata)
         adapter_metadata.setdefault("ug_srt_added_token_count", new_token_count)
         adapter_metadata["ug_srt_is_final_segment"] = bool(is_final_segment)
+        self._merge_ug_model_state_updates(
+            record,
+            adapter_metadata.get("ug_model_state_updates"),
+        )
+        adapter_metadata["ug_model_state"] = self._copy_ug_model_state(
+            record.ug_model_state
+        )
 
         if prepared.input_embeds is not None:
             suffix_embeds = prepared.input_embeds[stripped:]
@@ -743,24 +907,69 @@ class UGSessionRuntime:
             )
         return prefix_len, stripped
 
-    def _append_srt_u_decode_request(self, record: UGSessionRecord) -> None:
-        request_id = f"{record.session_id}:d{record.decode_count + 1}"
+    def _append_srt_u_decode_request(
+        self,
+        record: UGSessionRecord,
+        *,
+        max_new_tokens: int | None = None,
+        input_ids: list[int] | None = None,
+        position_ids: list[int] | tuple[int, ...] | None = None,
+        drop_previous_output: bool = False,
+        greedy: bool = False,
+        model_state_updates: dict[str, Any] | None = None,
+    ) -> list[int]:
+        max_new_tokens = (
+            self.srt_u_decode_max_new_tokens
+            if max_new_tokens is None
+            else int(max_new_tokens)
+        )
+        if max_new_tokens <= 0:
+            raise ValueError("UG SRT U decode requires max_new_tokens > 0")
+        input_ids = list(input_ids or [])
+        if position_ids is not None and len(position_ids) != len(input_ids):
+            raise ValueError(
+                "UG SRT U decode position_ids must match input_ids length: "
+                f"{len(position_ids)} != {len(input_ids)}"
+            )
+        request_id = f"{record.session_id}:d{record.srt_u_decode_request_count + 1}"
         req, _ = self._create_srt_session_req(
             record,
             request_id=request_id,
-            input_ids=[],
+            input_ids=input_ids,
             input_text="",
             mm_inputs=None,
-            max_new_tokens=self.srt_u_decode_max_new_tokens,
+            max_new_tokens=max_new_tokens,
+            drop_previous_output=drop_previous_output,
+            greedy=greedy,
         )
+        if position_ids is not None:
+            prefix_len = len(req.origin_input_ids) - len(input_ids)
+            if prefix_len < 0:
+                raise RuntimeError(
+                    "UG SRT U decode input length is inconsistent with session request"
+                )
+            req.ug_position_ids = list(range(prefix_len)) + [
+                int(position) for position in position_ids
+            ]
         self._record_srt_req(record, req, request_id=request_id)
+        adapter_metadata = {
+            "ug_srt_added_token_count": len(input_ids),
+        }
+        if position_ids is not None:
+            adapter_metadata["ug_srt_bagel_rope_delta"] = len(input_ids)
+        if model_state_updates is not None:
+            adapter_metadata["ug_model_state_updates"] = model_state_updates
+            self._merge_ug_model_state_updates(record, model_state_updates)
+        adapter_metadata["ug_model_state"] = self._copy_ug_model_state(
+            record.ug_model_state
+        )
         self._attach_srt_u_forward_metadata(
             record,
             req,
             state=UGSegmentState.U_DECODE,
             input_text="",
             messages=[],
-            adapter_metadata={"ug_srt_added_token_count": 0},
+            adapter_metadata=adapter_metadata,
         )
         self._execute_srt_req(record, req, state=UGSegmentState.U_DECODE)
         record.srt_u_decode_request_count += 1
@@ -769,7 +978,12 @@ class UGSessionRuntime:
         record.srt_last_u_decode_output_ids = list(
             req.output_ids[: req.sampling_params.max_new_tokens]
         )
-        record.context_length += len(record.srt_last_u_decode_output_ids)
+        record.srt_last_u_decode_text = self._decode_token_ids(
+            record.srt_last_u_decode_output_ids
+        )
+        record.context_length = len(req.origin_input_ids) + len(
+            record.srt_last_u_decode_output_ids
+        )
         self._notify_srt_u_forward(
             record,
             req,
@@ -777,6 +991,13 @@ class UGSessionRuntime:
             input_text="",
             messages=[],
         )
+        return list(record.srt_last_u_decode_output_ids)
+
+    def _decode_token_ids(self, token_ids: list[int] | tuple[int, ...]) -> str:
+        decode = getattr(self.tokenizer, "decode", None)
+        if callable(decode):
+            return str(decode(list(token_ids)))
+        return " ".join(str(token_id) for token_id in token_ids)
 
     def _create_srt_session_req(
         self,
@@ -787,6 +1008,8 @@ class UGSessionRuntime:
         input_text: str,
         mm_inputs: _UGSessionMMInputs | None,
         max_new_tokens: int,
+        drop_previous_output: bool = False,
+        greedy: bool = False,
     ):
         from sglang.srt.managers.io_struct import (
             SessionParams,
@@ -799,12 +1022,17 @@ class UGSessionRuntime:
             raise RuntimeError(
                 f"SRT session {record.session_id} is not open for UG request"
             )
+        sampling_params = SamplingParams(
+            max_new_tokens=max_new_tokens,
+            temperature=0.0 if greedy else 1.0,
+        )
+        sampling_params.normalize(self.tokenizer)
         recv_req = TokenizedGenerateReqInput(
             rid=request_id,
             input_text=input_text,
             input_ids=input_ids,
             mm_inputs=mm_inputs,
-            sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
+            sampling_params=sampling_params,
             return_logprob=False,
             logprob_start_len=0,
             top_logprobs_num=0,
@@ -814,7 +1042,7 @@ class UGSessionRuntime:
                 id=record.session_id,
                 rid=record.srt_last_request_id,
                 replace=False,
-                drop_previous_output=False,
+                drop_previous_output=drop_previous_output,
             ),
         )
         req = session.create_req(
@@ -953,10 +1181,54 @@ class UGSessionRuntime:
         metadata = dict(
             getattr(req, "ug_u_forward_metadata", {}).get("adapter_metadata", {})
         )
+        metadata.setdefault(
+            "ug_model_state", self._copy_ug_model_state(record.ug_model_state)
+        )
+        if state == UGSegmentState.U_DECODE:
+            metadata["srt_last_u_decode_text"] = record.srt_last_u_decode_text
         token_binding = self._srt_kv_token_binding(record, req, state=state)
         if token_binding is not None:
             metadata["srt_kv_token_binding"] = token_binding
         return metadata
+
+    @classmethod
+    def _merge_ug_model_state_updates(
+        cls,
+        record: UGSessionRecord,
+        updates: dict[str, Any] | None,
+    ) -> None:
+        if not updates:
+            return
+        if not isinstance(updates, dict):
+            raise ValueError("UG model state updates must be a dict")
+        for namespace, namespace_updates in updates.items():
+            if not isinstance(namespace_updates, dict):
+                raise ValueError(
+                    "UG model state namespace updates must be dicts: " f"{namespace!r}"
+                )
+            state = record.ug_model_state.setdefault(str(namespace), {})
+            for key, value in namespace_updates.items():
+                state[str(key)] = cls._copy_ug_model_state_value(value)
+
+    @classmethod
+    def _copy_ug_model_state(cls, state: dict[str, Any]) -> dict[str, Any]:
+        return {
+            str(key): cls._copy_ug_model_state_value(value)
+            for key, value in state.items()
+        }
+
+    @classmethod
+    def _copy_ug_model_state_value(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                str(key): cls._copy_ug_model_state_value(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [cls._copy_ug_model_state_value(item) for item in value]
+        if isinstance(value, tuple):
+            return tuple(cls._copy_ug_model_state_value(item) for item in value)
+        return value
 
     def _srt_kv_token_binding(
         self,

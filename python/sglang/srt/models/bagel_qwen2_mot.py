@@ -11,33 +11,40 @@ without exposing KV cache internals.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
-from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.linear import (
+    ColumnParallelLinear,
+    RowParallelLinear,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.bagel_visual import BAGELVisualFeatureMixin
-from sglang.srt.models.qwen2 import Qwen2ForCausalLM, Qwen2MLP, Qwen2Model
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -80,6 +87,99 @@ class BAGELMoTTokenRouting:
             raise ValueError("BAGEL MoT token routing indices must be disjoint")
 
 
+class BAGELRMSNorm(nn.Module):
+    def __init__(
+        self,
+        hidden_size: int,
+        eps: float = 1e-6,
+        *,
+        weight_dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=weight_dtype))
+        self.variance_epsilon = eps
+        self.hidden_size = hidden_size
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        post_residual_addition: Optional[torch.Tensor] = None,
+    ):
+        input_dtype = hidden_states.dtype
+        if residual is not None:
+            hidden_states = hidden_states + residual
+            if post_residual_addition is not None:
+                hidden_states = hidden_states + post_residual_addition
+
+        residual_out = hidden_states.to(input_dtype) if residual is not None else None
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        output = self.weight * hidden_states.to(input_dtype)
+        if residual is None:
+            return output
+        return output, residual_out
+
+
+def _normalize_bagel_rope_scaling(rope_scaling):
+    if not isinstance(rope_scaling, dict):
+        return rope_scaling
+    rope_type = rope_scaling.get("rope_type", rope_scaling.get("type"))
+    scaling_keys = set(rope_scaling) - {"rope_theta", "rope_type", "type"}
+    if rope_type == "default" and not scaling_keys:
+        return None
+    return rope_scaling
+
+
+class BAGELQwen2MLP(nn.Module):
+    """BAGEL-compatible Qwen2 MLP without fused gate/up activation."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        hidden_act: str,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        if hidden_act != "silu":
+            raise ValueError(
+                f"Unsupported activation: {hidden_act}. "
+                "Only silu is supported for BAGEL Qwen2-MoT."
+            )
+        self.gate_proj = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("gate_proj", prefix),
+        )
+        self.up_proj = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("up_proj", prefix),
+        )
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            quant_config=quant_config,
+            prefix=add_prefix("down_proj", prefix),
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        if get_global_server_args().rl_on_policy_target is not None:
+            hidden_states = hidden_states.bfloat16()
+        gate, _ = self.gate_proj(hidden_states)
+        up, _ = self.up_proj(hidden_states)
+        output, _ = self.down_proj(F.silu(gate) * up)
+        return output
+
+
 class BAGELQwen2MoTAttention(nn.Module):
     """Qwen2 attention with BAGEL MoT branch parameters.
 
@@ -108,6 +208,8 @@ class BAGELQwen2MoTAttention(nn.Module):
             assert tp_size % self.total_num_kv_heads == 0
         self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
         rope_theta, rope_scaling = get_rope_config(config)
+        rope_scaling = _normalize_bagel_rope_scaling(rope_scaling)
+        self.rope_scaling = rope_scaling
         head_dim = getattr(config, "head_dim", None)
         self.head_dim = head_dim or config.hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
@@ -115,14 +217,26 @@ class BAGELQwen2MoTAttention(nn.Module):
         self.scaling = self.head_dim**-0.5
         max_position_embeddings = getattr(config, "max_position_embeddings", 32768)
 
-        self.qkv_proj = QKVParallelLinear(
+        self.q_proj = ColumnParallelLinear(
             config.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
+            self.total_num_heads * self.head_dim,
             bias=True,
             quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
+            prefix=add_prefix("q_proj", prefix),
+        )
+        self.k_proj = ColumnParallelLinear(
+            config.hidden_size,
+            self.total_num_kv_heads * self.head_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("k_proj", prefix),
+        )
+        self.v_proj = ColumnParallelLinear(
+            config.hidden_size,
+            self.total_num_kv_heads * self.head_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("v_proj", prefix),
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
@@ -131,10 +245,10 @@ class BAGELQwen2MoTAttention(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("o_proj", prefix),
         )
-        self.q_norm = _make_qk_norm(config, self.head_dim)
-        self.k_norm = _make_qk_norm(config, self.head_dim)
-        self.q_norm_moe_gen = _make_qk_norm(config, self.head_dim)
-        self.k_norm_moe_gen = _make_qk_norm(config, self.head_dim)
+        self.q_norm = _make_bagel_rms_norm(config, self.head_dim)
+        self.k_norm = _make_bagel_rms_norm(config, self.head_dim)
+        self.q_norm_moe_gen = _make_bagel_rms_norm(config, self.head_dim)
+        self.k_norm_moe_gen = _make_bagel_rms_norm(config, self.head_dim)
         self.alt_stream = alt_stream
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -146,6 +260,18 @@ class BAGELQwen2MoTAttention(nn.Module):
                 config, "dual_chunk_attention_config", None
             ),
         )
+        official_inv_freq = 1.0 / (
+            rope_theta
+            ** (
+                torch.arange(0, self.head_dim, 2, dtype=torch.float)
+                / self.head_dim
+            )
+        )
+        self.register_buffer(
+            "official_inv_freq",
+            official_inv_freq,
+            persistent=False,
+        )
         self.attn = RadixAttention(
             self.num_heads,
             self.head_dim,
@@ -156,14 +282,26 @@ class BAGELQwen2MoTAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
-        self.qkv_proj_moe_gen = QKVParallelLinear(
+        self.q_proj_moe_gen = ColumnParallelLinear(
             config.hidden_size,
-            self.head_dim,
-            config.num_attention_heads,
-            config.num_key_value_heads,
+            config.num_attention_heads * self.head_dim,
             bias=True,
             quant_config=quant_config,
-            prefix=add_prefix("qkv_proj_moe_gen", prefix),
+            prefix=add_prefix("q_proj_moe_gen", prefix),
+        )
+        self.k_proj_moe_gen = ColumnParallelLinear(
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("k_proj_moe_gen", prefix),
+        )
+        self.v_proj_moe_gen = ColumnParallelLinear(
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("v_proj_moe_gen", prefix),
         )
         self.o_proj_moe_gen = RowParallelLinear(
             config.num_attention_heads * self.head_dim,
@@ -194,20 +332,217 @@ class BAGELQwen2MoTAttention(nn.Module):
         if mode != "und":
             raise ValueError(f"Unsupported BAGEL Qwen2-MoT mode: {mode}")
 
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = apply_qk_norm(
+        q, k, v = self._project_qkv(
+            hidden_states=hidden_states,
+            q_proj=self.q_proj,
+            k_proj=self.k_proj,
+            v_proj=self.v_proj,
+        )
+        q, k = self._apply_official_qk_norm(
             q=q,
             k=k,
             q_norm=self.q_norm,
             k_norm=self.k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
         )
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        if _can_use_bagel_official_non_causal_attention(forward_batch):
+            q, k = self._apply_official_rotary_pos_emb(positions, q, k)
+            attn_output = self._forward_official_non_causal_attention(
+                q=q,
+                k=k,
+                v=v,
+                forward_batch=forward_batch,
+            )
+        elif _can_use_bagel_official_causal_attention(forward_batch):
+            q, k = self._apply_official_rotary_pos_emb(positions, q, k)
+            attn_output = self._forward_official_causal_attention(
+                q=q,
+                k=k,
+                v=v,
+                forward_batch=forward_batch,
+            )
+        else:
+            q, k = self.rotary_emb(positions, q, k)
+            attn_output = self.attn(q, k, v, forward_batch)
         output, _ = self.o_proj(attn_output)
         return output
+
+    def _apply_official_rotary_pos_emb(
+        self,
+        positions: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if self.rope_scaling is not None:
+            return self.rotary_emb(positions, q, k)
+
+        q_shape = q.shape
+        k_shape = k.shape
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+
+        inv_freq = self.official_inv_freq.to(device=q.device)
+        position_ids = positions.reshape(1, -1).to(device=q.device)
+        inv_freq_expanded = inv_freq[None, :, None].float()
+        position_ids_expanded = position_ids[:, None, :].float()
+        device_type = q.device.type
+        if not isinstance(device_type, str) or device_type == "mps":
+            device_type = "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (
+                inv_freq_expanded.float() @ position_ids_expanded.float()
+            ).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos().squeeze(0).to(dtype=q.dtype)
+            sin = emb.sin().squeeze(0).to(dtype=q.dtype)
+
+        cos = cos.unsqueeze(1)
+        sin = sin.unsqueeze(1)
+        q = (q * cos) + (_rotate_half(q) * sin)
+        k = (k * cos) + (_rotate_half(k) * sin)
+        return q.reshape(q_shape), k.reshape(k_shape)
+
+    def _forward_official_non_causal_attention(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        from flash_attn import flash_attn_varlen_func
+
+        q = q.view(-1, self.num_heads, self.head_dim).to(torch.bfloat16)
+        k = k.view(-1, self.num_kv_heads, self.head_dim).to(torch.bfloat16)
+        v = v.view(-1, self.num_kv_heads, self.head_dim).to(torch.bfloat16)
+
+        if forward_batch.out_cache_loc is not None:
+            forward_batch.token_to_kv_pool.set_kv_buffer(
+                self.attn,
+                forward_batch.out_cache_loc,
+                k,
+                v,
+                self.attn.k_scale,
+                self.attn.v_scale,
+            )
+
+        query_lens = forward_batch.extend_seq_lens.to(torch.int32)
+        if int(query_lens.sum().item()) != q.shape[0]:
+            raise ValueError(
+                "BAGEL official non-causal attention query_lens do not match Q "
+                f"tokens: {int(query_lens.sum().item())} vs {q.shape[0]}"
+            )
+
+        if _is_bagel_zero_prefix_extend(forward_batch):
+            merged_key_states = k
+            merged_value_states = v
+            key_values_lens = query_lens
+        else:
+            key_values_lens = forward_batch.seq_lens.to(torch.int32)
+            key_buffer, value_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
+                self.attn.layer_id
+            )
+            kv_indices = _bagel_full_sequence_kv_indices(
+                forward_batch=forward_batch,
+                key_values_lens=key_values_lens,
+            )
+            merged_key_states = key_buffer.index_select(0, kv_indices).to(
+                torch.bfloat16
+            )
+            merged_value_states = value_buffer.index_select(0, kv_indices).to(
+                torch.bfloat16
+            )
+
+        cu_seqlens_q = torch.nn.functional.pad(
+            torch.cumsum(query_lens, dim=0),
+            (1, 0),
+        ).to(torch.int32)
+        cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(key_values_lens, dim=0),
+            (1, 0),
+        ).to(torch.int32)
+        max_seqlen = int(forward_batch.extend_seq_lens.max().item())
+        attn_output = flash_attn_varlen_func(
+            q=q,
+            k=merged_key_states,
+            v=merged_value_states,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen,
+            max_seqlen_k=int(key_values_lens.max().item()),
+            causal=False,
+        )
+        return attn_output.reshape(-1, self.q_size)
+
+    def _forward_official_causal_attention(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        from flash_attn import flash_attn_varlen_func
+
+        q = q.view(-1, self.num_heads, self.head_dim).to(torch.bfloat16)
+        k = k.view(-1, self.num_kv_heads, self.head_dim).to(torch.bfloat16)
+        v = v.view(-1, self.num_kv_heads, self.head_dim).to(torch.bfloat16)
+
+        if forward_batch.out_cache_loc is None:
+            raise ValueError("BAGEL official causal attention requires KV cache locs")
+        forward_batch.token_to_kv_pool.set_kv_buffer(
+            self.attn,
+            forward_batch.out_cache_loc,
+            k,
+            v,
+            self.attn.k_scale,
+            self.attn.v_scale,
+        )
+
+        query_lens = _bagel_query_lens(forward_batch)
+        key_values_lens = forward_batch.seq_lens.to(torch.int32)
+        if int(query_lens.sum().item()) != q.shape[0]:
+            raise ValueError(
+                "BAGEL official causal attention query_lens do not match Q tokens: "
+                f"{int(query_lens.sum().item())} vs {q.shape[0]}"
+            )
+
+        if _is_bagel_zero_prefix_extend(forward_batch):
+            merged_key_states = k
+            merged_value_states = v
+        else:
+            key_buffer, value_buffer = forward_batch.token_to_kv_pool.get_kv_buffer(
+                self.attn.layer_id
+            )
+            kv_indices = _bagel_full_sequence_kv_indices(
+                forward_batch=forward_batch,
+                key_values_lens=key_values_lens,
+            )
+            merged_key_states = key_buffer.index_select(0, kv_indices).to(
+                torch.bfloat16
+            )
+            merged_value_states = value_buffer.index_select(0, kv_indices).to(
+                torch.bfloat16
+            )
+
+        cu_seqlens_q = torch.nn.functional.pad(
+            torch.cumsum(query_lens, dim=0),
+            (1, 0),
+        ).to(torch.int32)
+        cu_seqlens_k = torch.nn.functional.pad(
+            torch.cumsum(key_values_lens, dim=0),
+            (1, 0),
+        ).to(torch.int32)
+        attn_output = flash_attn_varlen_func(
+            q=q,
+            k=merged_key_states,
+            v=merged_value_states,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=int(query_lens.max().item()),
+            max_seqlen_k=int(key_values_lens.max().item()),
+            causal=True,
+        )
+        return attn_output.reshape(-1, self.q_size)
 
     def forward_gen(
         self,
@@ -225,7 +560,9 @@ class BAGELQwen2MoTAttention(nn.Module):
         self._project_qkv_branch(
             hidden_states=hidden_states,
             token_indices=routing.text_token_indices,
-            qkv_proj=self.qkv_proj,
+            q_proj=self.q_proj,
+            k_proj=self.k_proj,
+            v_proj=self.v_proj,
             q_norm=self.q_norm,
             k_norm=self.k_norm,
             q_out=q,
@@ -235,7 +572,9 @@ class BAGELQwen2MoTAttention(nn.Module):
         self._project_qkv_branch(
             hidden_states=hidden_states,
             token_indices=routing.vae_token_indices,
-            qkv_proj=self.qkv_proj_moe_gen,
+            q_proj=self.q_proj_moe_gen,
+            k_proj=self.k_proj_moe_gen,
+            v_proj=self.v_proj_moe_gen,
             q_norm=self.q_norm_moe_gen,
             k_norm=self.k_norm_moe_gen,
             q_out=q,
@@ -243,8 +582,17 @@ class BAGELQwen2MoTAttention(nn.Module):
             v_out=v,
         )
 
-        q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, forward_batch)
+        if _can_use_bagel_official_non_causal_attention(forward_batch):
+            q, k = self._apply_official_rotary_pos_emb(positions, q, k)
+            attn_output = self._forward_official_non_causal_attention(
+                q=q,
+                k=k,
+                v=v,
+                forward_batch=forward_batch,
+            )
+        else:
+            q, k = self.rotary_emb(positions, q, k)
+            attn_output = self.attn(q, k, v, forward_batch)
 
         output = torch.empty_like(attn_output)
         _apply_indexed_module(
@@ -261,12 +609,43 @@ class BAGELQwen2MoTAttention(nn.Module):
         )
         return output
 
+    def _project_qkv(
+        self,
+        *,
+        hidden_states: torch.Tensor,
+        q_proj: nn.Module,
+        k_proj: nn.Module,
+        v_proj: nn.Module,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        q, _ = q_proj(hidden_states)
+        k, _ = k_proj(hidden_states)
+        v, _ = v_proj(hidden_states)
+        return q, k, v
+
+    def _apply_official_qk_norm(
+        self,
+        *,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        q_norm: nn.Module,
+        k_norm: nn.Module,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        q_shape = q.shape
+        k_shape = k.shape
+        q = q.view(-1, self.num_heads, self.head_dim)
+        k = k.view(-1, self.num_kv_heads, self.head_dim)
+        q = q_norm(q)
+        k = k_norm(k)
+        return q.contiguous().view(q_shape), k.contiguous().view(k_shape)
+
     def _project_qkv_branch(
         self,
         *,
         hidden_states: torch.Tensor,
         token_indices: torch.Tensor,
-        qkv_proj: nn.Module,
+        q_proj: nn.Module,
+        k_proj: nn.Module,
+        v_proj: nn.Module,
         q_norm: nn.Module,
         k_norm: nn.Module,
         q_out: torch.Tensor,
@@ -276,15 +655,17 @@ class BAGELQwen2MoTAttention(nn.Module):
         if token_indices.numel() == 0:
             return
         branch_hidden_states = hidden_states.index_select(0, token_indices)
-        qkv, _ = qkv_proj(branch_hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = apply_qk_norm(
+        q, k, v = self._project_qkv(
+            hidden_states=branch_hidden_states,
+            q_proj=q_proj,
+            k_proj=k_proj,
+            v_proj=v_proj,
+        )
+        q, k = self._apply_official_qk_norm(
             q=q,
             k=k,
             q_norm=q_norm,
             k_norm=k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
         )
         q_out[token_indices] = q
         k_out[token_indices] = k
@@ -310,29 +691,29 @@ class BAGELQwen2MoTDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
         )
-        self.mlp = Qwen2MLP(
+        self.mlp = BAGELQwen2MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
         )
-        self.mlp_moe_gen = Qwen2MLP(
+        self.mlp_moe_gen = BAGELQwen2MLP(
             hidden_size=config.hidden_size,
             intermediate_size=config.intermediate_size,
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp_moe_gen", prefix),
         )
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.input_layernorm_moe_gen = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.input_layernorm = _make_bagel_rms_norm(config, config.hidden_size)
+        self.input_layernorm_moe_gen = _make_bagel_rms_norm(
+            config, config.hidden_size
         )
-        self.post_attention_layernorm = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.post_attention_layernorm = _make_bagel_rms_norm(
+            config, config.hidden_size
         )
-        self.post_attention_layernorm_moe_gen = RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.post_attention_layernorm_moe_gen = _make_bagel_rms_norm(
+            config, config.hidden_size
         )
 
     def forward(
@@ -342,6 +723,14 @@ class BAGELQwen2MoTDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if getattr(forward_batch, "ug_g_non_causal_query_attention", False):
+            return self.forward_und_official_residual(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                residual=residual,
+            )
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -356,6 +745,31 @@ class BAGELQwen2MoTDecoderLayer(nn.Module):
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
+
+    def forward_und_official_residual(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, None]:
+        if residual is not None:
+            hidden_states = hidden_states + residual
+
+        residual_states = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+        hidden_states = residual_states + hidden_states
+
+        residual_states = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual_states + hidden_states
+        return hidden_states, None
 
     def forward_gen(
         self,
@@ -421,8 +835,10 @@ class BAGELQwen2MoTModel(Qwen2Model):
             alt_stream=alt_stream,
         )
         self.use_moe = "Mo" in getattr(config, "layer_module", "Qwen2MoTDecoderLayer")
+        if self.pp_group.is_last_rank:
+            self.norm = _make_bagel_rms_norm(config, config.hidden_size)
         if self.use_moe and self.pp_group.is_last_rank:
-            self.norm_moe_gen = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm_moe_gen = _make_bagel_rms_norm(config, config.hidden_size)
 
     def forward_gen_embeds(
         self,
@@ -540,7 +956,50 @@ class BAGELQwen2MoTForCausalLM(BAGELVisualFeatureMixin, Qwen2ForCausalLM):
                     continue
                 yield from _iter_bagel_language_model_weights([(name, loaded_weight)])
 
-        return super().load_weights(iter_language_weights())
+        for name, loaded_weight in iter_language_weights():
+            layer_id = get_layer_id(name)
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
+            ):
+                continue
+
+            if name == "model.embed_tokens.weight":
+                if (
+                    not hasattr(self, "pp_group") or self.pp_group.is_last_rank
+                ) and self.config.tie_word_embeddings:
+                    if "lm_head.weight" in params_dict:
+                        param = params_dict["lm_head.weight"]
+                        weight_loader = getattr(
+                            param,
+                            "weight_loader",
+                            default_weight_loader,
+                        )
+                        weight_loader(param, loaded_weight)
+
+            if "rotary_emb.inv_freq" in name or "projector" in name:
+                continue
+            if "rotary_emb.cos_cached" in name or "rotary_emb.sin_cached" in name:
+                continue
+            if name.startswith("model.vision_tower") and name not in params_dict:
+                continue
+
+            if name.endswith(".bias") and name not in params_dict:
+                continue
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(
+                    param,
+                    "weight_loader",
+                    default_weight_loader,
+                )
+                weight_loader(param, loaded_weight)
+            else:
+                logger.warning("Parameter %s not found in params_dict", name)
 
     @torch.no_grad()
     def forward(
@@ -771,6 +1230,75 @@ def _expand_bagel_timestep(
     return timestep
 
 
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def _can_use_bagel_official_non_causal_attention(forward_batch: ForwardBatch) -> bool:
+    if not getattr(forward_batch, "ug_g_non_causal_query_attention", False):
+        return False
+    if getattr(forward_batch, "extend_seq_lens", None) is None:
+        return False
+    return True
+
+
+def _can_use_bagel_official_causal_attention(forward_batch: ForwardBatch) -> bool:
+    if getattr(forward_batch, "ug_g_non_causal_query_attention", False):
+        return False
+    if getattr(forward_batch, "out_cache_loc", None) is None:
+        return False
+    ug_metadata = getattr(forward_batch, "ug_u_forward_metadata", None)
+    if ug_metadata and any(metadata is not None for metadata in ug_metadata):
+        return True
+    # BAGEL's Qwen2-MoT uses the official Qwen2 RoPE/attention semantics for
+    # understanding/text forwards. Keep this model on that path even when a
+    # caller reaches it outside the experimental UG session metadata bridge.
+    return True
+
+
+def _bagel_query_lens(forward_batch: ForwardBatch) -> torch.Tensor:
+    if forward_batch.forward_mode.is_decode():
+        return torch.ones(
+            forward_batch.batch_size,
+            dtype=torch.int32,
+            device=forward_batch.seq_lens.device,
+        )
+    if forward_batch.extend_seq_lens is None:
+        raise ValueError(
+            "BAGEL official causal attention requires extend_seq_lens outside decode"
+        )
+    return forward_batch.extend_seq_lens.to(torch.int32)
+
+
+def _is_bagel_zero_prefix_extend(forward_batch: ForwardBatch) -> bool:
+    if not forward_batch.forward_mode.is_extend():
+        return False
+    if forward_batch.extend_prefix_lens is None:
+        return False
+    return bool(torch.all(forward_batch.extend_prefix_lens == 0).item())
+
+
+def _bagel_full_sequence_kv_indices(
+    *,
+    forward_batch: ForwardBatch,
+    key_values_lens: torch.Tensor,
+) -> torch.Tensor:
+    req_to_token = forward_batch.req_to_token_pool.req_to_token
+    req_pool_indices = forward_batch.req_pool_indices.tolist()
+    seq_lens = key_values_lens.tolist()
+
+    kv_indices = []
+    for req_pool_idx, seq_len in zip(req_pool_indices, seq_lens):
+        if seq_len == 0:
+            continue
+        kv_indices.append(req_to_token[req_pool_idx, :seq_len])
+    if not kv_indices:
+        return torch.empty(0, dtype=torch.long, device=req_to_token.device)
+    return torch.cat(kv_indices, dim=0).to(torch.long)
+
+
 def _bagel_timestep_embedding(
     timestep: torch.Tensor,
     embedding_size: int,
@@ -823,16 +1351,17 @@ def _is_bagel_visual_gen_key(name: str) -> bool:
     )
 
 
-def _make_qk_norm(config, head_dim: int) -> RMSNorm:
-    norm_kwargs = (
-        dict(
-            weight_dtype=torch.float32,
-            cast_x_before_out_mul=True,
-        )
+def _make_bagel_rms_norm(config, hidden_size: int) -> BAGELRMSNorm:
+    weight_dtype = (
+        torch.float32
         if get_global_server_args().rl_on_policy_target is not None
-        else {}
+        else None
     )
-    return RMSNorm(head_dim, eps=config.rms_norm_eps, **norm_kwargs)
+    return BAGELRMSNorm(
+        hidden_size,
+        eps=config.rms_norm_eps,
+        weight_dtype=weight_dtype,
+    )
 
 
 EntryClass = [BAGELQwen2MoTForCausalLM]

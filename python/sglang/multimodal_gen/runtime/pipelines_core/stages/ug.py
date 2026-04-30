@@ -12,8 +12,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.ug.denoiser import UGDenoiserBridge
-from sglang.srt.ug.interleaved import UGInputSegment, UGInterleavedRequest
+from sglang.srt.ug.interleaved import (
+    UGGenerationMode,
+    UGInputSegment,
+    UGInterleavedRequest,
+    normalize_ug_generation_mode,
+)
 from sglang.srt.ug.runtime import UGInterleavedMessage
+from sglang.srt.ug.sampling import build_bagel_denoise_schedule
 
 
 class UGContextStage(PipelineStage):
@@ -41,11 +47,19 @@ class UGContextStage(PipelineStage):
             batch.width = pipeline_config.default_width
 
         interleaved_messages = batch.extra.get("ug_interleaved_messages")
+        request_metadata = dict(batch.extra.get("ug_request_metadata") or {})
+        mode = _resolve_ug_mode(batch, request_metadata)
+        think = _resolve_ug_think(batch, request_metadata)
+        think_max_new_tokens = _resolve_ug_think_max_new_tokens(batch, request_metadata)
+        batch.extra["ug_mode"] = mode
+        batch.extra["ug_think"] = think
         if interleaved_messages is not None:
             messages = _normalize_pipeline_interleaved_messages(interleaved_messages)
             batch.extra["ug_interleaved_messages"] = messages
             batch.extra["ug_contexts"] = self.bridge.build_contexts_from_messages(
-                messages=messages
+                messages=messages,
+                think=think,
+                think_max_new_tokens=think_max_new_tokens,
             )
             batch.extra["ug_pre_image_segments"] = batch.extra[
                 "ug_contexts"
@@ -70,6 +84,8 @@ class UGContextStage(PipelineStage):
         batch.extra["ug_contexts"] = self.bridge.build_contexts(
             prompt=batch.prompt,
             image=batch.condition_image,
+            think=think,
+            think_max_new_tokens=think_max_new_tokens,
         )
         batch.extra["ug_pre_image_segments"] = batch.extra[
             "ug_contexts"
@@ -144,17 +160,15 @@ class UGDenoiseStage(PipelineStage):
         if num_steps <= 0:
             raise ValueError(f"num_inference_steps must be positive, got {num_steps}")
 
-        timesteps = torch.linspace(1, 0, num_steps, dtype=x_t.dtype)
-        timesteps = (
-            params.timestep_shift
-            * timesteps
-            / (1 + (params.timestep_shift - 1) * timesteps)
+        schedule = build_bagel_denoise_schedule(
+            num_inference_steps=num_steps,
+            timestep_shift=params.timestep_shift,
+            device=x_t.device,
         )
-        dts = timesteps[:-1] - timesteps[1:]
         trajectory_latents = []
         trajectory_timesteps = []
 
-        for i, timestep in enumerate(timesteps[:-1]):
+        for i, timestep in enumerate(schedule.timesteps):
             trajectory_latents.append(x_t)
             trajectory_timesteps.append(timestep)
             velocity = self.bridge.predict_velocity(
@@ -164,7 +178,7 @@ class UGDenoiseStage(PipelineStage):
                 latent_position_ids=batch.extra["ug_latent_position_ids"],
                 sampling_params=params,
             )
-            x_t = x_t - velocity.to(x_t) * dts[i].to(x_t)
+            x_t = x_t - velocity.to(x_t) * schedule.dts[i].to(x_t)
 
         batch.latents = x_t
         if batch.return_trajectory_latents:
@@ -173,7 +187,7 @@ class UGDenoiseStage(PipelineStage):
                 batch.trajectory_timesteps = torch.stack(trajectory_timesteps)
             else:
                 batch.trajectory_latents = x_t[:0]
-                batch.trajectory_timesteps = timesteps[:0]
+                batch.trajectory_timesteps = schedule.timesteps[:0]
         return batch
 
 
@@ -188,6 +202,7 @@ class UGDecodeStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         contexts = batch.extra.get("ug_contexts")
+        mode = normalize_ug_generation_mode(batch.extra.get("ug_mode"), default="t2i")
         image = None
         if contexts is not None:
             image = self.bridge.decode_latents(
@@ -210,7 +225,7 @@ class UGDecodeStage(PipelineStage):
             if isinstance(image, Image.Image)
             else Image.fromarray(batch.output[0])
         )
-        if contexts is not None:
+        if contexts is not None and mode == "interleave":
             self.bridge.append_generated_image(
                 contexts=contexts,
                 image=image_for_append,
@@ -223,6 +238,13 @@ class UGDecodeStage(PipelineStage):
                 image=image_for_append,
                 post_image_segment=batch.extra["ug_post_image_segment"],
             )
+        elif contexts is not None:
+            batch.extra["ug_output_segments"] = [
+                {
+                    "type": "image",
+                    "image": image_for_append,
+                }
+            ]
         return batch
 
 
@@ -257,7 +279,14 @@ def _normalize_pipeline_interleaved_messages(messages) -> list[UGInterleavedMess
             content = message.get("image", message.get("content"))
             if content is None:
                 raise ValueError("UG image message is missing content")
-            if not isinstance(content, Image.Image):
+            if isinstance(content, dict) and "image" in content:
+                image_payload = dict(content)
+                image = image_payload["image"]
+                if not isinstance(image, Image.Image):
+                    image = load_image(image)
+                image_payload["image"] = image
+                content = image_payload
+            elif not isinstance(content, Image.Image):
                 content = load_image(content)
         else:
             raise ValueError(
@@ -269,6 +298,52 @@ def _normalize_pipeline_interleaved_messages(messages) -> list[UGInterleavedMess
     if not normalized:
         raise ValueError("UG interleaved messages must not be empty")
     return normalized
+
+
+def _resolve_ug_mode(
+    batch: Req,
+    metadata: dict,
+) -> UGGenerationMode:
+    if "ug_mode" in batch.extra:
+        return normalize_ug_generation_mode(
+            batch.extra["ug_mode"], default="interleave"
+        )
+    if "mode" in metadata:
+        return normalize_ug_generation_mode(metadata["mode"], default="interleave")
+    if batch.extra.get("ug_interleaved_messages") is not None:
+        return "interleave"
+    return "edit" if batch.condition_image is not None or batch.image_path else "t2i"
+
+
+def _resolve_ug_think(batch: Req, metadata: dict) -> bool:
+    if "think" in metadata:
+        return _coerce_ug_bool(metadata["think"], name="think")
+    return bool(getattr(batch.sampling_params, "think", False))
+
+
+def _resolve_ug_think_max_new_tokens(batch: Req, metadata: dict) -> int | None:
+    value = metadata.get(
+        "think_max_new_tokens",
+        getattr(batch.sampling_params, "think_max_new_tokens", None),
+    )
+    if value is None:
+        return None
+    value = int(value)
+    if value <= 0:
+        raise ValueError(f"think_max_new_tokens must be positive when set, got {value}")
+    return value
+
+
+def _coerce_ug_bool(value, *, name: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    raise ValueError(f"{name} must be a bool, got {value!r}")
 
 
 def _build_ug_output_segments(

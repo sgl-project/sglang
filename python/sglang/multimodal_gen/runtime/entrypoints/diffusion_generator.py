@@ -27,6 +27,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ShutdownReq,
     UnmergeLoraWeightsReq,
     build_ug_interleaved_generate_reqs,
+    build_ug_vlm_generate_reqs,
     expand_request_outputs,
     format_lora_message,
     prepare_request,
@@ -454,6 +455,36 @@ class DiffGenerator:
         payload: dict[str, Any] | list[Any],
     ) -> Any:
         return serialize_ug_interleaved_output(self.generate_interleaved(payload))
+
+    def generate_interleave(
+        self,
+        payload: dict[str, Any] | list[Any],
+    ) -> UGInterleavedResponse | list[UGInterleavedResponse]:
+        """Run the experimental UG interleave API through the scheduler."""
+        return self.generate_interleaved(payload)
+
+    def generate_interleave_serializable(
+        self,
+        payload: dict[str, Any] | list[Any],
+    ) -> Any:
+        return serialize_ug_interleaved_output(self.generate_interleave(payload))
+
+    def generate_vlm(
+        self,
+        payload: dict[str, Any] | list[Any],
+    ) -> UGInterleavedResponse | list[UGInterleavedResponse]:
+        """Run the experimental UG VLM-only API through the scheduler."""
+        req = build_ug_vlm_generate_reqs(payload)
+        output_batch = sync_scheduler_client.forward(req)
+        if output_batch.error:
+            raise RuntimeError(output_batch.error)
+        return output_batch.output
+
+    def generate_vlm_serializable(
+        self,
+        payload: dict[str, Any] | list[Any],
+    ) -> Any:
+        return serialize_ug_interleaved_output(self.generate_vlm(payload))
 
     # LoRA
     def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):

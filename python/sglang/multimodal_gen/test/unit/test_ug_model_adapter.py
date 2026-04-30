@@ -128,7 +128,9 @@ class TestUGModelRunnerAdapter(unittest.TestCase):
             [request.max_new_tokens for request in model_adapter.srt_forward_requests],
             [0, 1],
         )
-        self.assertEqual(model_adapter.srt_forward_requests[0].input_text, "draw a boat")
+        self.assertEqual(
+            model_adapter.srt_forward_requests[0].input_text, "draw a boat"
+        )
 
     def test_adapter_entrypoints_reuse_srt_session_context(self):
         tree_cache = FakeTreeCache()
@@ -230,6 +232,7 @@ class TestUGModelRunnerAdapter(unittest.TestCase):
             decode_view.metadata["srt_last_u_decode_request_id"],
             "adapter-u-decode-session:d1",
         )
+        self.assertIn("srt_last_u_decode_text", decode_view.metadata)
 
 
 if __name__ == "__main__":

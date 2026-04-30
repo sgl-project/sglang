@@ -546,7 +546,7 @@ def _infer_num_layers(cache: Any) -> int:
     if key_cache is not None:
         return len(key_cache)
     raise BAGELSRTKVCacheError(
-        "Cannot infer BAGEL cache layer count from official cache template"
+        "Cannot infer BAGEL cache layer count from reference cache template"
     )
 
 

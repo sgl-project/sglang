@@ -9,6 +9,7 @@ import torch
 from sglang.srt.managers.schedule_batch import (
     UG_BATCH_COMPAT_CAUSAL,
     UG_BATCH_COMPAT_NON_CAUSAL_QUERY,
+    ScheduleBatch,
     check_ug_non_causal_batch_compat,
     get_ug_batch_compat_key,
     get_ug_batch_compat_key_for_reqs,
@@ -22,6 +23,7 @@ from sglang.srt.ug.runtime import (
     UGInterleavedMessage,
     UGSegmentState,
     UGSessionRuntime,
+    UGSRTPreparedInput,
     UGVelocityRequest,
 )
 
@@ -56,9 +58,24 @@ class RecordingSRTRequestExecutor:
                 ),
                 "finished_reason": req.finished_reason,
                 "max_new_tokens": req.sampling_params.max_new_tokens,
+                "temperature": req.sampling_params.temperature,
+                "top_k": req.sampling_params.top_k,
                 "output_ids": list(req.output_ids),
+                "ug_position_ids": getattr(req, "ug_position_ids", None),
+                "ug_u_forward_metadata": getattr(req, "ug_u_forward_metadata", None),
             }
         )
+
+
+class OutputAppendingSRTExecutor(RecordingSRTRequestExecutor):
+    def __init__(self, token_ids):
+        super().__init__()
+        self.token_ids = list(token_ids)
+
+    def execute_ug_request(self, *, record, req, state):
+        if state == UGSegmentState.U_DECODE:
+            req.output_ids.extend(self.token_ids[: req.sampling_params.max_new_tokens])
+        super().execute_ug_request(record=record, req=req, state=state)
 
 
 class RecordingUGModelRunner(FakeUGModelRunner):
@@ -75,6 +92,71 @@ class RecordingUGModelRunner(FakeUGModelRunner):
                 "has_token_binding": "srt_kv_token_binding" in request.metadata,
             }
         )
+
+
+class ModelStateUGModelRunner(FakeUGModelRunner):
+    def __init__(self):
+        self.observed_model_states = []
+
+    def prepare_srt_u_message_inputs(self, *, record, message, state):
+        del record, state
+        return [
+            UGSRTPreparedInput(
+                input_ids=[7, 8, 9],
+                input_text=str(message.content),
+                messages=[message],
+                adapter_metadata={
+                    "ug_model_state_updates": {
+                        "bagel": {
+                            "logical_kv_lens": [3],
+                            "logical_ropes": [11],
+                        }
+                    }
+                },
+            )
+        ]
+
+    def observe_srt_u_forward(self, *, record, request, messages):
+        del record, messages
+        self.observed_model_states.append(request.metadata.get("ug_model_state"))
+
+
+class SidecarUGModelRunner(FakeUGModelRunner):
+    def prepare_srt_u_message_inputs(self, *, record, message, state):
+        del state
+        if message.type != "image":
+            return None
+        return [
+            UGSRTPreparedInput(
+                input_ids=[31],
+                input_text=f"main:{record.session_id}",
+                messages=[message],
+                adapter_metadata={
+                    "ug_model_state_updates": {
+                        "test": {
+                            "owner_session_id": record.session_id,
+                            "main_seen": True,
+                        }
+                    }
+                },
+            ),
+            UGSRTPreparedInput(
+                input_ids=[41],
+                input_text=f"sidecar:{record.session_id}",
+                messages=[message],
+                non_causal_query_attention=True,
+                srt_sidecar_role="cfg_img",
+                srt_sidecar_session_id=f"{record.session_id}:cfg_img",
+                adapter_metadata={
+                    "ug_model_state_updates": {
+                        "test": {
+                            "owner_session_id": record.session_id,
+                            "sidecar_seen": True,
+                        }
+                    }
+                },
+            ),
+        ]
 
 
 class ModelRunnerObserverSRTExecutor(RecordingSRTRequestExecutor):
@@ -414,6 +496,50 @@ class TestUGSessionRuntime(unittest.TestCase):
         self.assertEqual(binding.token_count, 3)
         self.assertTrue(torch.equal(binding.token_indices, torch.tensor([9, 10, 11])))
 
+    def test_runtime_persists_safe_model_state_metadata(self):
+        runner = ModelStateUGModelRunner()
+        runtime = UGSessionRuntime(
+            model_runner=runner,
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=OutputAppendingSRTExecutor([42]),
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="stateful")],
+            session_id="ug-model-state-session",
+        )
+        decoded = runtime.decode_text(
+            handle,
+            max_new_tokens=1,
+            start_token_id=42,
+            position_ids=[11],
+            greedy=True,
+            model_state_updates={
+                "bagel": {
+                    "logical_kv_lens": [4],
+                    "logical_ropes": [12],
+                }
+            },
+        )
+        counters = runtime.get_debug_counters(decoded.session)
+
+        self.assertEqual(
+            counters["ug_model_state"],
+            {"bagel": {"logical_kv_lens": [4], "logical_ropes": [12]}},
+        )
+        self.assertEqual(
+            runner.observed_model_states[0],
+            {"bagel": {"logical_kv_lens": [3], "logical_ropes": [11]}},
+        )
+        self.assertEqual(
+            runner.observed_model_states[1],
+            {"bagel": {"logical_kv_lens": [4], "logical_ropes": [12]}},
+        )
+        state_repr = str(counters["ug_model_state"]).lower()
+        self.assertNotIn("allocator", state_repr)
+        self.assertNotIn("slot", state_repr)
+        self.assertNotIn("page", state_repr)
+
     def test_u_decode_can_materialize_srt_session_decode_request(self):
         executor = RecordingSRTRequestExecutor()
         runtime = UGSessionRuntime(
@@ -440,6 +566,7 @@ class TestUGSessionRuntime(unittest.TestCase):
             ["srt-u-decode-session:u1", "srt-u-decode-session:d1"],
         )
         self.assertEqual([event["max_new_tokens"] for event in executor.events], [0, 1])
+        self.assertEqual(executor.events[-1]["top_k"], 1)
         self.assertEqual(debug["srt_request_count"], 2)
         self.assertEqual(debug["srt_u_decode_request_count"], 1)
         self.assertEqual(
@@ -447,6 +574,119 @@ class TestUGSessionRuntime(unittest.TestCase):
         )
         self.assertEqual(debug["srt_last_executed_state"], "u_decode")
         self.assertEqual(debug["state"], "g_denoise")
+
+    def test_decode_text_materializes_start_token_request(self):
+        executor = OutputAppendingSRTExecutor(token_ids=[201, 202])
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="describe")],
+            session_id="srt-u-text-decode-session",
+        )
+        decoded = runtime.decode_text(handle, max_new_tokens=2, start_token_id=101)
+        debug = runtime.get_debug_counters(decoded.session)
+
+        self.assertEqual(decoded.input_ids, (101,))
+        self.assertEqual(decoded.output_ids, (201, 202))
+        self.assertEqual(decoded.text, "201 202")
+        self.assertEqual(debug["state"], "u_decode")
+        self.assertEqual(debug["srt_u_decode_request_count"], 1)
+        self.assertEqual(executor.events[-1]["rid"], "srt-u-text-decode-session:d1")
+        self.assertEqual(executor.events[-1]["origin_input_ids"][-1], 101)
+        self.assertEqual(executor.events[-1]["max_new_tokens"], 2)
+
+    def test_srt_u_decode_records_tokenizer_decoded_text(self):
+        class DecodingTokenizer:
+            bos_token_id = None
+            eos_token_id = None
+
+            def encode(self, text, add_special_tokens=False):
+                del text, add_special_tokens
+                return [11]
+
+            def decode(self, token_ids):
+                self.last_decode = list(token_ids)
+                return "decoded:" + ",".join(str(token_id) for token_id in token_ids)
+
+        tokenizer = DecodingTokenizer()
+        executor = OutputAppendingSRTExecutor(token_ids=[201, 202])
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+            srt_u_decode_max_new_tokens=1,
+            tokenizer=tokenizer,
+            vocab_size=512,
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="describe")],
+            session_id="srt-u-decoded-text-session",
+        )
+        runtime.decode_next_segment(handle)
+        debug = runtime.get_debug_counters(handle)
+
+        self.assertEqual(tokenizer.last_decode, [201])
+        self.assertEqual(debug["srt_last_u_decode_output_ids"], [201])
+        self.assertEqual(debug["srt_last_u_decode_text"], "decoded:201")
+
+    def test_decode_text_can_use_bagel_logical_position_ids(self):
+        executor = OutputAppendingSRTExecutor(token_ids=[201])
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="describe")],
+            session_id="srt-u-text-position-session",
+        )
+        first = runtime.decode_text(
+            handle,
+            max_new_tokens=1,
+            start_token_id=101,
+            position_ids=[7],
+        )
+        second = runtime.decode_text(
+            first.session,
+            max_new_tokens=1,
+            start_token_id=201,
+            position_ids=[8],
+            drop_previous_output=True,
+        )
+
+        self.assertEqual(first.position_ids, (7,))
+        self.assertEqual(second.position_ids, (8,))
+        self.assertEqual(executor.events[-2]["rid"], "srt-u-text-position-session:d1")
+        self.assertEqual(executor.events[-1]["rid"], "srt-u-text-position-session:d2")
+        self.assertEqual(executor.events[-2]["ug_position_ids"][-1], 7)
+        self.assertEqual(executor.events[-1]["ug_position_ids"][-1], 8)
+
+    def test_decode_text_can_force_greedy_sampling(self):
+        executor = OutputAppendingSRTExecutor(token_ids=[201])
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(),
+            session_controller=SessionController(FakeTreeCache()),
+            srt_request_executor=executor,
+        )
+
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="describe")],
+            session_id="srt-u-text-greedy-session",
+        )
+        runtime.decode_text(
+            handle,
+            max_new_tokens=1,
+            start_token_id=101,
+            greedy=True,
+        )
+
+        self.assertEqual(executor.events[-1]["top_k"], 1)
 
     def test_close_session_releases_srt_multimodal_features(self):
         tree_cache = FakeTreeCache()
@@ -554,6 +794,66 @@ class TestUGSessionRuntime(unittest.TestCase):
             2,
         )
 
+    def test_close_session_releases_only_that_session_and_sidecars(self):
+        tree_cache = FakeTreeCache()
+        controller = SessionController(tree_cache)
+        runtime = UGSessionRuntime(
+            model_runner=SidecarUGModelRunner(),
+            session_controller=controller,
+            srt_request_executor=RecordingSRTRequestExecutor(),
+        )
+
+        handle_a = runtime.prefill_interleaved(
+            [
+                UGInterleavedMessage(type="image", content=object()),
+                UGInterleavedMessage(type="text", content="session a"),
+            ],
+            session_id="ug-sidecar-a",
+        )
+        handle_b = runtime.prefill_interleaved(
+            [
+                UGInterleavedMessage(type="image", content=object()),
+                UGInterleavedMessage(type="text", content="session b"),
+            ],
+            session_id="ug-sidecar-b",
+        )
+
+        debug_a = runtime.get_debug_counters(handle_a)
+        debug_b = runtime.get_debug_counters(handle_b)
+        self.assertEqual(debug_a["srt_sidecar_session_ids"], ["ug-sidecar-a:cfg_img"])
+        self.assertEqual(debug_b["srt_sidecar_session_ids"], ["ug-sidecar-b:cfg_img"])
+        self.assertEqual(
+            debug_a["ug_model_state"]["test"]["owner_session_id"],
+            "ug-sidecar-a",
+        )
+        self.assertEqual(
+            debug_b["ug_model_state"]["test"]["owner_session_id"],
+            "ug-sidecar-b",
+        )
+        self.assertIn("ug-sidecar-a", controller.sessions)
+        self.assertIn("ug-sidecar-a:cfg_img", controller.sessions)
+        self.assertIn("ug-sidecar-b", controller.sessions)
+        self.assertIn("ug-sidecar-b:cfg_img", controller.sessions)
+
+        runtime.close_session(handle_a)
+
+        self.assertEqual(
+            set(tree_cache.released_sessions),
+            {"ug-sidecar-a", "ug-sidecar-a:cfg_img"},
+        )
+        self.assertNotIn("ug-sidecar-a", controller.sessions)
+        self.assertNotIn("ug-sidecar-a:cfg_img", controller.sessions)
+        self.assertIn("ug-sidecar-b", controller.sessions)
+        self.assertIn("ug-sidecar-b:cfg_img", controller.sessions)
+        self.assertEqual(runtime.get_state(handle_b), UGSegmentState.U_DECODE)
+
+        handle_b = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="session b continues")],
+            session_id=handle_b.session_id,
+        )
+        self.assertEqual(handle_b.session_id, "ug-sidecar-b")
+        self.assertEqual(runtime.get_debug_counters(handle_b)["prefill_count"], 2)
+
     def test_ug_non_causal_batch_guard_rejects_mixed_batches(self):
         ordinary = SimpleNamespace()
         non_causal = SimpleNamespace(ug_non_causal_query_attention=True)
@@ -585,7 +885,26 @@ class TestUGSessionRuntime(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cannot be mixed"):
             get_ug_batch_compat_key_for_reqs([ordinary, non_causal])
 
-    def test_u_g_u_minimal_loop_keeps_one_session(self):
+    def test_schedule_batch_rejects_mixed_non_causal_extend_batch(self):
+        ordinary = SimpleNamespace(
+            fill_ids=[1, 2],
+            prefix_indices=[],
+            origin_input_ids=[1, 2],
+            extend_input_len=2,
+        )
+        non_causal = SimpleNamespace(
+            fill_ids=[3, 4],
+            prefix_indices=[],
+            origin_input_ids=[3, 4],
+            extend_input_len=2,
+            ug_non_causal_query_attention=True,
+        )
+        batch = ScheduleBatch(reqs=[ordinary, non_causal], device="cpu")
+
+        with self.assertRaisesRegex(ValueError, "cannot be mixed"):
+            batch.prepare_for_extend()
+
+    def test_interleave_minimal_loop_keeps_one_session(self):
         runtime = UGSessionRuntime(model_runner=FakeUGModelRunner())
         events = ["input_text", "input_image"]
 

@@ -1,0 +1,36 @@
+feature: 2026-04-30-ug-vlm-entrypoint-official-smoke
+created: 2026-04-30
+status: done
+stop_signal: null
+result: "已完成 VLM-only request contract、pipeline 分支、worker 分流、Python API、HTTP /v1/ug/vlm、CLI --ug-vlm-input，以及 image path/data-url/PIL wrapper 解析；CPU 单测在远端通过 21 tests。2026-04-30 真权重重跑：Python API、CLI、HTTP server 均输出 Audrey Hepburn in a red，token_ids 均为 [151644,52949,8073,60145,21719,304,264,2518]，且 prefill_count=1、velocity_count=0、append_image_count=0。Phase 3 可以关闭。"
+
+steps:
+  - action: "VLM request contract：payload 支持 mode=vlm 和 max_new_tokens metadata"
+    exit_signal: "CPU 单测证明 build req 后 metadata.mode == vlm，UGSamplingParams 不接收 max_new_tokens"
+    status: done
+  - action: "Pipeline VLM-only path：UGPipeline.forward_vlm 只做 SRT prefill + U decode"
+    exit_signal: "CPU 单测输出 text-only，velocity_count == 0，append_image_count == 0"
+    status: done
+  - action: "Worker/API/CLI/HTTP entrypoints：真实入口能路由到 VLM-only path"
+    exit_signal: "CPU 单测覆盖 worker route；py_compile/ruff 通过"
+    status: done
+  - action: "真权重 smoke：远端单卡跑一次 VLM entrypoint"
+    exit_signal: "输出文本与 Phase 2 短 greedy smoke 口径一致，且没有触发 G denoise"
+    status: done
+  - action: "真实 server/CLI 进程级 smoke：用 HTTP /v1/ug/vlm 和 CLI --ug-vlm-input 复验同一 VLM case"
+    exit_signal: "HTTP/CLI 输出 segment 顺序、token ids/text 与 Python API smoke 一致"
+    status: done
+
+checks:
+  - item: "不进入 G denoise / latent prepare / VAE decode"
+    source: 范围守护
+    status: done
+  - item: "不 import official BAGEL/seed runtime 函数"
+    source: 范围守护
+    status: done
+  - item: "VLM session 最终释放"
+    source: 生命周期
+    status: done
+  - item: "现有 interleaved U-G-U path 不退化"
+    source: 回归
+    status: done

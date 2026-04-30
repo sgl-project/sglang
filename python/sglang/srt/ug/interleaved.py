@@ -3,7 +3,38 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
+
+UGGenerationMode = Literal["t2i", "edit", "interleave", "vlm"]
+
+_UG_MODE_ALIASES = {
+    "text_to_image": "t2i",
+    "txt2img": "t2i",
+    "image_edit": "edit",
+    "i2i": "edit",
+    "img2img": "edit",
+    "interleaved": "interleave",
+    "vlm_chat": "vlm",
+    "chat": "vlm",
+}
+_UG_GENERATION_MODES = {"t2i", "edit", "interleave", "vlm"}
+
+
+def normalize_ug_generation_mode(
+    mode: Any | None,
+    *,
+    default: UGGenerationMode = "interleave",
+) -> UGGenerationMode:
+    if mode is None:
+        return default
+    normalized = str(mode).strip().lower().replace("-", "_")
+    normalized = _UG_MODE_ALIASES.get(normalized, normalized)
+    if normalized not in _UG_GENERATION_MODES:
+        raise ValueError(
+            "Unsupported UG generation mode "
+            f"{mode!r}; expected one of {sorted(_UG_GENERATION_MODES)}"
+        )
+    return cast(UGGenerationMode, normalized)
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,18 +202,24 @@ class UGOutputSegment:
 class UGRuntimeStats:
     session_id: str
     state: str
+    context_length: int = 0
+    context_version: int = 0
     prefill_count: int = 0
     velocity_count: int = 0
     append_image_count: int = 0
     decode_count: int = 0
     srt_request_count: int = 0
     srt_executed_request_count: int = 0
+    srt_sidecar_request_count: int = 0
+    srt_u_decode_request_count: int = 0
 
     @classmethod
     def from_debug_counters(cls, counters: dict[str, Any]) -> "UGRuntimeStats":
         return cls(
             session_id=str(counters["session_id"]),
             state=str(counters["state"]),
+            context_length=int(counters.get("context_length", 0)),
+            context_version=int(counters.get("context_version", 0)),
             prefill_count=int(counters.get("prefill_count", 0)),
             velocity_count=int(counters.get("velocity_count", 0)),
             append_image_count=int(counters.get("append_image_count", 0)),
@@ -190,6 +227,10 @@ class UGRuntimeStats:
             srt_request_count=int(counters.get("srt_request_count", 0)),
             srt_executed_request_count=int(
                 counters.get("srt_executed_request_count", 0)
+            ),
+            srt_sidecar_request_count=int(counters.get("srt_sidecar_request_count", 0)),
+            srt_u_decode_request_count=int(
+                counters.get("srt_u_decode_request_count", 0)
             ),
         )
 

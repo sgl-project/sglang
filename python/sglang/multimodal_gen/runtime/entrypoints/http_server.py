@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     build_ug_interleaved_generate_reqs,
+    build_ug_vlm_generate_reqs,
     prepare_request,
     save_outputs,
     serialize_ug_interleaved_output,
@@ -298,9 +299,10 @@ async def vertex_generate(vertex_req: VertexGenerateReqInput):
     return orjson_response({"predictions": results})
 
 
+@ug_router.post("/interleave")
 @ug_router.post("/interleaved")
 async def ug_interleaved(raw_request: Request):
-    """Experimental UG interleaved endpoint.
+    """Experimental UG interleave endpoint.
 
     Payload shape:
     {"messages": [...], "sampling_params": {...}, "metadata": {...}}
@@ -316,6 +318,27 @@ async def ug_interleaved(raw_request: Request):
         return orjson_response(serialize_ug_interleaved_output(result.output))
     except Exception as e:
         logger.error("Error during UG interleaved generation: %s", e, exc_info=True)
+        return orjson_response({"error": str(e)}, status_code=400)
+
+
+@ug_router.post("/vlm")
+async def ug_vlm(raw_request: Request):
+    """Experimental UG VLM-only endpoint.
+
+    Payload shape:
+    {"messages": [...], "max_new_tokens": 8, "metadata": {...}}
+    or {"requests": [...]} for sequential multi-session batch execution.
+    """
+
+    try:
+        payload = await raw_request.json()
+        scheduler_req = build_ug_vlm_generate_reqs(payload)
+        result = await async_scheduler_client.forward(scheduler_req)
+        if result.error:
+            return orjson_response({"error": result.error}, status_code=400)
+        return orjson_response(serialize_ug_interleaved_output(result.output))
+    except Exception as e:
+        logger.error("Error during UG VLM generation: %s", e, exc_info=True)
         return orjson_response({"error": str(e)}, status_code=400)
 
 

@@ -6,7 +6,7 @@ from typing import Any, Protocol
 
 import torch
 
-from sglang.srt.ug.context import UGContextBundle, UGContextHandle
+from sglang.srt.ug.context import UGContextBundle, UGContextHandle, UGSessionHandle
 from sglang.srt.ug.runtime import (
     FakeUGModelRunner,
     UGDecodeResult,
@@ -16,16 +16,26 @@ from sglang.srt.ug.runtime import (
     UGLatentPrepareResult,
     UGSessionRuntime,
     UGVelocityRequest,
+    UGVLMTextGenerationResult,
 )
 
 
 class UGDenoiserBridge(Protocol):
     def build_contexts(
-        self, *, prompt: str | list[str] | None, image: Any | None
+        self,
+        *,
+        prompt: str | list[str] | None,
+        image: Any | None,
+        think: bool = False,
+        think_max_new_tokens: int | None = None,
     ) -> UGContextBundle: ...
 
     def build_contexts_from_messages(
-        self, *, messages: list[UGInterleavedMessage | dict[str, Any]]
+        self,
+        *,
+        messages: list[UGInterleavedMessage | dict[str, Any]],
+        think: bool = False,
+        think_max_new_tokens: int | None = None,
     ) -> UGContextBundle: ...
 
     def predict_velocity(
@@ -62,17 +72,35 @@ class UGDenoiserBridge(Protocol):
 
     def decode_next_segment(self, *, contexts: UGContextBundle) -> UGDecodeResult: ...
 
+    def generate_vlm_text(
+        self,
+        *,
+        messages: list[UGInterleavedMessage | dict[str, Any]],
+        max_new_tokens: int,
+    ) -> UGVLMTextGenerationResult: ...
+
 
 class FakeUGDenoiserBridge:
     def build_contexts(
-        self, *, prompt: str | list[str] | None, image: Any | None
+        self,
+        *,
+        prompt: str | list[str] | None,
+        image: Any | None,
+        think: bool = False,
+        think_max_new_tokens: int | None = None,
     ) -> UGContextBundle:
+        del think, think_max_new_tokens
         messages = UGSessionRuntime.normalize_messages(prompt=prompt, image=image)
         return self.build_contexts_from_messages(messages=messages)
 
     def build_contexts_from_messages(
-        self, *, messages: list[UGInterleavedMessage | dict[str, Any]]
+        self,
+        *,
+        messages: list[UGInterleavedMessage | dict[str, Any]],
+        think: bool = False,
+        think_max_new_tokens: int | None = None,
     ) -> UGContextBundle:
+        del think, think_max_new_tokens
         normalized = normalize_ug_interleaved_messages(messages)
         text_tokens = sum(
             len(str(message.content).split())
@@ -131,6 +159,29 @@ class FakeUGDenoiserBridge:
         del contexts
         return UGDecodeResult(type="done")
 
+    def generate_vlm_text(
+        self,
+        *,
+        messages: list[UGInterleavedMessage | dict[str, Any]],
+        max_new_tokens: int,
+    ) -> UGVLMTextGenerationResult:
+        normalized = normalize_ug_interleaved_messages(messages)
+        token_ids = tuple(range(1, max(1, int(max_new_tokens)) + 1))
+        token_count = sum(
+            len(str(message.content).split()) if message.type == "text" else 2
+            for message in normalized
+        )
+        return UGVLMTextGenerationResult(
+            session=UGSessionHandle(
+                session_id="fake-vlm",
+                anchor_request_id="fake-vlm:u0",
+                context_length=token_count,
+                context_version=0,
+            ),
+            text="generated_text",
+            token_ids=token_ids,
+        )
+
 
 class SRTBackedUGDenoiserBridge:
     """Diffusion-side bridge that delegates UG model work to SRT runtime state."""
@@ -150,18 +201,45 @@ class SRTBackedUGDenoiserBridge:
         self.max_pre_image_decode_steps = max_pre_image_decode_steps
 
     def build_contexts(
-        self, *, prompt: str | list[str] | None, image: Any | None
+        self,
+        *,
+        prompt: str | list[str] | None,
+        image: Any | None,
+        think: bool = False,
+        think_max_new_tokens: int | None = None,
     ) -> UGContextBundle:
         messages = self.runtime.normalize_messages(prompt=prompt, image=image)
-        return self.build_contexts_from_messages(messages=messages)
+        return self.build_contexts_from_messages(
+            messages=messages,
+            think=think,
+            think_max_new_tokens=think_max_new_tokens,
+        )
 
     def build_contexts_from_messages(
-        self, *, messages: list[UGInterleavedMessage | dict[str, Any]]
+        self,
+        *,
+        messages: list[UGInterleavedMessage | dict[str, Any]],
+        think: bool = False,
+        think_max_new_tokens: int | None = None,
     ) -> UGContextBundle:
         messages = normalize_ug_interleaved_messages(messages)
         session = self.runtime.prefill_interleaved(messages)
         pre_image_segments: list[dict[str, Any]] = []
         try:
+            if think:
+                thinking = self._decode_thinking_text(
+                    session,
+                    max_new_tokens=think_max_new_tokens,
+                )
+                session = thinking.session
+                if thinking.text:
+                    pre_image_segments.append(
+                        {
+                            "type": "text",
+                            "text": thinking.text,
+                            "metadata": {"role": "think"},
+                        }
+                    )
             for _ in range(self.max_pre_image_decode_steps):
                 segment = self.runtime.decode_next_segment(session)
                 if segment.type == "image_marker":
@@ -208,6 +286,69 @@ class SRTBackedUGDenoiserBridge:
                 session=session,
             ),
         )
+
+    def _decode_thinking_text(
+        self,
+        session: UGSessionHandle,
+        *,
+        max_new_tokens: int | None,
+    ) -> UGVLMTextGenerationResult:
+        decode_vlm_text = getattr(self.runtime.model_runner, "decode_vlm_text", None)
+        if not callable(decode_vlm_text):
+            raise RuntimeError(
+                f"{self.runtime.model_runner.__class__.__name__} does not support "
+                "UG think text generation"
+            )
+        if max_new_tokens is None:
+            max_new_tokens = max(1, int(self.runtime.srt_u_decode_max_new_tokens or 8))
+        max_new_tokens = int(max_new_tokens)
+        if max_new_tokens <= 0:
+            raise ValueError(
+                f"UG think text generation requires max_new_tokens > 0, got {max_new_tokens}"
+            )
+        return decode_vlm_text(
+            runtime=self.runtime,
+            session=session,
+            max_new_tokens=max_new_tokens,
+        )
+
+    def generate_vlm_text(
+        self,
+        *,
+        messages: list[UGInterleavedMessage | dict[str, Any]],
+        max_new_tokens: int,
+    ) -> UGVLMTextGenerationResult:
+        max_new_tokens = int(max_new_tokens)
+        if max_new_tokens <= 0:
+            raise ValueError(
+                f"UG VLM text generation requires max_new_tokens > 0, got {max_new_tokens}"
+            )
+        session = self.runtime.prefill_interleaved(
+            normalize_ug_interleaved_messages(messages)
+        )
+        try:
+            decode_vlm_text = getattr(
+                self.runtime.model_runner, "decode_vlm_text", None
+            )
+            if callable(decode_vlm_text):
+                return decode_vlm_text(
+                    runtime=self.runtime,
+                    session=session,
+                    max_new_tokens=max_new_tokens,
+                )
+            segment = self.runtime.decode_next_segment(session)
+            if segment.type != "text":
+                raise ValueError(
+                    "UG VLM text generation expected a text segment, "
+                    f"got {segment.type}"
+                )
+            return UGVLMTextGenerationResult(
+                session=session,
+                text=segment.text or "",
+            )
+        except Exception:
+            self.runtime.close_session(session)
+            raise
 
     def predict_velocity(
         self,

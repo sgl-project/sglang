@@ -26,6 +26,8 @@ class UGSamplingParams(SamplingParams):
     cfg_renorm_min: float = 0.0
     cfg_renorm_type: str = "global"
     timestep_shift: float = 3.0
+    think: bool = False
+    think_max_new_tokens: int | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -57,3 +59,16 @@ class UGSamplingParams(SamplingParams):
                 raise ValueError(f"{name} must be finite, got {value!r}")
             if float(value) < 0.0:
                 raise ValueError(f"{name} must be non-negative, got {value!r}")
+        if float(self.timestep_shift) <= 0.0:
+            raise ValueError(
+                f"timestep_shift must be positive, got {self.timestep_shift!r}"
+            )
+        if not isinstance(self.think, bool):
+            raise ValueError(f"think must be a bool, got {self.think!r}")
+        if self.think_max_new_tokens is not None:
+            self.think_max_new_tokens = int(self.think_max_new_tokens)
+            if self.think_max_new_tokens <= 0:
+                raise ValueError(
+                    "think_max_new_tokens must be positive when set, got "
+                    f"{self.think_max_new_tokens!r}"
+                )

@@ -2,22 +2,24 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 import torch
 
-from sglang.srt.ug.context import UGSRTRequestView, UGSessionHandle
+from sglang.srt.ug.context import UGSessionHandle, UGSRTRequestView
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
     UGLatentDecodeRequest,
     UGLatentPrepareRequest,
     UGLatentPrepareResult,
-    UGSRTPreparedInput,
     UGSegmentState,
     UGSessionRecord,
+    UGSRTPreparedInput,
     UGVelocityRequest,
+    UGVLMTextGenerationResult,
 )
 
 
@@ -71,6 +73,14 @@ class UGModelAdapterProtocol(Protocol):
     ) -> UGModelPrefillResult: ...
 
     def decode_next_segment(self, *, session: UGModelSessionView) -> UGDecodeResult: ...
+
+    def decode_vlm_text(
+        self,
+        *,
+        runtime: Any,
+        session: UGSessionHandle,
+        max_new_tokens: int,
+    ) -> UGVLMTextGenerationResult: ...
 
     def predict_velocity_from_session(
         self,
@@ -153,6 +163,34 @@ class UGModelRunnerAdapter:
     def decode_next_segment(self, *, record: UGSessionRecord) -> UGDecodeResult:
         return self.adapter.decode_next_segment(session=self._session_view(record))
 
+    def decode_next_segment_from_runtime(
+        self, *, runtime: Any, record: UGSessionRecord
+    ) -> UGDecodeResult:
+        decode = getattr(self.adapter, "decode_next_segment_from_runtime", None)
+        if not callable(decode):
+            if runtime.srt_u_decode_max_new_tokens > 0:
+                runtime._append_srt_u_decode_request(record, greedy=True)
+            return self.decode_next_segment(record=record)
+        return decode(runtime=runtime, session=record.handle())
+
+    def decode_vlm_text(
+        self,
+        *,
+        runtime: Any,
+        session: UGSessionHandle,
+        max_new_tokens: int,
+    ) -> UGVLMTextGenerationResult:
+        decode = getattr(self.adapter, "decode_vlm_text", None)
+        if not callable(decode):
+            raise NotImplementedError(
+                f"{self.adapter.__class__.__name__} does not support VLM text decode"
+            )
+        return decode(
+            runtime=runtime,
+            session=session,
+            max_new_tokens=max_new_tokens,
+        )
+
     def predict_velocity_from_session(
         self, *, request: UGVelocityRequest, record: UGSessionRecord
     ) -> torch.Tensor:
@@ -207,5 +245,7 @@ class UGModelRunnerAdapter:
                 "srt_last_u_decode_output_ids": tuple(
                     record.srt_last_u_decode_output_ids
                 ),
+                "srt_last_u_decode_text": record.srt_last_u_decode_text,
+                "ug_model_state": deepcopy(record.ug_model_state),
             },
         )

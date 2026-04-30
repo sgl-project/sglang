@@ -1,0 +1,33 @@
+feature: 2026-04-30-ug-interleaved-official-parity
+created: 2026-04-30
+status: done
+stop_signal: null
+result: "远端 GPU2 真权重 interleave 1024x800/50-step official parity 通过：report passed、diffs=0；post-image text/token ids exact match；2026-05-01 2-step SGLANG_TEST_BAGEL_G_TASKS=interleave 复验 OK。"
+
+steps:
+  - action: "给 G parity harness 增加 interleave task"
+    exit_signal: "SGLANG_TEST_BAGEL_G_TASKS=interleave 能构造 case 并运行 official/SGLang subprocess"
+    status: done
+  - action: "记录 post-image text/token ids"
+    exit_signal: "official 与 SGLang artifact 都包含 text 和 token_ids.post_image_text"
+    status: done
+  - action: "断言同 session interleave counters"
+    exit_signal: "prefill_count=1、append_image_count=1、velocity_count=num_steps-1、srt_u_decode_request_count>0"
+    status: done
+  - action: "跑远端真权重 interleave smoke"
+    exit_signal: "report passed 且 diffs=0；必要时先 4-step，再 50-step"
+    status: done
+  - action: "回写 roadmap"
+    exit_signal: "ug-interleaved-official-parity 标为 done 或记录 stop signal"
+    status: done
+
+checks:
+  - item: "不做 HTTP/CLI 完整入口 smoke"
+    source: roadmap 边界
+    status: done
+  - item: "SGLang runtime 不 import official BAGEL/seed function"
+    source: runtime 边界
+    status: done
+  - item: "生成图后继续 U decode 复用同一个 session_id"
+    source: share-KV/interleave 目标
+    status: done

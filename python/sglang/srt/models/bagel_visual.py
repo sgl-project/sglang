@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import importlib
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +12,16 @@ from torch import nn
 from transformers.activations import ACT2FN
 
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.ug.bagel_autoencoder import load_bagel_autoencoder
+from sglang.srt.ug.bagel_preprocess import (
+    get_flattened_position_ids_extrapolate,
+    get_flattened_position_ids_interpolate,
+    patchify,
+)
+from sglang.srt.ug.bagel_siglip_navit import (
+    BAGELSiglipVisionConfig,
+    BAGELSiglipVisionModel,
+)
 
 
 class BAGELVisualFeatureMixin:
@@ -64,12 +73,11 @@ class BAGELVisualFeatureMixin:
                 f"ae.safetensors, got {vit_config_path} and {ae_path}"
             )
 
-        symbols = _import_bagel_visual_loader_symbols()
-        vit_config = symbols["SiglipVisionConfig"].from_json_file(str(vit_config_path))
+        vit_config = BAGELSiglipVisionConfig.from_json_file(str(vit_config_path))
         vit_config.rope = False
         vit_config.num_hidden_layers -= 1
 
-        vae_model, vae_config = symbols["load_ae"](local_path=str(ae_path))
+        vae_model, vae_config = load_bagel_autoencoder(local_path=str(ae_path))
         self.latent_channel = int(
             getattr(vae_config, "z_channels", self.latent_channel)
         )
@@ -85,7 +93,7 @@ class BAGELVisualFeatureMixin:
             )
 
         self.vae_model = vae_model.eval()
-        self.vit_model = symbols["SiglipVisionModel"](vit_config)
+        self.vit_model = BAGELSiglipVisionModel(vit_config)
         self.vit_model.vision_model.embeddings.convert_conv2d_to_linear(
             vit_config,
             meta=False,
@@ -133,7 +141,6 @@ class BAGELVisualFeatureMixin:
         new_token_ids,
     ):
         self._require_visual_feature_extractors()
-        data_utils = _bagel_data_utils()
         packed_vit_token_indexes = []
         vit_token_seqlens, packed_vit_tokens, packed_vit_position_ids = [], [], []
         packed_text_ids, packed_text_indexes = [], []
@@ -159,7 +166,7 @@ class BAGELVisualFeatureMixin:
                 self.vit_patch_size,
                 max_num_patches_per_side=self.vit_max_num_patch_per_side,
             )
-            vit_tokens = data_utils.patchify(image_tensor, self.vit_patch_size)
+            vit_tokens = patchify(image_tensor, self.vit_patch_size)
             packed_vit_tokens.append(vit_tokens)
             num_img_tokens = vit_tokens.shape[0]
             packed_vit_position_ids.append(vit_position_ids)
@@ -562,13 +569,11 @@ class BAGELVisualFeatureMixin:
         *,
         max_num_patches_per_side: int,
     ) -> torch.Tensor:
-        data_utils = _bagel_data_utils()
-        getter_name = (
-            "get_flattened_position_ids_interpolate"
+        getter = (
+            get_flattened_position_ids_interpolate
             if bool(getattr(self.config, "bagel_interpolate_pos", False))
-            else "get_flattened_position_ids_extrapolate"
+            else get_flattened_position_ids_extrapolate
         )
-        getter = getattr(data_utils, getter_name)
         return getter(
             height,
             width,
@@ -625,29 +630,3 @@ def _bagel_checkpoint_dir_from_config(config) -> Path | None:
     ).exists():
         return candidate
     return None
-
-
-def _import_bagel_visual_loader_symbols() -> dict[str, Any]:
-    try:
-        autoencoder = importlib.import_module("modeling.autoencoder")
-        bagel = importlib.import_module("modeling.bagel")
-    except ImportError as exc:
-        raise RuntimeError(
-            "BAGEL SRT visual feature extractor loading requires the official "
-            "BAGEL Python modules on PYTHONPATH"
-        ) from exc
-    return {
-        "load_ae": getattr(autoencoder, "load_ae"),
-        "SiglipVisionConfig": getattr(bagel, "SiglipVisionConfig"),
-        "SiglipVisionModel": getattr(bagel, "SiglipVisionModel"),
-    }
-
-
-def _bagel_data_utils():
-    try:
-        return importlib.import_module("data.data_utils")
-    except ImportError as exc:
-        raise RuntimeError(
-            "BAGEL SRT image packing requires official BAGEL data.data_utils "
-            "on PYTHONPATH"
-        ) from exc

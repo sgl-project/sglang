@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import importlib
-import importlib.util
 from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 import torch
+from transformers import AutoTokenizer
 
 from sglang.srt.ug.adapter import (
     UGModelAdapterProtocol,
@@ -19,7 +20,11 @@ from sglang.srt.ug.adapter import (
     UGModelPrefillResult,
 )
 from sglang.srt.ug.bagel_cache import BAGELSRTKVCacheFactory
-from sglang.srt.ug.context import UGSRTRequestView
+from sglang.srt.ug.bagel_preprocess import (
+    BAGELImageTransform,
+    add_bagel_special_tokens,
+)
+from sglang.srt.ug.context import UGSRTKVTokenBinding, UGSRTRequestView
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
@@ -29,38 +34,15 @@ from sglang.srt.ug.runtime import (
     UGSegmentState,
     UGSRTPreparedInput,
     UGVelocityRequest,
+    UGVLMTextGenerationResult,
 )
+from sglang.srt.ug.sampling import get_bagel_effective_cfg_scales
 
 _BAGEL_REQUIRED_CHECKPOINT_FILES = (
     "llm_config.json",
     "vit_config.json",
     "ae.safetensors",
     "ema.safetensors",
-)
-_BAGEL_REQUIRED_MODULES = (
-    "accelerate",
-    "data.data_utils",
-    "data.transforms",
-    "inferencer",
-    "modeling.autoencoder",
-    "modeling.bagel",
-    "modeling.qwen2",
-)
-_BAGEL_NATIVE_SRT_REQUIRED_MODULES = (
-    "data.data_utils",
-    "data.transforms",
-    "modeling.autoencoder",
-    "modeling.bagel",
-    "modeling.qwen2",
-)
-_BAGEL_SAME_DEVICE_MODULES = (
-    "language_model.model.embed_tokens",
-    "time_embedder",
-    "latent_pos_embed",
-    "vae2llm",
-    "llm2vae",
-    "connector",
-    "vit_pos_embed",
 )
 _BAGEL_GENERATION_INPUT_KEYS = (
     "packed_text_ids",
@@ -73,13 +55,6 @@ _BAGEL_GENERATION_INPUT_KEYS = (
     "key_values_lens",
     "packed_key_value_indexes",
 )
-_BAGEL_CFG_TEXT_INPUT_KEYS = (
-    "cfg_packed_position_ids",
-    "cfg_packed_query_indexes",
-    "cfg_key_values_lens",
-    "cfg_packed_key_value_indexes",
-)
-_BAGEL_CFG_IMG_INPUT_KEYS = _BAGEL_CFG_TEXT_INPUT_KEYS
 
 
 class BAGELAdapterError(RuntimeError):
@@ -90,45 +65,16 @@ class BAGELDenoiseStepError(RuntimeError):
     """Raised when a BAGEL single-step denoise call is malformed."""
 
 
-class BAGELPreparedDenoise:
-    """Official BAGEL denoise inputs prepared from a SRT-owned UG session."""
-
-    def __init__(
-        self,
-        *,
-        generation_input: dict[str, Any],
-        cfg_text_generation_input: dict[str, Any],
-        cfg_img_generation_input: dict[str, Any],
-        past_key_values: Any,
-        cfg_text_past_key_values: Any | None = None,
-        cfg_img_past_key_values: Any | None = None,
-        cfg_text_scale: float = 4.0,
-        cfg_img_scale: float = 1.5,
-        cfg_interval: tuple[float, float] = (0.4, 1.0),
-        cfg_renorm_min: float = 0.0,
-        cfg_renorm_type: str = "global",
-        cfg_type: str = "parallel",
-    ) -> None:
-        self.generation_input = generation_input
-        self.cfg_text_generation_input = cfg_text_generation_input
-        self.cfg_img_generation_input = cfg_img_generation_input
-        self.past_key_values = past_key_values
-        self.cfg_text_past_key_values = cfg_text_past_key_values
-        self.cfg_img_past_key_values = cfg_img_past_key_values
-        self.cfg_text_scale = cfg_text_scale
-        self.cfg_img_scale = cfg_img_scale
-        self.cfg_interval = cfg_interval
-        self.cfg_renorm_min = cfg_renorm_min
-        self.cfg_renorm_type = cfg_renorm_type
-        self.cfg_type = cfg_type
-
-
 @dataclass
 class BAGELNativeSRTPreparedDenoise:
     """Denoise inputs whose U context is owned by SRT KV cache."""
 
     generation_input: dict[str, Any]
     srt_kv_token_binding: Any | None = None
+    cfg_text_generation_input: dict[str, Any] | None = None
+    cfg_text_srt_kv_token_binding: Any | None = None
+    cfg_img_generation_input: dict[str, Any] | None = None
+    cfg_img_srt_kv_token_binding: Any | None = None
     cfg_text_scale: float = 1.0
     cfg_img_scale: float = 1.0
     cfg_interval: tuple[float, float] = (0.0, 1.0)
@@ -138,7 +84,7 @@ class BAGELNativeSRTPreparedDenoise:
 
 
 class BAGELNativeSRTDenoiseExecutor:
-    """Calls SRT-native BAGEL gen forward instead of official `_forward_flow`."""
+    """Calls SRT-native BAGEL gen forward through the ModelRunner path."""
 
     def __init__(
         self,
@@ -158,8 +104,81 @@ class BAGELNativeSRTDenoiseExecutor:
         timestep: torch.Tensor,
     ) -> torch.Tensor:
         self._validate_prepared(prepared)
-        self._validate_cfg(prepared, timestep)
-        generation_input = prepared.generation_input
+        with torch.no_grad():
+            cfg_text_scale, cfg_img_scale = _effective_cfg_scales(prepared, timestep)
+            self.velocity_count += 1
+            v_t = self._predict_velocity_branch(
+                prepared=prepared,
+                branch_name="full",
+                generation_input=prepared.generation_input,
+                srt_kv_token_binding=prepared.srt_kv_token_binding,
+                latent_tokens=latent_tokens,
+                timestep=timestep,
+            )
+            if cfg_text_scale <= 1.0:
+                return v_t
+
+            cfg_text_generation_input = self._cfg_branch_generation_input(
+                prepared.generation_input,
+                prepared.cfg_text_generation_input,
+                branch_name="cfg_text",
+            )
+            cfg_text_v_t = self._predict_velocity_branch(
+                prepared=prepared,
+                branch_name="cfg_text",
+                generation_input=cfg_text_generation_input,
+                srt_kv_token_binding=prepared.cfg_text_srt_kv_token_binding,
+                latent_tokens=latent_tokens,
+                timestep=timestep,
+            )
+
+            cfg_img_v_t = None
+            if cfg_img_scale > 1.0:
+                cfg_img_generation_input = self._cfg_branch_generation_input(
+                    prepared.generation_input,
+                    prepared.cfg_img_generation_input,
+                    branch_name="cfg_img",
+                )
+                cfg_img_v_t = self._predict_velocity_branch(
+                    prepared=prepared,
+                    branch_name="cfg_img",
+                    generation_input=cfg_img_generation_input,
+                    srt_kv_token_binding=prepared.cfg_img_srt_kv_token_binding,
+                    latent_tokens=latent_tokens,
+                    timestep=timestep,
+                )
+
+            return self._apply_cfg(
+                v_t=v_t,
+                cfg_text_v_t=cfg_text_v_t,
+                cfg_img_v_t=cfg_img_v_t,
+                cfg_text_scale=cfg_text_scale,
+                cfg_img_scale=cfg_img_scale,
+                cfg_renorm_min=prepared.cfg_renorm_min,
+                cfg_renorm_type=prepared.cfg_renorm_type,
+            )
+
+    def _predict_velocity_branch(
+        self,
+        *,
+        prepared: BAGELNativeSRTPreparedDenoise,
+        branch_name: str,
+        generation_input: dict[str, Any],
+        srt_kv_token_binding: Any | None,
+        latent_tokens: torch.Tensor,
+        timestep: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.forward_batch_provider is not None and srt_kv_token_binding is None:
+            raise BAGELDenoiseStepError(
+                f"Native SRT BAGEL velocity branch {branch_name} requires "
+                "an SRT token binding"
+            )
+        branch_prepared = replace(
+            prepared,
+            generation_input=generation_input,
+            srt_kv_token_binding=srt_kv_token_binding,
+        )
+        self._validate_prepared(branch_prepared)
         predictor = getattr(self.srt_model, "predict_velocity_from_packed_gen", None)
         if not callable(predictor):
             raise BAGELAdapterError(
@@ -167,7 +186,7 @@ class BAGELNativeSRTDenoiseExecutor:
                 "predict_velocity_from_packed_gen on the SRT model"
             )
         forward_batch_context = self._build_forward_batch(
-            prepared=prepared,
+            prepared=branch_prepared,
             latent_tokens=latent_tokens,
             timestep=timestep,
         )
@@ -176,7 +195,6 @@ class BAGELNativeSRTDenoiseExecutor:
             "forward_batch",
             forward_batch_context,
         )
-        self.velocity_count += 1
         try:
             return predictor(
                 latent_tokens=latent_tokens,
@@ -193,6 +211,94 @@ class BAGELNativeSRTDenoiseExecutor:
             release = getattr(forward_batch_context, "release", None)
             if callable(release):
                 release()
+
+    @staticmethod
+    def _cfg_branch_generation_input(
+        base_generation_input: dict[str, Any],
+        cfg_generation_input: dict[str, Any] | None,
+        *,
+        branch_name: str,
+    ) -> dict[str, Any]:
+        if cfg_generation_input is None:
+            raise BAGELDenoiseStepError(
+                f"Native SRT BAGEL CFG branch {branch_name} is missing "
+                "prepared cfg generation input"
+            )
+        required = (
+            "cfg_packed_position_ids",
+            "cfg_key_values_lens",
+            "cfg_packed_query_indexes",
+            "cfg_packed_key_value_indexes",
+        )
+        _require_keys(cfg_generation_input, required, f"{branch_name}_generation_input")
+        generation_input = dict(base_generation_input)
+        generation_input["packed_position_ids"] = cfg_generation_input[
+            "cfg_packed_position_ids"
+        ]
+        generation_input["key_values_lens"] = cfg_generation_input[
+            "cfg_key_values_lens"
+        ]
+        generation_input["packed_indexes"] = cfg_generation_input[
+            "cfg_packed_query_indexes"
+        ]
+        generation_input["packed_key_value_indexes"] = cfg_generation_input[
+            "cfg_packed_key_value_indexes"
+        ]
+        return generation_input
+
+    @staticmethod
+    def _apply_cfg(
+        *,
+        v_t: torch.Tensor,
+        cfg_text_v_t: torch.Tensor,
+        cfg_img_v_t: torch.Tensor | None,
+        cfg_text_scale: float,
+        cfg_img_scale: float,
+        cfg_renorm_min: float,
+        cfg_renorm_type: str,
+    ) -> torch.Tensor:
+        if cfg_renorm_type == "text_channel":
+            v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
+            norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
+            norm_v_t_text_ = torch.norm(v_t_text_, dim=-1, keepdim=True)
+            scale = (norm_v_t / (norm_v_t_text_ + 1e-8)).clamp(
+                min=cfg_renorm_min,
+                max=1.0,
+            )
+            v_t_text = v_t_text_ * scale
+            if cfg_img_scale > 1.0:
+                if cfg_img_v_t is None:
+                    raise BAGELDenoiseStepError(
+                        "Native SRT BAGEL CFG image branch velocity is missing"
+                    )
+                return cfg_img_v_t + cfg_img_scale * (v_t_text - cfg_img_v_t)
+            return v_t_text
+
+        v_t_text_ = cfg_text_v_t + cfg_text_scale * (v_t - cfg_text_v_t)
+        if cfg_img_scale > 1.0:
+            if cfg_img_v_t is None:
+                raise BAGELDenoiseStepError(
+                    "Native SRT BAGEL CFG image branch velocity is missing"
+                )
+            v_t_ = cfg_img_v_t + cfg_img_scale * (v_t_text_ - cfg_img_v_t)
+        else:
+            v_t_ = v_t_text_
+
+        if cfg_renorm_type == "global":
+            norm_v_t = torch.norm(v_t)
+            norm_v_t_ = torch.norm(v_t_)
+        elif cfg_renorm_type == "channel":
+            norm_v_t = torch.norm(v_t, dim=-1, keepdim=True)
+            norm_v_t_ = torch.norm(v_t_, dim=-1, keepdim=True)
+        else:
+            raise BAGELDenoiseStepError(
+                f"Unsupported BAGEL CFG renorm type: {cfg_renorm_type}"
+            )
+        scale = (norm_v_t / (norm_v_t_ + 1e-8)).clamp(
+            min=cfg_renorm_min,
+            max=1.0,
+        )
+        return v_t_ * scale
 
     def _build_forward_batch(
         self,
@@ -217,143 +323,6 @@ class BAGELNativeSRTDenoiseExecutor:
             "native_srt_generation_input",
         )
 
-    @staticmethod
-    def _validate_cfg(
-        prepared: BAGELNativeSRTPreparedDenoise,
-        timestep: torch.Tensor,
-    ) -> None:
-        cfg_text_scale, cfg_img_scale = BAGELDenoiseStepRunner._effective_cfg_scales(
-            prepared,
-            timestep,
-        )
-        if cfg_text_scale > 1.0 or cfg_img_scale > 1.0:
-            raise BAGELDenoiseStepError(
-                "Native SRT BAGEL denoise currently supports cfg_text_scale <= 1 "
-                "and cfg_img_scale <= 1 only"
-            )
-
-
-class BAGELDenoiseStepRunner:
-    """Runs the single `_forward_flow` step extracted from BAGEL.generate_image."""
-
-    def predict_velocity(
-        self,
-        *,
-        model: Any,
-        prepared: BAGELPreparedDenoise,
-        latent_tokens: torch.Tensor,
-        timestep: torch.Tensor,
-    ) -> torch.Tensor:
-        self._validate_prepared(prepared)
-        timestep = self._expand_timestep(timestep, latent_tokens)
-        cfg_text_scale, cfg_img_scale = self._effective_cfg_scales(prepared, timestep)
-        generation_input = prepared.generation_input
-        cfg_text_input = prepared.cfg_text_generation_input
-        cfg_img_input = prepared.cfg_img_generation_input
-        self._ensure_flow_runtime_flags(model)
-
-        return model._forward_flow(
-            x_t=latent_tokens,
-            timestep=timestep,
-            packed_vae_token_indexes=generation_input["packed_vae_token_indexes"],
-            packed_vae_position_ids=generation_input["packed_vae_position_ids"],
-            packed_text_ids=generation_input["packed_text_ids"],
-            packed_text_indexes=generation_input["packed_text_indexes"],
-            packed_position_ids=generation_input["packed_position_ids"],
-            packed_indexes=generation_input["packed_indexes"],
-            packed_seqlens=generation_input["packed_seqlens"],
-            key_values_lens=generation_input["key_values_lens"],
-            past_key_values=prepared.past_key_values,
-            packed_key_value_indexes=generation_input["packed_key_value_indexes"],
-            cfg_renorm_min=prepared.cfg_renorm_min,
-            cfg_renorm_type=prepared.cfg_renorm_type,
-            cfg_text_scale=cfg_text_scale,
-            cfg_text_packed_position_ids=cfg_text_input["cfg_packed_position_ids"],
-            cfg_text_packed_query_indexes=cfg_text_input["cfg_packed_query_indexes"],
-            cfg_text_key_values_lens=cfg_text_input["cfg_key_values_lens"],
-            cfg_text_past_key_values=prepared.cfg_text_past_key_values,
-            cfg_text_packed_key_value_indexes=cfg_text_input[
-                "cfg_packed_key_value_indexes"
-            ],
-            cfg_img_scale=cfg_img_scale,
-            cfg_img_packed_position_ids=cfg_img_input["cfg_packed_position_ids"],
-            cfg_img_packed_query_indexes=cfg_img_input["cfg_packed_query_indexes"],
-            cfg_img_key_values_lens=cfg_img_input["cfg_key_values_lens"],
-            cfg_img_past_key_values=prepared.cfg_img_past_key_values,
-            cfg_img_packed_key_value_indexes=cfg_img_input[
-                "cfg_packed_key_value_indexes"
-            ],
-            cfg_type=prepared.cfg_type,
-        )
-
-    @staticmethod
-    def build_timesteps(
-        *,
-        num_timesteps: int,
-        timestep_shift: float,
-        device: torch.device | str,
-        dtype: torch.dtype = torch.float32,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if num_timesteps <= 1:
-            raise BAGELDenoiseStepError(
-                f"num_timesteps must be > 1, got {num_timesteps}"
-            )
-        timesteps = torch.linspace(1, 0, num_timesteps, device=device, dtype=dtype)
-        timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
-        dts = timesteps[:-1] - timesteps[1:]
-        return timesteps[:-1], dts
-
-    @staticmethod
-    def _effective_cfg_scales(
-        prepared: BAGELPreparedDenoise,
-        timestep: torch.Tensor,
-    ) -> tuple[float, float]:
-        t = float(timestep.flatten()[0].detach().cpu())
-        start, end = prepared.cfg_interval
-        if t > start and t <= end:
-            return prepared.cfg_text_scale, prepared.cfg_img_scale
-        return 1.0, 1.0
-
-    @staticmethod
-    def _expand_timestep(
-        timestep: torch.Tensor,
-        latent_tokens: torch.Tensor,
-    ) -> torch.Tensor:
-        timestep = timestep.to(device=latent_tokens.device)
-        if timestep.numel() == 1:
-            return timestep.reshape(1).expand(latent_tokens.shape[0])
-        if timestep.shape[0] != latent_tokens.shape[0]:
-            raise BAGELDenoiseStepError(
-                "BAGEL timestep must be scalar or match latent token batch size: "
-                f"{tuple(timestep.shape)} vs {tuple(latent_tokens.shape)}"
-            )
-        return timestep
-
-    @staticmethod
-    def _validate_prepared(prepared: BAGELPreparedDenoise) -> None:
-        _require_keys(
-            prepared.generation_input,
-            _BAGEL_GENERATION_INPUT_KEYS,
-            "generation_input",
-        )
-        _require_keys(
-            prepared.cfg_text_generation_input,
-            _BAGEL_CFG_TEXT_INPUT_KEYS,
-            "cfg_text_generation_input",
-        )
-        _require_keys(
-            prepared.cfg_img_generation_input,
-            _BAGEL_CFG_IMG_INPUT_KEYS,
-            "cfg_img_generation_input",
-        )
-
-    @staticmethod
-    def _ensure_flow_runtime_flags(model: Any) -> None:
-        language_model = getattr(model, "language_model", None)
-        inner_model = getattr(language_model, "model", None)
-        if inner_model is not None and not hasattr(inner_model, "enable_taylorseer"):
-            inner_model.enable_taylorseer = False
-
 
 @dataclass
 class BAGELSessionContext:
@@ -361,29 +330,38 @@ class BAGELSessionContext:
     cfg_text_context: dict[str, Any]
     cfg_img_context: dict[str, Any]
     image_shape: tuple[int, int]
-    prepared_denoise: BAGELPreparedDenoise | None = None
+    prepared_denoise: BAGELNativeSRTPreparedDenoise | None = None
     decode_count: int = 0
     append_image_count: int = 0
     native_srt_u_context: bool = False
     native_srt_u_context_request_id: str | None = None
     native_srt_u_context_token_binding: Any | None = None
+    native_srt_cfg_text_token_binding: Any | None = None
+    native_srt_cfg_img_token_binding: Any | None = None
+    native_srt_cfg_text_token_count: int | None = None
+    native_srt_cfg_img_token_count: int | None = None
+    native_srt_cfg_img_requires_sidecar: bool = False
     srt_u_forward_results: dict[str, Any] = field(default_factory=dict)
     srt_u_forward_events: list[tuple[str, str]] = field(default_factory=list)
     srt_last_u_decode_output_ids: tuple[int, ...] = ()
+    srt_last_u_decode_text: str = ""
     native_srt_pending_added_tokens: int = 0
+    thinking_committed: bool = False
 
 
 class BAGELUForwardBridge:
-    """Maps safe SRT request views onto official BAGEL U context updates."""
+    """Maps safe SRT request views onto native BAGEL UG session state."""
 
     def __init__(
         self,
         *,
         srt_u_forward_executor: "BAGELSRTUForwardExecutor | None" = None,
     ) -> None:
-        self.srt_u_forward_executor = (
-            srt_u_forward_executor or BAGELSRTUForwardExecutor()
-        )
+        if srt_u_forward_executor is None:
+            raise BAGELAdapterError(
+                "BAGEL U forward bridge requires an explicit SRT-native executor"
+            )
+        self.srt_u_forward_executor = srt_u_forward_executor
 
     def observe(
         self,
@@ -393,7 +371,11 @@ class BAGELUForwardBridge:
         request: UGSRTRequestView,
         messages: list[UGInterleavedMessage],
     ) -> None:
-        state = backend._state_for(session.handle.session_id)
+        state_session_id = request.metadata.get(
+            "ug_srt_owner_session_id",
+            session.handle.session_id,
+        )
+        state = backend._state_for(str(state_session_id))
         state.srt_u_forward_events.append((request.state, request.request_id))
         result = self.srt_u_forward_executor.execute(
             backend,
@@ -406,7 +388,7 @@ class BAGELUForwardBridge:
 
 
 class BAGELSRTUForwardExecutor:
-    """Executes BAGEL U context updates from SRT request views."""
+    """Compatibility base for BAGEL U-forward observers."""
 
     def execute(
         self,
@@ -416,33 +398,18 @@ class BAGELSRTUForwardExecutor:
         request: UGSRTRequestView,
         messages: list[UGInterleavedMessage],
     ) -> UGModelPrefillResult | UGModelAppendImageResult | None:
-        backend._bind_srt_request_tokens(request)
-
-        if request.state == UGSegmentState.U_PREFILL.value:
-            return backend._apply_prefill_interleaved(
-                session=session,
-                messages=messages,
-            )
-
-        if request.state == UGSegmentState.APPEND_IMAGE.value:
-            image = messages[0].content if messages else None
-            return backend._apply_append_generated_image(
-                session=session,
-                image=image,
-            )
-
-        if request.state == UGSegmentState.U_DECODE.value:
-            state = backend._state_for(session.handle.session_id)
-            state.srt_last_u_decode_output_ids = request.output_ids
-        return None
+        del backend, session, request, messages
+        raise BAGELAdapterError(
+            "BAGEL external Python U-forward fallback has been removed; "
+            "use BAGELNativeSRTUForwardExecutor"
+        )
 
 
 class BAGELNativeSRTUForwardExecutor(BAGELSRTUForwardExecutor):
     """Consumes U-prefill views produced by native SRT BAGEL forward.
 
-    This executor deliberately does not call official BAGEL
-    `update_context_text`. It marks the session as SRT-owned so the G denoise
-    path can reuse SRT KV through a native generation ForwardBatch.
+    It marks the session as SRT-owned so the G denoise path can reuse SRT KV
+    through a native generation ForwardBatch.
     """
 
     def execute(
@@ -454,6 +421,10 @@ class BAGELNativeSRTUForwardExecutor(BAGELSRTUForwardExecutor):
         messages: list[UGInterleavedMessage],
     ) -> UGModelPrefillResult | UGModelAppendImageResult | None:
         backend._bind_srt_request_tokens(request)
+        sidecar_role = request.metadata.get("ug_srt_sidecar_role")
+        if sidecar_role is not None:
+            backend._sync_native_srt_sidecar_from_request(request)
+            return None
 
         state = backend._state_for(session.handle.session_id)
         backend._sync_native_srt_context_from_request(
@@ -466,6 +437,7 @@ class BAGELNativeSRTUForwardExecutor(BAGELSRTUForwardExecutor):
         is_final_segment = bool(request.metadata.get("ug_srt_is_final_segment", True))
         if request.state == UGSegmentState.U_PREFILL.value:
             state.decode_count = 0
+            state.thinking_committed = False
             state.prepared_denoise = None
             state.native_srt_u_context = True
             state.native_srt_u_context_request_id = request.request_id
@@ -494,26 +466,31 @@ class BAGELNativeSRTUForwardExecutor(BAGELSRTUForwardExecutor):
 
         if request.state == UGSegmentState.U_DECODE.value:
             state.srt_last_u_decode_output_ids = request.output_ids
+            state.srt_last_u_decode_text = str(
+                request.metadata.get("srt_last_u_decode_text") or ""
+            )
             return None
         return None
 
 
 class BAGELInterleaveContextBackend:
-    """Wraps a BAGEL inferencer or native-SRT shell behind UG adapter methods."""
+    """Wraps the native-SRT BAGEL shell behind UG adapter methods."""
 
     def __init__(
         self,
         inferencer: Any,
         *,
-        step_runner: BAGELDenoiseStepRunner | None = None,
+        step_runner: Any | None = None,
         u_forward_bridge: BAGELUForwardBridge | None = None,
         srt_kv_cache_factory: BAGELSRTKVCacheFactory | None = None,
         native_srt_denoise_executor: BAGELNativeSRTDenoiseExecutor | None = None,
         default_image_shape: tuple[int, int] = (1024, 1024),
     ) -> None:
+        del step_runner
         self.inferencer = inferencer
-        self.step_runner = step_runner or BAGELDenoiseStepRunner()
-        self.u_forward_bridge = u_forward_bridge or BAGELUForwardBridge()
+        self.u_forward_bridge = u_forward_bridge or BAGELUForwardBridge(
+            srt_u_forward_executor=BAGELNativeSRTUForwardExecutor()
+        )
         self.srt_kv_cache_factory = srt_kv_cache_factory
         self.native_srt_denoise_executor = native_srt_denoise_executor
         self.default_image_shape = default_image_shape
@@ -540,15 +517,23 @@ class BAGELInterleaveContextBackend:
         message: UGInterleavedMessage,
         state: UGSegmentState,
     ) -> list[UGSRTPreparedInput] | None:
-        if message.type != "image":
-            return None
         if not self._uses_native_srt_u_forward():
             return None
-        return self._prepare_native_srt_image_inputs(
-            session=session,
-            image=message.content,
-            state=state,
-        )
+        if message.type == "text":
+            return self._prepare_native_srt_text_inputs(
+                session=session,
+                text=str(message.content),
+            )
+        if message.type == "image":
+            image, use_vae, use_vit = self._unpack_image_message(message.content)
+            return self._prepare_native_srt_image_inputs(
+                session=session,
+                image=image,
+                state=state,
+                use_vae=use_vae,
+                use_vit=use_vit,
+            )
+        return None
 
     def prefill_interleaved(
         self, *, session, messages: list[UGInterleavedMessage]
@@ -561,53 +546,11 @@ class BAGELInterleaveContextBackend:
     def _apply_prefill_interleaved(
         self, *, session, messages: list[UGInterleavedMessage]
     ) -> UGModelPrefillResult:
-        if self._uses_native_srt_u_forward():
-            raise BAGELAdapterError(
-                "BAGEL native SRT U forward requires an SRT-executed prefill "
-                "result; refusing to fall back to official BAGEL "
-                "update_context_text/update_context_image"
-            )
-        state = self._state_for(session.handle.session_id)
-        state.decode_count = 0
-        added_tokens = 0
-        for message in messages:
-            if message.type == "text":
-                text = str(message.content)
-                state.cfg_text_context = self._clone_context(
-                    state.gen_context,
-                    session_id=session.handle.session_id,
-                    role="cfg_text",
-                )
-                with _bagel_autocast(self.inferencer.model):
-                    state.gen_context = self.inferencer.update_context_text(
-                        text,
-                        state.gen_context,
-                    )
-                    state.cfg_img_context = self.inferencer.update_context_text(
-                        text,
-                        state.cfg_img_context,
-                    )
-                added_tokens += len(text.split())
-            elif message.type == "image":
-                image = self._prepare_image(message.content)
-                with _bagel_autocast(self.inferencer.model):
-                    state.gen_context = self.inferencer.update_context_image(
-                        image,
-                        state.gen_context,
-                        vae=True,
-                        vit=True,
-                    )
-                state.image_shape = self._image_shape(image)
-                state.cfg_text_context = self._clone_context(
-                    state.gen_context,
-                    session_id=session.handle.session_id,
-                    role="cfg_text",
-                )
-                added_tokens += 2
-            else:
-                raise ValueError(f"Unsupported BAGEL message type: {message.type}")
-            state.prepared_denoise = None
-        return UGModelPrefillResult(added_tokens=added_tokens)
+        del session, messages
+        raise BAGELAdapterError(
+            "BAGEL real backend requires SRT-executed U prefill; "
+            "the external Python context-update fallback has been removed"
+        )
 
     def decode_next_segment(self, *, session) -> UGDecodeResult:
         state = self._state_for(session.handle.session_id)
@@ -617,35 +560,131 @@ class BAGELInterleaveContextBackend:
         if state.append_image_count > 0 and state.decode_count == 1:
             state.decode_count += 1
             if state.native_srt_u_context:
-                output_ids = state.srt_last_u_decode_output_ids
-                text = " ".join(str(token_id) for token_id in output_ids)
-                return UGDecodeResult(type="text", text=text)
-            with _bagel_autocast(self.inferencer.model):
-                text = self.inferencer.gen_text(
-                    state.gen_context,
-                    do_sample=False,
-                    temperature=0.3,
-                    max_length=512,
+                return UGDecodeResult(
+                    type="text",
+                    text=_strip_bagel_decoded_text(state.srt_last_u_decode_text),
                 )
-            return UGDecodeResult(type="text", text=text)
+            raise BAGELAdapterError(
+                "BAGEL text decode after generated image requires SRT-owned U "
+                "context"
+            )
         state.decode_count += 1
         return UGDecodeResult(type="done")
+
+    def decode_next_segment_from_runtime(
+        self, *, runtime: Any, session: Any
+    ) -> UGDecodeResult:
+        state = self._state_for(session.session_id)
+        if state.decode_count == 0:
+            if runtime.srt_u_decode_max_new_tokens > 0 and not state.thinking_committed:
+                curr_kvlens, curr_rope = self._native_srt_curr_lengths(state)
+                runtime.decode_text(
+                    session,
+                    max_new_tokens=runtime.srt_u_decode_max_new_tokens,
+                    greedy=True,
+                    model_state_updates=self._bagel_model_state_updates(
+                        kv_lens=[
+                            int(curr_kvlens[0]) + runtime.srt_u_decode_max_new_tokens
+                        ],
+                        ropes=[int(curr_rope[0]) + runtime.srt_u_decode_max_new_tokens],
+                    ),
+                )
+            return self.decode_next_segment(session=SimpleNamespace(handle=session))
+        if (
+            state.native_srt_u_context
+            and state.append_image_count > 0
+            and state.decode_count == 1
+        ):
+            max_new_tokens = max(1, int(runtime.srt_u_decode_max_new_tokens))
+            decoded = self.decode_vlm_text(
+                runtime=runtime,
+                session=session,
+                max_new_tokens=max_new_tokens,
+            )
+            state.decode_count += 1
+            state.srt_last_u_decode_text = decoded.text
+            return UGDecodeResult(type="text", text=decoded.text)
+        return self.decode_next_segment(session=SimpleNamespace(handle=session))
+
+    def decode_vlm_text(
+        self,
+        *,
+        runtime: Any,
+        session: Any,
+        max_new_tokens: int,
+    ) -> UGVLMTextGenerationResult:
+        max_new_tokens = int(max_new_tokens)
+        if max_new_tokens <= 0:
+            raise BAGELAdapterError(
+                f"BAGEL VLM text decode requires max_new_tokens > 0, got {max_new_tokens}"
+            )
+        new_token_ids = self.inferencer.new_token_ids
+        start_token_id = int(new_token_ids["bos_token_id"])
+        end_token_id = int(new_token_ids["eos_token_id"])
+        current_token = start_token_id
+        current_handle = session
+        generated: list[int] = []
+        next_token_ids: list[int] = []
+        position_ids: list[int] = []
+
+        for step in range(max_new_tokens):
+            state = self._state_for(current_handle.session_id)
+            rope = int((state.gen_context.get("ropes") or [0])[0])
+            curr_kvlens, _ = self._native_srt_curr_lengths(state)
+            decoded = runtime.decode_text(
+                current_handle,
+                max_new_tokens=1,
+                start_token_id=current_token,
+                position_ids=[rope],
+                drop_previous_output=step > 0,
+                greedy=True,
+                model_state_updates=self._bagel_model_state_updates(
+                    kv_lens=[int(curr_kvlens[0]) + 1],
+                    ropes=[rope + 1],
+                ),
+            )
+            generated.append(int(current_token))
+            position_ids.append(rope)
+            current_handle = decoded.session
+            if not decoded.output_ids:
+                break
+            next_token = int(decoded.output_ids[0])
+            next_token_ids.append(next_token)
+            if next_token == end_token_id:
+                break
+            current_token = next_token
+
+        decode_token_ids = getattr(runtime, "_decode_token_ids", None)
+        if callable(decode_token_ids):
+            text = _strip_bagel_decoded_text(decode_token_ids(generated))
+        else:
+            text = _decode_bagel_token_ids(self.inferencer.tokenizer, generated)
+        state = self._state_for(current_handle.session_id)
+        state.thinking_committed = True
+        state.srt_last_u_decode_text = text
+        return UGVLMTextGenerationResult(
+            session=current_handle,
+            text=text,
+            token_ids=tuple(generated),
+            next_token_ids=tuple(next_token_ids),
+            position_ids=tuple(position_ids),
+        )
 
     def predict_velocity_from_session(
         self, *, session, request: UGVelocityRequest
     ) -> torch.Tensor:
-        state = self._state_for(session.handle.session_id)
+        state = self._state_for_session(session)
         if state.prepared_denoise is None:
             state.prepared_denoise = self._prepare_denoise(
                 state, request.sampling_params
             )
         latent_tokens = request.latent_tokens
         timestep = request.timestep
-        runtime_model = (
-            self._native_srt_model()
-            if isinstance(state.prepared_denoise, BAGELNativeSRTPreparedDenoise)
-            else self.inferencer.model
-        )
+        if not isinstance(state.prepared_denoise, BAGELNativeSRTPreparedDenoise):
+            raise BAGELAdapterError(
+                "BAGEL G velocity requires native SRT prepared denoise inputs"
+            )
+        runtime_model = self._native_srt_model()
         runtime_device = _bagel_runtime_device(runtime_model)
         if runtime_device is not None:
             latent_tokens = latent_tokens.to(runtime_device)
@@ -656,30 +695,22 @@ class BAGELInterleaveContextBackend:
             enabled=latent_tokens.is_cuda,
             dtype=torch.bfloat16,
         ):
-            if isinstance(state.prepared_denoise, BAGELNativeSRTPreparedDenoise):
-                if self.native_srt_denoise_executor is None:
-                    raise BAGELAdapterError(
-                        "BAGEL native SRT U context requires a native SRT denoise "
-                        "executor"
-                    )
-                velocity = self.native_srt_denoise_executor.predict_velocity(
-                    prepared=state.prepared_denoise,
-                    latent_tokens=latent_tokens,
-                    timestep=timestep,
+            if self.native_srt_denoise_executor is None:
+                raise BAGELAdapterError(
+                    "BAGEL native SRT U context requires a native SRT denoise "
+                    "executor"
                 )
-            else:
-                velocity = self.step_runner.predict_velocity(
-                    model=self.inferencer.model,
-                    prepared=state.prepared_denoise,
-                    latent_tokens=latent_tokens,
-                    timestep=timestep,
-                )
+            velocity = self.native_srt_denoise_executor.predict_velocity(
+                prepared=state.prepared_denoise,
+                latent_tokens=latent_tokens,
+                timestep=timestep,
+            )
         return velocity.to(request.latent_tokens.device)
 
     def prepare_latents_from_session(
         self, *, session, request: UGLatentPrepareRequest
     ) -> UGLatentPrepareResult | None:
-        state = self._state_for(session.handle.session_id)
+        state = self._state_for_session(session)
         if state.prepared_denoise is None:
             state.prepared_denoise = self._prepare_denoise(
                 state,
@@ -700,11 +731,11 @@ class BAGELInterleaveContextBackend:
             request.sampling_params,
             state.image_shape,
         )
-        latent_shape_model = (
-            self._native_srt_model()
-            if isinstance(state.prepared_denoise, BAGELNativeSRTPreparedDenoise)
-            else self.inferencer.model
-        )
+        if not isinstance(state.prepared_denoise, BAGELNativeSRTPreparedDenoise):
+            raise BAGELAdapterError(
+                "BAGEL latent preparation requires native SRT prepared denoise inputs"
+            )
+        latent_shape_model = self._native_srt_model()
         latent_shape = _bagel_latent_shape(
             latent_shape_model, image_shape, latent_tokens
         )
@@ -725,29 +756,11 @@ class BAGELInterleaveContextBackend:
     def _apply_append_generated_image(
         self, *, session, image: Any | None
     ) -> UGModelAppendImageResult:
-        if self._uses_native_srt_u_forward():
-            raise BAGELAdapterError(
-                "BAGEL native SRT U forward requires an SRT-executed append-image "
-                "result; refusing to fall back to official BAGEL update_context_image"
-            )
-        state = self._state_for(session.handle.session_id)
-        image = self._prepare_image(image)
-        with _bagel_autocast(self.inferencer.model):
-            state.gen_context = self.inferencer.update_context_image(
-                image,
-                state.gen_context,
-                vae=True,
-                vit=True,
-            )
-        state.image_shape = self._image_shape(image)
-        state.cfg_text_context = self._clone_context(
-            state.gen_context,
-            session_id=session.handle.session_id,
-            role="cfg_text",
+        del session, image
+        raise BAGELAdapterError(
+            "BAGEL real backend requires SRT-executed append-image U forward; "
+            "the external Python context-update fallback has been removed"
         )
-        state.append_image_count += 1
-        state.prepared_denoise = None
-        return UGModelAppendImageResult(added_tokens=2)
 
     def _pop_srt_forward_result(self, session, result_type):
         request_id = session.srt_last_request_id
@@ -777,25 +790,15 @@ class BAGELInterleaveContextBackend:
         if latent_tokens.ndim == 3:
             latent_tokens = latent_tokens[0]
 
-        if state.native_srt_u_context:
-            decoder = getattr(self._native_srt_model(), "decode_bagel_image", None)
-            if not callable(decoder):
-                raise BAGELAdapterError(
-                    "BAGEL native SRT image decode requires decode_bagel_image "
-                    "on the SRT model"
-                )
-            return decoder(latent_tokens, image_shape)
-
-        vae_model = getattr(self.inferencer, "vae_model", None)
-        vae_device = _bagel_runtime_device(vae_model)
-        if vae_device is not None:
-            latent_tokens = latent_tokens.to(vae_device)
-
-        vae_dtype = _bagel_runtime_dtype(vae_model)
-        if vae_dtype is not None and latent_tokens.is_floating_point():
-            latent_tokens = latent_tokens.to(dtype=vae_dtype)
-
-        return self.inferencer.decode_image(latent_tokens, image_shape)
+        if not state.native_srt_u_context:
+            raise BAGELAdapterError("BAGEL image decode requires SRT-owned U context")
+        decoder = getattr(self._native_srt_model(), "decode_bagel_image", None)
+        if not callable(decoder):
+            raise BAGELAdapterError(
+                "BAGEL native SRT image decode requires decode_bagel_image "
+                "on the SRT model"
+            )
+        return decoder(latent_tokens, image_shape)
 
     def close_session(self, *, session_id: str) -> None:
         self.sessions.pop(session_id, None)
@@ -822,6 +825,14 @@ class BAGELInterleaveContextBackend:
             image_shape=self.default_image_shape,
         )
         self.sessions[session_id] = state
+        return state
+
+    def _state_for_session(self, session: Any) -> BAGELSessionContext:
+        state = self._state_for(session.handle.session_id)
+        self._sync_bagel_state_from_metadata(
+            state,
+            getattr(session, "metadata", {}) or {},
+        )
         return state
 
     def _init_context(self, *, session_id: str, role: str) -> dict[str, Any]:
@@ -870,44 +881,16 @@ class BAGELInterleaveContextBackend:
         sampling_params: Any | None,
         *,
         seed: int | None = None,
-    ) -> BAGELPreparedDenoise | BAGELNativeSRTPreparedDenoise:
-        if state.native_srt_u_context:
-            return self._prepare_native_srt_denoise(
-                state,
-                sampling_params,
-                seed=seed,
+    ) -> BAGELNativeSRTPreparedDenoise:
+        if not state.native_srt_u_context:
+            raise BAGELAdapterError(
+                "BAGEL G denoise requires SRT-owned U context before preparing "
+                "latents"
             )
-        image_shape = self._image_shape_from_params(sampling_params, state.image_shape)
-        model = self.inferencer.model
-        with _bagel_seed_context(seed):
-            generation_input = model.prepare_vae_latent(
-                curr_kvlens=state.gen_context["kv_lens"],
-                curr_rope=state.gen_context["ropes"],
-                image_sizes=[image_shape],
-                new_token_ids=self.inferencer.new_token_ids,
-            )
-        cfg_text_generation_input = model.prepare_vae_latent_cfg(
-            curr_kvlens=state.cfg_text_context["kv_lens"],
-            curr_rope=state.cfg_text_context["ropes"],
-            image_sizes=[image_shape],
-        )
-        cfg_img_generation_input = model.prepare_vae_latent_cfg(
-            curr_kvlens=state.cfg_img_context["kv_lens"],
-            curr_rope=state.cfg_img_context["ropes"],
-            image_sizes=[image_shape],
-        )
-        return BAGELPreparedDenoise(
-            generation_input=generation_input,
-            cfg_text_generation_input=cfg_text_generation_input,
-            cfg_img_generation_input=cfg_img_generation_input,
-            past_key_values=state.gen_context["past_key_values"],
-            cfg_text_past_key_values=state.cfg_text_context["past_key_values"],
-            cfg_img_past_key_values=state.cfg_img_context["past_key_values"],
-            cfg_text_scale=float(getattr(sampling_params, "cfg_text_scale", 4.0)),
-            cfg_img_scale=float(getattr(sampling_params, "cfg_img_scale", 1.5)),
-            cfg_interval=tuple(getattr(sampling_params, "cfg_interval", (0.4, 1.0))),
-            cfg_renorm_min=float(getattr(sampling_params, "cfg_renorm_min", 0.0)),
-            cfg_renorm_type=getattr(sampling_params, "cfg_renorm_type", "global"),
+        return self._prepare_native_srt_denoise(
+            state,
+            sampling_params,
+            seed=seed,
         )
 
     def _prepare_native_srt_denoise(
@@ -932,9 +915,23 @@ class BAGELInterleaveContextBackend:
                 image_sizes=[image_shape],
                 new_token_ids=self.inferencer.new_token_ids,
             )
+            cfg_text_generation_input = self._prepare_native_srt_cfg_latent(
+                model,
+                state.cfg_text_context,
+                image_shape=image_shape,
+            )
+            cfg_img_generation_input = self._prepare_native_srt_cfg_latent(
+                model,
+                state.cfg_img_context,
+                image_shape=image_shape,
+            )
         return BAGELNativeSRTPreparedDenoise(
             generation_input=generation_input,
             srt_kv_token_binding=binding,
+            cfg_text_generation_input=cfg_text_generation_input,
+            cfg_text_srt_kv_token_binding=state.native_srt_cfg_text_token_binding,
+            cfg_img_generation_input=cfg_img_generation_input,
+            cfg_img_srt_kv_token_binding=state.native_srt_cfg_img_token_binding,
             cfg_text_scale=float(getattr(sampling_params, "cfg_text_scale", 1.0)),
             cfg_img_scale=float(getattr(sampling_params, "cfg_img_scale", 1.0)),
             cfg_interval=tuple(getattr(sampling_params, "cfg_interval", (0.0, 1.0))),
@@ -948,7 +945,13 @@ class BAGELInterleaveContextBackend:
         session,
         image: Any | None,
         state: UGSegmentState,
+        use_vae: bool = True,
+        use_vit: bool = True,
     ) -> list[UGSRTPreparedInput]:
+        if not use_vae and not use_vit:
+            raise BAGELAdapterError(
+                "Native SRT BAGEL image U forward requires vae or vit modality"
+            )
         model = self._native_srt_model()
         if not hasattr(model, "prepare_vae_images") or not hasattr(
             model, "prepare_vit_images"
@@ -958,52 +961,62 @@ class BAGELInterleaveContextBackend:
                 "prepare_vae_images/prepare_vit_images on the SRT model"
             )
 
-        session_state = self._state_for(session.handle.session_id)
+        session_state = self._state_for_session(session)
         image = self._prepare_image(image)
         session_state.image_shape = self._image_shape(image)
         curr_kvlens, curr_rope = self._native_srt_curr_lengths(session_state)
 
         chunks: list[UGSRTPreparedInput] = []
-        with _bagel_autocast(model):
-            vae_input, curr_kvlens, curr_rope = model.prepare_vae_images(
-                curr_kvlens=curr_kvlens,
-                curr_rope=curr_rope,
-                images=[image],
-                transforms=self.inferencer.vae_transform,
-                new_token_ids=self.inferencer.new_token_ids,
-            )
-            chunks.append(
-                self._native_srt_prepared_input_from_packed_sequence(
-                    generation_input=vae_input,
-                    input_embeds=self._embed_native_srt_vae_image(vae_input),
-                    message_image=image,
-                    stage="vae",
-                    state=state,
-                    text_token_key="packed_text_indexes",
-                    vae_token_key="packed_vae_token_indexes",
-                    replace_token_key="packed_vae_token_indexes",
+        with torch.no_grad(), _bagel_autocast(model):
+            if use_vae:
+                vae_input, curr_kvlens, curr_rope = model.prepare_vae_images(
+                    curr_kvlens=curr_kvlens,
+                    curr_rope=curr_rope,
+                    images=[image],
+                    transforms=self.inferencer.vae_transform,
+                    new_token_ids=self.inferencer.new_token_ids,
                 )
-            )
+                chunks.append(
+                    self._native_srt_prepared_input_from_packed_sequence(
+                        generation_input=vae_input,
+                        input_embeds=self._embed_native_srt_vae_image(vae_input),
+                        message_image=image,
+                        stage="vae",
+                        state=state,
+                        text_token_key="packed_text_indexes",
+                        vae_token_key="packed_vae_token_indexes",
+                        replace_token_key="packed_vae_token_indexes",
+                        model_state_updates=self._bagel_model_state_updates(
+                            kv_lens=curr_kvlens,
+                            ropes=curr_rope,
+                        ),
+                    )
+                )
 
-            vit_input, curr_kvlens, curr_rope = model.prepare_vit_images(
-                curr_kvlens=curr_kvlens,
-                curr_rope=curr_rope,
-                images=[image],
-                transforms=self.inferencer.vit_transform,
-                new_token_ids=self.inferencer.new_token_ids,
-            )
-            chunks.append(
-                self._native_srt_prepared_input_from_packed_sequence(
-                    generation_input=vit_input,
-                    input_embeds=self._embed_native_srt_vit_image(vit_input),
-                    message_image=image,
-                    stage="vit",
-                    state=state,
-                    text_token_key="packed_text_indexes",
-                    vae_token_key=None,
-                    replace_token_key="packed_vit_token_indexes",
+            if use_vit:
+                vit_input, curr_kvlens, curr_rope = model.prepare_vit_images(
+                    curr_kvlens=curr_kvlens,
+                    curr_rope=curr_rope,
+                    images=[image],
+                    transforms=self.inferencer.vit_transform,
+                    new_token_ids=self.inferencer.new_token_ids,
                 )
-            )
+                chunks.append(
+                    self._native_srt_prepared_input_from_packed_sequence(
+                        generation_input=vit_input,
+                        input_embeds=self._embed_native_srt_vit_image(vit_input),
+                        message_image=image,
+                        stage="vit",
+                        state=state,
+                        text_token_key="packed_text_indexes",
+                        vae_token_key=None,
+                        replace_token_key="packed_vit_token_indexes",
+                        model_state_updates=self._bagel_model_state_updates(
+                            kv_lens=curr_kvlens,
+                            ropes=curr_rope,
+                        ),
+                    )
+                )
 
         session_state.gen_context["kv_lens"] = curr_kvlens
         session_state.gen_context["ropes"] = curr_rope
@@ -1014,6 +1027,133 @@ class BAGELInterleaveContextBackend:
         )
         session_state.prepared_denoise = None
         return chunks
+
+    def _prepare_native_srt_text_inputs(
+        self,
+        *,
+        session,
+        text: str,
+    ) -> list[UGSRTPreparedInput]:
+        session_state = self._state_for_session(session)
+        tokenizer = getattr(self.inferencer, "tokenizer", None)
+        encode = getattr(tokenizer, "encode", None)
+        if not callable(encode):
+            raise BAGELAdapterError(
+                "Native SRT BAGEL text U forward requires tokenizer.encode"
+            )
+        new_token_ids = self.inferencer.new_token_ids
+        try:
+            text_ids = list(encode(text))
+        except TypeError:
+            text_ids = list(encode(text, add_special_tokens=False))
+        input_ids = [
+            int(new_token_ids["bos_token_id"]),
+            *[int(token_id) for token_id in text_ids],
+            int(new_token_ids["eos_token_id"]),
+        ]
+
+        curr_kvlens, curr_rope = self._native_srt_curr_lengths(session_state)
+        position_start = int(curr_rope[0])
+        position_ids = list(range(position_start, position_start + len(input_ids)))
+        pre_text_kvlen = int(curr_kvlens[0])
+        session_state.cfg_text_context = self._clone_context(
+            session_state.gen_context,
+            session_id=session.handle.session_id,
+            role="cfg_text",
+        )
+        session_state.native_srt_cfg_text_token_count = pre_text_kvlen
+        session_state.native_srt_cfg_text_token_binding = None
+        session_state.gen_context["kv_lens"] = [pre_text_kvlen + len(input_ids)]
+        session_state.gen_context["ropes"] = [position_start + len(input_ids)]
+        sidecar_inputs: list[UGSRTPreparedInput] = []
+        text_message = UGInterleavedMessage(type="text", content=text)
+        if pre_text_kvlen == 0:
+            session_state.cfg_img_context = self._clone_context(
+                session_state.gen_context,
+                session_id=session.handle.session_id,
+                role="cfg_img",
+            )
+            session_state.native_srt_cfg_img_token_count = int(
+                session_state.gen_context["kv_lens"][0]
+            )
+            session_state.native_srt_cfg_img_requires_sidecar = False
+        else:
+            session_state.cfg_img_context = {
+                "kv_lens": [len(input_ids)],
+                "ropes": [len(input_ids)],
+                "past_key_values": None,
+            }
+            session_state.native_srt_cfg_img_token_count = None
+            session_state.native_srt_cfg_img_requires_sidecar = True
+            sidecar_inputs.append(
+                UGSRTPreparedInput(
+                    input_ids=input_ids,
+                    input_text=text,
+                    messages=[text_message],
+                    position_ids=list(range(len(input_ids))),
+                    srt_sidecar_role="cfg_img",
+                    srt_sidecar_session_id=f"{session.handle.session_id}:cfg_img",
+                    adapter_metadata={
+                        "bagel_u_text": True,
+                        "ug_srt_added_token_count": len(input_ids),
+                        "ug_srt_bagel_rope_delta": 0,
+                        "ug_model_state_updates": self._bagel_model_state_updates(
+                            kv_lens=session_state.gen_context["kv_lens"],
+                            ropes=session_state.gen_context["ropes"],
+                            cfg_text_kv_lens=session_state.cfg_text_context["kv_lens"],
+                            cfg_text_ropes=session_state.cfg_text_context["ropes"],
+                            cfg_text_token_count=pre_text_kvlen,
+                            cfg_img_kv_lens=session_state.cfg_img_context["kv_lens"],
+                            cfg_img_ropes=session_state.cfg_img_context["ropes"],
+                            cfg_img_token_count=len(input_ids),
+                            cfg_img_requires_sidecar=True,
+                            cfg_img_sidecar_session_id=(
+                                f"{session.handle.session_id}:cfg_img"
+                            ),
+                        ),
+                    },
+                )
+            )
+        session_state.native_srt_cfg_img_token_binding = None
+        session_state.prepared_denoise = None
+
+        main_input = UGSRTPreparedInput(
+            input_ids=input_ids,
+            input_text=text,
+            messages=[text_message],
+            position_ids=position_ids,
+            adapter_metadata={
+                "bagel_u_text": True,
+                "ug_srt_added_token_count": len(input_ids),
+                "ug_srt_bagel_rope_delta": 0,
+                "ug_model_state_updates": self._bagel_model_state_updates(
+                    kv_lens=session_state.gen_context["kv_lens"],
+                    ropes=session_state.gen_context["ropes"],
+                    cfg_text_kv_lens=session_state.cfg_text_context["kv_lens"],
+                    cfg_text_ropes=session_state.cfg_text_context["ropes"],
+                    cfg_text_token_count=pre_text_kvlen,
+                    cfg_img_kv_lens=session_state.cfg_img_context["kv_lens"],
+                    cfg_img_ropes=session_state.cfg_img_context["ropes"],
+                    cfg_img_token_count=(
+                        len(input_ids)
+                        if session_state.native_srt_cfg_img_requires_sidecar
+                        else session_state.native_srt_cfg_img_token_count
+                    ),
+                    cfg_img_requires_sidecar=(
+                        session_state.native_srt_cfg_img_requires_sidecar
+                    ),
+                    cfg_img_sidecar_session_id=(
+                        f"{session.handle.session_id}:cfg_img"
+                        if session_state.native_srt_cfg_img_requires_sidecar
+                        else None
+                    ),
+                ),
+            },
+        )
+        return [
+            main_input,
+            *sidecar_inputs,
+        ]
 
     def _native_srt_prepared_input_from_packed_sequence(
         self,
@@ -1026,6 +1166,7 @@ class BAGELInterleaveContextBackend:
         text_token_key: str,
         vae_token_key: str | None,
         replace_token_key: str,
+        model_state_updates: dict[str, Any] | None = None,
     ) -> UGSRTPreparedInput:
         input_embeds = input_embeds.detach().to(dtype=torch.float32, device="cpu")
         seq_len = int(input_embeds.shape[0])
@@ -1051,6 +1192,8 @@ class BAGELInterleaveContextBackend:
             "ug_srt_added_token_count": seq_len,
             "ug_srt_bagel_rope_delta": 0,
         }
+        if model_state_updates is not None:
+            metadata["ug_model_state_updates"] = model_state_updates
         return UGSRTPreparedInput(
             input_ids=input_ids,
             input_text=f"<bagel:{stage}:image>",
@@ -1115,11 +1258,145 @@ class BAGELInterleaveContextBackend:
         if binding is not None:
             state.native_srt_u_context_token_binding = binding
             state.gen_context["kv_lens"] = [int(binding.token_count)]
+            self._refresh_native_srt_cfg_token_bindings(state, binding)
+
+        if self._sync_bagel_state_from_metadata(state, request.metadata):
+            return
 
         rope_delta = self._native_srt_rope_delta(request=request, messages=messages)
         if rope_delta:
             ropes = state.gen_context.get("ropes") or [0]
             state.gen_context["ropes"] = [int(ropes[0]) + rope_delta]
+
+    @classmethod
+    def _sync_bagel_state_from_metadata(
+        cls,
+        state: BAGELSessionContext,
+        metadata: dict[str, Any],
+    ) -> bool:
+        bagel_state = cls._bagel_model_state_from_metadata(metadata)
+        if not bagel_state:
+            return False
+        kv_lens = bagel_state.get("logical_kv_lens")
+        if kv_lens is not None:
+            state.gen_context["kv_lens"] = [int(value) for value in kv_lens]
+        ropes = bagel_state.get("logical_ropes")
+        if ropes is not None:
+            state.gen_context["ropes"] = [int(value) for value in ropes]
+        cfg_text_kv_lens = bagel_state.get("cfg_text_logical_kv_lens")
+        if cfg_text_kv_lens is not None:
+            state.cfg_text_context["kv_lens"] = [
+                int(value) for value in cfg_text_kv_lens
+            ]
+        cfg_text_ropes = bagel_state.get("cfg_text_logical_ropes")
+        if cfg_text_ropes is not None:
+            state.cfg_text_context["ropes"] = [int(value) for value in cfg_text_ropes]
+        if "cfg_text_token_count" in bagel_state:
+            state.native_srt_cfg_text_token_count = _optional_int(
+                bagel_state.get("cfg_text_token_count")
+            )
+        cfg_img_kv_lens = bagel_state.get("cfg_img_logical_kv_lens")
+        if cfg_img_kv_lens is not None:
+            state.cfg_img_context["kv_lens"] = [int(value) for value in cfg_img_kv_lens]
+        cfg_img_ropes = bagel_state.get("cfg_img_logical_ropes")
+        if cfg_img_ropes is not None:
+            state.cfg_img_context["ropes"] = [int(value) for value in cfg_img_ropes]
+        if "cfg_img_token_count" in bagel_state:
+            state.native_srt_cfg_img_token_count = _optional_int(
+                bagel_state.get("cfg_img_token_count")
+            )
+        if "cfg_img_requires_sidecar" in bagel_state:
+            state.native_srt_cfg_img_requires_sidecar = bool(
+                bagel_state.get("cfg_img_requires_sidecar")
+            )
+        return any(
+            value is not None
+            for value in (
+                kv_lens,
+                ropes,
+                cfg_text_kv_lens,
+                cfg_text_ropes,
+                cfg_img_kv_lens,
+                cfg_img_ropes,
+            )
+        ) or any(
+            key in bagel_state
+            for key in (
+                "cfg_text_token_count",
+                "cfg_img_token_count",
+                "cfg_img_requires_sidecar",
+            )
+        )
+
+    @staticmethod
+    def _bagel_model_state_from_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+        model_state = metadata.get("ug_model_state") or {}
+        if not isinstance(model_state, dict):
+            return {}
+        bagel_state = model_state.get("bagel") or {}
+        if not isinstance(bagel_state, dict):
+            return {}
+        return bagel_state
+
+    @staticmethod
+    def _bagel_model_state_updates(
+        *,
+        kv_lens: list[int] | tuple[int, ...],
+        ropes: list[int] | tuple[int, ...],
+        cfg_text_kv_lens: list[int] | tuple[int, ...] | None = None,
+        cfg_text_ropes: list[int] | tuple[int, ...] | None = None,
+        cfg_text_token_count: int | None = None,
+        cfg_img_kv_lens: list[int] | tuple[int, ...] | None = None,
+        cfg_img_ropes: list[int] | tuple[int, ...] | None = None,
+        cfg_img_token_count: int | None = None,
+        cfg_img_requires_sidecar: bool | None = None,
+        cfg_img_sidecar_session_id: str | None = None,
+    ) -> dict[str, Any]:
+        bagel_state: dict[str, Any] = {
+            "logical_kv_lens": [int(value) for value in kv_lens],
+            "logical_ropes": [int(value) for value in ropes],
+        }
+        if cfg_text_kv_lens is not None:
+            bagel_state["cfg_text_logical_kv_lens"] = [
+                int(value) for value in cfg_text_kv_lens
+            ]
+        if cfg_text_ropes is not None:
+            bagel_state["cfg_text_logical_ropes"] = [
+                int(value) for value in cfg_text_ropes
+            ]
+        if cfg_text_token_count is not None:
+            bagel_state["cfg_text_token_count"] = int(cfg_text_token_count)
+        if cfg_img_kv_lens is not None:
+            bagel_state["cfg_img_logical_kv_lens"] = [
+                int(value) for value in cfg_img_kv_lens
+            ]
+        if cfg_img_ropes is not None:
+            bagel_state["cfg_img_logical_ropes"] = [
+                int(value) for value in cfg_img_ropes
+            ]
+        if cfg_img_token_count is not None:
+            bagel_state["cfg_img_token_count"] = int(cfg_img_token_count)
+        if cfg_img_requires_sidecar is not None:
+            bagel_state["cfg_img_requires_sidecar"] = bool(cfg_img_requires_sidecar)
+        if cfg_img_sidecar_session_id is not None:
+            bagel_state["cfg_img_sidecar_session_id"] = str(cfg_img_sidecar_session_id)
+        return {"bagel": bagel_state}
+
+    def _sync_native_srt_sidecar_from_request(
+        self,
+        request: UGSRTRequestView,
+    ) -> None:
+        owner_session_id = request.metadata.get("ug_srt_owner_session_id")
+        sidecar_role = request.metadata.get("ug_srt_sidecar_role")
+        binding = request.metadata.get("srt_kv_token_binding")
+        if owner_session_id is None or sidecar_role is None or binding is None:
+            return
+        state = self._state_for(str(owner_session_id))
+        if sidecar_role == "cfg_img":
+            self._sync_bagel_state_from_metadata(state, request.metadata)
+            state.native_srt_cfg_img_token_binding = binding
+            state.native_srt_cfg_img_token_count = int(binding.token_count)
+            state.native_srt_cfg_img_requires_sidecar = True
 
     @staticmethod
     def _native_srt_rope_delta(
@@ -1169,6 +1446,71 @@ class BAGELInterleaveContextBackend:
             raise BAGELAdapterError("BAGEL native SRT U context token binding is empty")
         return binding
 
+    @staticmethod
+    def _prepare_native_srt_cfg_latent(
+        model: Any,
+        context: dict[str, Any],
+        *,
+        image_shape: tuple[int, int],
+    ) -> dict[str, Any]:
+        prepare = getattr(model, "prepare_vae_latent_cfg", None)
+        if not callable(prepare):
+            raise BAGELAdapterError(
+                "BAGEL native SRT CFG requires prepare_vae_latent_cfg on "
+                "the SRT model"
+            )
+        kv_lens = context.get("kv_lens") or [0]
+        ropes = context.get("ropes") or [0]
+        return prepare(
+            curr_kvlens=[int(kv_lens[0])],
+            curr_rope=[int(ropes[0])],
+            image_sizes=[image_shape],
+        )
+
+    def _refresh_native_srt_cfg_token_bindings(
+        self,
+        state: BAGELSessionContext,
+        binding: UGSRTKVTokenBinding,
+    ) -> None:
+        if state.native_srt_cfg_text_token_count is not None:
+            state.native_srt_cfg_text_token_binding = self._slice_srt_token_binding(
+                binding,
+                token_count=state.native_srt_cfg_text_token_count,
+                role="cfg_text",
+            )
+        if (
+            state.native_srt_cfg_img_token_count is not None
+            and not state.native_srt_cfg_img_requires_sidecar
+        ):
+            state.native_srt_cfg_img_token_binding = self._slice_srt_token_binding(
+                binding,
+                token_count=state.native_srt_cfg_img_token_count,
+                role="cfg_img",
+            )
+
+    @staticmethod
+    def _slice_srt_token_binding(
+        binding: UGSRTKVTokenBinding,
+        *,
+        token_count: int,
+        role: str,
+    ) -> UGSRTKVTokenBinding:
+        token_count = int(token_count)
+        if token_count < 0:
+            raise BAGELAdapterError(
+                f"BAGEL native SRT {role} token count is negative: {token_count}"
+            )
+        token_indices = binding.token_indices[:token_count]
+        clone = getattr(token_indices, "clone", None)
+        if callable(clone):
+            token_indices = clone()
+        return UGSRTKVTokenBinding(
+            session_id=binding.session_id,
+            request_id=f"{binding.request_id}:{role}",
+            token_count=token_count,
+            token_indices=token_indices,
+        )
+
     def _prepare_image(self, image: Any | None) -> Any | None:
         if image is None:
             return None
@@ -1179,6 +1521,18 @@ class BAGELInterleaveContextBackend:
         if resize_transform is None:
             return image
         return resize_transform(image)
+
+    @staticmethod
+    def _unpack_image_message(content: Any) -> tuple[Any, bool, bool]:
+        if not isinstance(content, dict):
+            return content, True, True
+        if "image" not in content:
+            return content, True, True
+        return (
+            content.get("image"),
+            bool(content.get("vae", True)),
+            bool(content.get("vit", True)),
+        )
 
     def _image_shape(self, image: Any | None) -> tuple[int, int]:
         size = getattr(image, "size", None)
@@ -1222,6 +1576,14 @@ class BAGELBackendProtocol(Protocol):
 
     def decode_next_segment(self, *, session) -> UGDecodeResult: ...
 
+    def decode_vlm_text(
+        self,
+        *,
+        runtime: Any,
+        session: Any,
+        max_new_tokens: int,
+    ) -> UGVLMTextGenerationResult: ...
+
     def predict_velocity_from_session(
         self, *, session, request: UGVelocityRequest
     ) -> torch.Tensor: ...
@@ -1245,9 +1607,9 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
     """BAGEL-facing UG adapter shell.
 
     The adapter can use either a deterministic mock backend for smoke tests or
-    the official BAGEL modules behind the SRT-owned UG runtime. In the native
-    SRT path, the shell keeps tokenizer/transforms only; SRT owns feature
-    extractors, session requests, KV cache, and per-step G velocity execution.
+    the SRT-native BAGEL backend. The real backend keeps only tokenizer and
+    image transforms in this adapter; SRT owns feature extractors, session
+    requests, KV cache, and per-step G velocity execution.
     """
 
     def __init__(
@@ -1297,6 +1659,27 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
 
     def decode_next_segment(self, *, session) -> UGDecodeResult:
         return self.backend.decode_next_segment(session=session)
+
+    def decode_next_segment_from_runtime(
+        self, *, runtime: Any, session: Any
+    ) -> UGDecodeResult:
+        decode = getattr(self.backend, "decode_next_segment_from_runtime", None)
+        if callable(decode):
+            return decode(runtime=runtime, session=session)
+        return self.backend.decode_next_segment(session=SimpleNamespace(handle=session))
+
+    def decode_vlm_text(
+        self,
+        *,
+        runtime: Any,
+        session: Any,
+        max_new_tokens: int,
+    ) -> UGVLMTextGenerationResult:
+        return self.backend.decode_vlm_text(
+            runtime=runtime,
+            session=session,
+            max_new_tokens=max_new_tokens,
+        )
 
     def predict_velocity_from_session(
         self, *, session, request: UGVelocityRequest
@@ -1354,34 +1737,19 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
             raise BAGELAdapterError(
                 "BAGEL checkpoint is missing required files: "
                 f"{missing_files}. Expected a local ByteDance-Seed/BAGEL-7B-MoT "
-                "checkout with the official config and weight files."
+                "checkpoint directory with config and weight files."
             )
 
-        required_modules = (
-            _BAGEL_NATIVE_SRT_REQUIRED_MODULES
-            if native_srt_u_context
-            else _BAGEL_REQUIRED_MODULES
-        )
-        missing_modules = [
-            name for name in required_modules if _find_spec(name) is None
-        ]
-        if missing_modules:
+        if not native_srt_u_context or native_srt_denoise_executor is None:
             raise BAGELAdapterError(
-                "BAGEL Python modules are not importable: "
-                f"{missing_modules}. Add the official ByteDance-Seed/BAGEL repo "
-                "to PYTHONPATH or vendor the required model code before enabling "
-                "the real BAGEL backend."
+                "BAGEL real backend is native-SRT only; pass "
+                "native_srt_u_context=True and a BAGELNativeSRTDenoiseExecutor"
             )
 
-        if native_srt_u_context:
-            inferencer = _build_native_srt_bagel_inferencer_shell(checkpoint_dir)
-        else:
-            inferencer = _build_official_bagel_inferencer(checkpoint_dir)
-        u_forward_bridge = None
-        if native_srt_u_context:
-            u_forward_bridge = BAGELUForwardBridge(
-                srt_u_forward_executor=BAGELNativeSRTUForwardExecutor()
-            )
+        inferencer = _build_native_srt_bagel_inferencer_shell(checkpoint_dir)
+        u_forward_bridge = BAGELUForwardBridge(
+            srt_u_forward_executor=BAGELNativeSRTUForwardExecutor()
+        )
         return BAGELInterleaveContextBackend(
             inferencer,
             u_forward_bridge=u_forward_bridge,
@@ -1441,6 +1809,22 @@ class MockBAGELBackend:
         if decode_count == 1:
             return UGDecodeResult(type="text", text="bagel_mock_text_after_image")
         return UGDecodeResult(type="done")
+
+    def decode_vlm_text(
+        self,
+        *,
+        runtime: Any,
+        session: Any,
+        max_new_tokens: int,
+    ) -> UGVLMTextGenerationResult:
+        del runtime
+        self.events.append(("decode_vlm_text", session.session_id))
+        token_ids = tuple(range(1, max(1, int(max_new_tokens)) + 1))
+        return UGVLMTextGenerationResult(
+            session=session,
+            text="bagel_mock_vlm_text",
+            token_ids=token_ids,
+        )
 
     def predict_velocity_from_session(
         self, *, session, request: UGVelocityRequest
@@ -1505,8 +1889,33 @@ def _require_keys(
         raise BAGELDenoiseStepError(f"{name} is missing required keys: {missing}")
 
 
+def _effective_cfg_scales(
+    prepared: BAGELNativeSRTPreparedDenoise,
+    timestep: torch.Tensor,
+) -> tuple[float, float]:
+    return get_bagel_effective_cfg_scales(prepared, timestep)
+
+
 def _clone_context(context: dict[str, Any]) -> dict[str, Any]:
     return deepcopy(context)
+
+
+def _optional_int(value: Any) -> int | None:
+    if value is None:
+        return None
+    return int(value)
+
+
+def _decode_bagel_token_ids(tokenizer: Any, token_ids: list[int]) -> str:
+    return _strip_bagel_decoded_text(str(tokenizer.decode(token_ids)))
+
+
+def _strip_bagel_decoded_text(text: str) -> str:
+    if "<|im_end|>" in text:
+        text = text.split("<|im_end|>", 1)[0]
+    if "<|im_start|>" in text:
+        text = text.split("<|im_start|>", 1)[1]
+    return text
 
 
 def _bagel_runtime_device(model: Any) -> torch.device | None:
@@ -1555,100 +1964,12 @@ def _bagel_autocast(model: Any):
     return nullcontext()
 
 
-def _build_official_bagel_inferencer(
-    checkpoint_dir: Path,
-    *,
-    loader_symbols: dict[str, Any] | None = None,
-) -> Any:
-    if torch.cuda.device_count() < 1:
-        raise BAGELAdapterError(
-            "Real BAGEL backend requires at least one CUDA device. "
-            "Use sglang-internal/mock-bagel for CPU-only adapter tests."
-        )
-
-    _ensure_bagel_transformers_compat()
-    symbols = loader_symbols or _import_bagel_loader_symbols()
-
-    llm_config = symbols["Qwen2Config"].from_json_file(
-        str(checkpoint_dir / "llm_config.json")
-    )
-    llm_config.qk_norm = True
-    llm_config.tie_word_embeddings = False
-    llm_config.layer_module = "Qwen2MoTDecoderLayer"
-    if getattr(llm_config, "pad_token_id", None) is None:
-        llm_config.pad_token_id = getattr(llm_config, "eos_token_id", None)
-
-    vit_config = symbols["SiglipVisionConfig"].from_json_file(
-        str(checkpoint_dir / "vit_config.json")
-    )
-    vit_config.rope = False
-    vit_config.num_hidden_layers -= 1
-
-    vae_model, vae_config = symbols["load_ae"](
-        local_path=str(checkpoint_dir / "ae.safetensors")
-    )
-    config = symbols["BagelConfig"](
-        visual_gen=True,
-        visual_und=True,
-        llm_config=llm_config,
-        vit_config=vit_config,
-        vae_config=vae_config,
-        vit_max_num_patch_per_side=70,
-        connector_act="gelu_pytorch_tanh",
-        latent_patch_size=2,
-        max_latent_size=64,
-    )
-
-    with symbols["init_empty_weights"]():
-        language_model = symbols["Qwen2ForCausalLM"](llm_config)
-        vit_model = symbols["SiglipVisionModel"](vit_config)
-        model = symbols["Bagel"](language_model, vit_model, config)
-        model.vit_model.vision_model.embeddings.convert_conv2d_to_linear(
-            vit_config,
-            meta=True,
-        )
-
-    tokenizer = symbols["Qwen2Tokenizer"].from_pretrained(str(checkpoint_dir))
-    tokenizer, new_token_ids, _ = symbols["add_special_tokens"](tokenizer)
-
-    vae_transform = symbols["ImageTransform"](1024, 512, 16)
-    vit_transform = symbols["ImageTransform"](980, 224, 14)
-
-    device_map = symbols["infer_auto_device_map"](
-        model,
-        max_memory={
-            device_id: "80GiB" for device_id in range(torch.cuda.device_count())
-        },
-        no_split_module_classes=["Bagel", "Qwen2MoTDecoderLayer"],
-    )
-    device_map = _pin_bagel_shared_modules(device_map)
-
-    model = symbols["load_checkpoint_and_dispatch"](
-        model,
-        checkpoint=str(checkpoint_dir / "ema.safetensors"),
-        device_map=device_map,
-        offload_buffers=True,
-        offload_folder=str(checkpoint_dir / "offload"),
-        dtype=torch.bfloat16,
-        force_hooks=True,
-    ).eval()
-
-    return symbols["InterleaveInferencer"](
-        model=model,
-        vae_model=vae_model,
-        tokenizer=tokenizer,
-        vae_transform=vae_transform,
-        vit_transform=vit_transform,
-        new_token_ids=new_token_ids,
-    )
-
-
 class BAGELNativeSRTInferencerShell:
     """Tokenizer/transform shell for native SRT BAGEL execution.
 
-    The shell intentionally does not load the official BAGEL model or VAE/VIT
-    feature extractors. Native execution gets those modules from the SRT model
-    instance loaded by ModelRunner.
+    The shell intentionally does not load a second BAGEL model or VAE/VIT
+    feature extractor stack. Native execution gets those modules from the SRT
+    model instance loaded by ModelRunner.
     """
 
     def __init__(
@@ -1676,106 +1997,45 @@ class BAGELNativeSRTInferencerShell:
     def update_context_text(self, *args, **kwargs):
         del args, kwargs
         raise BAGELAdapterError(
-            "Native SRT BAGEL shell cannot update context through official BAGEL"
+            "Native SRT BAGEL shell cannot update context outside SRT"
         )
 
     def update_context_image(self, *args, **kwargs):
         del args, kwargs
         raise BAGELAdapterError(
-            "Native SRT BAGEL shell cannot append images through official BAGEL"
+            "Native SRT BAGEL shell cannot append images outside SRT"
         )
 
     def decode_image(self, *args, **kwargs):
         del args, kwargs
-        raise BAGELAdapterError(
-            "Native SRT BAGEL shell cannot decode through official BAGEL"
-        )
+        raise BAGELAdapterError("Native SRT BAGEL shell cannot decode outside SRT")
 
     def gen_text(self, *args, **kwargs):
         del args, kwargs
-        raise BAGELAdapterError(
-            "Native SRT BAGEL shell cannot decode text through official BAGEL"
-        )
+        raise BAGELAdapterError("Native SRT BAGEL shell cannot decode text outside SRT")
 
 
 def _build_native_srt_bagel_inferencer_shell(
     checkpoint_dir: Path,
     *,
-    loader_symbols: dict[str, Any] | None = None,
+    tokenizer_loader: Any | None = None,
+    image_transform_cls: type | None = None,
 ) -> BAGELNativeSRTInferencerShell:
     _ensure_bagel_transformers_compat()
-    symbols = loader_symbols or _import_bagel_native_srt_shell_symbols()
+    tokenizer_loader = tokenizer_loader or AutoTokenizer
+    image_transform_cls = image_transform_cls or BAGELImageTransform
 
-    tokenizer = symbols["Qwen2Tokenizer"].from_pretrained(str(checkpoint_dir))
-    tokenizer, new_token_ids, _ = symbols["add_special_tokens"](tokenizer)
+    tokenizer = tokenizer_loader.from_pretrained(
+        str(checkpoint_dir),
+        use_fast=False,
+    )
+    tokenizer, new_token_ids, _ = add_bagel_special_tokens(tokenizer)
     return BAGELNativeSRTInferencerShell(
         tokenizer=tokenizer,
-        vae_transform=symbols["ImageTransform"](1024, 512, 16),
-        vit_transform=symbols["ImageTransform"](980, 224, 14),
+        vae_transform=image_transform_cls(1024, 512, 16),
+        vit_transform=image_transform_cls(980, 224, 14),
         new_token_ids=new_token_ids,
     )
-
-
-def _import_bagel_native_srt_shell_symbols() -> dict[str, Any]:
-    data_utils = _import_module("data.data_utils")
-    transforms = _import_module("data.transforms")
-    qwen2 = _import_module("modeling.qwen2")
-
-    return {
-        "add_special_tokens": _module_attr(data_utils, "add_special_tokens"),
-        "ImageTransform": _module_attr(transforms, "ImageTransform"),
-        "Qwen2Tokenizer": _module_attr(qwen2, "Qwen2Tokenizer"),
-    }
-
-
-def _pin_bagel_shared_modules(device_map: dict[str, Any]) -> dict[str, Any]:
-    device_map = dict(device_map)
-    if torch.cuda.device_count() == 1:
-        first_device = device_map.get(_BAGEL_SAME_DEVICE_MODULES[0], "cuda:0")
-        for module_name in _BAGEL_SAME_DEVICE_MODULES:
-            device_map[module_name] = first_device
-        return device_map
-
-    first_device = device_map.get(_BAGEL_SAME_DEVICE_MODULES[0])
-    if first_device is None:
-        return device_map
-    for module_name in _BAGEL_SAME_DEVICE_MODULES:
-        if module_name in device_map:
-            device_map[module_name] = first_device
-    return device_map
-
-
-def _import_bagel_loader_symbols() -> dict[str, Any]:
-    accelerate = _import_module("accelerate")
-    data_utils = _import_module("data.data_utils")
-    transforms = _import_module("data.transforms")
-    inferencer_module = _import_module("inferencer")
-    autoencoder = _import_module("modeling.autoencoder")
-    bagel = _import_module("modeling.bagel")
-    qwen2 = _import_module("modeling.qwen2")
-
-    return {
-        "infer_auto_device_map": _module_attr(accelerate, "infer_auto_device_map"),
-        "load_checkpoint_and_dispatch": _module_attr(
-            accelerate,
-            "load_checkpoint_and_dispatch",
-        ),
-        "init_empty_weights": _module_attr(accelerate, "init_empty_weights"),
-        "add_special_tokens": _module_attr(data_utils, "add_special_tokens"),
-        "ImageTransform": _module_attr(transforms, "ImageTransform"),
-        "InterleaveInferencer": _module_attr(
-            inferencer_module,
-            "InterleaveInferencer",
-        ),
-        "load_ae": _module_attr(autoencoder, "load_ae"),
-        "BagelConfig": _module_attr(bagel, "BagelConfig"),
-        "Bagel": _module_attr(bagel, "Bagel"),
-        "Qwen2Config": _module_attr(bagel, "Qwen2Config"),
-        "Qwen2ForCausalLM": _module_attr(bagel, "Qwen2ForCausalLM"),
-        "SiglipVisionConfig": _module_attr(bagel, "SiglipVisionConfig"),
-        "SiglipVisionModel": _module_attr(bagel, "SiglipVisionModel"),
-        "Qwen2Tokenizer": _module_attr(qwen2, "Qwen2Tokenizer"),
-    }
 
 
 def _ensure_bagel_transformers_compat() -> None:
@@ -1805,31 +2065,3 @@ def _ensure_bagel_transformers_compat() -> None:
         return inv_freq, 1.0
 
     rope_init_functions["default"] = _compute_default_rope_parameters
-
-
-def _import_module(module_name: str):
-    try:
-        return importlib.import_module(module_name)
-    except ImportError as exc:
-        raise BAGELAdapterError(
-            f"BAGEL Python module is not importable: {module_name}. "
-            "Add the official ByteDance-Seed/BAGEL repo to PYTHONPATH before "
-            "enabling the real BAGEL backend."
-        ) from exc
-
-
-def _module_attr(module: Any, attr_name: str) -> Any:
-    try:
-        return getattr(module, attr_name)
-    except AttributeError as exc:
-        raise BAGELAdapterError(
-            f"BAGEL Python module {module.__name__} is missing required symbol "
-            f"{attr_name}."
-        ) from exc
-
-
-def _find_spec(module_name: str):
-    try:
-        return importlib.util.find_spec(module_name)
-    except (ImportError, ModuleNotFoundError, ValueError):
-        return None

@@ -10,12 +10,10 @@ from sglang.srt.ug.adapter import (
 from sglang.srt.ug.bagel import (
     BAGELAdapterError,
     BAGELDenoiseStepError,
-    BAGELDenoiseStepRunner,
     BAGELInterleaveContextBackend,
     BAGELNativeSRTDenoiseExecutor,
     BAGELNativeSRTPreparedDenoise,
     BAGELNativeSRTUForwardExecutor,
-    BAGELPreparedDenoise,
     BAGELSessionContext,
     BAGELSRTUForwardExecutor,
     BAGELUForwardBridge,
@@ -66,19 +64,23 @@ from sglang.srt.ug.srt_executor import (
     UGSRTSchedulerExecutor,
     UGSRTSchedulerExecutorError,
 )
+from sglang.srt.ug.srt_server import (
+    UGBAGELSRTSchedulerHandle,
+    build_bagel_language_model_view,
+    create_bagel_srt_scheduler,
+    is_real_bagel_ug_model,
+)
 
 __all__ = [
     "FakeUGDenoiserBridge",
     "FakeUGModelRunner",
     "BAGELAdapterError",
     "BAGELDenoiseStepError",
-    "BAGELDenoiseStepRunner",
     "BAGELInterleaveContextBackend",
     "BAGELNativeSRTDenoiseExecutor",
     "BAGELNativeSRTPreparedDenoise",
     "BAGELNativeSRTUForwardExecutor",
     "BAGELPagedKVCacheBacking",
-    "BAGELPreparedDenoise",
     "BAGELSRTKVCache",
     "BAGELSRTKVCacheError",
     "BAGELSRTKVCacheFactory",
@@ -115,7 +117,11 @@ __all__ = [
     "UGSRTRequestBoundaryExecutor",
     "UGSRTSchedulerExecutor",
     "UGSRTSchedulerExecutorError",
+    "UGBAGELSRTSchedulerHandle",
     "UGVelocityRequest",
     "UGVelocityResponse",
+    "build_bagel_language_model_view",
     "create_bagel_ug_model_adapter",
+    "create_bagel_srt_scheduler",
+    "is_real_bagel_ug_model",
 ]

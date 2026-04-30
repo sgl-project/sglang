@@ -1,0 +1,48 @@
+feature: 2026-04-30-ug-native-model-hardening
+created: 2026-04-30
+status: done
+stop_signal: null
+result: "Completed. First closure: post-image U text now comes from the SRT-owned BAGEL decode loop and SRT tokenizer decode. Second closure: BAGEL logical kv_len/rope flows through UGSessionRuntime ug_model_state and request/session views. Third closure: BAGEL CFG text/img logical context, token counts, and sidecar marker also flow through ug_model_state; BAGEL latent/velocity preparation resyncs CFG state from runtime while full KV length still comes from SRT token binding. Remote CPU runtime+BAGEL 56 tests OK, adapter+diffusion 29 tests OK. Remote true-weight Python smoke on GPU2 returned segments ['image', 'text'], text '<think>\\n', prefill_count=1, velocity_count=3, append_image_count=1, srt_u_decode_request_count=5."
+
+steps:
+  - action: "SRT-owned U decode text metadata"
+    exit_signal: "post-image text comes from greedy UGSessionRuntime tokenizer decode, not BAGEL adapter token-id join or sampled decode"
+    status: done
+  - action: "CPU regression tests"
+    exit_signal: "UG session/runtime, BAGEL adapter, and diffusion pipeline tests cover decoded text metadata and still pass"
+    status: done
+  - action: "True-weight entrypoint spot check"
+    exit_signal: "remote BAGEL interleaved entrypoint smoke keeps image+text stats and returns decoded post-image text"
+    status: done
+  - action: "Roadmap/checklist update"
+    exit_signal: "feature records the closure or any stop signal before wider hardening"
+    status: done
+  - action: "SRT-owned BAGEL logical state"
+    exit_signal: "UGSessionRuntime owns model-state metadata for BAGEL logical kv_len/rope and request views expose only scalar state, not KV allocator/page/slot"
+    status: done
+  - action: "BAGEL adapter consumes runtime state"
+    exit_signal: "BAGEL native text/image/denoise helpers derive curr_rope from SRT-owned model state instead of token_count or adapter-only reconstruction"
+    status: done
+  - action: "Second closure CPU regression"
+    exit_signal: "unit tests prove BAGEL rope survives text+image interleave through runtime model state and existing UG regressions pass"
+    status: done
+  - action: "SRT-owned BAGEL CFG state"
+    exit_signal: "CFG text/img logical contexts, token counts, and sidecar marker are persisted in ug_model_state; sidecar request views preserve owner model state"
+    status: done
+  - action: "BAGEL G preparation consumes CFG runtime state"
+    exit_signal: "prepare_latents/predict_velocity resync CFG state from session view while full KV length remains sourced from SRT token binding"
+    status: done
+  - action: "Third closure regression"
+    exit_signal: "remote CPU UG tests and true-weight Python entry smoke pass without changing image+text behavior"
+    status: done
+
+checks:
+  - item: "runtime 不 import official BAGEL/seed function"
+    source: architecture import discipline
+    status: done
+  - item: "不暴露 KV allocator/page/slot"
+    source: UG session contract
+    status: done
+  - item: "不进入 batching 产品化"
+    source: roadmap Phase 6 ordering
+    status: done

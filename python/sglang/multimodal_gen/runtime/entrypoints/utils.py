@@ -150,8 +150,9 @@ def build_ug_interleaved_generate_req(
     messages = payload.get("messages")
     if messages is None:
         raise ValueError("UG interleaved request is missing messages")
+    messages = _load_ug_input_images(messages)
     sampling_params = _build_ug_sampling_params(payload.get("sampling_params"))
-    metadata = dict(payload.get("metadata") or {})
+    metadata = _build_ug_request_metadata(payload)
     return UGInterleavedGenerateReq(
         UGInterleavedRequest.from_segments(
             messages,
@@ -177,6 +178,15 @@ def build_ug_interleaved_generate_reqs(
     return build_ug_interleaved_generate_req(payload)
 
 
+def build_ug_vlm_generate_reqs(
+    payload: dict[str, Any] | list[Any] | UGInterleavedRequest,
+) -> UGInterleavedGenerateReq | list[UGInterleavedGenerateReq]:
+    """Normalize a single or batched experimental UG VLM-only payload."""
+    return build_ug_interleaved_generate_reqs(
+        _with_ug_request_metadata(payload, {"mode": "vlm"})
+    )
+
+
 def _build_ug_sampling_params(
     payload: dict[str, Any] | UGSamplingParams | None,
 ) -> UGSamplingParams:
@@ -186,7 +196,112 @@ def _build_ug_sampling_params(
         return payload
     if not isinstance(payload, dict):
         raise TypeError(f"UG interleaved sampling_params must be a dict: {payload!r}")
-    return UGSamplingParams(**payload)
+    values = dict(payload)
+    for key in ("mode", "max_new_tokens", "max_length"):
+        values.pop(key, None)
+    return UGSamplingParams(**values)
+
+
+def _build_ug_request_metadata(payload: dict[str, Any]) -> dict[str, Any]:
+    metadata = dict(payload.get("metadata") or {})
+    sampling_params = payload.get("sampling_params")
+    if isinstance(sampling_params, dict):
+        for key in (
+            "mode",
+            "think",
+            "max_new_tokens",
+            "max_length",
+            "think_max_new_tokens",
+        ):
+            if key in sampling_params and sampling_params[key] is not None:
+                metadata[key] = sampling_params[key]
+    for key in (
+        "mode",
+        "think",
+        "max_new_tokens",
+        "max_length",
+        "think_max_new_tokens",
+    ):
+        if key in payload and payload[key] is not None:
+            metadata[key] = payload[key]
+    return metadata
+
+
+def _load_ug_input_images(messages: Any) -> Any:
+    if not isinstance(messages, list):
+        return messages
+    loaded = []
+    for message in messages:
+        if not isinstance(message, dict):
+            loaded.append(message)
+            continue
+        message_type = message.get("type")
+        if message_type != "image":
+            loaded.append(message)
+            continue
+        cloned = dict(message)
+        image = cloned.get("image", cloned.get("content"))
+        loaded_image = _load_ug_input_image(image)
+        if "image" in cloned:
+            cloned["image"] = loaded_image
+        else:
+            cloned["content"] = loaded_image
+        loaded.append(cloned)
+    return loaded
+
+
+def _load_ug_input_image(image: Any) -> Any:
+    if isinstance(image, dict) and "image" in image:
+        cloned = dict(image)
+        cloned["image"] = _load_ug_input_image(cloned["image"])
+        return cloned
+    if not isinstance(image, str):
+        return image
+    if image.startswith("data:image/"):
+        header, encoded = image.split(",", 1)
+        del header
+        return _open_ug_image(io.BytesIO(base64.b64decode(encoded)))
+    if os.path.exists(image):
+        return _open_ug_image(image)
+    return image
+
+
+def _open_ug_image(source: Any) -> Any:
+    from PIL import Image
+
+    with Image.open(source) as image:
+        return image.convert("RGB").copy()
+
+
+def _with_ug_request_metadata(
+    payload: dict[str, Any] | list[Any] | UGInterleavedRequest,
+    metadata_updates: dict[str, Any],
+) -> dict[str, Any] | list[Any] | UGInterleavedRequest:
+    if isinstance(payload, UGInterleavedRequest):
+        metadata = dict(payload.metadata)
+        metadata.update(metadata_updates)
+        return UGInterleavedRequest(
+            messages=payload.messages,
+            sampling_params=payload.sampling_params,
+            metadata=metadata,
+        )
+    if isinstance(payload, list):
+        return [_with_ug_request_metadata(item, metadata_updates) for item in payload]
+    if not isinstance(payload, dict):
+        return payload
+    if "requests" in payload:
+        cloned = dict(payload)
+        requests = cloned.get("requests")
+        if isinstance(requests, list):
+            cloned["requests"] = [
+                _with_ug_request_metadata(item, metadata_updates) for item in requests
+            ]
+        return cloned
+    cloned = dict(payload)
+    metadata = dict(cloned.get("metadata") or {})
+    metadata.update(metadata_updates)
+    cloned["metadata"] = metadata
+    return cloned
 
 
 def serialize_ug_interleaved_output(output: Any) -> Any:
@@ -754,6 +869,6 @@ def post_process_sample(
                     imageio.imwrite(save_file_path, frames[0], quality=quality)
             logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
         else:
-            logger.info(f"No output path provided, output not saved")
+            logger.info("No output path provided, output not saved")
 
     return frames

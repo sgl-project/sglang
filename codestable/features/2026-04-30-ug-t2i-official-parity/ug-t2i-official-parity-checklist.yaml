@@ -1,0 +1,36 @@
+feature: 2026-04-30-ug-t2i-official-parity
+created: 2026-04-30
+status: done
+stop_signal: null
+result: "完成 T2I official parity：harness 支持只跑 text_to_image；远端 GPU2 真权重 512x512/50-step 官方与 SGLang report passed、diffs=0，输出图已落盘到 /Users/bytedance/Desktop/ug-t2i-official-parity。过程中捕获并修复 native SRT G velocity 未关闭 autograd 导致 50-step OOM 的 stop signal。"
+
+steps:
+  - action: "拆分 T2I parity case，支持只跑 text_to_image"
+    exit_signal: "opt-in harness 可以通过 env 只执行 T2I，不强绑 edit"
+    status: done
+  - action: "补 T2I SGLang debug counter 验收"
+    exit_signal: "断言 prefill_count == 1、velocity_count == num_steps - 1、append_image_count == 0"
+    status: done
+  - action: "跑远端真权重 T2I quality probe"
+    exit_signal: "官方与 SGLang T2I report passed，输出图片落盘可查看"
+    status: done
+  - action: "回写 roadmap"
+    exit_signal: "ug-t2i-official-parity 标为 done 或记录 stop signal"
+    status: done
+
+checks:
+  - item: "不关闭 edit，不混入 image-edit 验收"
+    source: roadmap 边界
+    status: done
+  - item: "SRT 是 KV owner，SGLD 不接触 KV slot/page"
+    source: share-KV 边界
+    status: done
+  - item: "runtime 不 import official BAGEL/seed function"
+    source: runtime 边界
+    status: done
+
+validation:
+  - "远端 CPU 单测：python/sglang/multimodal_gen/test/unit/test_ug_bagel_adapter.py -v，35 tests OK"
+  - "远端真权重 fast smoke：SGLANG_TEST_BAGEL_G_TASKS=text_to_image, 256x256, 4 denoise steps, report passed"
+  - "远端真权重 quality probe：SGLANG_TEST_BAGEL_G_TASKS=text_to_image, 512x512, 50 denoise steps, report passed，diffs=0"
+  - "图片产物：/Users/bytedance/Desktop/ug-t2i-official-parity/official_t2i_512_50.png 与 sglang_t2i_512_50.png"
