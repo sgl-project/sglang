@@ -173,7 +173,7 @@ jobs:
 
   publish_dsv4:
     if: github.repository == 'sgl-project/sglang' && (github.event_name != 'workflow_dispatch' || inputs.job_select == 'all' || inputs.job_select == 'publish_dsv4')
-    runs-on: linux-mi300-8gpu-sglang
+    runs-on: amd-docker-scale
     environment: 'prod'
     strategy:
       fail-fast: false
