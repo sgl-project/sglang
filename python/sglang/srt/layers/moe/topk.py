@@ -324,10 +324,7 @@ class TopK(MultiPlatformOp):
             output_format = TopKOutputFormat.TRITON_KERNEL
         elif get_moe_runner_backend().is_flashinfer_trtllm() or (
             get_moe_runner_backend().is_flashinfer_mxfp4()
-            and not (
-                envs.SGLANG_DSV4_MODE.get() == "2604"
-                and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-            )
+            and not envs.SGLANG_DSV4_FP4_EXPERTS.get()
         ):
             output_format = TopKOutputFormat.BYPASSED
         else:

@@ -129,10 +129,7 @@ class DeepseekV4ModelNextN(nn.Module):
             hidden_states = input_embeds
 
         if hidden_states.shape[0] > 0:
-            if (
-                envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-                and envs.SGLANG_DSV4_MODE.get() == "2604"
-            ):
+            if envs.SGLANG_FIX_MTP_HC_HIDDEN.get():
                 n_tokens = hidden_states.shape[0]
                 d = self.config.hidden_size
                 hc_flat = forward_batch.spec_info.hidden_states.view(
@@ -175,7 +172,6 @@ class DeepseekV4ModelNextN(nn.Module):
         pre_hc_head = (
             hidden_states.flatten(1)
             if envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
             else None
         )
 
@@ -225,10 +221,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
     ) -> torch.Tensor:
         result = self.model(input_ids, positions, forward_batch)
         pre_hc_head = None
-        if (
-            envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
-        ):
+        if envs.SGLANG_FIX_MTP_HC_HIDDEN.get():
             hidden_states, pre_hc_head = result
         else:
             hidden_states = result

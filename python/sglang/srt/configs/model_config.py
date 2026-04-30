@@ -467,8 +467,6 @@ class ModelConfig:
             return
         if not is_deepseek_compressed(self.hf_config):
             return
-        if envs.SGLANG_DSV4_MODE.get() != "2604":
-            return
         try:
             dtype = _probe_routed_expert_weight_dtype(self.model_path)
         except Exception as e:
@@ -671,15 +669,10 @@ class ModelConfig:
             or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
         ):
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
-            if envs.SGLANG_DSV4_MODE.get() == "2604":
-                self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
-                self.window_size = self.hf_config.sliding_window
-            else:
-                self.qk_nope_head_dim = self.hf_config.qk_nope_head_dim
-                self.window_size = self.hf_config.window_size
+            self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
+            self.window_size = self.hf_config.sliding_window
             self.head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
-            if envs.SGLANG_DSV4_MODE.get() == "2604":
-                self.v_head_dim = self.head_dim
+            self.v_head_dim = self.head_dim
             self.index_head_dim = self.hf_config.index_head_dim
             self.compress_ratios = self.hf_config.compress_ratios
             self.attention_arch = AttentionArch.MHA
@@ -795,9 +788,7 @@ class ModelConfig:
         hc_mult = getattr(self.hf_text_config, "hc_mult", 1)
         self.spec_hidden_size = (
             self.hidden_size * hc_mult
-            if hc_mult > 1
-            and envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
+            if hc_mult > 1 and envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
             else self.hidden_size
         )
         self.num_hidden_layers = self.hf_text_config.num_hidden_layers

@@ -52,8 +52,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
 
             fp4_kwargs = (
                 dict(recipe_a=(1, 128), recipe_b=(1, 32))
-                if envs.SGLANG_DSV4_MODE.get() == "2604"
-                and envs.SGLANG_DSV4_FP4_EXPERTS.get()
+                if envs.SGLANG_DSV4_FP4_EXPERTS.get()
                 else {}
             )
 
@@ -103,7 +102,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
 
     fp4_kwargs = (
         dict(recipe_a=(1, 128), recipe_b=(1, 32))
-        if envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
+        if envs.SGLANG_DSV4_FP4_EXPERTS.get()
         else {}
     )
 

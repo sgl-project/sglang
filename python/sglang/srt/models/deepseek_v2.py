@@ -464,10 +464,7 @@ class DeepseekV2MoE(nn.Module):
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
 
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            n_hash_layers = config.num_hash_layers
-        else:
-            n_hash_layers = getattr(config, "n_hash_layers", 0)
+        n_hash_layers = config.num_hash_layers
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
 
         if self.tp_size > config.n_routed_experts:

@@ -216,11 +216,9 @@ class Compressor(nn.Module):
         assert not self.ape_converted
         self.ape_converted = True
 
-        is_model_2604 = envs.SGLANG_DSV4_MODE.get() == "2604"
-        if self.overlap and (envs.SGLANG_OPT_FIX_APE_2604.get() or not is_model_2604):
-            orders = [0, 1] if is_model_2604 else [1, 0]
+        if self.overlap and envs.SGLANG_OPT_FIX_APE_2604.get():
             ape = torch.chunk(self.ape.data, 2, dim=-1)
-            ape = torch.cat([ape[orders[0]], ape[orders[1]]], dim=0)
+            ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
     def _get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
@@ -423,10 +421,7 @@ class MQALayer(nn.Module):
         self.layer_id = layer_id
         self.dim = config.hidden_size
         self.qk_rope_head_dim = config.qk_rope_head_dim
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            self.qk_nope_head_dim = config.head_dim - config.qk_rope_head_dim
-        else:
-            self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_nope_head_dim = config.head_dim - config.qk_rope_head_dim
         self.head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
         self.n_heads = config.num_attention_heads
         self.n_local_heads = self.n_heads // attn_tp_size
@@ -446,10 +441,7 @@ class MQALayer(nn.Module):
         assert compress_ratio in [0, 4, 128]
         self.compress_ratio: Literal[0, 4, 128] = compress_ratio
 
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            assert self.head_dim == config.head_dim
-        else:
-            assert self.head_dim == config.v_head_dim
+        assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
 
         rope_theta, rope_scaling = get_rope_config(config)
@@ -469,9 +461,6 @@ class MQALayer(nn.Module):
         )
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
-
-        if envs.SGLANG_DSV4_MODE.get() not in ("2604", "2601"):
-            raise NotImplementedError
 
         assert self.compress_ratio in {0, 4, 128}
         if self.compress_ratio:
@@ -950,12 +939,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            first_k_dense_replace = 0
-            moe_layer_freq = 1
-        else:
-            first_k_dense_replace = self.config.first_k_dense_replace
-            moe_layer_freq = self.config.moe_layer_freq
+        first_k_dense_replace = 0
+        moe_layer_freq = 1
         return is_nextn or (
             self.config.n_routed_experts is not None
             and layer_id >= first_k_dense_replace
@@ -1288,7 +1273,6 @@ class DeepseekV4Model(nn.Module):
         pre_hc_head = (
             hidden_states.flatten(1)
             if envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
             else None
         )
 
@@ -1372,9 +1356,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
-        elif (
-            envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        ):
+        elif envs.SGLANG_DSV4_FP4_EXPERTS.get():
             disable_reason = "2604 routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
 
         disable_reason = "2604B checkpoint requires different clamping for shared and routed experts"
@@ -1416,10 +1398,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         pre_hc_head = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
-        if (
-            envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
-        ):
+        if envs.SGLANG_FIX_MTP_HC_HIDDEN.get():
             hidden_states, pre_hc_head = hidden_states
         return self.logits_processor(
             input_ids,
@@ -1532,8 +1511,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         return name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        assert envs.SGLANG_DSV4_MODE.get() in ["2601", "2604"]
-
         if MOE_BIT_WISE_EQUAL_MODE:
             assert (
                 self.num_fused_shared_experts == 0
@@ -1554,10 +1531,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if (
-            envs.SGLANG_DSV4_MODE.get() == "2604"
-            and not envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
-        ):
+        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
             weights = list(weights)
             exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
             if exists_wo_a_scale:
