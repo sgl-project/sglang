@@ -77,7 +77,13 @@ class FluxPipelineConfig(ImagePipelineConfig):
                 return_overflowing_tokens=False,
                 return_length=False,
             ),
-            None,
+            dict(
+                max_length=512,
+                padding="max_length",
+                truncation=True,
+                return_overflowing_tokens=False,
+                return_length=False,
+            ),
         ]
     )
 
