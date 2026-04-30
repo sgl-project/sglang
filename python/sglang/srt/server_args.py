@@ -642,7 +642,6 @@ class ServerArgs:
     disable_tokenizer_batch_decode: bool = False
     disable_outlines_disk_cache: bool = False
     disable_custom_all_reduce: bool = False
-    enable_mscclpp: bool = False
     enable_torch_symm_mem: bool = False
     pre_warm_nccl: bool = dataclasses.field(
         default_factory=lambda: is_hip()
@@ -6009,8 +6008,8 @@ class ServerArgs:
         )
         parser.add_argument(
             "--enable-mscclpp",
-            action="store_true",
-            help="Enable using mscclpp for small messages for all-reduce kernel and fall back to NCCL.",
+            action=DeprecatedAction,
+            help="Note: --enable-mscclpp is deprecated. mscclpp support has been removed from SGLang.",
         )
         parser.add_argument(
             "--enable-torch-symm-mem",

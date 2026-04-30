@@ -68,7 +68,6 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
     set_custom_all_reduce,
-    set_mscclpp_all_reduce,
     set_torch_symm_mem_all_reduce,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
@@ -1132,7 +1131,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.server_args.host or "127.0.0.1", self.dist_port
             ).to_tcp()
         set_custom_all_reduce(not self.server_args.disable_custom_all_reduce)
-        set_mscclpp_all_reduce(self.server_args.enable_mscclpp)
         set_torch_symm_mem_all_reduce(self.server_args.enable_torch_symm_mem)
 
         if not self.is_draft_worker:
