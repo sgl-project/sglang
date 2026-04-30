@@ -84,76 +84,63 @@ def _make_policy(curve_path: str, num_experts: int = 64,
 class TestCurveLookup:
     """1. Correctness — promotion decisions match the curve."""
 
-    def test_lookup_exact_M(self, curve_path):
-        p = _make_policy(curve_path)
-        assert p._T_for(32) == 10**9     # x=0 regime, T=∞
-        assert p._T_for(256) == 50
-        assert p._T_for(1024) == 24
-        assert p._T_for(4096) == 12
+    def test_mask_x_zero_means_all_int4(self, curve_path):
+        """At M=32 (x_runtime=0), mask should be all-INT4."""
+        p = _make_policy(curve_path, num_experts=64)
+        mask = p._mask_for(32)
+        assert (mask == 0).all().item()      # 0 = int4_group_idx
 
-    def test_lookup_nearest_M(self, curve_path):
-        p = _make_policy(curve_path)
-        # M=600 is between 256 (T=50) and 1024 (T=24).
-        # Distances: |600-256|=344  vs  |600-1024|=424. Nearest = 256.
-        assert p._T_for(600) == 50
-        # M=2000: |2000-1024|=976  vs  |2000-4096|=2096. Nearest = 1024.
-        assert p._T_for(2000) == 24
-        # M=8000: out of range, nearest 4096.
-        assert p._T_for(8000) == 12
+    def test_mask_top_x_are_bf16(self, curve_path):
+        """At M=1024 (x_runtime=16), top-16 by importance are BF16."""
+        p = _make_policy(curve_path, num_experts=64)
+        mask = p._mask_for(1024)
+        assert (mask == 1).sum().item() == 16  # exactly 16 BF16
+        assert (mask == 0).sum().item() == 48
 
-    def test_lookup_cache_warms(self, curve_path):
-        p = _make_policy(curve_path)
-        assert 1024 not in p._T_cache
-        p._T_for(1024)
-        assert p._T_cache[1024] == 24
+    def test_mask_nearest_M_fallback(self, curve_path):
+        """M=600 has no exact entry; nearest is 256 → x_runtime=4."""
+        p = _make_policy(curve_path, num_experts=64)
+        mask = p._mask_for(600)
+        assert (mask == 1).sum().item() == 4
 
-    def test_dispatch_promotes_high_frequency(self, curve_path):
-        """At M=1024 (T=24), build routing where experts 0..15 get >24
-        tokens each and 16..63 get ≤24. Verify only 0..15 land in BF16."""
+    def test_mask_is_constant_per_init(self, curve_path):
+        """Repeat _mask_for calls return the SAME tensor object — no
+        Python state mutation, mask was built once at __init__."""
+        p = _make_policy(curve_path, num_experts=64)
+        mask_a = p._mask_for(1024)
+        mask_b = p._mask_for(1024)
+        assert mask_a is mask_b
+
+    def test_dispatch_uses_static_top_x(self, curve_path):
+        """At M=1024 (x_runtime=16), the precomputed mask promotes the
+        top-16 by importance (default natural order = experts 0..15)."""
         p = _make_policy(curve_path, num_experts=64)
         device = torch.device("cuda")
-        N = 1024
-        K = 8
-        # Build routing where experts 0..15 each get 256 tokens (well above
-        # T=24) and experts 16..63 each get ~85 (also above T=24, but so
-        # we'll narrow the second pool to be below 24 instead).
-        ids = torch.zeros(N, K, dtype=torch.long, device=device)
-        for tok in range(N):
-            for slot in range(K):
-                if slot < K // 2:
-                    ids[tok, slot] = tok % 16              # experts 0..15
-                else:
-                    # Narrow into a few experts so they go above T too —
-                    # this verifies the threshold rule, not a specific count.
-                    ids[tok, slot] = 16 + (tok % 8)        # experts 16..23
+        N, K = 1024, 8
+        # Routing pattern doesn't matter — mask is precomputed.
+        ids = torch.randint(0, 64, (N, K), device=device, dtype=torch.long)
         scales = torch.ones(N, K, dtype=torch.float32, device=device)
         groups = p.dispatch(ids, scales, sentinel=-1)
         hot_ids = groups[1][0]
+        # Hot routes should ONLY contain experts 0..15 (the top-16 by
+        # default natural-order importance, since no importance arg).
         hot_set = set(hot_ids[hot_ids >= 0].unique().cpu().tolist())
-        # All experts above T=24 should be promoted; below stay INT4.
-        # Experts 0..15 each get ~256 tokens, 16..23 each get ~256 too,
-        # 24..63 get 0 — so hot set should be {0..23}.
-        assert hot_set.issubset(set(range(24))), (
-            f"expected hot ⊆ [0..24), got {sorted(hot_set)}"
-        )
-        assert len(hot_set) >= 16, (
-            f"expected ≥16 hot experts at M=1024, got {len(hot_set)}"
+        assert hot_set.issubset(set(range(16))), (
+            f"expected hot ⊆ [0..16), got {sorted(hot_set)}"
         )
 
-    def test_dispatch_high_T_no_promotion(self, curve_path):
-        """At M=32 (T=10^9), no expert can cross the threshold."""
+    def test_dispatch_x_zero_no_promotion(self, curve_path):
+        """At M=32 (x_runtime=0), mask is all-INT4; BF16 group is empty."""
         p = _make_policy(curve_path, num_experts=64)
         device = torch.device("cuda")
-        N = 32
-        K = 8
+        N, K = 32, 8
         ids = torch.randint(0, 64, (N, K), device=device, dtype=torch.long)
         scales = torch.ones(N, K, dtype=torch.float32, device=device)
         # should_skip_group returns True for the BF16 group at this M.
         assert p.should_skip_group(group_idx=1, num_tokens=N) is True
-        # Dispatch still runs; verify hot group is empty.
         groups = p.dispatch(ids, scales, sentinel=-1)
         hot_ids, hot_scales = groups[1]
-        assert (hot_ids == -1).all(), "BF16 group should be empty at T=∞"
+        assert (hot_ids == -1).all(), "BF16 group should be empty at x=0"
         assert (hot_scales == 0).all()
 
 
@@ -260,6 +247,65 @@ class TestCudaGraphCompatibility:
         assert (cold_out_ids == ref_cold_ids).all()
         assert (hot_out_ids == ref_hot_ids).all()
 
+    def test_should_skip_group_inside_capture(self, curve_path):
+        """should_skip_group is called by the LAYER inside CUDA graph
+        capture. ANY GPU→host sync inside should_skip_group raises
+        cudaErrorStreamCaptureUnsupported. This test opens a real CUDA
+        capture context and calls should_skip_group inside it. If the
+        method does .item() / .cpu() / any sync, capture aborts."""
+        p = _make_policy(curve_path, num_experts=64)
+        # Pre-warm any one-shot ops so we're capturing steady state.
+        for _ in range(3):
+            _ = p.should_skip_group(group_idx=1, num_tokens=32)
+            _ = p.should_skip_group(group_idx=1, num_tokens=1024)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        # If should_skip_group did any GPU sync, capture_begin → call →
+        # capture_end would raise here.
+        with torch.cuda.graph(graph):
+            # Trivial GPU op so the graph is non-empty
+            x = torch.zeros(1, device="cuda")
+            x.add_(1)
+            # Host-side calls inside the capture stream — must not sync.
+            _ = p.should_skip_group(group_idx=1, num_tokens=32)
+            _ = p.should_skip_group(group_idx=1, num_tokens=1024)
+            _ = p.should_skip_group(group_idx=1, num_tokens=600)  # nearest fallback
+            x.add_(1)
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+
+    def test_dispatch_inside_capture(self, curve_path):
+        """Same as above but for the full dispatch path. Must not sync."""
+        p = _make_policy(curve_path, num_experts=64)
+        device = torch.device("cuda")
+        N, K = 1024, 8
+        ids = torch.randint(0, 64, (N, K), device=device, dtype=torch.long)
+        scales = torch.ones(N, K, dtype=torch.float32, device=device)
+        for _ in range(3):
+            _ = p.dispatch(ids, scales, sentinel=-1)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        # Pre-allocate output buffers so the graph captures into stable addresses.
+        cold_ids = torch.empty(N, K, dtype=torch.long, device=device)
+        hot_ids = torch.empty(N, K, dtype=torch.long, device=device)
+
+        def run():
+            cold, hot = p.dispatch(ids, scales, sentinel=-1)
+            cold_ids.copy_(cold[0])
+            hot_ids.copy_(hot[0])
+
+        for _ in range(3):
+            run()
+        torch.cuda.synchronize()
+        with torch.cuda.graph(graph):
+            run()
+        torch.cuda.synchronize()
+        graph.replay()
+        torch.cuda.synchronize()
+
     def test_capture_at_x_zero_path(self, curve_path):
         """At M=32 (curve x=0), the 'no promotion' branch should also be
         graph-capturable. should_skip_group returns True host-side, so the
@@ -309,22 +355,24 @@ class TestDynamoCompatibility:
     Runs on CPU — no CUDA needed for dynamo tracing.
     """
 
-    def test_T_for_traceable(self, curve_path):
-        """_T_for must be dynamo-traceable (pure host-side dict lookup)."""
+    def test_mask_for_traceable(self, curve_path):
+        """_mask_for must be dynamo-traceable (pure host-side dict lookup
+        returning a tensor reference)."""
         p = _make_policy(curve_path, num_experts=64,
                          device=torch.device("cpu"))
 
         @torch.compile(fullgraph=True, dynamic=False, backend="eager")
         def call(M_int):
-            return p._T_for(M_int)
+            return p._mask_for(M_int)
 
-        assert call(1024) == 24
-        assert call(32) == 10**9
-        assert call(4096) == 12
+        # Returns the same precomputed tensor for known M values.
+        assert (call(1024) == 1).sum().item() == 16
+        assert (call(32) == 0).all().item()
 
-    def test_dispatch_traceable(self, curve_path):
-        """Full dispatch (host-side T lookup + single GPU compare) must
-        trace under dynamo without graph break."""
+    def test_dispatch_traceable_no_state_mutation(self, curve_path):
+        """Full dispatch (host-side dict lookup + GPU memcpy) must trace
+        under dynamo with NO Python state mutation. Repeated calls must
+        not change any cached state."""
         p = _make_policy(curve_path, num_experts=64,
                          device=torch.device("cpu"))
         N, K = 1024, 8
@@ -335,9 +383,23 @@ class TestDynamoCompatibility:
         def call(ids, scales):
             return p.dispatch(ids, scales, sentinel=-1)
 
+        # Snapshot the policy's internal dict refs BEFORE the call.
+        masks_before = {k: id(v) for k, v in p._M_to_mask.items()}
+        sorted_before = list(p._M_sorted)
+
         result = call(ids, scales)
         assert len(result) == 2
         assert result[0][0].shape == (N, K)
+
+        # AFTER the call: no new keys, no mutated tensor refs, sorted M
+        # unchanged. (Critical: this is what would have broken sglang's
+        # piecewise CUDA graph by triggering a runtime recompile.)
+        masks_after = {k: id(v) for k, v in p._M_to_mask.items()}
+        assert masks_before == masks_after, (
+            "EfficiencyPromotionPolicy mutated _M_to_mask during dispatch — "
+            "would trigger dynamo runtime recompile under PCG"
+        )
+        assert sorted_before == p._M_sorted
 
 
 if __name__ == "__main__":

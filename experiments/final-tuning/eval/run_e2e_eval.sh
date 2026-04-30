@@ -43,15 +43,7 @@ log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_DIR/driver.log" >&2; }
 # ---------------- launch + health check ----------------
 launch_server() {
     local label=$1 cfg=$2 port=$3 gpus=$4 logfile=$5
-    local extra=""
-    # Treatment uses EfficiencyPromotionPolicy which has Python-side
-    # cache mutation in dispatch — incompatible with piecewise CUDA
-    # graph's runtime recompile path. Disable piecewise capture for
-    # treatment; baseline keeps it on (no policy state mutation).
-    if [[ "$label" == "treatment" ]]; then
-        extra="--disable-piecewise-cuda-graph"
-    fi
-    log "launching $label on GPUs $gpus port $port $extra"
+    log "launching $label on GPUs $gpus port $port"
     CUDA_VISIBLE_DEVICES=$gpus python -m sglang.launch_server \
         --model-path "$BF16_MODEL" \
         --tp "$TP_SIZE" \
@@ -59,7 +51,6 @@ launch_server() {
         --trust-remote-code \
         --heter-precision-config "$cfg" \
         --mem-fraction-static 0.83 \
-        $extra \
         > "$logfile" 2>&1 &
     echo $!
 }
