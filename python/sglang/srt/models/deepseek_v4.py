@@ -1133,7 +1133,6 @@ class DeepseekV4Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.padding_id = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
         self.first_k_dense_replace = config.first_k_dense_replace
