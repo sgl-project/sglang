@@ -78,8 +78,16 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.page_size = page_size
     manager.tree_cache = tree_cache
     manager.offloaded_state = {}
+    manager.ongoing_offload = {}
+    manager.ongoing_backup = {}
+    manager.offload_inflight = {}
 
     return manager, freed_indices
+
+
+class _FinishedEvent:
+    def synchronize(self):
+        pass
 
 
 class TestReleaseFinishedReq(unittest.TestCase):
@@ -264,6 +272,144 @@ class TestReleaseFinishedReq(unittest.TestCase):
         self.assertTrue(torch.equal(freed[1], expected_committed))
         # State is deleted by _release_finished_req on the way out.
         self.assertNotIn(rid, manager.offloaded_state)
+
+    def test_unfinished_offload_ack_does_not_free_incremental_slots(self):
+        manager, freed = _make_manager(pool_size=32)
+        req = _make_mock_req(
+            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=1
+        )
+        req.finished.return_value = False
+        manager.offloaded_state[req.rid] = OffloadedState(
+            prefill_len=4, inc_len=4, last_hash=None
+        )
+        manager.offload_inflight[req.rid] = 1
+        manager.ongoing_offload[7] = (
+            req,
+            torch.arange(4, 8, dtype=torch.int64),
+            [10, 11, 12, 13],
+            0.0,
+            4,
+            8,
+        )
+        manager.cache_controller = MagicMock()
+        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [7])]
+        manager._trigger_backup = MagicMock(return_value="last_hash")
+
+        manager._check_offload_progress(1)
+
+        self.assertEqual(freed, [])
+        manager.req_to_token_pool.free.assert_not_called()
+        self.assertNotIn(req.rid, manager.offload_inflight)
+
+    def test_offload_kv_cache_tracks_inflight_write_until_ack(self):
+        manager, freed = _make_manager(pool_size=32, page_size=4)
+        manager.cache_controller = MagicMock()
+        manager.cache_controller.get_hash_str = MagicMock(return_value="prefill_hash")
+        manager.cache_controller.write = MagicMock(
+            return_value=torch.arange(4, 8, dtype=torch.int64)
+        )
+        manager.decode_host_mem_pool = MagicMock()
+        manager.request_counter = 0
+        manager.offload_stride = 4
+
+        req = _make_mock_req(
+            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=5
+        )
+        req.origin_input_ids = [0, 1, 2, 3]
+        req.output_ids = [4, 5, 6, 7, 8]
+        req.finished.return_value = False
+
+        did_offload = manager.offload_kv_cache(req)
+
+        self.assertTrue(did_offload)
+        self.assertEqual(manager.offload_inflight[req.rid], 1)
+        self.assertEqual(manager.offloaded_state[req.rid].inc_len, 4)
+        manager.cache_controller.write.assert_called_once()
+
+        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [1])]
+        manager._trigger_backup = MagicMock(return_value="last_hash")
+
+        manager._check_offload_progress(1)
+
+        self.assertEqual(freed, [])
+        self.assertNotIn(req.rid, manager.offload_inflight)
+
+    def test_finalize_release_defers_while_offload_is_in_flight(self):
+        manager, freed = _make_manager(pool_size=32)
+        req = _make_mock_req(
+            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=2
+        )
+        manager.offloaded_state[req.rid] = OffloadedState(
+            prefill_len=4, inc_len=8, last_hash=None
+        )
+        manager.offload_inflight[req.rid] = 1
+
+        manager.finalize_release_on_finish(req)
+
+        self.assertEqual(freed, [])
+        manager.req_to_token_pool.free.assert_not_called()
+        self.assertIn(req.rid, manager.offloaded_state)
+
+    def test_finished_offload_ack_waits_for_other_inflight_writes(self):
+        manager, freed = _make_manager(pool_size=32)
+        req = _make_mock_req(
+            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=3
+        )
+        req.finished.return_value = True
+        manager.offloaded_state[req.rid] = OffloadedState(
+            prefill_len=4, inc_len=8, last_hash=None
+        )
+        manager.offload_inflight[req.rid] = 2
+        manager.ongoing_offload[8] = (
+            req,
+            torch.arange(4, 8, dtype=torch.int64),
+            [10, 11, 12, 13],
+            0.0,
+            4,
+            8,
+        )
+        manager.cache_controller = MagicMock()
+        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [8])]
+        manager._trigger_backup = MagicMock(return_value="last_hash")
+
+        manager._check_offload_progress(1)
+
+        self.assertEqual(freed, [])
+        manager.req_to_token_pool.free.assert_not_called()
+        self.assertEqual(manager.offload_inflight[req.rid], 1)
+
+    def test_finished_request_releases_all_committed_slots_after_last_offload_ack(
+        self,
+    ):
+        manager, freed = _make_manager(pool_size=32)
+        req = _make_mock_req(
+            req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20, rid=4
+        )
+        req.finished.return_value = True
+        manager.offloaded_state[req.rid] = OffloadedState(
+            prefill_len=4, inc_len=8, last_hash=None
+        )
+        manager.offload_inflight[req.rid] = 1
+        manager.ongoing_offload[9] = (
+            req,
+            torch.arange(8, 12, dtype=torch.int64),
+            [14, 15, 16, 17],
+            0.0,
+            8,
+            12,
+        )
+        manager.cache_controller = MagicMock()
+        manager.cache_controller.ack_write_queue = [(None, _FinishedEvent(), [9])]
+        manager._trigger_backup = MagicMock(return_value="last_hash")
+
+        manager._check_offload_progress(1)
+
+        self.assertEqual(len(freed), 2)
+        self.assertTrue(torch.equal(freed[0], torch.arange(0, 4, dtype=torch.int64)))
+        self.assertTrue(torch.equal(freed[1], torch.arange(4, 20, dtype=torch.int64)))
+        manager.req_to_token_pool.free.assert_called_once_with(req)
+        self.assertNotIn(req.rid, manager.offloaded_state)
+        self.assertNotIn(req.rid, manager.offload_inflight)
 
 
 if __name__ == "__main__":
