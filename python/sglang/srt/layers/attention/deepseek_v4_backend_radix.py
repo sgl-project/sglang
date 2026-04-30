@@ -7,7 +7,6 @@ import warnings
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
-    Callable,
     Dict,
     List,
     Literal,

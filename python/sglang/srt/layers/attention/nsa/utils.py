@@ -4,10 +4,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
-    attn_cp_all_gather_into_tensor,
     get_attention_cp_rank,
     get_attention_cp_size,
     get_attention_dp_rank,
@@ -228,5 +226,3 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
         return True
     else:
         return False
-
-

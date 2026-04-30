@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import os
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Set, Tuple
 
 import torch
@@ -1271,9 +1269,7 @@ class DeepseekV4Model(nn.Module):
             )
 
         pre_hc_head = (
-            hidden_states.flatten(1)
-            if envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            else None
+            hidden_states.flatten(1) if envs.SGLANG_FIX_MTP_HC_HIDDEN.get() else None
         )
 
         hidden_states = self.hc_head(
@@ -1359,7 +1355,9 @@ class DeepseekV4ForCausalLM(nn.Module):
         elif envs.SGLANG_DSV4_FP4_EXPERTS.get():
             disable_reason = "2604 routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
 
-        disable_reason = "2604B checkpoint requires different clamping for shared and routed experts"
+        disable_reason = (
+            "2604B checkpoint requires different clamping for shared and routed experts"
+        )
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
@@ -1961,5 +1959,3 @@ def _dequant_fp8_wo_a(
         yield name, _dequant_fp8(weight, scale)
 
     yield from weights_dict.items()
-
-

@@ -170,9 +170,7 @@ class DeepseekV4ModelNextN(nn.Module):
         )
 
         pre_hc_head = (
-            hidden_states.flatten(1)
-            if envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            else None
+            hidden_states.flatten(1) if envs.SGLANG_FIX_MTP_HC_HIDDEN.get() else None
         )
 
         hidden_states = self.hc_head(
