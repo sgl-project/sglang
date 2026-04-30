@@ -11,7 +11,6 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.environ import envs
 
 from .utils import make_name
 
@@ -64,35 +63,6 @@ def _jit_compress_plan_module() -> Module:
             ("plan_prefill_legacy", "plan_compress_prefill_legacy"),
             ("plan_decode_legacy", "plan_compress_decode_legacy"),
         ],
-    )
-
-
-@cache_once
-def _jit_compress_128_online_plan_module() -> Module:
-    """Host-side plan generator for online compress 128 (no template args)."""
-    return load_jit(
-        make_name("compress_128_online_plan"),
-        cuda_files=["deepseek_v4/c128_online.cuh"],
-        cuda_wrappers=[
-            ("plan_compress_online_prefill", "plan_compress_online_prefill"),
-        ],
-    )
-
-
-@cache_once
-def _jit_compress_128_online_module(head_dim: int) -> Module:
-    """Online compress 128 kernel: ring_size=1, per-index (max, sum, kv) state."""
-    args = make_cpp_args(head_dim, is_arch_support_pdl())
-    kernel_class = f"FlashCompress128OnlineKernel<{args}>"
-    return load_jit(
-        make_name("compress_128_online"),
-        *args,
-        cuda_files=["deepseek_v4/c128_online.cuh"],
-        cuda_wrappers=[
-            ("decode", f"{kernel_class}::run_decode"),
-            ("prefill", f"{kernel_class}::run_prefill"),
-        ],
-        extra_cuda_cflags=["-use_fast_math"],
     )
 
 
@@ -181,17 +151,8 @@ class CompressorPrefillPlan(NamedTuple):
         swa_page_size: int,
         ring_size: int,
         num_q_tokens: int,
-        device: torch.device,
         use_cuda_graph: bool = False,
     ) -> CompressorPrefillPlan:
-        if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            return CompressorPrefillPlan._generate_online(
-                num_q_tokens=num_q_tokens,
-                seq_lens=seq_lens,
-                extend_lens=extend_lens,
-                device=device,
-                use_cuda_graph=use_cuda_graph,
-            )
         is_gpu_input = seq_lens.device.type == "cuda"
         pin_buffer = torch.empty(
             0 if is_gpu_input else num_q_tokens * _PREFILL_PLAN_BYTES,
@@ -216,35 +177,6 @@ class CompressorPrefillPlan(NamedTuple):
             compress_ratio,
             torch.from_dlpack(plan_c),
             torch.from_dlpack(plan_w),
-        )
-
-    @staticmethod
-    def _generate_online(
-        num_q_tokens: int,
-        seq_lens: torch.Tensor,
-        extend_lens: torch.Tensor,
-        device: torch.device,
-        use_cuda_graph: bool,
-    ) -> CompressorPrefillPlan:
-        # Online plan host-side path: only CPU/cuda-host implemented today
-        plan_tensor = torch.empty(
-            (2, num_q_tokens, 16),
-            dtype=torch.uint8,
-            device="cpu",
-            pin_memory=True,
-        )
-        module = _jit_compress_128_online_plan_module()
-        plan_lens = module.plan_compress_online_prefill(
-            extend_lens,
-            seq_lens,
-            plan_tensor[0],
-            plan_tensor[1],
-            use_cuda_graph,
-        )
-        return CompressorPrefillPlan(
-            128,
-            plan_tensor[0, : plan_lens[0]].to(device, non_blocking=True),
-            plan_tensor[1, : plan_lens[1]].to(device, non_blocking=True),
         )
 
     @staticmethod
@@ -298,12 +230,6 @@ def compress_forward(
         num_q_tokens = plan[1].shape[0]  # NOTE: decode = bs, prefill = dynamic
         out = kv_score_input.new_empty((num_q_tokens, head_dim))
     assert plan.compress_ratio == compress_ratio, "Mismatched compress ratio in plan!"
-    # Online c128: separate JIT module, fp32 state, no compile-time dtypes.
-    if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-        online_module = _jit_compress_128_online_module(head_dim=head_dim)
-        fn = online_module.decode if plan.is_decode else online_module.prefill
-        fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:])
-        return out
     module = _jit_compress_module(
         head_dim, kv_score_input.dtype, out.dtype, compress_ratio
     )

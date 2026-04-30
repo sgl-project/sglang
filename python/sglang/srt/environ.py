@@ -493,7 +493,6 @@ class Envs:
     SGLANG_FIX_SWA_CHUNKED_REQ_DOUBLE_FREE = EnvBool(True)
     SGLANG_OPT_V4_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)  # usually not useful
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
-    SGLANG_OPT_USE_OVERLAP_STORE_CACHE = EnvBool(True)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
@@ -527,7 +526,7 @@ class Envs:
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
     SGLANG_FIX_DSV4_BASE_MODEL_LOAD = EnvBool(False)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
-    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(False)
+    SGLANG_OPT_USE_COMPRESSOR_V2 = EnvBool(True)
 
     # Dangerous untested flagas
     SGLANG_OPT_USE_FAST_MASK_EP = EnvBool(False)

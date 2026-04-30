@@ -25,8 +25,6 @@ class CompressorBackend:
     def __init__(self):
         super().__init__()
         self.forward_metadata: DeepseekV4Metadata
-        self.forward_indexer_compressor = self.forward_unified
-        self.forward_core_compressor = self.forward_unified
 
     # NOTE: Will be overridden
     def _maybe_upgrade_forward_metadata(self): ...
@@ -123,6 +121,10 @@ class CompressorBackend:
             page_size=page_size,
         )
 
+    # NOTE: alias for backward compatibility
+    forward_indexer_compressor = forward_unified
+    forward_core_compressor = forward_unified
+
 
 def is_overlap_compress(compress_ratio: int) -> bool:
     return compress_ratio == 4
@@ -179,7 +181,6 @@ def create_paged_compressor_data(
             swa_page_size=swa_page_size,
             ring_size=ring_size,
             num_q_tokens=num_q_tokens,
-            device=seq_lens.device,
             use_cuda_graph=use_prefill_cuda_graph,
         )
     else:

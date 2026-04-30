@@ -14,9 +14,10 @@ import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import (
+    fused_norm_rope_inplace,
+    fused_q_norm_rope,
     fused_rope_inplace,
     linear_bf16_fp32,
-    rmsnorm_self,
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
@@ -622,7 +623,9 @@ class MQALayer(nn.Module):
             prefix=add_prefix("attn_mqa", prefix),
         )
 
-        self.overlap_store_cache = envs.SGLANG_OPT_USE_OVERLAP_STORE_CACHE.get()
+        # KV cache write is always fused into the K kernel
+        # (`_compute_kv_to_cache`), so the legacy "overlap store cache" flag
+        # has no effect here -- the fused path is on by default.
 
     def _compute_q_a(
         self,
@@ -643,31 +646,57 @@ class MQALayer(nn.Module):
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        q = rmsnorm_self(q, self.eps, out=q_out)
-        fused_rope_inplace(
-            q[..., -self.qk_rope_head_dim :],
-            None,
-            self.freqs_cis,
+        if q_out is None:
+            q_out = torch.empty_like(q)
+        # Fused warp-per-(token, head) rmsnorm-self + RoPE + write to q_out.
+        fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
+        return q_out
+
+    def _compute_kv_to_cache(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        qkv_a: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Fused: rmsnorm + RoPE + write directly to FlashMLA paged cache.
+
+        Replaces the bf16-kv-intermediate path. Used everywhere except the NSA
+        prefill-CP case (which needs bf16 kv for the cross-rank all-gather).
+        """
+        if qkv_a is not None:
+            kv = qkv_a[..., self.q_lora_rank :]
+        else:
+            kv, _ = self.wkv(x)
+        token_to_kv_pool = forward_batch.token_to_kv_pool
+        assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        token_to_kv_pool.set_swa_key_buffer_radix_fused_norm_rope(
+            layer_id=self.layer_id,
+            raw_loc=forward_batch.out_cache_loc,
+            kv=kv,
+            kv_weight=self.kv_norm.weight.data,
+            eps=self.eps,
+            freqs_cis=self.freqs_cis,
             positions=positions,
         )
-        return q
 
-    def _compute_kv(
+    def _compute_kv_bf16(
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
         qkv_a: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Bf16-kv path used by the NSA prefill-CP case (needs all-gather)."""
         if qkv_a is not None:
             kv = qkv_a[..., self.q_lora_rank :]
         else:
             kv, _ = self.wkv(x)
-        kv = self.kv_norm(kv)
-        fused_rope_inplace(
-            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-            None,
+        fused_norm_rope_inplace(
+            kv,
+            self.kv_norm.weight.data,
+            self.eps,
             self.freqs_cis,
-            positions=positions,
+            positions,
         )
         return kv
 
@@ -678,7 +707,7 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4BackendRadix,
         q_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         assert self.alt_streams is not None
         assert len(self.alt_streams) >= 3
 
@@ -713,13 +742,8 @@ class MQALayer(nn.Module):
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
-            kv = self._compute_kv(x, positions, qkv_a=qkv_a)
-            if self.overlap_store_cache:
-                attn_backend.store_cache(
-                    layer_id=self.layer_id,
-                    swa_k=kv,
-                    forward_batch=forward_batch,
-                )
+            # Fused norm + rope + cache write -- no bf16 KV intermediate.
+            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
 
         del qkv_a
 
@@ -734,7 +758,7 @@ class MQALayer(nn.Module):
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
 
-        return q, kv
+        return q
 
     def _forward_prepare(
         self,
@@ -743,28 +767,22 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4BackendRadix,
         q_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.fuse_wqa_wkv:
             qkv_a, _ = self.wqkv_a(x)
-            q = qkv_a[..., : self.q_lora_rank]
-            kv = qkv_a[..., self.q_lora_rank :]
-            del qkv_a
+            q_lora = qkv_a[..., : self.q_lora_rank]
         else:
-            kv, _ = self.wkv(x)
-            q, _ = self.wq_a(x)
-        q = self.q_norm(q)
-        q_lora = q
-        q, _ = self.wq_b(q)
-        q = q.view(-1, self.n_local_heads, self.head_dim)
-        q = rmsnorm_self(q, self.eps, out=q_out)
-        kv = self.kv_norm(kv)
-        fused_rope_inplace(
-            q[..., -self.qk_rope_head_dim :],
-            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-            self.freqs_cis,
-            positions=positions,
-        )
-        if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
+            q_lora, _ = self.wq_a(x)
+            qkv_a = None
+        q_lora = self.q_norm(q_lora)
+        q = self._compute_q_b(q_lora, positions, q_out)
+
+        use_cp = self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch)
+        kv: Optional[torch.Tensor]
+        if use_cp:
+            # NSA CP: keep bf16 kv around for the cross-rank all-gather, then
+            # write to the FlashMLA cache after gather.
+            kv = self._compute_kv_bf16(x, positions, qkv_a=qkv_a)
             kv = cp_all_gather_rerange_output(
                 kv.contiguous(),
                 self.cp_size,
@@ -777,13 +795,16 @@ class MQALayer(nn.Module):
                     tag=f"kv_after_allgather layer_id={self.layer_id}",
                     forward_batch=forward_batch,
                 )
-
-        if self.overlap_store_cache:
             attn_backend.store_cache(
                 layer_id=self.layer_id,
                 swa_k=kv,
                 forward_batch=forward_batch,
             )
+        else:
+            self._compute_kv_to_cache(x, positions, forward_batch, qkv_a=qkv_a)
+            kv = None
+
+        del qkv_a
 
         if self.indexer is not None:
             self.indexer(x=x, q_lora=q_lora, forward_batch=forward_batch)
@@ -830,23 +851,31 @@ class MQALayer(nn.Module):
             q_out = q_padded[:, tp_slice, :]
 
         if enable_multi_stream:
-            q, kv = self._forward_prepare_multi_stream(
+            # Multi-stream path always fuses cache write into the K kernel,
+            # so the bf16 KV intermediate is gone.
+            q = self._forward_prepare_multi_stream(
                 x, positions, forward_batch, attn_backend, q_out
             )
+            kv = None
         else:
             q, kv = self._forward_prepare(
                 x, positions, forward_batch, attn_backend, q_out
             )
 
+        # The cache write is always fused / already done by _forward_prepare* --
+        # tell the backend to skip its own store_cache. When `kv is None`
+        # (no NSA-CP), pass `q` as a sentinel for the `k is v` assert; the
+        # attention path doesn't read it once `save_kv_cache=False`.
+        attn_k = kv if kv is not None else q
         o = attn_backend.forward(
             q=q_padded if q_padded is not None else q,
-            k=kv,
-            v=kv,
+            k=attn_k,
+            v=attn_k,
             layer=self.attn_mqa,
             forward_batch=forward_batch,
             compress_ratio=self.compress_ratio,
             attn_sink=self.attn_sink,
-            save_kv_cache=not self.overlap_store_cache,
+            save_kv_cache=False,
         )
         o = o[:, tp_slice, :]
         fused_rope_inplace(
