@@ -182,6 +182,23 @@ setup_pip_toolchain() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
+uninstall_cu12_packages() {
+    # Remove any installed packages whose distribution name ends in `-cu12`
+    # (e.g. nvidia-cuda-nvrtc-cu12). These leak in when switching a runner from
+    # a cu12 toolchain to cu13 and can shadow the matching cu13 libraries.
+    CU12_PKGS=$(pip list --format=freeze 2>/dev/null | awk -F'==' '{print $1}' | grep -i -- '-cu12$' || true)
+    if [ -n "$CU12_PKGS" ]; then
+        echo "Uninstalling cu12-suffixed packages:"
+        echo "$CU12_PKGS"
+        # shellcheck disable=SC2086
+        $PIP_UNINSTALL_CMD $(echo "$CU12_PKGS" | tr '\n' ' ') $PIP_UNINSTALL_SUFFIX || true
+    else
+        echo "No cu12-suffixed packages found"
+    fi
+
+    mark_step_done "${FUNCNAME[0]}"
+}
+
 uninstall_stale_flashinfer() {
     # Keep flashinfer packages if version matches to avoid re-downloading:
     # - flashinfer-cubin: 150+ MB
@@ -468,6 +485,9 @@ main() {
     install_apt_packages
     clean_site_packages
     setup_pip_toolchain
+    if [ "$CU_MAJOR" != "12" ]; then
+        uninstall_cu12_packages
+    fi
     uninstall_stale_flashinfer
     install_sglang
     install_sglang_kernel
