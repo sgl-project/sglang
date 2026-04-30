@@ -13,23 +13,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
-/**
- * Ahead-of-time (AOT) build of the DeepSeek-V4 indexer top-k transform for
- * ROCm/HIP. Mirrors the JIT module
- *   `sglang/jit_kernel/csrc/deepseek_v4/topk.cuh` (TopK512Kernel::transform)
- * so HIP hosts can use the V4 indexer fast path without a runtime CUDA
- * toolchain (which is what the JIT path needs on the NVIDIA side).
- *
- * Algorithm and shared-memory layout follow the v1 `radix_topk` cuh almost
- * verbatim, plus the paged page-table translation
- *   slot = (page_table[raw >> page_bits] << page_bits) | (raw & page_mask)
- * applied at the final scatter. The 8-bit radix top-k logic is the same
- * approach already proven on ROCm by NSA's `fast_topk` (csrc/elementwise/topk.cu).
- *
- * NOTE: This translation unit is only added to setup_rocm.py. NV continues to
- * use the JIT path (see python/sglang/jit_kernel/deepseek_v4.py).
- */
-
 #include <ATen/core/TensorBase.h>
 #include <ATen/core/TensorBody.h>
 #include <c10/cuda/CUDAStream.h>
@@ -48,9 +31,6 @@ constexpr uint32_t kTopK = 512;
 constexpr uint32_t kBlockSize = 512;
 static_assert(kTopK <= kBlockSize, "kTopK must be <= kBlockSize for the final scatter loop.");
 
-// Dynamic LDS budget for the radix top-k. setup_rocm.py injects a per-arch
-// value via -DSGL_TOPK_DYNAMIC_SMEM_BYTES (matching csrc/elementwise/topk.cu).
-// The radix inner loop allocates exactly kSMEM bytes of dynamic shared memory.
 #ifdef SGL_TOPK_DYNAMIC_SMEM_BYTES
 constexpr size_t kSMEM = static_cast<size_t>(SGL_TOPK_DYNAMIC_SMEM_BYTES);
 #else
@@ -63,7 +43,7 @@ struct TopK512Params {
   const int32_t* __restrict__ seq_lens;
   const int32_t* __restrict__ page_table;
   int32_t* __restrict__ page_indices;
-  int32_t* __restrict__ raw_indices;  // optional (nullptr to skip)
+  int32_t* __restrict__ raw_indices;  // optional: output raw abs position indices before page transform
   int64_t score_stride;
   int64_t page_table_stride;
   uint32_t page_bits;
@@ -87,9 +67,6 @@ page_to_slot(const int32_t* __restrict__ page_table, uint32_t i, uint32_t page_b
   return (page_table[i >> page_bits] << page_bits) | static_cast<int32_t>(i & mask);
 }
 
-// length <= TopK fast path: write 0..length-1 with paged translation, fill
-// the rest with -1. Both `page_indices` and `raw_indices` (if non-null) are
-// written.
 __device__ void naive_paged_transform(
     int32_t length,
     uint32_t page_bits,
@@ -110,8 +87,6 @@ __device__ void naive_paged_transform(
   }
 }
 
-// Top-K (assuming length > kTopK). Writes the kTopK winning row-relative
-// positions into `output[0..kTopK)`. Mirrors the v1 cuh `radix_topk`.
 __device__ void radix_topk(const float* __restrict__ input, int32_t* __restrict__ output, const uint32_t length) {
   constexpr uint32_t RADIX = 256;
   constexpr uint32_t BLOCK_SIZE = kBlockSize;
@@ -123,7 +98,6 @@ __device__ void radix_topk(const float* __restrict__ input, int32_t* __restrict_
   alignas(128) __shared__ uint32_t s_num_input[2];
   alignas(128) __shared__ int32_t s_last_remain;
 
-  // Two ping-pong tie buffers; total dynamic smem = kSMEM bytes.
   extern __shared__ uint32_t s_input_idx[][SMEM_INPUT_SIZE];
 
   const uint32_t tx = threadIdx.x;
@@ -147,7 +121,7 @@ __device__ void radix_topk(const float* __restrict__ input, int32_t* __restrict_
     }
   };
 
-  // Stage 1: 8-bit coarse histogram.
+  // stage 1: 8bit coarse histogram
   if (tx < RADIX + 1) s_histogram[tx] = 0;
   __syncthreads();
   for (uint32_t idx = tx; idx < length; idx += BLOCK_SIZE) {
@@ -200,7 +174,7 @@ __device__ void radix_topk(const float* __restrict__ input, int32_t* __restrict_
     __syncthreads();
   }
 
-  // Stage 2: refine with up to 4 8-bit radix passes.
+  // stage 2: refine with 8bit radix passes
 #pragma unroll 4
   for (int round = 0; round < 4; ++round) {
     const auto r_idx = round % 2;
@@ -280,7 +254,6 @@ __global__ __launch_bounds__(kBlockSize) void deepseek_v4_topk_transform_512_ker
   __shared__ int32_t s_topk_indices[kTopK];
   radix_topk(score_ptr, s_topk_indices, static_cast<uint32_t>(seq_len));
 
-  // Final scatter: row-relative position -> paged physical slot.
   __syncthreads();
   const auto tx = threadIdx.x;
   if (tx < kTopK) {
@@ -297,9 +270,6 @@ void setup_kernel_smem_once() {
   [[maybe_unused]]
   static const auto result = [] {
 #ifdef USE_ROCM
-    // hipify: cudaFuncSetAttribute -> hipFuncSetAttribute. The HIP overload
-    // expects `const void*` and hipcc does not implicitly accept a function
-    // pointer, so cast explicitly (same workaround as csrc/elementwise/topk.cu).
     return ::cudaFuncSetAttribute(
         reinterpret_cast<const void*>(f), ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
 #else
@@ -363,7 +333,6 @@ void deepseek_v4_topk_transform_512(
 
   TORCH_CHECK(
       page_size > 0 && (page_size & (page_size - 1)) == 0, "page_size must be a positive power of 2, got ", page_size);
-  // C++17 portable replacement for std::countr_zero (C++20).
   const auto page_bits = static_cast<uint32_t>(__builtin_ctzll(static_cast<unsigned long long>(page_size)));
 
   int32_t* raw_ptr = nullptr;
