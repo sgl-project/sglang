@@ -77,6 +77,17 @@ is_rdna3 = amdgpu_target in RDNA3_TARGETS
 is_rdna4 = amdgpu_target in RDNA4_TARGETS
 is_rdna = is_rdna3 or is_rdna4
 
+# common_extension_rocm.cc is built with cxx-only flags; HIP sources get hipcc_flags.
+# Mirror RDNA macros on cxx so #ifndef SGL_IS_RDNA matches the linked objects (CDNA-only
+# quick_all_reduce / qr_* are omitted on RDNA — otherwise we link references to qr_destroy
+# without defining it).
+if is_rdna:
+    cxx_flags.append("-DSGL_IS_RDNA")
+if is_rdna3:
+    cxx_flags.append("-DSGL_IS_RDNA3")
+if is_rdna4:
+    cxx_flags.append("-DSGL_IS_RDNA4")
+
 # FP8 format selection:
 #   gfx942 (CDNA3):  FNUZ (non-IEEE, max=224)
 #   gfx950 (CDNA3+): standard E4M3 (IEEE, same as NVIDIA)
@@ -139,6 +150,11 @@ if is_rdna4:
 
 if fp8_macro is not None:
     hipcc_flags.extend(["-DENABLE_FP8", fp8_macro])
+
+# MoE topk: host and device must agree on logical warp width (64 CDNA, 32 RDNA).
+_rocm_warp = 64 if is_cdna else 32
+hipcc_flags.append(f"-DSGL_ROCM_WARP_SIZE={_rocm_warp}")
+cxx_flags.append(f"-DSGL_ROCM_WARP_SIZE={_rocm_warp}")
 
 ext_modules = [
     CUDAExtension(

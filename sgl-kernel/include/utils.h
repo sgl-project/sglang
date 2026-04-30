@@ -342,7 +342,14 @@ inline bool getEnvEnablePDL() {
 #ifndef USE_ROCM
 #define WARP_SIZE 32
 #else
-#if defined(__GFX9__) || !defined(__HIP_DEVICE_COMPILE__)
+// ROCm: host code used to always see WARP_SIZE 64 via !__HIP_DEVICE_COMPILE__, while RDNA
+// device code used 32 — breaking host-side grid/block math in MoE topk launchers.
+#ifdef SGL_ROCM_WARP_SIZE
+#define WARP_SIZE SGL_ROCM_WARP_SIZE
+#elif defined(__gfx942__) || defined(__gfx941__) || defined(__gfx940__) || defined(__gfx950__) || \
+    defined(__gfx90a__) || defined(__gfx908__) || defined(__gfx906__)
+#define WARP_SIZE 64
+#elif defined(__HIP_DEVICE_COMPILE__) && defined(__GFX9__)
 #define WARP_SIZE 64
 #else
 #define WARP_SIZE 32
