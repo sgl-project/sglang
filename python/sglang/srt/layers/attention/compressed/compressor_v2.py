@@ -10,6 +10,7 @@ from sglang.jit_kernel.dsv4 import (
     compress_forward,
     compress_norm_rope_store,
 )
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.metadata import DeepseekV4Metadata
@@ -25,6 +26,9 @@ class CompressorBackend:
     def __init__(self):
         super().__init__()
         self.forward_metadata: DeepseekV4Metadata
+        assert (
+            not envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
+        ), "online compress 128 not supported yet"
 
     # NOTE: Will be overridden
     def _maybe_upgrade_forward_metadata(self): ...

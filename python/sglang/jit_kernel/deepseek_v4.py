@@ -231,6 +231,20 @@ def _jit_main_k_norm_rope_flashmla_module(
 
 
 @cache_once
+def _jit_main_q_indexer_rope_hadamard_quant_module(dtype: torch.dtype) -> Module:
+    """C4 indexer Q kernel: RoPE + 128-pt Hadamard + fp8 act-quant (no norm)."""
+    args = make_cpp_args(dtype, is_arch_support_pdl())
+    return load_jit(
+        make_name("main_q_indexer_rope_hadamard_quant"),
+        *args,
+        cuda_files=["deepseek_v4/main_norm_rope.cuh"],
+        cuda_wrappers=[
+            ("forward", f"FusedQIndexerRopeHadamardQuantKernel<{args}>::forward"),
+        ],
+    )
+
+
+@cache_once
 def _jit_metadata_module():
     return load_jit(
         make_name("metadata"),
@@ -679,21 +693,30 @@ def fused_q_norm_rope(
     freqs_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> None:
-    """Q-side main MLA prep: rmsnorm-self + RoPE + write to ``q_output``.
-
-    One warp per (token, head). Used at both prefill and decode -- Q always
-    has many heads, so warp-per-item keeps occupancy high.
-
-    Shapes:
-      q_input, q_output: (B, num_q_heads, head_dim) bf16
-      freqs_cis:         (max_pos, rope_dim/2) complex
-      positions:         (B,) int32 or int64
-    """
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = q_input.shape[-1]
     rope_dim = freqs_real.shape[-1]
     module = _jit_main_q_norm_rope_module(q_input.dtype, head_dim, rope_dim)
     module.forward(q_input, q_output, freqs_real, positions, eps)
+
+
+def fused_q_indexer_rope_hadamard_quant(
+    q_input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: float,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    q_fp8 = torch.empty(q_input.shape, dtype=torch.float8_e4m3fn, device=q_input.device)
+    weights_out = torch.empty(
+        (*q_input.shape[:-1], 1), dtype=torch.float32, device=q_input.device
+    )
+    module = _jit_main_q_indexer_rope_hadamard_quant_module(q_input.dtype)
+    module.forward(
+        q_input, q_fp8, weight, weights_out, float(weight_scale), freqs_real, positions
+    )
+    return q_fp8, weights_out
 
 
 def fused_k_norm_rope_flashmla(
@@ -706,25 +729,6 @@ def fused_k_norm_rope_flashmla(
     kvcache: torch.Tensor,
     page_size: int,
 ) -> None:
-    """K-side main MLA prep + FlashMLA paged-cache write.
-
-    Fuses k rmsnorm (with ``kv_weight``) + RoPE + UE8M0 fp8 nope / bf16 rope
-    store into the FlashMLA cache. One block per token; warps 0..6 emit one
-    fp8 group each (64 elems / scale byte), warp 7 handles the bf16 rope tail.
-
-    Used at both prefill and decode: K is fused all the way to the cache, so
-    no bf16 KV intermediate is kept and no separate ``fused_store_cache`` call
-    is needed. The cache layout matches ``fused_store_flashmla_cache``.
-
-    Shapes:
-      kv:        (B, head_dim) bf16 -- consumed (not modified in-place)
-      kv_weight: (head_dim,) bf16
-      freqs_cis: (max_pos, rope_dim/2) complex
-      positions: (B,) int32 or int64
-      out_loc:   (B,) int32 -- cache slot id per token
-      kvcache:   (npages, page_bytes) uint8
-      page_size: pow-of-two page size
-    """
     freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
     head_dim = kv.shape[-1]
     rope_dim = freqs_real.shape[-1]

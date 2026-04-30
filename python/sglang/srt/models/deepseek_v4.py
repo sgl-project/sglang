@@ -15,6 +15,7 @@ import triton.language as tl
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import (
     fused_norm_rope_inplace,
+    fused_q_indexer_rope_hadamard_quant,
     fused_q_norm_rope,
     fused_rope_inplace,
     linear_bf16_fp32,
@@ -27,7 +28,6 @@ from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.environ import envs, is_large_dummy_model
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.utils import (
     assert_tensor_identical_across_cp_ranks,
     can_cp_split,
@@ -361,17 +361,17 @@ class C4Indexer(nn.Module):
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
         self.alt_streams = alt_streams
 
-    def compute_q(self, q_lora: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def compute_q(
+        self,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        fused_rope_inplace(
-            q[..., -self.rope_head_dim :],
-            None,
-            self.freqs_cis,
-            positions=positions,
+        return fused_q_indexer_rope_hadamard_quant(
+            q, weight, self.weight_scale, self.freqs_cis, positions
         )
-        q = rotate_activation(q)
-        return q
 
     def compute_weights(self, x: torch.Tensor, skip_scale=False) -> torch.Tensor:
         out, _ = self.weights_proj(x)

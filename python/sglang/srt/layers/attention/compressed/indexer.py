@@ -16,7 +16,6 @@ from sglang.srt.layers.attention.compressed.metadata import (
 from sglang.srt.layers.attention.indexer_topk_capturer import (
     get_global_indexer_capturer,
 )
-from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
@@ -262,21 +261,21 @@ class C4IndexerBackend:
             layer_id=c4_indexer.layer_id,
         )
 
+        # The weight projection is small and fast; compute it on its own
+        # stream, then have the Q stream wait on it before launching the big
+        # fused Q kernel (which folds rope + hadamard + fp8 quant + the
+        # weight*weight_scale*q_scale step into one pass).
+        with torch.cuda.stream(stream_weights):
+            weights = c4_indexer.compute_weights(x, skip_scale=True)
+            weights_ready = stream_weights.record_event()
+
         with torch.cuda.stream(stream_q):
             if q_lora_ready is not None:
                 stream_q.wait_event(q_lora_ready)
-            q = c4_indexer.compute_q(q_lora, positions=positions)
-            q_fp8, q_scale = act_quant(q)
-            q_scale_ready = stream_q.record_event()
-
-        with torch.cuda.stream(stream_weights):
-            weights = c4_indexer.compute_weights(x, skip_scale=True)
-            stream_weights.wait_event(q_scale_ready)
-            weights = fused_scale(weights, c4_indexer.weight_scale, q_scale)
+            stream_q.wait_event(weights_ready)
+            q_fp8, weights = c4_indexer.compute_q(q_lora, positions, weights)
 
         current_stream.wait_stream(stream_q)
-        current_stream.wait_stream(stream_weights)
-
         return q_fp8, weights, c4_indexer_kv_cache
 
     def _forward_prepare_normal(
@@ -291,10 +290,8 @@ class C4IndexerBackend:
         if TYPE_CHECKING:
             assert isinstance(self, CompressorBackend)
 
-        q = c4_indexer.compute_q(q_lora, positions=positions)
-        q_fp8, q_scale = act_quant(q)
         weights = c4_indexer.compute_weights(x, skip_scale=True)
-        weights = fused_scale(weights, c4_indexer.weight_scale, q_scale)
+        q_fp8, weights = c4_indexer.compute_q(q_lora, positions, weights)
         self.forward_indexer_compressor(
             x=x,
             forward_batch=forward_batch,
