@@ -20,6 +20,10 @@ class RelayKVConfig:
     resident_budget_tokens: int = 0
     recent_window: int = 0
     anchor_pages: int = 0
+    available_kv_budget_mib: float = 0.0
+    kv_working_budget_tokens: int = 0
+    anchor_blocks: int = 0
+    retrieval_top_k: int = 0
     log_interval: int = 1
     host_backup_shadow: bool = False
     host_backup_max_mib: float = 0.0
@@ -41,6 +45,14 @@ class RelayKVConfig:
             ),
             recent_window=int(getattr(server_args, "relaykv_recent_window", 0) or 0),
             anchor_pages=int(getattr(server_args, "relaykv_anchor_pages", 0) or 0),
+            available_kv_budget_mib=float(
+                getattr(server_args, "relaykv_available_kv_budget_mib", 0.0) or 0.0
+            ),
+            kv_working_budget_tokens=int(
+                getattr(server_args, "relaykv_working_budget_tokens", 0) or 0
+            ),
+            anchor_blocks=int(getattr(server_args, "relaykv_anchor_blocks", 0) or 0),
+            retrieval_top_k=int(getattr(server_args, "relaykv_retrieval_top_k", 0) or 0),
             log_interval=int(getattr(server_args, "relaykv_log_interval", 1) or 1),
             host_backup_shadow=bool(
                 getattr(server_args, "relaykv_host_backup_shadow", False)
@@ -58,12 +70,30 @@ class RelayKVConfig:
             return
         if self.mode != "shadow":
             raise ValueError("MVP-0 supports only --relaykv-mode shadow")
-        if self.resident_budget_tokens <= 0:
-            raise ValueError("--relaykv-resident-budget-tokens must be > 0")
+        if (
+            self.resident_budget_tokens <= 0
+            and self.kv_working_budget_tokens <= 0
+            and self.available_kv_budget_mib <= 0
+        ):
+            raise ValueError(
+                "one of --relaykv-resident-budget-tokens, "
+                "--relaykv-working-budget-tokens, or "
+                "--relaykv-available-kv-budget-mib must be > 0"
+            )
+        if self.resident_budget_tokens < 0:
+            raise ValueError("--relaykv-resident-budget-tokens must be >= 0")
+        if self.kv_working_budget_tokens < 0:
+            raise ValueError("--relaykv-working-budget-tokens must be >= 0")
+        if self.available_kv_budget_mib < 0:
+            raise ValueError("--relaykv-available-kv-budget-mib must be >= 0")
         if self.recent_window < 0:
             raise ValueError("--relaykv-recent-window must be >= 0")
         if self.anchor_pages < 0:
             raise ValueError("--relaykv-anchor-pages must be >= 0")
+        if self.anchor_blocks < 0:
+            raise ValueError("--relaykv-anchor-blocks must be >= 0")
+        if self.retrieval_top_k < 0:
+            raise ValueError("--relaykv-retrieval-top-k must be >= 0")
         if self.log_interval <= 0:
             raise ValueError("--relaykv-log-interval must be > 0")
         if self.host_backup_max_mib < 0:

@@ -50,6 +50,18 @@ RELAYKV_SHADOW_LOG_MEMORY_KEYS = {
     "logical_kv_mib",
 }
 
+RELAYKV_SHADOW_LOG_BUDGET_KEYS = {
+    "available_kv_budget_mib",
+    "kv_working_budget_tokens",
+    "recent_window_tokens",
+    "anchor_budget_tokens",
+    "retrieval_budget_tokens",
+    "retrieval_top_k_requested",
+    "retrieval_top_k_effective",
+    "budget_overflow",
+    "budget_policy_reason",
+}
+
 RELAYKV_SHADOW_LOG_HOST_BACKUP_KEYS = {
     "host_backup_shadow",
     "host_backup_candidate_tokens",
@@ -288,6 +300,30 @@ def estimate_kv_memory_from_metadata(
         logical_kv_mib=_to_mib(logical_kv_bytes),
         kv_memory_estimate_reason="ok",
     )
+
+
+def estimate_kv_bytes_per_token_for_model(
+    *,
+    model_config: Any,
+    kv_dtype: Any,
+) -> Optional[int]:
+    num_layers = getattr(model_config, "num_hidden_layers", None)
+    num_kv_heads = getattr(model_config, "num_key_value_heads", None)
+    head_dim = getattr(model_config, "head_dim", None)
+    if head_dim is None:
+        hidden_size = getattr(model_config, "hidden_size", None)
+        num_attention_heads = getattr(model_config, "num_attention_heads", None)
+        if hidden_size is not None and num_attention_heads:
+            head_dim = hidden_size // num_attention_heads
+    kv_dtype_bytes = _dtype_bytes(kv_dtype)
+    if (
+        num_layers is None
+        or num_kv_heads is None
+        or head_dim is None
+        or kv_dtype_bytes is None
+    ):
+        return None
+    return int(2 * num_kv_heads * head_dim * kv_dtype_bytes * num_layers)
 
 
 def estimate_kv_memory_for_plan(
@@ -784,6 +820,11 @@ def observe_request_kv_pool_mapping(
 
 
 def validate_shadow_log_schema(payload: dict[str, Any]) -> None:
+    missing_budget = RELAYKV_SHADOW_LOG_BUDGET_KEYS - payload.keys()
+    if missing_budget:
+        raise AssertionError(
+            f"Missing RelayKV budget planner log keys: {sorted(missing_budget)}"
+        )
     missing = RELAYKV_SHADOW_LOG_MEMORY_KEYS - payload.keys()
     if missing:
         raise AssertionError(f"Missing RelayKV shadow log keys: {sorted(missing)}")

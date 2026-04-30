@@ -158,6 +158,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.platforms import current_platform
 from sglang.srt.relaykv.memory import (
     estimate_host_backup_shadow_for_plan,
+    estimate_kv_bytes_per_token_for_model,
     estimate_kv_memory_for_plan,
 )
 from sglang.srt.relaykv import RelayKVConfig, make_shadow_plan
@@ -798,6 +799,10 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "resident_budget_tokens": config.resident_budget_tokens,
                 "recent_window": config.recent_window,
                 "anchor_pages": config.anchor_pages,
+                "available_kv_budget_mib": config.available_kv_budget_mib,
+                "kv_working_budget_tokens": config.kv_working_budget_tokens,
+                "anchor_blocks": config.anchor_blocks,
+                "retrieval_top_k": config.retrieval_top_k,
                 "log_interval": config.log_interval,
                 "page_size": self.page_size,
                 "tp_rank": self.tp_rank,
@@ -821,11 +826,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if seq_len <= 0:
             return
 
+        kv_bytes_per_token = estimate_kv_bytes_per_token_for_model(
+            model_config=self.model_config,
+            kv_dtype=getattr(self, "kv_cache_dtype", None),
+        )
         plan = make_shadow_plan(
             seq_len=seq_len,
             config=config,
             page_size=1,
             request_id=f"startup:tp{self.tp_rank}:pp{self.pp_rank}",
+            kv_bytes_per_token=kv_bytes_per_token,
         )
         memory_estimate = estimate_kv_memory_for_plan(
             plan,

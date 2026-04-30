@@ -50,6 +50,40 @@ def _assert_close(actual: float, expected: float) -> None:
         raise AssertionError(f"expected {expected}, got {actual}")
 
 
+def _assert_budget_plan(
+    *,
+    available_mib: float,
+    expected_working_tokens: int,
+    expected_retrieval_tokens: int,
+) -> None:
+    plan = make_shadow_plan(
+        100000,
+        RelayKVConfig(
+            enabled=True,
+            mode="shadow",
+            available_kv_budget_mib=available_mib,
+            recent_window=8192,
+            anchor_blocks=128,
+            retrieval_top_k=70000,
+        ),
+        kv_bytes_per_token=28672,
+    )
+    if plan.kv_working_budget_tokens != expected_working_tokens:
+        raise AssertionError(plan)
+    if plan.recent_window_tokens != 8192:
+        raise AssertionError(plan)
+    if plan.anchor_budget_tokens != 128:
+        raise AssertionError(plan)
+    if plan.retrieval_budget_tokens != expected_retrieval_tokens:
+        raise AssertionError(plan)
+    if plan.retrieval_top_k_effective != expected_retrieval_tokens:
+        raise AssertionError(plan)
+    if plan.budget_overflow is not True:
+        raise AssertionError(plan)
+    if plan.budget_policy_reason != "retrieval_top_k_clipped_to_remaining_budget":
+        raise AssertionError(plan)
+
+
 def main() -> None:
     plan = make_shadow_plan(
         2535,
@@ -180,6 +214,40 @@ def main() -> None:
     payload.update(layout_observation.to_log_dict())
     payload.update(mapping_observation.to_log_dict())
     validate_shadow_log_schema(payload)
+
+    _assert_budget_plan(
+        available_mib=512.0,
+        expected_working_tokens=18724,
+        expected_retrieval_tokens=10404,
+    )
+    _assert_budget_plan(
+        available_mib=1024.0,
+        expected_working_tokens=37449,
+        expected_retrieval_tokens=29129,
+    )
+    _assert_budget_plan(
+        available_mib=2048.0,
+        expected_working_tokens=74898,
+        expected_retrieval_tokens=66578,
+    )
+
+    explicit_plan = make_shadow_plan(
+        4096,
+        RelayKVConfig(
+            enabled=True,
+            mode="shadow",
+            available_kv_budget_mib=512.0,
+            kv_working_budget_tokens=2048,
+            recent_window=1024,
+            anchor_blocks=64,
+            retrieval_top_k=2048,
+        ),
+        kv_bytes_per_token=28672,
+    )
+    if explicit_plan.kv_working_budget_tokens != 2048:
+        raise AssertionError(explicit_plan)
+    if explicit_plan.retrieval_top_k_effective != 960:
+        raise AssertionError(explicit_plan)
 
     print("relaykv_memory_smoke: ok")
     print(payload)

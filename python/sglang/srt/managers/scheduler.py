@@ -170,6 +170,7 @@ from sglang.srt.managers.schedule_policy import (
 )
 from sglang.srt.relaykv.memory import (
     estimate_host_backup_shadow_for_plan,
+    estimate_kv_bytes_per_token_for_model,
     estimate_kv_memory_for_plan,
     observe_kv_layout_for_host_backup,
     observe_request_kv_pool_mapping,
@@ -2723,11 +2724,16 @@ class Scheduler(
                     self._relaykv_logged_prefill_rids.discard(stale_rid)
 
             seq_len = len(req.origin_input_ids) + len(req.output_ids)
+            kv_bytes_per_token = estimate_kv_bytes_per_token_for_model(
+                model_config=self.model_config,
+                kv_dtype=getattr(self.tp_worker.model_runner, "kv_cache_dtype", None),
+            )
             plan = make_shadow_plan(
                 seq_len=seq_len,
                 config=config,
                 page_size=1,
                 request_id=req.rid,
+                kv_bytes_per_token=kv_bytes_per_token,
             )
             memory_estimate = estimate_kv_memory_for_plan(
                 plan,

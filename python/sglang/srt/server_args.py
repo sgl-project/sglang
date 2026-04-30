@@ -597,6 +597,10 @@ class ServerArgs:
     relaykv_resident_budget_tokens: int = 0
     relaykv_recent_window: int = 0
     relaykv_anchor_pages: int = 0
+    relaykv_available_kv_budget_mib: float = 0.0
+    relaykv_working_budget_tokens: int = 0
+    relaykv_anchor_blocks: int = 0
+    relaykv_retrieval_top_k: int = 0
     relaykv_log_interval: int = 1
     relaykv_host_backup_shadow: bool = False
     relaykv_host_backup_max_mib: float = 0.0
@@ -5831,6 +5835,39 @@ class ServerArgs:
             type=int,
             default=ServerArgs.relaykv_anchor_pages,
             help="Number of leading pages to keep as planned RelayKV anchors.",
+        )
+        parser.add_argument(
+            "--relaykv-available-kv-budget-mib",
+            type=float,
+            default=ServerArgs.relaykv_available_kv_budget_mib,
+            help=(
+                "Available GPU KV working-set budget in MiB for RelayKV "
+                "shadow budget planning."
+            ),
+        )
+        parser.add_argument(
+            "--relaykv-working-budget-tokens",
+            type=int,
+            default=ServerArgs.relaykv_working_budget_tokens,
+            help=(
+                "Explicit RelayKV working-set token budget; overrides "
+                "MiB-based estimation."
+            ),
+        )
+        parser.add_argument(
+            "--relaykv-anchor-blocks",
+            type=int,
+            default=ServerArgs.relaykv_anchor_blocks,
+            help=(
+                "Number of leading KV blocks to reserve as RelayKV anchors "
+                "for budget planning."
+            ),
+        )
+        parser.add_argument(
+            "--relaykv-retrieval-top-k",
+            type=int,
+            default=ServerArgs.relaykv_retrieval_top_k,
+            help="Requested number of cold KV blocks to retrieve into the working set.",
         )
         parser.add_argument(
             "--relaykv-log-interval",

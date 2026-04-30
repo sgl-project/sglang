@@ -16,6 +16,15 @@ class RelayKVPlan:
     resident_budget_tokens: int
     planned_resident_tokens: int
     planned_cold_tokens: int
+    available_kv_budget_mib: float
+    kv_working_budget_tokens: int
+    recent_window_tokens: int
+    anchor_budget_tokens: int
+    retrieval_budget_tokens: int
+    retrieval_top_k_requested: int
+    retrieval_top_k_effective: int
+    budget_overflow: bool
+    budget_policy_reason: str
     anchor_pages: List[int]
     recent_page_range: Tuple[int, int]
     resident_anchor_ranges: List[List[int]]
@@ -44,19 +53,110 @@ def _make_range(start: int, end: int) -> List[List[int]]:
     return [[start, end]]
 
 
+def _estimate_working_budget_tokens(
+    config: RelayKVConfig,
+    kv_bytes_per_token: Optional[int],
+) -> tuple[int, str]:
+    if config.kv_working_budget_tokens > 0:
+        return config.kv_working_budget_tokens, "explicit_working_budget_tokens"
+    if config.available_kv_budget_mib > 0:
+        if kv_bytes_per_token and kv_bytes_per_token > 0:
+            budget_bytes = int(config.available_kv_budget_mib * 1024 * 1024)
+            return (
+                budget_bytes // kv_bytes_per_token,
+                "estimated_from_available_kv_budget_mib",
+            )
+        if config.resident_budget_tokens > 0:
+            return (
+                config.resident_budget_tokens,
+                "fallback_resident_budget_tokens_missing_kv_bytes_per_token",
+            )
+        return 0, "missing_kv_bytes_per_token_for_available_kv_budget_mib"
+    return config.resident_budget_tokens, "legacy_resident_budget_tokens"
+
+
+def _budget_metadata(
+    *,
+    config: RelayKVConfig,
+    seq_len: int,
+    page_size: int,
+    kv_bytes_per_token: Optional[int],
+) -> dict[str, Any]:
+    working_budget, reason = _estimate_working_budget_tokens(config, kv_bytes_per_token)
+    working_budget = max(int(working_budget), 0)
+    anchor_block_count = (
+        config.anchor_blocks if config.anchor_blocks > 0 else config.anchor_pages
+    )
+    requested_anchor_tokens = max(anchor_block_count, 0) * page_size
+
+    recent_window_tokens = min(config.recent_window, seq_len, working_budget)
+    remaining_after_recent = max(working_budget - recent_window_tokens, 0)
+    anchor_budget_tokens = min(
+        requested_anchor_tokens,
+        remaining_after_recent,
+        max(seq_len - recent_window_tokens, 0),
+    )
+
+    remaining_after_anchor = max(
+        working_budget - recent_window_tokens - anchor_budget_tokens, 0
+    )
+    cold_tokens_available = max(
+        seq_len - recent_window_tokens - anchor_budget_tokens, 0
+    )
+    retrieval_top_k_requested = config.retrieval_top_k
+    retrieval_top_k_effective = min(
+        retrieval_top_k_requested,
+        remaining_after_anchor // page_size,
+        _ceil_div(cold_tokens_available, page_size) if cold_tokens_available else 0,
+    )
+    retrieval_budget_tokens = min(
+        retrieval_top_k_effective * page_size,
+        remaining_after_anchor,
+        cold_tokens_available,
+    )
+
+    overflow = False
+    policy_reason = reason
+    if working_budget <= 0:
+        overflow = bool(seq_len > 0)
+        policy_reason = reason
+    elif config.recent_window > recent_window_tokens:
+        overflow = True
+        policy_reason = "recent_window_clipped_to_working_budget"
+    elif requested_anchor_tokens > anchor_budget_tokens:
+        overflow = True
+        policy_reason = "anchor_budget_clipped_after_recent_window"
+    elif retrieval_top_k_requested > retrieval_top_k_effective:
+        overflow = True
+        policy_reason = "retrieval_top_k_clipped_to_remaining_budget"
+
+    return {
+        "available_kv_budget_mib": config.available_kv_budget_mib,
+        "kv_working_budget_tokens": working_budget,
+        "recent_window_tokens": recent_window_tokens,
+        "anchor_budget_tokens": anchor_budget_tokens,
+        "retrieval_budget_tokens": retrieval_budget_tokens,
+        "retrieval_top_k_requested": retrieval_top_k_requested,
+        "retrieval_top_k_effective": retrieval_top_k_effective,
+        "budget_overflow": overflow,
+        "budget_policy_reason": policy_reason,
+    }
+
+
 def build_shadow_plan(
     *,
     config: RelayKVConfig,
     seq_len: int,
     page_size: int = 1,
     request_id: Optional[str] = None,
+    kv_bytes_per_token: Optional[int] = None,
 ) -> RelayKVPlan:
     """Build a deterministic shadow resident/cold plan.
 
     This is deliberately simple for MVP-0:
     - reserve the first N pages as anchors
     - reserve a trailing recent window
-    - cap total resident tokens by resident_budget_tokens
+    - cap total resident tokens by the effective working KV budget
     - never mutate or inspect actual KV tensors
     """
 
@@ -75,6 +175,15 @@ def build_shadow_plan(
             resident_budget_tokens=0,
             planned_resident_tokens=seq_len,
             planned_cold_tokens=0,
+            available_kv_budget_mib=config.available_kv_budget_mib,
+            kv_working_budget_tokens=0,
+            recent_window_tokens=0,
+            anchor_budget_tokens=0,
+            retrieval_budget_tokens=0,
+            retrieval_top_k_requested=config.retrieval_top_k,
+            retrieval_top_k_effective=0,
+            budget_overflow=False,
+            budget_policy_reason="relaykv_disabled",
             anchor_pages=[],
             recent_page_range=(0, seq_len),
             resident_anchor_ranges=[],
@@ -85,12 +194,21 @@ def build_shadow_plan(
 
     config.validate()
 
-    resident_budget = min(config.resident_budget_tokens, seq_len)
+    budget_metadata = _budget_metadata(
+        config=config,
+        seq_len=seq_len,
+        page_size=page_size,
+        kv_bytes_per_token=kv_bytes_per_token,
+    )
+    resident_budget = min(budget_metadata["kv_working_budget_tokens"], seq_len)
     planned_resident = resident_budget
     planned_cold = max(seq_len - planned_resident, 0)
 
     total_pages = _ceil_div(seq_len, page_size) if seq_len else 0
-    anchor_page_count = min(config.anchor_pages, total_pages)
+    anchor_block_count = (
+        config.anchor_blocks if config.anchor_blocks > 0 else config.anchor_pages
+    )
+    anchor_page_count = min(anchor_block_count, total_pages)
     anchors = list(range(anchor_page_count))
     anchor_ranges = _make_range(0, anchor_page_count)
 
@@ -113,9 +231,18 @@ def build_shadow_plan(
         request_id=request_id,
         seq_len=seq_len,
         page_size=page_size,
-        resident_budget_tokens=config.resident_budget_tokens,
+        resident_budget_tokens=budget_metadata["kv_working_budget_tokens"],
         planned_resident_tokens=planned_resident,
         planned_cold_tokens=planned_cold,
+        available_kv_budget_mib=budget_metadata["available_kv_budget_mib"],
+        kv_working_budget_tokens=budget_metadata["kv_working_budget_tokens"],
+        recent_window_tokens=budget_metadata["recent_window_tokens"],
+        anchor_budget_tokens=budget_metadata["anchor_budget_tokens"],
+        retrieval_budget_tokens=budget_metadata["retrieval_budget_tokens"],
+        retrieval_top_k_requested=budget_metadata["retrieval_top_k_requested"],
+        retrieval_top_k_effective=budget_metadata["retrieval_top_k_effective"],
+        budget_overflow=budget_metadata["budget_overflow"],
+        budget_policy_reason=budget_metadata["budget_policy_reason"],
         anchor_pages=anchors,
         recent_page_range=(recent_start, recent_end),
         resident_anchor_ranges=anchor_ranges,
@@ -130,10 +257,12 @@ def make_shadow_plan(
     config: RelayKVConfig,
     page_size: int = 1,
     request_id: Optional[str] = None,
+    kv_bytes_per_token: Optional[int] = None,
 ) -> RelayKVPlan:
     return build_shadow_plan(
         config=config,
         seq_len=seq_len,
         page_size=page_size,
         request_id=request_id,
+        kv_bytes_per_token=kv_bytes_per_token,
     )
