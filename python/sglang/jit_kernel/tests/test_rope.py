@@ -107,8 +107,8 @@ def torch_impl_rope(
     # Actual rotation dim: limited by both q's last dim and the cache.
     rope_dim = min(q.shape[-1], cache_dim)
     # cos_sin_cache: [max_pos, cache_dim] — first half cos, second half sin
-    cos = cos_sin_cache[positions, : cache_dim // 2][:, : rope_dim // 2].float()  # [T, rope_dim/2]
-    sin = cos_sin_cache[positions, cache_dim // 2 :][:, : rope_dim // 2].float()  # [T, rope_dim/2]
+    cos = cos_sin_cache[positions, : rope_dim // 2].float()  # [T, rope_dim/2]
+    sin = cos_sin_cache[positions, cache_dim // 2 : cache_dim // 2 + rope_dim // 2].float()  # [T, rope_dim/2]
 
     def _rotate(x: torch.Tensor) -> None:
         # x: [T, H, D] where D >= rope_dim; only the first rope_dim elements rotate.
