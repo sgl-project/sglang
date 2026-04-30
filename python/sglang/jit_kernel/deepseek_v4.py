@@ -12,9 +12,6 @@ from sglang.jit_kernel.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
@@ -905,7 +902,6 @@ def silu_and_mul_clamp(
     # pre-refactor kernel.
     from sglang.srt.environ import envs
 
-    deepseek_v4_moe_code_path_checker.observed += 1
     if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
         module = _jit_silu_and_mul_clamp_module(input.dtype)
     else:
@@ -926,8 +922,6 @@ def silu_and_mul_masked_post_quant(
     swizzle: bool = False,
 ) -> None:
     apply_swiglu_limit = swiglu_limit is not None
-    if apply_swiglu_limit:
-        deepseek_v4_moe_code_path_checker.observed += 1
     if swizzle:
         module = _jit_silu_mul_quant_varlen_module(
             quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
@@ -958,8 +952,6 @@ def silu_and_mul_contig_post_quant(
     swizzle: bool = False,
 ) -> None:
     apply_swiglu_limit = swiglu_limit is not None
-    if apply_swiglu_limit:
-        deepseek_v4_moe_code_path_checker.observed += 1
     module = _jit_silu_mul_quant_contig_module(
         quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
     )

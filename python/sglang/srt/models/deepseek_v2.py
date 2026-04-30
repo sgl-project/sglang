@@ -1190,9 +1190,6 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-            deepseek_v4_moe_code_path_checker,
-        )
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         num_tokens = hidden_states.shape[0]
@@ -1203,7 +1200,6 @@ class DeepseekV2MoE(nn.Module):
             and num_tokens > 0
             and get_is_capture_mode()
         )
-        deepseek_v4_moe_code_path_checker.observed += 1
 
         if sbo_overlap_flag:
             current_stream = torch.cuda.current_stream()

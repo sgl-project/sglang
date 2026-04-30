@@ -9,9 +9,6 @@ import triton
 import triton.language as tl
 
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
 from sglang.srt.layers.moe.utils import get_moe_padding_size
 from sglang.srt.layers.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
@@ -1038,8 +1035,6 @@ def act_and_mul_triton(
     expert_ids_row = topk_ids.view(-1) if not down_moe_use_tma else expert_ids
     expert_step = 1 if not down_moe_use_tma else config["BLOCK_SIZE_M"]
     has_swiglu_limit = swiglu_limit is not None
-    if has_swiglu_limit:
-        deepseek_v4_moe_code_path_checker.observed += 1
     act_and_mul_kernel[grid](
         gateup_output,
         down_input,

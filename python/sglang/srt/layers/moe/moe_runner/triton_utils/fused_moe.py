@@ -11,9 +11,6 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
@@ -571,7 +568,6 @@ def _fused_moe_kernel_sequence(
                 intermediate_cache1[:, half:].clamp_(
                     min=-swiglu_limit, max=swiglu_limit
                 )
-                deepseek_v4_moe_code_path_checker.observed += 1
 
             if _is_cuda or _is_hip or _is_xpu:
                 if not filter_expert:

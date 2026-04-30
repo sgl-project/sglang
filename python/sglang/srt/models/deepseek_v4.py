@@ -13,9 +13,6 @@ import triton.language as tl
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import fused_rope, linear_bf16_fp32, rmsnorm_self
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
 from sglang.srt.environ import envs
@@ -1056,8 +1053,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
-        assert deepseek_v4_moe_code_path_checker.observed == 0
-
         residual = hidden_states
         hidden_states, post, comb = self.hc_pre(
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
@@ -1124,9 +1119,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             hidden_states = torch.cat(gathered)
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
-
-        assert deepseek_v4_moe_code_path_checker.observed == 1
-        deepseek_v4_moe_code_path_checker.observed = 0
 
         return hidden_states
 

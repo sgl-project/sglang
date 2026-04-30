@@ -7,9 +7,6 @@ import einops
 import torch
 
 from sglang.jit_kernel.deepseek_v4 import silu_and_mul_masked_post_quant
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
@@ -236,7 +233,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gateup_output = _apply_swiglu_limit(
                 gateup_output, swiglu_limit=self.swiglu_limit
             )
-            deepseek_v4_moe_code_path_checker.observed += 1
 
             down_input = torch.empty(
                 (all_tokens, N // 2),
@@ -345,7 +341,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gateup_output = einops.rearrange(
                 gateup_output, "(grp tok) hidden -> grp tok hidden", grp=num_groups
             )
-            deepseek_v4_moe_code_path_checker.observed += 1
 
         # Act
         down_input, down_input_scale = _varlen_deep_gemm_silu_mul_quant(

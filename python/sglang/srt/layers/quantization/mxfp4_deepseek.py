@@ -37,9 +37,6 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_bool_env_var
 
@@ -411,9 +408,6 @@ class DeepSeekMxfp4MoEMethod:
             symm_output = torch.empty(
                 num_tokens, out_hidden_size, dtype=torch.bfloat16, device=x_quant.device
             )
-
-        if self._gemm1_clamp_limit_tensor is not None:
-            deepseek_v4_moe_code_path_checker.observed += 1
 
         output = trtllm_fp4_block_scale_routed_moe(
             topk_ids=packed_topk,
