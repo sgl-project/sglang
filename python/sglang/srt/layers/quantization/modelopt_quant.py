@@ -1008,20 +1008,19 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
 
             topk_config = topk_output.topk_config
 
-            # Constraints for ModelOpt FP8 MoE
-            assert (
-                self.moe_runner_config.activation == "silu"
-            ), "Only silu is supported for flashinfer fp8 moe"
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                get_activation_type,
+            )
 
-            # Enforce Llama4 routing for ModelOpt FP8 MoE for now.
-            # TODO(brayden): support other routing methods
-            assert topk_config.top_k == 1, "ModelOpt FP8 MoE requires top_k==1"
-            assert (
-                not topk_config.num_expert_group
-            ), "ModelOpt FP8 MoE does not support expert grouping"
-            assert (
-                not topk_config.topk_group
-            ), "ModelOpt FP8 MoE does not support grouped top-k"
+            _SUPPORTED_FP8_ACTIVATIONS = {"silu", "relu2"}
+            assert self.moe_runner_config.activation in _SUPPORTED_FP8_ACTIVATIONS, (
+                f"Only {_SUPPORTED_FP8_ACTIVATIONS} are supported for "
+                f"flashinfer trtllm fp8 moe, got '{self.moe_runner_config.activation}'"
+            )
+
+            routing_method_type = getattr(
+                layer, "routing_method_type", RoutingMethodType.Llama4
+            )
 
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,
@@ -1030,13 +1029,14 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
                 local_num_experts=layer.num_local_experts,
                 intermediate_size=layer.w2_weight.shape[2],
-                routing_method_type=RoutingMethodType.Llama4,
+                routing_method_type=routing_method_type,
                 block_quant=False,
                 w13_input_scale=layer.w13_input_scale,
                 output1_scales_scalar=layer.output1_scales_scalar,
                 output1_scales_gate_scalar=layer.output1_scales_gate_scalar,
                 output2_scales_scalar=layer.output2_scales_scalar,
                 use_routing_scales_on_input=True,
+                activation_type=get_activation_type(self.moe_runner_config.activation),
             )
 
             return fused_experts_none_to_flashinfer_trtllm_fp8(
