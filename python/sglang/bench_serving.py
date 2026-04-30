@@ -466,8 +466,8 @@ async def async_request_openai_chat_completions(
                                 # Reasoning models stream thoughts via
                                 # `reasoning_content`; count them like content.
                                 delta = data.get("choices", [{}])[0].get("delta") or {}
-                                content = (delta.get("content") or "") + (
-                                    delta.get("reasoning_content") or ""
+                                content = (delta.get("reasoning_content") or "") + (
+                                    delta.get("content") or ""
                                 )
 
                                 if content:

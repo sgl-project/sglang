@@ -22,6 +22,7 @@ from sglang.bench_serving import (
     set_global_args,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
 
@@ -69,7 +70,7 @@ def _make_chunk(content=None, reasoning_content=None, completion_tokens=None):
     return chunk
 
 
-class TestBenchServingReasoningStream(unittest.TestCase):
+class TestBenchServingReasoningStream(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         set_global_args(
@@ -142,6 +143,18 @@ class TestBenchServingReasoningStream(unittest.TestCase):
         self.assertEqual(len(out.itl), 3)
         self.assertEqual(out.text_chunks, ["step2 ", "answer ", "here"])
         self.assertEqual(out.output_len, 4)
+
+    def test_single_delta_preserves_reasoning_before_content(self):
+        chunks = [
+            _make_chunk(content="answer", reasoning_content="thought "),
+            _make_chunk(completion_tokens=2),
+        ]
+        out = self._run(chunks)
+
+        self.assertTrue(out.success, msg=f"request failed: {out.error}")
+        self.assertEqual(out.generated_text, "thought answer")
+        self.assertGreater(out.ttft, 0.0)
+        self.assertEqual(out.output_len, 2)
 
     def test_content_only_stream_unchanged(self):
         chunks = [
