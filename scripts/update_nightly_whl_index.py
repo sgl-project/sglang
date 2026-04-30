@@ -175,8 +175,8 @@ def main():
     parser.add_argument(
         "--cuda-version",
         type=str,
-        default="129",
-        help="CUDA version (e.g., '129' or '130'). Defaults to '129'.",
+        default="130",
+        help="CUDA version (e.g., '129' or '130'). Defaults to '130'.",
     )
     parser.add_argument(
         "--build-date",
