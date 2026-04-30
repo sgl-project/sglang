@@ -74,10 +74,12 @@ class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     grammar: BaseGrammarObject = None
 
     # Shape info for padding
-    num_tokens_per_req: int = -1
+    num_tokens_per_req: int = -1  # -1 auto-fills from draft_token_num.
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_VERIFY)
+        if self.num_tokens_per_req < 0:
+            self.num_tokens_per_req = self.draft_token_num
 
     def get_spec_adjust_token_coefficient(self) -> Tuple[int, int]:
         return self.draft_token_num, self.draft_token_num
