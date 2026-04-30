@@ -6,11 +6,10 @@ and contains one ``CustomTestCase`` subclass per recipe
 (Low-Latency / Balanced / Max-Throughput / CP, where supported).
 
 Each subclass launches the server with the cookbook's exact flags and
-runs the AIME25 evaluation by shelling out to ``sgl-eval run aime25``
-(https://github.com/sgl-project/sgl-eval). sgl-eval bundles the AIME25
-dataset and uses ``math_verify`` for grading, so no nemo-skills setup
-is required and there is no separate ``regrade`` pass — the relaxed
-extractor is built in.
+runs two sgl-eval evaluations (https://github.com/sgl-project/sgl-eval):
+- ``test_smoke_gsm8k`` — short, cheap GSM8K pass to verify the server
+  can produce coherent math answers at all (smoke gate).
+- ``test_aime25`` — full AIME25 accuracy run (heavy; 16 repeats default).
 
 Cookbook reference:
     https://docs.sglang.io/cookbook/autoregressive/DeepSeek/DeepSeek-V4
@@ -20,16 +19,30 @@ These are MANUAL tests (not CI). ``sgl-eval`` must be on PATH.
 Per-variant defaults (set on the Flash/Pro intermediate base classes):
     Flash recipes -> AIME25 score threshold 0.93
     Pro   recipes -> AIME25 score threshold 0.95
+GSM8K smoke threshold (0.7) is shared — DSv4 should clear it easily;
+the assertion only catches catastrophic regressions.
 
 AIME25 knobs (env vars):
-    DSV4_AIME25_NUM_REPEATS       (default 16  -> --n-repeats)
-    DSV4_AIME25_TEMPERATURE       (default 1.0 -> --temperature)
-    DSV4_AIME25_TOP_P             (default 1.0 -> --top-p)
+    DSV4_AIME25_NUM_REPEATS       (default 16    -> --n-repeats)
+    DSV4_AIME25_TEMPERATURE       (default 1.0   -> --temperature)
+    DSV4_AIME25_TOP_P             (default 1.0   -> --top-p)
     DSV4_AIME25_MAX_TOKENS        (default 65536 -> --max-tokens)
-    DSV4_AIME25_NUM_THREADS       (default 512 -> --num-threads)
-    DSV4_AIME25_OUT_DIR           (default /tmp/sgl-eval-out -> --out-dir)
-    DSV4_AIME25_SCORE_METRIC      (default "pass@1"; key in sgl-eval JSON to assert on)
-    DSV4_AIME25_SCORE_THRESHOLD   (default 0; >0 overrides the per-variant default)
+    DSV4_AIME25_NUM_THREADS       (default 512   -> --num-threads)
+    DSV4_AIME25_SCORE_METRIC      (default "pass@1")
+    DSV4_AIME25_SCORE_THRESHOLD   (default 0; >0 overrides per-variant default)
+
+GSM8K smoke knobs (env vars):
+    DSV4_GSM8K_NUM_EXAMPLES       (default 50    -> --num-examples)
+    DSV4_GSM8K_N_REPEATS          (default 1     -> --n-repeats)
+    DSV4_GSM8K_TEMPERATURE        (default 0.6   -> --temperature)
+    DSV4_GSM8K_TOP_P              (default 0.95  -> --top-p)
+    DSV4_GSM8K_MAX_TOKENS         (default 8192  -> --max-tokens)
+    DSV4_GSM8K_NUM_THREADS        (default 64    -> --num-threads)
+    DSV4_GSM8K_SCORE_METRIC       (default "pass@1")
+    DSV4_GSM8K_SCORE_THRESHOLD    (default 0.7;  set to 0 to skip the assertion)
+
+Shared knobs:
+    DSV4_SGL_EVAL_OUT_DIR         (default /tmp/sgl-eval-out -> --out-dir)
     DSV4_SGL_EVAL_BIN             (default "sgl-eval"; override path to the CLI)
 
 Multi-node knobs (only consumed by multi-node test classes; if either
@@ -55,15 +68,24 @@ from sglang.test.test_utils import (
 )
 
 SGL_EVAL_BIN = os.environ.get("DSV4_SGL_EVAL_BIN", "sgl-eval")
+SGL_EVAL_OUT_DIR = os.environ.get("DSV4_SGL_EVAL_OUT_DIR", "/tmp/sgl-eval-out")
 
 AIME25_NUM_REPEATS = int(os.environ.get("DSV4_AIME25_NUM_REPEATS", "16"))
 AIME25_TEMPERATURE = float(os.environ.get("DSV4_AIME25_TEMPERATURE", "1.0"))
 AIME25_TOP_P = float(os.environ.get("DSV4_AIME25_TOP_P", "1.0"))
 AIME25_MAX_TOKENS = int(os.environ.get("DSV4_AIME25_MAX_TOKENS", "65536"))
 AIME25_NUM_THREADS = int(os.environ.get("DSV4_AIME25_NUM_THREADS", "512"))
-AIME25_OUT_DIR = os.environ.get("DSV4_AIME25_OUT_DIR", "/tmp/sgl-eval-out")
 AIME25_SCORE_METRIC = os.environ.get("DSV4_AIME25_SCORE_METRIC", "pass@1")
 AIME25_SCORE_THRESHOLD = float(os.environ.get("DSV4_AIME25_SCORE_THRESHOLD", "0.0"))
+
+GSM8K_NUM_EXAMPLES = int(os.environ.get("DSV4_GSM8K_NUM_EXAMPLES", "50"))
+GSM8K_N_REPEATS = int(os.environ.get("DSV4_GSM8K_N_REPEATS", "1"))
+GSM8K_TEMPERATURE = float(os.environ.get("DSV4_GSM8K_TEMPERATURE", "0.6"))
+GSM8K_TOP_P = float(os.environ.get("DSV4_GSM8K_TOP_P", "0.95"))
+GSM8K_MAX_TOKENS = int(os.environ.get("DSV4_GSM8K_MAX_TOKENS", "8192"))
+GSM8K_NUM_THREADS = int(os.environ.get("DSV4_GSM8K_NUM_THREADS", "64"))
+GSM8K_SCORE_METRIC = os.environ.get("DSV4_GSM8K_SCORE_METRIC", "pass@1")
+GSM8K_SCORE_THRESHOLD = float(os.environ.get("DSV4_GSM8K_SCORE_THRESHOLD", "0.7"))
 
 # DeepEP "large SMS" config — appears as `--deepep-config '{...}'` in every
 # DeepEP recipe except multi-node ones (where it is gated off in the JSX).
@@ -132,59 +154,102 @@ class Dsv4Aime25TestBase(CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             kill_process_tree(cls.process.pid)
 
-    def test_aime25(self):
-        if shutil.which(SGL_EVAL_BIN) is None:
-            self.skipTest(f"{SGL_EVAL_BIN!r} not found on PATH")
-
-        out_dir = Path(AIME25_OUT_DIR)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        before = set(out_dir.glob("sgl_eval_aime25_*.json"))
-
-        cmd = [
-            SGL_EVAL_BIN,
-            "run",
-            "aime25",
-            "--base-url",
-            f"{self.base_url}/v1",
-            "--n-repeats",
-            str(AIME25_NUM_REPEATS),
-            "--temperature",
-            str(AIME25_TEMPERATURE),
-            "--top-p",
-            str(AIME25_TOP_P),
-            "--max-tokens",
-            str(AIME25_MAX_TOKENS),
-            "--num-threads",
-            str(AIME25_NUM_THREADS),
-            "--out-dir",
-            str(out_dir),
-        ]
-        print(f"[{type(self).__name__}] + {' '.join(cmd)}", flush=True)
-        subprocess.run(cmd, check=True)
-
-        new = sorted(set(out_dir.glob("sgl_eval_aime25_*.json")) - before)
-        if not new:
-            self.fail(f"sgl-eval produced no new results JSON in {out_dir}")
-        result_path = new[-1]
-        with open(result_path) as f:
-            result = json.load(f)
-        print(
-            f"[{type(self).__name__}] sgl-eval result ({result_path.name}): "
-            f"{json.dumps(result, indent=2)}",
-            flush=True,
+    def test_smoke_gsm8k(self):
+        """Quick GSM8K pass to verify the server is producing math answers."""
+        self._run_sgl_eval(
+            eval_name="gsm8k",
+            n_repeats=GSM8K_N_REPEATS,
+            temperature=GSM8K_TEMPERATURE,
+            top_p=GSM8K_TOP_P,
+            max_tokens=GSM8K_MAX_TOKENS,
+            num_threads=GSM8K_NUM_THREADS,
+            num_examples=GSM8K_NUM_EXAMPLES,
+            metric=GSM8K_SCORE_METRIC,
+            threshold=GSM8K_SCORE_THRESHOLD,
         )
 
-        score = self._extract_score(result, AIME25_SCORE_METRIC)
+    def test_aime25(self):
+        """Full AIME25 accuracy run; threshold gated by Flash vs Pro base."""
         threshold = (
             AIME25_SCORE_THRESHOLD
             if AIME25_SCORE_THRESHOLD > 0
             else self.SCORE_THRESHOLD
         )
+        self._run_sgl_eval(
+            eval_name="aime25",
+            n_repeats=AIME25_NUM_REPEATS,
+            temperature=AIME25_TEMPERATURE,
+            top_p=AIME25_TOP_P,
+            max_tokens=AIME25_MAX_TOKENS,
+            num_threads=AIME25_NUM_THREADS,
+            num_examples=None,
+            metric=AIME25_SCORE_METRIC,
+            threshold=threshold,
+        )
+
+    def _run_sgl_eval(
+        self,
+        eval_name,
+        n_repeats,
+        temperature,
+        top_p,
+        max_tokens,
+        num_threads,
+        num_examples,
+        metric,
+        threshold,
+    ):
+        if shutil.which(SGL_EVAL_BIN) is None:
+            self.skipTest(f"{SGL_EVAL_BIN!r} not found on PATH")
+
+        out_dir = Path(SGL_EVAL_OUT_DIR)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        glob_pattern = f"sgl_eval_{eval_name}_*.json"
+        before = set(out_dir.glob(glob_pattern))
+
+        cmd = [
+            SGL_EVAL_BIN,
+            "run",
+            eval_name,
+            "--base-url",
+            f"{self.base_url}/v1",
+            "--n-repeats",
+            str(n_repeats),
+            "--temperature",
+            str(temperature),
+            "--top-p",
+            str(top_p),
+            "--max-tokens",
+            str(max_tokens),
+            "--num-threads",
+            str(num_threads),
+            "--out-dir",
+            str(out_dir),
+        ]
+        if num_examples is not None:
+            cmd += ["--num-examples", str(num_examples)]
+
+        print(f"[{type(self).__name__}] + {' '.join(cmd)}", flush=True)
+        subprocess.run(cmd, check=True)
+
+        new = sorted(set(out_dir.glob(glob_pattern)) - before)
+        if not new:
+            self.fail(f"sgl-eval produced no new {eval_name} JSON in {out_dir}")
+        result_path = new[-1]
+        with open(result_path) as f:
+            result = json.load(f)
+        print(
+            f"[{type(self).__name__}] sgl-eval {eval_name} result "
+            f"({result_path.name}): {json.dumps(result, indent=2)}",
+            flush=True,
+        )
+
+        score = self._extract_score(result, metric)
         if threshold > 0:
             self.assertGreaterEqual(
                 score,
                 threshold,
-                f"{AIME25_SCORE_METRIC}={score} below threshold {threshold}",
+                f"{eval_name} {metric}={score} below threshold {threshold}",
             )
 
     @staticmethod
