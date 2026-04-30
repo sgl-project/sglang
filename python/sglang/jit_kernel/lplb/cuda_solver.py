@@ -29,12 +29,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# IPM kernel block dim. The matmuls inside are tiny (NC, NV ≤ ~50) so the
-# usual rule-of-thumb 256-thread-block is wasteful — most threads idle past
-# the cuBLASDx tile. 128 keeps the warp count low while still providing
-# enough parallelism for the prefix-sum / shfl reductions.
-DEFAULT_BLOCK_DIM = 128
-# Per-element kernels (post-LP dispatch) saturate easily — keep 256.
+DEFAULT_BLOCK_DIM = 256
+# Per-element kernels (post-LP dispatch) saturate easily — also 256.
 DISPATCH_BLOCK_DIM = 256
 DEFAULT_NUM_ITERS = 5
 
