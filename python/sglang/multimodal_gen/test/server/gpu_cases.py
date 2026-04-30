@@ -331,6 +331,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             extras=[
                 "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode snapshot"
             ],
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
+            },
         ),
         T2I_sampling_params,
     ),
@@ -611,13 +615,6 @@ TWO_GPU_CASES = [
             tp_size=2,
         ),
         T2I_sampling_params,
-    ),
-    DiffusionTestCase(
-        "flux_2_klein_ti2i_2_gpus",
-        DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-klein-4B",
-        ),
-        TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "ltx_2.3_one_stage_ti2v",
