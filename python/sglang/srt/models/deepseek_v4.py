@@ -1829,7 +1829,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             )
         }
         if unloaded_params:
-            raise RuntimeError(
+            logger.warning(
                 f"Some weights are not initialized from checkpoints: {unloaded_params}"
             )
 
