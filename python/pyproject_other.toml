@@ -59,7 +59,7 @@ runtime_common = [
   "torchao==0.9.0",
   "tqdm",
   "mistral_common>=1.11.0",
-  "transformers==5.5.4",
+  "transformers==5.6.0",
   "uvicorn",
   "uvloop",
   "xgrammar==0.1.32",
@@ -167,7 +167,7 @@ test = [
   "tabulate",
 ]
 
-all_hip = ["sglang[srt_hip]", "sglang[diffusion_hip]"]
+all_hip = ["sglang[srt_hip]", "sglang[diffusion_hip]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_musa = ["sglang[srt_musa]", "sglang[diffusion_musa]"]
 all_mps = ["sglang[srt_mps]", "sglang[diffusion_mps]"]
