@@ -284,7 +284,7 @@ class ComponentResidencyManager:
         self.begin_use(use)
 
     def begin_use(self, use: ComponentUse, module: nn.Module | None = None) -> None:
-        """Begin one sequential component use interval.
+        """Begin one sequential component use interval. this is idempotent
 
         1. Finish the previous active use if this is a different timeline use.
         2. Prepare the current component.

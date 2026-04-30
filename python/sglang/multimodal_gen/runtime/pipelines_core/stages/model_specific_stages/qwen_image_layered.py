@@ -158,7 +158,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        stage_name = stage_name or self.__class__.__name__
+        stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
                 stage_name, "qwen_layered_text_encoder", target_dtype=torch.bfloat16

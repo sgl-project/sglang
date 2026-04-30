@@ -141,7 +141,7 @@ class ImageEncodingStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        stage_name = stage_name or self.__class__.__name__
+        stage_name = self._component_stage_name(stage_name)
         uses = []
         if self.image_encoder is not None:
             uses.append(ComponentUse(stage_name, "image_encoder"))
@@ -332,16 +332,17 @@ class LTX2ImageEncodingStage(PipelineStage):
     ) -> list[ComponentUse]:
         arch_config = server_args.pipeline_config.vae_config.arch_config
         encoder_subdir = str(getattr(arch_config, "condition_encoder_subdir", ""))
+        stage_name = self._component_stage_name(stage_name)
         if encoder_subdir:
             return [
                 ComponentUse(
-                    stage_name or self.__class__.__name__,
+                    stage_name,
                     "condition_image_encoder",
                 )
             ]
         if self.vae is None:
             return []
-        return [ComponentUse(stage_name or self.__class__.__name__, "vae")]
+        return [ComponentUse(stage_name, "vae")]
 
     # -- lazy condition encoder (LTX-2.3) --------------------------------
 
@@ -694,9 +695,10 @@ class ImageVAEEncodingStage(PipelineStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
-                stage_name or self.__class__.__name__,
+                stage_name,
                 "vae",
                 target_dtype=vae_dtype,
             )

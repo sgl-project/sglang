@@ -162,15 +162,17 @@ class MOVADenoisingStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        stage_name = stage_name or self.__class__.__name__
+        stage_name = self._component_stage_name(stage_name)
         uses = [
+            ComponentUse(stage_name, "audio_dit"),
+            ComponentUse(stage_name, "dual_tower_bridge"),
             ComponentUse(
                 stage_name,
                 "video_dit",
                 phase="video_dit",
                 preferred_ready_after_request=True,
                 memory_intensive=True,
-            )
+            ),
         ]
         if self.video_dit_2 is not None:
             uses.append(
@@ -181,12 +183,6 @@ class MOVADenoisingStage(PipelineStage):
                     memory_intensive=True,
                 )
             )
-        uses.extend(
-            [
-                ComponentUse(stage_name, "audio_dit"),
-                ComponentUse(stage_name, "dual_tower_bridge"),
-            ]
-        )
         return uses
 
     @property
@@ -390,7 +386,7 @@ class MOVADenoisingStage(PipelineStage):
 
         component_name = manager.component_name_for_module(current_model, default_name)
         use = ComponentUse(
-            stage_name=manager.state.stage_name or self.__class__.__name__,
+            stage_name=self._active_component_stage_name(),
             component_name=component_name,
             phase=component_name,
             preferred_ready_after_request=component_name == "video_dit",
@@ -404,7 +400,7 @@ class MOVADenoisingStage(PipelineStage):
         manager = self._component_residency_manager
         if manager is None:
             return
-        stage_name = manager.state.stage_name or self.__class__.__name__
+        stage_name = self._active_component_stage_name()
         manager.ensure_ready(
             ComponentUse(stage_name, "audio_dit"),
             module=self.audio_dit,
@@ -949,7 +945,7 @@ class MOVADecodingStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        stage_name = stage_name or self.__class__.__name__
+        stage_name = self._component_stage_name(stage_name)
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
         return [
             ComponentUse(stage_name, "video_vae", target_dtype=vae_dtype),

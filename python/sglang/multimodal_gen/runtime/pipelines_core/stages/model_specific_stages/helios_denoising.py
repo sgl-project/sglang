@@ -110,7 +110,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        stage_name = stage_name or self.__class__.__name__
+        stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
                 stage_name=stage_name,
@@ -505,8 +505,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             memory_intensive=True,
         )
         manager = self._component_residency_manager
-        if manager is not None:
-            manager.begin_use(transformer_use, module=self.transformer)
+        manager.begin_use(transformer_use, module=self.transformer)
 
         # Get encoder outputs (prompt_embeds is a list of tensors, one per encoder)
         prompt_embeds = batch.prompt_embeds

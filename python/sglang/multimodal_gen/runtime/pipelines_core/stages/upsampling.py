@@ -1,5 +1,3 @@
-from typing import Protocol
-
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
@@ -10,12 +8,6 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
-
-class LTX2LoRAPipeline(Protocol):
-    def should_skip_ltx2_lora_switch_stage(self) -> bool: ...
-
-    def switch_lora_phase(self, phase: str, batch: Req | None = None) -> None: ...
 
 
 class LTX2HalveResolutionStage(PipelineStage):
@@ -47,7 +39,7 @@ class LTX2HalveResolutionStage(PipelineStage):
 class LTX2LoRASwitchStage(PipelineStage):
     """Switch LoRA configuration for the requested two-stage phase."""
 
-    def __init__(self, pipeline: LTX2LoRAPipeline, phase: str):
+    def __init__(self, pipeline, phase: str):
         super().__init__()
         self.pipeline = pipeline
         self.phase = phase
@@ -80,7 +72,7 @@ class LTX2UpsampleStage(PipelineStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        stage_name = stage_name or self.__class__.__name__
+        stage_name = self._component_stage_name(stage_name)
         uses = [
             ComponentUse(stage_name, "spatial_upsampler"),
             ComponentUse(stage_name, "vae"),

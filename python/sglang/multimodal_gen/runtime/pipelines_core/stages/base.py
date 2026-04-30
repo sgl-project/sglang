@@ -113,6 +113,15 @@ class PipelineStage(StageDedupMixin, ABC):
     def set_component_residency_manager(self, manager) -> None:
         self._component_residency_manager = manager
 
+    def _component_stage_name(self, stage_name: str | None = None) -> str:
+        return stage_name or self.__class__.__name__
+
+    def _active_component_stage_name(self) -> str:
+        manager = self._component_residency_manager
+        if manager is not None and manager.state.stage_name is not None:
+            return manager.state.stage_name
+        return self.__class__.__name__
+
     def _finish_active_component_use(self) -> None:
         if self._component_residency_manager is not None:
             self._component_residency_manager.finish_active_use()
@@ -137,11 +146,7 @@ class PipelineStage(StageDedupMixin, ABC):
         target_dtype: torch.dtype | None = None,
     ) -> ComponentUse:
         manager = self._component_residency_manager
-        stage_name = (
-            manager.state.stage_name
-            if manager is not None and manager.state.stage_name is not None
-            else self.__class__.__name__
-        )
+        stage_name = self._active_component_stage_name()
         server_args = manager.server_args if manager is not None else self.server_args
         for use in self.component_uses(server_args, stage_name):
             if use.component_name != component_name:

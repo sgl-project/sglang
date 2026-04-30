@@ -73,9 +73,10 @@ class DecodingStage(PipelineStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+        stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
-                stage_name or self.__class__.__name__,
+                stage_name,
                 self.component_name,
                 target_dtype=vae_dtype,
                 keep_ready_after_warmup=True,

@@ -198,7 +198,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        stage_name = stage_name or self.__class__.__name__
+        stage_name = self._component_stage_name(stage_name)
         uses: list[ComponentUse] = []
         if self.vae is not None:
             uses.append(
@@ -1071,17 +1071,18 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     ) -> None:
         """
         manage dit's residency by reporting the active sequential use
+
+        only applicable for dual-dit architecture like Wan
+
         Args:
             current_model: the next active dit, transformer_1 or transformer_2
         """
         manager = self._component_residency_manager
-        if manager is None:
-            return
 
         component_name = manager.component_name_for_module(current_model, current_phase)
         phase = str(batch.extra.get("ltx2_phase", current_phase))
         use = ComponentUse(
-            stage_name=manager.state.stage_name or self.__class__.__name__,
+            stage_name=self._active_component_stage_name(),
             component_name=component_name,
             phase=phase,
             preferred_ready_after_request=component_name == "transformer",

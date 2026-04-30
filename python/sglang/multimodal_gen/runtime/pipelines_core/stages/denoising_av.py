@@ -31,7 +31,7 @@ class LTX2AVDenoisingStage(LTX2DenoisingStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        stage_name = stage_name or self.__class__.__name__
+        stage_name = self._component_stage_name(stage_name)
         return [
             ComponentUse(
                 stage_name=stage_name,
@@ -124,7 +124,7 @@ class LTX2RefinementStage(LTX2AVDenoisingStage):
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
-        stage_name = stage_name or self.__class__.__name__
+        stage_name = self._component_stage_name(stage_name)
         component_name = "transformer_2"
         pipeline = self.pipeline() if self.pipeline else None
         if pipeline is not None and "transformer_2" not in pipeline.modules:
