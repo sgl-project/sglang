@@ -766,7 +766,7 @@ class Scheduler(
                 page_size=self.page_size,
                 num_pages=self.max_total_num_tokens // self.page_size,
                 context_len=self.model_config.context_len,
-                available_gpu_memory_gb=avail_mem,
+                startup_available_gpu_memory_gb=avail_mem,
             )
 
     def init_cache_with_memory_pool(self):
