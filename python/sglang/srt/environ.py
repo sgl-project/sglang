@@ -606,7 +606,7 @@ class Envs:
     SGLANG_HANDLE_C128_PREFILL_KERNEL = EnvBool(False)
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
 
-    # Dangerous untested flagas
+    # Dangerous untested flags
     SGLANG_OPT_USE_FAST_MASK_EP = EnvBool(False)
     SGLANG_OPT_USE_FLASHINFER_NORM = EnvBool(False)
 
