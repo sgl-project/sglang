@@ -19,8 +19,7 @@ These are MANUAL tests (not CI). ``sgl-eval`` must be on PATH.
 Per-variant defaults (set on the Flash/Pro intermediate base classes):
     Flash recipes -> AIME25 score threshold 0.93
     Pro   recipes -> AIME25 score threshold 0.95
-GSM8K smoke threshold (0.7) is shared — DSv4 should clear it easily;
-the assertion only catches catastrophic regressions.
+GSM8K smoke threshold (0.93) is shared across Flash and Pro.
 
 AIME25 knobs (env vars):
     DSV4_AIME25_NUM_REPEATS       (default 16    -> --n-repeats)
@@ -39,7 +38,7 @@ GSM8K smoke knobs (env vars):
     DSV4_GSM8K_MAX_TOKENS         (default 8192  -> --max-tokens)
     DSV4_GSM8K_NUM_THREADS        (default 64    -> --num-threads)
     DSV4_GSM8K_SCORE_METRIC       (default "pass@1")
-    DSV4_GSM8K_SCORE_THRESHOLD    (default 0.7;  set to 0 to skip the assertion)
+    DSV4_GSM8K_SCORE_THRESHOLD    (default 0.93; set to 0 to skip the assertion)
 
 Shared knobs:
     DSV4_SGL_EVAL_OUT_DIR         (default /tmp/sgl-eval-out -> --out-dir)
@@ -85,7 +84,7 @@ GSM8K_TOP_P = float(os.environ.get("DSV4_GSM8K_TOP_P", "0.95"))
 GSM8K_MAX_TOKENS = int(os.environ.get("DSV4_GSM8K_MAX_TOKENS", "8192"))
 GSM8K_NUM_THREADS = int(os.environ.get("DSV4_GSM8K_NUM_THREADS", "64"))
 GSM8K_SCORE_METRIC = os.environ.get("DSV4_GSM8K_SCORE_METRIC", "pass@1")
-GSM8K_SCORE_THRESHOLD = float(os.environ.get("DSV4_GSM8K_SCORE_THRESHOLD", "0.7"))
+GSM8K_SCORE_THRESHOLD = float(os.environ.get("DSV4_GSM8K_SCORE_THRESHOLD", "0.93"))
 
 # DeepEP "large SMS" config — appears as `--deepep-config '{...}'` in every
 # DeepEP recipe except multi-node ones (where it is gated off in the JSX).
