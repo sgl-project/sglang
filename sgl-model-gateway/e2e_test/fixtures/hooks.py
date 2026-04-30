@@ -233,17 +233,30 @@ def pytest_collection_modifyitems(
     else:
         logger.info("Scanned worker requirements: (none)")
 
-    # TEMPORARY: skip all e2e tests until upstream kernels publishes a release
-    # without `import_name: str | None`. The CI runner installs kernels==0.13.0
-    # with huggingface_hub>=1.9.0, whose strict-dataclass validator rejects the
-    # PEP 604 union and crashes transformers.integrations.hub_kernels at import,
-    # taking down sglang.launch_server. See huggingface/trl#5528.
+    # TEMPORARY: skip every test that would launch an sglang worker, until
+    # upstream kernels publishes a release without `import_name: str | None`.
+    # The CI runner installs kernels==0.13.0 with huggingface_hub>=1.9.0,
+    # whose strict-dataclass validator rejects the PEP 604 union and crashes
+    # transformers.integrations.hub_kernels at import, taking down
+    # sglang.launch_server. See huggingface/trl#5528.
+    #
+    # Filter on `model_pool` in fixturenames (covers setup_backend, model_client,
+    # model_base_url, backend_router — all transitively depend on model_pool) so
+    # tests without an explicit `@pytest.mark.e2e` marker (e.g. chat_completions)
+    # are also skipped. Then clear scanned worker requirements so model_pool —
+    # if realized for any non-skipped fixture — starts with an empty pool and
+    # never spawns sglang.launch_server.
     skip_marker = pytest.mark.skip(
-        reason="e2e tests disabled: kernels==0.13.0 + huggingface_hub strict dataclass crash"
+        reason="worker-dependent tests disabled: kernels==0.13.0 + huggingface_hub strict dataclass crash"
     )
     for item in items:
-        if item.get_closest_marker("e2e") is not None:
+        if (
+            item.get_closest_marker("e2e") is not None
+            or "model_pool" in item.fixturenames
+        ):
             item.add_marker(skip_marker)
+    _worker_counts.clear()
+    _first_seen_order.clear()
 
 
 # ---------------------------------------------------------------------------
