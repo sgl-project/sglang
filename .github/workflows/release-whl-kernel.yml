@@ -182,12 +182,6 @@ jobs:
           BUILD_JOBS: 64
           NVCC_THREADS: 8
 
-      # rename_wheels.sh tags the cu130 wheel's METADATA Version with +cu130
-      # (needed elsewhere — e.g. local install discrimination — see PR #23587),
-      # but PyPI rejects PEP 440 local version labels with HTTP 400. Repack a
-      # PyPI-clean copy with the +cu130 segment stripped into dist-pypi/, and
-      # upload that copy. dist/ is left untouched so the +cu130 wheel still
-      # flows through the upload-artifact -> sgl-project/whl index path below.
       - name: Strip +cu130 local version for PyPI upload
         working-directory: sgl-kernel
         run: |
