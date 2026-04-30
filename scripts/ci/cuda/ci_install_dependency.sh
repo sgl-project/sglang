@@ -276,12 +276,9 @@ install_sglang_kernel() {
         fi
     fi
 
-    # Reinstall torch with matching CUDA version if needed.
-    # Read the CUDA tag from the installed wheel's local-version label (e.g. 2.9.1+cu130 → cu130)
-    # rather than `import torch`: importing torch dlopens libcusparseLt etc., which can fail when
-    # the matching nvidia-* wheel left only its .dist-info on disk (#23592 follow-up).
+    # Reinstall torch with matching CUDA version if needed
     # TODO: Remove after torch 2.11 where cu13 is enabled by default
-    TORCH_CUDA_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9]\+\).*/\1/p')
+    TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
     echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
     if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
         TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
