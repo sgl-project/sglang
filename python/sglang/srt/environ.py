@@ -589,7 +589,8 @@ class Envs:
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM = EnvBool(True)  # verified in journal 2026-04-21-017
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
-    SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(True)
+    # TODO(DSV4): @ispobock this has bug on main branch when retract
+    SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
     SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD = EnvBool(True)
