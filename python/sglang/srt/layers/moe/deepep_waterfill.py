@@ -34,7 +34,6 @@ def _empty_expanded(topk_ids: Tensor, topk_weights: Tensor):
     return (
         torch.empty(0, topk + 1, dtype=topk_ids.dtype, device=d),
         torch.empty(0, topk + 1, dtype=topk_weights.dtype, device=d),
-        torch.empty(0, dtype=torch.bool, device=d),
     )
 
 
@@ -81,7 +80,6 @@ def _waterfill_expand_kernel(
     routed_counts_ptr,
     expanded_ids_ptr,
     expanded_weights_ptr,
-    local_mask_ptr,
     num_tokens,
     topk: tl.constexpr,
     old_experts_per_rank,
@@ -240,7 +238,7 @@ def _waterfill_expand_kernel(
         val = tl.where(expert_id >= 0, val, 0.0)
         tl.store(expanded_weights_ptr + token_idx * (topk + 1) + k, val, mask=mask)
 
-    # Step 4: Write shared expert column and local mask.
+    # Step 4: Write shared expert column.
     tl.store(
         expanded_ids_ptr + token_idx * (topk + 1) + topk,
         shared_expert_id,
@@ -251,7 +249,6 @@ def _waterfill_expand_kernel(
         tl.where(has_valid, shared_weight, 0.0),
         mask=mask,
     )
-    tl.store(local_mask_ptr + token_idx, is_local, mask=mask)
 
 
 def waterfill_prepare_dispatch_fused(
@@ -264,7 +261,7 @@ def waterfill_prepare_dispatch_fused(
     shared_weight: float,
     allow_all_ranks: bool = False,
     target_total: int = 0,
-) -> Tuple[Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor]:
     """Fused waterfill + expand + ID remapping via Triton kernel."""
     num_tokens = topk_ids.shape[0]
     topk = topk_ids.shape[1]
@@ -281,8 +278,6 @@ def waterfill_prepare_dispatch_fused(
     expanded_topk_weights = torch.empty(
         num_tokens, topk + 1, dtype=topk_weights.dtype, device=device
     )
-    local_shared_mask = torch.empty(num_tokens, dtype=torch.bool, device=device)
-
     BLOCK_SIZE = 256
     grid = ((num_tokens + BLOCK_SIZE - 1) // BLOCK_SIZE,)
     _waterfill_expand_kernel[grid](
@@ -291,7 +286,6 @@ def waterfill_prepare_dispatch_fused(
         routed_counts,
         expanded_topk_ids,
         expanded_topk_weights,
-        local_shared_mask,
         num_tokens,
         topk,
         old_experts_per_rank,
@@ -307,7 +301,7 @@ def waterfill_prepare_dispatch_fused(
         BLOCK_SIZE,
     )
 
-    return expanded_topk_ids, expanded_topk_weights, local_shared_mask
+    return expanded_topk_ids, expanded_topk_weights
 
 
 @torch.compile(dynamic=True)
@@ -318,7 +312,7 @@ def expand_topk_with_shared_expert(
     world_size: int,
     source_rank: int,
     shared_weight: float,
-) -> Tuple[Tensor, Tensor, Tensor]:
+) -> Tuple[Tensor, Tensor]:
     """Expand topk [N, 8] → [N, 9] with ID remap; shared expert always local."""
     num_tokens = topk_ids.shape[0]
     topk = topk_ids.shape[1]
@@ -344,8 +338,7 @@ def expand_topk_with_shared_expert(
     expanded_topk_weights[:, topk] = torch.where(has_valid, shared_weight, 0.0).to(
         topk_weights.dtype
     )
-    local_shared_mask = has_valid
-    return expanded_topk_ids, expanded_topk_weights, local_shared_mask
+    return expanded_topk_ids, expanded_topk_weights
 
 
 class DeepEPWaterfillBalancer:
@@ -419,7 +412,7 @@ class DeepEPWaterfillBalancer:
         topk_weights: Tensor,
         routed_counts: Tensor,
         local_tokens_per_rank: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor]:
+    ) -> Tuple[Tensor, Tensor]:
         """Expand topk [N, 8] → [N, 9] with waterfill-assigned shared expert."""
         num_tokens = topk_ids.shape[0]
         if num_tokens == 0:
@@ -478,7 +471,7 @@ class DeepEPWaterfillBalancer:
         ):
             # Static EPLB low-batch path can use local expansion. Dynamic mode
             # always all-reduces so decode and extend have the same participation.
-            expanded_ids, expanded_weights, _ = expand_topk_with_shared_expert(
+            expanded_ids, expanded_weights = expand_topk_with_shared_expert(
                 topk_output.topk_ids,
                 topk_output.topk_weights,
                 self.num_routed_experts,
@@ -513,7 +506,7 @@ class DeepEPWaterfillBalancer:
             global_routed_counts = buf[:world]
             local_tokens_per_rank = buf[world:]
 
-        expanded_ids, expanded_weights, _ = self.prepare_dispatch(
+        expanded_ids, expanded_weights = self.prepare_dispatch(
             topk_output.topk_ids,
             topk_output.topk_weights,
             global_routed_counts,
