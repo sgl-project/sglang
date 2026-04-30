@@ -312,6 +312,9 @@ class NativeSparseAttnBackend(
     def supports_compiled_replay_prepare(self) -> bool:
         return True
 
+    def get_cuda_graph_replay_metadata(self, bs: int) -> NSAMetadata:
+        return self.decode_cuda_graph_metadata[bs]
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -1049,6 +1052,36 @@ class NativeSparseAttnBackend(
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
+    def init_forward_metadata_replay_cuda_graph_with_metadata(
+        self,
+        metadata: NSAMetadata,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+        seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: Optional[torch.Tensor] = None,
+    ):
+        if not torch.compiler.is_compiling():
+            assert seq_lens_cpu is not None
+            self.set_nsa_prefill_impl(forward_batch=None)
+
+        bs = metadata.cache_seqlens_int32.shape[0]
+        self._init_forward_metadata_replay_cuda_graph_impl(
+            metadata,
+            bs,
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            encoder_lens,
+            forward_mode,
+            spec_info,
+            seq_lens_cpu,
+            out_cache_loc,
+        )
+
     def init_forward_metadata_replay_cuda_graph(
         self,
         bs: int,
@@ -1066,12 +1099,38 @@ class NativeSparseAttnBackend(
             assert seq_lens_cpu is not None
             self.set_nsa_prefill_impl(forward_batch=None)
 
+        # Normal Decode
+        metadata: NSAMetadata = self.decode_cuda_graph_metadata[bs]
+        self._init_forward_metadata_replay_cuda_graph_impl(
+            metadata,
+            bs,
+            req_pool_indices,
+            seq_lens,
+            seq_lens_sum,
+            encoder_lens,
+            forward_mode,
+            spec_info,
+            seq_lens_cpu,
+            out_cache_loc,
+        )
+
+    def _init_forward_metadata_replay_cuda_graph_impl(
+        self,
+        metadata: NSAMetadata,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_sum: int,
+        encoder_lens: Optional[torch.Tensor],
+        forward_mode: ForwardMode,
+        spec_info: Optional[SpecInput],
+        seq_lens_cpu: Optional[torch.Tensor],
+        out_cache_loc: Optional[torch.Tensor] = None,
+    ):
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
-        # Normal Decode
-        metadata: NSAMetadata = self.decode_cuda_graph_metadata[bs]
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = seq_lens_cpu.max().item()
