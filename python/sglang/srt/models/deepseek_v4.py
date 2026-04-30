@@ -281,8 +281,6 @@ class Compressor(nn.Module):
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
 
-        self.forward_mode = forward_batch.forward_mode
-
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
         if nsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
