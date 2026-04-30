@@ -760,7 +760,7 @@ class Scheduler(
         if self.enable_metrics and hasattr(self, "metrics_collector"):
             self.metrics_collector.emit_constants(
                 max_total_num_tokens=self.max_total_num_tokens,
-                max_running_requests_under_SLO=self.stats.max_running_requests_under_SLO,
+                max_running_requests_under_SLO=getattr(self, "max_running_requests_under_SLO", None),
                 engine_startup_time=0.0,
                 engine_load_weights_time=0.0,
                 page_size=self.page_size,
