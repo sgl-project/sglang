@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Iterable, List, Literal, Optional, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -220,23 +220,6 @@ class Compressor(nn.Module):
 
         assert isinstance(ret, CompressStatePool)
 
-        return ret
-
-    def overlap_transform(self, tensor: torch.Tensor, fill_value: Any) -> torch.Tensor:
-        assert tensor.dim() == 3
-        assert tensor.shape[1:] == (self.ratio, 2 * self.head_dim)
-
-        s, r, d = tensor.size(0), self.ratio, self.head_dim
-        new_tensor = tensor.new_full((s, 2 * r, d), fill_value)
-        new_tensor[:, r:] = tensor[:, :, d:]
-        new_tensor[1:, :r] = tensor[:-1, :, :d]
-        return new_tensor
-
-    def overlap_transform_decode(self, tensor: torch.Tensor) -> torch.Tensor:
-        assert tensor.dim() == 3
-        assert tensor.shape[1:] == (2 * self.ratio, 2 * self.head_dim)
-        r, d = self.ratio, self.head_dim
-        ret = torch.cat((tensor[:, :r, :d], tensor[:, r:, d:]), dim=1)
         return ret
 
     @staticmethod
