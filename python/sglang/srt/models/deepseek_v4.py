@@ -1135,7 +1135,6 @@ class DeepseekV4Model(nn.Module):
         super().__init__()
         self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        self.first_k_dense_replace = config.first_k_dense_replace
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
