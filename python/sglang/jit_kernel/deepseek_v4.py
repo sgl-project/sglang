@@ -13,18 +13,18 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_cuda, is_xpu
 
 _is_cpu = is_cpu()
-_cpu_amx = cpu_has_amx_support()
-if TYPE_CHECKING:
-    from tvm_ffi.module import Module
-
-
 # JIT-compiled CUDA kernels in this module require tvm_ffi and a working CUDA
 # toolchain. On non-CUDA backends (e.g. XPU) those entrypoints fall back to
 # triton/torch implementations.
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
+_cpu_amx = cpu_has_amx_support()
+
+if TYPE_CHECKING:
+    from tvm_ffi.module import Module
 
 
 def make_name(name: str) -> str:
@@ -580,6 +580,1153 @@ def _torch_plan_compress_prefill(
     return compress_count, write_count
 
 
+def _decode_prefill_plan(plan_bytes: torch.Tensor) -> torch.Tensor:
+    """Decode packed PrefillPlan tensor ([N, 16] uint8) into [N, 4] int64.
+
+    Each plan slot is 4 little-endian uint32:
+    (ragged_id, batch_id, position, window_len). Invalid entries use
+    ``0xFFFFFFFF`` for every field.
+    """
+    cpu = plan_bytes.detach().to("cpu", copy=False).contiguous()
+    arr = cpu.numpy().reshape(-1).view("<u4").reshape(-1, 4).astype("int64")
+    return torch.from_numpy(arr)
+
+
+_INVALID_PLAN = 0xFFFFFFFF
+
+
+def _describe(x: Any) -> str:
+    if isinstance(x, torch.Tensor):
+        return f"Tensor(shape={tuple(x.shape)}, dtype={x.dtype}, device={x.device})"
+    if isinstance(x, (CompressorDecodePlan, CompressorPrefillPlan)):
+        fields = ", ".join(
+            f"{name}={_describe(getattr(x, name))}" for name in x._fields
+        )
+        return f"{type(x).__name__}({fields})"
+    if x is None:
+        return "None"
+    return repr(x)
+
+
+def _torch_compress_forward(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    extra_data: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+    compress_ratio: Literal[4, 128],
+) -> None:
+    if compress_ratio == 4:
+        if plan.is_decode:
+            _torch_c4_decode(
+                kv_score_buffer,
+                kv_score_input,
+                out,
+                ape,
+                indices,
+                plan.seq_lens,
+                extra_data,
+                head_dim=head_dim,
+            )
+        else:
+            _torch_c4_prefill(
+                kv_score_buffer,
+                kv_score_input,
+                out,
+                ape,
+                indices,
+                plan.compress_plan,
+                plan.write_plan,
+                extra_data,
+                head_dim=head_dim,
+            )
+    else:
+        assert compress_ratio == 128
+        if plan.is_decode:
+            _torch_c128_decode(
+                kv_score_buffer,
+                kv_score_input,
+                out,
+                ape,
+                indices,
+                plan.seq_lens,
+                head_dim=head_dim,
+            )
+        else:
+            _torch_c128_prefill(
+                kv_score_buffer,
+                kv_score_input,
+                out,
+                ape,
+                indices,
+                plan.compress_plan,
+                plan.write_plan,
+                extra_data,
+                head_dim=head_dim,
+            )
+
+
+def _softmax_weighted_sum(
+    kv: torch.Tensor,
+    score: torch.Tensor,
+    bias: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Safe softmax over dim=-2 then weighted sum of ``kv``.
+
+    Shapes: ``kv``/``score``/``bias`` all ``[..., S, head_dim]``.
+    Returns ``[..., head_dim]`` cast to ``out_dtype``.
+    """
+    s = (score.float() + bias.float())
+    m = s.amax(dim=-2, keepdim=True)
+    w = (s - m).exp()
+    num = (kv.float() * w).sum(dim=-2)
+    den = w.sum(dim=-2)
+    return (num / den).to(out_dtype)
+
+
+# ---------------------------------------------------------------------------
+# c4 fallback
+# ---------------------------------------------------------------------------
+
+
+def _c4_split_chunks(buf_or_input: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """Split last dim ``head_dim*4`` into ``[..., 4, head_dim]``.
+
+    Layout: ``| kv_overlap | kv | score_overlap | score |``.
+    """
+    return buf_or_input.view(*buf_or_input.shape[:-1], 4, head_dim)
+
+
+def _torch_c4_decode(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extra: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+) -> None:
+    # Determine page mode from buffer shape.
+    page_size = kv_score_buffer.shape[1]
+    paged = page_size == 4
+    assert paged or page_size == 8
+    HD = head_dim
+    B = indices.shape[0]
+    device = kv_score_input.device
+    out_dtype = out.dtype
+
+    indices_i64 = indices.to(torch.int64)
+    seq_lens_i64 = seq_lens.to(torch.int64)
+
+    # 1) write current step into the buffer
+    write_pos = (seq_lens_i64 + (page_size - 1)) % page_size  # [B]
+    kv_score_buffer[indices_i64, write_pos] = kv_score_input.to(kv_score_buffer.dtype)
+
+    # 2) forward only when seq_len % 4 == 0
+    do_fwd = (seq_lens_i64 % 4) == 0
+    if not bool(do_fwd.any()):
+        return
+
+    fwd_idx = do_fwd.nonzero(as_tuple=True)[0]
+    fwd_indices = indices_i64[fwd_idx]  # [F]
+    fwd_seq_lens = seq_lens_i64[fwd_idx]  # [F]
+
+    # Gather 8 slots from buffer for each forward batch.
+    buf4 = _c4_split_chunks(kv_score_buffer, HD)  # [N_idx, page, 4, HD]
+
+    if paged:
+        assert extra is not None, "Page4Align mode requires extra tensor"
+        index_prev = extra.view(-1)[fwd_idx].to(torch.int64)  # [F]
+        # i in [0,8): first 4 use index_prev (overlap), last 4 use index
+        kv_chunks = []
+        score_chunks = []
+        for i in range(8):
+            k = i % 4
+            page_idx = index_prev if i < 4 else fwd_indices
+            chunk_kv = 0 if i < 4 else 1
+            chunk_score = 2 if i < 4 else 3
+            kv_chunks.append(buf4[page_idx, k, chunk_kv])
+            score_chunks.append(buf4[page_idx, k, chunk_score])
+    else:
+        # Ring buffer of size 8.
+        kv_chunks = []
+        score_chunks = []
+        for i in range(8):
+            k = (fwd_seq_lens + i) % 8
+            chunk_kv = 0 if i < 4 else 1
+            chunk_score = 2 if i < 4 else 3
+            kv_chunks.append(buf4[fwd_indices, k, chunk_kv])
+            score_chunks.append(buf4[fwd_indices, k, chunk_score])
+
+    kv_stack = torch.stack(kv_chunks, dim=1)  # [F, 8, HD]
+    score_stack = torch.stack(score_chunks, dim=1)
+    bias = ape.unsqueeze(0).expand(kv_stack.shape[0], -1, -1)  # [F, 8, HD]
+
+    # seq_len == 4 special case: zero overlap kv, -inf overlap score.
+    sl4 = (fwd_seq_lens == 4)
+    if bool(sl4.any()):
+        sl4_b = sl4.view(-1, 1, 1)
+        zero = torch.zeros((), dtype=kv_stack.dtype, device=device)
+        ninf = torch.full((), -1e9, dtype=score_stack.dtype, device=device)
+        head_mask = torch.zeros(8, dtype=torch.bool, device=device)
+        head_mask[:4] = True
+        full_mask = sl4_b & head_mask.view(1, 8, 1)
+        kv_stack = torch.where(full_mask, zero, kv_stack)
+        score_stack = torch.where(full_mask, ninf, score_stack)
+
+    result = _softmax_weighted_sum(kv_stack, score_stack, bias, out_dtype)
+    out[fwd_idx] = result
+
+
+def _torch_c4_prefill(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    compress_plan: torch.Tensor,
+    write_plan: torch.Tensor,
+    extra: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+) -> None:
+    page_size = kv_score_buffer.shape[1]
+    paged = page_size == 4
+    assert paged or page_size == 8
+    HD = head_dim
+    device = kv_score_input.device
+    indices_i64 = indices.to(torch.int64)
+
+    # Decode plans on CPU then move valid entries to device.
+    cplan_cpu = _decode_prefill_plan(compress_plan)  # [Nc, 4] int64
+    wplan_cpu = _decode_prefill_plan(write_plan)  # [Nw, 4] int64
+
+    extra_i64: Optional[torch.Tensor] = None
+    if paged:
+        assert extra is not None, "Page4Align c4 prefill requires extra tensor"
+        extra_i64 = extra.to(torch.int64)
+
+    # NOTE: order matches the CUDA kernel launches in c4.cuh: compress
+    # (reads buffer) runs BEFORE write (mutates buffer). Reversing the order
+    # would feed write-modified slots into compress and corrupt the output.
+
+    # ---- compress plan ----------------------------------------------------
+    valid_c = (cplan_cpu[:, 0] != _INVALID_PLAN)
+    if bool(valid_c.any()):
+        cp = cplan_cpu[valid_c].to(device)
+        ragged_ids = cp[:, 0]
+        batch_ids = cp[:, 1]
+        positions = cp[:, 2]
+        window_lens = cp[:, 3]
+        seq_lens = positions + 1  # [N]
+        N = ragged_ids.shape[0]
+
+        buf4 = _c4_split_chunks(kv_score_buffer, HD)  # [N_idx, page, 4, HD]
+        inp4 = _c4_split_chunks(kv_score_input, HD)  # [N_q, 4, HD]
+
+        if paged:
+            assert extra_i64 is not None
+            load_first_page = extra_i64[batch_ids, 0]
+            load_second_page = extra_i64[batch_ids, 1]
+            # Choose per-i page: window_len <= 4 means both halves use second
+            # page; otherwise overlap (i<4) uses first, normal (i>=4) uses
+            # second.
+            wl_le_4 = window_lens <= 4
+
+        kv_chunks = []
+        score_chunks = []
+        for i in range(8):
+            chunk_kv = 0 if i < 4 else 1
+            chunk_score = 2 if i < 4 else 3
+            use_buf = (i < window_lens)  # [N] bool
+
+            # Buffer source.
+            if paged:
+                if i < 4:
+                    page_idx = torch.where(
+                        wl_le_4, load_second_page, load_first_page
+                    )
+                else:
+                    page_idx = load_second_page
+                k_buf = torch.full_like(positions, i % 4)
+                buf_kv = buf4[page_idx, k_buf, chunk_kv]
+                buf_score = buf4[page_idx, k_buf, chunk_score]
+            else:
+                page_idx = indices_i64[batch_ids]
+                k_buf = (seq_lens + i) % 8
+                buf_kv = buf4[page_idx, k_buf, chunk_kv]
+                buf_score = buf4[page_idx, k_buf, chunk_score]
+
+            # Ragged tail source (k = i - 7 <= 0).
+            rag_off = (ragged_ids + (i - 7)).clamp(min=0)
+            rag_kv = inp4[rag_off, chunk_kv]
+            rag_score = inp4[rag_off, chunk_score]
+
+            ub = use_buf.unsqueeze(-1)
+            kv_chunks.append(torch.where(ub, buf_kv, rag_kv))
+            score_chunks.append(torch.where(ub, buf_score, rag_score))
+
+        kv_stack = torch.stack(kv_chunks, dim=1)  # [N, 8, HD]
+        score_stack = torch.stack(score_chunks, dim=1)
+        bias = ape.unsqueeze(0).expand(N, -1, -1)
+
+        sl4 = (seq_lens == 4)
+        if bool(sl4.any()):
+            sl4_b = sl4.view(-1, 1, 1)
+            zero = torch.zeros((), dtype=kv_stack.dtype, device=device)
+            ninf = torch.full((), -1e9, dtype=score_stack.dtype, device=device)
+            head_mask = torch.zeros(8, dtype=torch.bool, device=device)
+            head_mask[:4] = True
+            full_mask = sl4_b & head_mask.view(1, 8, 1)
+            kv_stack = torch.where(full_mask, zero, kv_stack)
+            score_stack = torch.where(full_mask, ninf, score_stack)
+
+        result = _softmax_weighted_sum(kv_stack, score_stack, bias, out.dtype)
+        out[ragged_ids] = result
+
+    # ---- write plan (must run AFTER compress) ----------------------------
+    _torch_c4_prefill_write(
+        kv_score_buffer,
+        kv_score_input,
+        indices_i64,
+        extra_i64,
+        wplan_cpu,
+        paged,
+        device,
+    )
+
+
+def _torch_c4_prefill_write(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    indices_i64: torch.Tensor,
+    extra_i64: Optional[torch.Tensor],
+    wplan_cpu: torch.Tensor,
+    paged: bool,
+    device: torch.device,
+) -> None:
+    valid_w = (wplan_cpu[:, 0] != _INVALID_PLAN)
+    if not bool(valid_w.any()):
+        return
+    wp = wplan_cpu[valid_w].to(device)
+    ragged_ids = wp[:, 0]
+    batch_ids = wp[:, 1]
+    positions = wp[:, 2]
+    if paged:
+        assert extra_i64 is not None
+        last_pos = extra_i64[batch_ids, 3]
+        write_first_page = extra_i64[batch_ids, 2]
+        write_second_page = indices_i64[batch_ids]
+        tgt_index = torch.where(
+            positions < last_pos, write_first_page, write_second_page
+        )
+        tgt_pos = positions % 4
+    else:
+        tgt_index = indices_i64[batch_ids]
+        tgt_pos = positions % 8
+    kv_score_buffer[tgt_index, tgt_pos] = kv_score_input[ragged_ids].to(
+        kv_score_buffer.dtype
+    )
+
+
+# ---------------------------------------------------------------------------
+# c128 fallback
+# ---------------------------------------------------------------------------
+
+
+def _c128_split_chunks(buf_or_input: torch.Tensor, head_dim: int) -> torch.Tensor:
+    """Split last dim ``head_dim*2`` into ``[..., 2, head_dim]``.
+
+    Layout: ``| kv | score |``.
+    """
+    return buf_or_input.view(*buf_or_input.shape[:-1], 2, head_dim)
+
+
+def _torch_c128_decode(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    head_dim: int,
+) -> None:
+    HD = head_dim
+    device = kv_score_input.device
+    indices_i64 = indices.to(torch.int64)
+    seq_lens_i64 = seq_lens.to(torch.int64)
+
+    # 1) write current step at (seq_len + 127) % 128.
+    write_pos = (seq_lens_i64 + 127) % 128
+    kv_score_buffer[indices_i64, write_pos] = kv_score_input.to(kv_score_buffer.dtype)
+
+    # 2) forward only when seq_len % 128 == 0; window_len = 128 (all from buf).
+    do_fwd = (seq_lens_i64 % 128) == 0
+    if not bool(do_fwd.any()):
+        return
+    fwd_idx = do_fwd.nonzero(as_tuple=True)[0]
+    fwd_indices = indices_i64[fwd_idx]
+
+    buf2 = _c128_split_chunks(kv_score_buffer, HD)  # [N_idx, 128, 2, HD]
+    gathered = buf2[fwd_indices]  # [F, 128, 2, HD]
+    kv = gathered[..., 0, :]  # [F, 128, HD]
+    score = gathered[..., 1, :]
+    bias = ape.unsqueeze(0).expand(kv.shape[0], -1, -1)
+    out[fwd_idx] = _softmax_weighted_sum(kv, score, bias, out.dtype)
+
+
+def _torch_c128_prefill(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    compress_plan: torch.Tensor,
+    write_plan: torch.Tensor,
+    extra: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+) -> None:
+    HD = head_dim
+    device = kv_score_input.device
+    indices_i64 = indices.to(torch.int64)
+    # extra is optional load_indices; falls back to indices when absent.
+    load_indices_i64 = (
+        extra.to(torch.int64) if extra is not None else indices_i64
+    )
+
+    cplan_cpu = _decode_prefill_plan(compress_plan)
+    wplan_cpu = _decode_prefill_plan(write_plan)
+
+    # NOTE: order matches the CUDA kernel launches in c128.cuh: compress
+    # (reads buffer) runs BEFORE write (mutates buffer). Reversing the order
+    # would feed write-modified slots into compress and corrupt the output.
+
+    # ---- compress plan (uses `load_indices`) -----------------------------
+    valid_c = (cplan_cpu[:, 0] != _INVALID_PLAN)
+    if bool(valid_c.any()):
+        cp = cplan_cpu[valid_c].to(device)
+        ragged_ids = cp[:, 0]
+        batch_ids = cp[:, 1]
+        window_lens = cp[:, 3]
+        N = ragged_ids.shape[0]
+
+        buf2 = _c128_split_chunks(kv_score_buffer, HD)  # [N_idx, 128, 2, HD]
+        inp2 = _c128_split_chunks(kv_score_input, HD)  # [N_q, 2, HD]
+
+        page_idx = load_indices_i64[batch_ids]  # [N]
+        buf_slot = buf2[page_idx]  # [N, 128, 2, HD]
+        buf_kv = buf_slot[..., 0, :]  # [N, 128, HD]
+        buf_score = buf_slot[..., 1, :]
+
+        j = torch.arange(128, device=device, dtype=torch.int64)
+        rag_off = (ragged_ids.unsqueeze(1) + (j.unsqueeze(0) - 127)).clamp(
+            min=0
+        )  # [N, 128]
+        rag_kv = inp2[..., 0, :][rag_off]  # [N, 128, HD]
+        rag_score = inp2[..., 1, :][rag_off]
+
+        use_buf = (j.unsqueeze(0) < window_lens.unsqueeze(1)).unsqueeze(
+            -1
+        )  # [N,128,1]
+        kv = torch.where(use_buf, buf_kv, rag_kv)
+        score = torch.where(use_buf, buf_score, rag_score)
+        bias = ape.unsqueeze(0).expand(N, -1, -1)  # [N, 128, HD]
+
+        out[ragged_ids] = _softmax_weighted_sum(kv, score, bias, out.dtype)
+
+    # ---- write plan (uses `indices`, must run AFTER compress) ------------
+    valid_w = (wplan_cpu[:, 0] != _INVALID_PLAN)
+    if bool(valid_w.any()):
+        wp = wplan_cpu[valid_w].to(device)
+        ragged_ids = wp[:, 0]
+        batch_ids = wp[:, 1]
+        positions = wp[:, 2]
+        tgt_index = indices_i64[batch_ids]
+        tgt_pos = positions % 128
+        kv_score_buffer[tgt_index, tgt_pos] = kv_score_input[ragged_ids].to(
+            kv_score_buffer.dtype
+        )
+
+
+# ---------------------------------------------------------------------------
+# Triton fallbacks for non-CUDA backends (XPU/AMD).
+#
+# These kernels mirror the CUDA c{4,128} kernels exactly. They replace the
+# pure-torch path above, which materializes [B, 128, HD] / [N, 128, HD]
+# intermediates and runs several full-tensor torch.where passes per layer.
+# Triton fuses the gather + softmax + weighted-sum into a single program per
+# (work_item, head_dim_split), which avoids the intermediate allocations and
+# the multi-kernel store/load chain.
+#
+# Layout reminders (matching the C++ kernels):
+#   c4 buffer:  [N_idx, page_size, 4*HD]  | kv_overlap | kv | score_ovr | score |
+#               page_size = 4 (paged) or 8 (ring)
+#   c4 input:   [N_q,                4*HD] same chunk layout
+#   c128 buffer:[N_idx, 128,         2*HD] | kv | score |
+#   c128 input: [N_q,                2*HD] same chunk layout
+#   ape:        [SEQ, HD]   SEQ = 8 for c4, 128 for c128
+#
+# Plan tensor on entry is [N_plan, 16] uint8; we view it as int32 [N_plan, 4]:
+#   (ragged_id, batch_id, position, window_len), with 0xFFFFFFFF (== -1 as
+#   int32) as the invalid sentinel.
+# ---------------------------------------------------------------------------
+
+
+def _pick_block_hd(head_dim: int) -> int:
+    # Triton tiles need power-of-two; HD is always a multiple of 128 here.
+    return head_dim if head_dim <= 128 else 128
+
+
+# --- c128 decode -----------------------------------------------------------
+
+
+@triton.jit
+def _triton_c128_decode_kernel(
+    buf_ptr,            # [N_idx, 128, 2*HD]
+    inp_ptr,            # [B, 2*HD]
+    out_ptr,            # [B, HD]
+    ape_ptr,            # [128, HD]
+    indices_ptr,        # [B] int32
+    seq_lens_ptr,       # [B] int32
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+):
+    SEQ: tl.constexpr = 128
+    pid_b = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    index = tl.load(indices_ptr + pid_b).to(tl.int64)
+    seq_len = tl.load(seq_lens_ptr + pid_b).to(tl.int64)
+
+    offs_hd = pid_s * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    hd_mask = offs_hd < HD
+
+    # Load the current step's kv + score (input chunks 0 and 1).
+    inp_base = inp_ptr + pid_b * (2 * HD)
+    inp_kv = tl.load(inp_base + offs_hd, mask=hd_mask)
+    inp_score = tl.load(inp_base + HD + offs_hd, mask=hd_mask)
+
+    do_fwd = (seq_len % SEQ) == 0
+
+    if do_fwd:
+        # When seq_len % 128 == 0, write_pos == 127. Read positions 0..126
+        # from the buffer; supply position 127 from `inp_kv`/`inp_score`
+        # directly to avoid depending on store-then-load coherence inside
+        # the same program.
+        offs_s = tl.arange(0, SEQ)
+        is_last = (offs_s == (SEQ - 1))[:, None]
+
+        slot_off_2d = (
+            index * (SEQ * 2 * HD)
+            + offs_s[:, None].to(tl.int64) * (2 * HD)
+            + offs_hd[None, :].to(tl.int64)
+        )
+        load_mask = (~is_last) & hd_mask[None, :]
+        buf_kv = tl.load(buf_ptr + slot_off_2d, mask=load_mask, other=0.0).to(tl.float32)
+        buf_score = tl.load(buf_ptr + slot_off_2d + HD, mask=load_mask, other=0.0).to(tl.float32)
+
+        kv_t = tl.where(is_last, inp_kv[None, :].to(tl.float32), buf_kv)
+        score_t = tl.where(is_last, inp_score[None, :].to(tl.float32), buf_score)
+
+        bias = tl.load(
+            ape_ptr + offs_s[:, None] * HD + offs_hd[None, :],
+            mask=hd_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        s = score_t + bias
+        m = tl.max(s, axis=0)
+        w = tl.exp(s - m[None, :])
+        num = tl.sum(kv_t * w, axis=0)
+        den = tl.sum(w, axis=0)
+        result = num / den
+
+        tl.store(out_ptr + pid_b * HD + offs_hd, result, mask=hd_mask)
+
+    # Always commit the current step into the buffer at write_pos. Done last
+    # so the conditional forward above never reads our own pending store.
+    write_pos = (seq_len + (SEQ - 1)) % SEQ
+    write_base = buf_ptr + index * (SEQ * 2 * HD) + write_pos * (2 * HD)
+    tl.store(write_base + offs_hd, inp_kv, mask=hd_mask)
+    tl.store(write_base + HD + offs_hd, inp_score, mask=hd_mask)
+
+
+# --- c128 prefill ----------------------------------------------------------
+
+
+@triton.jit
+def _triton_c128_prefill_compress_kernel(
+    buf_ptr,
+    inp_ptr,
+    out_ptr,
+    ape_ptr,
+    plan_ptr,           # [N_plan, 4] int32 (ragged_id, batch_id, position, window_len)
+    load_indices_ptr,   # [B] int32  (== `indices` when no extra is provided)
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+):
+    SEQ: tl.constexpr = 128
+    pid_p = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    plan_base = plan_ptr + pid_p * 4
+    ragged_id = tl.load(plan_base + 0)
+    batch_id = tl.load(plan_base + 1)
+    window_len = tl.load(plan_base + 3)
+
+    if ragged_id == -1:
+        return
+
+    index = tl.load(load_indices_ptr + batch_id.to(tl.int64)).to(tl.int64)
+
+    offs_hd = pid_s * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    hd_mask = offs_hd < HD
+
+    offs_s = tl.arange(0, SEQ)
+    use_buf = (offs_s < window_len)[:, None]
+
+    # Buffer source (j < window_len).
+    buf_off_2d = (
+        index * (SEQ * 2 * HD)
+        + offs_s[:, None].to(tl.int64) * (2 * HD)
+        + offs_hd[None, :].to(tl.int64)
+    )
+    buf_load_mask = use_buf & hd_mask[None, :]
+    buf_kv = tl.load(buf_ptr + buf_off_2d, mask=buf_load_mask, other=0.0).to(tl.float32)
+    buf_score = tl.load(buf_ptr + buf_off_2d + HD, mask=buf_load_mask, other=0.0).to(tl.float32)
+
+    # Ragged tail source: rag_off = max(ragged_id + j - 127, 0).
+    rag_off = tl.maximum(
+        ragged_id.to(tl.int64) + offs_s.to(tl.int64) - (SEQ - 1), 0
+    )
+    rag_off_2d = rag_off[:, None] * (2 * HD) + offs_hd[None, :].to(tl.int64)
+    rag_load_mask = (~use_buf) & hd_mask[None, :]
+    rag_kv = tl.load(inp_ptr + rag_off_2d, mask=rag_load_mask, other=0.0).to(tl.float32)
+    rag_score = tl.load(inp_ptr + rag_off_2d + HD, mask=rag_load_mask, other=0.0).to(tl.float32)
+
+    kv_t = tl.where(use_buf, buf_kv, rag_kv)
+    score_t = tl.where(use_buf, buf_score, rag_score)
+
+    bias = tl.load(
+        ape_ptr + offs_s[:, None] * HD + offs_hd[None, :],
+        mask=hd_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    s = score_t + bias
+    m = tl.max(s, axis=0)
+    w = tl.exp(s - m[None, :])
+    num = tl.sum(kv_t * w, axis=0)
+    den = tl.sum(w, axis=0)
+    result = num / den
+
+    tl.store(out_ptr + ragged_id.to(tl.int64) * HD + offs_hd, result, mask=hd_mask)
+
+
+@triton.jit
+def _triton_c128_prefill_write_kernel(
+    buf_ptr,
+    inp_ptr,
+    plan_ptr,
+    indices_ptr,
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+):
+    SEQ: tl.constexpr = 128
+    pid_p = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    plan_base = plan_ptr + pid_p * 4
+    ragged_id = tl.load(plan_base + 0)
+    batch_id = tl.load(plan_base + 1)
+    position = tl.load(plan_base + 2)
+
+    if ragged_id == -1:
+        return
+
+    index = tl.load(indices_ptr + batch_id.to(tl.int64)).to(tl.int64)
+
+    offs_hd = pid_s * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    hd_mask = offs_hd < HD
+
+    pos = (position % SEQ).to(tl.int64)
+    src_base = inp_ptr + ragged_id.to(tl.int64) * (2 * HD)
+    tgt_base = buf_ptr + index * (SEQ * 2 * HD) + pos * (2 * HD)
+
+    src_kv = tl.load(src_base + offs_hd, mask=hd_mask)
+    src_score = tl.load(src_base + HD + offs_hd, mask=hd_mask)
+    tl.store(tgt_base + offs_hd, src_kv, mask=hd_mask)
+    tl.store(tgt_base + HD + offs_hd, src_score, mask=hd_mask)
+
+
+# --- c4 decode -------------------------------------------------------------
+
+
+@triton.jit
+def _triton_c4_decode_kernel(
+    buf_ptr,
+    inp_ptr,
+    out_ptr,
+    ape_ptr,
+    indices_ptr,
+    seq_lens_ptr,
+    extra_ptr,            # [B] int32 (index_prev) for paged; ignored for ring
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,    # 4 (paged) or 8 (ring)
+):
+    SEQ: tl.constexpr = 8
+    NUM_CHUNKS: tl.constexpr = 4
+    PAGED: tl.constexpr = (PAGE_SIZE == 4)
+    STRIDE_IDX: tl.constexpr = PAGE_SIZE * NUM_CHUNKS * HD
+    STRIDE_POS: tl.constexpr = NUM_CHUNKS * HD
+
+    pid_b = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    index = tl.load(indices_ptr + pid_b).to(tl.int64)
+    seq_len = tl.load(seq_lens_ptr + pid_b).to(tl.int64)
+
+    offs_hd = pid_s * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    hd_mask = offs_hd < HD
+
+    # Input chunks (0=kv_ovr, 1=kv, 2=score_ovr, 3=score).
+    inp_base = inp_ptr + pid_b * (NUM_CHUNKS * HD)
+    inp_kv_ovr = tl.load(inp_base + 0 * HD + offs_hd, mask=hd_mask)
+    inp_kv = tl.load(inp_base + 1 * HD + offs_hd, mask=hd_mask)
+    inp_score_ovr = tl.load(inp_base + 2 * HD + offs_hd, mask=hd_mask)
+    inp_score = tl.load(inp_base + 3 * HD + offs_hd, mask=hd_mask)
+
+    do_fwd = (seq_len % 4) == 0
+
+    if do_fwd:
+        offs_s = tl.arange(0, SEQ)
+        chunk_kv_off = tl.where(offs_s < 4, 0, HD).to(tl.int64)
+        chunk_score_off = chunk_kv_off + 2 * HD
+
+        if PAGED:
+            index_prev = tl.load(extra_ptr + pid_b).to(tl.int64)
+            page_idx = tl.where(offs_s < 4, index_prev, index)
+            slot_pos = (offs_s % 4).to(tl.int64)
+            slot_base_2d = page_idx[:, None] * STRIDE_IDX + slot_pos[:, None] * STRIDE_POS
+        else:
+            slot_pos = (seq_len + offs_s.to(tl.int64)) % 8
+            slot_base_2d = index * STRIDE_IDX + slot_pos[:, None] * STRIDE_POS
+
+        kv_off_2d = slot_base_2d + chunk_kv_off[:, None] + offs_hd[None, :].to(tl.int64)
+        score_off_2d = slot_base_2d + chunk_score_off[:, None] + offs_hd[None, :].to(tl.int64)
+
+        # i == 7 (newest entry) is supplied by the input directly to avoid
+        # depending on store-then-load coherence (we may not have written it
+        # yet; even if we had, the buffer write happens at the end).
+        is_i7 = (offs_s == 7)[:, None]
+        load_mask = (~is_i7) & hd_mask[None, :]
+        buf_kv = tl.load(buf_ptr + kv_off_2d, mask=load_mask, other=0.0).to(tl.float32)
+        buf_score = tl.load(buf_ptr + score_off_2d, mask=load_mask, other=0.0).to(tl.float32)
+
+        kv_t = tl.where(is_i7, inp_kv[None, :].to(tl.float32), buf_kv)
+        score_t = tl.where(is_i7, inp_score[None, :].to(tl.float32), buf_score)
+
+        # seq_len == 4 special case: zero overlap kv, -inf overlap score.
+        sl4_active = ((seq_len == 4) & (offs_s < 4))[:, None]
+        kv_t = tl.where(sl4_active, tl.zeros([SEQ, BLOCK_HD], tl.float32), kv_t)
+        score_t = tl.where(
+            sl4_active, tl.full([SEQ, BLOCK_HD], -1e9, tl.float32), score_t
+        )
+
+        bias = tl.load(
+            ape_ptr + offs_s[:, None] * HD + offs_hd[None, :],
+            mask=hd_mask[None, :],
+            other=0.0,
+        ).to(tl.float32)
+
+        s = score_t + bias
+        m = tl.max(s, axis=0)
+        w = tl.exp(s - m[None, :])
+        num = tl.sum(kv_t * w, axis=0)
+        den = tl.sum(w, axis=0)
+        result = num / den
+
+        tl.store(out_ptr + pid_b * HD + offs_hd, result, mask=hd_mask)
+
+    # Always commit the current step (4 chunks) at write_pos.
+    write_pos = (seq_len + PAGE_SIZE - 1) % PAGE_SIZE
+    write_base = buf_ptr + index * STRIDE_IDX + write_pos * STRIDE_POS
+    tl.store(write_base + 0 * HD + offs_hd, inp_kv_ovr, mask=hd_mask)
+    tl.store(write_base + 1 * HD + offs_hd, inp_kv, mask=hd_mask)
+    tl.store(write_base + 2 * HD + offs_hd, inp_score_ovr, mask=hd_mask)
+    tl.store(write_base + 3 * HD + offs_hd, inp_score, mask=hd_mask)
+
+
+# --- c4 prefill ------------------------------------------------------------
+
+
+@triton.jit
+def _triton_c4_prefill_compress_kernel(
+    buf_ptr,
+    inp_ptr,
+    out_ptr,
+    ape_ptr,
+    plan_ptr,
+    indices_ptr,
+    extra_ptr,            # [B, 4] int32 for paged; ignored for ring
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+):
+    SEQ: tl.constexpr = 8
+    NUM_CHUNKS: tl.constexpr = 4
+    PAGED: tl.constexpr = (PAGE_SIZE == 4)
+    STRIDE_IDX: tl.constexpr = PAGE_SIZE * NUM_CHUNKS * HD
+    STRIDE_POS: tl.constexpr = NUM_CHUNKS * HD
+
+    pid_p = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    plan_base = plan_ptr + pid_p * 4
+    ragged_id = tl.load(plan_base + 0)
+    batch_id = tl.load(plan_base + 1)
+    position = tl.load(plan_base + 2)
+    window_len = tl.load(plan_base + 3)
+
+    if ragged_id == -1:
+        return
+
+    seq_len = position + 1
+
+    offs_hd = pid_s * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    hd_mask = offs_hd < HD
+
+    offs_s = tl.arange(0, SEQ)
+    use_buf = (offs_s < window_len)[:, None]
+    chunk_kv_off = tl.where(offs_s < 4, 0, HD).to(tl.int64)
+    chunk_score_off = chunk_kv_off + 2 * HD
+
+    # ---- Buffer offsets ----
+    if PAGED:
+        ex_base = extra_ptr + batch_id.to(tl.int64) * 4
+        load_first_page = tl.load(ex_base + 0).to(tl.int64)
+        load_second_page = tl.load(ex_base + 1).to(tl.int64)
+        # When window_len <= 4 the overlap half is unused, so reuse load_second
+        # to keep loads in-bounds (matches the CUDA kernel's selection).
+        page_idx_overlap = tl.where(window_len <= 4, load_second_page, load_first_page)
+        page_idx = tl.where(offs_s < 4, page_idx_overlap, load_second_page)
+        slot_pos = (offs_s % 4).to(tl.int64)
+        slot_base_2d = page_idx[:, None] * STRIDE_IDX + slot_pos[:, None] * STRIDE_POS
+    else:
+        page_idx_scalar = tl.load(indices_ptr + batch_id.to(tl.int64)).to(tl.int64)
+        slot_pos = (seq_len.to(tl.int64) + offs_s.to(tl.int64)) % 8
+        slot_base_2d = page_idx_scalar * STRIDE_IDX + slot_pos[:, None] * STRIDE_POS
+
+    kv_off_2d = slot_base_2d + chunk_kv_off[:, None] + offs_hd[None, :].to(tl.int64)
+    score_off_2d = slot_base_2d + chunk_score_off[:, None] + offs_hd[None, :].to(tl.int64)
+    buf_load_mask = use_buf & hd_mask[None, :]
+    buf_kv = tl.load(buf_ptr + kv_off_2d, mask=buf_load_mask, other=0.0).to(tl.float32)
+    buf_score = tl.load(buf_ptr + score_off_2d, mask=buf_load_mask, other=0.0).to(tl.float32)
+
+    # ---- Ragged tail offsets: rag_off = max(ragged_id + i - 7, 0) ----
+    rag_off = tl.maximum(ragged_id.to(tl.int64) + offs_s.to(tl.int64) - 7, 0)
+    rag_base_2d = rag_off[:, None] * (NUM_CHUNKS * HD)
+    rag_kv_off_2d = rag_base_2d + chunk_kv_off[:, None] + offs_hd[None, :].to(tl.int64)
+    rag_score_off_2d = rag_base_2d + chunk_score_off[:, None] + offs_hd[None, :].to(tl.int64)
+    rag_load_mask = (~use_buf) & hd_mask[None, :]
+    rag_kv = tl.load(inp_ptr + rag_kv_off_2d, mask=rag_load_mask, other=0.0).to(tl.float32)
+    rag_score = tl.load(inp_ptr + rag_score_off_2d, mask=rag_load_mask, other=0.0).to(tl.float32)
+
+    kv_t = tl.where(use_buf, buf_kv, rag_kv)
+    score_t = tl.where(use_buf, buf_score, rag_score)
+
+    sl4_active = ((seq_len == 4) & (offs_s < 4))[:, None]
+    kv_t = tl.where(sl4_active, tl.zeros([SEQ, BLOCK_HD], tl.float32), kv_t)
+    score_t = tl.where(
+        sl4_active, tl.full([SEQ, BLOCK_HD], -1e9, tl.float32), score_t
+    )
+
+    bias = tl.load(
+        ape_ptr + offs_s[:, None] * HD + offs_hd[None, :],
+        mask=hd_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    s = score_t + bias
+    m = tl.max(s, axis=0)
+    w = tl.exp(s - m[None, :])
+    num = tl.sum(kv_t * w, axis=0)
+    den = tl.sum(w, axis=0)
+    result = num / den
+
+    tl.store(out_ptr + ragged_id.to(tl.int64) * HD + offs_hd, result, mask=hd_mask)
+
+
+@triton.jit
+def _triton_c4_prefill_write_kernel(
+    buf_ptr,
+    inp_ptr,
+    plan_ptr,
+    indices_ptr,
+    extra_ptr,
+    HD: tl.constexpr,
+    BLOCK_HD: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+):
+    NUM_CHUNKS: tl.constexpr = 4
+    PAGED: tl.constexpr = (PAGE_SIZE == 4)
+    STRIDE_IDX: tl.constexpr = PAGE_SIZE * NUM_CHUNKS * HD
+    STRIDE_POS: tl.constexpr = NUM_CHUNKS * HD
+
+    pid_p = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    plan_base = plan_ptr + pid_p * 4
+    ragged_id = tl.load(plan_base + 0)
+    batch_id = tl.load(plan_base + 1)
+    position = tl.load(plan_base + 2)
+
+    if ragged_id == -1:
+        return
+
+    offs_hd = pid_s * BLOCK_HD + tl.arange(0, BLOCK_HD)
+    hd_mask = offs_hd < HD
+
+    if PAGED:
+        ex_base = extra_ptr + batch_id.to(tl.int64) * 4
+        write_first_page = tl.load(ex_base + 2).to(tl.int64)
+        last_pos = tl.load(ex_base + 3)
+        write_second_page = tl.load(indices_ptr + batch_id.to(tl.int64)).to(tl.int64)
+        tgt_index = tl.where(position < last_pos, write_first_page, write_second_page)
+        tgt_pos = (position % 4).to(tl.int64)
+    else:
+        tgt_index = tl.load(indices_ptr + batch_id.to(tl.int64)).to(tl.int64)
+        tgt_pos = (position % 8).to(tl.int64)
+
+    src_base = inp_ptr + ragged_id.to(tl.int64) * (NUM_CHUNKS * HD)
+    tgt_base = buf_ptr + tgt_index * STRIDE_IDX + tgt_pos * STRIDE_POS
+
+    for c in tl.static_range(NUM_CHUNKS):
+        v = tl.load(src_base + c * HD + offs_hd, mask=hd_mask)
+        tl.store(tgt_base + c * HD + offs_hd, v, mask=hd_mask)
+
+
+# --- Triton wrapper functions ----------------------------------------------
+
+
+def _triton_c128_decode(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    *,
+    head_dim: int,
+) -> None:
+    B = indices.shape[0]
+    if B == 0:
+        return
+    BLOCK_HD = _pick_block_hd(head_dim)
+    grid = (B, triton.cdiv(head_dim, BLOCK_HD))
+    _triton_c128_decode_kernel[grid](
+        kv_score_buffer,
+        kv_score_input,
+        out,
+        ape,
+        indices,
+        seq_lens,
+        HD=head_dim,
+        BLOCK_HD=BLOCK_HD,
+    )
+
+
+def _triton_c128_prefill(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    compress_plan_bytes: torch.Tensor,
+    write_plan_bytes: torch.Tensor,
+    extra: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+) -> None:
+    cplan = compress_plan_bytes.view(torch.int32).reshape(-1, 4)
+    wplan = write_plan_bytes.view(torch.int32).reshape(-1, 4)
+    load_indices = extra if extra is not None else indices
+    BLOCK_HD = _pick_block_hd(head_dim)
+    if cplan.shape[0] > 0:
+        grid = (cplan.shape[0], triton.cdiv(head_dim, BLOCK_HD))
+        _triton_c128_prefill_compress_kernel[grid](
+            kv_score_buffer,
+            kv_score_input,
+            out,
+            ape,
+            cplan,
+            load_indices,
+            HD=head_dim,
+            BLOCK_HD=BLOCK_HD,
+        )
+    if wplan.shape[0] > 0:
+        grid = (wplan.shape[0], triton.cdiv(head_dim, BLOCK_HD))
+        _triton_c128_prefill_write_kernel[grid](
+            kv_score_buffer,
+            kv_score_input,
+            wplan,
+            indices,
+            HD=head_dim,
+            BLOCK_HD=BLOCK_HD,
+        )
+
+
+def _triton_c4_decode(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    extra: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+) -> None:
+    B = indices.shape[0]
+    if B == 0:
+        return
+    page_size = kv_score_buffer.shape[1]
+    assert page_size in (4, 8)
+    BLOCK_HD = _pick_block_hd(head_dim)
+    grid = (B, triton.cdiv(head_dim, BLOCK_HD))
+    extra_arg = extra if extra is not None else indices  # dummy ptr for ring
+    _triton_c4_decode_kernel[grid](
+        kv_score_buffer,
+        kv_score_input,
+        out,
+        ape,
+        indices,
+        seq_lens,
+        extra_arg,
+        HD=head_dim,
+        BLOCK_HD=BLOCK_HD,
+        PAGE_SIZE=page_size,
+    )
+
+
+def _triton_c4_prefill(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    compress_plan_bytes: torch.Tensor,
+    write_plan_bytes: torch.Tensor,
+    extra: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+) -> None:
+    page_size = kv_score_buffer.shape[1]
+    assert page_size in (4, 8)
+    BLOCK_HD = _pick_block_hd(head_dim)
+    cplan = compress_plan_bytes.view(torch.int32).reshape(-1, 4)
+    wplan = write_plan_bytes.view(torch.int32).reshape(-1, 4)
+    extra_arg = extra if extra is not None else indices  # dummy ptr for ring
+    if cplan.shape[0] > 0:
+        grid = (cplan.shape[0], triton.cdiv(head_dim, BLOCK_HD))
+        _triton_c4_prefill_compress_kernel[grid](
+            kv_score_buffer,
+            kv_score_input,
+            out,
+            ape,
+            cplan,
+            indices,
+            extra_arg,
+            HD=head_dim,
+            BLOCK_HD=BLOCK_HD,
+            PAGE_SIZE=page_size,
+        )
+    if wplan.shape[0] > 0:
+        grid = (wplan.shape[0], triton.cdiv(head_dim, BLOCK_HD))
+        _triton_c4_prefill_write_kernel[grid](
+            kv_score_buffer,
+            kv_score_input,
+            wplan,
+            indices,
+            extra_arg,
+            HD=head_dim,
+            BLOCK_HD=BLOCK_HD,
+            PAGE_SIZE=page_size,
+        )
+
+
+def _triton_compress_forward(
+    kv_score_buffer: torch.Tensor,
+    kv_score_input: torch.Tensor,
+    out: torch.Tensor,
+    ape: torch.Tensor,
+    indices: torch.Tensor,
+    plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    extra_data: Optional[torch.Tensor],
+    *,
+    head_dim: int,
+    compress_ratio: Literal[4, 128],
+) -> None:
+    if compress_ratio == 4:
+        if plan.is_decode:
+            _triton_c4_decode(
+                kv_score_buffer,
+                kv_score_input,
+                out,
+                ape,
+                indices,
+                plan.seq_lens,
+                extra_data,
+                head_dim=head_dim,
+            )
+        else:
+            _triton_c4_prefill(
+                kv_score_buffer,
+                kv_score_input,
+                out,
+                ape,
+                indices,
+                plan.compress_plan,
+                plan.write_plan,
+                extra_data,
+                head_dim=head_dim,
+            )
+    else:
+        assert compress_ratio == 128
+        if plan.is_decode:
+            _triton_c128_decode(
+                kv_score_buffer,
+                kv_score_input,
+                out,
+                ape,
+                indices,
+                plan.seq_lens,
+                head_dim=head_dim,
+            )
+        else:
+            _triton_c128_prefill(
+                kv_score_buffer,
+                kv_score_input,
+                out,
+                ape,
+                indices,
+                plan.compress_plan,
+                plan.write_plan,
+                extra_data,
+                head_dim=head_dim,
+            )
+
+
 class CompressorDecodePlan(NamedTuple):
     compress_ratio: int
     seq_lens: torch.Tensor
@@ -647,6 +1794,23 @@ def compress_forward(
         online_module = _jit_compress_128_online_module(head_dim=head_dim)
         F = online_module.decode if plan.is_decode else online_module.prefill
         F(kv_score_buffer, kv_score_input, out, ape, indices, *plan[1:], extra_data)
+        return out
+    if _is_xpu:
+        # Triton fallback for non-CUDA backends. Mirrors
+        # FlashCompress{4,128}Kernel in jit_kernel/csrc/deepseek_v4/c{4,128}.cuh.
+        # The pure-torch implementation (`_torch_compress_forward`) is kept
+        # below as a reference / debug fallback.
+        _triton_compress_forward(
+            kv_score_buffer,
+            kv_score_input,
+            out,
+            ape,
+            indices,
+            plan,
+            extra_data,
+            head_dim=head_dim,
+            compress_ratio=compress_ratio,
+        )
         return out
     module = _jit_compress_module(
         head_dim,
