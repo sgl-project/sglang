@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
 from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
     LayerwiseOffloadManager,
 )
-from sglang.multimodal_gen.runtime.utils import (
+from sglang.multimodal_gen.runtime.managers import (
     layerwise_offload as layerwise_offload_mod,
 )
 
