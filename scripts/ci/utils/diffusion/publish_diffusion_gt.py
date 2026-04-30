@@ -138,9 +138,7 @@ def publish(source_dir, target_dir=None):
                 return
 
             try:
-                tree_items = create_blobs(
-                    REPO_OWNER, REPO_NAME, changed_files, token
-                )
+                tree_items = create_blobs(REPO_OWNER, REPO_NAME, changed_files, token)
             except Exception as e:
                 if is_rate_limit_error(e):
                     print("Rate-limited during blob creation, skipping.")
