@@ -234,6 +234,16 @@ install_sglang() {
     echo "Installing python extras: [${EXTRAS}]"
     $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
 
+    # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
+    # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
+    # If the file is missing, force-reinstall the wheel before downstream steps.
+    SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
+    if [ ! -f "$SITE_PACKAGES/nvidia/cusparselt/lib/libcusparseLt.so.0" ] \
+       && pip show nvidia-cusparselt-cu13 >/dev/null 2>&1; then
+        echo "WARNING: nvidia-cusparselt-cu13 metadata present but libcusparseLt.so.0 missing — reinstalling"
+        $PIP_CMD install --reinstall nvidia-cusparselt-cu13 $PIP_INSTALL_SUFFIX
+    fi
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
@@ -266,9 +276,12 @@ install_sglang_kernel() {
         fi
     fi
 
-    # Reinstall torch with matching CUDA version if needed
+    # Reinstall torch with matching CUDA version if needed.
+    # Read the CUDA tag from the installed wheel's local-version label (e.g. 2.9.1+cu130 → cu130)
+    # rather than `import torch`: importing torch dlopens libcusparseLt etc., which can fail when
+    # the matching nvidia-* wheel left only its .dist-info on disk (#23592 follow-up).
     # TODO: Remove after torch 2.11 where cu13 is enabled by default
-    TORCH_CUDA_VER=$(python3 -c "import torch; v=torch.version.cuda; parts=v.split('.'); print(f'cu{parts[0]}{parts[1]}')")
+    TORCH_CUDA_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed -n 's/.*+\(cu[0-9]\+\).*/\1/p')
     echo "Detected torch CUDA version: ${TORCH_CUDA_VER}"
     if [ "${TORCH_CUDA_VER}" != "${CU_VERSION}" ]; then
         TORCH_VER=$(pip show torch 2>/dev/null | grep "^Version:" | awk '{print $2}' | sed 's/+.*//')
@@ -488,7 +501,6 @@ main() {
     setup_pip_toolchain
     uninstall_stale_flashinfer
     install_sglang
-    setup_ld_library_path
     install_sglang_kernel
     install_sglang_router
     download_flashinfer_cache
@@ -497,6 +509,7 @@ main() {
     fix_nvidia_deps
     install_test_tools
     prepare_runner
+    setup_ld_library_path
     verify_imports
 }
 
