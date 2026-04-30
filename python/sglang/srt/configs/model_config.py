@@ -371,6 +371,12 @@ class ModelConfig:
             self.hf_config.architectures[0] = "ExaoneMoEForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Exaone4_5_ForConditionalGeneration"
+        ):
+            self.hf_config.architectures[0] = "Exaone4_5_MTP"
+
         if is_draft_model and self.hf_config.architectures[0] == "NemotronHForCausalLM":
             self.hf_config.architectures[0] = "NemotronHForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1
@@ -785,7 +791,6 @@ class ModelConfig:
             if not is_local:
                 # Conditional import based on SGLANG_USE_MODELSCOPE environment variable
                 if envs.SGLANG_USE_MODELSCOPE.get():
-
                     from modelscope import HubApi, model_file_download
 
                     hf_api = HubApi()
@@ -1515,8 +1520,7 @@ def compute_mla_mscale_scaling(rope_scaling: dict, base_scaling: float) -> float
     mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
     if "factor" not in rope_scaling:
         logger.warning(
-            "rope_scaling missing 'factor', defaulting to 1.0. "
-            "Check model accuracy.",
+            "rope_scaling missing 'factor', defaulting to 1.0. Check model accuracy.",
         )
     scaling_factor = rope_scaling.get("factor", 1.0)
     mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
