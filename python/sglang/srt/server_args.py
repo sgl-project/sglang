@@ -870,6 +870,30 @@ class ServerArgs:
                     "indexes KV pool slots that no longer hold real data."
                 )
 
+            # Context-parallel prefill stages K/V through cp_allgather_and_save_kv_cache,
+            # which writes to the pool via set_kv_buffer. NoOpMHATokenToKVPool intentionally
+            # raises on writes, so the engine would boot fine but fail on the first request.
+            if self.attn_cp_size > 1:
+                raise ValueError(
+                    "--prefill-only-disable-kv-cache is incompatible with --attn-cp-size > 1: "
+                    "the context-parallel attention path writes K/V to the pool via set_kv_buffer, "
+                    "which the no-op pool intentionally rejects."
+                )
+            if self.enable_prefill_context_parallel:
+                raise ValueError(
+                    "--prefill-only-disable-kv-cache is incompatible with "
+                    "--enable-prefill-context-parallel: the prefill-CP path stages K/V through "
+                    "the paged cache, which the no-op pool does not support."
+                )
+
+            # HiSparse selects a different pool class (HiSparseNSATokenToKVPool /
+            # HiSparseTokenToKVPoolAllocator) that is not the no-op pool.
+            if self.enable_hisparse:
+                raise ValueError(
+                    "--prefill-only-disable-kv-cache is incompatible with --enable-hisparse: "
+                    "HiSparse uses a dedicated pool family that is not the no-op MHA pool."
+                )
+
         self._maybe_download_model_for_runai()
 
         # Normalize load balancing defaults early (before dummy-model short-circuit).

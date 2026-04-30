@@ -725,6 +725,25 @@ class ModelRunnerKVCacheMixin:
                     swa_allocator.full_to_swa_index_mapping
                 )
 
+        # When --prefill-only-disable-kv-cache is set we expect the no-op pool to
+        # have been selected. MLA, NSA, SWA, Mamba, NPU, FP4 etc. take other
+        # branches above and would silently allocate a real pool — fail fast
+        # with a clear message so users understand which configs are supported.
+        if (
+            self.server_args.prefill_only_disable_kv_cache
+            and not self.is_draft_worker
+            and not isinstance(self.token_to_kv_pool, NoOpMHATokenToKVPool)
+        ):
+            raise RuntimeError(
+                "--prefill-only-disable-kv-cache expected NoOpMHATokenToKVPool but the "
+                f"runtime pool is {type(self.token_to_kv_pool).__name__}. This pool "
+                "family is not yet supported by --prefill-only-disable-kv-cache. "
+                "Supported configurations today: plain MHA models on CUDA with the FA "
+                "(fa3/fa4) prefill backend, --is-embedding, --chunked-prefill-size=-1, "
+                "--disable-radix-cache, no context-parallel attention, no HiSparse, "
+                "and --kv-cache-dtype != fp4_e2m1."
+            )
+
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
         """Apply external constraints to token capacity: user cap, PP sync.
 
