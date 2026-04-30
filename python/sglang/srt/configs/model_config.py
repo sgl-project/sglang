@@ -1586,6 +1586,8 @@ multimodal_model_archs = [
 
 piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV32ForCausalLM",
+    "DeepseekV4ForCausalLM",
+    "DeepseekV4ForCausalLMNextN",
     "Qwen3NextForCausalLM",
     "GlmMoeDsaForCausalLM",
     "BailingMoeV2_5ForCausalLM",
