@@ -118,8 +118,14 @@ class DoubleSparseAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
-        **kwargs,
+        sinks=None,
+        q_rope=None,
+        k_rope=None,
     ):
+        if sinks is not None or q_rope is not None or k_rope is not None:
+            raise NotImplementedError(
+                "DoubleSparseAttnBackend does not support sinks / split RoPE"
+            )
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -173,8 +179,14 @@ class DoubleSparseAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
-        **kwargs,
+        sinks=None,
+        q_rope=None,
+        k_rope=None,
     ):
+        if sinks is not None or q_rope is not None or k_rope is not None:
+            raise NotImplementedError(
+                "DoubleSparseAttnBackend does not support sinks / split RoPE"
+            )
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
         q = q.reshape(-1, layer.tp_q_head_num * layer.qk_head_dim)
