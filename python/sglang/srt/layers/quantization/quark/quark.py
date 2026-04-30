@@ -394,6 +394,7 @@ class QuarkConfig(QuantizationConfig):
             for layer in self.exclude_layers
         )
 
+
 class QuarkLinearMethod(LinearMethodBase):
 
     def __init__(self, quantization_config: QuarkConfig):
