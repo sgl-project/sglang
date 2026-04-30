@@ -93,14 +93,14 @@ struct ActivationKernel {
 
   template <bool kFilterExpert>
   static auto select_kernel(const std::string& type)
-      -> decltype(ActivationKernel<T, kUsePDL>::template activation_kernel<ActivationKind::kSiLU, kFilterExpert>) {
+      -> decltype(ActivationKernel::template activation_kernel<ActivationKind::kSiLU, kFilterExpert>) {
     using namespace host;
     if (type == "silu") {
-      return ActivationKernel<T, kUsePDL>::template activation_kernel<ActivationKind::kSiLU, kFilterExpert>;
+      return ActivationKernel::template activation_kernel<ActivationKind::kSiLU, kFilterExpert>;
     } else if (type == "gelu") {
-      return ActivationKernel<T, kUsePDL>::template activation_kernel<ActivationKind::kGELU, kFilterExpert>;
+      return ActivationKernel::template activation_kernel<ActivationKind::kGELU, kFilterExpert>;
     } else if (type == "gelu_tanh") {
-      return ActivationKernel<T, kUsePDL>::template activation_kernel<ActivationKind::kGELUTanh, kFilterExpert>;
+      return ActivationKernel::template activation_kernel<ActivationKind::kGELUTanh, kFilterExpert>;
     } else {
       Panic("unsupported activation type: ", type);
     }
@@ -150,10 +150,10 @@ struct ActivationKernel {
     };
     if (expert_ids != nullptr) {
       RuntimeCheck(expert_step > 0, "expert_step must be positive");
-      const auto kernel = ActivationKernel<T, kUsePDL>::template select_kernel<true>(type);
+      const auto kernel = ActivationKernel::template select_kernel<true>(type);
       LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
     } else {
-      const auto kernel = ActivationKernel<T, kUsePDL>::template select_kernel<false>(type);
+      const auto kernel = ActivationKernel::template select_kernel<false>(type);
       LaunchKernel(num_blocks, kBlockSize, device).enable_pdl(kUsePDL)(kernel, params);
     }
   }
