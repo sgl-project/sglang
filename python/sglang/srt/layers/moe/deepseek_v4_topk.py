@@ -33,7 +33,6 @@ _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     _mask_topk_ids_padded_region,
-    _maybe_override_topk_ids_random,
 )
 
 
@@ -125,9 +124,6 @@ class HashTopK(nn.Module):
             input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0]
         ), f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
 
-        if envs.SGLANG_HACK_FORCE_TID2EID_ZERO.get():
-            self.tid2eid.zero_()
-
         if envs.SGLANG_OPT_USE_FUSED_HASH_TOPK.get():
             from sglang.jit_kernel.deepseek_v4 import hash_topk
 
@@ -145,7 +141,6 @@ class HashTopK(nn.Module):
         if is_hip():
             topk_weights = topk_weights.to(torch.float32)
 
-        topk_ids = _maybe_override_topk_ids_random(topk_ids, self.num_experts)
         topk_ids = topk_ids_logical_to_physical(topk_ids, expert_location_dispatch_info)
         _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
         topk_output = StandardTopKOutput(

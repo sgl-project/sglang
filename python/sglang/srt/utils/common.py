@@ -687,6 +687,16 @@ def make_layers_non_pp(
     return layers
 
 
+def get_dispatch_device_backend():
+    if is_cuda_alike():
+        dispatch_key = "CUDA"
+    elif is_xpu():
+        dispatch_key = "XPU"
+    else:
+        raise RuntimeError("No supported accelerator (CUDA/XPU) available")
+    return dispatch_key
+
+
 @lru_cache(maxsize=1)
 def get_device_module():
     return torch.get_device_module()
@@ -699,6 +709,8 @@ def set_random_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    if torch.xpu.is_available():
+        torch.xpu.manual_seed_all(seed)
 
 
 def load_audio(
@@ -1947,6 +1959,8 @@ def get_device_count() -> int:
 def get_device_core_count(device_id: int = 0) -> int:
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_properties(device_id).multi_processor_count
+    elif hasattr(torch, "xpu") and torch.xpu.is_available():
+        return torch.xpu.get_device_properties(device_id).gpu_eu_count
 
     return 0
 
@@ -2262,6 +2276,11 @@ class SafeUnpickler(pickle.Unpickler):
             f"Blocked unsafe class loading ({module}.{name}), "
             f"to prevent exploitation of CVE-2025-10164"
         )
+
+
+def safe_pickle_load(fp):
+    """Drop-in replacement for pickle.load() that blocks unsafe class loading."""
+    return SafeUnpickler(fp).load()
 
 
 def debug_timing(func):

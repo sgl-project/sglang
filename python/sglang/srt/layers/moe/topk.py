@@ -324,10 +324,7 @@ class TopK(MultiPlatformOp):
             output_format = TopKOutputFormat.TRITON_KERNEL
         elif get_moe_runner_backend().is_flashinfer_trtllm() or (
             get_moe_runner_backend().is_flashinfer_mxfp4()
-            and not (
-                envs.SGLANG_DSV4_MODE.get() == "2604"
-                and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-            )
+            and not envs.SGLANG_DSV4_FP4_EXPERTS.get()
         ):
             output_format = TopKOutputFormat.BYPASSED
         else:
@@ -787,16 +784,6 @@ def _mask_topk_ids_padded_region(
         topk_ids[indices >= num_token_non_padded, :] = -1
 
 
-def _maybe_override_topk_ids_random(
-    topk_ids: torch.Tensor, num_experts: int
-) -> torch.Tensor:
-    if not envs.SGLANG_HACK_OVERRIDE_TOPK_IDS_RANDOM.get() or topk_ids.numel() == 0:
-        return topk_ids
-    n_tokens, k = topk_ids.shape
-    scores = torch.rand(n_tokens, num_experts, device=topk_ids.device)
-    return scores.topk(k, dim=-1).indices.to(topk_ids.dtype)
-
-
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
@@ -924,7 +911,6 @@ def biased_grouped_topk_gpu(
         # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
         if _is_cuda and num_experts == 384 and num_expert_group == 1:
-            assert False, "dpsk should not use kimi"
             return kimi_k2_moe_fused_gate(
                 gating_output.to(dtype=torch.float32),
                 correction_bias,
@@ -1271,9 +1257,6 @@ def select_experts(
         expert_location_dispatch_info=expert_location_dispatch_info,
     )
 
-    topk_ids = _maybe_override_topk_ids_random(
-        topk_ids, num_experts=router_logits.shape[-1]
-    )
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)

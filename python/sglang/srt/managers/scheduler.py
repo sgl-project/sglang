@@ -2362,6 +2362,7 @@ class Scheduler(
         self.tree_cache.cache_unfinished_req(req, chunked=True)
 
     def _build_hisparse_decode_batch(self, reqs):
+        """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
         device = self.device
 
         batch = ScheduleBatch.init_new(

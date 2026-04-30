@@ -464,10 +464,7 @@ class DeepseekV2MoE(nn.Module):
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
 
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            n_hash_layers = config.num_hash_layers
-        else:
-            n_hash_layers = getattr(config, "n_hash_layers", 0)
+        n_hash_layers = config.num_hash_layers
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
 
         if self.tp_size > config.n_routed_experts:
@@ -656,8 +653,7 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            assert hasattr(self, "shared_experts")
+        assert hasattr(self, "shared_experts")
 
     def get_moe_weights(self):
         return [
@@ -1194,9 +1190,6 @@ class DeepseekV2MoE(nn.Module):
         forward_batch: Optional[ForwardBatch] = None,
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-            deepseek_v4_moe_code_path_checker,
-        )
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         num_tokens = hidden_states.shape[0]
@@ -1207,7 +1200,6 @@ class DeepseekV2MoE(nn.Module):
             and num_tokens > 0
             and get_is_capture_mode()
         )
-        deepseek_v4_moe_code_path_checker.observed += 1
 
         if sbo_overlap_flag:
             current_stream = torch.cuda.current_stream()

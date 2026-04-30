@@ -16,9 +16,6 @@ from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
-from sglang.srt.layers.attention.nsa.utils import (
-    assert_tensor_identical_across_cp_ranks,
-)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.metadata import DeepseekV4Metadata
@@ -120,12 +117,6 @@ class CompressorBackend:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch)
-        if envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get():
-            assert_tensor_identical_across_cp_ranks(
-                new_compressed_kv,
-                tag=f"compressor(ratio={compressor.ratio}) layer_id={layer_id}",
-                forward_batch=forward_batch,
-            )
         core_metadata = self.forward_metadata.core_metadata
         out_loc = (
             core_metadata.c4_out_loc
@@ -157,12 +148,6 @@ class CompressorBackend:
             assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
 
         new_compressed_kv = compressor(x, forward_batch)
-        if envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get():
-            assert_tensor_identical_across_cp_ranks(
-                new_compressed_kv,
-                tag=f"indexer_compressor(ratio={compressor.ratio}) layer_id={layer_id}",
-                forward_batch=forward_batch,
-            )
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             token_to_kv_pool.set_index_k_fused(
                 layer_id=layer_id,
@@ -276,11 +261,6 @@ def create_paged_compressor_data(
             use_cuda_graph=use_prefill_cuda_graph,
             **plan_kwargs,
         )
-        _maybe_dump_metadata_extras(
-            token_to_kv_pool=token_to_kv_pool,
-            compress_ratio=compress_ratio,
-            plan=plan,
-        )
     else:
         write_positions = clip_down(seq_lens - 1)
         write_loc = get_raw_loc(write_positions)
@@ -292,27 +272,3 @@ def create_paged_compressor_data(
         plan = CompressorDecodePlan(compress_ratio, seq_lens.to(torch.int32))
 
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
-
-
-def _maybe_dump_metadata_extras(
-    *,
-    token_to_kv_pool: DeepSeekV4TokenToKVPool,
-    compress_ratio: int,
-    plan: CompressorPrefillPlan,
-) -> None:
-    from sglang.jit_kernel.deepseek_v4 import maybe_dump_compress_metadata_extras
-
-    try:
-        ratio_idx = list(token_to_kv_pool.compression_ratios).index(compress_ratio)
-        pool = token_to_kv_pool.compress_state_pools[ratio_idx]
-        kv = pool.kv_score_buffer.kv_score
-        shape, dtype = kv.shape, kv.dtype
-    except (AttributeError, ValueError, IndexError):
-        return
-    maybe_dump_compress_metadata_extras(
-        compress_ratio=compress_ratio,
-        kv_score_buffer_shape=shape,
-        kv_score_buffer_dtype=dtype,
-        plan_compress_plan=plan.compress_plan,
-        plan_write_plan=plan.write_plan,
-    )

@@ -659,10 +659,6 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
 
-    assert not get_bool_env_var(
-        "SGLANG_HACK_DEEPGEMM_W8A8_FORCE_TRITON"
-    ), "removed flag"
-
     if not (shape_supported and dtype_supported):
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
@@ -672,8 +668,6 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             weight_scale = _unpack_ue8m0_scale_for_triton(
                 weight_scale, weight.shape, block_size
             )
-
-        assert not get_bool_env_var("SGLANG_HACK_CUSTOM_W8A8_GEMM"), "removed flag"
 
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias

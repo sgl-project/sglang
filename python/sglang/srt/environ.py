@@ -409,12 +409,6 @@ class Envs:
     SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK = EnvInt(128)
     SGLANG_DEEPEP_LL_COMBINE_SEND_NUM_SMS = EnvInt(32)
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
-    SGLANG_HACK_OVERRIDE_TOPK_IDS_RANDOM = EnvBool(False)
-    SGLANG_HACK_FORCE_TID2EID_ZERO = EnvBool(False)
-    # Workaround torch.profiler+kineto first-call dropping all GPU events on
-    # PyTorch 2.9.1 + CUDA 13.0 + GB300. Run a tiny dummy 1-kernel profile at
-    # first start() to warm CUPTI activity callbacks. See journal 0427_011.
-    SGLANG_HACK_WARMUP_KINETO = EnvBool(False)
 
     # NIXL-EP
     SGLANG_NIXL_EP_BF16_DISPATCH = EnvBool(False)
@@ -561,15 +555,11 @@ class Envs:
     SGLANG_REASONING_EFFORT = EnvStr("")
 
     SGLANG_DSV4_ISOLATE = EnvInt(False)
-    SGLANG_DSV4_MODE = EnvStr("2604")
-    SGLANG_DSV4_2604_SUBMODE = EnvStr("2604B")
-    SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)  # Set False when using FP4-to-FP8 converted checkpoint with 2604 config
+    SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)  # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint
     SGLANG_OPT_HISPARSE_C4_SHRINK = EnvInt(1)
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
-    SGLANG_HACK_FLASHMLA_BACKEND = EnvStr("kernel")
-    SGLANG_HACK_SKIP_FP4_FP8_GEMM = EnvBool(False)
     SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
 
 
@@ -589,7 +579,8 @@ class Envs:
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
     SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM = EnvBool(True)  # verified in journal 2026-04-21-017
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
-    SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(True)
+    # TODO(DSV4): @ispobock this has bug on main branch when retract
+    SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
     SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD = EnvBool(True)
@@ -598,14 +589,8 @@ class Envs:
     SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
     SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
     SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE = EnvInt(-1)
-    SGLANG_DSV4_FIX_ATTN_PADDING = EnvBool(True)  # verified in journal 2026-04-21-017
     SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
-    SGLANG_DEBUG_SANITY_CHECK_CONFIG = EnvBool(False)
-    SGLANG_DEBUG_HACK_CP_ASSERT_PURE_EXTEND = EnvBool(False)
-    SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)
-    SGLANG_OPT_FIX_APE_2604 = EnvBool(True)
-    SGLANG_OPT_CP_REARRANGE_TRITON = EnvBool(True)
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
     SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH = EnvBool(True)
@@ -615,12 +600,10 @@ class Envs:
     SGLANG_OPT_FIX_NEXTN_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(False)
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
-    SGLANG_FIX_DSV4_BASE_MODEL_LOAD = EnvBool(False)
     SGLANG_HANDLE_C128_PREFILL_KERNEL = EnvBool(False)
-    SGLANG_HACK_DEBUG_DUMP_CREATE_PAGED_COMPRESS_DATA = EnvStr("")
     SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
 
-    # Dangerous untested flagas
+    # Dangerous untested flags
     SGLANG_OPT_USE_FAST_MASK_EP = EnvBool(False)
     SGLANG_OPT_USE_FLASHINFER_NORM = EnvBool(False)
 
@@ -658,14 +641,6 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
-from functools import lru_cache
-
-
-@lru_cache(maxsize=1)
-def is_large_dummy_model() -> bool:
-    return os.environ.get("SGLANG_HACK_ASSERT_CKPT_VERSION") == "large-dummy"
-
-
 def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):
     if old_name in os.environ:
         if new_name is None:
@@ -694,9 +669,6 @@ def _convert_SGL_to_SGLANG():
     _print_deprecated_env(
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
-    )
-    _print_deprecated_env(
-        "SGLANG_ADVANCED_CUDA_GRAPH_CAPTURE", "SGLANG_PREP_IN_CUDA_GRAPH"
     )
     _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
     _deprecated_ms_to_s = {

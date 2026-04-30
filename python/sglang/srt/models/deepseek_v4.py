@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import os
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, List, Literal, Optional, Set, Tuple
 
 import torch
@@ -15,21 +13,16 @@ import triton.language as tl
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import fused_rope, linear_bf16_fp32, rmsnorm_self
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
-from sglang.srt.distributed.parallel_state import get_moe_expert_parallel_world_size
-from sglang.srt.environ import envs, is_large_dummy_model
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 from sglang.srt.layers.attention.nsa.utils import (
-    assert_tensor_identical_across_cp_ranks,
     can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
-from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
+from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
@@ -188,12 +181,11 @@ class Compressor(nn.Module):
         self.dim = config.hidden_size
         self.head_dim = head_dim
         self.rope_head_dim = getattr(config, "qk_rope_head_dim", 64)
-        self.nope_head_dim = head_dim - self.rope_head_dim
         assert compress_ratio != 0, "compress_ratio should not be 0"
         self.ratio = compress_ratio
         self.overlap = self.ratio == 4
         self.rotate = rotate
-        self.coff = coff = 1 + self.overlap
+        coff = 1 + self.overlap
 
         self.ape = nn.Parameter(
             torch.empty(self.ratio, coff * self.head_dim, dtype=torch.float32)
@@ -217,11 +209,9 @@ class Compressor(nn.Module):
         assert not self.ape_converted
         self.ape_converted = True
 
-        is_model_2604 = envs.SGLANG_DSV4_MODE.get() == "2604"
-        if self.overlap and (envs.SGLANG_OPT_FIX_APE_2604.get() or not is_model_2604):
-            orders = [0, 1] if is_model_2604 else [1, 0]
+        if self.overlap:
             ape = torch.chunk(self.ape.data, 2, dim=-1)
-            ape = torch.cat([ape[orders[0]], ape[orders[1]]], dim=0)
+            ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
     def _get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
@@ -290,8 +280,6 @@ class Compressor(nn.Module):
             assert x.shape[0] == 0
             return x.new_empty(0, self.head_dim)
 
-        self.forward_mode = forward_batch.forward_mode
-
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
         if nsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
@@ -320,7 +308,6 @@ class C4Indexer(nn.Module):
         self.n_heads = config.index_n_heads
         self.head_dim = config.index_head_dim
         self.rope_head_dim = config.qk_rope_head_dim
-        self.index_topk = config.index_topk
         self.q_lora_rank = config.q_lora_rank
         self.softmax_scale = self.head_dim**-0.5
         self.n_local_heads = self.n_heads
@@ -424,10 +411,7 @@ class MQALayer(nn.Module):
         self.layer_id = layer_id
         self.dim = config.hidden_size
         self.qk_rope_head_dim = config.qk_rope_head_dim
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            self.qk_nope_head_dim = config.head_dim - config.qk_rope_head_dim
-        else:
-            self.qk_nope_head_dim = config.qk_nope_head_dim
+        self.qk_nope_head_dim = config.head_dim - config.qk_rope_head_dim
         self.head_dim = self.qk_rope_head_dim + self.qk_nope_head_dim
         self.n_heads = config.num_attention_heads
         self.n_local_heads = self.n_heads // attn_tp_size
@@ -447,20 +431,13 @@ class MQALayer(nn.Module):
         assert compress_ratio in [0, 4, 128]
         self.compress_ratio: Literal[0, 4, 128] = compress_ratio
 
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            assert self.head_dim == config.head_dim
-        else:
-            assert self.head_dim == config.v_head_dim
+        assert self.head_dim == config.head_dim
         assert config.num_key_value_heads == 1
 
         rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
-        if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get():
-            assert (
-                config.compress_rope_theta == 160000
-            ), f"{config.compress_rope_theta=}"
         rope_base = config.compress_rope_theta if self.compress_ratio else rope_theta
 
         self.rotary_emb = get_rope_wrapper(
@@ -475,25 +452,11 @@ class MQALayer(nn.Module):
 
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get():
-                assert rope_scaling["factor"] == 16
-        elif envs.SGLANG_DSV4_MODE.get() == "2601":
-            if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get():
-                assert rope_scaling["factor"] == 4
-        else:
-            raise NotImplementedError
-
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            assert self.compress_ratio in {0, 4, 128}
-            if self.compress_ratio:
-                original_seq_len = rope_scaling["original_max_position_embeddings"]
-                if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get():
-                    assert original_seq_len == 65536
-            else:
-                original_seq_len = 0
-        else:
+        assert self.compress_ratio in {0, 4, 128}
+        if self.compress_ratio:
             original_seq_len = rope_scaling["original_max_position_embeddings"]
+        else:
+            original_seq_len = 0
 
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
@@ -788,12 +751,6 @@ class MQALayer(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
-            if envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get():
-                assert_tensor_identical_across_cp_ranks(
-                    kv,
-                    tag=f"kv_after_allgather layer_id={self.layer_id}",
-                    forward_batch=forward_batch,
-                )
 
         if self.overlap_store_cache:
             attn_backend.store_cache(
@@ -923,7 +880,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
-        self.is_nextn = is_nextn
         self.self_attn = MQALayer(
             config=config,
             layer_id=layer_id,
@@ -933,15 +889,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             compress_ratio_override=compress_ratio_override,
         )
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
-        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
         self.mlp = deepseek_v2.DeepseekV2MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
@@ -972,12 +919,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            first_k_dense_replace = 0
-            moe_layer_freq = 1
-        else:
-            first_k_dense_replace = self.config.first_k_dense_replace
-            moe_layer_freq = self.config.moe_layer_freq
+        first_k_dense_replace = 0
+        moe_layer_freq = 1
         return is_nextn or (
             self.config.n_routed_experts is not None
             and layer_id >= first_k_dense_replace
@@ -1095,9 +1038,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            assert deepseek_v4_moe_code_path_checker.observed == 0
-
         residual = hidden_states
         hidden_states, post, comb = self.hc_pre(
             hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
@@ -1165,10 +1105,6 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            assert deepseek_v4_moe_code_path_checker.observed == 1
-            deepseek_v4_moe_code_path_checker.observed = 0
-
         return hidden_states
 
 
@@ -1182,10 +1118,7 @@ class DeepseekV4Model(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.padding_id = config.pad_token_id
-        self.vocab_size = config.vocab_size
         self.pp_group = get_pp_group()
-        self.first_k_dense_replace = config.first_k_dense_replace
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
@@ -1210,12 +1143,6 @@ class DeepseekV4Model(nn.Module):
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gemm_output_zero_allocator_size = 0
-        self.layers_to_capture = []
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            self.enable_a2a_moe = True
-        else:
-            self.enable_a2a_moe = False
-
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
         self.norm_eps = config.rms_norm_eps
@@ -1288,36 +1215,8 @@ class DeepseekV4Model(nn.Module):
             input_ids_global = input_ids
 
         if nsa_use_prefill_cp(forward_batch):
-            _check_rank_consistency = (
-                envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get()
-            )
-            if _check_rank_consistency:
-                _pre_split_hidden_states = hidden_states.clone()
-                _pre_split_positions = positions.clone()
             hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
-            if _check_rank_consistency:
-                _gathered_hidden = cp_all_gather_rerange_output(
-                    hidden_states,
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
-                assert torch.equal(_gathered_hidden, _pre_split_hidden_states), (
-                    "SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY: "
-                    "cp_split_and_rebuild_data ∘ cp_all_gather_rerange_output is not identity on hidden_states. "
-                    "Round-robin split/gather helpers are inconsistent."
-                )
-                _gathered_positions = cp_all_gather_rerange_output(
-                    positions.unsqueeze(-1),
-                    self.cp_size,
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                ).squeeze(-1)
-                assert torch.equal(_gathered_positions, _pre_split_positions), (
-                    "SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY: "
-                    "cp_split_and_rebuild_position ∘ cp_all_gather_rerange_output is not identity on positions."
-                )
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -1338,10 +1237,7 @@ class DeepseekV4Model(nn.Module):
             )
 
         pre_hc_head = (
-            hidden_states.flatten(1)
-            if envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
-            else None
+            hidden_states.flatten(1) if envs.SGLANG_FIX_MTP_HC_HIDDEN.get() else None
         )
 
         hidden_states = self.hc_head(
@@ -1406,42 +1302,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         if get_global_server_args().disable_shared_experts_fusion:
             return
 
-        disable_reason = None
-        if self.config.n_routed_experts != 256 or self.config.n_shared_experts != 1:
-            disable_reason = "Config not support fused shared expert(s)."
-        elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
-            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
-        ):
-            disable_reason = (
-                "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
-                "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
-            )
-        elif get_moe_expert_parallel_world_size() > 1 and (
-            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
-        ):
-            disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
-        elif disable_reason is None and get_moe_a2a_backend().is_deepep():
-            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
-        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
-            disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
-        elif (
-            envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        ):
-            disable_reason = "2604 routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
-
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            disable_reason = "2604B checkpoint requires different clamping for shared and routed experts"
-
-        if disable_reason is not None:
-            get_global_server_args().disable_shared_experts_fusion = True
-            self.num_fused_shared_experts = 0
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
+        get_global_server_args().disable_shared_experts_fusion = True
+        log_info_on_rank0(
+            logger,
+            "DeepSeek V4 requires different clamping for shared and routed experts. "
+            "Shared experts fusion optimization is disabled.",
+        )
 
     @torch.no_grad()
     def forward(
@@ -1469,10 +1335,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         pre_hc_head = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
-        if (
-            envs.SGLANG_FIX_MTP_HC_HIDDEN.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
-        ):
+        if envs.SGLANG_FIX_MTP_HC_HIDDEN.get():
             hidden_states, pre_hc_head = hidden_states
         return self.logits_processor(
             input_ids,
@@ -1585,22 +1448,6 @@ class DeepseekV4ForCausalLM(nn.Module):
         return name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        assert envs.SGLANG_DSV4_MODE.get() in ["2601", "2604"]
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            assert envs.SGLANG_DSV4_2604_SUBMODE.get() in ["2604A", "2604B"]
-        else:
-            assert envs.SGLANG_DSV4_2604_SUBMODE.get() == ""
-
-        if (
-            envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get()
-            and envs.SGLANG_DSV4_MODE.get() == "2604"
-        ):
-            _debug_assert_model_path_configs()
-        if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get() and is_large_dummy_model():
-            assert (
-                envs.SGLANG_HACK_OVERRIDE_TOPK_IDS_RANDOM.get()
-            ), "dummy model must use SGLANG_HACK_OVERRIDE_TOPK_IDS_RANDOM"
-
         if MOE_BIT_WISE_EQUAL_MODE:
             assert (
                 self.num_fused_shared_experts == 0
@@ -1621,27 +1468,14 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
-        if (
-            envs.SGLANG_DSV4_MODE.get() == "2604"
-            and not envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
-        ):
-            if envs.SGLANG_FIX_DSV4_BASE_MODEL_LOAD.get():
-                weights = list(weights)
-                exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
-                if exists_wo_a_scale:
-                    logger.info("Execute dequant fp8 wo_a")
-                    weights = _dequant_fp8_wo_a(weights)
-                else:
-                    logger.info("Skip dequant fp8 wo_a")
+        if not envs.SGLANG_OPT_FP8_WO_A_GEMM.get():
+            weights = list(weights)
+            exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
+            if exists_wo_a_scale:
+                logger.info("Execute dequant fp8 wo_a")
+                weights = _dequant_fp8_wo_a(weights)
             else:
-                # ----------------------------- legacy code ------------------------------
-                if envs.SGLANG_DSV4_FP4_EXPERTS.get():
-                    weights = _dequant_fp8_wo_a(weights)
-                else:
-                    weights = (
-                        (n, t) for n, t in weights if not n.endswith(".wo_a.scale")
-                    )
-                # ------------------------------------------------------------------------
+                logger.info("Skip dequant fp8 wo_a")
 
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
@@ -1931,11 +1765,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                 for skipped_checking_pattern in skipped_checking_patterns
             )
         }
-        if os.environ.get("SGLANG_SKIP_CHECKPOINT_LOAD_CHECK", "0") == "0":
-            if unloaded_params:
-                raise RuntimeError(
-                    f"Some weights are not initialized from checkpoints: {unloaded_params}"
-                )
+        if unloaded_params:
+            logger.warning(
+                f"Some weights are not initialized from checkpoints: {unloaded_params}"
+            )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
@@ -1972,9 +1805,6 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
         torch.float8_e8m0fnu,
         torch.float32,
     ), f"expected fp8_e8m0fnu or float32, got {scale.dtype}"
-    if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get() and not is_large_dummy_model():
-        assert weight.shape == (8192, 4096), f"unexpected weight shape {weight.shape}"
-        assert scale.shape == (64, 32), f"unexpected scale shape {scale.shape}"
 
     weight_f32 = rearrange(
         weight.float(), "(sn bn) (sk bk) -> sn bn sk bk", bn=128, bk=128
@@ -1982,8 +1812,6 @@ def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     result = rearrange(
         weight_f32 * scale.float()[:, None, :, None], "sn bn sk bk -> (sn bn) (sk bk)"
     )
-    if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get() and not is_large_dummy_model():
-        assert result.shape == (8192, 4096)
 
     return result.to(torch.bfloat16)
 
@@ -2070,31 +1898,3 @@ def _dequant_fp8_wo_a(
         yield name, _dequant_fp8(weight, scale)
 
     yield from weights_dict.items()
-
-
-def _debug_assert_model_path_configs() -> None:
-    assert_ckpt_version = os.environ.get("SGLANG_HACK_ASSERT_CKPT_VERSION", "v1")
-
-    model_path = Path(get_global_server_args().model_path)
-    ref_dir = (
-        Path(__file__).resolve().parents[4]
-        / "deepseek_v4"
-        / "assembled_hf_config_0409"
-        / assert_ckpt_version
-    )
-    for ref_file in ref_dir.iterdir():
-        if ref_file.name in ["apply.py", "create.py", "README.md"]:
-            continue
-        user_file = model_path / ref_file.name
-        if not user_file.exists():
-            raise AssertionError(
-                f"2604 mode: expected {ref_file.name} in model_path {model_path}, but not found"
-            )
-        if user_file.read_bytes() != ref_file.read_bytes():
-            raise AssertionError(
-                f"2604 mode: {ref_file.name} in model_path differs from reference.\n"
-                f"  model_path: {user_file}\n"
-                f"  reference:  {ref_file}\n"
-                f"  Please use the files generated by deepseek_v4/assembled_hf_config_0409/create.py"
-            )
-    logger.info("2604 mode: all config files match reference (bytewise equal)")

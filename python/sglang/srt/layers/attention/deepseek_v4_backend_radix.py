@@ -7,7 +7,6 @@ import warnings
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
-    Callable,
     Dict,
     List,
     Literal,
@@ -31,9 +30,6 @@ from sglang.srt.layers.attention.compressed.indexer import C4IndexerBackend
 from sglang.srt.layers.attention.compressed.metadata import (
     PagedIndexerMetadata,
     maybe_copy_inplace,
-)
-from sglang.srt.layers.attention.debug_flash_mla_adapter import (
-    flash_mla_with_kvcache_entrypoint,
 )
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
@@ -380,7 +376,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}
-        self.debug_dump_hook: Optional[Callable] = None
         self.swa_page_size = 128
         assert model_runner.page_size is not None
         assert model_runner.req_to_token_pool is not None
@@ -597,7 +592,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         extend_seq_lens = raw_metadata.extend_seq_lens
 
         seq_lens_casual, req_pool_indices_repeated = (
-            self.expend_extend_with_same_length(
+            self.expand_extend_with_same_length(
                 bs, num_draft_tokens, seq_lens, req_pool_indices
             )
         )
@@ -744,8 +739,6 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
 
         self.forward_metadata = metadata
-        if h := self.debug_dump_hook:
-            h("init_forward_metadata_output", metadata)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
         self.decode_cuda_graph_shared_data = _DecodeCudaGraphSharedData()
@@ -1094,7 +1087,9 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                     extra_indices.shape[-1] % 64 == 0
                 ), f"{extra_indices.shape=}'s last dimension is not aligned to 64"
 
-            input_dict = dict(
+            import flash_mla
+
+            o = flash_mla.flash_mla_with_kvcache(
                 q=q,
                 k_cache=swa_k_cache,
                 head_dim_v=self.head_dim_v,
@@ -1109,10 +1104,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 extra_k_cache=extra_k_cache,
                 extra_indices_in_kvcache=extra_indices,
                 extra_topk_length=extra_topk_lengths,
-            )
-
-            backend = envs.SGLANG_HACK_FLASHMLA_BACKEND.get()
-            o = flash_mla_with_kvcache_entrypoint(**input_dict, backend=backend)[0]
+            )[0]
 
             o = o.squeeze(1)
             return o
@@ -1139,15 +1131,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         assert offset == num_tokens
         req_pool_indices_repeated = req_pool_indices[idx_to_req_repeated]
 
-        _need_pad = (
-            is_nsa_prefill_cp_round_robin_split()
-            or envs.SGLANG_DSV4_FIX_ATTN_PADDING.get()
-        )
-        if (
-            _need_pad
-            and padded_num_tokens is not None
-            and padded_num_tokens > num_tokens
-        ):
+        if padded_num_tokens is not None and padded_num_tokens > num_tokens:
             pad_size = padded_num_tokens - num_tokens
             seq_lens_casual = torch.nn.functional.pad(
                 seq_lens_casual,
@@ -1162,7 +1146,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
 
         return seq_lens_casual, req_pool_indices_repeated
 
-    def expend_extend_with_same_length(
+    def expand_extend_with_same_length(
         self,
         bs: int,
         qo_len: int,

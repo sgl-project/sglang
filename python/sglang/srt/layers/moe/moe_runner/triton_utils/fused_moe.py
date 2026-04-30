@@ -11,9 +11,6 @@ import torch
 import torch.nn.functional as F
 import triton.language as tl
 
-from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-    deepseek_v4_moe_code_path_checker,
-)
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_padding_size
@@ -541,40 +538,34 @@ def _fused_moe_kernel_sequence(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
         else:
-            # DSv4 2604B submode: optional swiglu clamp before silu_and_mul.
+            # DeepSeek V4: optional swiglu clamp before silu_and_mul.
             # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
             #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
-            is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
-            assert is_2604b == (swiglu_limit is not None), (
-                f"swiglu_limit must be non-None iff submode=2604B "
-                f"(got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, swiglu_limit={swiglu_limit!r})"
-            )
+            assert (
+                swiglu_limit is not None
+            ), f"swiglu_limit must be non-None for DeepSeek V4 (got {swiglu_limit!r})"
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
-            if is_2604b:
-                assert swiglu_limit == 10
-                assert intermediate_cache1.shape == (total_tokens, N)
-                assert (
-                    _is_cuda or _is_hip
-                ), "DSV4 2604 submode 2604B only supports CUDA/HIP downstream"
+            assert swiglu_limit == 10
+            assert intermediate_cache1.shape == (total_tokens, N)
+            assert _is_cuda or _is_hip, "DeepSeek V4 only supports CUDA/HIP downstream"
 
-                if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
-                    if filter_expert:
-                        swiglu_limit_for_triton = swiglu_limit
-                    else:
-                        assert (
-                            _is_cuda
-                        ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
-                        swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
+            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+                if filter_expert:
+                    swiglu_limit_for_triton = swiglu_limit
                 else:
-                    half = N // 2
-                    intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
-                    intermediate_cache1[:, half:].clamp_(
-                        min=-swiglu_limit, max=swiglu_limit
-                    )
-                    deepseek_v4_moe_code_path_checker.observed += 1
+                    assert (
+                        _is_cuda
+                    ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
+                    swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
+            else:
+                half = N // 2
+                intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
+                intermediate_cache1[:, half:].clamp_(
+                    min=-swiglu_limit, max=swiglu_limit
+                )
 
             if _is_cuda or _is_hip or _is_xpu:
                 if not filter_expert:
@@ -602,7 +593,7 @@ def _fused_moe_kernel_sequence(
                         swiglu_limit=swiglu_limit_for_triton,
                     )
             elif _is_musa:
-                # MUSA: explicit clamp_ above (fusion=False path) handles 2604B;
+                # MUSA: explicit clamp_ above (fusion=False path) handles DeepSeek V4;
                 # _silu_and_mul_musa does not accept swiglu_limit.
                 intermediate_cache2 = _silu_and_mul_musa(
                     intermediate_cache1.view(-1, N)

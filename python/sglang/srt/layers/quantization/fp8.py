@@ -14,7 +14,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.environ import envs, is_large_dummy_model
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -257,8 +257,7 @@ class Fp8Config(QuantizationConfig):
             fp8_method = Fp8MoEMethod(self)
 
             if (
-                envs.SGLANG_DSV4_MODE.get() == "2604"
-                and envs.SGLANG_DSV4_FP4_EXPERTS.get()
+                envs.SGLANG_DSV4_FP4_EXPERTS.get()
                 and get_moe_runner_backend().is_flashinfer_mxfp4()
             ):
                 from sglang.srt.layers.quantization.mxfp4_deepseek import (
@@ -815,9 +814,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.is_fp4_expert = (
-            envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        )
+        self.is_fp4_expert = envs.SGLANG_DSV4_FP4_EXPERTS.get()
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
@@ -987,12 +984,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # WEIGHT_SCALES
         if self.is_fp4_expert:
-            if (
-                envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get()
-                and not is_large_dummy_model()
-            ):
-                assert hidden_size == 4096
-                assert intermediate_size_per_partition == 2048
             fp4_block_k = 32
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
@@ -1186,7 +1177,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
                 if (
                     envs.SGLANG_OPT_DEEPGEMM_SCALE_CONVERT_AT_INIT.get()
-                    and envs.SGLANG_DSV4_MODE.get() == "2604"
                     and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
                     and will_use_deepgemm
                 ):
