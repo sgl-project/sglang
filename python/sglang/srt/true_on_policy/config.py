@@ -72,6 +72,22 @@ def should_disable_fused_qk_norm_mrope() -> bool:
     ).disable_fused_qk_norm_mrope
 
 
+def should_use_deterministic_moe_routing(server_args: Optional[Any] = None) -> bool:
+    return resolve_true_on_policy_runtime_policy(
+        _get_server_args(server_args)
+    ).deterministic_moe_routing
+
+
+def should_use_deterministic_moe_combine(server_args: Optional[Any] = None) -> bool:
+    return resolve_true_on_policy_runtime_policy(
+        _get_server_args(server_args)
+    ).deterministic_moe_combine
+
+
+def get_moe_topk_tiebreak(server_args: Optional[Any] = None) -> Optional[str]:
+    return resolve_true_on_policy_runtime_policy(_get_server_args(server_args)).moe_topk_tiebreak
+
+
 def get_on_policy_rms_norm_kwargs(
     *,
     weight_dtype: Optional[torch.dtype] = None,
