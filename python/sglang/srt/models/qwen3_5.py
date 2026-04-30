@@ -945,6 +945,65 @@ class Qwen3_5ForCausalLM(nn.Module):
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
 
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "out_proj",
+        "in_proj_qkvz",
+        "gate_up_proj",
+        "down_proj",
+        "lm_head",
+    ]
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        config = self.config
+        head_dim = config.head_dim or (config.hidden_size // config.num_attention_heads)
+
+        if module_name == "qkv_proj":
+            attn_output_gate = getattr(config, "attn_output_gate", True)
+            q_heads = config.num_attention_heads * (2 if attn_output_gate else 1)
+            return (
+                config.hidden_size,
+                head_dim * (q_heads + config.num_key_value_heads * 2),
+            )
+        elif module_name == "o_proj":
+            return config.num_attention_heads * head_dim, config.hidden_size
+        elif module_name == "out_proj":
+            value_dim = config.linear_value_head_dim * config.linear_num_value_heads
+            return value_dim, config.hidden_size
+        elif module_name == "in_proj_qkvz":
+            key_dim = config.linear_key_head_dim * config.linear_num_key_heads
+            value_dim = config.linear_value_head_dim * config.linear_num_value_heads
+            return config.hidden_size, key_dim * 2 + value_dim * 2
+        elif module_name == "gate_up_proj":
+            # MoE: shared expert uses shared_expert_intermediate_size
+            # Dense: regular MLP uses intermediate_size
+            is_moe = "moe" in getattr(config, "model_type", "")
+            if is_moe:
+                inter = config.shared_expert_intermediate_size
+            else:
+                inter = config.intermediate_size
+            return config.hidden_size, inter * 2
+        elif module_name == "down_proj":
+            is_moe = "moe" in getattr(config, "model_type", "")
+            if is_moe:
+                inter = config.shared_expert_intermediate_size
+            else:
+                inter = config.intermediate_size
+            return inter, config.hidden_size
+        elif module_name == "gate_up_proj_moe":
+            return config.hidden_size, config.moe_intermediate_size * 2
+        elif module_name == "down_proj_moe":
+            return config.moe_intermediate_size, config.hidden_size
+        elif module_name == "embed_tokens":
+            return config.vocab_size, config.hidden_size
+        elif module_name == "lm_head":
+            return config.hidden_size, config.vocab_size
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
+
     def __init__(
         self,
         config: Qwen3_5TextConfig,
@@ -1386,6 +1445,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
+    supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
+
     def __init__(
         self,
         config: Qwen3_5Config,
@@ -1401,6 +1462,12 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
         self.is_mrope_enabled = "mrope_section" in rope_config
 
         self.deepstack_visual_indexes = self.visual.deepstack_visual_indexes
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        return module_name.startswith("model.layers.")
 
     @property
     def start_layer(self) -> int:
@@ -1532,6 +1599,8 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
     hf_to_sglang_mapper = None
 
+    supported_lora_modules = Qwen3_5ForCausalLM.supported_lora_modules
+
     def __init__(
         self,
         config: Qwen3_5MoeConfig,
@@ -1551,6 +1620,13 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             self.num_fused_shared_experts = self._get_num_fused_shared_experts()
 
         self.enable_shared_expert_fusion = self.num_fused_shared_experts > 0
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int):
+        return self.model.get_hidden_dim(module_name, layer_idx)
+
+    def should_apply_lora(self, module_name: str) -> bool:
+        # Accept all language model layer modules (attention, linear_attn, mlp).
+        return module_name.startswith("model.layers.")
 
     def _get_num_fused_shared_experts(self):
         if not (
