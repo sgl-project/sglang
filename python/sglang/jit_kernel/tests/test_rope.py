@@ -96,8 +96,42 @@ def torch_impl_rope(
     positions: torch.Tensor,
     is_neox: bool,
 ) -> None:
-    # TODO: implement a pure-PyTorch reference for extra coverage
-    pass
+    """Pure-PyTorch RoPE reference, works on any device (including XPU).
+
+    Operates in-place on *q* and *k*.  The rotation dimension is
+    ``min(q.shape[-1], cos_sin_cache.shape[-1])`` so the function handles
+    both full-head RoPE and partial-RoPE (where q/k are pre-sliced to rope_dim
+    or are narrower than the cache).
+    """
+    cache_dim = cos_sin_cache.shape[-1]
+    # Actual rotation dim: limited by both q's last dim and the cache.
+    rope_dim = min(q.shape[-1], cache_dim)
+    # cos_sin_cache: [max_pos, cache_dim] — first half cos, second half sin
+    cos = cos_sin_cache[positions, : cache_dim // 2][:, : rope_dim // 2].float()  # [T, rope_dim/2]
+    sin = cos_sin_cache[positions, cache_dim // 2 :][:, : rope_dim // 2].float()  # [T, rope_dim/2]
+
+    def _rotate(x: torch.Tensor) -> None:
+        # x: [T, H, D] where D >= rope_dim; only the first rope_dim elements rotate.
+        half = rope_dim // 2
+        if is_neox:
+            x_f = x[..., :rope_dim].float()
+            x1, x2 = x_f[..., :half], x_f[..., half:]
+            c = cos.unsqueeze(1)  # [T, 1, half]
+            s = sin.unsqueeze(1)
+            x[..., :half] = (x1 * c - x2 * s).to(x.dtype)
+            x[..., half:rope_dim] = (x1 * s + x2 * c).to(x.dtype)
+        else:
+            x_f = x[..., :rope_dim].float()
+            # Reshape to adjacent pairs: [..., half, 2]
+            pairs = x_f.reshape(*x_f.shape[:-1], half, 2)
+            c = cos.unsqueeze(1)  # [T, 1, half]
+            s = sin.unsqueeze(1)
+            x0, x1 = pairs[..., 0], pairs[..., 1]
+            out = torch.stack([x0 * c - x1 * s, x0 * s + x1 * c], dim=-1)
+            x[..., :rope_dim] = out.reshape(*x_f.shape).to(x.dtype)
+
+    _rotate(q)
+    _rotate(k)
 
 
 # ---------------------------------------------------------------------------
@@ -152,21 +186,17 @@ def test_rope(
         sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
         
         atol = rtol = 1e-2
-        if triton is not None:
-            triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
-            triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
-        else:
-            torch.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
-            torch.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
     else:
-        # For XPU, just ensure the kernel runs without errors
-        # TODO: add a PyTorch reference implementation for XPU
+        # For XPU, compare against the pure-PyTorch reference.
+        q_ref, k_ref = q.clone(), k.clone()
+        torch_impl_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
         sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
-        # Basic sanity check: output should not be all zeros or NaN
-        assert not torch.isnan(q_jit).any(), "q_jit contains NaN"
-        assert not torch.isnan(k_jit).any(), "k_jit contains NaN"
-        assert not (q_jit == 0).all(), "q_jit is all zeros"
-        assert not (k_jit == 0).all(), "k_jit is all zeros"
+
+        atol = rtol = 1e-2
+        torch.testing.assert_close(q_ref, q_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_ref, k_jit, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -191,17 +221,16 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
         sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
 
         atol = rtol = 1e-2
-        if triton is not None:
-            triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
-            triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
-        else:
-            torch.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
-            torch.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
     else:
-        # For XPU, just ensure the kernel runs without errors
+        # For XPU, compare against the pure-PyTorch reference.
+        torch_impl_rope(q_fi, k_fi, cos_sin_cache, positions, is_neox)
         sglang_jit_rope(q_jit, k_jit, cos_sin_cache, positions, is_neox)
-        assert not torch.isnan(q_jit).any()
-        assert not torch.isnan(k_jit).any()
+
+        atol = rtol = 1e-2
+        torch.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
@@ -230,17 +259,23 @@ def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: i
         sglang_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
 
         atol = rtol = 1e-2
-        if triton is not None:
-            triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
-            triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
-        else:
-            torch.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
-            torch.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
     else:
-        # For XPU, just ensure the kernel runs without errors
+        # For XPU, compare the first rope_dim elements against the pure-PyTorch
+        # reference, and verify the remainder of each head is unchanged.
+        q_ref, k_ref = q.clone(), k.clone()
+        torch_impl_rope(q_ref[rope], k_ref[rope], cos_sin_cache, positions, is_neox)
         sglang_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
-        assert not torch.isnan(q_jit).any()
-        assert not torch.isnan(k_jit).any()
+
+        atol = rtol = 1e-2
+        # Rotated slice should match the reference.
+        torch.testing.assert_close(q_ref[rope], q_jit[rope], atol=atol, rtol=rtol)
+        torch.testing.assert_close(k_ref[rope], k_jit[rope], atol=atol, rtol=rtol)
+        # Unrotated tail should be unchanged from the original.
+        tail = ..., slice(rope_dim, None)
+        torch.testing.assert_close(q[tail], q_jit[tail])
+        torch.testing.assert_close(k[tail], k_jit[tail])
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
@@ -303,21 +338,20 @@ def test_fused_rope_store(
 
         atol = rtol = 1e-2
         # q should match RoPE-only result
-        if triton is not None:
-            triton.testing.assert_close(q_ref, q_fused, atol=atol, rtol=rtol)
-            # k_cache should contain the rotated k
-            triton.testing.assert_close(
-                k_cache_ref[out_loc], k_cache_fused[out_loc], atol=atol, rtol=rtol
-            )
-        else:
-            torch.testing.assert_close(q_ref, q_fused, atol=atol, rtol=rtol)
-            torch.testing.assert_close(
-                k_cache_ref[out_loc], k_cache_fused[out_loc], atol=atol, rtol=rtol
-            )
+        torch.testing.assert_close(q_ref, q_fused, atol=atol, rtol=rtol)
+        # k_cache should contain the rotated k
+        torch.testing.assert_close(
+            k_cache_ref[out_loc], k_cache_fused[out_loc], atol=atol, rtol=rtol
+        )
         # v_cache should be an exact copy
         assert torch.all(v_cache_ref[out_loc] == v_cache_fused[out_loc]), "v_cache mismatch"
     else:
-        # For XPU, just ensure the kernel runs without errors
+        # For XPU, compare against a pure-PyTorch reference: RoPE + explicit scatter.
+        q_ref, k_ref = q.clone(), k.clone()
+        torch_impl_rope(q_ref, k_ref, cos_sin_cache, positions, is_neox)
+        k_cache_ref[out_loc] = k_ref.view(batch_size, -1)
+        v_cache_ref[out_loc] = v.view(batch_size, -1)
+
         q_fused, k_fused = q.clone(), k.clone()
         v_fused = v.clone()
         apply_rope_inplace_with_kvcache(
@@ -331,14 +365,16 @@ def test_fused_rope_store(
             out_loc,
             is_neox=is_neox,
         )
-        # Basic sanity checks
-        assert not torch.isnan(q_fused).any()
-        assert not torch.isnan(k_fused).any()
-        assert not torch.isnan(k_cache_fused).any()
-        assert not torch.isnan(v_cache_fused).any()
-        # Check that cache was actually written to
-        assert not (k_cache_fused[out_loc] == 0).all(), "k_cache not written"
-        assert not (v_cache_fused[out_loc] == 0).all(), "v_cache not written"
+
+        atol = rtol = 1e-2
+        # q/k inplace rotation should match the reference.
+        torch.testing.assert_close(q_ref, q_fused, atol=atol, rtol=rtol)
+        # k_cache rows at out_loc should match rotated k.
+        torch.testing.assert_close(
+            k_cache_ref[out_loc], k_cache_fused[out_loc], atol=atol, rtol=rtol
+        )
+        # v_cache rows should be an exact copy of v.
+        assert torch.all(v_cache_ref[out_loc] == v_cache_fused[out_loc]), "v_cache mismatch"
 
 
 if __name__ == "__main__":

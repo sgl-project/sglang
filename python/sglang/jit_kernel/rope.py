@@ -154,6 +154,22 @@ class XPUFusedRopeWrapper:
         # stride(1) is the number of elements between consecutive heads in memory,
         # which equals head_dim for un-sliced tensors and rope_dim for sliced views.
         head_stride = q.stride(1)
+        # Both q and k must share the same inter-head stride so the kernel can use
+        # a single head_stride parameter for addressing both buffers.
+        if k.stride(1) != head_stride:
+            raise ValueError(
+                f"q and k must have the same head stride (stride(1)) for XPU RoPE, "
+                f"got q.stride(1)={head_stride}, k.stride(1)={k.stride(1)}"
+            )
+        # The compiled kernel processes exactly self._rope_dim elements per head.
+        if q.shape[-1] != self._rope_dim:
+            raise ValueError(
+                f"q last dim ({q.shape[-1]}) must equal compiled rope_dim ({self._rope_dim})"
+            )
+        if k.shape[-1] != self._rope_dim:
+            raise ValueError(
+                f"k last dim ({k.shape[-1]}) must equal compiled rope_dim ({self._rope_dim})"
+            )
 
         idtype_str = "i32" if positions.dtype == torch.int32 else "i64"
 
@@ -230,6 +246,36 @@ class XPUFusedRopeWrapper:
         k_stride = k.stride(0)
         v_stride = v.stride(0)
         head_stride = q.stride(1)
+        # q, k, and v must all share the same inter-head stride; the SYCL kernel
+        # uses a single head_stride for all three input buffers.
+        if k.stride(1) != head_stride or v.stride(1) != head_stride:
+            raise ValueError(
+                f"q, k, and v must have the same head stride (stride(1)) for XPU RoPE store, "
+                f"got q.stride(1)={head_stride}, k.stride(1)={k.stride(1)}, "
+                f"v.stride(1)={v.stride(1)}"
+            )
+        # The SYCL fused-store kernel writes exactly rope_dim elements per head into
+        # the cache at offset kv_head_id * head_stride.  head_stride must therefore
+        # equal rope_dim (the compiled constant) so writes land in the right rows.
+        if head_stride != self._rope_dim:
+            raise ValueError(
+                f"head_stride ({head_stride}) must equal rope_dim ({self._rope_dim}) "
+                f"for XPU RoPE fused store. Use partial-RoPE slicing before calling."
+            )
+        # Each cache row must hold exactly num_kv_heads * rope_dim elements so that
+        # the per-head scatter (loc * cache_stride + head_id * head_stride) stays
+        # within bounds.
+        expected_row_size = num_kv_heads * self._rope_dim
+        if k_cache.shape[1] != expected_row_size:
+            raise ValueError(
+                f"k_cache second dim ({k_cache.shape[1]}) must equal "
+                f"num_kv_heads * rope_dim = {expected_row_size}"
+            )
+        if v_cache.shape[1] != expected_row_size:
+            raise ValueError(
+                f"v_cache second dim ({v_cache.shape[1]}) must equal "
+                f"num_kv_heads * rope_dim = {expected_row_size}"
+            )
         cache_stride = k_cache.stride(0)
 
         idtype_str = "i32" if positions.dtype == torch.int32 else "i64"
