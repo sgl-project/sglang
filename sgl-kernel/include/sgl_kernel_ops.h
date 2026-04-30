@@ -169,9 +169,6 @@ void fast_topk_transform_ragged_interface(
 #ifdef USE_ROCM
 void gelu_quick(at::Tensor& out, const at::Tensor& input);
 
-// DeepSeek-V4 indexer top-k transform (TopK = 512). ROCm-only AOT build.
-// On NVIDIA this lives in the JIT module
-//   sglang/jit_kernel/csrc/deepseek_v4/topk.cuh (TopK512Kernel::transform).
 void deepseek_v4_topk_transform_512(
     const at::Tensor& scores,
     const at::Tensor& seq_lens,
