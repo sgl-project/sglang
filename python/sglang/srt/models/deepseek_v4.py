@@ -1596,10 +1596,6 @@ class DeepseekV4ForCausalLM(nn.Module):
             and envs.SGLANG_DSV4_MODE.get() == "2604"
         ):
             _debug_assert_model_path_configs()
-        if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get() and is_large_dummy_model():
-            assert (
-                envs.SGLANG_HACK_OVERRIDE_TOPK_IDS_RANDOM.get()
-            ), "dummy model must use SGLANG_HACK_OVERRIDE_TOPK_IDS_RANDOM"
 
         if MOE_BIT_WISE_EQUAL_MODE:
             assert (

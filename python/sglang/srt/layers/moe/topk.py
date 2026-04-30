@@ -787,16 +787,6 @@ def _mask_topk_ids_padded_region(
         topk_ids[indices >= num_token_non_padded, :] = -1
 
 
-def _maybe_override_topk_ids_random(
-    topk_ids: torch.Tensor, num_experts: int
-) -> torch.Tensor:
-    if not envs.SGLANG_HACK_OVERRIDE_TOPK_IDS_RANDOM.get() or topk_ids.numel() == 0:
-        return topk_ids
-    n_tokens, k = topk_ids.shape
-    scores = torch.rand(n_tokens, num_experts, device=topk_ids.device)
-    return scores.topk(k, dim=-1).indices.to(topk_ids.dtype)
-
-
 @torch.compile(dynamic=True, backend=get_compiler_backend())
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
@@ -1271,9 +1261,6 @@ def select_experts(
         expert_location_dispatch_info=expert_location_dispatch_info,
     )
 
-    topk_ids = _maybe_override_topk_ids_random(
-        topk_ids, num_experts=router_logits.shape[-1]
-    )
     get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
     return StandardTopKOutput(topk_weights, topk_ids, router_logits)
