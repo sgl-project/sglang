@@ -908,19 +908,8 @@ def biased_grouped_topk_gpu(
         )
         return topk_weights, topk_ids
     else:
-        # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
-        if _is_cuda and num_experts == 384 and num_expert_group == 1:
-            assert False, "dpsk should not use kimi"
-            return kimi_k2_moe_fused_gate(
-                gating_output.to(dtype=torch.float32),
-                correction_bias,
-                topk=topk,
-                renormalize=renormalize,
-                routed_scaling_factor=routed_scaling_factor,
-                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
-            )
-        elif (
+        if (
             _is_cuda
             and num_expert_group == 1
             and topk_group == 1
