@@ -398,7 +398,7 @@ class MambaPool:
         self.copy_from(src_index, dst_index)
         return dst_index
 
-    def get_cpu_copy(self, indices, **kwargs):
+    def get_cpu_copy(self, indices):
         torch.cuda.synchronize()
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
@@ -410,7 +410,7 @@ class MambaPool:
         torch.cuda.synchronize()
         return conv_cpu, temporal_cpu
 
-    def load_cpu_copy(self, mamba_cache_cpu, indices, **kwargs):
+    def load_cpu_copy(self, mamba_cache_cpu, indices):
         conv_cpu, temporal_cpu = mamba_cache_cpu
         torch.cuda.synchronize()
         for i, conv in enumerate(self.mamba_cache.conv):
@@ -760,10 +760,10 @@ class KVCache(abc.ABC):
     def register_layer_transfer_counter(self, layer_transfer_counter: LayerDoneCounter):
         self.layer_transfer_counter = layer_transfer_counter
 
-    def get_cpu_copy(self, indices, **kwargs):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         raise NotImplementedError()
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         raise NotImplementedError()
 
     def maybe_get_custom_mem_pool(self):
@@ -965,7 +965,7 @@ class MHATokenToKVPool(KVCache):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
-    def get_cpu_copy(self, indices, **kwargs):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         torch.cuda.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -983,7 +983,7 @@ class MHATokenToKVPool(KVCache):
         torch.cuda.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
@@ -1449,7 +1449,7 @@ class HybridLinearKVPool(KVCache):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
-    def get_cpu_copy(self, indices, mamba_indices=None, **kwargs):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices)
         mamba_cpu = (
             self.mamba_pool.get_cpu_copy(mamba_indices)
@@ -1458,7 +1458,7 @@ class HybridLinearKVPool(KVCache):
         )
         return kv_cpu, mamba_cpu
 
-    def load_cpu_copy(self, cache_cpu, indices, mamba_indices=None, **kwargs):
+    def load_cpu_copy(self, cache_cpu, indices, mamba_indices=None):
         kv_cpu, mamba_cpu = cache_cpu
         self.full_kv_pool.load_cpu_copy(kv_cpu, indices)
         if mamba_cpu is not None and mamba_indices is not None:
@@ -1695,7 +1695,7 @@ class MLATokenToKVPool(KVCache):
         get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope
 
-    def get_cpu_copy(self, indices, **kwargs):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         torch.cuda.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -1710,7 +1710,7 @@ class MLATokenToKVPool(KVCache):
         torch.cuda.synchronize()
         return kv_cache_cpu
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         torch.cuda.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
