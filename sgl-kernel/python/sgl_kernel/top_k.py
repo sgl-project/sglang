@@ -89,7 +89,10 @@ def deepseek_v4_topk_transform_512(
     raw_indices: Optional[torch.Tensor] = None,
 ) -> None:
     """
-    Performs the DeepSeek-V4 indexer top-k selection (TopK = 512) and writes the paged physical slot indices into ``page_indices``. Optionally also writes the row-relative raw token positions into ``raw_indices`` for hisparse capture.
+    Performs the DeepSeek-V4 indexer top-k selection (TopK = 512) and writes
+    the paged physical slot indices into ``page_indices``. Optionally also
+    writes the row-relative raw token positions into ``raw_indices`` for
+    hisparse capture.
 
     Args:
         scores: float32 ``[B, max_seq_len]`` indexer logits, contiguous on dim 1.
