@@ -271,7 +271,7 @@ def compress_forward(
         F = online_module.decode if plan.is_decode else online_module.prefill
         F(kv_score_buffer, kv_score_input, out, ape, indices, *plan[1:], extra_data)
         return out
-    if _is_xpu:
+    if _is_cuda:
         module = _jit_compress_module(
             head_dim,
             kv_score_input.dtype,
@@ -305,6 +305,18 @@ def compress_fused_norm_rope_inplace(
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    if _is_xpu:
+        mode = 1 if plan.is_decode else 0
+        _torch_fused_norm_rope(
+            kv,
+            weight,
+            plan[1],
+            freq_cis,
+            mode,
+            eps,
+            plan.compress_ratio,
+        )
+        return
     module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
     module.forward(
         kv,
@@ -325,6 +337,17 @@ def fused_norm_rope_inplace(
     positions: torch.Tensor,
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
+    if _is_xpu:
+        _torch_fused_norm_rope(
+            kv,
+            weight,
+            positions,
+            freq_cis,
+            2,
+            eps,
+            0,
+        )
+        return
     module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
     module.forward(
         kv,
@@ -884,3 +907,67 @@ def _torch_c128_prefill(
         kv_score_buffer[tgt_index, tgt_pos] = kv_score_input[ragged_ids].to(
             kv_score_buffer.dtype
         )
+
+
+def _torch_fused_norm_rope(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    handle: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    mode: int,
+    eps: float,
+    compress_ratio: int,
+) -> None:
+    """Pure-torch fallback for ``FusedNormRopeKernel::forward``.
+
+    Mirrors ``fused_norm_rope`` in
+    ``jit_kernel/csrc/deepseek_v4/fused_norm_rope.cuh``: per-row RMSNorm
+    in-place, then RoPE on the trailing ``rope_dim`` of each selected row.
+
+    ``mode``:
+      0 = CompressExtend  (handle = packed PrefillPlan, [N, 16] uint8)
+      1 = CompressDecode  (handle = seq_lens, [N])
+      2 = DefaultForward  (handle = positions, [N])
+    """
+    head_dim = input_tensor.shape[-1]
+    rope_dim = freqs_cis.shape[-1]
+    device = input_tensor.device
+    in_dtype = input_tensor.dtype
+
+    if mode == 0:
+        plan = _decode_prefill_plan(handle).to(device)
+        valid = plan[:, 0] != _INVALID_PLAN
+        if not bool(valid.any()):
+            return
+        rows = plan[valid, 0]
+        positions = plan[valid, 2] + 1 - compress_ratio
+    elif mode == 1:
+        seq_lens = handle.to(torch.int64)
+        valid = (seq_lens % compress_ratio) == 0
+        if not bool(valid.any()):
+            return
+        rows = valid.nonzero(as_tuple=True)[0]
+        positions = seq_lens[valid] - compress_ratio
+    elif mode == 2:
+        num_works = handle.shape[0]
+        positions = handle.to(torch.int64)
+        rows = torch.arange(num_works, device=device, dtype=torch.int64)
+    else:
+        raise ValueError(f"unsupported fused_norm_rope mode: {mode}")
+
+    # RMSNorm in-place on selected rows.
+    x = input_tensor[rows].float()  # [N, head_dim]
+    var = (x * x).mean(dim=-1, keepdim=True)
+    x = x * torch.rsqrt(var + eps) * weight.float()
+
+    # RoPE on the trailing rope_dim, viewed as (real, imag) interleaved pairs.
+    n = x.shape[0]
+    rope = x[..., -rope_dim:].view(n, rope_dim // 2, 2)
+    freq = freqs_cis.float()[positions].view(n, rope_dim // 2, 2)
+    xr, xi = rope[..., 0], rope[..., 1]
+    fr, fi = freq[..., 0], freq[..., 1]
+    out_r = xr * fr - xi * fi
+    out_i = xr * fi + xi * fr
+    rope_out = torch.stack([out_r, out_i], dim=-1).reshape(n, rope_dim)
+    x[..., -rope_dim:] = rope_out
+    input_tensor[rows] = x.to(in_dtype)
