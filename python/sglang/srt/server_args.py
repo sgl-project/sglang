@@ -3683,6 +3683,12 @@ class ServerArgs:
         if self.disaggregation_mode == "decode":
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
+            if self.enable_mamba_extra_buffer():
+                logger.warning(
+                    "Mamba extra_buffer is disabled because decode disaggregation "
+                    "currently forces chunk cache. Falling back to no_buffer."
+                )
+                self.mamba_scheduler_strategy = "no_buffer"
 
         elif self.disaggregation_mode == "prefill":
             assert (
