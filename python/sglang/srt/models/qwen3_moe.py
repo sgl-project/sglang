@@ -35,6 +35,7 @@ from sglang.srt.distributed import (
     get_pp_group,
     get_tensor_model_parallel_rank,
     moe_expert_parallel_all_reduce,
+    moe_expert_parallel_tree_all_reduce,
     moe_tensor_model_parallel_all_reduce,
 )
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -62,7 +63,7 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import MRotaryEmbedding, get_rope
+from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     can_cp_split,
@@ -81,9 +82,12 @@ from sglang.srt.models.utils import (
 )
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.true_on_policy import (
+    get_moe_topk_tiebreak,
     get_on_policy_rms_norm_kwargs,
-    is_true_on_policy_enabled,
     should_disable_fused_qk_norm_mrope,
+    should_force_bfloat16_dense_tensor_math,
+    should_use_deterministic_moe_combine,
+    should_use_deterministic_moe_routing,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -115,6 +119,17 @@ _is_npu = is_npu()
 
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+
+
+def _stable_topk(scores: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    expert_ids = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.float32)
+    scores_fp32 = scores.float()
+    tie_step = torch.finfo(torch.float32).eps * scores_fp32.abs().clamp_min(
+        1.0 / scores.shape[-1]
+    )
+    scores_for_topk = scores_fp32 - expert_ids.view(1, -1) * tie_step
+    _, selected_ids = torch.topk(scores_for_topk, top_k, dim=-1)
+    return torch.gather(scores, dim=-1, index=selected_ids), selected_ids
 
 
 def compute_yarn_parameters(
@@ -260,6 +275,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             use_grouped_topk=False,
             layer_id=layer_id,
         )
+        self.top_k = config.num_experts_per_tok
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.num_experts
@@ -287,7 +303,6 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             self.num_experts = (
                 config.num_experts + get_global_server_args().ep_num_redundant_experts
             )
-            self.top_k = config.num_experts_per_tok
 
     def forward(
         self,
@@ -327,29 +342,49 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         hidden_states = hidden_states.view(-1, hidden_dim)
 
         # router_logits: (num_tokens, n_experts)
-        router_logits, _ = self.gate(hidden_states)
-        if is_true_on_policy_enabled():
+        router_hidden_states = hidden_states
+        if should_use_deterministic_moe_routing():
+            gate_weight = getattr(self.gate, "weight", None)
+            if gate_weight is not None and router_hidden_states.dtype != gate_weight.dtype:
+                router_hidden_states = router_hidden_states.to(gate_weight.dtype)
+        router_logits, _ = self.gate(router_hidden_states)
+        if should_use_deterministic_moe_routing():
             routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-            routing_weights, selected_experts = torch.topk(
-                routing_weights, self.top_k, dim=-1
-            )
+            if get_moe_topk_tiebreak() == "stable_sort":
+                routing_weights, selected_experts = _stable_topk(routing_weights, self.top_k)
+            else:
+                routing_weights, selected_experts = torch.topk(
+                    routing_weights, self.top_k, dim=-1
+                )
             routing_weights /= routing_weights.sum(dim=-1, keepdim=True)
-            routing_weights = routing_weights.to(hidden_states.dtype)
+            routing_weights = routing_weights.to(router_hidden_states.dtype)
             topk_output = StandardTopKOutput(
                 topk_weights=routing_weights,
-                topk_ids=selected_experts,
+                topk_ids=selected_experts.to(torch.int32),
                 router_logits=router_logits,
             )
         else:
             topk_output = self.topk(hidden_states, router_logits)
-        final_hidden_states = self.experts(hidden_states, topk_output)
+
+        expert_hidden_states = router_hidden_states
+        if should_use_deterministic_moe_routing():
+            expert_weight = getattr(self.experts, "w13_weight", None)
+            if (
+                expert_weight is not None
+                and expert_hidden_states.dtype != expert_weight.dtype
+            ):
+                expert_hidden_states = expert_hidden_states.to(expert_weight.dtype)
+        final_hidden_states = self.experts(expert_hidden_states, topk_output)
 
         if (
             self.ep_size > 1
             and not should_allreduce_fusion
             and not use_reduce_scatter
         ):
-            final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
+            if should_use_deterministic_moe_combine():
+                final_hidden_states = moe_expert_parallel_tree_all_reduce(final_hidden_states)
+            else:
+                final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
         if (
             self.tp_size > 1
@@ -530,12 +565,12 @@ class Qwen3MoeAttention(nn.Module):
             rope_scaling=rope_scaling,
             dual_chunk_attention_config=dual_chunk_attention_config,
         )
-        self.compatible_with_fused_kv_buffer = (
-            False if isinstance(self.rotary_emb, MRotaryEmbedding) else True
-        ) and not is_true_on_policy_enabled()
-        self.compatible_with_fused_qk_norm_rope = not isinstance(
-            self.rotary_emb, MRotaryEmbedding
-        ) and self.head_dim in (64, 128, 256)
+        # Keep the standard off-policy Qwen3-MoE decode path unchanged. The
+        # parity work only needs to disable these fused paths for true-on-policy;
+        # enabling them here changes generation-time logprobs relative to the
+        # previous off-policy baseline.
+        self.compatible_with_fused_kv_buffer = False
+        self.compatible_with_fused_qk_norm_rope = False
         _yarn_factor, _, _, _ = compute_yarn_parameters(config)
         self.use_fused_qk_norm_rope = (
             get_global_server_args().enable_fused_qk_norm_rope
@@ -560,7 +595,10 @@ class Qwen3MoeAttention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
-        norm_kwargs = get_on_policy_rms_norm_kwargs(fp32_residual=False)
+        norm_kwargs = get_on_policy_rms_norm_kwargs(
+            fp32_residual=False,
+            weight_dtype=torch.float32,
+        )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps, **norm_kwargs)
         self.alt_stream = alt_stream
@@ -684,6 +722,11 @@ class Qwen3MoeAttention(nn.Module):
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         ):
+            if (
+                should_force_bfloat16_dense_tensor_math()
+                and hidden_states.dtype != self.qkv_proj.weight.dtype
+            ):
+                hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
             return self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -702,6 +745,9 @@ class Qwen3MoeAttention(nn.Module):
             return hidden_states
 
         q, k, v, fb = inner_state
+        if should_force_bfloat16_dense_tensor_math() and q.dtype != v.dtype:
+            q = q.to(v.dtype)
+            k = k.to(v.dtype)
 
         must_save_kv = self._used_fused_qk_norm_rope_last_call
         save_kv_cache = must_save_kv or not (
@@ -806,7 +852,11 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
             )
-        norm_kwargs = get_on_policy_rms_norm_kwargs(fp32_residual=False)
+        norm_kwargs = get_on_policy_rms_norm_kwargs(
+            fp32_residual=True,
+            weight_dtype=torch.float32,
+            override_orig_dtype=torch.float32,
+        )
         self.input_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )

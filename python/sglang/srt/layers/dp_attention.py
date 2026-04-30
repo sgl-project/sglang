@@ -66,6 +66,15 @@ class DpPaddingMode(IntEnum):
     ) -> DpPaddingMode:
         dp_size = get_attention_dp_size()
 
+        if dp_size > 1:
+            try:
+                from sglang.srt.true_on_policy import is_true_on_policy_enabled
+
+                if is_true_on_policy_enabled():
+                    return cls.MAX_LEN
+            except Exception:
+                pass
+
         # When is_extend_in_batch and dp_size > 1, use SUM_LEN to avoid padding
         # overhead from uneven token distribution.
         # For dp_size=1, max_len equals sum_len, so prefer MAX_LEN mode
@@ -123,21 +132,21 @@ class _DpGatheredBufferWrapper:
         cls._global_num_tokens = global_num_tokens
 
     @classmethod
-    def get_global_dp_buffer(cls) -> torch.Tensor:
+    def get_global_dp_buffer(cls, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._global_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
+                dtype=dtype or cls._dtype,
                 device=cls._device,
             )
         return buffer
 
     @classmethod
-    def get_local_dp_buffer(cls) -> torch.Tensor:
+    def get_local_dp_buffer(cls, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         with use_symmetric_memory(get_tp_group(), disabled=not cls._dp_max_padding):
             buffer = torch.empty(
                 (cls._local_dp_buffer_len, cls._hidden_size),
-                dtype=cls._dtype,
+                dtype=dtype or cls._dtype,
                 device=cls._device,
             )
         return buffer
@@ -190,12 +199,12 @@ def set_dp_buffer_len(
     )
 
 
-def get_global_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_global_dp_buffer()
+def get_global_dp_buffer(dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_global_dp_buffer(dtype=dtype)
 
 
-def get_local_dp_buffer() -> torch.Tensor:
-    return _DpGatheredBufferWrapper.get_local_dp_buffer()
+def get_local_dp_buffer(dtype: Optional[torch.dtype] = None) -> torch.Tensor:
+    return _DpGatheredBufferWrapper.get_local_dp_buffer(dtype=dtype)
 
 
 def get_global_dp_buffer_len() -> int:

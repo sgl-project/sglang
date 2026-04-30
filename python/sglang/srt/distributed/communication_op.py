@@ -77,3 +77,10 @@ def moe_tensor_model_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
 def moe_expert_parallel_all_reduce(input_: torch.Tensor) -> torch.Tensor:
     """All-reduce the input tensor across moe expert parallel group."""
     return get_moe_ep_group().all_reduce(input_)
+
+
+def moe_expert_parallel_tree_all_reduce(input_: torch.Tensor) -> torch.Tensor:
+    """All-reduce the input tensor across moe expert parallel group in fixed tree order."""
+    from sglang.srt.tp_invariant_ops import tree_all_reduce_sum
+
+    return tree_all_reduce_sum(input_, device_group=get_moe_ep_group().device_group)

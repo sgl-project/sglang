@@ -880,7 +880,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             or self.forward_mode.is_draft_extend(include_v2=True)
             or self.forward_mode.is_idle()
         ):
-            if self.is_extend_in_batch and dp_padding_mode.is_max_len():
+            if (
+                self.is_extend_in_batch
+                and dp_padding_mode.is_max_len()
+                and self.batch_size > 0
+            ):
                 setattr(self, "_original_forward_mode", self.forward_mode)
                 self.forward_mode = ForwardMode.EXTEND
                 self.extend_num_tokens = bs
@@ -1049,6 +1053,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 self.out_cache_loc = self.output_cache_loc_backup
 
         elif self.forward_mode.is_decode() or self.forward_mode.is_idle():
+            self.positions = self.positions[:bs]
+            self.seq_lens = self.seq_lens[:bs]
+            self.req_pool_indices = self.req_pool_indices[:bs]
+            if self.seq_lens_cpu is not None:
+                self.seq_lens_cpu = self.seq_lens_cpu[:bs]
             logits_output.next_token_logits = logits_output.next_token_logits[:bs]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
