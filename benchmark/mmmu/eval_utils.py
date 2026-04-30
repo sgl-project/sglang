@@ -38,7 +38,7 @@ class EvalArgs:
     concurrency: int = 1
     max_new_tokens: Optional[int] = None
     temperature: Optional[float] = None
-    response_answer_regex: str = "(.*)"
+    response_answer_regex: str = "(?s)(.*)"
     lora_path: Optional[str] = None
     reasoning_effort: Optional[str] = None
 
@@ -273,11 +273,34 @@ def get_sampling_params(eval_args):
 
 
 # ----------- Process Multi-choice -------------
+def _parse_explicit_multi_choice_answer(response, all_choices):
+    choice_map = {choice.upper(): choice for choice in all_choices}
+    matches = []
+
+    answer_pattern = r"\banswer\s*:\s*\*{0,2}\s*\(?([A-Z])\)?\s*\*{0,2}(?![A-Za-z])"
+    for match in re.finditer(answer_pattern, response, flags=re.IGNORECASE):
+        candidate = match.group(1).upper()
+        if candidate in choice_map:
+            matches.append((match.start(1), choice_map[candidate]))
+
+    final_letter_pattern = r"(?:^|\n)\s*\*{0,2}\s*\(?([A-Z])\)?\s*\*{0,2}\s*\.?\s*$"
+    for match in re.finditer(final_letter_pattern, response, flags=re.IGNORECASE):
+        candidate = match.group(1).upper()
+        if candidate in choice_map:
+            matches.append((match.start(1), choice_map[candidate]))
+
+    return max(matches)[1] if matches else None
+
+
 def parse_multi_choice_response(response, all_choices, index2ans):
     """
     Parse the prediction from the generated response.
     Return the predicted index e.g., A, B, C, D.
     """
+    explicit_answer = _parse_explicit_multi_choice_answer(response, all_choices)
+    if explicit_answer is not None:
+        return explicit_answer
+
     for char in [",", ".", "!", "?", ";", ":", "'"]:
         response = response.strip(char)
     response = " " + response + " "  # add space to avoid partial match
