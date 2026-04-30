@@ -30,6 +30,15 @@ export const MistralMedium35Deployment = () => {
       ],
       commandRule: (value) => value === 'enabled' ? '--tool-call-parser mistral' : null
     },
+    speculative: {
+      name: 'speculative',
+      title: 'Speculative Decoding (EAGLE)',
+      items: [
+        { id: 'disabled', label: 'Disabled', default: false },
+        { id: 'enabled', label: 'Enabled', default: true }
+      ],
+      commandRule: (value) => value === 'enabled' ? '--dtype bfloat16 \\\n  --speculative-algorithm EAGLE \\\n  --speculative-draft-model-path mistralai/Mistral-Medium-3.5-128B-EAGLE \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4' : null
+    },
   };
 
   // 128B dense FP8 ≈ 130GB, plus KV cache headroom

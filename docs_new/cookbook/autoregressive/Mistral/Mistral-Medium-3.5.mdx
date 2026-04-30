@@ -39,9 +39,16 @@ The HuggingFace repo ships both the mistral native layout (`params.json` + `cons
 
 ## 2. SGLang Installation
 
-SGLang offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+Refer to the [official SGLang installation guide](../../../docs/get-started/install).
 
-Please refer to the [official SGLang installation guide](../../../docs/get-started/install) for installation instructions.
+**Docker Images by Hardware:**
+
+| Hardware | Docker Image |
+| --- | --- |
+| H100 / H200 (Hopper, CUDA 12.9) | `lmsysorg/sglang:dev-mistral-medium-3.5` |
+| B200 / B300 (Blackwell, CUDA 13.0) | `lmsysorg/sglang:dev-cu13-mistral-medium-3.5` |
+
+> Day-0 support for Mistral Medium 3.5 is not yet in `lmsysorg/sglang:latest` — pull one of the tags above (matching your GPU's CUDA driver) until the changes propagate to the next stable release.
 
 ---
 
@@ -62,6 +69,30 @@ Please refer to the [official SGLang installation guide](../../../docs/get-start
 - **Tool calling**: Enable `--tool-call-parser mistral` to activate native function calling support.
 - **Reasoning parser**: Enable `--reasoning-parser mistral` to separate `reasoning_content` from the main response content.
 - **System prompt**: The model ships with a recommended system prompt in `chat_template.jinja` and `SYSTEM_PROMPT.txt`. If you do not pass a system message yourself, the chat template injects Mistral's default (model identity, current date, tool-use guidelines). For full fidelity with Mistral's reference setup, load `SYSTEM_PROMPT.txt` from the HF repo and substitute `{name}`, `{today}`, `{yesterday}` (see Section 4.6).
+
+### 3.3 Speculative Decoding (EAGLE)
+
+Mistral ships an EAGLE draft head, [`mistralai/Mistral-Medium-3.5-128B-EAGLE`](https://huggingface.co/mistralai/Mistral-Medium-3.5-128B-EAGLE), that lets you run speculative decoding on top of the dense 128B target. The draft is a 2-layer GQA body sharing the target's vocab/head, FP8-quantized like the target (~4 GB), and is meant for low-concurrency latency-bound serving.
+
+```bash Command
+python -m sglang.launch_server \
+  --model-path mistralai/Mistral-Medium-3.5-128B \
+  --tp 4 \
+  --dtype bfloat16 \
+  --tool-call-parser mistral \
+  --reasoning-parser mistral \
+  --speculative-algorithm EAGLE \
+  --speculative-draft-model-path mistralai/Mistral-Medium-3.5-128B-EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --port 30000
+```
+
+- **`--dtype bfloat16` is required.** The draft `params.json` does not carry a `dtype` field, so `--dtype auto` falls back to fp32 and downcasts to fp16, which conflicts with the bf16 target when the embed/head are shared. Setting bf16 explicitly keeps both sides aligned (this is a no-op for the target — it already loads as bf16).
+- The draft uses the same vocab and lm_head as the target. Memory overhead on top of the base model is ~4 GB per TP shard.
+- `(num-steps, eagle-topk, num-draft-tokens) = (3, 1, 4)` is the recommended starting point. Tune for your workload — wider trees (higher `eagle-topk` / `num-draft-tokens`) help high-acceptance (templated) outputs, narrower trees keep latency tight on more diverse text.
+- EAGLE shines at low concurrency. At high concurrency, throughput is dominated by the target's batched forward pass and the draft's contribution shrinks; consider running without EAGLE for batch-serving workloads.
 
 ---
 
@@ -396,3 +427,37 @@ Median TTFT (ms):                        152.95
 Median TPOT (ms):                        42.53
 ==================================================
 ```
+
+### 5.3 EAGLE Speculative Decoding (Latency)
+
+Same 4× H200 setup, EAGLE configuration from [Section 3.3](#3-3-speculative-decoding-eagle). Single-stream latency benchmark (`--max-concurrency 1`).
+
+```bash Command
+python3 -m sglang.bench_serving \
+  --backend sglang \
+  --dataset-name random \
+  --num-prompts 10 \
+  --max-concurrency 1 \
+  --random-input-len 1024 \
+  --random-output-len 512 \
+  --port 30000
+```
+
+**Results:**
+
+```text Output
+============ Serving Benchmark Result ============
+Backend:                                 sglang
+Successful requests:                     10
+Benchmark duration (s):                  27.64
+Total input tokens:                      6101
+Total generated tokens:                  2684
+Output token throughput (tok/s):         97.10
+Mean E2E Latency (ms):                   2762.99
+Median TTFT (ms):                        90.69
+Median TPOT (ms):                        9.73
+Accept length:                           1.72
+==================================================
+```
+
+EAGLE delivers **~1.41× output throughput and ~29% lower E2E latency** vs. the baseline in [Section 5.2](#5-2-speed-benchmarks) on the same workload. Acceptance length of 1.72 means each draft cycle averages roughly 1.7 accepted tokens.
