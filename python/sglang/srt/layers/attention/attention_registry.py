@@ -270,6 +270,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
 
 @register_attention_backend("intel_xpu")
 def create_intel_xpu_backend(runner):
+    architectures = getattr(runner.model_config.hf_config, "architectures", []) or []
+    if any("DeepseekV4" in arch for arch in architectures):
+        from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4Backend
+
+        return DeepseekV4Backend(runner)
+
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
