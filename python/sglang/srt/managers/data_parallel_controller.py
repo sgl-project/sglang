@@ -567,7 +567,6 @@ class DataParallelController:
                         or self.elastic_ep_send_timeout_ms < 0
                     ):
                         raise
-                    self.status[self.round_robin_counter] = False
                     logger.warning(
                         f"Timed out sending request to DP worker "
                         f"{self.round_robin_counter} after "
