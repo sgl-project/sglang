@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
-from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.ep_moe.kernels import moe_permute, moe_unpermute
 from sglang.srt.layers.moe.fused_moe_triton.moe_fused_mul_sum import moe_fused_mul_sum
@@ -22,6 +21,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
+from sglang.srt.platforms import current_platform
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
