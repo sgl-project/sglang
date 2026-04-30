@@ -553,7 +553,7 @@ void fused_experts_kernel_impl(
     int64_t num_tokens_post_pad,
     float alpha,
     float limit,
-    CPUAcTMethod act_func,
+    CPUActMethod act_func,
     bool with_bias) {
   // handle 2 tiles per block
   constexpr int64_t BLOCK_M = block_size_m();
@@ -632,7 +632,7 @@ void fused_experts_kernel_impl(
 
       } else {
         const int64_t offset = offsets[mb];
-        if (act_func == CPUAcTMethod::silu_and_mul) {
+        if (act_func == CPUActMethod::silu_and_mul) {
           // silu_and_mul uses the fused tinygemm_kernel_nn2 path which has
           // SiLU hardcoded in its store step. Other activations (gelu_and_mul,
           // swiglu) use separate GEMMs followed by a dedicated activation step.
@@ -679,11 +679,11 @@ void fused_experts_kernel_impl(
       }
       // 1.d activation and mul
       const int64_t offset = offsets[mb];
-      if (act_func == CPUAcTMethod::silu_and_mul && use_brgemm) {
+      if (act_func == CPUActMethod::silu_and_mul && use_brgemm) {
         silu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N);
-      } else if (act_func == CPUAcTMethod::gelu_and_mul) {
+      } else if (act_func == CPUActMethod::gelu_and_mul) {
         gelu_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N + nb * BLOCK_N, C0, C1, m_size, N);
-      } else if (act_func == CPUAcTMethod::swiglu) {
+      } else if (act_func == CPUActMethod::swiglu) {
         clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(ic1 + offset * N, C0, m_size, N, alpha, limit, 0 + nb * BLOCK_N / 2);
         clamp_sigmoid_and_mul<scalar_t, BLOCK_N>(
             ic1 + offset * N, C1, m_size, N, alpha, limit, N / 2 + nb * BLOCK_N / 2);
@@ -1007,25 +1007,24 @@ at::Tensor fused_experts_cpu(
     const std::optional<double>& limit,
     bool is_vnni,
     const std::optional<std::string>& activation) {
-
   // Determine activation function
-  auto determine_act_func = [&]() -> CPUAcTMethod {
+  auto determine_act_func = [&]() -> CPUActMethod {
     if (alpha.has_value() && limit.has_value()) {
-      return CPUAcTMethod::swiglu;
+      return CPUActMethod::swiglu;
     }
     if (activation.has_value()) {
       const auto& act = activation.value();
       if (act == "gelu") {
-        return CPUAcTMethod::gelu_and_mul;
+        return CPUActMethod::gelu_and_mul;
       } else if (act == "silu") {
-        return CPUAcTMethod::silu_and_mul;
+        return CPUActMethod::silu_and_mul;
       } else {
         TORCH_CHECK(false, "Unsupported activation: ", act, ". Supported: silu, gelu");
       }
     }
-    return CPUAcTMethod::silu_and_mul;
+    return CPUActMethod::silu_and_mul;
   };
-  const CPUAcTMethod act_func_resolved = determine_act_func();
+  const CPUActMethod act_func_resolved = determine_act_func();
 
   auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
   auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);

@@ -67,15 +67,12 @@ inline int64_t get_row_size(int64_t K, bool use_int8_w8a8) {
   return use_int8_w8a8 ? K + sizeof(int32_t) : K;
 }
 
-enum class CPUAcTMethod : int { silu_and_mul = 0, swiglu = 1, gelu_and_mul = 2 };
+enum class CPUActMethod : int {
+  silu_and_mul = 0,
+  swiglu = 1,
+  gelu_and_mul = 2,
+};
 
-constexpr bool operator==(CPUAcTMethod a, int b) {
-  return static_cast<int>(a) == b;
-}
-
-constexpr bool operator==(int a, CPUAcTMethod b) {
-  return a == static_cast<int>(b);
-}
 
 enum class CPUQuantMethod : int64_t { BF16 = 0, INT8_W8A8 = 1, FP8_W8A16 = 2, INT4_W4A8 = 3, MXFP4 = 4 };
 
@@ -165,7 +162,7 @@ void fused_experts_fp_kernel_impl(
     int64_t num_tokens_post_pad,
     float alpha,
     float limit,
-    CPUAcTMethod act_func,
+    CPUActMethod act_func,
     bool with_bias);
 
 // shared expert implementation for int8 w8a8

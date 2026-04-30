@@ -445,7 +445,6 @@ at::Tensor flash_attn_varlen_func(
     int64_t max_seqlen_k,
     bool causal,
     std::optional<double> scale) {
-
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(q);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(k);
   CHECK_LAST_DIM_CONTIGUOUS_INPUT(v);
