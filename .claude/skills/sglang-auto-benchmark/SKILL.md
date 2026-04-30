@@ -276,7 +276,7 @@ python3 -m sglang.auto_benchmark validate \
 
 - Tier 1
   - Fastest and smallest sweep.
-  - Best for smoke tests, config validation, and quickly checking whether a model can run at all.
+  - Best for quick checks, config validation, and confirming whether a model can run at all.
   - Uses a very small subset of the search space and mainly does one-at-a-time changes on top of the baseline.
   - Lowest search cost, but also the easiest to miss a better configuration.
 - Tier 2

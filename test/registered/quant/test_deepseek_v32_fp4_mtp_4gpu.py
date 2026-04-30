@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -16,7 +15,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=1030, suite="stage-c-test-4-gpu-b200")
+register_cuda_ci(est_time=1060, suite="stage-c-test-4-gpu-b200")
 
 FULL_DEEPSEEK_V3_FP4_MODEL_PATH = "nvidia/DeepSeek-V3.2-NVFP4"
 SERVER_LAUNCH_TIMEOUT = 1200
@@ -54,13 +53,12 @@ class TestDeepseekV32FP4DPSpecV2(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=SERVER_LAUNCH_TIMEOUT,
-                other_args=other_args,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=other_args,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -145,13 +143,12 @@ class TestDeepseekV32FP4TPSpecV2(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=SERVER_LAUNCH_TIMEOUT,
-                other_args=other_args,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=other_args,
+        )
 
     @classmethod
     def tearDownClass(cls):
