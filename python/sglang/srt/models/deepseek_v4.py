@@ -211,7 +211,7 @@ class Compressor(nn.Module):
         assert not self.ape_converted
         self.ape_converted = True
 
-        if self.overlap and envs.SGLANG_OPT_FIX_APE_2604.get():
+        if self.overlap:
             ape = torch.chunk(self.ape.data, 2, dim=-1)
             ape = torch.cat([ape[0], ape[1]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
