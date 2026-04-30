@@ -27,12 +27,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import torch
 from numpy import float64
 
-from sglang.srt.disaggregation.kv_events import (
-    AllBlocksCleared,
-    BlockRemoved,
-    BlockStored,
-    StorageMedium,
-)
 from sglang.srt.distributed import get_tensor_model_parallel_rank
 from sglang.srt.layers.attention.fla.chunk_delta_h import CHUNK_SIZE as FLA_CHUNK_SIZE
 from sglang.srt.mem_cache.allocator import (
@@ -52,12 +46,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchResult,
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
-from sglang.srt.mem_cache.radix_cache import (
-    RadixKey,
-    compute_node_hash_values,
-    split_node_hash_value,
-)
-from sglang.srt.mem_cache.utils import hash_str_to_int64
+from sglang.srt.mem_cache.radix_cache import RadixKey, split_node_hash_value
+from sglang.srt.mem_cache.utils import KVCacheEventMixin
 from sglang.srt.server_args import get_global_server_args
 
 if TYPE_CHECKING:
@@ -426,7 +416,7 @@ class LRUList:
                 raise Exception(msg)
 
 
-class MambaRadixCache(BasePrefixCache):
+class MambaRadixCache(KVCacheEventMixin, BasePrefixCache):
     def __init__(self, params: CacheInitParams):
         assert isinstance(
             params.token_to_kv_pool_allocator, TokenToKVPoolAllocator
@@ -1240,87 +1230,6 @@ class MambaRadixCache(BasePrefixCache):
         assert v == node, f"parent does not have child key, {key}"
 
         self.full_evictable_size_ -= len(node.key)
-
-    def _record_store_event(self, node: TreeNode, medium=None):
-        # Mamba cache events intentionally track only the full-attention KV blocks.
-        if self.enable_kv_cache_events:
-            if medium is None:
-                medium = StorageMedium.GPU
-
-            if node.hash_value is None:
-                node.hash_value = compute_node_hash_values(node, self.page_size)
-
-            parent_block_hash = None
-            if node.parent is not None and node.parent != self.root_node:
-                if (
-                    node.parent.hash_value is not None
-                    and len(node.parent.hash_value) > 0
-                ):
-                    parent_block_hash = hash_str_to_int64(node.parent.hash_value[-1])
-
-            page_index = 0
-            logical_len = len(node.key)
-            is_bigram = node.key.is_bigram
-            raw = node.key.token_ids
-            for start in range(0, logical_len, self.page_size):
-                end = min(start + self.page_size, logical_len)
-                if end <= start:
-                    continue
-
-                if is_bigram:
-                    page_tokens = [(raw[j], raw[j + 1]) for j in range(start, end)]
-                else:
-                    page_tokens = raw[start:end]
-
-                block_hash = hash_str_to_int64(node.hash_value[page_index])
-
-                self.kv_event_queue.append(
-                    BlockStored(
-                        block_hashes=[block_hash],
-                        parent_block_hash=parent_block_hash,
-                        token_ids=page_tokens,
-                        block_size=len(page_tokens),
-                        lora_id=None,
-                        medium=medium,
-                    )
-                )
-
-                parent_block_hash = block_hash
-                page_index += 1
-
-    def _record_remove_event(self, node: TreeNode, medium=None):
-        # Mamba-only state eviction is not reported; callers invoke this only
-        # when full-attention KV blocks leave the cache.
-        if self.enable_kv_cache_events:
-            if medium is None:
-                medium = StorageMedium.GPU
-
-            if node.hash_value is None:
-                node.hash_value = compute_node_hash_values(node, self.page_size)
-
-            page_index = 0
-            logical_len = len(node.key)
-            for start in range(0, logical_len, self.page_size):
-                end = min(start + self.page_size, logical_len)
-                if end <= start:
-                    continue
-
-                block_hash = hash_str_to_int64(node.hash_value[page_index])
-                self.kv_event_queue.append(
-                    BlockRemoved(block_hashes=[block_hash], medium=medium)
-                )
-                page_index += 1
-
-    def _record_all_cleared_event(self):
-        if self.enable_kv_cache_events:
-            self.kv_event_queue.append(AllBlocksCleared())
-
-    def take_events(self):
-        if not self.enable_kv_cache_events:
-            return []
-        events = self.kv_event_queue
-        self.kv_event_queue = []
-        return events
 
     def _collect_nontombstone_nodes(self) -> List[TreeNode]:
         ret_list = []
