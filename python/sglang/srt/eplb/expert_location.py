@@ -189,6 +189,9 @@ class ExpertLocationMetadata:
             ),
         )
         if metadata is not None and server_args.enable_deepep_waterfill:
+            # NOTE: Static Waterfill rank load is only available when
+            # init_expert_location provides logical_count. Mapping-only init
+            # has no token counts and falls back to dynamic Waterfill.
             metadata.rank_load = _compute_rank_load(
                 logical_count,
                 metadata.physical_to_logical_map,
@@ -544,22 +547,19 @@ class ModelConfigForExpertLocation:
             return None
 
 
-def _compute_rank_load(logical_count_raw, physical_to_logical_map, ep_size):
-    """Compute per-rank load (num_layers, ep_size) from logical counts and EPLB mapping."""
+def _compute_rank_load(
+    logical_count: torch.Tensor, physical_to_logical_map: torch.Tensor, ep_size: int
+):
+    """Compute per-rank load (num_layers, ep_size) from EPLB-normalized counts."""
     from sglang.srt.eplb.expert_distribution import compute_gpu_physical_count
 
-    # logical_count_raw comes from data_dict["logical_count"] loaded from .pt/.json:
-    # it may be Tensor/list, and shape may be [layers, experts] or [samples, layers, experts].
-    if not isinstance(logical_count_raw, torch.Tensor):
-        logical_count_raw = torch.tensor(logical_count_raw)
-    if logical_count_raw.dim() == 3:
-        logical_count_raw = logical_count_raw.float().mean(dim=0)
-    elif logical_count_raw.dim() != 2:
+    if logical_count.dim() != 3:
         return None
+    logical_count = logical_count.float().mean(dim=0)
 
     phy_map = physical_to_logical_map.long()
     device = phy_map.device
-    lc = logical_count_raw.to(device=device, dtype=torch.float64)
+    lc = logical_count.to(device=device, dtype=torch.float64)
     n_layers, n_phy = phy_map.shape
     ones = torch.ones(n_layers, n_phy, dtype=torch.float64, device=device)
     replicas = torch.zeros(n_layers, lc.shape[-1], dtype=torch.float64, device=device)

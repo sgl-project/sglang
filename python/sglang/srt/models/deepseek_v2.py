@@ -384,13 +384,6 @@ class DeepseekV2MoE(nn.Module):
             is_deepep_class_backend() and self.num_fused_shared_experts > 0
         )
 
-        # DeepEP waterfill: shared expert dispatched to least-loaded rank via DeepEP.
-        # Uses same expert layout as fusion but routes shared expert dynamically
-        # instead of always sending to home rank.
-        _enable_deepep_waterfill = (
-            get_global_server_args().enable_deepep_waterfill and _is_deepep_fusion
-        )
-
         if _is_deepep_fusion:
             # 256 routed + EP_size shared slots = 272 experts total (for EP=16)
             num_experts_for_moe = config.n_routed_experts + self.moe_ep_size
@@ -463,7 +456,6 @@ class DeepseekV2MoE(nn.Module):
             use_grouped_topk=True,
             num_expert_group=config.n_group,
             num_fused_shared_experts=self.num_fused_shared_experts,
-            enable_deepep_waterfill=_enable_deepep_waterfill,
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             quant_config=quant_config,
@@ -2224,7 +2216,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             return
 
         disable_reason = None
-        if is_deepep_class_backend() and server_args.enforce_shared_experts_fusion:
+        if server_args.enforce_shared_experts_fusion:
             pass
         elif is_sbo_enabled() or is_tbo_enabled():
             disable_reason = "SBO/TBO enabled: incompatible with fusing shared expert into MoE kernel."

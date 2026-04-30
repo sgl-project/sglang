@@ -2870,6 +2870,13 @@ class ServerArgs:
             )
 
     def _handle_a2a_moe(self):
+        if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
+            logger.warning(
+                "moe_a2a_backend is overridden to 'deepep' because DeepEP "
+                "Waterfill requires the DeepEP backend."
+            )
+            self.moe_a2a_backend = "deepep"
+
         if self.moe_a2a_backend == "deepep":
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
@@ -2888,13 +2895,6 @@ class ServerArgs:
                 logger.info(
                     "DeepEP Waterfill is enabled. Shared expert will be dispatched through DeepEP for load balancing."
                 )
-
-        # Validate enable_deepep_waterfill requires deepep backend
-        if self.enable_deepep_waterfill and self.moe_a2a_backend != "deepep":
-            raise ValueError(
-                "enable_deepep_waterfill requires moe_a2a_backend='deepep'. "
-                f"Current moe_a2a_backend='{self.moe_a2a_backend}'."
-            )
 
         if self.moe_a2a_backend == "mooncake":
             self.ep_size = self.tp_size
@@ -5427,10 +5427,11 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.enable_deepep_waterfill,
             help="Enable DeepEP Waterfill: dispatch the shared expert as the 9th "
-            "routed expert to the least-loaded EP rank. Requires "
+            "routed expert to the least-loaded EP rank. Automatically sets "
             "--moe-a2a-backend deepep, implicitly enables shared-expert fusion, "
-            "and supports --deepep-mode auto or normal. Use auto for production "
-            "decode so CUDA graph remains enabled. Supported on DeepSeek-V3/R1 "
+            "and supports --deepep-mode auto, normal, or low_latency. Use auto "
+            "or low_latency for production decode so CUDA graph remains enabled. "
+            "Supported on DeepSeek-V3/R1 "
             "with EP >= 2.",
         )
 

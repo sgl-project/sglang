@@ -255,7 +255,6 @@ class TopK(MultiPlatformOp):
         num_expert_group: Optional[int] = None,
         renormalize: bool = True,
         num_fused_shared_experts: int = 0,
-        enable_deepep_waterfill: bool = False,
         custom_routing_function: Optional[Callable] = None,
         scoring_func: str = "softmax",
         correction_bias: Optional[torch.Tensor] = None,
@@ -273,18 +272,21 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        self.enable_deepep_waterfill = enable_deepep_waterfill
+        if num_fused_shared_experts > 0:
+            from sglang.srt.server_args import get_global_server_args
+
+            try:
+                self.enable_deepep_waterfill = (
+                    get_global_server_args().enable_deepep_waterfill
+                )
+            except ValueError:
+                self.enable_deepep_waterfill = False
+        else:
+            self.enable_deepep_waterfill = False
+
         self.deepep_waterfill_balancer = None
-        if enable_deepep_waterfill:
-            if num_fused_shared_experts != 1:
-                raise ValueError("DeepEP waterfill expects exactly one shared expert.")
-            if layer_id is None:
-                raise ValueError("DeepEP waterfill requires layer_id.")
-            if not _is_cuda:
-                raise ValueError("DeepEP waterfill TopK is only supported on CUDA.")
-            if output_format not in (None, TopKOutputFormat.STANDARD):
-                raise ValueError("DeepEP waterfill requires STANDARD TopK output.")
-            # Waterfill appends the shared expert after routed TopK selection.
+        if self.enable_deepep_waterfill:
+            # TODO(ch-wan): Refactor shared-expert fusion and routed TopK fusion.
             top_k -= num_fused_shared_experts
             num_fused_shared_experts = 0
             output_format = TopKOutputFormat.STANDARD
