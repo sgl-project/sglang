@@ -55,6 +55,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PostProcessWeightsReqInput,
+    PostProcessWeightsReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -102,6 +104,7 @@ _COMMUNICATOR_SPECS = [
     ("send_weights_to_remote_instance", SendWeightsToRemoteInstanceReqOutput),
     ("update_weights_from_tensor", UpdateWeightsFromTensorReqOutput),
     ("update_weights_from_ipc", UpdateWeightsFromIPCReqOutput),
+    ("post_process_weights", PostProcessWeightsReqOutput),
     ("get_weights_by_name", GetWeightsByNameReqOutput),
     ("release_memory_occupation", ReleaseMemoryOccupationReqOutput),
     ("resume_memory_occupation", ResumeMemoryOccupationReqOutput),
@@ -530,6 +533,17 @@ class TokenizerControlMixin:
             message += f" Weight version updated to {obj.weight_version}."
 
         return success, message
+
+    async def post_process_weights(
+        self: TokenizerManager,
+        obj: PostProcessWeightsReqInput,
+        request: Optional[fastapi.Request] = None,
+    ) -> Tuple[bool, str]:
+        """Trigger post-processing hooks for weights after loading (e.g., Marlin conversion)."""
+        self.auto_create_handle_loop()
+        async with self.model_update_lock.writer_lock:
+            results = await self.post_process_weights_communicator(obj)
+            return FanOutCommunicator.merge_results(results)
 
     async def _unload_lora_adapter_locked(
         self: TokenizerManager,
