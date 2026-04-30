@@ -542,9 +542,9 @@ class BaseMultimodalProcessor(ABC):
                 return load_audio(data, audio_sample_rate)
 
         except Exception as e:
-            data_preview = str(data)[:500]
+            data_preview = str(data[:500]) if isinstance(data, (str, bytes, list, tuple)) else str(data)[:500]
             raise RuntimeError(
-                f"Error while loading data (first 500 chars): {data_preview}: {e}"
+                f"Error while loading data (preview): {data_preview}: {e}"
             )
 
     def _submit_mm_data_loading_tasks_simple(
