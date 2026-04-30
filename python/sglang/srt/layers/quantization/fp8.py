@@ -189,7 +189,10 @@ class Fp8Config(QuantizationConfig):
             if (
                 envs.SGLANG_DSV4_MODE.get() == "2604"
                 and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-                and get_moe_runner_backend().is_flashinfer_mxfp4()
+                and (
+                    get_moe_runner_backend().is_flashinfer_mxfp4()
+                    or get_moe_runner_backend().is_marlin()
+                )
             ):
                 from sglang.srt.layers.quantization.mxfp4_deepseek import (
                     DeepSeekMxfp4MoEMethod,
@@ -929,6 +932,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             will_use_deepgemm = self.is_deepgemm_moe_runner_backend_enabled()
 
             if self.is_fp4_expert:
+                # FP4 experts support three MoE backends:
+                # - marlin (Hopper w4a16): only needs int8 view
+                # - flashinfer_mxfp4: only needs int8 view
+                # - deepgemm/auto (Blackwell): int8 view + mega_moe or scale conversion
                 layer.w13_weight.data = layer.w13_weight.data.view(torch.int8)
                 layer.w2_weight.data = layer.w2_weight.data.view(torch.int8)
 

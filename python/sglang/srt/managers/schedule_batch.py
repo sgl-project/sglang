@@ -645,6 +645,8 @@ class Req:
         self.host_hit_length = 0
         # The node to lock until for swa radix tree lock ref
         self.swa_uuid_for_lock: Optional[int] = None
+        # Whether the prefill-time SWA tree lock has been released early
+        self.swa_prefix_lock_released: bool = False
         # The prefix length that is inserted into the tree cache
         self.cache_protected_len: int = 0
 
@@ -1087,6 +1089,7 @@ class Req:
         self.indexer_topk = None
         self.last_node = None
         self.swa_uuid_for_lock = None
+        self.swa_prefix_lock_released = False
         self.extend_input_len = 0
         self.customized_info = None
         self.is_retracted = True
@@ -1828,6 +1831,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             new_pages = sum(1 for r in requests if r.kv_committed_len % page_size == 0)
             return new_pages * page_size
 
+        if self.is_spec_v2:
+            return self._new_tokens_required_next_decode_spec_v2(requests, page_size)
+
         server_args = get_global_server_args()
         len_per_topk = server_args.speculative_num_steps or 1
         spec_topk = server_args.speculative_eagle_topk or 1
@@ -1843,9 +1849,20 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_tokens = ceil_align(spec_tokens, page_size)
 
         num_tokens = max(len_per_topk * spec_topk, spec_tokens) * len(requests)
+        return num_tokens
 
-        # v2 eagle has over-allocation
-        return num_tokens * (1 + self.is_spec_v2)
+    def _new_tokens_required_next_decode_spec_v2(self, requests, page_size):
+        """Tight estimate matching eagle_info_v2.prepare_for_decode allocation."""
+        from sglang.srt.managers.utils import get_alloc_len_per_decode
+
+        alloc_len = get_alloc_len_per_decode()
+        total = 0
+        for r in requests:
+            x = max(0, r.kv_committed_len + 2 * alloc_len - r.kv_allocated_len)
+            cur = r.kv_allocated_len
+            nxt = cur + x
+            total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
+        return total
 
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         num_tokens = self.new_tokens_required_next_decode(selected_indices)
@@ -2294,6 +2311,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     def maybe_evict_swa(self):
         if self.tree_cache.supports_swa():
             sliding_window_size = self.tree_cache.sliding_window_size
+            release_leaf_lock = (
+                envs.SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW.get()
+                and hasattr(self.tree_cache, "dec_swa_lock_only")
+            )
             for idx, req in enumerate(self.reqs):
                 if self.forward_mode.is_decode():
                     # We set evict_swa condition here with two reasons:
@@ -2301,6 +2322,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     # 2. Evict swa every window_size tokens to reduce the overhead.
                     if req.decode_batch_idx % sliding_window_size == 1:
                         self._evict_swa(req, req.seqlen - 1)
+
+                    # Once the decode position has moved past the sliding window,
+                    # the SWA portion of the prefill-time tree lock is no longer
+                    # needed by this request. Convert it from protected to
+                    # evictable so SWA LRU can reclaim it under pressure.
+                    if (
+                        release_leaf_lock
+                        and not req.swa_prefix_lock_released
+                        and req.swa_uuid_for_lock is not None
+                        and req.last_node is not None
+                        and req.decode_batch_idx >= sliding_window_size
+                    ):
+                        self.tree_cache.dec_swa_lock_only(
+                            req.last_node, req.swa_uuid_for_lock
+                        )
+                        req.swa_prefix_lock_released = True
                 elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
                     pre_len = self.prefix_lens[idx]
                     if self.enable_overlap:
@@ -2328,9 +2365,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         ), "cache_protected_len must be page aligned"
         req.swa_evicted_seqlen = max(req.swa_evicted_seqlen, req.cache_protected_len)
 
+        if envs.SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN.get():
+            evict_threshold = pre_len - sliding_window_size
+        else:
+            evict_threshold = pre_len - sliding_window_size - self.tree_cache.page_size
         new_swa_evicted_seqlen = max(
             req.swa_evicted_seqlen,
-            pre_len - sliding_window_size - self.tree_cache.page_size,
+            evict_threshold,
         )
 
         if self.tree_cache.page_size > 1:

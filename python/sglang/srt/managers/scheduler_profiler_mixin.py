@@ -34,6 +34,31 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+_kineto_warmed = False
+
+
+def _warmup_kineto_once() -> None:
+    """Workaround torch.profiler+kineto first-call dropping all GPU activities
+    on PyTorch 2.9.1 + CUDA 13.0 + GB300. Run a tiny dummy 1-kernel profile
+    once per process before the first real profile.
+    """
+    global _kineto_warmed
+    if _kineto_warmed or not torch.cuda.is_available():
+        return
+    logger.info("[KINETO_WARMUP] running dummy 1-kernel profile to warm CUPTI")
+    with torch.profiler.profile(
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ]
+    ):
+        t = torch.zeros(64, device="cuda")
+        t.add_(1.0)
+        torch.cuda.synchronize()
+    _kineto_warmed = True
+    logger.info("[KINETO_WARMUP] done")
+
+
 class SchedulerProfilerMixin:
     def init_profiler(self: Scheduler):
         if envs.SGLANG_PROFILE_V2.get():
@@ -188,6 +213,13 @@ class SchedulerProfilerMixin:
             self.rpd_profiler.rangePush("", "rpd profile range", "")
             self.profile_in_progress = True
         elif torchprof_activities:
+            if (
+                envs.SGLANG_HACK_WARMUP_KINETO.get()
+                and not _is_npu
+                and torch.profiler.ProfilerActivity.CUDA in torchprof_activities
+            ):
+                _warmup_kineto_once()
+
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,

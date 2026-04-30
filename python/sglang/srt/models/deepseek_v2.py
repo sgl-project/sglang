@@ -227,9 +227,11 @@ class DeepseekV2MLP(nn.Module):
         prefix: str = "",
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
+        swiglu_limit: Optional[float] = None,
     ) -> None:
         super().__init__()
         self.tp_size = tp_size
+        self.swiglu_limit = swiglu_limit
 
         self.gate_up_proj = MergedColumnParallelLinear(
             hidden_size,
@@ -283,6 +285,12 @@ class DeepseekV2MLP(nn.Module):
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
+        if self.swiglu_limit is not None:
+            _g, _u = gate_up.chunk(2, dim=-1)
+            _lim = float(self.swiglu_limit)
+            gate_up = torch.cat(
+                [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+            )
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x,
@@ -533,6 +541,7 @@ class DeepseekV2MoE(nn.Module):
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 reduce_results=False,
+                swiglu_limit=getattr(config, "swiglu_limit", None),
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(tp_rank=0, tp_size=1)
@@ -1086,8 +1095,9 @@ class DeepseekV2MoE(nn.Module):
         if not getattr(self.experts, "_mega_moe_weights_built", False):
             return False
 
-        if self.is_nextn:
-            return False
+        if not envs.SGLANG_OPT_FIX_NEXTN_MEGA_MOE.get():
+            if self.is_nextn:
+                return False
 
         if not envs.SGLANG_OPT_FIX_HASH_MEGA_MOE.get():
             if self.is_hash:
@@ -2593,6 +2603,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
+                swiglu_limit=getattr(config, "swiglu_limit", None),
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

@@ -282,7 +282,12 @@ class DSV4AttnMetadataRadix:
             )
 
     def init_flashmla_related(self):
-        assert self.c4_sparse_topk == 512
+        # c4_sparse_topk is set from model_config.index_topk per-model
+        # (small model: 512, large model: 1024).
+        assert self.c4_sparse_topk in (512, 1024), (
+            f"unexpected c4_sparse_topk={self.c4_sparse_topk}; "
+            "supported: 512 (small) or 1024 (large)"
+        )
         assert self.c4_topk_lengths_clamp1 is not None
         self.c4_sparse_topk_lengths = torch.clamp(
             self.c4_topk_lengths_clamp1, max=self.c4_sparse_topk
@@ -387,6 +392,9 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        self.c4_topk = getattr(
+            model_runner.model_config.hf_text_config, "index_topk", C4_TOPK
+        )
 
         self.topk = model_runner.server_args.speculative_eagle_topk or 0
         assert self.topk in [0, 1], "MTP Topk > 1 not supported for DeepSeek V4"
@@ -1209,7 +1217,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             page_table=page_table,
             swa_page_indices=swa_page_indices,
             swa_topk_lengths=swa_topk_lengths,
-            c4_sparse_topk=C4_TOPK,
+            c4_sparse_topk=self.c4_topk,
         )
 
         if need_compress:

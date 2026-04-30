@@ -114,13 +114,21 @@ class CompressStatePool:
         device: str,
         enable_memory_saver: bool,
         ratio: int,
+        online: bool = False,
     ):
         self.swa_page_size = swa_page_size
         self.ring_size = ring_size
         self.enable_memory_saver = enable_memory_saver
+        self.online = online
 
-        self._size = size + self.ring_size + 1
-        self._size = (self._size + ratio - 1) // ratio * ratio
+        if online:
+            assert ring_size == 1, "online compress requires ring_size=1"
+            self._size = size + self.ring_size + 1
+            last_dim = 3 * head_dim
+        else:
+            self._size = size + self.ring_size + 1
+            self._size = (self._size + ratio - 1) // ratio * ratio
+            last_dim = 2 * (1 + overlap) * head_dim
 
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
@@ -137,12 +145,13 @@ class CompressStatePool:
             ):
                 self.kv_score_buffer = KVAndScore(
                     torch.empty(
-                        (self._size, 2 * (1 + overlap) * head_dim),
+                        (self._size, last_dim),
                         dtype=dtype,
                         device=device,
                     )
                 )
-                self.kv_score_buffer[-1].clear()
+                if not online:
+                    self.kv_score_buffer[-1].clear()
 
     def translate_from_swa_loc_to_state_loc(
         self, swa_loc: torch.Tensor

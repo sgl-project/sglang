@@ -41,6 +41,11 @@ class TransferInfo:
     dst_kv_indices: npt.NDArray[np.int32]
     dst_aux_index: int
     required_dst_info_num: int
+    # Decode-side state pool indices for SWA / NSA / Mamba state transfer.
+    # Empty when the model has no state buffer.
+    dst_state_indices: npt.NDArray[np.int32] = dataclasses.field(
+        default_factory=lambda: np.array([], dtype=np.int32)
+    )
 
     def is_dummy(self):
         return self.dst_kv_indices.size == 0
@@ -55,6 +60,7 @@ class TransferInfo:
             dst_kv_indices=np.frombuffer(msg[4], dtype=np.int32),
             dst_aux_index=int(msg[5].decode("ascii")),
             required_dst_info_num=int(msg[6].decode("ascii")),
+            dst_state_indices=np.frombuffer(msg[7], dtype=np.int32),
         )
 
 
@@ -73,6 +79,10 @@ class KVArgsRegisterInfo:
     decode_tp_size: int
     decode_tp_rank: int
     dst_kv_item_len: int
+    # Decode-side state buffer base pointers and per-tensor item lengths.
+    # Empty for models without a state buffer (state_type == "none").
+    dst_state_data_ptrs: list[int] = dataclasses.field(default_factory=list)
+    dst_state_item_lens: list[int] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -88,6 +98,12 @@ class KVArgsRegisterInfo:
             decode_tp_size=int(msg[8].decode("ascii")),
             decode_tp_rank=int(msg[9].decode("ascii")),
             dst_kv_item_len=int(msg[10].decode("ascii")),
+            dst_state_data_ptrs=list(
+                struct.unpack(f"{len(msg[11]) // 8}Q", msg[11])
+            ),
+            dst_state_item_lens=list(
+                struct.unpack(f"{len(msg[12]) // 4}I", msg[12])
+            ),
         )
 
 
@@ -105,6 +121,12 @@ class TransferStatus:
     num_pp_ranks_expected: Optional[int] = None
     # Whether aux data has been received.
     received_aux: bool = False
+    # Whether SWA / NSA / Mamba state pages are expected, and whether they
+    # have arrived. Set to True by the receiver only when the model has a
+    # state buffer; non-state models leave both False so is_done() ignores
+    # them.
+    expects_state: bool = False
+    received_state: bool = False
     # Mark as failed
     is_failure: bool = False
 
@@ -112,6 +134,8 @@ class TransferStatus:
         if self.is_failure:
             return True
         if self.num_pp_ranks_expected is None or not self.received_aux:
+            return False
+        if self.expects_state and not self.received_state:
             return False
         # All PP ranks must have reported their expected count
         if len(self.expected_kvs_per_pp) < self.num_pp_ranks_expected:
@@ -318,6 +342,27 @@ class NixlKVManager(CommonKVManager):
         logger.debug(f"Register aux tensors, len(aux_addrs)= {len(aux_addrs)}")
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
+
+        # Register the SWA / NSA / Mamba state pool. It lives in VRAM on the
+        # prefill side and must be transferred to decode along with the main
+        # KV cache; without this, decode reads zero-initialised state for
+        # every state-bearing layer and produces incorrect attention output.
+        # Mirrors the equivalent logic in the mooncake backend.
+        self.state_descs = None
+        if self.kv_args.state_data_ptrs and self.kv_args.state_data_lens:
+            state_addrs = [
+                (ptr, length, self.kv_args.gpu_id, "")
+                for ptr, length in zip(
+                    self.kv_args.state_data_ptrs, self.kv_args.state_data_lens
+                )
+            ]
+            self.state_descs = self.agent.register_memory(state_addrs, "VRAM")
+            logger.debug(
+                f"Register state tensors, len(state_addrs)= {len(state_addrs)}, "
+                f"state_type={self.kv_args.state_type}"
+            )
+            if not self.state_descs:
+                raise Exception("NIXL memory registration failed for state tensors")
 
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
         agent_name = decode_kv_args.agent_name
@@ -575,6 +620,69 @@ class NixlKVManager(CommonKVManager):
             raise Exception("KVSender failed to post transfer")
         return xfer_handle
 
+    def send_state(
+        self,
+        peer_name: str,
+        prefill_state_indices: npt.NDArray[np.int32],
+        dst_state_ptrs: list[int],
+        dst_state_indices: npt.NDArray[np.int32],
+        dst_state_item_lens: list[int],
+        dst_gpu_id: int,
+        notif: str,
+    ):
+        """Per-page WRITE transfer of SWA / NSA / Mamba state pages.
+
+        Mirrors :meth:`send_kvcache` (page-by-index VRAM->VRAM WRITE) but
+        operates on the state pool rather than the KV cache. Caller must only
+        invoke this on the last chunk of a request and only when both sides
+        have registered state pointers.
+        """
+        src_state_ptrs = self.kv_args.state_data_ptrs
+        src_state_item_lens = self.kv_args.state_item_lens
+        assert len(src_state_ptrs) == len(dst_state_ptrs)
+        assert len(src_state_item_lens) == len(dst_state_item_lens)
+        # The page-by-index transfer below assumes prefill and decode have
+        # matching state-pool layouts (same item_len per tensor). Mismatched
+        # layouts arise only with mamba TP-slice across non-equal attn_tp_size,
+        # which is not yet supported in the nixl backend (see mooncake
+        # _send_mamba_state_with_tp_slice for the future TP-slice path).
+        for i in range(len(src_state_item_lens)):
+            assert src_state_item_lens[i] == dst_state_item_lens[i], (
+                f"State item length mismatch at index {i}: "
+                f"{src_state_item_lens[i]} != {dst_state_item_lens[i]} "
+                "(non-equal item lens require mamba TP-slice transfer, "
+                "not yet supported in nixl backend)"
+            )
+
+        src_addrs = []
+        dst_addrs = []
+        for i in range(len(src_state_ptrs)):
+            item_len = src_state_item_lens[i]
+            for src_idx, dst_idx in zip(prefill_state_indices, dst_state_indices):
+                src_addr = src_state_ptrs[i] + int(src_idx) * item_len
+                dst_addr = dst_state_ptrs[i] + int(dst_idx) * item_len
+                src_addrs.append((src_addr, item_len, self.kv_args.gpu_id))
+                dst_addrs.append((dst_addr, item_len, dst_gpu_id))
+
+        if not src_addrs:
+            return None
+
+        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM")
+        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM")
+        xfer_handle = self.agent.initialize_xfer(
+            "WRITE",
+            src_descs,
+            dst_descs,
+            peer_name,
+            notif.encode("ascii"),  # type: ignore
+        )
+        if not xfer_handle:
+            raise Exception("KVSender failed to create state transfer")
+        state = self.agent.transfer(xfer_handle)
+        if state == "ERR":
+            raise Exception("KVSender failed to post state transfer")
+        return xfer_handle
+
     def add_transfer_request(
         self,
         bootstrap_room: int,
@@ -583,6 +691,7 @@ class NixlKVManager(CommonKVManager):
         is_last: bool,
         chunk_id: int,
         aux_index: Optional[int] = None,
+        state_indices: Optional[npt.NDArray[np.int32]] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
         assert not is_last or (is_last and aux_index is not None)
@@ -640,6 +749,30 @@ class NixlKVManager(CommonKVManager):
                     str(req.room) + "_aux",
                 )
                 handles.append(aux_xfer_handle)
+
+                # If the model has a state buffer (SWA / NSA / Mamba), ship
+                # the per-request state pages now and emit a "_state" notif
+                # so the receiver waits for it. Skipped (and notif omitted)
+                # when either side has no state, which keeps non-state
+                # models on the same code path.
+                peer = self.decode_kv_args_table[req.agent_name]
+                if (
+                    self.kv_args.state_data_ptrs
+                    and peer.dst_state_data_ptrs
+                    and state_indices is not None
+                    and req.dst_state_indices.size > 0
+                ):
+                    state_xfer_handle = self.send_state(
+                        req.agent_name,
+                        np.asarray(state_indices, dtype=np.int32),
+                        peer.dst_state_data_ptrs,
+                        req.dst_state_indices,
+                        peer.dst_state_item_lens,
+                        peer.gpu_id,
+                        str(req.room) + "_state",
+                    )
+                    if state_xfer_handle is not None:
+                        handles.append(state_xfer_handle)
         if is_last:
             del self.transfer_infos[bootstrap_room]
         return handles
@@ -674,6 +807,8 @@ class NixlKVManager(CommonKVManager):
                             )
                 elif components[1] == "aux":
                     self.transfer_statuses[room].received_aux = True
+                elif components[1] == "state":
+                    self.transfer_statuses[room].received_state = True
 
     def check_transfer_done(self, room: int):
         if room not in self.transfer_statuses:
@@ -748,6 +883,7 @@ class NixlKVSender(CommonKVSender):
             is_last,
             self.chunk_id,
             self.aux_index,
+            state_indices=state_indices,
         )
         self.xfer_handles.extend(new_xfer_handles)
         self.chunk_id += 1
@@ -810,6 +946,13 @@ class NixlKVReceiver(CommonKVReceiver):
             logger.debug(
                 f"Sending to prefill server with bootstrap room {self.bootstrap_room} {is_dummy=}"
             )
+            if state_indices is not None and not is_dummy:
+                state_indices_bytes = np.asarray(
+                    state_indices, dtype=np.int32
+                ).tobytes()
+            else:
+                state_indices_bytes = b""
+
             with lock:
                 sock.send_multipart(
                     [
@@ -821,8 +964,19 @@ class NixlKVReceiver(CommonKVReceiver):
                         kv_indices.tobytes() if not is_dummy else b"",
                         str(aux_index).encode("ascii"),
                         str(self.required_dst_info_num).encode("ascii"),
+                        state_indices_bytes,
                     ]
                 )
+
+        # Tell the transfer-status tracker to wait for the state-page
+        # transfer when this receiver is going to receive one (i.e. the
+        # model has a state buffer and we sent indices to a non-dummy peer).
+        if (
+            state_indices is not None
+            and len(state_indices) > 0
+            and self.kv_mgr.kv_args.state_data_ptrs
+        ):
+            self.kv_mgr.transfer_statuses[self.bootstrap_room].expects_state = True
 
         self.started_transfer = True
         self.init_time = time.time()
@@ -875,6 +1029,14 @@ class NixlKVReceiver(CommonKVReceiver):
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
+            packed_state_data_ptrs = b"".join(
+                struct.pack("Q", ptr)
+                for ptr in self.kv_mgr.kv_args.state_data_ptrs
+            )
+            packed_state_item_lens = b"".join(
+                struct.pack("I", int(length))
+                for length in self.kv_mgr.kv_args.state_item_lens
+            )
 
             with lock:
                 sock.send_multipart(
@@ -891,6 +1053,8 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.kv_args.decode_tp_size).encode("ascii"),
                         str(self.kv_mgr.kv_args.engine_rank).encode("ascii"),
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
+                        packed_state_data_ptrs,
+                        packed_state_item_lens,
                     ]
                 )
 

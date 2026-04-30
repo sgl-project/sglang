@@ -688,6 +688,13 @@ class PrefillAdder:
                     return AddReqResult.NO_TOKEN
                 tokens_freed += tokens_occupied
 
+        if (self.prefill_delayer_single_pass is not None) and (
+            not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
+                local_prefillable=True
+            )
+        ):
+            return AddReqResult.OTHER
+
         if self.dllm_config is not None:
             if self.rem_dllm_tokens <= 0:
                 return AddReqResult.OTHER

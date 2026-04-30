@@ -32,6 +32,9 @@ class _NegotiateOutput(NamedTuple):
     output_reason: str
     num_prefillable: int
     num_token_watermark_force_allow: int
+    # Debug info: prev_state captured at decision time (wait_success/wait_timeout
+    # zero out next_state, so we keep prev_state separately to inspect timing).
+    debug_prev_state: Optional[_State] = None
 
 
 class PrefillDelayer:
@@ -128,6 +131,7 @@ class PrefillDelayer:
                 next_state=None,
                 output_allow=True,
                 output_reason="wait_success" if exist_previous_wait else "no_wait",
+                debug_prev_state=prev_state,
                 **debug_info,
             )
         elif prefillable_status == "none":
@@ -162,6 +166,7 @@ class PrefillDelayer:
                     next_state=None,
                     output_allow=True,
                     output_reason="wait_timeout",
+                    debug_prev_state=prev_state,
                     **debug_info,
                 )
         else:
@@ -218,11 +223,25 @@ def _record_single_pass_result(
     output: _NegotiateOutput,
     metrics_collector: Optional["SchedulerMetricsCollector"],
 ) -> None:
+    # Compute waited time/passes (independent of metrics_collector path so DEBUG_LOG can print them).
+    # next_state captures in-progress delay; debug_prev_state captures completed wait_success/wait_timeout.
+    if (_dbg_s := output.next_state) is not None:
+        _dbg_wait_seconds = time.perf_counter() - _dbg_s.start_time
+        _dbg_forward_passes = _dbg_s.delayed_count
+    elif (_dbg_s := output.debug_prev_state) is not None:
+        _dbg_wait_seconds = time.perf_counter() - _dbg_s.start_time
+        _dbg_forward_passes = _dbg_s.delayed_count
+    else:
+        _dbg_wait_seconds = _dbg_forward_passes = 0
+
     if _DEBUG_LOG:
         if output.output_allow and (output.output_reason == "wait_timeout"):
             logger.info(
                 f"PrefillDelayer timeout thus not forbid prefill "
                 f"(num_prefillable={output.num_prefillable}, "
+                f"input_estimation={output.input_estimation}, "
+                f"forward_passes={_dbg_forward_passes}, "
+                f"wait_seconds={_dbg_wait_seconds:.4f}, "
                 f"actual_execution={actual_execution})"
             )
         elif output.output_allow and (output.output_reason == "token_watermark"):
@@ -232,6 +251,33 @@ def _record_single_pass_result(
                 f"num_token_watermark_force_allow={output.num_token_watermark_force_allow}, "
                 f"actual_execution={actual_execution})"
             )
+        elif output.output_allow and (output.output_reason == "wait_success"):
+            logger.info(
+                f"PrefillDelayer wait_success: prefill allowed after delay "
+                f"(num_prefillable={output.num_prefillable}, "
+                f"input_estimation={output.input_estimation}, "
+                f"forward_passes={_dbg_forward_passes}, "
+                f"wait_seconds={_dbg_wait_seconds:.4f}, "
+                f"actual_execution={actual_execution})"
+            )
+        elif output.output_allow and (output.output_reason == "no_wait"):
+            logger.info(
+                f"PrefillDelayer no_wait: prefill allowed immediately "
+                f"(num_prefillable={output.num_prefillable}, "
+                f"input_estimation={output.input_estimation}, "
+                f"actual_execution={actual_execution})"
+            )
+        elif (not output.output_allow) and (output.output_reason == "delay"):
+            logger.info(
+                f"PrefillDelayer delay: prefill blocked this pass "
+                f"(num_prefillable={output.num_prefillable}, "
+                f"input_estimation={output.input_estimation}, "
+                f"forward_passes={_dbg_forward_passes}, "
+                f"wait_seconds={_dbg_wait_seconds:.4f})"
+            )
+        elif output.output_reason == "":
+            # prefillable_status=='none' branch — silenced (one per scheduler pass × 8 ranks → log explosion)
+            pass
         else:
             assert output.output_reason in {
                 "",
@@ -241,14 +287,9 @@ def _record_single_pass_result(
             }
 
     if metrics_collector is not None:
-        if (s := output.next_state) is not None:
-            wait_seconds = time.perf_counter() - s.start_time
-            forward_passes = s.delayed_count
-        else:
-            wait_seconds = forward_passes = 0
         metrics_collector.observe_prefill_delayer_outcome(
-            forward_passes=forward_passes,
-            wait_seconds=wait_seconds,
+            forward_passes=_dbg_forward_passes,
+            wait_seconds=_dbg_wait_seconds,
             input_estimation=output.input_estimation,
             output_allow=output.output_allow,
             output_reason=output.output_reason,

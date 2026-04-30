@@ -336,6 +336,7 @@ class Envs:
     # DeepGemm
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
     SGLANG_JIT_DEEPGEMM_PRECOMPILE = EnvBool(True)
+    SGLANG_JIT_DEEPGEMM_FAST_WARMUP = EnvBool(False)
     SGLANG_JIT_DEEPGEMM_COMPILE_WORKERS = EnvInt(4)
     SGLANG_IN_DEEPGEMM_PRECOMPILE_STAGE = EnvBool(False)
     SGLANG_DG_CACHE_DIR = EnvStr(os.path.expanduser("~/.cache/deep_gemm"))
@@ -351,6 +352,10 @@ class Envs:
     SGLANG_BLACKWELL_OVERLAP_SHARED_EXPERTS_OUTSIDE_SBO = EnvBool(False)
     SGLANG_HACK_OVERRIDE_TOPK_IDS_RANDOM = EnvBool(False)
     SGLANG_HACK_FORCE_TID2EID_ZERO = EnvBool(False)
+    # Workaround torch.profiler+kineto first-call dropping all GPU events on
+    # PyTorch 2.9.1 + CUDA 13.0 + GB300. Run a tiny dummy 1-kernel profile at
+    # first start() to warm CUPTI activity callbacks. See journal 0427_011.
+    SGLANG_HACK_WARMUP_KINETO = EnvBool(False)
 
     # NSA Backend
     SGLANG_NSA_FUSE_TOPK = EnvBool(True)
@@ -495,6 +500,9 @@ class Envs:
     SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM = EnvBool(True)  # verified in journal 2026-04-21-017
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(True)
+    SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
+    SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
+    SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
     SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD = EnvBool(True)
     SGLANG_OPT_MXFP4_STATIC_SCALE_ONES = EnvBool(True)
     SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING = EnvBool(True)
@@ -515,8 +523,13 @@ class Envs:
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
     SGLANG_OPT_USE_JIT_NORM = EnvBool(False)
     SGLANG_OPT_FIX_HASH_MEGA_MOE = EnvBool(False)
+    SGLANG_OPT_FIX_NEXTN_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(False)
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
+    SGLANG_FIX_DSV4_BASE_MODEL_LOAD = EnvBool(False)
+    SGLANG_HANDLE_C128_PREFILL_KERNEL = EnvBool(False)
+    SGLANG_HACK_DEBUG_DUMP_CREATE_PAGED_COMPRESS_DATA = EnvStr("")
+    SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
 
     # Dangerous untested flagas
     SGLANG_OPT_USE_FAST_MASK_EP = EnvBool(False)

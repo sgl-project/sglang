@@ -531,27 +531,31 @@ def run_one_case(
 def should_skip_due_to_token_capacity(
     batch_size, input_len, output_len, skip_token_capacity_threshold
 ):
-    if batch_size * (input_len + output_len) > skip_token_capacity_threshold:
-        print(
-            "=" * 8
-            + f"Skip benchmark {batch_size=} * ({input_len=} + {output_len=}) = {batch_size * (input_len + output_len)} > {skip_token_capacity_threshold=} due to kv cache limit."
-            + "=" * 8
-        )
-        return True
+    # NOTE HACK
     return False
+    # if batch_size * (input_len + output_len) > skip_token_capacity_threshold:
+    #     print(
+    #         "=" * 8
+    #         + f"Skip benchmark {batch_size=} * ({input_len=} + {output_len=}) = {batch_size * (input_len + output_len)} > {skip_token_capacity_threshold=} due to kv cache limit."
+    #         + "=" * 8
+    #     )
+    #     return True
+    # return False
 
 
 def should_skip_due_to_max_running_requests(
     batch_size, skip_max_running_requests_threshold
 ):
-    if batch_size > skip_max_running_requests_threshold:
-        print(
-            "=" * 8
-            + f"Skip benchmark {batch_size=} > {skip_max_running_requests_threshold=} due to max running requests limit."
-            + "=" * 8
-        )
-        return True
+    # NOTE HACK
     return False
+    # if batch_size > skip_max_running_requests_threshold:
+    #     print(
+    #         "=" * 8
+    #         + f"Skip benchmark {batch_size=} > {skip_max_running_requests_threshold=} due to max running requests limit."
+    #         + "=" * 8
+    #     )
+    #     return True
+    # return False
 
 
 def get_report_summary(

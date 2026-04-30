@@ -52,24 +52,6 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-cutlass)
 
-# DeepGEMM
-FetchContent_Declare(
-    repo-deepgemm
-    GIT_REPOSITORY https://github.com/sgl-project/DeepGEMM
-    GIT_TAG        54f99a8af537b3c6eb4819b69907ccbe2b600792
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-deepgemm)
-
-# fmt
-FetchContent_Declare(
-    repo-fmt
-    GIT_REPOSITORY https://github.com/fmtlib/fmt
-    GIT_TAG        553ec11ec06fbe0beebfbb45f9dc3c9eabd83d28
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-fmt)
-
 # Triton kernel
 FetchContent_Declare(
     repo-triton
@@ -87,15 +69,6 @@ FetchContent_Declare(
     GIT_SHALLOW    OFF
 )
 FetchContent_Populate(repo-flashinfer)
-
-# flash-attention
-FetchContent_Declare(
-    repo-flash-attention
-    GIT_REPOSITORY https://github.com/sgl-project/sgl-attn
-    GIT_TAG        f866ec34002250e74c8bbcbcffa0e1ae71300b2d
-    GIT_SHALLOW    OFF
-)
-FetchContent_Populate(repo-flash-attention)
 
 # mscclpp
 FetchContent_Declare(
@@ -225,6 +198,18 @@ if (ENABLE_BELOW_SM90)
 
 endif()
 
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-gencode=arch=compute_90a,code=sm_90a"
+    )
+endif()
+
+if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
+    list(APPEND SGL_KERNEL_CUDA_FLAGS
+        "-DENABLE_NVFP4=1"
+    )
+endif()
+
 if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     list(APPEND SGL_KERNEL_CUDA_FLAGS
         "-gencode=arch=compute_100a,code=sm_100a"
@@ -251,18 +236,6 @@ if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
     endif()
 endif()
 
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.4")
-    set(SGL_KERNEL_ENABLE_FA3 ON)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-gencode=arch=compute_90a,code=sm_90a"
-    )
-endif()
-
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_FP4)
-    list(APPEND SGL_KERNEL_CUDA_FLAGS
-        "-DENABLE_NVFP4=1"
-    )
-endif()
 
 # All source files
 # NOTE: Please sort the filenames alphabetically
@@ -347,11 +320,6 @@ set(SOURCES
     "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform_cuda.cu"
     "${repo-fast-hadamard-transform_SOURCE_DIR}/csrc/fast_hadamard_transform.cpp"
 
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_causal_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_bf16_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_causal_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src/flash_fwd_sparse_hdim128_fp16_sm80.cu"
-    "${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/flash_sparse_api.cpp"
 )
 
 set(INCLUDES
@@ -362,7 +330,6 @@ set(INCLUDES
     ${repo-mscclpp_SOURCE_DIR}/include
     ${repo-cutlass_SOURCE_DIR}/examples/77_blackwell_fmha
     ${repo-cutlass_SOURCE_DIR}/examples/common
-    ${repo-flash-attention_SOURCE_DIR}/csrc/flash_attn/src
 )
 
 # =========================== Common SM90 Build ============================= #
@@ -377,20 +344,6 @@ target_include_directories(common_ops_sm90_build PRIVATE ${INCLUDES})
 set_target_properties(common_ops_sm90_build PROPERTIES
     OUTPUT_NAME "common_ops"
     LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm90"
-)
-
-# =========================== Common SM100+ Build ============================= #
-# Build SM100+ library with precise math (same namespace, different directory)
-Python_add_library(common_ops_sm100_build MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})
-
-target_compile_options(common_ops_sm100_build PRIVATE
-    $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>
-)
-target_include_directories(common_ops_sm100_build PRIVATE ${INCLUDES})
-# Set output name and separate build directory to avoid conflicts
-set_target_properties(common_ops_sm100_build PROPERTIES
-    OUTPUT_NAME "common_ops"
-    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/sm100"
 )
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -419,217 +372,11 @@ add_subdirectory(
 )
 
 target_link_libraries(common_ops_sm90_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
-target_link_libraries(common_ops_sm100_build PRIVATE ${TORCH_LIBRARIES} c10 cuda cublas cublasLt mscclpp_static)
 
-# sparse flash attention
-target_compile_definitions(common_ops_sm90_build PRIVATE
-    FLASHATTENTION_DISABLE_BACKWARD
-    FLASHATTENTION_DISABLE_DROPOUT
-    FLASHATTENTION_DISABLE_UNEVEN_K
-)
-target_compile_definitions(common_ops_sm100_build PRIVATE
-    FLASHATTENTION_DISABLE_BACKWARD
-    FLASHATTENTION_DISABLE_DROPOUT
-    FLASHATTENTION_DISABLE_UNEVEN_K
-)
-
-# Install to different subdirectories
-# CMake will find the built libraries in their respective LIBRARY_OUTPUT_DIRECTORY locations
-# and install them to the specified destinations
 install(TARGETS common_ops_sm90_build LIBRARY DESTINATION sgl_kernel/sm90)
-install(TARGETS common_ops_sm100_build LIBRARY DESTINATION sgl_kernel/sm100)
-
-# ============================ Optional Install: FA3 ============================= #
-# set flash-attention sources file
-# Now FA3 support sm80/sm86/sm90
-if (SGL_KERNEL_ENABLE_FA3)
-    set(SGL_FLASH_KERNEL_CUDA_FLAGS
-        "-DNDEBUG"
-        "-DOPERATOR_NAMESPACE=sgl-kernel"
-        "-O3"
-        "-Xcompiler"
-        "-fPIC"
-        "-gencode=arch=compute_90a,code=sm_90a"
-        "-std=c++17"
-        "-DCUTE_USE_PACKED_TUPLE=1"
-        "-DCUTLASS_ENABLE_TENSOR_CORE_MMA=1"
-        "-DCUTLASS_VERSIONS_GENERATED"
-        "-DCUTLASS_TEST_LEVEL=0"
-        "-DCUTLASS_TEST_ENABLE_CACHED_RESULTS=1"
-        "-DCUTLASS_DEBUG_TRACE_LEVEL=0"
-        "--expt-relaxed-constexpr"
-        "--expt-extended-lambda"
-        "--use_fast_math"
-        "-Xcompiler=-Wconversion"
-        "-Xcompiler=-fno-strict-aliasing"
-    )
-
-    if (ENABLE_BELOW_SM90)
-        list(APPEND SGL_FLASH_KERNEL_CUDA_FLAGS
-            "-gencode=arch=compute_80,code=sm_80"
-            "-gencode=arch=compute_86,code=sm_86"
-        )
-        # SM8X Logic
-        file(GLOB FA3_SM8X_GEN_SRCS
-            "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim*_sm80.cu")
-    endif()
-
-    file(GLOB FA3_BF16_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_bf16*_sm90.cu")
-    file(GLOB FA3_BF16_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
-    list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
-
-    # FP16 source files
-    file(GLOB FA3_FP16_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_fp16*_sm90.cu")
-    file(GLOB FA3_FP16_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
-    list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
-
-    # FP8 source files
-    file(GLOB FA3_FP8_GEN_SRCS
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimall_e4m3*_sm90.cu")
-    file(GLOB FA3_FP8_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
-    list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
-
-    set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS} ${FA3_SM8X_GEN_SRCS})
-
-    set(FLASH_SOURCES
-        "csrc/flash_extension.cc"
-        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_prepare_scheduler.cu"
-        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_api.cpp"
-        "${repo-flash-attention_SOURCE_DIR}/hopper/flash_fwd_combine.cu"
-        "${FA3_GEN_SRCS}"
-    )
-
-    Python_add_library(flash_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${FLASH_SOURCES})
-
-    target_compile_options(flash_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_FLASH_KERNEL_CUDA_FLAGS}>)
-    target_include_directories(flash_ops PRIVATE
-        ${repo-cutlass_SOURCE_DIR}/include
-        ${repo-cutlass_SOURCE_DIR}/tools/util/include
-        ${repo-flash-attention_SOURCE_DIR}/hopper
-    )
-    target_link_libraries(flash_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
-
-    install(TARGETS flash_ops LIBRARY DESTINATION "sgl_kernel")
-    set(FLASH_OPS_COMPILE_DEFS
-        FLASHATTENTION_DISABLE_BACKWARD
-        FLASHATTENTION_DISABLE_DROPOUT
-        FLASHATTENTION_DISABLE_UNEVEN_K
-        FLASHATTENTION_VARLEN_ONLY
-    )
-
-    if(NOT ENABLE_BELOW_SM90)
-        list(APPEND FLASH_OPS_COMPILE_DEFS FLASHATTENTION_DISABLE_SM8x)
-    endif()
-    target_compile_definitions(flash_ops PRIVATE ${FLASH_OPS_COMPILE_DEFS})
-endif()
-
-# Build spatial_ops as a separate, optional extension for green contexts
-set(SPATIAL_SOURCES
-    "csrc/spatial/greenctx_stream.cu"
-    "csrc/spatial_extension.cc"
-)
-
-Python_add_library(spatial_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SPATIAL_SOURCES})
-target_compile_options(spatial_ops PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
-target_link_libraries(spatial_ops PRIVATE ${TORCH_LIBRARIES} c10 cuda)
-install(TARGETS spatial_ops LIBRARY DESTINATION sgl_kernel)
-
-# ============================ Extra Install: FLashMLA ============================= #
-include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla.cmake)
-
-# ============================ Extra Install: DeepGEMM (JIT) ============================= #
-# Create a separate library for DeepGEMM's Python API.
-# This keeps its compilation isolated from the main common_ops.
-set(DEEPGEMM_SOURCES
-    "${repo-deepgemm_SOURCE_DIR}/csrc/python_api.cpp"
-)
-
-Python_add_library(deep_gemm_cpp MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${DEEPGEMM_SOURCES})
-
-# Link against necessary libraries, including nvrtc for JIT compilation.
-target_link_libraries(deep_gemm_cpp PRIVATE ${TORCH_LIBRARIES} c10 cuda nvrtc mscclpp_static)
-
-# Add include directories needed by DeepGEMM.
-target_include_directories(deep_gemm_cpp PRIVATE
-    ${repo-deepgemm_SOURCE_DIR}/deep_gemm/include
-    ${repo-cutlass_SOURCE_DIR}/include
-    ${repo-fmt_SOURCE_DIR}/include
-)
-
-# Apply the same compile options as common_ops.
-target_compile_options(deep_gemm_cpp PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${SGL_KERNEL_CUDA_FLAGS}>)
-
-# Create an empty __init__.py to make `deepgemm` a Python package.
-file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py "")
-install(
-    FILES ${CMAKE_CURRENT_BINARY_DIR}/deepgemm_pkg_init.py
-    DESTINATION deep_gemm
-    RENAME __init__.py
-)
-
-# Install the compiled DeepGEMM API library.
-install(TARGETS deep_gemm_cpp LIBRARY DESTINATION deep_gemm)
-
-# Install the source files required by DeepGEMM for runtime JIT compilation.
-install(
-    DIRECTORY ${repo-deepgemm_SOURCE_DIR}/deep_gemm/
-    DESTINATION deep_gemm
-)
-
-install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cute/"
-        DESTINATION "deep_gemm/include/cute")
-
-install(DIRECTORY "${repo-cutlass_SOURCE_DIR}/include/cutlass/"
-        DESTINATION "deep_gemm/include/cutlass")
 
 # ============================ Extra Install: triton kernels ============================= #
 install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
         DESTINATION "triton_kernels"
         PATTERN ".git*" EXCLUDE
         PATTERN "__pycache__" EXCLUDE)
-
-# ============================ Extra Install: FA4 ============================= #
-# TODO: find a better install condition.
-if ("${CUDA_VERSION}" VERSION_GREATER_EQUAL "12.8" OR SGL_KERNEL_ENABLE_SM100A)
-
-    set(FLASH_ATTN_CUTE_SRC "${repo-flash-attention_SOURCE_DIR}/flash_attn/cute")
-    set(FLASH_ATTN_CUTE_DST "${CMAKE_CURRENT_BINARY_DIR}/flash_attn_origin/cute")
-
-    file(MAKE_DIRECTORY "${FLASH_ATTN_CUTE_DST}")
-
-    file(COPY "${FLASH_ATTN_CUTE_SRC}/"
-         DESTINATION "${FLASH_ATTN_CUTE_DST}"
-         PATTERN ".git*" EXCLUDE
-         PATTERN "__pycache__" EXCLUDE)
-
-    file(GLOB_RECURSE FLASH_ATTN_CUTE_DST_PY
-         "${FLASH_ATTN_CUTE_DST}/*.py")
-
-    foreach(FILE_PATH IN LISTS FLASH_ATTN_CUTE_DST_PY)
-        file(READ "${FILE_PATH}" FILE_CONTENT)
-
-        set(MODIFIED_CONTENT "${FILE_CONTENT}")
-
-        # The main goal is to avoid using "flash_attn" so that other libraries (such as transformers) do not mistakenly assume that "flash_attn" is already installed.
-
-        string(REPLACE "flash_attn.cute"
-                       "flash_attn_origin.cute"
-                       MODIFIED_CONTENT "${MODIFIED_CONTENT}")
-
-        if (NOT FILE_CONTENT STREQUAL MODIFIED_CONTENT)
-            file(WRITE "${FILE_PATH}" "${MODIFIED_CONTENT}")
-            message(STATUS "  - [FA4 Patch] Patched: ${FILE_PATH}")
-        endif()
-    endforeach()
-
-    install(DIRECTORY "${FLASH_ATTN_CUTE_DST}/"
-            DESTINATION "flash_attn_origin/cute"
-            PATTERN ".git*" EXCLUDE
-            PATTERN "__pycache__" EXCLUDE)
-
-endif()

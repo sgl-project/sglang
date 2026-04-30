@@ -638,6 +638,178 @@ class ServingChatTestCase(unittest.TestCase):
             serving_chat = OpenAIServingChat(tokenizer_manager, TemplateManager())
             self.assertEqual(serving_chat.chat_encoding_spec, "dsv4")
 
+    # ------------- dsv4 task + latest_reminder -------------
+    def test_dsv4_task_field_schema(self):
+        """Top-level `task` accepts the 6 DS task tokens and rejects others."""
+        for valid in ("action", "query", "authority", "domain", "title", "read_url"):
+            req = ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "hi"}],
+                task=valid,
+            )
+            self.assertEqual(req.task, valid)
+
+        # None / unset is fine
+        self.assertIsNone(self.basic_req.task)
+
+        # Bogus value rejected at validation time
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError):
+            ChatCompletionRequest(
+                model="x",
+                messages=[{"role": "user", "content": "hi"}],
+                task="bogus",
+            )
+
+    def test_latest_reminder_role_accepted(self):
+        """`latest_reminder` is a first-class message role on generic param."""
+        from sglang.srt.entrypoints.openai.protocol import (
+            ChatCompletionMessageGenericParam,
+        )
+
+        msg = ChatCompletionMessageGenericParam(
+            role="latest_reminder", content="Be terse."
+        )
+        self.assertEqual(msg.role, "latest_reminder")
+
+        # Full request with reminder before user parses cleanly.
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "latest_reminder", "content": "Be terse."},
+                {"role": "user", "content": "Hi"},
+            ],
+        )
+        self.assertEqual(req.messages[0].role, "latest_reminder")
+        self.assertEqual(req.messages[1].role, "user")
+
+    def test_attach_task_to_last_user_message(self):
+        """Helper attaches task to the nearest user/developer message."""
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        messages = [{"role": "user", "content": "Hi"}]
+        encoding_dsv4.attach_task_to_last_user_message(messages, "domain")
+        self.assertEqual(messages[0]["task"], "domain")
+
+        # Prefers the LAST user message across a multi-turn conversation.
+        messages = [
+            {"role": "user", "content": "first"},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": "second"},
+        ]
+        encoding_dsv4.attach_task_to_last_user_message(messages, "query")
+        self.assertNotIn("task", messages[0])
+        self.assertEqual(messages[2]["task"], "query")
+
+        # `developer` role is treated like `user` (matches encoder semantics).
+        messages = [{"role": "developer", "content": "dev"}]
+        encoding_dsv4.attach_task_to_last_user_message(messages, "authority")
+        self.assertEqual(messages[0]["task"], "authority")
+
+        # No user/developer present -> raises.
+        with self.assertRaises(ValueError):
+            encoding_dsv4.attach_task_to_last_user_message(
+                [{"role": "system", "content": "s"}], "domain"
+            )
+
+    def test_dsv4_content_parts_list_normalized(self):
+        """OpenAI list-of-parts content flattens to text before reaching the encoder."""
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+        from sglang.srt.parser.jinja_template_utils import (
+            process_content_for_template_format,
+        )
+
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "say hi"}],
+                }
+            ],
+        )
+        messages = [m.model_dump() for m in req.messages]
+        # Mirror the boundary normalization _process_messages does for any
+        # non-None chat_encoding_spec.
+        for i, msg in enumerate(messages):
+            if isinstance(msg.get("content"), list):
+                messages[i] = process_content_for_template_format(
+                    msg, "string", [], [], [], []
+                )
+        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
+        self.assertIn("<｜User｜>say hi", out)
+
+        # Multiple text parts concat with single space; non-text parts dropped.
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {"url": "x"}},
+                ],
+            }
+        ]
+        for i, msg in enumerate(messages):
+            if isinstance(msg.get("content"), list):
+                messages[i] = process_content_for_template_format(
+                    msg, "string", [], [], [], []
+                )
+        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
+        self.assertIn("<｜User｜>describe", out)
+        self.assertNotIn("image_url", out)
+
+    def test_dsv4_task_and_reminder_encode_end_to_end(self):
+        """Task + latest_reminder plumb through to the dsv4 encoder correctly."""
+        from sglang.srt.entrypoints.openai import encoding_dsv4
+
+        # 1) task='domain' in chat mode -> `<｜domain｜>` appended, no Assistant
+        #    prefix (this is a single-shot classification, not a chat turn).
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "What is SGLang?"}],
+            task="domain",
+        )
+        messages = [m.model_dump() for m in req.messages]
+        encoding_dsv4.attach_task_to_last_user_message(messages, req.task)
+        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
+        self.assertIn("<｜domain｜>", out)
+        self.assertTrue(out.rstrip().endswith("<｜domain｜>"))
+        self.assertNotIn("<｜Assistant｜>", out)
+
+        # 2) task='action' in thinking mode -> Assistant + <think> + <｜action｜>
+        #    (action is the one task that still runs a reasoning pass).
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            task="action",
+        )
+        messages = [m.model_dump() for m in req.messages]
+        encoding_dsv4.attach_task_to_last_user_message(messages, req.task)
+        out = encoding_dsv4.encode_messages(messages, thinking_mode="thinking")
+        self.assertIn("<｜Assistant｜>", out)
+        self.assertIn("<think>", out)
+        self.assertTrue(out.rstrip().endswith("<｜action｜>"))
+
+        # 3) latest_reminder preceding user -> reminder renders before user,
+        #    Assistant prefix still comes after user.
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {"role": "latest_reminder", "content": "Be terse."},
+                {"role": "user", "content": "Hello"},
+            ],
+        )
+        messages = [m.model_dump() for m in req.messages]
+        out = encoding_dsv4.encode_messages(messages, thinking_mode="chat")
+        self.assertIn("<｜latest_reminder｜>Be terse.", out)
+        self.assertIn("<｜User｜>Hello", out)
+        self.assertLess(
+            out.index("<｜latest_reminder｜>"),
+            out.index("<｜User｜>"),
+        )
+        self.assertIn("<｜Assistant｜>", out)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

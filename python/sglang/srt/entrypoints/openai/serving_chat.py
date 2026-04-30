@@ -400,6 +400,14 @@ class OpenAIServingChat(OpenAIServingBase):
             thinking_mode = "thinking" if thinking_requested else "chat"
             messages = [msg.model_dump() for msg in request.messages]
 
+            # dsv4/dsv32 are text-only and consume string content; flatten
+            # OpenAI parts-list content here so the encoder sees a plain string.
+            for i, msg in enumerate(messages):
+                if isinstance(msg.get("content"), list):
+                    messages[i] = process_content_for_template_format(
+                        msg, "string", [], [], [], []
+                    )
+
             # Handle continue_final_message: separate final assistant message
             messages, assistant_prefix = self._handle_last_assistant_message(
                 messages, request
@@ -423,6 +431,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 v4_reasoning_effort = (
                     effort_source if effort_source in ("max", "high") else None
                 )
+                if request.task is not None:
+                    encoding_dsv4.attach_task_to_last_user_message(
+                        messages, request.task
+                    )
                 real_input = encoding_dsv4.encode_messages(
                     messages,
                     thinking_mode=thinking_mode,
