@@ -1131,15 +1131,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         assert offset == num_tokens
         req_pool_indices_repeated = req_pool_indices[idx_to_req_repeated]
 
-        _need_pad = (
-            is_nsa_prefill_cp_round_robin_split()
-            or envs.SGLANG_DSV4_FIX_ATTN_PADDING.get()
-        )
-        if (
-            _need_pad
-            and padded_num_tokens is not None
-            and padded_num_tokens > num_tokens
-        ):
+        if padded_num_tokens is not None and padded_num_tokens > num_tokens:
             pad_size = padded_num_tokens - num_tokens
             seq_lens_casual = torch.nn.functional.pad(
                 seq_lens_casual,
