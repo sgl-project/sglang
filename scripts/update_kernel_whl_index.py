@@ -7,7 +7,7 @@ import re
 
 # All the CUDA versions that the wheels will cover
 SUPPORTED_CUDA_VERSIONS = ["129", "130"]
-DEFAULT_CUDA_VERSION = "129"
+DEFAULT_CUDA_VERSION = "130"
 
 
 def check_wheel_cuda_version(path_name, target_cuda_version):
