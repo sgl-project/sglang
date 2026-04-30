@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -21,7 +20,6 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.srt.utils.torch_compile_utils import CompileConfig, compile_callable
 
 if TYPE_CHECKING:
     from sglang.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
@@ -35,8 +33,6 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_mps = is_mps()
-logger = logging.getLogger(__name__)
-_logged_rope_local_compile_dynamic_override = False
 
 if _is_cuda:
     from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
@@ -53,8 +49,6 @@ if _is_hip:
 
 class RotaryEmbedding(MultiPlatformOp):
     """Original rotary positional embedding."""
-
-    compile_config = CompileConfig(dynamic=True)
 
     def __init__(
         self,
@@ -207,36 +201,6 @@ class RotaryEmbedding(MultiPlatformOp):
         cos_sin = self.cos_sin_cache[:seqlen]
         cos, sin = cos_sin.chunk(2, dim=-1)
         return cos, sin
-
-    def _get_local_torch_compile_forward_method(
-        self,
-        method_name: str,
-        compile_mode: Optional[str] = None,
-        compile_options: Optional[dict] = None,
-        compile_dynamic: bool = False,
-    ) -> Callable:
-        global _logged_rope_local_compile_dynamic_override
-
-        # forward_native can handle fused KV cache writes. cache_loc varies
-        # across calls, so local RoPE compile must use dynamic shapes even if
-        # an override tries to disable them.
-        if (
-            compile_dynamic is not True
-            and not _logged_rope_local_compile_dynamic_override
-        ):
-            logger.info(
-                "Forcing torch.compile(dynamic=True) for local RotaryEmbedding "
-                "compile because fused KV cache writes use dynamic cache_loc."
-            )
-            _logged_rope_local_compile_dynamic_override = True
-        compile_dynamic = True
-
-        return compile_callable(
-            getattr(self, method_name),
-            compile_mode=compile_mode,
-            compile_options=compile_options,
-            compile_dynamic=compile_dynamic,
-        )
 
     def forward_native(
         self,
