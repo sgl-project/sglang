@@ -7,16 +7,13 @@ Common generate cli test, one test for image and video each
 import dataclasses
 import os
 import shlex
-import subprocess
-import sys
 import unittest
-from typing import Optional
 
 from PIL import Image
 
 from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.test.test_utils import check_image_size
+from sglang.multimodal_gen.test.test_utils import check_image_size, run_command
 
 logger = init_logger(__name__)
 
@@ -28,30 +25,11 @@ class TestResult:
     succeed: bool
 
 
-def run_command(command) -> Optional[float]:
-    """Runs a command and returns the execution time and status."""
-    print(f"Running command: {shlex.join(command)}")
-
-    with subprocess.Popen(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-    ) as process:
-        for line in process.stdout:
-            sys.stdout.write(line)
-        process.wait()
-        if process.returncode == 0:
-            return True
-        print(f"Command failed with exit code {process.returncode}")
-    return False
-
-
 class CLIBase(unittest.TestCase):
     model_path: str = None
     extra_args = []
     data_type: DataType = None
+    log_level: str = "info"
     # tested on h100
 
     width: int = 720
@@ -83,7 +61,7 @@ class CLIBase(unittest.TestCase):
             "--prompt",
             "A curious raccoon",
             "--save-output",
-            "--log-level=debug",
+            f"--log-level={self.log_level}",
             f"--width={self.width}",
             f"--height={self.height}",
             f"--output-path={self.output_path}",

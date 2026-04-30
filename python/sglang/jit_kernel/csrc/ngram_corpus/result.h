@@ -18,5 +18,8 @@ struct Node {
 };
 
 Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, int root);
+std::vector<std::vector<int32_t>> extractLeafPaths_(const Result& result);
+Result buildResultFromLeafPaths_(int last_token, int draft_token_num, const std::vector<std::vector<int32_t>>& paths);
+Result combineRootResults_(int last_token, int draft_token_num, const Result& primary, const Result& secondary);
 
 }  // namespace ngram

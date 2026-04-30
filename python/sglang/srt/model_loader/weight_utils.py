@@ -39,6 +39,7 @@ from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
+    get_world_group,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
@@ -67,6 +68,18 @@ except ImportError as e:
     SafeTensorsFileLoader = SingleGroup = None
 
 logger = logging.getLogger(__name__)
+
+# Block size for sequential checkpoint prefetch reads (page cache warming).
+_PREFETCH_BLOCK_SIZE = None
+
+
+def _get_prefetch_block_size() -> int:
+    global _PREFETCH_BLOCK_SIZE
+    if _PREFETCH_BLOCK_SIZE is None:
+        from sglang.srt.environ import envs
+
+        _PREFETCH_BLOCK_SIZE = envs.SGLANG_PREFETCH_BLOCK_SIZE_MB.get() * 1024 * 1024
+    return _PREFETCH_BLOCK_SIZE
 
 
 # use system-level temp directory for file locks, so that multiple users
@@ -551,9 +564,9 @@ def download_safetensors_index_file_from_hf(
         # If file not found on remote or locally, we should not fail since
         # only some models will have index_file.
         except huggingface_hub.utils.EntryNotFoundError:
-            logger.info("No %s found in remote.", index_file)
+            logger.debug("No %s found in remote.", index_file)
         except huggingface_hub.utils.LocalEntryNotFoundError:
-            logger.info("No %s found in local cache.", index_file)
+            logger.debug("No %s found in local cache.", index_file)
 
 
 # For models like Mistral-7B-v0.3, there are both sharded
@@ -700,16 +713,127 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
+def _prefetch_checkpoint_file(file_path: str) -> None:
+    """Prefetch a checkpoint file into the OS page cache.
+
+    Reads the file sequentially in 16 MB blocks so the kernel caches its pages
+    before workers load the same file via mmap.
+    """
+    with open(file_path, "rb") as f:
+        while f.read(_get_prefetch_block_size()):
+            pass
+
+
+def _prefetch_all_checkpoints(
+    sorted_files: List[str],
+    num_threads: int = 4,
+) -> None:
+    """Start prefetching checkpoint files into page cache in a background thread.
+
+    When multiple ranks on the same node load the same checkpoint (e.g.
+    DP-attention), each rank independently mmaps the same files, causing
+    redundant NFS/Lustre reads. By distributing the prefetch across ranks
+    (each rank reads 1/Nth of the shards), the total network I/O is reduced
+    from N * checkpoint_size to 1 * checkpoint_size, with subsequent
+    mmap accesses hitting the shared OS page cache.
+
+    The prefetch runs in a background thread so that loading can start
+    immediately and benefit from pages that have already been cached,
+    rather than blocking until all files are prefetched. This pipelining
+    naturally adapts to any RAM size — even if the full checkpoint does
+    not fit in page cache, the prefetch thread stays ahead of the loader.
+    """
+    import asyncio
+    import threading
+    import time
+
+    # Use node-local rank so that each node independently prefetches the
+    # full checkpoint into its own page cache. Global rank would split files
+    # across nodes, but page cache is not shared across nodes.
+    if torch.distributed.is_initialized():
+        world_group = get_world_group()
+        local_rank = world_group.local_rank
+        local_world_size = world_group.local_size or world_group.world_size
+    else:
+        local_rank = 0
+        local_world_size = 1
+
+    my_files = sorted_files[local_rank::local_world_size]
+    total_for_rank = len(my_files)
+
+    logger.info(
+        "Rank %d: prefetching %d/%d checkpoint shards into page cache "
+        "(background, %d local ranks sharing the work, %d threads per rank)...",
+        local_rank,
+        total_for_rank,
+        len(sorted_files),
+        local_world_size,
+        num_threads,
+    )
+
+    async def _prefetch_all() -> None:
+        semaphore = asyncio.Semaphore(num_threads)
+        completed = 0
+        next_log_pct = 10
+
+        async def prefetch_one(path: str) -> None:
+            nonlocal completed, next_log_pct
+            try:
+                async with semaphore:
+                    await asyncio.to_thread(_prefetch_checkpoint_file, path)
+                completed += 1
+                if total_for_rank > 0 and next_log_pct <= 100:
+                    pct = 100 * completed / total_for_rank
+                    if pct >= next_log_pct:
+                        logger.info(
+                            "Rank %d: prefetching checkpoint files: %d%% (%d/%d)",
+                            local_rank,
+                            next_log_pct,
+                            completed,
+                            total_for_rank,
+                        )
+                        next_log_pct += 10
+            except Exception:
+                logger.warning(
+                    "Failed to prefetch checkpoint file %r.",
+                    path,
+                    exc_info=True,
+                )
+
+        await asyncio.gather(*(prefetch_one(p) for p in my_files))
+
+    def _run_prefetch() -> None:
+        start = time.perf_counter()
+        asyncio.run(_prefetch_all())
+        elapsed = time.perf_counter() - start
+        logger.info(
+            "Rank %d: prefetching checkpoint files into page cache "
+            "finished in %.2fs",
+            local_rank,
+            elapsed,
+        )
+
+    threading.Thread(target=_run_prefetch, daemon=True).start()
+
+
 def safetensors_weights_iterator(
     hf_weights_files: List[str],
     disable_mmap: bool = False,
+    prefetch: bool = False,
+    prefetch_num_threads: int = 4,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Iterate over the weights in the model safetensor files."""
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
+
+    sorted_files = sorted(hf_weights_files)
+
+    if prefetch and not disable_mmap:
+        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
+
     for st_file in tqdm(
-        hf_weights_files,
+        sorted_files,
         desc="Loading safetensors checkpoint shards",
         disable=not enable_tqdm,
         bar_format=BAR_FORMAT,
@@ -821,6 +945,8 @@ def buffered_multi_thread_safetensors_weights_iterator(
     hf_weights_files: List[str],
     max_workers: int,
     disable_mmap: bool = False,
+    prefetch: bool = False,
+    prefetch_num_threads: int = 4,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
@@ -828,6 +954,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
+    sorted_files = sorted(hf_weights_files)
+    if prefetch and not disable_mmap:
+        _prefetch_all_checkpoints(sorted_files, num_threads=prefetch_num_threads)
     enable_tqdm = (
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
@@ -845,7 +974,7 @@ def buffered_multi_thread_safetensors_weights_iterator(
     buffer_size = max_workers + 1
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        file_iter = iter(hf_weights_files)
+        file_iter = iter(sorted_files)
         pending: collections.deque = collections.deque()
 
         # Seed the buffer.
@@ -968,21 +1097,85 @@ def gguf_quant_weights_iterator(
 
     reader = gguf.GGUFReader(gguf_file)
 
+    # MoE expert weight name patterns
+    MOE_WEIGHT_PATTERNS = {
+        "ffn_gate_exps": "gate_proj",  # gate projection
+        "ffn_up_exps": "up_proj",  # up projection
+        "ffn_down_exps": "down_proj",  # down projection
+    }
+
+    # First pass: yield weight types
     for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
+        weight_type = tensor.tensor_type
+        tensor_name = tensor.name
+
+        # Check if this is a MoE expert weight (packed format)
+        is_moe_weight = any(
+            pattern in tensor_name for pattern in MOE_WEIGHT_PATTERNS.keys()
+        )
+
+        if is_moe_weight:
+            # MoE weights need special handling - extract layer_id and weight type
+            # Format: blk.{layer_id}.ffn_gate_exps.weight
+            import re
+
+            match = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight", tensor_name)
+            if match:
+                layer_id = int(match.group(1))
+                weight_pattern = match.group(2)
+                hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
+
+                if hf_weight_name and weight_type.name != "F32":
+                    # Yield weight type for each expert
+                    weight = tensor.data
+                    num_experts = weight.shape[0]
+                    for expert_id in range(num_experts):
+                        hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight_type"
+                        yield hf_name, torch.tensor(weight_type)
+        elif tensor_name in gguf_to_hf_name_map:
+            # Normal weight handling
+            name = gguf_to_hf_name_map[tensor_name]
 
             if weight_type.name != "F32":
                 weight_type_name = name.replace("weight", "qweight_type")
-                weight_type = torch.tensor(weight_type)
-                yield weight_type_name, weight_type
+                yield weight_type_name, torch.tensor(weight_type)
 
+    # Second pass: yield actual weights
     for tensor in reader.tensors:
-        if tensor.name in gguf_to_hf_name_map:
-            weight = tensor.data
-            weight_type = tensor.tensor_type
-            name = gguf_to_hf_name_map[tensor.name]
+        weight = tensor.data
+        weight_type = tensor.tensor_type
+        tensor_name = tensor.name
+
+        # Check if this is a MoE expert weight (packed format)
+        is_moe_weight = any(
+            pattern in tensor_name for pattern in MOE_WEIGHT_PATTERNS.keys()
+        )
+
+        if is_moe_weight:
+            # MoE weights: split packed format into individual expert weights
+            import re
+
+            match = re.match(r"blk\.(\d+)\.(ffn_\w+_exps)\.weight", tensor_name)
+            if match:
+                layer_id = int(match.group(1))
+                weight_pattern = match.group(2)
+                hf_weight_name = MOE_WEIGHT_PATTERNS.get(weight_pattern)
+
+                if hf_weight_name:
+                    # Packed format: [num_experts, ...]
+                    num_experts = weight.shape[0]
+                    for expert_id in range(num_experts):
+                        expert_weight = weight[expert_id]
+
+                        if weight_type.name != "F32":
+                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.qweight"
+                        else:
+                            hf_name = f"model.layers.{layer_id}.mlp.experts.{expert_id}.{hf_weight_name}.weight"
+
+                        yield hf_name, torch.tensor(expert_weight)
+        elif tensor_name in gguf_to_hf_name_map:
+            # Normal weight handling
+            name = gguf_to_hf_name_map[tensor_name]
 
             if weight_type.name != "F32":
                 name = name.replace("weight", "qweight")
@@ -1055,7 +1248,11 @@ def sharded_weight_loader(shard_axis: int) -> LoaderFunction:
 
         if (
             is_cpu()
-            and loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
+            and (
+                loaded_weight.size(0) % get_tensor_model_parallel_world_size() != 0
+                or loaded_weight.size(0)
+                < get_tensor_model_parallel_world_size() * shard_size
+            )
             and loaded_weight.dim() == 1
         ):
             param_data = param.data  # view copy on param for uneven padding
@@ -1430,3 +1627,33 @@ def narrow_padded_param_and_loaded_weight(
     param_data = param_data.narrow(dim, param_data_start, actual_shard_size)
 
     return param_data, loaded_weight
+
+
+def pad_loaded_weight(loaded_weight, output_dim, output_sizes):
+    # This function is for padding zeros when loaded_weight is less than output_sizes.
+    # Most cases, sum(output_sizes) = loaded_weight.size(output_dim),
+    # while in some TP cases like TP6, output_sizes will be padded, thus loaded_weight needs padding.
+    total_output_size = sum(output_sizes)
+    raw_output_size = loaded_weight.size(output_dim)
+    if total_output_size > raw_output_size:
+        loaded_weight_pad = []
+        weight_split_size = [
+            int(output_size / total_output_size * raw_output_size)
+            for output_size in output_sizes
+        ]
+        assert (
+            sum(weight_split_size) == raw_output_size
+        ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {output_sizes} to {raw_output_size}"
+
+        split_weight = loaded_weight.split_with_sizes(weight_split_size, dim=output_dim)
+        for i, output_size in enumerate(output_sizes):
+            pad_size = output_size - weight_split_size[i]
+            target_pad_shape = list(loaded_weight.size())
+            target_pad_shape[output_dim] = pad_size
+            pad_tensor = torch.zeros(target_pad_shape).to(loaded_weight.dtype)
+            loaded_weight_pad.append(
+                torch.cat([split_weight[i], pad_tensor], dim=output_dim)
+            )
+        return torch.cat(loaded_weight_pad, dim=output_dim)
+    else:
+        return loaded_weight

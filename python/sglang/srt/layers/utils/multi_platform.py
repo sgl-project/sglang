@@ -3,6 +3,7 @@ from typing import Callable, ClassVar, Collection, Optional, Tuple
 from torch import nn
 
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -25,6 +26,14 @@ _is_musa = is_musa()
 
 class MultiPlatformOp(nn.Module):
     compile_config: ClassVar[CompileConfig] = CompileConfig()
+
+    # OOT forward registry: maps dispatch_key -> {op_cls -> forward_fn}
+    _oot_forward_registry: ClassVar[dict[str, dict[type, Callable]]] = {}
+
+    @classmethod
+    def register_oot_forward(cls, op_cls: type, fn: Callable, platform_key: str):
+        """Register an OOT forward implementation for a specific op class and platform."""
+        cls._oot_forward_registry.setdefault(platform_key, {})[op_cls] = fn
 
     def __init__(self):
         super().__init__()
@@ -179,6 +188,17 @@ class MultiPlatformOp(nn.Module):
         return self.forward_native(*args, **kwargs)
 
     def dispatch_forward(self):
+        # OOT platform dispatch: check registry then method lookup
+        if current_platform.is_out_of_tree():
+            key = current_platform.get_dispatch_key_name()
+            oot = self._oot_forward_registry.get(key, {})
+            if type(self) in oot:
+                return oot[type(self)].__get__(self)
+            method = getattr(self, f"forward_{key}", None)
+            if method is not None:
+                return method
+            return self.forward_native
+
         if _is_cuda:
             return self.forward_cuda
         elif _is_hip:

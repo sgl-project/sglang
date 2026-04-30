@@ -66,6 +66,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         x: torch.Tensor,
         weights: torch.Tensor,
         pruned_batch_info: LoRABatchInfo = None,
+        stack_num: int = 1,
         *args,
         **kwargs,
     ) -> torch.Tensor:
@@ -76,7 +77,7 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
             x=x,
             weights=weights,
             batch_info=batch_info,
-            num_slices=1,
+            num_slices=stack_num,
         )
 
     def run_lora_b_sgemm(
@@ -112,20 +113,21 @@ class ChunkedSgmvLoRABackend(BaseLoRABackend):
         output_offset: torch.Tensor,
         max_qkv_out_dim: int,
         base_output: torch.Tensor = None,
+        n_slices: int = 3,
         *args,
         **kwargs,
     ) -> torch.Tensor:
 
         # x: (s, input_dim)
-        # qkv_lora_a: (num_lora, 3 * r, input_dim)
-        # qkv_lora_b: (num_lora, output_dim_q + 2 * output_dim_kv, r)
+        # qkv_lora_a: (num_lora, n_slices * r, input_dim)
+        # qkv_lora_b: (num_lora, total_output_dim, r)
         assert isinstance(qkv_lora_b, torch.Tensor)
 
         lora_a_output = chunked_sgmv_lora_shrink_forward(
             x=x,
             weights=qkv_lora_a,
             batch_info=self.batch_info,
-            num_slices=3,
+            num_slices=n_slices,
         )
         lora_output = chunked_sgmv_lora_expand_forward(
             x=lora_a_output,
