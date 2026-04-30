@@ -276,11 +276,6 @@ def create_paged_compressor_data(
             use_cuda_graph=use_prefill_cuda_graph,
             **plan_kwargs,
         )
-        _maybe_dump_metadata_extras(
-            token_to_kv_pool=token_to_kv_pool,
-            compress_ratio=compress_ratio,
-            plan=plan,
-        )
     else:
         write_positions = clip_down(seq_lens - 1)
         write_loc = get_raw_loc(write_positions)
@@ -292,27 +287,3 @@ def create_paged_compressor_data(
         plan = CompressorDecodePlan(compress_ratio, seq_lens.to(torch.int32))
 
     return FusedCompressMetadata(write_loc=write_loc, extra_data=extra_data, plan=plan)
-
-
-def _maybe_dump_metadata_extras(
-    *,
-    token_to_kv_pool: DeepSeekV4TokenToKVPool,
-    compress_ratio: int,
-    plan: CompressorPrefillPlan,
-) -> None:
-    from sglang.jit_kernel.deepseek_v4 import maybe_dump_compress_metadata_extras
-
-    try:
-        ratio_idx = list(token_to_kv_pool.compression_ratios).index(compress_ratio)
-        pool = token_to_kv_pool.compress_state_pools[ratio_idx]
-        kv = pool.kv_score_buffer.kv_score
-        shape, dtype = kv.shape, kv.dtype
-    except (AttributeError, ValueError, IndexError):
-        return
-    maybe_dump_compress_metadata_extras(
-        compress_ratio=compress_ratio,
-        kv_score_buffer_shape=shape,
-        kv_score_buffer_dtype=dtype,
-        plan_compress_plan=plan.compress_plan,
-        plan_write_plan=plan.write_plan,
-    )
