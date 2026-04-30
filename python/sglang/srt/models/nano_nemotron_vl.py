@@ -372,4 +372,8 @@ class NemotronH_Nano_VL_V2(EVS):
             self.sound_encoder.load_weights(sound_weights)
 
 
-EntryClass = [NemotronH_Nano_VL_V2]
+class NemotronH_Nano_Omni_Reasoning_V3(NemotronH_Nano_VL_V2):
+    pass
+
+
+EntryClass = [NemotronH_Nano_VL_V2, NemotronH_Nano_Omni_Reasoning_V3]

@@ -20,6 +20,10 @@ from pathlib import Path
 import tabulate
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.multimodal_gen.test.partitioning import (
+    PartitionItem,
+    partition_items_by_lpt,
+)
 from sglang.multimodal_gen.test.server.gpu_cases import (
     ONE_GPU_CASES,
     TWO_GPU_CASES,
@@ -177,16 +181,21 @@ def auto_partition(
     if not cases or size <= 0:
         return []
 
-    sorted_cases = sorted(cases, key=lambda c: get_case_est_time(c.id), reverse=True)
-    partitions: list[list[DiffusionTestCase]] = [[] for _ in range(size)]
-    partition_sums = [0.0] * size
+    case_by_id = {case.id: case for case in cases}
+    items = [
+        PartitionItem(kind="case", item_id=case.id, est_time=get_case_est_time(case.id))
+        for case in cases
+    ]
+    partitions = partition_items_by_lpt(items, size)
+    if rank >= len(partitions):
+        return []
+    return [case_by_id[item.item_id] for item in partitions[rank]]
 
-    for case in sorted_cases:
-        min_idx = partition_sums.index(min(partition_sums))
-        partitions[min_idx].append(case)
-        partition_sums[min_idx] += get_case_est_time(case.id)
 
-    return partitions[rank] if rank < size else []
+def get_suite_files_rel(suite: str, parametrized_only: bool = False) -> list[str]:
+    if parametrized_only and suite in PARAMETRIZED_CASE_GROUPS:
+        return [filename for filename, _ in PARAMETRIZED_CASE_GROUPS[suite]]
+    return SUITES[suite]
 
 
 def _normalize_standalone_key(standalone_file: str) -> str:
@@ -746,12 +755,16 @@ def run_pytest(
     )
 
 
-def partition_test_files(files, partition_id, total_partitions):
+def partition_items_by_index(
+    items: list[str], partition_id: int, total_partitions: int
+) -> list[str]:
     return [
-        file_path
-        for i, file_path in enumerate(files)
-        if i % total_partitions == partition_id
+        item for i, item in enumerate(items) if i % total_partitions == partition_id
     ]
+
+
+def partition_test_files(files, partition_id, total_partitions):
+    return partition_items_by_index(files, partition_id, total_partitions)
 
 
 def run_component_accuracy_files(files, filter_expr=None, continue_on_error=False):

@@ -16,7 +16,7 @@ except ImportError:
     CuteDslMoEWrapper = None
     convert_sf_to_mma_layout = None
 
-register_cuda_ci(est_time=590, suite="stage-c-test-4-gpu-b200-small")
+register_cuda_ci(est_time=427, suite="stage-c-test-4-gpu-b200-small")
 
 SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
 SKIP_REASON = "Nvfp4 Requires compute capability of 10 or above."
@@ -581,7 +581,7 @@ class TestCuteDslV2(unittest.TestCase):
 
         Also checks both match the pure-PyTorch reference, and that a second
         cuda_graph pass reuses buffers deterministically (subsumes the former
-        cuda_graph_smoke test).
+        cuda_graph check).
         """
         test_cases = [
             # (num_tokens, hidden_size, intermediate_size, num_experts, top_k)

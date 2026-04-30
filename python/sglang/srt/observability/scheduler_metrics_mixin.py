@@ -99,11 +99,12 @@ class SchedulerMetricsMixin:
         self.last_input_throughput: float = 0.0
         self.step_time_dict = defaultdict(list)  # Dict[batch size -> step time]
 
-        # The number of accepted tokens and forward ct for the recent `decode_log_interval` batches (for logging)
-        self.spec_num_accepted_tokens = 0
+        # Cumulative spec-decoding counters (reset every decode_log_interval).
+        # Each update adds (num_accepted_drafts + bs, bs).
+        # `*_accepted_tokens` = drafts + bonus; `*_accepted_drafts` = drafts-only.
+        self.spec_num_accepted_tokens = 0  # per-log-interval
         self.spec_num_forward_ct = 0
-        # The total number of accepted tokens and forward ct for the whole server lifetime
-        self.spec_total_num_accepted_tokens = 0
+        self.spec_total_num_accepted_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
 
         # For PD disaggregation
@@ -120,14 +121,9 @@ class SchedulerMetricsMixin:
             self.attn_tp_rank == 0 or self.server_args.enable_metrics_for_all_schedulers
         )
         if self.enable_metrics:
-            if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:
-                engine_type = "prefill"
-            elif (
-                self.server_args.disaggregation_mode == DisaggregationMode.DECODE.value
-            ):
-                engine_type = "decode"
-            else:
-                engine_type = "unified"
+            engine_type = DisaggregationMode.to_engine_type(
+                self.server_args.disaggregation_mode
+            )
 
             labels = {
                 "model_name": self.server_args.served_model_name,
@@ -180,10 +176,12 @@ class SchedulerMetricsMixin:
                 kv_events_config, self.attn_dp_rank
             )
 
-    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_tokens: int):
-        self.spec_num_accepted_tokens += num_accepted_tokens + bs
+    def update_spec_metrics(self: Scheduler, bs: int, num_accepted_drafts: int):
+        self.spec_num_accepted_tokens += num_accepted_drafts + bs
         self.spec_num_forward_ct += bs
-        self.num_generated_tokens += num_accepted_tokens
+
+        # Bonus tokens updated elsewhere
+        self.num_generated_tokens += num_accepted_drafts
 
     def _init_estimated_perf_constants(self: Scheduler) -> None:
         model_config = self.model_config
@@ -464,13 +462,13 @@ class SchedulerMetricsMixin:
         self: Scheduler,
         can_run_cuda_graph: bool,
         running_batch: ScheduleBatch = None,
-        num_accepted_tokens: int = 0,
+        num_accepted_drafts: int = 0,
     ):
         batch = running_batch or self.running_batch
 
         # Every-iteration work: realtime token counting + status logger
         if self.current_scheduler_metrics_enabled:
-            decode_tokens = batch.batch_size() + num_accepted_tokens
+            decode_tokens = batch.batch_size() + num_accepted_drafts
             self.metrics_collector.increment_realtime_tokens(
                 # TODO unify this w/ the bumping logic in `Scheduler.num_generated_tokens` accumulator
                 decode_tokens=decode_tokens,
@@ -527,15 +525,16 @@ class SchedulerMetricsMixin:
             spec_accept_length = (
                 self.spec_num_accepted_tokens / self.spec_num_forward_ct
             )
-            # Calculate acceptance rate: accepted tokens / total draft tokens
-            draft_tokens_fallback = (self.server_args.speculative_num_steps or 0) + 1
-            num_draft_tokens = (
-                self.server_args.speculative_num_draft_tokens or draft_tokens_fallback
+            num_accepted_drafts = (
+                self.spec_num_accepted_tokens - self.spec_num_forward_ct
             )
-            total_draft_tokens = self.spec_num_forward_ct * num_draft_tokens
-
+            if self.server_args.speculative_num_draft_tokens:
+                draft_per_round = self.server_args.speculative_num_draft_tokens - 1
+            else:
+                draft_per_round = self.server_args.speculative_num_steps or 0
+            total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             spec_accept_rate = (
-                self.spec_num_accepted_tokens / total_draft_tokens
+                num_accepted_drafts / total_draft_tokens
                 if total_draft_tokens > 0
                 else 0
             )

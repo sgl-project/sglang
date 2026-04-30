@@ -1,6 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-from typing import List
+from typing import Any, Callable, List
 
 import torch
 
@@ -52,15 +52,14 @@ class ParallelExecutor(PipelineExecutor):
                 src=self.worker.cfg_group.ranks[0],
             )
 
-    def _execute(
+    def _execute_stages(
         self,
         stages: List[PipelineStage],
-        batch: Req,
+        payload: Any,
         server_args: ServerArgs,
-    ) -> OutputBatch:
-        """
-        Execute all pipeline stages respecting their declared parallelism type.
-        """
+        run_stage: Callable[[PipelineStage, Any], Any],
+    ) -> Any:
+        """Execute stages while respecting their declared parallelism type."""
         if server_args.enable_cfg_parallel:
             rank = get_classifier_free_guidance_rank()
         else:
@@ -108,5 +107,22 @@ class ParallelExecutor(PipelineExecutor):
         batch: Req,
         server_args: ServerArgs,
     ) -> OutputBatch:
-        batch = self._execute(stages, batch, server_args)
-        return batch
+        return self._execute_stages(
+            stages,
+            batch,
+            server_args,
+            lambda stage, current: stage(current, server_args),
+        )
+
+    def execute_group(
+        self,
+        stages: List[PipelineStage],
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        return self._execute_stages(
+            stages,
+            batches,
+            server_args,
+            lambda stage, current: stage.run_grouped_requests(current, server_args),
+        )
