@@ -403,7 +403,9 @@ def _build_nvfp4_config_from_safetensors_files(
         if mapping_fn is not None:
             mapped, _, _ = mapping_fn(raw_weight_name)
             if mapped != raw_weight_name:
-                exclude_modules.append(module_bfl)
+                exclude_modules.append(
+                    mapped[: -len(".weight")] if mapped.endswith(".weight") else mapped
+                )
                 continue
 
         if reverse_mapping_fn is not None:
