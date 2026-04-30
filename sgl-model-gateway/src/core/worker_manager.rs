@@ -5,11 +5,13 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use axum::response::{IntoResponse, Response};
+use axum::Json;
 use futures::{
     future,
     stream::{self, StreamExt},
 };
 use http::StatusCode;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::{
     sync::{watch, Mutex},
@@ -67,6 +69,41 @@ async fn fan_out(
         .await
 }
 
+/// Fan out POST requests with a JSON body to workers in parallel
+async fn fan_out_json<T: Serialize + Clone + Send + 'static>(
+    workers: &[Arc<dyn Worker>],
+    client: &reqwest::Client,
+    endpoint: &str,
+    body: &T,
+) -> Vec<WorkerResponse> {
+    let futures: Vec<_> = workers
+        .iter()
+        .map(|worker| {
+            let client = client.clone();
+            let url = worker.url().to_string();
+            let full_url = format!("{}/{}", url, endpoint);
+            let api_key = worker.api_key().clone();
+            let body = body.clone();
+
+            async move {
+                let mut req = client.post(&full_url).json(&body).timeout(REQUEST_TIMEOUT);
+                if let Some(key) = api_key {
+                    req = req.bearer_auth(key);
+                }
+                WorkerResponse {
+                    url,
+                    result: req.send().await,
+                }
+            }
+        })
+        .collect();
+
+    stream::iter(futures)
+        .buffer_unordered(MAX_CONCURRENT)
+        .collect()
+        .await
+}
+
 pub enum EngineMetricsResult {
     Ok(String),
     Err(String),
@@ -78,6 +115,46 @@ impl IntoResponse for EngineMetricsResult {
             Self::Ok(text) => (StatusCode::OK, text).into_response(),
             Self::Err(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
         }
+    }
+}
+
+/// Request body for aborting requests, matching SGLang's AbortReq
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbortRequestBody {
+    /// Request ID to abort. If empty and abort_all is false, this is a no-op.
+    #[serde(default)]
+    pub rid: Option<String>,
+    /// Whether to abort all in-flight requests
+    #[serde(default)]
+    pub abort_all: bool,
+}
+
+/// Result of fanning out an abort request to all workers
+#[derive(Debug, Serialize)]
+pub struct AbortRequestResult {
+    pub successful: Vec<String>,
+    pub failed: Vec<(String, String)>,
+    pub total_workers: usize,
+    pub http_workers: usize,
+    pub message: String,
+}
+
+impl IntoResponse for AbortRequestResult {
+    fn into_response(self) -> Response {
+        let status = if self.failed.is_empty() {
+            StatusCode::OK
+        } else if self.successful.is_empty() {
+            StatusCode::INTERNAL_SERVER_ERROR
+        } else {
+            StatusCode::OK // Partial success is still OK
+        };
+        (status, Json(serde_json::json!({
+            "successful": self.successful,
+            "failed": self.failed,
+            "total_workers": self.total_workers,
+            "http_workers": self.http_workers,
+            "message": self.message,
+        }))).into_response()
     }
 }
 
@@ -149,6 +226,74 @@ impl WorkerManager {
         info!("{}", message);
 
         FlushCacheResult {
+            successful,
+            failed,
+            total_workers,
+            http_workers: http_workers.len(),
+            message,
+        }
+    }
+
+    pub async fn abort_request_all(
+        worker_registry: &WorkerRegistry,
+        client: &reqwest::Client,
+        body: &AbortRequestBody,
+    ) -> AbortRequestResult {
+        let workers = worker_registry.get_all();
+        let total_workers = workers.len();
+
+        let http_workers: Vec<_> = workers
+            .into_iter()
+            .filter(|w| matches!(w.connection_mode(), ConnectionMode::Http))
+            .collect();
+
+        if http_workers.is_empty() {
+            return AbortRequestResult {
+                successful: vec![],
+                failed: vec![],
+                total_workers,
+                http_workers: 0,
+                message: "No HTTP workers available for abort request".to_string(),
+            };
+        }
+
+        info!(
+            "Sending abort request to {} HTTP workers (out of {} total), rid={:?} abort_all={}",
+            http_workers.len(),
+            total_workers,
+            body.rid,
+            body.abort_all,
+        );
+
+        let responses = fan_out_json(&http_workers, client, "abort_request", body).await;
+
+        let mut successful = Vec::new();
+        let mut failed = Vec::new();
+
+        for resp in responses {
+            match resp.result {
+                Ok(r) if r.status().is_success() => successful.push(resp.url),
+                Ok(r) => failed.push((resp.url, format!("HTTP {}", r.status()))),
+                Err(e) => failed.push((resp.url, e.to_string())),
+            }
+        }
+
+        let message = if failed.is_empty() {
+            format!(
+                "Successfully sent abort request to all {} HTTP workers",
+                successful.len()
+            )
+        } else {
+            format!(
+                "Abort request: {} succeeded, {} failed",
+                successful.len(),
+                failed.len()
+            )
+        };
+
+        info!("{}", message);
+
+        AbortRequestResult {
             successful,
             failed,
             total_workers,

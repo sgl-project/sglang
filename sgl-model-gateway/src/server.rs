@@ -30,7 +30,7 @@ use crate::{
         job_queue::{JobQueue, JobQueueConfig},
         steps::{TokenizerConfigRequest, WorkflowEngines},
         worker::WorkerType,
-        worker_manager::WorkerManager,
+        worker_manager::{AbortRequestBody, WorkerManager},
         Job,
     },
     middleware::{self, AuthConfig, QueuedRequest},
@@ -415,6 +415,15 @@ async fn flush_cache(State(state): State<Arc<AppState>>, _req: Request) -> Respo
         .into_response()
 }
 
+async fn abort_request(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<AbortRequestBody>,
+) -> Response {
+    WorkerManager::abort_request_all(&state.context.worker_registry, &state.context.client, &body)
+        .await
+        .into_response()
+}
+
 async fn get_loads(State(state): State<Arc<AppState>>, _req: Request) -> Response {
     WorkerManager::get_all_worker_loads(&state.context.worker_registry, &state.context.client)
         .await
@@ -617,6 +626,7 @@ pub fn build_app(
     // Build admin routes with control plane auth if configured, otherwise use simple API key auth
     let admin_routes = Router::new()
         .route("/flush_cache", post(flush_cache))
+        .route("/abort_request", post(abort_request))
         .route("/get_loads", get(get_loads))
         .route("/parse/function_call", post(parse_function_call))
         .route("/parse/reasoning", post(parse_reasoning))
