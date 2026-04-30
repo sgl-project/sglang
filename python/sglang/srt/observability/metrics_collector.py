@@ -41,6 +41,26 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class QueueCount:
+    """Holds both the total count and optional per-priority breakdown for a queue."""
+
+    total: int = 0
+    by_priority: Optional[Dict[int, int]] = None
+
+    @classmethod
+    def from_reqs(cls, reqs: List[Req], enable_priority_scheduling: bool = False):
+        # NOTE: If requests have priority=None (no --default-priority-value set),
+        # Counter will produce {None: N}, resulting in priority="None" Prometheus labels.
+        # Set --default-priority-value when enabling priority scheduling to avoid this.
+        by_priority = (
+            dict(Counter(req.priority for req in reqs))
+            if enable_priority_scheduling
+            else None
+        )
+        return cls(total=len(reqs), by_priority=by_priority)
+
+
+@dataclass
 class SchedulerStats:
     # Basics
     num_running_reqs: QueueCount = field(default_factory=QueueCount)
@@ -1180,7 +1200,9 @@ class SchedulerMetricsCollector:
         self._log_gauge(self.page_size, page_size)
         self._log_gauge(self.num_pages, num_pages)
         self._log_gauge(self.context_len, context_len)
-        self._log_gauge(self.startup_available_gpu_memory_gb, startup_available_gpu_memory_gb)
+        self._log_gauge(
+            self.startup_available_gpu_memory_gb, startup_available_gpu_memory_gb
+        )
 
 
 class TokenizerMetricsCollector:
@@ -1688,23 +1710,3 @@ def get_histogram_conf_from_env(env_var_name: str) -> Optional[List[float]]:
     if not env_var_value:
         return None
     return [float(x) for x in env_var_value.split(",")]
-
-
-@dataclass
-class QueueCount:
-    """Holds both the total count and optional per-priority breakdown for a queue."""
-
-    total: int = 0
-    by_priority: Optional[Dict[int, int]] = None
-
-    @classmethod
-    def from_reqs(cls, reqs: List[Req], enable_priority_scheduling: bool = False):
-        # NOTE: If requests have priority=None (no --default-priority-value set),
-        # Counter will produce {None: N}, resulting in priority="None" Prometheus labels.
-        # Set --default-priority-value when enabling priority scheduling to avoid this.
-        by_priority = (
-            dict(Counter(req.priority for req in reqs))
-            if enable_priority_scheduling
-            else None
-        )
-        return cls(total=len(reqs), by_priority=by_priority)
