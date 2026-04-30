@@ -57,7 +57,7 @@ def get_workflow_runs(repo: str, hours: int = 24) -> list[dict]:
         if len(page_runs) < 100:
             break
         page += 1
-        if page > 20:  # Safety limit
+        if page > 50:  # Safety limit (5000 runs)
             break
     return runs
 
@@ -76,7 +76,7 @@ def get_jobs_for_run(repo: str, run_id: int) -> list[dict]:
         if len(data.get("jobs", [])) < 100:
             break
         page += 1
-        if page > 5:  # Safety limit
+        if page > 20:  # Safety limit (2000 jobs per run)
             break
     return jobs
 
@@ -234,14 +234,14 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
 
     results = []
     for label in sorted(all_labels):
-        # Hosts that advertise this label (from API if available, else
-        # observed in job data).
-        if label in api_label_runners and api_label_runners[label]:
-            hosts = api_label_runners[label]
-        elif label in job_label_runners:
-            hosts = job_label_runners[label]
-        else:
-            hosts = set()
+        # Hosts to attribute to this label = union of currently-online
+        # runners advertising the label PLUS hosts that actually ran a
+        # job under it during the window. The union catches hosts that
+        # went offline mid-window (their busy time is still real
+        # capacity consumed) and hosts that came online late.
+        hosts = api_label_runners.get(label, set()) | job_label_runners.get(
+            label, set()
+        )
         num_runners = len(hosts) if hosts else 1
 
         # Pool busy time: sum of busy time across the hosts that could
