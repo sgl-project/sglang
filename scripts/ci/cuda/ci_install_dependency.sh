@@ -423,7 +423,15 @@ install_extra_deps() {
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
     if [ "$IS_BLACKWELL" != "1" ]; then
-        git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+        # Skip the clone if an existing checkout is already at the required tag
+        # (idempotent on local re-runs; real CI gets a fresh actions/checkout
+        # so this is a fast no-op when there's nothing reusable).
+        LMMS_EVAL_TAG="v0.5"
+        EXISTING_TAG=$(git -C lmms-eval describe --tags --exact-match 2>/dev/null || true)
+        if [ "$EXISTING_TAG" != "$LMMS_EVAL_TAG" ]; then
+            rm -rf lmms-eval
+            git clone --branch "$LMMS_EVAL_TAG" --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
+        fi
         $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
     fi
     $PIP_CMD uninstall xformers || true
