@@ -1557,7 +1557,7 @@ def _build_fp8_combined_view(k_cache: torch.Tensor) -> Tuple[torch.Tensor, int, 
 
 
 _TOPK_LEN_SENTINEL_CACHE: dict = {}
-_INT32_MAX = 2**31 - 1
+_INT32_MAX = 2**30
 
 
 def _topk_length_sentinel(device: torch.device, batch: int) -> torch.Tensor:
