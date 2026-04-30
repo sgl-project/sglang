@@ -423,6 +423,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
 
+    # For beam search
+    is_beam_search: bool = False
+
     attn_cp_metadata: Optional[ContextParallelMetadata] = None
 
     # For hidden states before normal
@@ -487,6 +490,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             token_type_ids=batch.token_type_ids,
             tbo_split_seq_index=batch.tbo_split_seq_index,
             dimensions=batch.dimensions,
+            is_beam_search=batch.is_beam_search,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             rids=[req.rid for req in batch.reqs],

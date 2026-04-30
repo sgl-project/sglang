@@ -26,6 +26,7 @@ import zmq
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
+from sglang.srt.managers.beam_search_detokenizer_mixin import BeamSearchDetokenizerMixin
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
@@ -70,7 +71,7 @@ class DecodeStatus:
     sent_offset: int = 0
 
 
-class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+class DetokenizerManager(BeamSearchDetokenizerMixin, MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
@@ -321,12 +322,16 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         return output_strs
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
-        # If handling idle batch, set output_strs to [].
-        output_strs = (
-            self._decode_batch_token_id_output(recv_obj)
-            if len(recv_obj.rids) > 0
-            else []
-        )
+        if self.is_beam_search_batch(recv_obj):
+            self.decode_beam_search_output(recv_obj)
+            output_strs = [""] * len(recv_obj.rids)
+        else:
+            # If handling idle batch, set output_strs to [].
+            output_strs = (
+                self._decode_batch_token_id_output(recv_obj)
+                if len(recv_obj.rids) > 0
+                else []
+            )
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
@@ -362,6 +367,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
             load=recv_obj.load,
+            beam_search_output=recv_obj.beam_search_output,
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
         )

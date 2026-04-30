@@ -168,6 +168,9 @@ from sglang.srt.managers.schedule_policy import (
     PrefillAdder,
     SchedulePolicy,
 )
+from sglang.srt.managers.scheduler_beam_search_processor_mixin import (
+    SchedulerBeamSearchProcessorMixin,
+)
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
 from sglang.srt.managers.scheduler_output_processor_mixin import (
@@ -320,6 +323,7 @@ def validate_dflash_request(req: Req) -> Optional[str]:
 
 
 class Scheduler(
+    SchedulerBeamSearchProcessorMixin,
     SchedulerOutputProcessorMixin,
     SchedulerUpdateWeightsMixin,
     SchedulerProfilerMixin,
@@ -1469,14 +1473,12 @@ class Scheduler(
     def event_loop_normal(self):
         """A normal scheduler loop."""
         while True:
-            # Receive requests
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
                 self.cancel_bubble_timer()
                 continue
 
-            # Get the next batch to run
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
 
@@ -1931,13 +1933,15 @@ class Scheduler(
                 # Use default bootstrap port
                 recv_req.bootstrap_port = self.server_args.disaggregation_bootstrap_port
 
+            # beam search not support return logprob
+            is_beam_search = self.server_args.enable_beam_search
             req = Req(
                 recv_req.rid,
                 recv_req.input_text,
                 recv_req.input_ids,
                 recv_req.sampling_params,
-                return_logprob=recv_req.return_logprob,
-                top_logprobs_num=recv_req.top_logprobs_num,
+                return_logprob=recv_req.return_logprob if not is_beam_search else False,
+                top_logprobs_num=recv_req.top_logprobs_num if not is_beam_search else 0,
                 token_ids_logprob=recv_req.token_ids_logprob,
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
@@ -1948,6 +1952,7 @@ class Scheduler(
                 require_reasoning=recv_req.require_reasoning,
                 return_hidden_states=recv_req.return_hidden_states,
                 return_routed_experts=recv_req.return_routed_experts,
+                is_beam_search=is_beam_search,
                 eos_token_ids=self.model_config.hf_eos_token_id,
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
@@ -3045,7 +3050,10 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         if batch.forward_mode.is_decode():
-            self.process_batch_result_decode(batch, result)
+            if batch.reqs and batch.reqs[0].is_beam_search:
+                self.process_beam_search_decode_result(batch, result)
+            else:
+                self.process_batch_result_decode(batch, result)
         elif batch.forward_mode.is_extend():
             if batch.is_dllm():
                 self.process_batch_result_dllm(batch, result)
