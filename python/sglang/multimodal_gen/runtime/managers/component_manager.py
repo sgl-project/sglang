@@ -2,10 +2,12 @@ from dataclasses import dataclass
 from functools import lru_cache
 from typing import Mapping, MutableMapping, Protocol, Sequence
 
+import torch
 import torch.nn as nn
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -43,6 +45,7 @@ class ResidencyState:
     stage_name: str | None = None
     next_stage_name: str | None = None
     current_use: ComponentUse | None = None
+    # the ComponentUses from the following stages
     future_uses: tuple[ComponentUse, ...] = ()
     batch_is_warmup: bool = False
     manager_mode: str = "static"
@@ -92,6 +95,7 @@ class ComponentResidencyStrategy:
         use: ComponentUse,
         state: ResidencyState,
     ) -> None:
+        """Wait for the preparation to be ready"""
         pass
 
     def finish_use(
@@ -139,6 +143,159 @@ class StageManagedStrategy(ComponentResidencyStrategy):
     """No-op strategy for components with existing stage-local device lifecycle."""
 
     name = "stage_managed"
+
+
+class SnapshotModuleResidency:
+    """Reusable snapshot-based module residency primitive.
+
+    This helper only knows how to:
+    - keep CPU parameter/buffer snapshots,
+    - prefetch a module (H2D) to the local device on a CUDA side stream
+    - release a module by rebinding tensors to those snapshots,
+    - track and wait for readiness events.
+
+    It deliberately does not know about pipeline stages, phases, or model-specific
+    ordering. Strategy subclasses decide when each primitive is called.
+    """
+
+    def __init__(self, *, pin_cpu_memory: bool, enable_async_prefetch: bool) -> None:
+        self.pin_cpu_memory = pin_cpu_memory
+        self.enable_async_prefetch = enable_async_prefetch
+        self._cpu_param_snapshots: dict[str, dict[str, torch.Tensor]] = {}
+        self._cpu_buffer_snapshots: dict[str, dict[str, torch.Tensor]] = {}
+        self._prefetch_stream: object | None = None
+        self._ready_events: dict[str, object] = {}
+
+    @staticmethod
+    def is_on_gpu(module: nn.Module | None) -> bool:
+        if module is None:
+            return False
+        param = next(module.parameters(), None)
+        return param is not None and param.device.type == "cuda"
+
+    def is_ready(self, component_name: str) -> bool:
+        return component_name in self._ready_events
+
+    def wait_ready(self, component_name: str) -> None:
+        """wait for the (H2D) stream to be ready"""
+        ready_event = self._ready_events.get(component_name)
+        if ready_event is None or not current_platform.is_cuda():
+            return
+        torch.get_device_module().current_stream().wait_event(ready_event)
+
+    def record_ready(self, component_name: str, module: nn.Module | None) -> None:
+        if not current_platform.is_cuda():
+            self._ready_events.pop(component_name, None)
+            return
+        if not self.is_on_gpu(module):
+            self._ready_events.pop(component_name, None)
+            return
+        event = torch.get_device_module().Event()
+        event.record(torch.get_device_module().current_stream())
+        self._ready_events[component_name] = event
+
+    @staticmethod
+    def _clone_cpu_tensor_snapshot(
+        tensor: torch.Tensor, *, pin_memory: bool
+    ) -> torch.Tensor:
+        snapshot = tensor.detach()
+        if snapshot.device.type == "cpu":
+            if pin_memory and not snapshot.is_pinned():
+                return snapshot.pin_memory()
+            return snapshot
+
+        cpu_tensor = snapshot.to("cpu")
+        if pin_memory:
+            return cpu_tensor.pin_memory()
+        return cpu_tensor
+
+    def _should_pin_memory(self) -> bool:
+        return bool(self.pin_cpu_memory and torch.get_device_module().is_available())
+
+    def capture(self, component_name: str, module: nn.Module) -> None:
+        """Capture a CPU snapshot for a component"""
+        if component_name in self._cpu_param_snapshots:
+            return
+
+        pin_memory = self._should_pin_memory()
+        self._cpu_param_snapshots[component_name] = {
+            name: self._clone_cpu_tensor_snapshot(param.data, pin_memory=pin_memory)
+            for name, param in module.named_parameters()
+        }
+        self._cpu_buffer_snapshots[component_name] = {
+            name: self._clone_cpu_tensor_snapshot(buffer.data, pin_memory=pin_memory)
+            for name, buffer in module.named_buffers()
+        }
+
+    def release_to_snapshot(self, component_name: str, module: nn.Module) -> None:
+        """Release CUDA storages by rebinding tensors to cached CPU snapshots.
+
+        This does not call `module.to("cpu")`. Instead, parameter and buffer
+        storages are rebound to pre-captured CPU tensors so CUDA storages can be
+        released by the allocator without an explicit D2H transfer.
+        """
+        param_snapshots = self._cpu_param_snapshots.get(component_name)
+        buffer_snapshots = self._cpu_buffer_snapshots.get(component_name)
+        if param_snapshots is None or buffer_snapshots is None:
+            module.to("cpu")
+            self._ready_events.pop(component_name, None)
+            return
+
+        pin_memory = self._should_pin_memory()
+        for name, param in module.named_parameters():
+            snapshot = param_snapshots.get(name)
+            if snapshot is None:
+                snapshot = self._clone_cpu_tensor_snapshot(
+                    param.data, pin_memory=pin_memory
+                )
+                param_snapshots[name] = snapshot
+            param.data = snapshot
+
+        for name, buffer in module.named_buffers():
+            snapshot = buffer_snapshots.get(name)
+            if snapshot is None:
+                snapshot = self._clone_cpu_tensor_snapshot(
+                    buffer.data, pin_memory=pin_memory
+                )
+                buffer_snapshots[name] = snapshot
+            # Preserve runtime-updated buffers (e.g., lazily built caches) when
+            # releasing back to CPU snapshots.
+            if buffer.device.type == "cuda":
+                snapshot.copy_(buffer.detach().to(device="cpu", dtype=snapshot.dtype))
+            elif buffer.device.type == "cpu":
+                snapshot.copy_(buffer.detach().to(dtype=snapshot.dtype))
+            buffer.data = snapshot
+
+        self._ready_events.pop(component_name, None)
+
+    def _supports_async_prefetch(self) -> bool:
+        return self.enable_async_prefetch and current_platform.is_cuda()
+
+    def _get_prefetch_stream(self):
+        """returns a stream is async-prefetch is enabled"""
+        if not self._supports_async_prefetch():
+            return None
+        if self._prefetch_stream is None:
+            self._prefetch_stream = torch.get_device_module().Stream(
+                device=get_local_torch_device()
+            )
+        return self._prefetch_stream
+
+    def prefetch_to_device(self, component_name: str, module: nn.Module | None) -> None:
+        if module is None:
+            self._ready_events.pop(component_name, None)
+            return
+        prefetch_stream = self._get_prefetch_stream()
+        if prefetch_stream is None:
+            # if the async prefetching is disabled
+            module.to(get_local_torch_device(), non_blocking=True)
+            self.record_ready(component_name, module)
+            return
+        with torch.get_device_module().stream(prefetch_stream):
+            module.to(get_local_torch_device(), non_blocking=True)
+            event = torch.get_device_module().Event()
+            event.record(prefetch_stream)
+        self._ready_events[component_name] = event
 
 
 class VanillaD2HStrategy(ComponentResidencyStrategy):
@@ -377,7 +534,10 @@ class ComponentResidencyManager:
         for use in self._stage_uses(stage_index):
             self.after_use(use)
         self._trace("stage_exit", detail=f"index={stage_index}")
-        self.prefetch_future_uses(stage_index + 1)
+        # Automatic cross-stage prefetch only looks at the next future stage
+        # that declares component uses. Explicit sequential component handoff
+        # inside a stage is handled by use-site hooks such as switch_use().
+        self.prefetch_next_stage_uses(stage_index + 1)
 
     def before_use(self, use: ComponentUse) -> None:
         """component use-site starts"""
@@ -505,7 +665,12 @@ class ComponentResidencyManager:
                 strategy.finish_request(module, use, self.state, preferred=preferred)
         self._trace("request_end")
 
-    def prefetch_future_uses(self, start_index: int) -> None:
+    def prefetch_next_stage_uses(self, start_index: int) -> None:
+        """Prefetch uses declared by the next future stage with component needs.
+
+        TODO: this is temporary and conservative. Broader lookahead requires a
+        real dependency graph, otherwise prefetch can over-reserve VRAM.
+        """
         if not self.enabled:
             return
         for index in range(start_index, len(self._stage_uses_by_index)):
@@ -572,6 +737,7 @@ class ComponentResidencyManager:
             return True
         return False
 
+    @lru_cache(maxsize=None)
     def _should_keep_single_dit(self, component_name: str) -> bool:
         modules = self.pipeline.modules
         return (component_name == "transformer" and "transformer_2" not in modules) or (
@@ -579,6 +745,7 @@ class ComponentResidencyManager:
         )
 
     def _preferred_request_end_use(self) -> ComponentUse | None:
+        """Returns a ComponentUse preferred to be resident after a request finishes, to prepare for next request"""
         for uses in self._stage_uses_by_index:
             for use in uses:
                 if use.preferred_ready_after_request:

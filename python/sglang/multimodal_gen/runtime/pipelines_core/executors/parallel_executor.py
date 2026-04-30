@@ -55,7 +55,7 @@ class ParallelExecutor(PipelineExecutor):
     def _execute_stages(
         self,
         stages: List[PipelineStage],
-        payload: Any,
+        batch: Any,
         server_args: ServerArgs,
         run_stage: Callable[[PipelineStage, Any], Any],
     ) -> Any:
