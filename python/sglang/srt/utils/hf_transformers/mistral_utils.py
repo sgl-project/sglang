@@ -27,8 +27,12 @@ def adapt_config_dict(
         is_moe and (config_dict["moe"].get("num_shared_experts") or 0) > 0
     )
     is_eagle = "eagle" in model.lower()
-    if is_eagle and not is_moe:
-        # Dense EAGLE draft model (e.g. Mistral Small 4 EAGLE).
+    is_mla_eagle = is_eagle and any(
+        config_dict.get(k) is not None
+        for k in ("kv_lora_rank", "q_lora_rank", "v_head_dim")
+    )
+    if is_eagle and not is_moe and is_mla_eagle:
+        # Dense MLA EAGLE draft model (e.g. Mistral Small 4 EAGLE).
         # Uses MLA attention like MistralLarge3 but has no MoE layers.
         # Set model_type to deepseek_v3 for MLA support, and override
         # MoE fields so all layers are dense.
@@ -47,6 +51,21 @@ def adapt_config_dict(
         config_dict["topk_method"] = None
         config_dict["scoring_func"] = "softmax"
         config_dict["routing_method_type"] = 1
+    elif is_eagle and not is_moe:
+        # Dense GQA EAGLE draft model (e.g. Mistral Medium 3.5 EAGLE).
+        # Routes to a Llama-backbone draft body — no MoE shimming required.
+        config_dict["architectures"] = ["MistralForCausalLMEagle"]
+        config_dict["model_type"] = "mistral"
+        config_dict["rope_is_neox_style"] = False
+        for mla_key in (
+            "q_lora_rank",
+            "qk_rope_head_dim",
+            "qk_nope_head_dim",
+            "kv_lora_rank",
+            "v_head_dim",
+        ):
+            if config_dict.get(mla_key) is None:
+                config_dict.pop(mla_key, None)
     elif is_moe:
         if is_mistral_large_3:
             config_dict = _remap_moe_args(config_dict)
@@ -328,9 +347,14 @@ class MistralConfigParser:
 def is_mistral_model(name) -> bool:
     """Return True if *name* refers to a Mistral model needing the custom parser."""
     lower = str(name).lower()
-    return (
-        "mistral-large-3" in lower or "mistral-small-4" in lower or "leanstral" in lower
-    )
+    if "mistral-large-3" in lower or "mistral-small-4" in lower or "leanstral" in lower:
+        return True
+    # EAGLE drafts for Mistral targets ship native-format only (params.json +
+    # consolidated.safetensors, no config.json), so route them through the
+    # custom parser regardless of the base model name.
+    if "eagle" in lower and "mistral" in lower:
+        return True
+    return False
 
 
 @lru_cache(maxsize=2)
