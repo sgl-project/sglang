@@ -699,6 +699,10 @@ class Scheduler(
         else:
             self.model_worker = self.draft_worker
 
+        # Install device timer on model runner for fwd occupancy tracking
+        if hasattr(self, "forward_pass_device_timer"):
+            self.tp_worker.model_runner.device_timer = self.forward_pass_device_timer
+
         # Get token and memory info from the model worker
         (
             self.max_total_num_tokens,
@@ -2914,11 +2918,10 @@ class Scheduler(
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     self.future_map.resolve_future(model_worker_batch)
-                    with self.record_forward_metrics(batch):
-                        batch_result = self.model_worker.forward_batch_generation(
-                            model_worker_batch
-                            # here pp is not compatible with overlap
-                        )
+                    batch_result = self.model_worker.forward_batch_generation(
+                        model_worker_batch
+                        # here pp is not compatible with overlap
+                    )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
@@ -2949,10 +2952,9 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                with self.record_forward_metrics(batch):
-                    batch_result = self.model_worker.forward_batch_generation(
-                        worker_batch_or_batch, **kwargs
-                    )
+                batch_result = self.model_worker.forward_batch_generation(
+                    worker_batch_or_batch, **kwargs
+                )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
@@ -3067,6 +3069,7 @@ class Scheduler(
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
+        self.update_device_timer()
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:

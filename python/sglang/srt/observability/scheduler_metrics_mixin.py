@@ -4,7 +4,6 @@ import dataclasses
 import logging
 import time
 from collections import defaultdict
-from contextlib import contextmanager
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 from sglang.srt.disaggregation.kv_events import EventPublisherFactory, KVEventBatch
@@ -160,9 +159,9 @@ class SchedulerMetricsMixin:
 
         if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
-            self._device_timer_window_gpu_time = 0
+            self._device_timer_window_gpu_time = 0.0
             self._device_timer_window_start = None
-            self._device_timer_gpu_busy_pct = 0.0
+            self.fwd_occupancy = float("nan")
 
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
@@ -392,7 +391,7 @@ class SchedulerMetricsMixin:
             msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
         if ENABLE_METRICS_DEVICE_TIMER:
-            msg += f", GPU busy: {self._device_timer_gpu_busy_pct:.2f}%"
+            msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -583,7 +582,7 @@ class SchedulerMetricsMixin:
             self._mfu_log_write_bytes = 0.0
 
         if ENABLE_METRICS_DEVICE_TIMER:
-            msg += f", GPU busy: {self._device_timer_gpu_busy_pct:.2f}%"
+            msg += f", fwd occupancy: {self.fwd_occupancy:.2f}%"
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -920,41 +919,25 @@ class SchedulerMetricsMixin:
             queues=queues,
         )
 
-    @contextmanager
-    def record_forward_metrics(self: Scheduler, batch: ScheduleBatch):
+    def update_device_timer(self: Scheduler):
         if not ENABLE_METRICS_DEVICE_TIMER:
-            yield
             return
-
-        with self.forward_pass_device_timer.wrap(
-            metadata=dict(
-                category="forward_" + batch.forward_mode.name.lower(),
-                dp_cooperation_info=batch.dp_cooperation_info,
-            ),
-        ):
-            yield
-
+        self.forward_pass_device_timer._report()
         now = time.perf_counter()
-
         if self._device_timer_window_batch_count == 0:
-            # Reset the window
             self._device_timer_window_start = now
-            self._device_timer_gpu_busy_pct = float("nan")
             self._device_timer_window_gpu_time = 0.0
-        elif self._device_timer_window_batch_count <= 3:
-            # The window is too small, do not report
-            self._device_timer_gpu_busy_pct = float("nan")
+            cpu_time = 0
+            self.fwd_occupancy = float("nan")
         else:
-            # The window is large enough, let us report
-            elapsed = now - self._device_timer_window_start
-            self._device_timer_gpu_busy_pct = (
-                self._device_timer_window_gpu_time / elapsed * 100
-            )
-
+            cpu_time = now - self._device_timer_window_start
+            self.fwd_occupancy = self._device_timer_window_gpu_time / cpu_time * 100
+        # ratio = self._device_timer_window_gpu_time / cpu_time if cpu_time > 0 else float("nan")
+        # print(f"{self._device_timer_window_batch_count=} {self.fwd_occupancy=}, {self._device_timer_window_gpu_time=}, {cpu_time=}, {ratio=}")
         self._device_timer_window_batch_count += 1
         if (
             self._device_timer_window_batch_count
-            >= self.server_args.decode_log_interval // 2 + 1
+            >= self.server_args.decode_log_interval
         ):
             self._device_timer_window_batch_count = 0
 

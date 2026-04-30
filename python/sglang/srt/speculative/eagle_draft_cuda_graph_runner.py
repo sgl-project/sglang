@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -216,7 +217,13 @@ class EAGLEDraftCudaGraphRunner:
         return out
 
     def _replay(self, forward_batch: ForwardBatch):
-        self.graphs[self.bs].replay()
+        ctx = (
+            self.model_runner.device_timer.wrap(metadata={"category": "eagle_draft"})
+            if self.model_runner.device_timer
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            self.graphs[self.bs].replay()
 
     def capture(self):
         CudaGraphRunner.capture(self)

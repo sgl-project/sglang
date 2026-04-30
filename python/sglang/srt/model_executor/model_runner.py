@@ -348,6 +348,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.is_draft_worker = is_draft_worker
         self.memory_pool_config = memory_pool_config
         self.is_generation = model_config.is_generation
+        self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
@@ -2976,12 +2977,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
+        ctx = (
+            self.device_timer.wrap(metadata={"category": "decode"})
+            if self.device_timer
+            else contextlib.nullcontext()
         )
+        with ctx:
+            return self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
 
     def forward_extend(
         self,
@@ -3016,10 +3023,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if can_run_graph:
-            return (
-                self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs),
-                can_run_graph,
+            ctx = (
+                self.device_timer.wrap(metadata={"category": "extend"})
+                if self.device_timer
+                else contextlib.nullcontext()
             )
+            with ctx:
+                ret = self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+            return (ret, can_run_graph)
 
         if not skip_attn_backend_init:
             if hasattr(self.model, "prepare_forward_batch"):
@@ -3028,15 +3039,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model.prepare_forward_batch(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
 
-        return (
-            self.model.forward(
+        ctx = (
+            self.device_timer.wrap(metadata={"category": "extend"})
+            if self.device_timer
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            ret = self.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
-            ),
-            can_run_graph,
-        )
+            )
+        return (ret, can_run_graph)
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
@@ -3050,12 +3065,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
+        ctx = (
+            self.device_timer.wrap(metadata={"category": "idle"})
+            if self.device_timer
+            else contextlib.nullcontext()
         )
+        with ctx:
+            return self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
 
     def forward_split_prefill(
         self,
@@ -3069,12 +3090,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
         )
-        ret = self.model.forward_split_prefill(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            (forward_batch.split_index, next_split_index),
+        ctx = (
+            self.device_timer.wrap(metadata={"category": "split_prefill"})
+            if self.device_timer
+            else contextlib.nullcontext()
         )
+        with ctx:
+            ret = self.model.forward_split_prefill(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                (forward_batch.split_index, next_split_index),
+            )
         forward_batch.split_index = next_split_index
         return ret
 

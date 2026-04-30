@@ -1017,7 +1017,7 @@ class SchedulerMetricsCollector:
         self,
         category: str,
         t: float,
-        dp_cooperation_info: Optional[DPCooperationInfo],
+        dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
         self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(t)
         if dp_cooperation_info is not None:

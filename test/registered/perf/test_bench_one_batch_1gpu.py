@@ -76,20 +76,22 @@ class TestBenchOneBatch1GPU(CustomTestCase):
             )
             self.assertGreater(output_throughput, 135)
 
-        gpu_busy_values = []
+        fwd_occupancy_values = []
         for line in error.split("\n"):
-            match = re.search(r"GPU busy:\s*([\d.]+|nan)%", line)
+            match = re.search(r"fwd occupancy:\s*([\d.]+|nan)%", line)
             if match:
                 val = match.group(1)
                 if val != "nan":
-                    gpu_busy_values.append(float(val))
+                    fwd_occupancy_values.append(float(val))
 
-        print(f"{gpu_busy_values=}", flush=True)
-        self.assertGreater(len(gpu_busy_values), 0, "No GPU busy values found in logs")
+        print(f"{fwd_occupancy_values=}", flush=True)
+        self.assertGreater(
+            len(fwd_occupancy_values), 0, "No fwd occupancy values found in logs"
+        )
 
-        gpu_busy_values_p90 = float(np.percentile(gpu_busy_values, 90))
-        print(f"{gpu_busy_values_p90=}", flush=True)
-        self.assertGreater(gpu_busy_values_p90, 99.1)
+        fwd_occupancy_p90 = float(np.percentile(fwd_occupancy_values, 90))
+        print(f"{fwd_occupancy_p90=}", flush=True)
+        self.assertGreater(fwd_occupancy_p90, 98)
 
 
 if __name__ == "__main__":
