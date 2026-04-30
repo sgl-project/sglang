@@ -30,6 +30,11 @@ class TestEAGLEServerBasic(EagleServerBase):
 
     extra_args = ["--chunked-prefill-size", 128, "--max-running-requests", 8]
 
+    @classmethod
+    def setUpClass(cls):
+        with envs.SGLANG_ENABLE_SPEC_V2.override(False):
+            super().setUpClass()
+
     # FIXME(lsyin): move the test methods to kits
     def test_request_abort(self):
         concurrency = 4
