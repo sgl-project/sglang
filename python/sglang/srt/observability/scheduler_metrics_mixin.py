@@ -946,8 +946,8 @@ class SchedulerMetricsMixin:
         now = time.perf_counter()
         elapsed = now - self._device_timer_window_start
         if elapsed > 0:
-            self._device_timer_gpu_busy_pct = (
-                self._device_timer_window_execution_s / elapsed * 100
+            self._device_timer_gpu_busy_pct = min(
+                self._device_timer_window_execution_s / elapsed * 100, 100.0
             )
         if self._device_timer_window_batch_count >= 10:
             self._device_timer_window_execution_s = 0.0
