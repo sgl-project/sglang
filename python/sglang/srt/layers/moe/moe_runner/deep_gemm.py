@@ -10,7 +10,7 @@ from sglang.jit_kernel.deepseek_v4 import silu_and_mul_masked_post_quant
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
-from sglang.srt.environ import envs, is_large_dummy_model
+from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
@@ -761,8 +761,6 @@ def _apply_swiglu_limit(
     assert swiglu_limit == 10
 
     num_tokens, hidden_size_x2 = gateup_output.shape
-    if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get() and not is_large_dummy_model():
-        assert hidden_size_x2 == 2048 * 2
     assert gateup_output.dtype == torch.bfloat16
 
     gate, up = torch.chunk(gateup_output, chunks=2, dim=-1)

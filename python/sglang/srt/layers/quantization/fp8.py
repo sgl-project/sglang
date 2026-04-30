@@ -14,7 +14,7 @@ from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
-from sglang.srt.environ import envs, is_large_dummy_model
+from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -987,12 +987,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # WEIGHT_SCALES
         if self.is_fp4_expert:
-            if (
-                envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get()
-                and not is_large_dummy_model()
-            ):
-                assert hidden_size == 4096
-                assert intermediate_size_per_partition == 2048
             fp4_block_k = 32
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
