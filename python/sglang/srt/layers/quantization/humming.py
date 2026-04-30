@@ -1,21 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import dataclasses
 import json
 import math
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, List
 
 import regex as re
-import dataclasses
 import torch
-from sglang.multimodal_gen.runtime.layers.linear import (
-    LinearMethodBase,
-)
-from sglang.multimodal_gen.runtime.layers.quantization import QuantizationMethods
-from sglang.multimodal_gen.runtime.loader.weight_utils import default_weight_loader
-from sglang.multimodal_gen.runtime.models.utils import set_weight_attrs
 from sglang.srt.environ import envs
-from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.linear import LinearBase, set_weight_attrs
 from sglang.srt.layers.moe import (
     MoeRunner,
     MoeRunnerBackend,
@@ -23,6 +17,7 @@ from sglang.srt.layers.moe import (
     get_moe_runner_backend,
 )
 from sglang.srt.layers.parameter import (
+    BasevLLMParameter,
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
     GroupQuantScaleParameter,
@@ -30,10 +25,10 @@ from sglang.srt.layers.parameter import (
     PackedvLLMParameter,
     PerTensorScaleParameter,
     RowvLLMParameter,
-    BasevLLMParameter,
 )
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
+    LinearMethodBase,
     QuantizationConfig,
     QuantizeMethodBase,
 )
@@ -41,6 +36,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.model_loader.weight_utils import default_weight_loader
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
@@ -182,7 +178,7 @@ class HummingConfig(QuantizationConfig):
         self.full_config: dict[str, Any] = full_config or {}
 
     @classmethod
-    def get_name(cls) -> QuantizationMethods:
+    def get_name(cls) -> str:
         return "humming"
 
     @classmethod
@@ -205,9 +201,7 @@ class HummingConfig(QuantizationConfig):
         raise NotImplementedError
 
     @classmethod
-    def override_quantization_method(
-        cls, hf_quant_cfg, user_quant,
-    ) -> QuantizationMethods | None:
+    def override_quantization_method(cls, hf_quant_cfg, user_quant) -> str | None:
         if hf_quant_cfg["quant_method"] == "mxfp4":
             # NOTE: gpt-oss has a special weight loading logic, so we don't support it now.
             # TODO: integrate humming kernels to mxfp4.py
