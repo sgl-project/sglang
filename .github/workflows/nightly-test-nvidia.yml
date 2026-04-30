@@ -190,6 +190,7 @@ jobs:
       cancel-in-progress: false
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         partition: [0, 1, 2, 3]
     env:
@@ -311,6 +312,7 @@ jobs:
       cancel-in-progress: false
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         partition: [0, 1, 2, 3]
     steps:
@@ -527,7 +529,7 @@ jobs:
       cancel-in-progress: false
     strategy:
       fail-fast: false
-      max-parallel: 5
+      max-parallel: 2
       matrix:
         part: [0, 1]
     steps:
@@ -588,7 +590,7 @@ jobs:
       cancel-in-progress: false
     strategy:
       fail-fast: false
-      max-parallel: 5
+      max-parallel: 2
       matrix:
         part: [0, 1]
     steps:
