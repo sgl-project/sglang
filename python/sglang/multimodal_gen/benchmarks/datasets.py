@@ -22,6 +22,7 @@ class RequestFuncInput:
     prompt: str
     api_url: str = ""
     model: str = ""
+    num_outputs_per_prompt: int = 1
     width: Optional[int] = None
     height: Optional[int] = None
     num_frames: Optional[int] = None
@@ -42,6 +43,7 @@ class RequestFuncOutput:
     response_body: Dict[str, Any] = field(default_factory=dict)
     peak_memory_mb: float = 0.0
     slo_achieved: Optional[bool] = None
+    output_count: int = 0
 
 
 def is_dir_not_empty(path: str) -> bool:
@@ -274,6 +276,7 @@ class VBenchDataset(BaseDataset):
             prompt=item.get("prompt", ""),
             api_url=self.api_url,
             model=self.model,
+            num_outputs_per_prompt=self.args.num_outputs_per_prompt,
             width=self.args.width,
             height=self.args.height,
             num_frames=self.args.num_frames,
@@ -315,6 +318,9 @@ class RandomDataset(BaseDataset):
             prompt=f"Random prompt {idx} for benchmarking diffusion models",
             api_url=self.api_url,
             model=self.model,
+            num_outputs_per_prompt=profile.get(
+                "num_outputs_per_prompt", self.args.num_outputs_per_prompt
+            ),
             width=profile.get("width", self.args.width),
             height=profile.get("height", self.args.height),
             num_frames=profile.get("num_frames", self.args.num_frames),
