@@ -647,14 +647,6 @@ envs = Envs()
 EnvField._allow_set_name = False
 
 
-from functools import lru_cache
-
-
-@lru_cache(maxsize=1)
-def is_large_dummy_model() -> bool:
-    return os.environ.get("SGLANG_HACK_ASSERT_CKPT_VERSION") == "large-dummy"
-
-
 def _print_deprecated_env(old_name: str, new_name: Optional[str] = None):
     if old_name in os.environ:
         if new_name is None:
