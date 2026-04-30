@@ -267,7 +267,9 @@ class DeepseekV2WeightLoaderMixin:
                         if fuse_qkv_a_proj and (
                             "q_a_proj" in name or "kv_a_proj_with_mqa" in name
                         ):
-                            cached_a_proj[name] = loaded_weight
+                            # Clone because we hold this tensor until its pair
+                            # arrives; the RunAI streamer may reuse the buffer.
+                            cached_a_proj[name] = loaded_weight.clone()
                             q_a_proj_name = (
                                 name
                                 if "q_a_proj" in name
