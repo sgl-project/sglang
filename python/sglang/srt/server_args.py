@@ -2683,10 +2683,23 @@ class ServerArgs:
             )
             self.attention_backend = "triton"
 
-        if self.attention_backend == "intel_xpu":
-            if self.page_size not in [32, 64, 128]:
+        prefill_backend, decode_backend = self.get_attention_backends()
+        if self.use_mla_backend() and prefill_backend == "intel_xpu":
+            raise ValueError(
+                "intel_xpu backend is only supported on decode for MLA models, please set --decode-attention-backend to intel_xpu and do not set --attention-backend or --prefill-attention-backend to intel_xpu for prefill instead use triton."
+            )
+
+        if decode_backend == "intel_xpu":
+            if self.use_mla_backend():
+                supported_page_sizes = [16, 32, 64, 128]
+                msg = "Intel XPU attention backend for MLA Decode"
+            else:
+                supported_page_sizes = [64, 128]
+                msg = "Intel XPU attention backend"
+
+            if self.page_size not in supported_page_sizes:
                 logger.warning(
-                    f"Intel XPU attention backend only supports page_size of 32, 64 or 128, changing page_size from {self.page_size} to 128."
+                    f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {self.page_size} to 128."
                 )
                 self.page_size = 128
 
