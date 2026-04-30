@@ -600,6 +600,7 @@ class ServerArgs:
     relaykv_available_kv_budget_mib: float = 0.0
     relaykv_working_budget_tokens: int = 0
     relaykv_anchor_blocks: int = 0
+    relaykv_budget_block_size: int = 128
     relaykv_retrieval_top_k: int = 0
     relaykv_log_interval: int = 1
     relaykv_host_backup_shadow: bool = False
@@ -5861,6 +5862,15 @@ class ServerArgs:
             help=(
                 "Number of leading KV blocks to reserve as RelayKV anchors "
                 "for budget planning."
+            ),
+        )
+        parser.add_argument(
+            "--relaykv-budget-block-size",
+            type=int,
+            default=ServerArgs.relaykv_budget_block_size,
+            help=(
+                "RelayKV logical budget block size in tokens for anchor and "
+                "retrieval budget metadata."
             ),
         )
         parser.add_argument(

@@ -20,9 +20,11 @@ class RelayKVPlan:
     kv_working_budget_tokens: int
     kv_working_budget_source: str
     recent_window_tokens: int
+    budget_block_size: int
     anchor_blocks: int
     anchor_budget_tokens: int
     retrieval_budget_tokens: int
+    retrieval_block_budget: int
     retrieval_top_k_requested: int
     retrieval_top_k_effective: int
     budget_overflow: bool
@@ -86,35 +88,25 @@ def _budget_metadata(
 ) -> dict[str, Any]:
     working_budget, reason = _estimate_working_budget_tokens(config, kv_bytes_per_token)
     working_budget = max(int(working_budget), 0)
+    budget_block_size = max(int(config.budget_block_size), 1)
     anchor_block_count = (
         config.anchor_blocks if config.anchor_blocks > 0 else config.anchor_pages
     )
-    requested_anchor_tokens = max(anchor_block_count, 0) * page_size
+    requested_anchor_tokens = max(anchor_block_count, 0) * budget_block_size
 
-    recent_window_tokens = min(config.recent_window, seq_len, working_budget)
+    recent_window_tokens = min(config.recent_window, working_budget)
     remaining_after_recent = max(working_budget - recent_window_tokens, 0)
-    anchor_budget_tokens = min(
-        requested_anchor_tokens,
-        remaining_after_recent,
-        max(seq_len - recent_window_tokens, 0),
-    )
+    anchor_budget_tokens = min(requested_anchor_tokens, remaining_after_recent)
 
     remaining_after_anchor = max(
         working_budget - recent_window_tokens - anchor_budget_tokens, 0
     )
-    cold_tokens_available = max(
-        seq_len - recent_window_tokens - anchor_budget_tokens, 0
-    )
     retrieval_top_k_requested = config.retrieval_top_k
+    retrieval_budget_tokens = remaining_after_anchor
+    retrieval_block_budget = retrieval_budget_tokens // budget_block_size
     retrieval_top_k_effective = min(
         retrieval_top_k_requested,
-        remaining_after_anchor // page_size,
-        _ceil_div(cold_tokens_available, page_size) if cold_tokens_available else 0,
-    )
-    retrieval_budget_tokens = min(
-        retrieval_top_k_effective * page_size,
-        remaining_after_anchor,
-        cold_tokens_available,
+        retrieval_block_budget,
     )
 
     overflow = False
@@ -128,6 +120,9 @@ def _budget_metadata(
     elif requested_anchor_tokens > anchor_budget_tokens:
         overflow = True
         policy_reason = "anchor_budget_clipped_after_recent_window"
+    elif retrieval_top_k_requested > 0 and retrieval_block_budget <= 0:
+        overflow = True
+        policy_reason = "no_retrieval_room_after_recent_and_anchor"
     elif retrieval_top_k_requested > retrieval_top_k_effective:
         overflow = True
         policy_reason = "retrieval_top_k_clipped_to_remaining_budget"
@@ -137,9 +132,11 @@ def _budget_metadata(
         "kv_working_budget_tokens": working_budget,
         "kv_working_budget_source": reason,
         "recent_window_tokens": recent_window_tokens,
+        "budget_block_size": budget_block_size,
         "anchor_blocks": anchor_block_count,
         "anchor_budget_tokens": anchor_budget_tokens,
         "retrieval_budget_tokens": retrieval_budget_tokens,
+        "retrieval_block_budget": retrieval_block_budget,
         "retrieval_top_k_requested": retrieval_top_k_requested,
         "retrieval_top_k_effective": retrieval_top_k_effective,
         "budget_overflow": overflow,
@@ -183,9 +180,11 @@ def build_shadow_plan(
             kv_working_budget_tokens=0,
             kv_working_budget_source="relaykv_disabled",
             recent_window_tokens=0,
+            budget_block_size=config.budget_block_size,
             anchor_blocks=config.anchor_blocks,
             anchor_budget_tokens=0,
             retrieval_budget_tokens=0,
+            retrieval_block_budget=0,
             retrieval_top_k_requested=config.retrieval_top_k,
             retrieval_top_k_effective=0,
             budget_overflow=False,
@@ -245,9 +244,11 @@ def build_shadow_plan(
         kv_working_budget_tokens=budget_metadata["kv_working_budget_tokens"],
         kv_working_budget_source=budget_metadata["kv_working_budget_source"],
         recent_window_tokens=budget_metadata["recent_window_tokens"],
+        budget_block_size=budget_metadata["budget_block_size"],
         anchor_blocks=budget_metadata["anchor_blocks"],
         anchor_budget_tokens=budget_metadata["anchor_budget_tokens"],
         retrieval_budget_tokens=budget_metadata["retrieval_budget_tokens"],
+        retrieval_block_budget=budget_metadata["retrieval_block_budget"],
         retrieval_top_k_requested=budget_metadata["retrieval_top_k_requested"],
         retrieval_top_k_effective=budget_metadata["retrieval_top_k_effective"],
         budget_overflow=budget_metadata["budget_overflow"],

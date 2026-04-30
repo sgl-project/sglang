@@ -54,7 +54,16 @@ def _assert_budget_plan(
     *,
     available_mib: float,
     expected_working_tokens: int,
+    recent_window: int,
+    anchor_blocks: int,
+    budget_block_size: int,
+    retrieval_top_k: int,
+    expected_anchor_tokens: int,
     expected_retrieval_tokens: int,
+    expected_retrieval_blocks: int,
+    expected_top_k_effective: int,
+    expected_overflow: bool,
+    expected_reason: str,
 ) -> None:
     plan = make_shadow_plan(
         100000,
@@ -62,9 +71,10 @@ def _assert_budget_plan(
             enabled=True,
             mode="shadow",
             available_kv_budget_mib=available_mib,
-            recent_window=8192,
-            anchor_blocks=128,
-            retrieval_top_k=70000,
+            recent_window=recent_window,
+            anchor_blocks=anchor_blocks,
+            budget_block_size=budget_block_size,
+            retrieval_top_k=retrieval_top_k,
         ),
         kv_bytes_per_token=28672,
     )
@@ -72,19 +82,51 @@ def _assert_budget_plan(
         raise AssertionError(plan)
     if plan.kv_working_budget_source != "estimated_from_available_kv_budget_mib":
         raise AssertionError(plan)
-    if plan.recent_window_tokens != 8192:
+    if plan.recent_window_tokens != recent_window:
         raise AssertionError(plan)
-    if plan.anchor_blocks != 128:
+    if plan.budget_block_size != budget_block_size:
         raise AssertionError(plan)
-    if plan.anchor_budget_tokens != 128:
+    if plan.anchor_blocks != anchor_blocks:
+        raise AssertionError(plan)
+    if plan.anchor_budget_tokens != expected_anchor_tokens:
         raise AssertionError(plan)
     if plan.retrieval_budget_tokens != expected_retrieval_tokens:
         raise AssertionError(plan)
-    if plan.retrieval_top_k_effective != expected_retrieval_tokens:
+    if plan.retrieval_block_budget != expected_retrieval_blocks:
+        raise AssertionError(plan)
+    if plan.retrieval_top_k_effective != expected_top_k_effective:
+        raise AssertionError(plan)
+    if plan.budget_overflow is not expected_overflow:
+        raise AssertionError(plan)
+    if plan.budget_policy_reason != expected_reason:
+        raise AssertionError(plan)
+
+
+def _assert_small_budget_plan() -> None:
+    plan = make_shadow_plan(
+        100000,
+        RelayKVConfig(
+            enabled=True,
+            mode="shadow",
+            kv_working_budget_tokens=1024,
+            recent_window=768,
+            anchor_blocks=4,
+            budget_block_size=128,
+            retrieval_top_k=8,
+        ),
+        kv_bytes_per_token=28672,
+    )
+    if plan.anchor_budget_tokens != 256:
+        raise AssertionError(plan)
+    if plan.retrieval_budget_tokens != 0:
+        raise AssertionError(plan)
+    if plan.retrieval_block_budget != 0:
+        raise AssertionError(plan)
+    if plan.retrieval_top_k_effective != 0:
         raise AssertionError(plan)
     if plan.budget_overflow is not True:
         raise AssertionError(plan)
-    if plan.budget_policy_reason != "retrieval_top_k_clipped_to_remaining_budget":
+    if plan.budget_policy_reason != "anchor_budget_clipped_after_recent_window":
         raise AssertionError(plan)
 
 
@@ -222,18 +264,46 @@ def main() -> None:
     _assert_budget_plan(
         available_mib=512.0,
         expected_working_tokens=18724,
-        expected_retrieval_tokens=10404,
+        recent_window=768,
+        anchor_blocks=4,
+        budget_block_size=128,
+        retrieval_top_k=8,
+        expected_anchor_tokens=512,
+        expected_retrieval_tokens=17444,
+        expected_retrieval_blocks=136,
+        expected_top_k_effective=8,
+        expected_overflow=False,
+        expected_reason="estimated_from_available_kv_budget_mib",
     )
     _assert_budget_plan(
         available_mib=1024.0,
         expected_working_tokens=37449,
-        expected_retrieval_tokens=29129,
+        recent_window=768,
+        anchor_blocks=4,
+        budget_block_size=128,
+        retrieval_top_k=8,
+        expected_anchor_tokens=512,
+        expected_retrieval_tokens=36169,
+        expected_retrieval_blocks=282,
+        expected_top_k_effective=8,
+        expected_overflow=False,
+        expected_reason="estimated_from_available_kv_budget_mib",
     )
     _assert_budget_plan(
         available_mib=2048.0,
         expected_working_tokens=74898,
-        expected_retrieval_tokens=66578,
+        recent_window=768,
+        anchor_blocks=4,
+        budget_block_size=128,
+        retrieval_top_k=8,
+        expected_anchor_tokens=512,
+        expected_retrieval_tokens=73618,
+        expected_retrieval_blocks=575,
+        expected_top_k_effective=8,
+        expected_overflow=False,
+        expected_reason="estimated_from_available_kv_budget_mib",
     )
+    _assert_small_budget_plan()
 
     explicit_plan = make_shadow_plan(
         4096,
@@ -244,6 +314,7 @@ def main() -> None:
             kv_working_budget_tokens=2048,
             recent_window=1024,
             anchor_blocks=64,
+            budget_block_size=128,
             retrieval_top_k=2048,
         ),
         kv_bytes_per_token=28672,
@@ -254,7 +325,11 @@ def main() -> None:
         raise AssertionError(explicit_plan)
     if explicit_plan.anchor_blocks != 64:
         raise AssertionError(explicit_plan)
-    if explicit_plan.retrieval_top_k_effective != 960:
+    if explicit_plan.anchor_budget_tokens != 1024:
+        raise AssertionError(explicit_plan)
+    if explicit_plan.retrieval_budget_tokens != 0:
+        raise AssertionError(explicit_plan)
+    if explicit_plan.retrieval_top_k_effective != 0:
         raise AssertionError(explicit_plan)
 
     print("relaykv_memory_smoke: ok")

@@ -23,6 +23,7 @@ class RelayKVConfig:
     available_kv_budget_mib: float = 0.0
     kv_working_budget_tokens: int = 0
     anchor_blocks: int = 0
+    budget_block_size: int = 128
     retrieval_top_k: int = 0
     log_interval: int = 1
     host_backup_shadow: bool = False
@@ -52,6 +53,9 @@ class RelayKVConfig:
                 getattr(server_args, "relaykv_working_budget_tokens", 0) or 0
             ),
             anchor_blocks=int(getattr(server_args, "relaykv_anchor_blocks", 0) or 0),
+            budget_block_size=int(
+                getattr(server_args, "relaykv_budget_block_size", 128) or 128
+            ),
             retrieval_top_k=int(getattr(server_args, "relaykv_retrieval_top_k", 0) or 0),
             log_interval=int(getattr(server_args, "relaykv_log_interval", 1) or 1),
             host_backup_shadow=bool(
@@ -92,6 +96,8 @@ class RelayKVConfig:
             raise ValueError("--relaykv-anchor-pages must be >= 0")
         if self.anchor_blocks < 0:
             raise ValueError("--relaykv-anchor-blocks must be >= 0")
+        if self.budget_block_size <= 0:
+            raise ValueError("--relaykv-budget-block-size must be > 0")
         if self.retrieval_top_k < 0:
             raise ValueError("--relaykv-retrieval-top-k must be >= 0")
         if self.log_interval <= 0:

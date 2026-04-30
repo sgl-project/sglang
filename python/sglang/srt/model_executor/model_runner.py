@@ -802,6 +802,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 "available_kv_budget_mib": config.available_kv_budget_mib,
                 "kv_working_budget_tokens": config.kv_working_budget_tokens,
                 "anchor_blocks": config.anchor_blocks,
+                "budget_block_size": config.budget_block_size,
                 "retrieval_top_k": config.retrieval_top_k,
                 "log_interval": config.log_interval,
                 "page_size": self.page_size,
