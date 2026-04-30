@@ -409,11 +409,9 @@ def _build_nvfp4_config_from_safetensors_files(
         if reverse_mapping_fn is not None:
             reverse_mapped, _, _ = reverse_mapping_fn(raw_weight_name)
             if reverse_mapped != raw_weight_name:
-                exclude_modules.append(
-                    reverse_mapped[: -len(".weight")]
-                    if reverse_mapped.endswith(".weight")
-                    else reverse_mapped
-                )
+                # Input is in SGLang form (only the reverse rule matched); the
+                # model is keyed by SGLang names, so excludes must use module_bfl.
+                exclude_modules.append(module_bfl)
                 continue
 
         exclude_modules.append(module_bfl)
