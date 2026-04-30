@@ -1306,7 +1306,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         get_global_server_args().disable_shared_experts_fusion = True
         log_info_on_rank0(
             logger,
-            "2604B checkpoint requires different clamping for shared and routed experts. "
+            "DeepSeek V4 requires different clamping for shared and routed experts. "
             "Shared experts fusion optimization is disabled.",
         )
 

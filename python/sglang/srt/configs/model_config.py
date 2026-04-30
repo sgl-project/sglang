@@ -103,7 +103,7 @@ def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
 import re as _re
 
 # Matches routed-expert weight keys in both HF-style layouts
-# (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepseekV4 2604-style
+# (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
 # layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). ``shared_experts`` is
 # excluded because the index segment requires a digit after ``.experts.``.
 _ROUTED_EXPERT_KEY_RE = _re.compile(
@@ -237,7 +237,7 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
-        # Auto-detect FP4 vs FP8 routed-expert storage for DeepseekV4 2604 mode
+        # Auto-detect FP4 vs FP8 routed-expert storage for DeepSeek V4
         self._maybe_auto_set_dsv4_fp4_experts()
 
         # Check model type
@@ -456,7 +456,7 @@ class ModelConfig:
 
     def _maybe_auto_set_dsv4_fp4_experts(self):
         """Auto-set SGLANG_DSV4_FP4_EXPERTS based on the checkpoint's routed-
-        expert weight dtype for DeepseekV4 in 2604 mode.
+        expert weight dtype for DeepSeek V4.
 
         mxfp4-packed experts are stored as ``U8`` in safetensors; FP4-to-FP8
         converted experts are stored as ``F8_E4M3``. The flag defaults to True
@@ -481,14 +481,14 @@ class ModelConfig:
             return
         # Packed mxfp4 expert weights are stored as int8/uint8 (or native F4);
         # the FP4-to-FP8 conversion path writes F8_E4M3. Anything else is
-        # unexpected for 2604 mode, so leave the env alone and log it.
+        # unexpected for DeepSeek V4, so leave the env alone and log it.
         if dtype in ("U8", "I8", "F4"):
             is_fp4_experts = True
         elif dtype == "F8_E4M3":
             is_fp4_experts = False
         else:
             logger.warning(
-                "Unexpected routed-expert safetensors dtype=%s for 2604 mode; "
+                "Unexpected routed-expert safetensors dtype=%s for DeepSeek V4; "
                 "keeping SGLANG_DSV4_FP4_EXPERTS default.",
                 dtype,
             )

@@ -136,7 +136,7 @@ class DeepSeekMxfp4MoEMethod:
         swiglu_limit = moe_runner_config.swiglu_limit
         assert (
             swiglu_limit is not None
-        ), f"swiglu_limit must be non-None for 2604B (got {swiglu_limit!r})"
+        ), f"swiglu_limit must be non-None for DeepSeek V4 (got {swiglu_limit!r})"
         self._gemm1_clamp_limit_tensor = (
             torch.full(
                 (layer.num_local_experts,),

@@ -320,14 +320,14 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         assert (
             self.swiglu_limit is not None
-        ), f"swiglu_limit must be non-None for 2604B (got {self.swiglu_limit!r})"
+        ), f"swiglu_limit must be non-None for DeepSeek V4 (got {self.swiglu_limit!r})"
         swiglu_limit_arg: Optional[float] = None
         assert (
             not _MASKED_GEMM_FAST_ACT
-        ), "DSV4 2604 submode 2604B does not support SGLANG_MASKED_GEMM_FAST_ACT"
+        ), "DeepSeek V4 does not support SGLANG_MASKED_GEMM_FAST_ACT"
         assert (
             envs.SGLANG_OPT_USE_JIT_EP_ACTIVATION.get()
-        ), "DSV4 2604 submode 2604B requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        ), "DeepSeek V4 requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
 
         if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
             swiglu_limit_arg = self.swiglu_limit
@@ -674,7 +674,7 @@ def _varlen_deep_gemm_silu_mul_quant(
         )
         assert (
             swiglu_limit is None
-        ), "swiglu_limit (DSV4 2604 submode 2604B) is not supported together with SGLANG_MASKED_GEMM_FAST_ACT"
+        ), "swiglu_limit (DeepSeek V4) is not supported together with SGLANG_MASKED_GEMM_FAST_ACT"
         return sglang_per_token_group_quant_8bit(
             x=gateup_output,
             dst_dtype=torch.float8_e4m3fn,
@@ -724,7 +724,7 @@ def _varlen_deep_gemm_silu_mul_quant(
     else:
         assert (
             swiglu_limit is None
-        ), "swiglu_limit (DSV4 2604 submode 2604B) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
+        ), "swiglu_limit (DeepSeek V4) requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
         assert (
             not swizzle
         ), "SGLANG_OPT_FIX_MEGA_MOE_MEMORY requires SGLANG_OPT_USE_JIT_EP_ACTIVATION=True"
