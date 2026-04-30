@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fake-worker-0
+  namespace: smg-test
+  labels:
+    app: fake-worker
+spec:
+  containers:
+    - name: worker
+      image: python:3.12-slim
+      imagePullPolicy: IfNotPresent
+      command: ["python3", "/app/fake_worker.py"]
+      ports:
+        - containerPort: 8000
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 2
+        periodSeconds: 3
+      volumeMounts:
+        - name: app
+          mountPath: /app
+  volumes:
+    - name: app
+      configMap:
+        name: fake-worker-script
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: fake-worker-1
+  namespace: smg-test
+  labels:
+    app: fake-worker
+spec:
+  containers:
+    - name: worker
+      image: python:3.12-slim
+      imagePullPolicy: IfNotPresent
+      command: ["python3", "/app/fake_worker.py"]
+      ports:
+        - containerPort: 8000
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8000
+        initialDelaySeconds: 2
+        periodSeconds: 3
+      volumeMounts:
+        - name: app
+          mountPath: /app
+  volumes:
+    - name: app
+      configMap:
+        name: fake-worker-script
