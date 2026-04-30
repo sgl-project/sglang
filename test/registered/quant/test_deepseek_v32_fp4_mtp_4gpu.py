@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import requests
 
-from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -54,13 +53,12 @@ class TestDeepseekV32FP4DPSpecV2(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=SERVER_LAUNCH_TIMEOUT,
-                other_args=other_args,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=other_args,
+        )
 
     @classmethod
     def tearDownClass(cls):
@@ -145,13 +143,12 @@ class TestDeepseekV32FP4TPSpecV2(CustomTestCase):
             "--model-loader-extra-config",
             '{"enable_multithread_load": true,"num_threads": 64}',
         ]
-        with envs.SGLANG_ENABLE_SPEC_V2.override(True):
-            cls.process = popen_launch_server(
-                cls.model,
-                cls.base_url,
-                timeout=SERVER_LAUNCH_TIMEOUT,
-                other_args=other_args,
-            )
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=SERVER_LAUNCH_TIMEOUT,
+            other_args=other_args,
+        )
 
     @classmethod
     def tearDownClass(cls):

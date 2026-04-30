@@ -14,7 +14,12 @@ on:
         default: ''
         type: string
       output_name:
-        description: 'Custom output folder name (also used for artifact names and publish target dir). Leave empty to use defaults.'
+        description: 'Custom local output/artifact folder name. Leave empty to use defaults.'
+        required: false
+        default: ''
+        type: string
+      publish_target_dir:
+        description: 'Remote target directory in sglang-ci-data. Leave empty to use diffusion-ci/consistency_gt/sglang_generated.'
         required: false
         default: ''
         type: string
@@ -36,6 +41,7 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   OUTPUT_NAME: ${{ inputs.output_name || 'diffusion-ci-outputs' }}
+  PUBLISH_TARGET_DIR: ${{ inputs.publish_target_dir || 'diffusion-ci/consistency_gt/sglang_generated' }}
 
 jobs:
   compute-diffusion-partitions:
@@ -136,7 +142,7 @@ jobs:
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
 
   multimodal-diffusion-gen-2gpu:
     needs: compute-diffusion-partitions
@@ -202,7 +208,7 @@ jobs:
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
 
   multimodal-diffusion-gen-b200:
     needs: compute-diffusion-partitions
@@ -268,4 +274,4 @@ jobs:
         run: |
           python scripts/ci/utils/diffusion/publish_diffusion_gt.py \
             --source-dir python/${{ env.OUTPUT_NAME }} \
-            ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
+            --target-dir "${{ env.PUBLISH_TARGET_DIR }}"
