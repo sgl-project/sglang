@@ -945,28 +945,38 @@ void shared_expert_kernel_impl(
 }  // anonymous namespace
 
 // common checks
+template <CPUQuantMethod quant>
 static inline void check_moe_scales(
-    bool use_int8_w8a8,
-    bool use_fp8_w8a16,
-    bool use_mxfp4,
+  const std::optional<at::Tensor>& w1_scale,
+  const std::optional<at::Tensor>& w2_scale,
+  const std::optional<std::vector<int64_t>> block_size) {
+    if constexpr(quant == CPUQuantMethod::INT8_W8A8) {
+      TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for int8 w8a8.");
+      TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for int8 w8a8.");
+    } else if constexpr (quant == CPUQuantMethod::FP8_W8A16) {
+      TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for fp8 w8a16.");
+      TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for fp8 w8a16.");
+      TORCH_CHECK(block_size.has_value(), "missing block_size for fp8 w8a16.");
+      TORCH_CHECK(block_size.value().size() == 2, "expect block_size.size() to be 2.");
+    } else if constexpr (quant == CPUQuantMethod::MXFP4) {
+      TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for mxfp4.");
+      TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for mxfp4.");
+      TORCH_CHECK(w1_scale.value().scalar_type() == at::kByte, "expect w1_scale to be uint8.");
+      TORCH_CHECK(w2_scale.value().scalar_type() == at::kByte, "expect w2_scale to be uint8.");
+    }
+}
+
+static inline void check_moe_scales(
+    int64_t moe_comp_method,
     const std::optional<at::Tensor>& w1_scale,
     const std::optional<at::Tensor>& w2_scale,
     const std::optional<std::vector<int64_t>> block_size) {
-  if (use_int8_w8a8) {
-    TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for int8 w8a8.");
-    TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for int8 w8a8.");
-  }
-  if (use_fp8_w8a16) {
-    TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for fp8 w8a16.");
-    TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for fp8 w8a16.");
-    TORCH_CHECK(block_size.has_value(), "missing block_size for fp8 w8a16.");
-    TORCH_CHECK(block_size.value().size() == 2, "expect block_size.size() to be 2.");
-  }
-  if (use_mxfp4) {
-    TORCH_CHECK(w1_scale.has_value(), "missing w1_scale for mxfp4.");
-    TORCH_CHECK(w2_scale.has_value(), "missing w2_scale for mxfp4.");
-    TORCH_CHECK(w1_scale.value().scalar_type() == at::kByte, "expect w1_scale to be uint8.");
-    TORCH_CHECK(w2_scale.value().scalar_type() == at::kByte, "expect w2_scale to be uint8.");
+  if (moe_comp_method == CPUQuantMethod::INT8_W8A8) {
+    check_moe_scales<CPUQuantMethod::INT8_W8A8>(w1_scale, w2_scale, block_size);
+  } else if (moe_comp_method == CPUQuantMethod::FP8_W8A16) {
+    check_moe_scales<CPUQuantMethod::FP8_W8A16>(w1_scale, w2_scale, block_size);
+  } else if (moe_comp_method == CPUQuantMethod::MXFP4) {
+    check_moe_scales<CPUQuantMethod::MXFP4>(w1_scale, w2_scale, block_size);
   }
 }
 
@@ -1064,12 +1074,8 @@ at::Tensor fused_experts_cpu(
   int64_t topk = topk_weights_.size(1);
 
   // we use int32_t compensation for int8 w8a8
-  int64_t packed_K = moe_comp_method == CPUQuantMethod::MXFP4
-                         ? get_row_size<uint8_t>(K)
-                         : get_row_size(K, moe_comp_method == CPUQuantMethod::INT8_W8A8);
-  int64_t packed_N = moe_comp_method == CPUQuantMethod::MXFP4
-                         ? get_row_size<uint8_t>(N)
-                         : get_row_size(N, moe_comp_method == CPUQuantMethod::INT8_W8A8);
+  int64_t packed_K = get_row_size(static_cast<CPUQuantMethod>(moe_comp_method), K);
+  int64_t packed_N = get_row_size(static_cast<CPUQuantMethod>(moe_comp_method), N);
 
   // check weight shapes
   CHECK_EQ(w2.size(0), E);
@@ -1079,13 +1085,7 @@ at::Tensor fused_experts_cpu(
     CHECK_EQ(packed_w2.size(2), packed_N / (moe_comp_method == CPUQuantMethod::INT4_W4A8 ? 2 : 1));
   }
   // check scales
-  check_moe_scales(
-      moe_comp_method == CPUQuantMethod::INT8_W8A8,
-      moe_comp_method == CPUQuantMethod::FP8_W8A16,
-      moe_comp_method == CPUQuantMethod::MXFP4,
-      w1_scale,
-      w2_scale,
-      block_size);
+  check_moe_scales(moe_comp_method, w1_scale, w2_scale, block_size);
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 
@@ -1417,7 +1417,11 @@ at::Tensor shared_expert_cpu(
   CHECK_EQ(packed_w2.size(1), packed_N);
 
   // check scales
-  check_moe_scales(use_int8_w8a8, use_fp8_w8a16, false, w1_scale, w2_scale, block_size);
+  if (use_int8_w8a8) {
+    check_moe_scales<CPUQuantMethod::INT8_W8A8>(w1_scale, w2_scale, block_size);
+  } else if (use_fp8_w8a16) {
+    check_moe_scales<CPUQuantMethod::FP8_W8A16>(w1_scale, w2_scale, block_size);
+  }
 
   at::Tensor out_hidden_states = inplace ? hidden_states : at::empty_like(hidden_states);
 

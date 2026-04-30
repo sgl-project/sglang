@@ -93,6 +93,17 @@ constexpr bool operator==(int64_t a, CPUQuantAlgo b) {
   return a == static_cast<int64_t>(b);
 }
 
+inline int64_t get_row_size(CPUQuantMethod quant, int64_t K) {
+  switch (quant) {
+    case CPUQuantMethod::INT8_W8A8:
+      return K + sizeof(int32_t);
+    case CPUQuantMethod::MXFP4:
+      return K >> 1;
+    default:
+      return K;
+  }
+}
+
 inline int64_t get_4bit_block_k_size(int64_t group_size) {
   return group_size > 128 ? 128 : group_size;
 }
