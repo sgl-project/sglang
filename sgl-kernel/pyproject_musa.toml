@@ -3,7 +3,7 @@ requires = [
   "setuptools>=75.0",
   "scikit-build-core>=0.10",
   "torch",
-  "torchada>=0.1.50",
+  "torchada>=0.1.53",
   "wheel",
 ]
 build-backend = "setuptools.build_meta"

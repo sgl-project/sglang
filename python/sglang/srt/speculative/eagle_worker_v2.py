@@ -63,6 +63,7 @@ from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     next_power_of_2,
 )
@@ -70,6 +71,7 @@ from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_hip = is_hip()
 
 logger = logging.getLogger(__name__)
@@ -265,6 +267,7 @@ class EagleDraftWorker(BaseDraftWorker):
         Device2DraftCudaGraphRunner = {
             "npu": EAGLEDraftNpuGraphRunner,
             "cuda": EAGLEDraftCudaGraphRunner,
+            "musa": EAGLEDraftCudaGraphRunner,
         }
         # Capture draft
         if self.speculative_num_steps > 1:
@@ -284,6 +287,7 @@ class EagleDraftWorker(BaseDraftWorker):
         Device2ExtendCudaGraphRunner = {
             "npu": EAGLEDraftExtendNpuGraphRunner,
             "cuda": EAGLEDraftExtendCudaGraphRunner,
+            "musa": EAGLEDraftCudaGraphRunner,
         }
         supports_hip_aiter_draft_extend_graph = False
         if _is_hip:
@@ -296,7 +300,7 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.draft_attn_backend, AiterMultiStepDraftBackend
             )
 
-        supports_cuda_draft_extend_graph = _is_cuda and (
+        supports_cuda_draft_extend_graph = (_is_cuda or _is_musa) and (
             isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
             or isinstance(self.draft_extend_attn_backend, TRTLLMMLABackend)
         )
