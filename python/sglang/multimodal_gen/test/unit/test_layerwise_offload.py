@@ -9,11 +9,11 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _ModelOptFp8OffloadAdapter,
 )
-from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
-    LayerwiseOffloadManager,
-)
 from sglang.multimodal_gen.runtime.managers import (
     layerwise_offload as layerwise_offload_mod,
+)
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+    LayerwiseOffloadManager,
 )
 
 
