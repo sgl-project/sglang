@@ -9,6 +9,7 @@ from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Dict, List, Optional, Union
 
 import jinja2
+import msgspec
 import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
@@ -52,6 +53,75 @@ from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.parser.conversation import generate_chat_conv
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
+
+_SSE_DATA_B = b"data: "
+_SSE_NL_B = b"\n\n"
+
+
+class _StreamDelta(msgspec.Struct, omit_defaults=True):
+    # OpenAI Python SDK's ChoiceDelta does not declare reasoning_content; it is
+    # surfaced via pydantic `extra`. With omit_defaults=True, defaulting to
+    # None would drop the key entirely from the SSE payload, making
+    # `data.reasoning_content` raise AttributeError on the client. Keep it
+    # required (no default) so it is always serialized as null or a string.
+    reasoning_content: Optional[str]
+    role: Optional[str] = None
+    content: Optional[str] = None
+
+
+class _StreamChoice(msgspec.Struct):
+    index: int
+    delta: _StreamDelta
+    logprobs: Optional[dict] = None
+    finish_reason: Optional[str] = None
+    matched_stop: Union[None, int, str] = None
+
+
+class _StreamChunk(msgspec.Struct, omit_defaults=True):
+    id: str
+    object: str
+    created: int
+    model: str
+    choices: List[_StreamChoice]
+    usage: Optional[dict] = None
+
+
+_stream_encoder = msgspec.json.Encoder()
+
+
+def _fast_sse_content(
+    chunk_id: str,
+    created: int,
+    model: str,
+    index: int,
+    role: Optional[str] = None,
+    content: Optional[str] = None,
+    reasoning_content: Optional[str] = None,
+    finish_reason: Optional[str] = None,
+    logprobs: Optional[dict] = None,
+    matched_stop: Union[None, int, str] = None,
+    usage: Optional[dict] = None,
+) -> str:
+    delta = _StreamDelta(
+        role=role, content=content, reasoning_content=reasoning_content
+    )
+    choice = _StreamChoice(
+        index=index,
+        delta=delta,
+        logprobs=logprobs,
+        finish_reason=finish_reason,
+        matched_stop=matched_stop,
+    )
+    chunk = _StreamChunk(
+        id=chunk_id,
+        object="chat.completion.chunk",
+        created=created,
+        model=model,
+        choices=[choice],
+        usage=usage,
+    )
+    return (_SSE_DATA_B + _stream_encoder.encode(chunk) + _SSE_NL_B).decode()
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.template_manager import TemplateManager
@@ -349,6 +419,7 @@ class OpenAIServingChat(OpenAIServingBase):
             image_max_dynamic_patch=img_max_dynamic_patch,
             video_max_dynamic_patch=vid_max_dynamic_patch,
             max_dynamic_patch=getattr(request, "max_dynamic_patch", None),
+            use_audio_in_video=getattr(request, "use_audio_in_video", False),
         )
 
         return adapted_request, request
@@ -721,7 +792,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     if n_prev_token < total_output_logprobs:
                         choice_logprobs = self._process_streaming_logprobs(
                             content, n_prev_token, total_output_logprobs
-                        )
+                        ).model_dump()
                     n_prev_tokens[index] = total_output_logprobs
 
                 finish_reason = content["meta_info"].get("finish_reason", None)
@@ -751,20 +822,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 # First chunk with role
                 if is_firsts.get(index, True):
                     is_firsts[index] = False
-                    delta = DeltaMessage(role="assistant", content="")
-                    choice_data = ChatCompletionResponseStreamChoice(
-                        index=index,
-                        delta=delta,
-                        finish_reason=None,
-                        logprobs=None,
-                    )
-                    chunk = ChatCompletionStreamResponse(
-                        id=content["meta_info"]["id"],
+                    yield _fast_sse_content(
+                        chunk_id=content["meta_info"]["id"],
                         created=int(time.time()),
-                        choices=[choice_data],
                         model=request.model,
+                        index=index,
+                        role="assistant",
+                        content="",
                     )
-                    yield f"data: {chunk.model_dump_json()}\n\n"
                     stream_started = True
 
                 offset = stream_offsets.get(index, 0)
@@ -781,27 +846,22 @@ class OpenAIServingChat(OpenAIServingBase):
                         index, delta, reasoning_parser_dict, content, request
                     )
                     if reasoning_text:
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=index,
-                            delta=DeltaMessage(reasoning_content=reasoning_text),
-                            finish_reason=None,
-                        )
-                        chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
-                            created=int(time.time()),
-                            choices=[choice_data],
-                            model=request.model,
-                        )
-
-                        # Add usage stats if continuous_usage_stats is enabled
+                        usage = None
                         if continuous_usage_stats:
-                            chunk.usage = UsageProcessor.calculate_token_usage(
+                            usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
-                            )
+                            ).model_dump()
 
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        yield _fast_sse_content(
+                            chunk_id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            model=request.model,
+                            index=index,
+                            reasoning_content=reasoning_text,
+                            usage=usage,
+                        )
 
                 # Handle tool calls
                 if (
@@ -833,29 +893,23 @@ class OpenAIServingChat(OpenAIServingBase):
                 else:
                     # Regular content
                     if delta:
-                        choice_data = ChatCompletionResponseStreamChoice(
-                            index=index,
-                            delta=DeltaMessage(content=delta),
-                            finish_reason=None,
-                            matched_stop=None,
-                            logprobs=choice_logprobs,
-                        )
-                        chunk = ChatCompletionStreamResponse(
-                            id=content["meta_info"]["id"],
-                            created=int(time.time()),
-                            choices=[choice_data],
-                            model=request.model,
-                        )
-
-                        # Add usage stats if continuous_usage_stats is enabled
+                        usage = None
                         if continuous_usage_stats:
-                            chunk.usage = UsageProcessor.calculate_token_usage(
+                            usage = UsageProcessor.calculate_token_usage(
                                 prompt_tokens=prompt_tokens.get(index, 0),
                                 reasoning_tokens=reasoning_tokens.get(index, 0),
                                 completion_tokens=completion_tokens.get(index, 0),
-                            )
+                            ).model_dump()
 
-                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        yield _fast_sse_content(
+                            chunk_id=content["meta_info"]["id"],
+                            created=int(time.time()),
+                            model=request.model,
+                            index=index,
+                            content=delta,
+                            logprobs=choice_logprobs,
+                            usage=usage,
+                        )
 
             # Send finish_reason chunks for each index that completed
             for idx, finish_reason_data in finish_reasons.items():
@@ -866,27 +920,15 @@ class OpenAIServingChat(OpenAIServingBase):
                 if has_tool_calls.get(idx, False) and finish_reason_type == "stop":
                     final_finish_reason = "tool_calls"
 
-                finish_reason_chunk = ChatCompletionStreamResponse(
-                    id=content["meta_info"][
-                        "id"
-                    ],  # NOTE: openai uses the same chatcmpl-id for all indices
+                matched_stop = finish_reason_data.get("matched")
+                yield _fast_sse_content(
+                    chunk_id=content["meta_info"]["id"],
                     created=int(time.time()),
-                    choices=[
-                        ChatCompletionResponseStreamChoice(
-                            index=idx,
-                            delta=DeltaMessage(),
-                            finish_reason=final_finish_reason,
-                            matched_stop=(
-                                finish_reason_data["matched"]
-                                if "matched" in finish_reason_data
-                                else None
-                            ),
-                        )
-                    ],
                     model=request.model,
-                    usage=None,
+                    index=idx,
+                    finish_reason=final_finish_reason,
+                    matched_stop=matched_stop,
                 )
-                yield f"data: {finish_reason_chunk.model_dump_json()}\n\n"
 
             # Send hidden states if requested
             if request.return_hidden_states and hidden_states:
@@ -1363,9 +1405,14 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("enable_thinking") is True
             )
-        if self.reasoning_parser in ["mistral"]:
-            # Mistral models only reason when reasoning_effort is explicitly
-            # set to a value other than None/"none" (typically "high").
+        if self.reasoning_parser == "hunyuan":
+            # Hy3-preview template emits no <think> when reasoning_effort is
+            # "no_think" / "none" / unset; forcing reasoning would route all
+            # output into reasoning_content.
+            return request.reasoning_effort not in (None, "none", "no_think")
+        if self.reasoning_parser == "mistral":
+            # Mistral only reasons when reasoning_effort is explicitly set
+            # to a non-"none" value (typically "high").
             return (
                 request.reasoning_effort is not None
                 and request.reasoning_effort != "none"
