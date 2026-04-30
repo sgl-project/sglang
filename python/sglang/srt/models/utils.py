@@ -106,24 +106,16 @@ class WeightsMapper:
         }
 
 
-def enable_fused_set_kv_buffer(
-    forward_batch: ForwardBatch,
-    is_compiled: bool = False,
-):
-    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache.
-    When is_compiled=True (torch.compile path), also allows SWAKVPool
-    since forward_native handles the dual-pool addressing in pure PyTorch,
-    but only when out_cache_loc_swa is available."""
-    pool = forward_batch.token_to_kv_pool
-    is_swa = isinstance(pool, SWAKVPool)
+def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
+    """Enable fused set_kv_buffer only on CUDA with bfloat16 KV cache."""
     return (
         _is_cuda
-        and hasattr(pool, "dtype")
-        and pool.dtype == torch.bfloat16
-        and (
-            not is_swa
-            or (is_compiled and forward_batch.out_cache_loc_swa is not None)
-        )
+        and hasattr(forward_batch.token_to_kv_pool, "dtype")
+        and forward_batch.token_to_kv_pool.dtype == torch.bfloat16
+        # TODO(mattteochen): Allow SWAKVPool after the compiled/native RoPE
+        # path reports whether the fused write actually happened, so attention
+        # can set save_kv_cache from the executed write instead of this predicate.
+        and not isinstance(forward_batch.token_to_kv_pool, SWAKVPool)
         and not is_prefill_context_parallel_enabled()
     ) or (_is_hip and not is_prefill_context_parallel_enabled())
 
@@ -143,7 +135,6 @@ def create_fused_set_kv_buffer_arg(
 
     if not _is_hip:
         assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
-
         cache_loc = forward_batch.out_cache_loc
         if isinstance(token_to_kv_pool, SWAKVPool):
             _, is_swa_layer = token_to_kv_pool.layers_mapping[layer_id]

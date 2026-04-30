@@ -88,7 +88,6 @@ from sglang.srt.utils import (
     is_npu,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
-from sglang.srt.utils.torch_compile_utils import CompilableRegionMixin
 
 _is_cuda = is_cuda()
 
@@ -430,7 +429,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
         state.hidden_states_mlp_output = state.pop("hidden_states_after_combine")
 
 
-class Qwen3MoeAttention(nn.Module, CompilableRegionMixin):
+class Qwen3MoeAttention(nn.Module):
     def __init__(
         self,
         hidden_size: int,
@@ -526,7 +525,7 @@ class Qwen3MoeAttention(nn.Module, CompilableRegionMixin):
                 _yarn_factor != 1.0,
             )
         )
-        self._did_fused_kv_write_last_call = False
+        self._used_fused_qk_norm_rope_last_call = False
 
         self.attn = RadixAttention(
             self.num_heads,
@@ -592,43 +591,9 @@ class Qwen3MoeAttention(nn.Module, CompilableRegionMixin):
         inner_state = q, k, v, forward_batch
         return None, forward_batch, inner_state
 
-    # -- CompilableRegionMixin interface ----------------------------------
-
-    _REGION_DYNAMIC = {"QKNorm": False, "RopeKV": None}
-
-    def get_compilable_regions(self) -> dict[str, str]:
-        return {"QKNorm": "_apply_qk_norm_native", "RopeKV": "_rope_kv_native"}
-
-    def _apply_qk_norm_native(self, q, k):
-        q = self.q_norm(q.reshape(-1, self.head_dim)).view(q.shape)
-        k = self.k_norm(k.reshape(-1, self.head_dim)).view(k.shape)
-        return q, k
-
-    def _rope_kv_native(self, q, k, positions, fused_kv_arg):
-        q, k = self.rotary_emb(positions, q, k, fused_set_kv_buffer_arg=fused_kv_arg)
-        return q, k
-
-    # -- apply_qk_norm_rope ---------------------------------------------
-
     def apply_qk_norm_rope(self, qkv, positions, forward_batch):
-
-        if self.is_region_compiled("QKNorm") and self.is_region_compiled("RopeKV"):
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            fused_kv_arg = (
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
-                )
-                if enable_fused_set_kv_buffer(forward_batch, is_compiled=True)
-                and self.compatible_with_fused_kv_buffer
-                else None
-            )
-            q, k = self._apply_qk_norm_native(q, k)
-            q, k = self._rope_kv_native(q, k, positions, fused_kv_arg)
-            # In this branch kv cache is fused with rope, if allowed
-            self._did_fused_kv_write_last_call = fused_kv_arg is not None
-        elif self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16:
+        use_fused = self.use_fused_qk_norm_rope and qkv.dtype == torch.bfloat16
+        if use_fused:
             theta = self.rope_theta
             positions = (
                 positions.view(-1).to(dtype=torch.int32, device=qkv.device).contiguous()
@@ -652,7 +617,7 @@ class Qwen3MoeAttention(nn.Module, CompilableRegionMixin):
                 attention_factor,
             )
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            self._did_fused_kv_write_last_call = False
+            self._used_fused_qk_norm_rope_last_call = True
         else:
             # Fallback to non-fused QK Norm & RoPE implementation
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -679,10 +644,7 @@ class Qwen3MoeAttention(nn.Module, CompilableRegionMixin):
                     else None
                 ),
             )
-            self._did_fused_kv_write_last_call = (
-                enable_fused_set_kv_buffer(forward_batch)
-                and self.compatible_with_fused_kv_buffer
-            )
+            self._used_fused_qk_norm_rope_last_call = False
         return q, k, v
 
     def forward_prepare(
@@ -716,7 +678,11 @@ class Qwen3MoeAttention(nn.Module, CompilableRegionMixin):
 
         q, k, v, fb = inner_state
 
-        save_kv_cache = not self._did_fused_kv_write_last_call
+        must_save_kv = self._used_fused_qk_norm_rope_last_call
+        save_kv_cache = must_save_kv or not (
+            enable_fused_set_kv_buffer(forward_batch)
+            and self.compatible_with_fused_kv_buffer
+        )
         attn_output = self.attn(
             q,
             k,

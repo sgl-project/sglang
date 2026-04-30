@@ -382,7 +382,6 @@ class GptOssAttention(nn.Module):
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
-        _is_compiled = self.rotary_emb.is_torch_compile
         extra_args = {}
         if not _is_npu:
             extra_args = {
@@ -392,9 +391,7 @@ class GptOssAttention(nn.Module):
                         layer=self.attn,
                         forward_batch=forward_batch,
                     )
-                    if enable_fused_set_kv_buffer(
-                        forward_batch, is_compiled=_is_compiled
-                    )
+                    if enable_fused_set_kv_buffer(forward_batch)
                     else None
                 ),
             }
@@ -406,13 +403,10 @@ class GptOssAttention(nn.Module):
         hidden_states, forward_batch, inner_state = intermediate_state
         if inner_state is None:
             return hidden_states
-        _is_compiled = self.rotary_emb.is_torch_compile
         attn_output = self.attn(
             *inner_state,
             sinks=self.sinks,
-            save_kv_cache=not enable_fused_set_kv_buffer(
-                forward_batch, is_compiled=_is_compiled
-            ),
+            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
         )
         output, _ = self.o_proj(attn_output)
         return output
