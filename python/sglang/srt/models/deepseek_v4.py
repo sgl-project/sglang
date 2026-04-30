@@ -1326,41 +1326,12 @@ class DeepseekV4ForCausalLM(nn.Module):
         if get_global_server_args().disable_shared_experts_fusion:
             return
 
-        disable_reason = None
-        if self.config.n_routed_experts != 256 or self.config.n_shared_experts != 1:
-            disable_reason = "Config not support fused shared expert(s)."
-        elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
-            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
-        ):
-            disable_reason = (
-                "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
-                "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
-            )
-        elif get_moe_expert_parallel_world_size() > 1 and (
-            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
-        ):
-            disable_reason = "Only Deepseek V3/R1 on AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization under expert parallelism."
-        elif disable_reason is None and get_moe_a2a_backend().is_deepep():
-            disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
-        elif self.quant_config and self.quant_config.get_name() == "w4afp8":
-            disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
-        elif envs.SGLANG_DSV4_FP4_EXPERTS.get():
-            disable_reason = "2604 routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
-
-        disable_reason = (
-            "2604B checkpoint requires different clamping for shared and routed experts"
+        get_global_server_args().disable_shared_experts_fusion = True
+        log_info_on_rank0(
+            logger,
+            "2604B checkpoint requires different clamping for shared and routed experts. "
+            "Shared experts fusion optimization is disabled.",
         )
-
-        if disable_reason is not None:
-            get_global_server_args().disable_shared_experts_fusion = True
-            self.num_fused_shared_experts = 0
-            log_info_on_rank0(
-                logger,
-                f"{disable_reason} Shared experts fusion optimization is disabled.",
-            )
-            return
-
-        self.num_fused_shared_experts = self.config.n_shared_experts
 
     @torch.no_grad()
     def forward(
