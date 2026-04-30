@@ -188,8 +188,8 @@ class DecodeInputBuffers(ForwardInputBuffers):
         num_tokens_per_bs: int,
         cache_loc_dtype: torch.dtype,
         enable_mamba_track: bool,
-        is_hybrid_swa: bool = False,
         ne_token_table: Optional[torch.Tensor] = None,
+        is_hybrid_swa: bool = False,
     ) -> "DecodeInputBuffers":
         with torch.device(device):
             input_ids = torch.zeros((max_num_token,), dtype=torch.int64)
