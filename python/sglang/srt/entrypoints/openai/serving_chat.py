@@ -434,15 +434,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         self._patch_mistral_skip_special_tokens(request)
 
-        thinking_mode = True
-        if request.chat_template_kwargs is not None:
-            if "enable_thinking" in request.chat_template_kwargs:
-                if isinstance(request.chat_template_kwargs["enable_thinking"], bool):
-                    thinking_mode = request.chat_template_kwargs["enable_thinking"]
-            elif "thinking" in request.chat_template_kwargs:
-                if isinstance(request.chat_template_kwargs["thinking"], bool):
-                    thinking_mode = request.chat_template_kwargs["thinking"]
-
+        thinking_mode = self._get_reasoning_from_request(request)
         tool_call_constraint = None
 
         # Apply chat template and its stop strings
