@@ -280,7 +280,7 @@ class TextEncodingStage(PipelineStage):
         embeds_list: list[torch.Tensor] = []
         pooled_embeds_list: list[torch.Tensor] = []
 
-        attn_masks_list: list[torch.Tensor] = []
+        attn_masks_list: list[torch.Tensor | None] = []
 
         preprocess_funcs = server_args.pipeline_config.preprocess_text_funcs
         postprocess_funcs = server_args.pipeline_config.postprocess_text_funcs
@@ -369,18 +369,25 @@ class TextEncodingStage(PipelineStage):
                 pooled_embeds_list.append(pooled_output.to(device=target_device))
 
             if return_attention_mask:
-                if (
-                    has_postprocessed_attention_mask
-                    and postprocessed_attention_mask is not None
-                ):
-                    mask_to_store = postprocessed_attention_mask.to(
-                        device=target_device
+                if has_postprocessed_attention_mask:
+                    mask_to_store = (
+                        postprocessed_attention_mask.to(device=target_device)
+                        if postprocessed_attention_mask is not None
+                        else None
                     )
-                elif attention_mask is not None:
+                elif attention_mask is not None and list(attention_mask.shape) == list(
+                    prompt_embeds.shape[:2]
+                ):
                     mask_to_store = attention_mask.to(device=target_device)
                 else:
                     mask_to_store = torch.ones(
-                        input_ids.shape[:2], device=target_device
+                        prompt_embeds.shape[:2],
+                        device=target_device,
+                        dtype=(
+                            attention_mask.dtype
+                            if attention_mask is not None
+                            else torch.long
+                        ),
                     )
                 attn_masks_list.append(mask_to_store)
 
@@ -410,13 +417,23 @@ class TextEncodingStage(PipelineStage):
                 )
         stacked_embeds = torch.stack(embeds_list, dim=0)
         if return_attention_mask:
-            base_mask_shape = list(attn_masks_list[0].shape)
-            for m in attn_masks_list[1:]:
+            stackable_masks = [
+                (
+                    mask
+                    if mask is not None
+                    else torch.ones(
+                        embed.shape[:2], device=embed.device, dtype=torch.long
+                    )
+                )
+                for embed, mask in zip(embeds_list, attn_masks_list, strict=True)
+            ]
+            base_mask_shape = list(stackable_masks[0].shape)
+            for m in stackable_masks[1:]:
                 if list(m.shape) != base_mask_shape:
                     raise ValueError(
-                        f"Cannot stack attention masks with differing shapes: {[list(m.shape) for m in attn_masks_list]}"
+                        f"Cannot stack attention masks with differing shapes: {[list(m.shape) for m in stackable_masks]}"
                     )
-            stacked_masks = torch.stack(attn_masks_list, dim=0)
+            stacked_masks = torch.stack(stackable_masks, dim=0)
             return stacked_embeds, stacked_masks
         return stacked_embeds
 
