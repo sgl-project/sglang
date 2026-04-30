@@ -6,7 +6,11 @@ from typing import Any, Dict, List, Literal, Optional, Union
 import orjson
 from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
-from xgrammar import StructuralTag
+
+try:
+    from xgrammar import StructuralTag
+except ImportError:
+    StructuralTag = Any
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
