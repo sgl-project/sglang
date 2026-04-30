@@ -5,6 +5,6 @@ __all__ = [
     "CompressorDecodePlan",
     "CompressorPrefillPlan",
     "compress_forward",
-    "compress_fused_norm_rope_inplace",
+    "compress_norm_rope_store",
     "make_name",
 ]

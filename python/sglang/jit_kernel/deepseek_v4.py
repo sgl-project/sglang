@@ -628,7 +628,7 @@ def fused_norm_rope_inplace(
     )
 
 
-def fused_rope(
+def fused_rope_inplace(
     q: torch.Tensor,
     k: Optional[torch.Tensor],
     freqs_cis: torch.Tensor,
@@ -922,9 +922,10 @@ def silu_and_mul_contig_post_quant(
     transposed: bool = False,
     swiglu_limit: Optional[float] = None,
     swizzle: bool = False,
+    observe: bool = True,
 ) -> None:
     apply_swiglu_limit = swiglu_limit is not None
-    if apply_swiglu_limit:
+    if observe and apply_swiglu_limit:
         deepseek_v4_moe_code_path_checker.observed += 1
     module = _jit_silu_mul_quant_contig_module(
         quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
@@ -969,9 +970,12 @@ def get_paged_mqa_logits_metadata(seq_lens: torch.Tensor, page_size: int, num_sm
     return metadata
 
 
-def rmsnorm_self(q: torch.Tensor, eps: float) -> torch.Tensor:
+def rmsnorm_self(
+    q: torch.Tensor, eps: float, out: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     module = _jit_rmsnorm_head_module(q.shape[-1], q.dtype)
-    out = q.new_empty(q.shape)
+    if out is None:
+        out = q.new_empty(q.shape)
     module.run_self(q, out, eps)
     return out
 

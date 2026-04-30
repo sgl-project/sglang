@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Tuple, Union
+from typing import List, Literal, NamedTuple, Optional, Tuple
 
 import torch
 
@@ -703,7 +703,6 @@ class DeepSeekV4TokenToKVPool(KVCache):
     def get_swa_key_buffer(self, layer_id: int) -> torch.Tensor:
         return self.swa_kv_pool.get_key_buffer(layer_id)
 
-
     def set_swa_key_buffer(
         self,
         layer_id: int,
@@ -712,7 +711,12 @@ class DeepSeekV4TokenToKVPool(KVCache):
     ) -> None:
         self.swa_kv_pool.set_key_buffer(layer_id, loc, cache_nope_fp8_rope_bf16_pack)
 
-    def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor | None:
+    def get_extra_key_page_size(self, layer_id: int) -> int:
+        _, _, compress_kv_pool = self.layer_mapping[layer_id]
+        assert compress_kv_pool is not None
+        return compress_kv_pool.page_size
+
+    def get_extra_key_buffer(self, layer_id: int) -> torch.Tensor:
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
         return compress_kv_pool.get_key_buffer(compress_layer_id)
@@ -728,6 +732,9 @@ class DeepSeekV4TokenToKVPool(KVCache):
         compress_kv_pool.set_key_buffer(
             compress_layer_id, loc, cache_nope_fp8_rope_bf16_pack
         )
+
+    def get_index_k_page_size(self) -> int:
+        return self.c4_indexer_kv_pool.page_size
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
@@ -818,4 +825,3 @@ class DeepSeekV4TokenToKVPool(KVCache):
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
         return self.c4_indexer_kv_pool.set_index_fused(compress_layer_id, loc, cache_k)
-

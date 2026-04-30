@@ -21,8 +21,9 @@ def _jit_compress_norm_rope_module(
     dtype: torch.dtype,
     head_dim: int,
     rope_dim: int,
+    page_size: int,
 ) -> Module:
-    args = make_cpp_args(dtype, head_dim, rope_dim, is_arch_support_pdl())
+    args = make_cpp_args(dtype, head_dim, rope_dim, page_size, is_arch_support_pdl())
     return load_jit(
         make_name(f"fused_norm_rope_v2"),
         *args,
@@ -293,8 +294,8 @@ def compress_forward(
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert head_dim % 128 == 0
-    num_q_tokens = kv_score_input.shape[0]
     if out is None:
+        num_q_tokens = plan[1].shape[0]  # NOTE: decode = bs, prefill = dynamic
         out = kv_score_input.new_empty((num_q_tokens, head_dim))
     assert plan.compress_ratio == compress_ratio, "Mismatched compress ratio in plan!"
     # Online c128: separate JIT module, fp32 state, no compile-time dtypes.
@@ -311,21 +312,29 @@ def compress_forward(
     return out
 
 
-def compress_fused_norm_rope_inplace(
+def compress_norm_rope_store(
     kv: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float,
-    freq_cis: torch.Tensor,
     plan: Union[CompressorDecodePlan, CompressorPrefillPlan],
+    *,
+    norm_weight: torch.Tensor,
+    norm_eps: float,
+    freq_cis: torch.Tensor,
+    out_loc: torch.Tensor,
+    kvcache: torch.Tensor,
+    page_size: int,
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
-    module = _jit_compress_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
+    module = _jit_compress_norm_rope_module(
+        kv.dtype, kv.shape[-1], freq_cis.shape[-1], page_size
+    )
     module.forward(
         kv,
-        weight,
         plan[1],
+        norm_weight,
+        norm_eps,
         freq_cis,
-        int(plan.is_decode),
-        eps,
+        out_loc,
+        kvcache,
+        plan.is_decode,
         plan.compress_ratio,
     )

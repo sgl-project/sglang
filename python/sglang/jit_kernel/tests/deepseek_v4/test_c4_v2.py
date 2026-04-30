@@ -136,9 +136,11 @@ def test_prefill_no_context(mode: str, seq_len: int) -> None:
         ctx, pool, kv_in_cpu.cuda(), ape_cpu.cuda(), seq_lens_cpu, extend_lens_cpu
     )
 
-    for P in range(RATIO - 1, seq_len, RATIO):
+    # Compact prefill output: row per compress plan, in CPU-planner order
+    # (batch-major, position-ascending).
+    for plan_id, P in enumerate(range(RATIO - 1, seq_len, RATIO)):
         gt = _gt_compress(kv_in_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
-        triton.testing.assert_close(out[P].cpu(), gt, atol=ATOL, rtol=RTOL)
+        triton.testing.assert_close(out[plan_id].cpu(), gt, atol=ATOL, rtol=RTOL)
 
 
 @pytest.mark.parametrize("mode", ["legacy", "paged"])
@@ -233,8 +235,8 @@ def test_prefill_then_extend(mode: str, prefix_len: int) -> None:
 
     P = seq_len - 1
     gt = _gt_compress(kv_full_cpu, ape_cpu, P=P, head_dim=ctx.head_dim)
-    # The compress event sits at the last ragged token of the extend.
-    triton.testing.assert_close(out[extend_len - 1].cpu(), gt, atol=ATOL, rtol=RTOL)
+    # Single compress event in this extend; compact plan_id 0.
+    triton.testing.assert_close(out[0].cpu(), gt, atol=ATOL, rtol=RTOL)
 
 
 def test_paged_buffer_intermediate() -> None:
@@ -302,7 +304,10 @@ def test_prefill_multibatch(mode: str) -> None:
         ctx, pool, kv_in_cpu.cuda(), ape_cpu.cuda(), seq_lens_cpu, extend_lens_cpu
     )
 
+    # Compact: walk batches in order, then positions in order; matches the
+    # CPU planner's emit order for plan_c.
     base = 0
+    plan_id = 0
     for b, (seq, ext) in enumerate(seq_extend):
         for j in range(ext):
             P = j  # prefix=0 here
@@ -315,11 +320,12 @@ def test_prefill_multibatch(mode: str) -> None:
                 head_dim=ctx.head_dim,
             )
             triton.testing.assert_close(
-                out[base + j].cpu(),
+                out[plan_id].cpu(),
                 gt,
                 atol=ATOL,
                 rtol=RTOL,
             )
+            plan_id += 1
         base += ext
 
 

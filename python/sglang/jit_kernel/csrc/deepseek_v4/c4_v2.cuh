@@ -241,7 +241,8 @@ C4_KERNEL void flash_c4_prefill(const __grid_constant__ Compress4PrefillParams p
   if (plan.is_invalid()) return;
 
   const auto kv_src = kv_input + plan.ragged_id * Trait::kElementSize;
-  const auto kv_out = kv_output + plan.ragged_id * Trait::kHeadDim;
+  // Compact output: one row per compress plan, indexed by `global_pid`.
+  const auto kv_out = kv_output + global_pid * Trait::kHeadDim;
   const auto kv_buf_0 = kv_buffer + plan.read_page_0 * Trait::kPageElementSize;
   const auto kv_buf_1 = kv_buffer + plan.read_page_1 * Trait::kPageElementSize;
   const bool need_overlap = plan.seq_len > 4;
@@ -361,11 +362,11 @@ struct FlashCompress4Kernel {
         .with_dtype<InFloat>()
         .with_device(device_)
         .verify(kv_buffer);
-    TensorMatcher({N, Trait::kElementSize})  // kv score input
+    TensorMatcher({N, Trait::kElementSize})  // kv score input (ragged)
         .with_dtype<InFloat>()
         .with_device(device_)
         .verify(kv_input);
-    TensorMatcher({N, kHeadDim})  // kv compressed output
+    TensorMatcher({C, kHeadDim})  // kv compressed output (compact)
         .with_dtype<OutFloat>()
         .with_device(device_)
         .verify(kv_output);
@@ -389,7 +390,7 @@ struct FlashCompress4Kernel {
         .num_compress = num_c,
         .num_write = num_w,
     };
-    RuntimeCheck(num_q_tokens >= std::max(num_c, num_w), "invalid prefill plan");
+    RuntimeCheck(num_q_tokens >= num_w, "invalid prefill plan: num_q < num_w");
     if (const auto num_c_blocks = div_ceil(num_c * kNumSplit, kWarpsPerBlock)) {
       LaunchKernel(num_c_blocks, kBlockSize, device)  //
           .enable_pdl(kUsePDL)(prefill_c_kernel, params);

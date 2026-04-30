@@ -27,6 +27,11 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.jit_kernel.deepseek_v4 import (
+    linear_bf16_fp32,
+    mega_moe_pre_dispatch,
+    silu_and_mul_contig_post_quant,
+)
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -107,6 +112,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.fp8_kernel import (
+    create_per_token_group_quant_fp8_output_scale,
     fp8_dtype,
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
@@ -286,11 +292,37 @@ class DeepseekV2MLP(nn.Module):
 
         gate_up, _ = self.gate_up_proj(x)
         if self.swiglu_limit is not None:
-            _g, _u = gate_up.chunk(2, dim=-1)
-            _lim = float(self.swiglu_limit)
-            gate_up = torch.cat(
-                [_g.clamp(max=_lim), _u.clamp(min=-_lim, max=_lim)], dim=-1
+            # NOTE: deepseek v4 clamp fast path
+            M, N = gate_up.shape
+            down_input_fp8 = gate_up.new_empty((M, N // 2), dtype=torch.float8_e4m3fn)
+            scale_block_size = 128
+            down_input_scale = create_per_token_group_quant_fp8_output_scale(
+                x_shape=(M, N // 2),
+                device=gate_up.device,
+                group_size=scale_block_size,
+                column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
             )
+            silu_and_mul_contig_post_quant(
+                input=gate_up,
+                output=down_input_fp8,
+                output_scale=down_input_scale,
+                quant_group_size=scale_block_size,
+                scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                observe=False,
+            )
+            down_output = gate_up.new_empty(
+                (M, self.down_proj.output_size), dtype=torch.bfloat16
+            )
+            deep_gemm_wrapper.gemm_nt_f8f8bf16(
+                (down_input_fp8, down_input_scale),
+                (self.down_proj.weight, self.down_proj.weight_scale_inv),
+                down_output,
+            )
+            assert not self.down_proj.reduce_results
+            return down_output
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x,
@@ -370,8 +402,6 @@ class MoEGate(nn.Module):
                     hidden_states, self.weight, gemm_output_zero_allocator
                 )
             else:
-                from sglang.jit_kernel.deepseek_v4 import linear_bf16_fp32
-
                 logits = linear_bf16_fp32(hidden_states, self.weight)
 
         return logits
@@ -1219,8 +1249,6 @@ class DeepseekV2MoE(nn.Module):
 
         padded_max = buf.topk_idx.shape[0]
         if envs.SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH.get():
-            from sglang.jit_kernel.deepseek_v4 import mega_moe_pre_dispatch
-
             if num_tokens > 0:
                 topk_ids_in = topk_ids
                 topk_weights_in = topk_weights

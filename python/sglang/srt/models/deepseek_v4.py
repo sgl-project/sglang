@@ -13,7 +13,11 @@ import triton
 import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
-from sglang.jit_kernel.deepseek_v4 import fused_rope, linear_bf16_fp32, rmsnorm_self
+from sglang.jit_kernel.deepseek_v4 import (
+    fused_rope_inplace,
+    linear_bf16_fp32,
+    rmsnorm_self,
+)
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
@@ -34,7 +38,6 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
-from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     attn_tp_all_gather,
@@ -221,7 +224,8 @@ class Compressor(nn.Module):
             ape = torch.cat([ape[orders[0]], ape[orders[1]]], dim=0)
             self.ape.data.copy_(ape.view(self.ratio, -1))
 
-    def _get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
+    # NOTE: used by v2 compressor backend
+    def get_state_pool(self, forward_batch: ForwardBatch) -> CompressStatePool:
         token_to_kv_pool = forward_batch.token_to_kv_pool
         assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
         if self.is_in_indexer:
@@ -267,7 +271,7 @@ class Compressor(nn.Module):
         backend = forward_batch.attn_backend
         if TYPE_CHECKING:
             assert isinstance(backend, DeepseekV4BackendRadix)
-        kv_score_buffer = self._get_state_pool(forward_batch)
+        kv_score_buffer = self.get_state_pool(forward_batch)
         kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
         return backend.forward_compress(
             kv_score_buffer=kv_score_buffer,
@@ -282,13 +286,8 @@ class Compressor(nn.Module):
             is_paged=True,
         )
 
-    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
-        if forward_batch.forward_mode.is_idle():
-            assert x.shape[0] == 0
-            return x.new_empty(0, self.head_dim)
-
-        self.forward_mode = forward_batch.forward_mode
-
+    # NOTE: used by v2 compressor backend
+    def compute_kv_score(self, x: torch.Tensor, forward_batch: ForwardBatch):
         kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
         if nsa_use_prefill_cp(forward_batch):
             kv_score = cp_all_gather_rerange_output(
@@ -297,6 +296,14 @@ class Compressor(nn.Module):
                 forward_batch,
                 torch.cuda.current_stream(),
             )
+        return kv_score
+
+    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
+
+        kv_score = self.compute_kv_score(x, forward_batch)
         return self.compress_fused(kv_score, forward_batch)
 
 
@@ -356,7 +363,7 @@ class C4Indexer(nn.Module):
     def compute_q(self, q_lora: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
         q, _ = self.wq_b(q_lora)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        fused_rope(
+        fused_rope_inplace(
             q[..., -self.rope_head_dim :],
             None,
             self.freqs_cis,
@@ -616,7 +623,6 @@ class MQALayer(nn.Module):
         )
 
         self.overlap_store_cache = envs.SGLANG_OPT_USE_OVERLAP_STORE_CACHE.get()
-        self.use_jit_norm = envs.SGLANG_OPT_USE_JIT_NORM.get()
 
     def _compute_q_a(
         self,
@@ -627,38 +633,29 @@ class MQALayer(nn.Module):
             q = qkv_a[..., : self.q_lora_rank]
         else:
             q, _ = self.wq_a(x)
-        q = self.q_norm(q)
-        q_lora = q
-        return q_lora
+        return self.q_norm(q)
 
     def _compute_q_b(
         self,
         q: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[torch.Tensor] = None,
+        positions: torch.Tensor,
+        q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.use_jit_norm:
-            q = rmsnorm_self(q, self.eps)
-        else:
-            q = rms_normalize_triton(q, self.eps)
-        if positions is not None:
-            fused_rope(
-                q[..., -self.qk_rope_head_dim :],
-                None,
-                self.freqs_cis,
-                positions=positions,
-            )
-        else:
-            apply_rotary_emb_triton(q[..., -self.qk_rope_head_dim :], self.freqs_cis)
+        q = rmsnorm_self(q, self.eps, out=q_out)
+        fused_rope_inplace(
+            q[..., -self.qk_rope_head_dim :],
+            None,
+            self.freqs_cis,
+            positions=positions,
+        )
         return q
 
     def _compute_kv(
         self,
         x: torch.Tensor,
-        positions: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[torch.Tensor] = None,
+        positions: torch.Tensor,
         qkv_a: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if qkv_a is not None:
@@ -666,15 +663,12 @@ class MQALayer(nn.Module):
         else:
             kv, _ = self.wkv(x)
         kv = self.kv_norm(kv)
-        if positions is not None:
-            fused_rope(
-                kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
-                None,
-                self.freqs_cis,
-                positions=positions,
-            )
-        else:
-            apply_rotary_emb_triton(kv[..., -self.qk_rope_head_dim :], self.freqs_cis)
+        fused_rope_inplace(
+            kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
+            None,
+            self.freqs_cis,
+            positions=positions,
+        )
         return kv
 
     def _forward_prepare_multi_stream(
@@ -683,7 +677,6 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4BackendRadix,
-        freqs_cis: Optional[torch.Tensor] = None,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert self.alt_streams is not None
@@ -720,7 +713,7 @@ class MQALayer(nn.Module):
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
-            kv = self._compute_kv(x, positions, freqs_cis, qkv_a=qkv_a)
+            kv = self._compute_kv(x, positions, qkv_a=qkv_a)
             if self.overlap_store_cache:
                 attn_backend.store_cache(
                     layer_id=self.layer_id,
@@ -736,10 +729,7 @@ class MQALayer(nn.Module):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_lora, positions, freqs_cis)
-        if q_out is not None:
-            q_out.copy_(q)
-
+        q = self._compute_q_b(q_lora, positions, q_out)
         current_stream.wait_stream(stream_kv)
         current_stream.wait_stream(stream_compressor)
         current_stream.wait_stream(stream_indexer)
@@ -752,7 +742,6 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4BackendRadix,
-        freqs_cis: Optional[torch.Tensor] = None,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.fuse_wqa_wkv:
@@ -767,20 +756,14 @@ class MQALayer(nn.Module):
         q_lora = q
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
-        if self.use_jit_norm:
-            q = rmsnorm_self(q, self.eps)
-        else:
-            q = rms_normalize_triton(q, self.eps)
-
+        q = rmsnorm_self(q, self.eps, out=q_out)
         kv = self.kv_norm(kv)
-
-        fused_rope(
+        fused_rope_inplace(
             q[..., -self.qk_rope_head_dim :],
             kv[..., -self.qk_rope_head_dim :].unsqueeze(1),
             self.freqs_cis,
             positions=positions,
         )
-
         if self.nsa_enable_prefill_cp and nsa_use_prefill_cp(forward_batch):
             kv = cp_all_gather_rerange_output(
                 kv.contiguous(),
@@ -812,8 +795,6 @@ class MQALayer(nn.Module):
                 self.compressor,
             )
 
-        if q_out is not None:
-            q_out.copy_(q)
         return q, kv
 
     def forward(
@@ -833,8 +814,6 @@ class MQALayer(nn.Module):
         if TYPE_CHECKING:
             assert isinstance(attn_backend, DeepseekV4BackendRadix)
 
-        freqs_cis = None
-
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
@@ -852,11 +831,11 @@ class MQALayer(nn.Module):
 
         if enable_multi_stream:
             q, kv = self._forward_prepare_multi_stream(
-                x, positions, forward_batch, attn_backend, freqs_cis, q_out
+                x, positions, forward_batch, attn_backend, q_out
             )
         else:
             q, kv = self._forward_prepare(
-                x, positions, forward_batch, attn_backend, freqs_cis, q_out
+                x, positions, forward_batch, attn_backend, q_out
             )
 
         o = attn_backend.forward(
@@ -870,7 +849,7 @@ class MQALayer(nn.Module):
             save_kv_cache=not self.overlap_store_cache,
         )
         o = o[:, tp_slice, :]
-        fused_rope(
+        fused_rope_inplace(
             o[..., -self.qk_rope_head_dim :],
             None,
             self.freqs_cis,
@@ -1638,7 +1617,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if envs.SGLANG_DSV4_FP4_EXPERTS.get():
                     weights = _dequant_fp8_wo_a(weights)
                 else:
-                    weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
+                    weights = (
+                        (n, t) for n, t in weights if not n.endswith(".wo_a.scale")
+                    )
                 # ------------------------------------------------------------------------
 
         stacked_params_mapping = [

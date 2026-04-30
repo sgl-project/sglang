@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union
+from typing import TYPE_CHECKING, List, Literal, Optional, TypeAlias, Union, cast
 
 import torch
 
@@ -8,15 +8,7 @@ from sglang.jit_kernel.dsv4 import (
     CompressorDecodePlan,
     CompressorPrefillPlan,
     compress_forward,
-    compress_fused_norm_rope_inplace,
-)
-from sglang.srt.environ import envs
-from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
-    quant_to_nope_fp8_rope_bf16_pack_triton,
-)
-from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
-from sglang.srt.layers.attention.nsa.utils import (
-    assert_tensor_identical_across_cp_ranks,
+    compress_norm_rope_store,
 )
 
 if TYPE_CHECKING:
@@ -33,14 +25,27 @@ class CompressorBackend:
     def __init__(self):
         super().__init__()
         self.forward_metadata: DeepseekV4Metadata
+        self.forward_indexer_compressor = self.forward_unified
+        self.forward_core_compressor = self.forward_unified
 
-    def get_paged_compress_metadata(self, compress_ratio: int) -> CompressMetadata:
+    # NOTE: Will be overridden
+    def _maybe_upgrade_forward_metadata(self): ...
+
+    def _get_paged_compress_metadata(self, compress_ratio: int) -> CompressMetadata:
         attr_name = f"c{compress_ratio}_compress_metadata"
         metadata = getattr(self.forward_metadata, attr_name)
         assert isinstance(metadata, (CompressorDecodePlan, CompressorPrefillPlan))
         return metadata
 
-    def forward_compress(
+    def _get_out_loc(self, compress_ratio: int) -> torch.Tensor:
+        core_metadata = self.forward_metadata.core_metadata
+        return (
+            core_metadata.c4_out_loc
+            if compress_ratio == 4
+            else core_metadata.c128_out_loc
+        )
+
+    def _forward_compress_all_in_one(
         self,
         *,
         kv_score_buffer: torch.Tensor,
@@ -49,43 +54,41 @@ class CompressorBackend:
         head_dim: int,
         norm: DeepseekRefRMSNorm,
         freqs_cis_cache: torch.Tensor,
+        kv_cache: torch.Tensor,
+        is_indexer: bool,
         rotate: bool,
-        forward_batch: ForwardBatch,
         compress_ratio: int,
-        is_paged: bool = False,
-    ) -> torch.Tensor:
-        from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
-
+        page_size: int,
+    ) -> None:
         assert compress_ratio == 4 or compress_ratio == 128
-        assert is_paged, "Non-paged compress path is no longer supported."
+        assert rotate == is_indexer == (head_dim == 128)
 
-        plan = self.get_paged_compress_metadata(compress_ratio)
+        plan = self._get_paged_compress_metadata(compress_ratio)
         coff = 2 if is_overlap_compress(compress_ratio) else 1
-        if compress_ratio == 128 and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get():
-            kv_score_buffer = kv_score_buffer.view(-1, 1, head_dim * 3)
-        else:
-            last_dim = 2 * head_dim * coff
-            assert kv_score_buffer.shape[-1] == last_dim
-            kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
-
+        last_dim = 2 * head_dim * coff
+        assert kv_score_buffer.shape[-1] == last_dim
+        kv_score_buffer = kv_score_buffer.view(-1, compress_ratio, last_dim)
         kv_compressed = compress_forward(
             kv_score_buffer=kv_score_buffer,
             kv_score_input=kv_score_input,
-            ape=ape,
+            ape=ape.view(-1, head_dim),
             plan=plan,
             compress_ratio=compress_ratio,
             head_dim=head_dim,
         )
-        compress_fused_norm_rope_inplace(
+        # NOTE: we use some hack here...
+        compress_norm_rope_store(
             kv_compressed,
-            norm.weight,
-            norm.eps,
-            freqs_cis_cache,
             plan,
+            norm_weight=norm.weight,
+            norm_eps=norm.eps,
+            freq_cis=freqs_cis_cache,
+            out_loc=self._get_out_loc(compress_ratio),
+            kvcache=kv_cache,
+            page_size=page_size,
         )
-        return rotate_activation(kv_compressed) if rotate else kv_compressed
 
-    def forward_core_compressor(
+    def forward_unified(
         self,
         x: torch.Tensor,
         forward_batch: ForwardBatch,
@@ -94,75 +97,31 @@ class CompressorBackend:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        # PREP_IN_CG lazy upgrade: the concrete backend (DeepseekV4BackendRadix)
-        # owns this helper. MQALayer._forward_prepare calls us before
-        # attn_backend.forward(), so Raw -> Radix must happen here too
-        # (e.g. 1.6T layer 0 has compress_ratio=128 and needs cX_compress_metadata).
+
         self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = forward_batch.token_to_kv_pool
-        if TYPE_CHECKING:
-            assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-
-        new_compressed_kv = compressor(x, forward_batch)
-        if envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get():
-            assert_tensor_identical_across_cp_ranks(
-                new_compressed_kv,
-                tag=f"compressor(ratio={compressor.ratio}) layer_id={layer_id}",
-                forward_batch=forward_batch,
-            )
-        core_metadata = self.forward_metadata.core_metadata
-        out_loc = (
-            core_metadata.c4_out_loc
-            if compressor.ratio == 4
-            else core_metadata.c128_out_loc
+        token_to_kv_pool = cast("DeepSeekV4TokenToKVPool", token_to_kv_pool)
+        kv_score_input = compressor.compute_kv_score(x, forward_batch)
+        state_pool = compressor.get_state_pool(forward_batch)
+        if compressor.is_in_indexer:
+            kv_cache = token_to_kv_pool.get_index_k_with_scale_buffer(layer_id)
+            page_size = token_to_kv_pool.get_index_k_page_size()
+        else:
+            kv_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
+            page_size = token_to_kv_pool.get_extra_key_page_size(layer_id)
+        self._forward_compress_all_in_one(
+            kv_score_buffer=state_pool.kv_score_buffer.kv_score,
+            kv_score_input=kv_score_input,
+            ape=compressor.ape,
+            head_dim=compressor.head_dim,
+            norm=compressor.norm,
+            freqs_cis_cache=compressor.freqs_cis,
+            kv_cache=kv_cache.view(dtype=torch.uint8),
+            is_indexer=compressor.is_in_indexer,
+            rotate=compressor.rotate,
+            compress_ratio=compressor.ratio,
+            page_size=page_size,
         )
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            token_to_kv_pool.set_extra_key_buffer_fused(
-                layer_id=layer_id,
-                loc=out_loc,
-                cache_k=new_compressed_kv,
-            )
-        else:
-            pack = quant_to_nope_fp8_rope_bf16_pack_triton(new_compressed_kv.bfloat16())
-            token_to_kv_pool.set_extra_key_buffer(layer_id, out_loc, pack)
-
-    def forward_indexer_compressor(
-        self,
-        x: torch.Tensor,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-        compressor: Compressor,
-    ) -> None:
-        assert is_overlap_compress(compressor.ratio)
-        # PREP_IN_CG lazy upgrade (see forward_core_compressor for rationale).
-        self._maybe_upgrade_forward_metadata()
-        token_to_kv_pool = forward_batch.token_to_kv_pool
-        if TYPE_CHECKING:
-            assert isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool)
-
-        new_compressed_kv = compressor(x, forward_batch)
-        if envs.SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY.get():
-            assert_tensor_identical_across_cp_ranks(
-                new_compressed_kv,
-                tag=f"indexer_compressor(ratio={compressor.ratio}) layer_id={layer_id}",
-                forward_batch=forward_batch,
-            )
-        if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            token_to_kv_pool.set_index_k_fused(
-                layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
-                cache_k=new_compressed_kv,
-            )
-        else:
-            new_compressed_kv_fp8, new_compressed_kv_scale = act_quant(
-                new_compressed_kv
-            )
-            token_to_kv_pool.set_index_k_scale_buffer(
-                layer_id=layer_id,
-                loc=self.forward_metadata.core_metadata.c4_out_loc,
-                index_k=new_compressed_kv_fp8,
-                index_k_scale=new_compressed_kv_scale,
-            )
 
 
 def is_overlap_compress(compress_ratio: int) -> bool:
