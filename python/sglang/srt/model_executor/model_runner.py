@@ -1045,10 +1045,30 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         server_args = self.server_args
 
         if server_args.enable_double_sparsity:
+            ds_allowed_backends = (None, "triton", "fa3")
+            if server_args.attention_backend not in ds_allowed_backends:
+                raise ValueError(
+                    "--enable-double-sparsity is only supported with "
+                    "--attention-backend in {triton, fa3} (or unset, "
+                    "which defaults to fa3). Got: "
+                    f"{server_args.attention_backend!r}."
+                )
+            if self.model_config.is_encoder_decoder:
+                raise ValueError(
+                    "--enable-double-sparsity does not support encoder-decoder models."
+                )
+            if server_args.attn_cp_size > 1:
+                raise ValueError(
+                    "--enable-double-sparsity does not support context parallel "
+                    f"(attn_cp_size={server_args.attn_cp_size})."
+                )
+            if server_args.attention_backend is None:
+                server_args.attention_backend = "fa3"
             logger.info(
-                "Double sparsity optimization is turned on. Use triton backend without CUDA graph."
+                "Double sparsity optimization is turned on. Use %s backend "
+                "without CUDA graph.",
+                server_args.attention_backend,
             )
-            server_args.attention_backend = "triton"
             server_args.disable_cuda_graph = True
 
         if self.is_multimodal:

@@ -140,6 +140,12 @@ def create_flashattention_v3_backend(runner):
             "FlashAttention v3 Backend requires SM>=80 and SM<=90. "
             "Please use `--attention-backend flashinfer`."
         )
+        if runner.server_args.enable_double_sparsity:
+            from sglang.srt.layers.attention.double_sparsity_fa3_backend import (
+                DoubleSparseFA3Backend,
+            )
+
+            return DoubleSparseFA3Backend(runner)
         from sglang.srt.layers.attention.flashattention_backend import (
             FlashAttentionBackend,
         )
