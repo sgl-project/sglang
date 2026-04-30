@@ -39,9 +39,14 @@ configure_environment() {
     NVIDIA_NVSHMEM_VERSION="3.4.5"
     OPTIONAL_DEPS="${1:-}"
 
-    # Whether to create a uv venv (set USE_VENV=1). Default: 0.
-    USE_VENV="${USE_VENV:-0}"
-    echo "USE_VENV=${USE_VENV}"
+    # Match ci_cleanup_venv.sh parsing — install and cleanup must agree on
+    # what USE_VENV=true means, or one runs while the other skips.
+    USE_VENV_RAW="${USE_VENV:-0}"
+    case "$(printf '%s' "$USE_VENV_RAW" | tr '[:upper:]' '[:lower:]')" in
+        1 | true | yes) USE_VENV=1 ;;
+        *)              USE_VENV=0 ;;
+    esac
+    echo "USE_VENV=${USE_VENV} (input: ${USE_VENV_RAW})"
 
     # ------------------------------------------------------------------------------
     # Self-heal dangling flashinfer/tvm_ffi symlinks in system site-packages
@@ -119,7 +124,7 @@ configure_environment() {
             echo "$UV_VENV/bin" >> "$GITHUB_PATH"
         fi
     else
-        echo "USE_VENV=0: skipping uv venv creation, installing into system Python"
+        echo "USE_VENV=${USE_VENV} (input: ${USE_VENV_RAW}): skipping uv venv creation, installing into system Python"
         UV_VENV=""
     fi
 
