@@ -479,7 +479,7 @@ CUDA_SUITE_TO_RUNNER = {
     "stage-a-test-1-gpu-small": "1-gpu-5090",
     "stage-a-test-cpu": "ubuntu-latest",
     "stage-b-test-1-gpu-small": "1-gpu-5090",
-    "stage-b-test-1-gpu-large": "1-gpu-h100",
+    "stage-b-test-1-gpu-large": "1-gpu-h100-h200",
     "stage-b-test-2-gpu-large": "2-gpu-h100",
     "stage-b-test-4-gpu-b200": "4-gpu-b200",
     "stage-c-test-4-gpu-h100": "4-gpu-h100",
@@ -521,6 +521,49 @@ MULTIMODAL_PATH_TO_RUNNER = {
     "2-gpu": "2-gpu-h100",
 }
 MULTIMODAL_DEFAULT_RUNNER = "1-gpu-h100"
+
+
+def _known_test_groups():
+    groups = []
+    for group_dir in glob.glob("test/registered/*"):
+        if os.path.isdir(group_dir):
+            groups.append(os.path.basename(group_dir))
+    return sorted(groups)
+
+
+def resolve_test_group_specs(group_name):
+    """
+    Resolve a test group name into /rerun-test specs.
+
+    A group maps to a directory under test/registered/. For example,
+    "hicache" maps to all test_*.py files under test/registered/hicache/.
+
+    Returns (test_specs, error_message). On success error_message is None.
+    """
+    group_name = group_name.strip().strip("/")
+    if (
+        not group_name
+        or group_name.startswith(".")
+        or "/." in group_name
+        or ".." in group_name.split("/")
+    ):
+        return [], f"Invalid test group `{group_name}`."
+
+    group_dir = os.path.join("test", "registered", group_name)
+    if not os.path.isdir(group_dir):
+        known = ", ".join(f"`{g}`" for g in _known_test_groups())
+        return (
+            [],
+            f"Unknown test group `{group_name}`.\n\nKnown groups: {known}",
+        )
+
+    test_files = sorted(
+        glob.glob(os.path.join(group_dir, "**", "test_*.py"), recursive=True)
+    )
+    if not test_files:
+        return [], f"No registered test files found in `{group_dir}`."
+
+    return [os.path.relpath(path, "test") for path in test_files], None
 
 
 def resolve_test_file(file_part):
@@ -842,23 +885,21 @@ def _dispatch_batch(gh_repo, pr, batch, token):
         }
 
 
-def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
+def _check_rerun_test_permissions(gh_repo, pr, comment, user_perms, command_name):
     """
-    Handles the /rerun-test command. Resolves all test specs, groups them by
-    (runner_label, use_deepep, is_cpu), and dispatches one workflow per group.
+    Check permissions shared by /rerun-test and /rerun-group.
     """
-    # SECURITY: For fork PRs, only allow /rerun-test if the commenter has write+ permission.
-    # This command checks out and executes code from the PR branch on self-hosted GPU
-    # runners, so we must ensure the commenter is a trusted collaborator.
+    # SECURITY: These commands check out and execute code from the PR branch on
+    # self-hosted GPU runners, so fork PRs require a trusted collaborator.
     is_fork = pr.head.repo is None or pr.head.repo.owner.login != gh_repo.owner.login
     if is_fork:
         commenter = comment.user.login
         perm = gh_repo.get_collaborator_permission(commenter)
         if perm not in ("admin", "write"):
-            print(f"Permission denied: /rerun-test on fork PR by {commenter}.")
+            print(f"Permission denied: /{command_name} on fork PR by {commenter}.")
             comment.create_reaction("confused")
             pr.create_issue_comment(
-                "❌ `/rerun-test` is not available for fork PRs unless the commenter "
+                f"❌ `/{command_name}` is not available for fork PRs unless the commenter "
                 "has write permission on the repo.\n\n"
                 "Please ask a maintainer to run this command, or use the normal CI flow."
             )
@@ -870,6 +911,21 @@ def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
         or user_perms.get("can_rerun_stage", False)
     ):
         print("Permission denied: neither can_rerun_test nor can_rerun_stage is true.")
+        return False
+
+    return True
+
+
+def handle_rerun_test(
+    gh_repo, pr, comment, user_perms, test_specs, token, skip_permission_check=False
+):
+    """
+    Handles the /rerun-test command. Resolves all test specs, groups them by
+    (runner_label, use_deepep, is_cpu), and dispatches one workflow per group.
+    """
+    if not skip_permission_check and not _check_rerun_test_permissions(
+        gh_repo, pr, comment, user_perms, "rerun-test"
+    ):
         return False
 
     if not test_specs:
@@ -959,6 +1015,56 @@ def handle_rerun_test(gh_repo, pr, comment, user_perms, test_specs, token):
     return len(successes) > 0
 
 
+def handle_rerun_group(gh_repo, pr, comment, user_perms, group_names, token):
+    """
+    Handles the /rerun-group command. Expands one or more registered test
+    groups into test file specs, then reuses /rerun-test dispatch behavior.
+    """
+    if not _check_rerun_test_permissions(
+        gh_repo, pr, comment, user_perms, "rerun-group"
+    ):
+        return False
+
+    if not group_names:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(
+            "❌ Please specify a test group: `/rerun-group <group>`\n\n"
+            "Example:\n"
+            "- `/rerun-group hicache`"
+        )
+        return False
+
+    test_specs = []
+    failures = []
+    seen = set()
+    for group_name in group_names:
+        specs, err = resolve_test_group_specs(group_name)
+        if err:
+            failures.append((group_name, err))
+            continue
+
+        for spec in specs:
+            if spec not in seen:
+                test_specs.append(spec)
+                seen.add(spec)
+
+    if failures:
+        comment.create_reaction("confused")
+        lines = [f"❌ `{group}`: {err}" for group, err in failures]
+        pr.create_issue_comment("\n\n".join(lines))
+        return False
+
+    return handle_rerun_test(
+        gh_repo,
+        pr,
+        comment,
+        user_perms,
+        test_specs,
+        token,
+        skip_permission_check=True,
+    )
+
+
 def main():
     # 1. Load Environment Variables
     token = get_env_var("GITHUB_TOKEN")
@@ -1039,6 +1145,10 @@ def main():
         parts = first_line.split(maxsplit=1)
         stage_name = parts[1].strip() if len(parts) > 1 else None
         handle_rerun_stage(repo, pr, comment, user_perms, stage_name, token)
+
+    elif first_line.startswith("/rerun-group"):
+        group_names = first_line.split()[1:]
+        handle_rerun_group(repo, pr, comment, user_perms, group_names or None, token)
 
     elif first_line.startswith("/rerun-test"):
         test_specs = first_line.split()[1:]
