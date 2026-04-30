@@ -246,7 +246,8 @@ class FunctionCallParser:
                     # For "auto": only constrain when strict is enabled.
                     tag = self.get_legacy_structural_tag(at_least_one=is_required)
                     return ("structural_tag", tag)
-            elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+
+            if tool_choice == "required" or isinstance(tool_choice, ToolChoice):
                 json_schema = get_json_schema_constraint(
                     self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
                 )
