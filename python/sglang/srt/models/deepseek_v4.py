@@ -252,11 +252,20 @@ class Compressor(nn.Module):
         state_len = seq_len % ratio + (ratio == 4) * ratio
         return torch.arange(seq_len - state_len, seq_len).clamp(min=-1)
 
-    def compress_fused(
-        self,
-        kv_score: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
+
+        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
+        if nsa_use_prefill_cp(forward_batch):
+            kv_score = cp_all_gather_rerange_output(
+                kv_score,
+                get_attention_tp_size(),
+                forward_batch,
+                torch.cuda.current_stream(),
+            )
+
         backend = forward_batch.attn_backend
         if TYPE_CHECKING:
             assert isinstance(backend, DeepseekV4BackendRadix)
@@ -274,21 +283,6 @@ class Compressor(nn.Module):
             forward_batch=forward_batch,
             is_paged=True,
         )
-
-    def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
-        if forward_batch.forward_mode.is_idle():
-            assert x.shape[0] == 0
-            return x.new_empty(0, self.head_dim)
-
-        kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)
-        if nsa_use_prefill_cp(forward_batch):
-            kv_score = cp_all_gather_rerange_output(
-                kv_score,
-                get_attention_tp_size(),
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
-        return self.compress_fused(kv_score, forward_batch)
 
 
 class C4Indexer(nn.Module):
