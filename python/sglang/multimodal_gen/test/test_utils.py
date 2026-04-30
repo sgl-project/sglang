@@ -31,7 +31,13 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/diffusion-ci/consistency_gt"
+SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/diffusion-ci/consistency_gt/official_generated"
+SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/diffusion-ci/consistency_gt/sglang_generated"
+SGL_TEST_FILES_CONSISTENCY_GT_BASE = SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
+SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
+    SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
+    SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
+)
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
 )
@@ -873,11 +879,55 @@ def get_consistency_gt_remote_files(
     case_id: str, num_gpus: int, is_video: bool, output_format: str | None = None
 ) -> list[tuple[str, str]]:
     """Return GT filenames with their remote raw URLs."""
-    filenames = _consistency_gt_filenames(case_id, num_gpus, is_video, output_format)
-    return [
-        (filename, f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{filename}")
-        for filename in filenames
-    ]
+    files = _find_remote_consistency_gt_files(
+        case_id, num_gpus, is_video, output_format
+    )
+    if files:
+        return files
+
+    return _remote_consistency_gt_candidates(
+        SGL_TEST_FILES_CONSISTENCY_GT_BASE, case_id, num_gpus, is_video, output_format
+    )
+
+
+def _remote_consistency_gt_candidates(
+    base_url: str,
+    case_id: str,
+    num_gpus: int,
+    is_video: bool,
+    output_format: str | None = None,
+) -> list[tuple[str, str]]:
+    filenames = get_consistency_gt_candidates(
+        case_id, num_gpus, is_video, output_format
+    )
+    return [(filename, f"{base_url}/{filename}") for filename in filenames]
+
+
+def _remote_file_exists(url: str) -> bool:
+    try:
+        return requests.head(url, timeout=10, allow_redirects=True).status_code == 200
+    except requests.RequestException:
+        return False
+
+
+def _find_remote_consistency_gt_files(
+    case_id: str,
+    num_gpus: int,
+    is_video: bool,
+    output_format: str | None = None,
+) -> list[tuple[str, str]]:
+    for base_url in SGL_TEST_FILES_CONSISTENCY_GT_BASES:
+        candidates = _remote_consistency_gt_candidates(
+            base_url, case_id, num_gpus, is_video, output_format
+        )
+        if is_video:
+            if all(_remote_file_exists(url) for _, url in candidates):
+                return candidates
+        else:
+            for filename, url in candidates:
+                if _remote_file_exists(url):
+                    return [(filename, url)]
+    return []
 
 
 def _get_consistency_gt_dir() -> Path | None:
@@ -942,13 +992,20 @@ def load_consistency_gt(
             images.append(np.array(Image.open(path).convert("RGB")))
         logger.info(f"Loaded {len(images)} GT images for {case_id} from {gt_dir}")
     else:
-        for fn in filenames:
-            url = f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{fn}"
+        remote_files = _find_remote_consistency_gt_files(
+            case_id, num_gpus, is_video, output_format
+        )
+        if not remote_files:
+            raise FileNotFoundError(
+                f"GT image not found for {case_id}. Tried: {', '.join(filenames)}"
+            )
+        for _, url in remote_files:
             resp = requests.get(url, timeout=30)
             if resp.status_code != 200:
                 raise FileNotFoundError(f"GT image not found: {url}")
             images.append(np.array(Image.open(io.BytesIO(resp.content)).convert("RGB")))
-        logger.info(f"Loaded {len(images)} GT images for {case_id} from sglang-ci-data")
+        source_dir = remote_files[0][1].rsplit("/", 1)[0]
+        logger.info(f"Loaded {len(images)} GT images for {case_id} from {source_dir}")
 
     embeddings = [compute_clip_embedding(arr) for arr in images]
     loaded_gt = LoadedConsistencyGT(images=images, embeddings=embeddings)
@@ -987,14 +1044,9 @@ def gt_exists(
             return all((gt_dir / c).exists() for c in candidates)
         return any((gt_dir / c).exists() for c in candidates)
 
-    filenames = _consistency_gt_filenames(case_id, num_gpus, is_video, output_format)
-    fn = filenames[0]
-    url = f"{SGL_TEST_FILES_CONSISTENCY_GT_BASE}/{fn}"
-    try:
-        r = requests.head(url, timeout=10)
-        return r.status_code == 200
-    except Exception:
-        return False
+    return bool(
+        _find_remote_consistency_gt_files(case_id, num_gpus, is_video, output_format)
+    )
 
 
 def extract_key_frames_from_video(
