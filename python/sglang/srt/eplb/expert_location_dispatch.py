@@ -139,17 +139,26 @@ def _topk_ids_logical_to_physical_probability(
 ) -> torch.Tensor:
     """Select physical experts based on LP-computed probability distribution.
 
-    Sync-free: the previous form had ``if zero_rows.any():`` which forced a
-    GPU->host sync via aten::is_nonzero on every forward pass. Replace with
-    a torch.where that always evaluates the fallback (a cheap mask op) and
-    selects between it and the LP probabilities row-wise on-device.
+    Tries the JIT-compiled CUDA kernel first (one launch); falls back to
+    the torch reference path if the kernel can't run (CPU, dtype mismatch,
+    Math-DX missing, etc.).
     """
+    if topk_ids.is_cuda:
+        try:
+            from sglang.jit_kernel.lplb import cuda_solver
+
+            return cuda_solver.dispatch_probability(
+                topk_ids, log2phy_prob, info.partial_logical_to_all_physical_map
+            )
+        except Exception:  # pragma: no cover
+            pass
+
+    # Torch reference fallback. Sync-free: the previous form had
+    # ``if zero_rows.any():`` which forced an aten::is_nonzero sync.
     topk_ids_original_shape = topk_ids.shape
     topk_ids = topk_ids.flatten()
     log2phy_map = info.partial_logical_to_all_physical_map
     topk_probs = log2phy_prob[topk_ids].float()
-    # Row-wise fallback: for any row where all LP probs are zero, sample
-    # uniformly over the valid physical copies (mask of log2phy != -1).
     row_sums = topk_probs.sum(dim=-1, keepdim=True)
     fallback = (log2phy_map[topk_ids] >= 0).float()
     topk_probs = torch.where(row_sums > 0, topk_probs, fallback)
