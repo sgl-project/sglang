@@ -2084,6 +2084,22 @@ class DoubleSparseTokenToKVPool(KVCache):
                     for _ in range(layer_num)
                 ]
 
+        self._finalize_allocation_log(size)
+
+    def get_kv_size_bytes(self):
+        assert hasattr(self, "k_buffer")
+        assert hasattr(self, "v_buffer")
+        assert hasattr(self, "label_buffer")
+        k_size_bytes = 0
+        for k_cache in self.k_buffer:
+            k_size_bytes += get_tensor_size_bytes(k_cache)
+        for label_cache in self.label_buffer:
+            k_size_bytes += get_tensor_size_bytes(label_cache)
+        v_size_bytes = 0
+        for v_cache in self.v_buffer:
+            v_size_bytes += get_tensor_size_bytes(v_cache)
+        return k_size_bytes, v_size_bytes
+
     def get_key_buffer(self, layer_id: int):
         return self.k_buffer[layer_id - self.start_layer]
 

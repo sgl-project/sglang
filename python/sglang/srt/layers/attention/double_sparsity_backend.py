@@ -118,6 +118,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        **kwargs,
     ):
         # TODO: reuse the buffer across layers
         if layer.qk_head_dim != layer.v_head_dim:
@@ -172,6 +173,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         save_kv_cache=True,
+        **kwargs,
     ):
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
@@ -239,7 +241,7 @@ class DoubleSparseAttnBackend(AttentionBackend):
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id),
                 forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id),
-                o.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                 q_label,
                 forward_batch.token_to_kv_pool.get_label_buffer(layer.layer_id),
                 ds_req_to_token,

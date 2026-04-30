@@ -1253,6 +1253,9 @@ class ServerArgs:
         # 18. CUDA Graph debug mode
         if self.debug_cuda_graph:
             self.disable_piecewise_cuda_graph = True
+        # 19. Double Sparsity (triton DS backend does not support torch.compile)
+        if self.enable_double_sparsity:
+            self.disable_piecewise_cuda_graph = True
 
     def _handle_multi_item_scoring(self):
         """Setup and validate multi-item scoring constraints.
