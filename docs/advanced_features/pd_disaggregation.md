@@ -15,7 +15,7 @@ PD Disaggregation resolves these by separating the two stages, enabling tailored
 
 For the design details, please refer to [link](https://docs.google.com/document/d/1rQXJwKd5b9b1aOzLh98mnyMhBMhlxXA5ATZTHoQrwvc/edit?tab=t.0).
 
-Currently, we support Mooncake and NIXL as the transfer engine.
+Currently, we support Mooncake, NIXL, and `shm_pinned` as transfer backends.
 
 ## Profiling in PD Disaggregation Mode
 

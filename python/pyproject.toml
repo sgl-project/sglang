@@ -46,6 +46,7 @@ dependencies = [
   "packaging",
   "partial_json_parser",
   "pillow",
+  "posix_ipc>=1.1.1",
   "prometheus-client>=0.20.0",
   "psutil",
   "py-spy",
