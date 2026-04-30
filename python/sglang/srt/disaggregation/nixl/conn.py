@@ -175,7 +175,9 @@ class NixlKVManager(CommonKVManager):
 
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
         num_threads = 8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
-        backend_params = json.loads(envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS.get())
+        backend_params = json.loads(
+            envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS.get()
+        )
         if not isinstance(backend_params, dict) or not all(
             isinstance(key, str) and isinstance(value, str)
             for key, value in backend_params.items()
