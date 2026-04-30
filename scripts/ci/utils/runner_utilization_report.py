@@ -21,7 +21,7 @@ DEFAULT_LABELS_TO_IGNORE = {"self-hosted", "Linux", "X64", "ARM64"}
 GITHUB_HOSTED_LABELS = {"ubuntu-latest", "ubuntu-22.04", "ubuntu-24.04"}
 
 
-def run_gh_command(args: list[str], max_retries: int = 5) -> dict:
+def run_gh_command(args: list[str], max_retries: int = 10) -> dict:
     """Run gh CLI command and return JSON result.
 
     Retries on transient failures (5xx, secondary rate limits, network
@@ -62,8 +62,8 @@ def run_gh_command(args: list[str], max_retries: int = 5) -> dict:
         )
         if not retryable:
             break
-        # Exponential backoff with jitter: 1s, 2s, 4s, 8s, 16s
-        delay = (2**attempt) + random.uniform(0, 1)
+        # Exponential backoff with jitter, capped at 60s.
+        delay = min(60, (2**attempt) + random.uniform(0, 1))
         time.sleep(delay)
     raise Exception(f"gh api failed after {max_retries} attempts: {last_err[:300]}")
 
@@ -157,12 +157,49 @@ def parse_time(time_str: str) -> datetime:
     return datetime.fromisoformat(time_str.replace("Z", "+00:00"))
 
 
+_NON_GPU_WORKFLOW_HINTS = (
+    "lint",
+    "deploy",
+    "release",
+    "publish",
+    "docs",
+    "doc",
+    "mintlify",
+    "runner utilization",  # this very script
+    "tag-and-rerun",
+    "auto",  # auto-merge etc.
+    "label",
+    "stale",
+    "dependabot",
+    "codeql",
+)
+
+
+def _likely_no_gpu_jobs(workflow_name: str) -> bool:
+    """Heuristic: skip per-run job-fetch for workflows that don't dispatch
+    to self-hosted GPU runners. The GH API rate limit (~5000 req/hr per
+    token) is the bottleneck on busy 24h windows where ~4000 workflow
+    runs fire — but only a fraction of those (pr-test, nightly-test,
+    pr-test-*kernel, etc.) actually run on GPU runners. Skipping the
+    docs/lint/release runs cuts the API call budget by 2-4x.
+    """
+    if not workflow_name:
+        return False
+    n = workflow_name.lower()
+    return any(h in n for h in _NON_GPU_WORKFLOW_HINTS)
+
+
 def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None):
     """Calculate runner utilization metrics."""
 
     print(f"Fetching workflow runs from last {hours} hours...")
-    runs = get_workflow_runs(repo, hours)
-    print(f"Found {len(runs)} workflow runs")
+    all_runs = get_workflow_runs(repo, hours)
+    runs = [r for r in all_runs if not _likely_no_gpu_jobs(r.get("name", ""))]
+    skipped = len(all_runs) - len(runs)
+    print(
+        f"Found {len(all_runs)} workflow runs "
+        f"({skipped} skipped as non-GPU: docs/lint/release/etc.)"
+    )
 
     # Try to get online runners from API
     print("Fetching online runners...")
@@ -211,13 +248,20 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
 
     all_jobs = []
     failed_runs = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    # Concurrency=4 with longer retry budget keeps us well below the GH
+    # API secondary rate-limit threshold (~10 req/s). On a 24h window
+    # with ~1500 GPU-relevant runs (post-filter), this completes in ~5
+    # min and almost never hits the rate limit.
+    with ThreadPoolExecutor(max_workers=4) as executor:
         futures = [executor.submit(fetch_jobs_for_run, run) for run in runs]
         completed = 0
         for future in as_completed(futures):
             completed += 1
-            if completed % 50 == 0:
-                print(f"Fetched jobs for {completed}/{total_runs} runs...")
+            if completed % 100 == 0:
+                print(
+                    f"Fetched jobs for {completed}/{total_runs} runs "
+                    f"({len(failed_runs)} failed so far)..."
+                )
             run_id, jobs, err = future.result()
             if err:
                 failed_runs.append((run_id, err))
@@ -233,6 +277,7 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
         )
         for rid, err in failed_runs[:5]:
             print(f"  run {rid}: {err}")
+    fetch_failure_pct = len(failed_runs) / total_runs * 100 if total_runs > 0 else 0
 
     for job in all_jobs:
         runner_name = job.get("runner_name")
@@ -342,10 +387,12 @@ def calculate_utilization(repo: str, hours: int = 24, runner_filter: str = None)
             }
         )
 
-    return results
+    return results, fetch_failure_pct
 
 
-def format_report(results: list[dict], hours: int) -> str:
+def format_report(
+    results: list[dict], hours: int, fetch_failure_pct: float = 0.0
+) -> str:
     """One compact summary table — original schema, fixed columns.
 
     Active (hrs) and Utilization now reflect the actual host pool's
@@ -362,9 +409,21 @@ def format_report(results: list[dict], hours: int) -> str:
         f"**Time window:** Last {hours} hours · "
         f"**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}",
         "",
-        "| Label | Runners | Jobs | Active (hrs) | Utilization | Avg Queue | Max Queue |",
-        "|-------|---------|------|--------------|-------------|-----------|-----------|",
     ]
+    if fetch_failure_pct > 1.0:
+        lines.append(
+            f"⚠️ **Data completeness warning**: {fetch_failure_pct:.0f}% of "
+            f"GPU-relevant workflow runs failed to fetch jobs after retries "
+            f"(GH API rate limit). Active hours and utilization below are "
+            f"under-counted by approximately this fraction."
+        )
+        lines.append("")
+    lines.extend(
+        [
+            "| Label | Runners | Jobs | Active (hrs) | Utilization | Avg Queue | Max Queue |",
+            "|-------|---------|------|--------------|-------------|-----------|-----------|",
+        ]
+    )
     for r in results:
         bar = "█" * int(r["utilization_pct"] / 10) + "░" * (
             10 - int(r["utilization_pct"] / 10)
@@ -389,8 +448,10 @@ def main():
     parser.add_argument("--output", type=str, help="Output file (default: stdout)")
     args = parser.parse_args()
 
-    results = calculate_utilization(args.repo, args.hours, args.filter)
-    report = format_report(results, args.hours)
+    results, fetch_failure_pct = calculate_utilization(
+        args.repo, args.hours, args.filter
+    )
+    report = format_report(results, args.hours, fetch_failure_pct)
 
     if args.output:
         with open(args.output, "w") as f:
