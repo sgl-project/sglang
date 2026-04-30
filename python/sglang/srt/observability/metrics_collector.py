@@ -304,13 +304,13 @@ class SchedulerMetricsCollector:
         # Speculative decoding
         self.spec_accept_length = Gauge(
             name="sglang:spec_accept_length",
-            documentation="The average acceptance length of speculative decoding.",
+            documentation="Mean acceptance length of speculative decoding (accepted drafts + bonus token per forward).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )
         self.spec_accept_rate = Gauge(
             name="sglang:spec_accept_rate",
-            documentation="The average acceptance rate of speculative decoding (`accepted tokens / total draft tokens` in batch).",
+            documentation="Speculative acceptance rate (`accepted drafts / proposed drafts` in batch).",
             labelnames=labels.keys(),
             multiprocess_mode="mostrecent",
         )

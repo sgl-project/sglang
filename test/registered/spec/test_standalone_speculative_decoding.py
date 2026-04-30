@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -80,6 +79,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
         # please don't do this if you want to make your inference workload faster
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
+        envs.SGLANG_ENABLE_SPEC_V2.set(False)
         model = cls.model
         cls.process = popen_launch_server(
             model,
@@ -91,6 +91,7 @@ class TestStandaloneSpeculativeDecodingBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
+        envs.SGLANG_ENABLE_SPEC_V2.clear()
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")
@@ -140,7 +141,6 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
         # please don't do this if you want to make your inference workload faster
         envs.SGLANG_JIT_DEEPGEMM_PRECOMPILE.set(False)
         envs.SGLANG_ENABLE_JIT_DEEPGEMM.set(False)
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)  # Enable Speculative Decoding V2
         model = cls.model
         cls.process = popen_launch_server(
             model,
@@ -152,8 +152,6 @@ class TestStandaloneV2SpeculativeDecodingBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
-        if "SGLANG_ENABLE_SPEC_V2" in os.environ:
-            envs.SGLANG_ENABLE_SPEC_V2.set(False)
 
     def test_gsm8k(self):
         requests.get(self.base_url + "/flush_cache")

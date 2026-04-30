@@ -138,7 +138,7 @@ jobs:
               - ".github/workflows/pr-gate.yml"
               - ".github/actions/**"
               - "python/pyproject.toml"
-              - "python/sglang/!(multimodal_gen|jit_kernel/diffusion|jit_kernel/tests/diffusion|jit_kernel/benchmark/diffusion|cli)/**/!(*.md)"
+              - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "scripts/ci/cuda/*"
               - "scripts/ci/utils/*"
               - "test/**/!(*.md)"
@@ -725,11 +725,16 @@ jobs:
 
       # Needed by setuptools-rust to build the bundled native gRPC extension
       # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
-      - name: Install protoc
-        run: sudo bash scripts/ci/utils/install_protoc.sh
+      - name: Install protoc + Rust toolchain
+        timeout-minutes: 10
+        run: bash scripts/ci/utils/install_rust_protoc.sh
 
-      - name: Install Rust toolchain
-        run: bash scripts/ci/utils/install_rustup.sh
+      - name: Rust cache (sglang-grpc)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/sglang-grpc
+          shared-key: "sglang-grpc-cpu"
+          save-if: ${{ matrix.partition == 0 }}
 
       # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
@@ -820,7 +825,10 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-h100
+    # `1-gpu-h100-h200` is a shared label advertised by both the 1-GPU H100 and
+    # 1-GPU H200 runner pools, so this job can land on either. Multimodal_gen
+    # jobs in pr-test-multimodal-gen.yml continue to pin to `1-gpu-h100`.
+    runs-on: 1-gpu-h100-h200
     timeout-minutes: 240
     strategy:
       fail-fast: false

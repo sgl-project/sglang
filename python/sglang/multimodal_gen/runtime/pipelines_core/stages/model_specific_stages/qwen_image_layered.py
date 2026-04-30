@@ -293,6 +293,9 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         prompt_embeds_mask = prompt_embeds_mask.repeat(1, num_images_per_prompt, 1)
         prompt_embeds_mask = prompt_embeds_mask.view(num_images_per_prompt, seq_len)
 
+        if prompt_embeds_mask is not None and prompt_embeds_mask.all():
+            prompt_embeds_mask = None
+
         return prompt_embeds, prompt_embeds_mask
 
     # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit.QwenImageEditPipeline._encode_vae_image
@@ -412,7 +415,7 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         batch: Req,
         server_args: ServerArgs,
     ) -> Req:
-        use_en_prompt = True
+        use_en_prompt = batch.use_en_prompt
         device = get_local_torch_device()
         layers = batch.num_frames
         num_inference_steps = batch.num_inference_steps
@@ -443,9 +446,11 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         image = image.unsqueeze(2)
         image = image.to(dtype=torch.bfloat16)
 
-        prompt = self.get_image_caption(
-            prompt_image, use_en_prompt=use_en_prompt, device=device
-        )
+        prompt = batch.prompt
+        if not prompt or prompt.isspace():
+            prompt = self.get_image_caption(
+                prompt_image, use_en_prompt=use_en_prompt, device=device
+            )
 
         prompt_embeds, prompt_embeds_mask = self.encode_prompt(
             prompt=prompt,
@@ -514,9 +519,9 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         is_rgb = torch.tensor([0]).to(device=device, dtype=torch.long)
 
         batch.prompt_embeds = [prompt_embeds]
-        batch.prompt_embeds_mask = [prompt_embeds_mask]
+        batch.prompt_attention_mask = [prompt_embeds_mask]
         batch.negative_prompt_embeds = [negative_prompt_embeds]
-        batch.negative_prompt_embeds_mask = [negative_prompt_embeds_mask]
+        batch.negative_attention_mask = [negative_prompt_embeds_mask]
         batch.latents = latents
         batch.image_latent = image_latents
         batch.timesteps = timesteps

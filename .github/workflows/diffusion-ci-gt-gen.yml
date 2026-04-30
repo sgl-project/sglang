@@ -38,12 +38,49 @@ env:
   OUTPUT_NAME: ${{ inputs.output_name || 'diffusion-ci-outputs' }}
 
 jobs:
-  multimodal-diffusion-gen-1gpu:
+  compute-diffusion-partitions:
     if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    outputs:
+      matrix-1gpu: ${{ steps.compute.outputs.matrix-1gpu }}
+      matrix-2gpu: ${{ steps.compute.outputs.matrix-2gpu }}
+      matrix-b200: ${{ steps.compute.outputs.matrix-b200 }}
+      partition-count-1gpu: ${{ steps.compute.outputs['partition-count-1gpu'] }}
+      partition-count-2gpu: ${{ steps.compute.outputs['partition-count-2gpu'] }}
+      partition-count-b200: ${{ steps.compute.outputs['partition-count-b200'] }}
+      plan-1gpu: ${{ steps.compute.outputs.plan-1gpu }}
+      plan-2gpu: ${{ steps.compute.outputs.plan-2gpu }}
+      plan-b200: ${{ steps.compute.outputs.plan-b200 }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Compute partitions
+        id: compute
+        run: |
+          python scripts/ci/utils/diffusion/compute_diffusion_partitions.py \
+            --min-time 1200 \
+            --target-time 1800 \
+            --max-time 2400 \
+            --max-partitions 10 \
+            --parametrized-only
+
+  multimodal-diffusion-gen-1gpu:
+    needs: compute-diffusion-partitions
+    if: |
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"include":[]}'
     runs-on: 1-gpu-h100
     strategy:
-      matrix:
-        part: [0, 1]
+      fail-fast: false
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-1gpu) }}
     timeout-minutes: 150
     steps:
       - name: Checkout code
@@ -75,12 +112,14 @@ jobs:
       - name: Generate outputs
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
         run: |
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
             --suite 1-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-1gpu'] }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
             --out-dir ./${{ env.OUTPUT_NAME }} \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
@@ -100,11 +139,14 @@ jobs:
             ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
 
   multimodal-diffusion-gen-2gpu:
-    if: github.repository == 'sgl-project/sglang'
+    needs: compute-diffusion-partitions
+    if: |
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"include":[]}'
     runs-on: 2-gpu-h100
     strategy:
-      matrix:
-        part: [0, 1]
+      fail-fast: false
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-2gpu) }}
     timeout-minutes: 150
     steps:
       - name: Checkout code
@@ -136,12 +178,14 @@ jobs:
       - name: Generate outputs
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
         run: |
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
             --suite 2-gpu \
             --partition-id ${{ matrix.part }} \
-            --total-partitions 2 \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-2gpu'] }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
             --out-dir ./${{ env.OUTPUT_NAME }} \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
@@ -161,8 +205,14 @@ jobs:
             ${{ inputs.output_name != '' && format('--target-dir diffusion-ci/{0}', inputs.output_name) || '' }}
 
   multimodal-diffusion-gen-b200:
-    if: github.repository == 'sgl-project/sglang'
+    needs: compute-diffusion-partitions
+    if: |
+      needs.compute-diffusion-partitions.result == 'success' &&
+      needs.compute-diffusion-partitions.outputs.matrix-b200 != '{"include":[]}'
     runs-on: 4-gpu-b200
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.compute-diffusion-partitions.outputs.matrix-b200) }}
     timeout-minutes: 240
     steps:
       - name: Checkout code
@@ -194,17 +244,21 @@ jobs:
       - name: Generate outputs
         env:
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          PARTITION_PLAN_JSON: ${{ needs.compute-diffusion-partitions.outputs.plan-b200 }}
         run: |
           cd python
           python -m sglang.multimodal_gen.test.scripts.gen_diffusion_ci_outputs \
             --suite 1-gpu-b200 \
+            --partition-id ${{ matrix.part }} \
+            --total-partitions ${{ needs.compute-diffusion-partitions.outputs['partition-count-b200'] }} \
+            --partition-plan-json "$PARTITION_PLAN_JSON" \
             --out-dir ./${{ env.OUTPUT_NAME }} \
             ${{ inputs.case_ids != '' && format('--case-ids {0}', inputs.case_ids) || '' }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ env.OUTPUT_NAME }}-b200
+          name: ${{ env.OUTPUT_NAME }}-b200-part${{ matrix.part }}
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 

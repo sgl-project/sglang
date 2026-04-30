@@ -264,6 +264,11 @@ def extract_transfer_fields(req) -> tuple[dict, dict]:
             except (TypeError, ValueError):
                 pass
 
+    if getattr(req, "generator", None) is not None:
+        seed = getattr(req, "seed", None)
+        if seed is not None:
+            scalar_fields["seed"] = _to_json_serializable(seed)
+
     if _debug_transfer:
         import torch as _torch
 
@@ -1316,9 +1321,13 @@ class SchedulerDisaggMixin:
         # Recreate torch.Generator from seed (not serializable over transfer)
         seed = scalar_fields.get("seed")
         if seed is not None:
-            gen = torch.Generator(device="cpu")
-            gen.manual_seed(int(seed))
-            req.generator = gen
+            if isinstance(seed, list):
+                req.generator = [
+                    torch.Generator(device="cpu").manual_seed(int(item))
+                    for item in seed
+                ]
+            else:
+                req.generator = torch.Generator(device="cpu").manual_seed(int(seed))
         # Rebuild trace_ctx from the propagated __getstate__ dict so this role's
         # spans nest under the sender's trace (same mechanism SRT uses via pickle).
         if trace_state and trace_state.get("tracing_enable"):
