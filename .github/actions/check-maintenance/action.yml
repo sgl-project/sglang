@@ -36,7 +36,15 @@ runs:
         # rebase check is enforced regardless of whether the issue is open
         # or closed — so maintainers can require all PRs to rebase past a
         # specific commit without having to open the maintenance issue.
-        MIN_BASE_SHA=$(printf '%s' "$ISSUE_BODY" | tr -d '\r' | grep -iE '^[[:space:]]*`?MIN_BASE_SHA`?[[:space:]]*[:=]' | head -n1 | sed -E 's/.*[:=][[:space:]]*//; s/`//g' | awk '{print $1}')
+        # `grep` exits 1 on no-match, which under `set -eo pipefail` (the
+        # default for `shell: bash` composite steps) would abort the whole
+        # script — silently failing every PR whose issue body has no
+        # MIN_BASE_SHA line. Wrap grep in a brace group with `|| true` so
+        # an empty match falls through cleanly to "no directive set".
+        MIN_BASE_SHA=$(
+          { printf '%s' "$ISSUE_BODY" | tr -d '\r' | grep -iE '^[[:space:]]*`?MIN_BASE_SHA`?[[:space:]]*[:=]' || true; } \
+            | head -n1 | sed -E 's/.*[:=][[:space:]]*//; s/`//g' | awk '{print $1}'
+        )
         if [[ -n "$MIN_BASE_SHA" ]] && ! [[ "$MIN_BASE_SHA" =~ ^[a-fA-F0-9]{7,40}$ ]]; then
           WARN="⚠️  Ignoring malformed MIN_BASE_SHA directive in issue #$MAINTENANCE_ISSUE: '$MIN_BASE_SHA' (must be 7-40 hex chars)"
           echo "$WARN"
