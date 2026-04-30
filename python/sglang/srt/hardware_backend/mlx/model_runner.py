@@ -5,10 +5,18 @@ scheduler (``TokenToKVPoolAllocator`` / ``RadixCache``).  This runner
 reads cached KV from ``MlxKVPool``, runs the forward pass, and writes
 new KV back.  Each request also keeps a ``ContiguousKVCache`` for
 decode-time attention.
+
+The module also exposes a lazy-eval (`*_start` / `*_finalize`) surface
+used by the MLX overlap scheduler to pipeline CPU bookkeeping with
+GPU execution.  The lazy API is a thin split of the synchronous API:
+``*_start`` builds the compute graph without materialising outputs,
+``*_finalize`` blocks on the lazy token(s) and commits per-request
+state.
 """
 
 import logging
 import time
+from dataclasses import dataclass
 
 import mlx.core as mx
 import psutil
@@ -32,6 +40,56 @@ from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class MlxPendingPrefill:
+    """Lazy prefill state, finalised after ``mx.eval``/``async_eval``.
+
+    ``cache`` is the per-layer list of ``ContiguousKVCache`` that will
+    become ``_req_caches[req_id]`` once the request is committed.  It
+    may have been converted from a transient ``PoolBackedCache`` list
+    already (so its ``state`` arrays are safe to hand to ``async_eval``).
+    """
+
+    lazy_token: mx.array
+    cache: list  # list[ContiguousKVCache]
+    req_id: str
+    full_token_ids: list[int]
+    req_pool_idx: int
+    synced_offset: int
+
+
+@dataclass
+class MlxPendingExtend:
+    """Lazy chunked-prefill-continuation state for an existing request.
+
+    Mirrors :meth:`MlxModelRunner.extend` split into launch/finalize
+    halves.  ``cache`` is the request's existing per-layer cache (not a
+    fresh one) so the graph writes extend onto the already-materialised
+    prefix.
+    """
+
+    lazy_token: mx.array
+    req_id: str
+    new_token_ids: list[int]
+    new_synced_offset: int
+
+
+@dataclass
+class MlxPendingDecode:
+    """Lazy decode state, finalised after ``mx.eval``/``async_eval``.
+
+    ``caches`` is a per-request list of per-layer ``ContiguousKVCache``
+    references (``caches[req_idx][layer_idx]``).  These are the same
+    objects the attention wrapper writes into during the forward pass,
+    so :meth:`decode_batch_start_chained` can launch the next step on
+    top of the same caches without materialising this step first.
+    """
+
+    lazy_tokens: mx.array
+    req_ids: list[str]
+    caches: list  # list[list[ContiguousKVCache]]
+
+
 class MlxModelRunner:
     """MLX model runner with radix-cache prefix sharing."""
 
@@ -48,6 +106,8 @@ class MlxModelRunner:
         self.model = None
         self.disable_radix_cache = disable_radix_cache
         self._mem_fraction_static = mem_fraction_static
+        # Counter used to trigger periodic mx.clear_cache() calls.
+        self._decode_step_ct: int = 0
 
         self._load_model()
 
@@ -103,6 +163,21 @@ class MlxModelRunner:
     ) -> None:
         """Evaluate token result and all cache buffers in one mx.eval call."""
         mx.eval(token_result, *[s for c in cache for s in c.state])
+
+    @staticmethod
+    def _cache_state_arrays(
+        pending_caches: list[list[ContiguousKVCache | PoolBackedCache]],
+    ) -> list[mx.array]:
+        """Flatten pending decode cache state list into an array list.
+
+        Safe to hand to ``mx.async_eval``.
+        """
+        return [
+            s
+            for cache_list in pending_caches
+            for cache in cache_list
+            for s in cache.state
+        ]
 
     def _load_model(self):
         """Load model using mlx_lm."""
@@ -203,74 +278,16 @@ class MlxModelRunner:
         req_pool_idx: int,
     ) -> int:
         """Prefill a request.  Returns next_token_id."""
-        num_layers = self._num_layers
-        prefix_len = len(prefix_slot_ids)
-
-        if self.disable_radix_cache:
-            cache = self._acquire_cache()
-            input_ids = mx.array([new_token_ids], dtype=mx.int32)
-            model_output = self.model(input_ids, cache=cache)
-            logits = self._extract_logits(model_output)
-            next_token_mlx = mx.argmax(logits[:, -1, :], axis=-1)
-            self._eval_with_cache(next_token_mlx, cache)
-            next_token = int(next_token_mlx.item())
-
-            self._req_token_ids[req_id] = list(full_token_ids) + [next_token]
-            self._req_caches[req_id] = cache
-            self._req_pool_idx[req_id] = req_pool_idx
-            self._req_synced_offset[req_id] = 0
-            return next_token
-
-        assert self._kv_pool is not None
-
-        new_token_count = len(new_token_ids)
-
-        if prefix_len > 0:
-            slot_ids_mx = mx.array(prefix_slot_ids, dtype=mx.int32)
-            cache = [
-                PoolBackedCache(self._kv_pool, i, slot_ids_mx, prefix_len)
-                for i in range(num_layers)
-            ]
-        else:
-            cache = self._acquire_cache()
-
-        if new_token_count > 0:
-            extend_tokens = new_token_ids
-        else:
-            # Full cache hit — rerun last token to get next-token logits
-            extend_tokens = full_token_ids[-1:]
-            for c in cache:
-                c.offset = max(c.offset - 1, 0)
-
-        input_ids = mx.array([extend_tokens], dtype=mx.int32)
-        model_output = self.model(input_ids, cache=cache)
-        logits = self._extract_logits(model_output)
-
-        last_logits = logits[:, -1, :]
-        next_token_mlx = mx.argmax(last_logits, axis=-1)
-
-        # Convert PoolBackedCache → ContiguousKVCache for decode
-        if prefix_len > 0:
-            contiguous_cache = self._acquire_cache()
-            for layer_idx in range(num_layers):
-                pbc = cache[layer_idx]
-                contiguous_cache[layer_idx].update_and_fetch(
-                    pbc._full_keys, pbc._full_values
-                )
-            cache = contiguous_cache
-
-        self._eval_with_cache(next_token_mlx, cache)
-        next_token = int(next_token_mlx.item())
-
-        if new_slot_ids:
-            self._sync_new_kv_to_pool(cache, prefix_len, new_slot_ids)
-
-        self._req_token_ids[req_id] = list(full_token_ids) + [next_token]
-        self._req_caches[req_id] = cache
-        self._req_pool_idx[req_id] = req_pool_idx
-        self._req_synced_offset[req_id] = prefix_len + len(new_slot_ids)
-
-        return next_token
+        pending = self.prefill_start(
+            req_id=req_id,
+            new_token_ids=new_token_ids,
+            full_token_ids=full_token_ids,
+            prefix_slot_ids=prefix_slot_ids,
+            new_slot_ids=new_slot_ids,
+            req_pool_idx=req_pool_idx,
+        )
+        self._eval_with_cache(pending.lazy_token, pending.cache)
+        return self.prefill_finalize(pending)
 
     def extend(
         self,
@@ -279,32 +296,9 @@ class MlxModelRunner:
         new_slot_ids: list[int],
     ) -> int:
         """Continue prefill for a chunked request.  Returns next_token_id."""
-        assert req_id in self._req_caches, f"extend called for unknown request {req_id}"
-
-        cache = self._req_caches[req_id]
-
-        input_ids = mx.array([new_token_ids], dtype=mx.int32)
-        model_output = self.model(input_ids, cache=cache)
-        logits = self._extract_logits(model_output)
-
-        last_logits = logits[:, -1, :]
-        next_token_mlx = mx.argmax(last_logits, axis=-1)
-        self._eval_with_cache(next_token_mlx, cache)
-        next_token = int(next_token_mlx.item())
-
-        prev_tokens = self._req_token_ids[req_id]
-        if prev_tokens:
-            prev_tokens.pop()  # remove stale intermediate token
-        prev_tokens.extend(new_token_ids)
-        prev_tokens.append(next_token)
-
-        # Sync new chunk KV to pool immediately
-        if not self.disable_radix_cache and new_slot_ids:
-            synced = self._req_synced_offset[req_id]
-            self._sync_new_kv_to_pool(cache, synced, new_slot_ids)
-            self._req_synced_offset[req_id] = synced + len(new_slot_ids)
-
-        return next_token
+        pending = self.extend_start(req_id, new_token_ids, new_slot_ids)
+        self._eval_with_cache(pending.lazy_token, self._req_caches[req_id])
+        return self.extend_finalize(pending)
 
     def _sync_new_kv_to_pool(
         self,
@@ -318,6 +312,7 @@ class MlxModelRunner:
         num_layers = len(cache)
         end = cache_start + len(slot_ids)
         slot_ids_mx = mx.array(slot_ids, dtype=mx.int32)
+        # TODO: Standardize ContiguousKVCache size to avoid transpose
         # Transpose cache (1, n_kv_heads, S, head_dim) → pool (S, n_kv_heads, head_dim)
         k_all = mx.stack(
             [
@@ -370,11 +365,172 @@ class MlxModelRunner:
         req_ids: list[str],
     ) -> list[int]:
         """Decode one token per request."""
+        pending = self.decode_batch_start(req_ids)
+        # Evaluate lazy_tokens together with every affected cache buffer so
+        # the attention write-then-read ordering is materialised in one
+        # kernel submission.
+        cache_arrays = self._cache_state_arrays(pending.caches)
+        mx.eval(pending.lazy_tokens, *cache_arrays)
+        return self.decode_batch_finalize(pending)
+
+    def prefill_start(
+        self,
+        req_id: str,
+        new_token_ids: list[int],
+        full_token_ids: list[int],
+        prefix_slot_ids: list[int],
+        new_slot_ids: list[int],
+        req_pool_idx: int,
+    ) -> MlxPendingPrefill:
+        """Queue a prefill forward pass without evaluating.
+
+        Returns an :class:`MlxPendingPrefill` containing the lazy
+        next-token ``mx.array`` plus everything needed to commit the
+        request in :meth:`prefill_finalize`.  The caller drives the GPU
+        by handing ``lazy_token`` (and cache state) to ``mx.async_eval``.
+        """
+        num_layers = self._num_layers
+        prefix_len = len(prefix_slot_ids)
+
+        if self.disable_radix_cache:
+            cache = self._acquire_cache()
+            input_ids = mx.array([new_token_ids], dtype=mx.int32)
+            model_output = self.model(input_ids, cache=cache)
+            logits = self._extract_logits(model_output)
+            lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
+            return MlxPendingPrefill(
+                lazy_token=lazy_token,
+                cache=cache,
+                req_id=req_id,
+                full_token_ids=list(full_token_ids),
+                req_pool_idx=req_pool_idx,
+                synced_offset=0,
+            )
+
+        assert self._kv_pool is not None
+
+        new_token_count = len(new_token_ids)
+
+        if prefix_len > 0:
+            slot_ids_mx = mx.array(prefix_slot_ids, dtype=mx.int32)
+            cache = [
+                PoolBackedCache(self._kv_pool, i, slot_ids_mx, prefix_len)
+                for i in range(num_layers)
+            ]
+        else:
+            cache = self._acquire_cache()
+
+        if new_token_count > 0:
+            extend_tokens = new_token_ids
+        else:
+            # Full cache hit — rerun last token to get next-token logits
+            extend_tokens = full_token_ids[-1:]
+            for c in cache:
+                c.offset = max(c.offset - 1, 0)
+
+        input_ids = mx.array([extend_tokens], dtype=mx.int32)
+        model_output = self.model(input_ids, cache=cache)
+        logits = self._extract_logits(model_output)
+
+        last_logits = logits[:, -1, :]
+        lazy_token = mx.argmax(last_logits, axis=-1)
+
+        # Convert PoolBackedCache → ContiguousKVCache for decode.
+        # This appends a lazy slice-assign onto the forward graph; the
+        # arrays get materialised when the caller evaluates lazy_token.
+        if prefix_len > 0:
+            contiguous_cache = self._acquire_cache()
+            for layer_idx in range(num_layers):
+                pbc = cache[layer_idx]
+                contiguous_cache[layer_idx].update_and_fetch(
+                    pbc._full_keys, pbc._full_values
+                )
+            cache = contiguous_cache
+
+        if new_slot_ids:
+            self._sync_new_kv_to_pool(cache, prefix_len, new_slot_ids)
+
+        return MlxPendingPrefill(
+            lazy_token=lazy_token,
+            cache=cache,
+            req_id=req_id,
+            full_token_ids=list(full_token_ids),
+            req_pool_idx=req_pool_idx,
+            synced_offset=prefix_len + len(new_slot_ids),
+        )
+
+    def prefill_finalize(self, pending: MlxPendingPrefill) -> int:
+        """Materialise a pending prefill and commit per-request state.
+
+        Must be called *after* ``pending.lazy_token`` has been handed to
+        ``mx.async_eval`` / ``mx.eval``.  ``.item()`` here is blocking on
+        that specific lazy scalar.
+        """
+        next_token = int(pending.lazy_token.item())
+        self._req_token_ids[pending.req_id] = list(pending.full_token_ids) + [
+            next_token
+        ]
+        self._req_caches[pending.req_id] = pending.cache
+        self._req_pool_idx[pending.req_id] = pending.req_pool_idx
+        self._req_synced_offset[pending.req_id] = pending.synced_offset
+        return next_token
+
+    def extend_start(
+        self,
+        req_id: str,
+        new_token_ids: list[int],
+        new_slot_ids: list[int],
+    ) -> MlxPendingExtend:
+        """Queue chunked-prefill continuation without evaluating."""
+        assert (
+            req_id in self._req_caches
+        ), f"extend_start called for unknown request {req_id}"
+
+        cache = self._req_caches[req_id]
+
+        input_ids = mx.array([new_token_ids], dtype=mx.int32)
+        model_output = self.model(input_ids, cache=cache)
+        logits = self._extract_logits(model_output)
+        lazy_token = mx.argmax(logits[:, -1, :], axis=-1)
+
+        if not self.disable_radix_cache and new_slot_ids:
+            synced = self._req_synced_offset[req_id]
+            self._sync_new_kv_to_pool(cache, synced, new_slot_ids)
+            new_synced_offset = synced + len(new_slot_ids)
+        else:
+            new_synced_offset = self._req_synced_offset.get(req_id, 0)
+
+        return MlxPendingExtend(
+            lazy_token=lazy_token,
+            req_id=req_id,
+            new_token_ids=list(new_token_ids),
+            new_synced_offset=new_synced_offset,
+        )
+
+    def extend_finalize(self, pending: MlxPendingExtend) -> int:
+        """Materialise a pending extend and commit per-request state."""
+        next_token = int(pending.lazy_token.item())
+
+        prev_tokens = self._req_token_ids[pending.req_id]
+        if prev_tokens:
+            prev_tokens.pop()  # remove stale intermediate token
+        prev_tokens.extend(pending.new_token_ids)
+        prev_tokens.append(next_token)
+
+        self._req_synced_offset[pending.req_id] = pending.new_synced_offset
+        return next_token
+
+    def decode_batch_start(self, req_ids: list[str]) -> MlxPendingDecode:
+        """Queue a decode forward pass without evaluating.
+
+        The caller is responsible for calling ``mx.async_eval`` on the
+        returned ``lazy_tokens`` (and optionally per-cache state arrays)
+        to kick off GPU work before :meth:`decode_batch_finalize`.
+        """
         batch_size = len(req_ids)
         num_layers = self._num_layers
 
         caches = [self._req_caches[rid] for rid in req_ids]
-        seq_lens = [caches[i][0].offset for i in range(batch_size)]
 
         if batch_size == 1:
             cache = caches[0]
@@ -382,41 +538,140 @@ class MlxModelRunner:
             input_ids = mx.array([[last_token]], dtype=mx.int32)
             model_output = self.model(input_ids, cache=cache)
             logits = self._extract_logits(model_output)
-            next_tokens_mlx = mx.argmax(logits[:, -1, :], axis=-1)
-            self._eval_with_cache(next_tokens_mlx, cache)
-        else:
-            layer_caches = [
-                [caches[i][layer_idx] for i in range(batch_size)]
-                for layer_idx in range(num_layers)
-            ]
-            ctx = BatchedDecodeContext(
-                batch_size=batch_size,
-                seq_lens=seq_lens,
-                layer_caches=layer_caches,
+            lazy_tokens = mx.argmax(logits[:, -1, :], axis=-1)
+            return MlxPendingDecode(
+                lazy_tokens=lazy_tokens,
+                req_ids=list(req_ids),
+                caches=caches,
             )
-            set_context(ctx)
-            try:
-                max_offset = max(seq_lens)
-                shim_cache = [OffsetCache(offset=max_offset) for _ in range(num_layers)]
-                last_tokens = [self._req_token_ids[rid][-1] for rid in req_ids]
-                batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
-                model_output = self.model(batched_input, cache=shim_cache)
-                logits = self._extract_logits(model_output)
-                next_tokens_mlx = mx.argmax(logits[:, -1, :], axis=-1)
 
-                eval_targets = [next_tokens_mlx]
-                for c_list in caches:
-                    for c in c_list:
-                        eval_targets.append(c.keys)
-                        eval_targets.append(c.values)
-                mx.eval(*eval_targets)
-            finally:
-                clear_context()
+        seq_lens = [caches[i][0].offset for i in range(batch_size)]
+        layer_caches = [
+            [caches[i][layer_idx] for i in range(batch_size)]
+            for layer_idx in range(num_layers)
+        ]
+        ctx = BatchedDecodeContext(
+            batch_size=batch_size,
+            seq_lens=seq_lens,
+            layer_caches=layer_caches,
+        )
+        set_context(ctx)
+        try:
+            max_offset = max(seq_lens)
+            shim_cache = [OffsetCache(offset=max_offset) for _ in range(num_layers)]
+            last_tokens = [self._req_token_ids[rid][-1] for rid in req_ids]
+            batched_input = mx.array(last_tokens, dtype=mx.int32)[:, None]
+            model_output = self.model(batched_input, cache=shim_cache)
+            logits = self._extract_logits(model_output)
+            lazy_tokens = mx.argmax(logits[:, -1, :], axis=-1)
+        finally:
+            clear_context()
 
-        next_tokens = next_tokens_mlx.tolist()
+        return MlxPendingDecode(
+            lazy_tokens=lazy_tokens,
+            req_ids=list(req_ids),
+            caches=caches,
+        )
 
-        for i, rid in enumerate(req_ids):
+    def decode_batch_start_chained(
+        self,
+        prev: MlxPendingDecode,
+    ) -> MlxPendingDecode:
+        """Build the next decode step on top of a still-lazy previous decode.
+
+        Feeds ``prev.lazy_tokens`` (an unevaluated ``mx.array`` of shape
+        ``(B,)``) as the next step's input ids, reusing
+        ``prev.caches`` in-place so that the per-layer ``ContiguousKVCache``
+        writes from step N and step N+1 land in the same buffers.  MLX
+        tracks the full dependency graph, so once ``mx.async_eval`` is
+        called the GPU executes N+1 immediately after N with no gap.
+
+        Caller contract:
+
+        * ``prev`` MUST refer to the same set of requests (same order) as
+          the batch the caller intends to run next.  Composition changes
+          (finished reqs, new prefills) must break the chain instead.
+        * After calling this, finalise ``prev`` BEFORE finalising the
+          returned pending: state bookkeeping for step N has to happen
+          before step N+1's bookkeeping.
+        """
+        batch_size = len(prev.req_ids)
+        num_layers = self._num_layers
+        caches = prev.caches
+
+        # TODO (changminbark): Need to fix ContiguousKVCache.write_token
+        # to accommodate dynamic growing like ContiguousKVCache.update_and_fetch.
+
+        # After prev's graph ran, each ContiguousKVCache.offset was
+        # bumped by one per layer — attention wrapper's `write_token`
+        # mutates the Python offset synchronously at graph-build time.
+        # So layer-0 offsets reflect the position the NEW token will
+        # be written at in step N+1 (and equivalently the RoPE offset).
+        seq_lens = [caches[i][0].offset for i in range(batch_size)]
+
+        if batch_size == 1:
+            cache = caches[0]
+            batched_input = prev.lazy_tokens[:, None]
+            model_output = self.model(batched_input, cache=cache)
+            logits = self._extract_logits(model_output)
+            lazy_tokens = mx.argmax(logits[:, -1, :], axis=-1)
+            return MlxPendingDecode(
+                lazy_tokens=lazy_tokens,
+                req_ids=prev.req_ids,
+                caches=caches,
+            )
+
+        layer_caches = [
+            [caches[i][layer_idx] for i in range(batch_size)]
+            for layer_idx in range(num_layers)
+        ]
+        ctx = BatchedDecodeContext(
+            batch_size=batch_size,
+            seq_lens=seq_lens,
+            layer_caches=layer_caches,
+        )
+        set_context(ctx)
+        try:
+            max_offset = max(seq_lens)
+            shim_cache = [OffsetCache(offset=max_offset) for _ in range(num_layers)]
+            batched_input = prev.lazy_tokens[:, None]
+            model_output = self.model(batched_input, cache=shim_cache)
+            logits = self._extract_logits(model_output)
+            lazy_tokens = mx.argmax(logits[:, -1, :], axis=-1)
+        finally:
+            clear_context()
+
+        return MlxPendingDecode(
+            lazy_tokens=lazy_tokens,
+            req_ids=prev.req_ids,
+            caches=caches,
+        )
+
+    def decode_batch_finalize(
+        self,
+        pending: MlxPendingDecode,
+    ) -> list[int]:
+        """Materialise a pending decode and update per-request token lists.
+
+        ``pending.lazy_tokens.tolist()`` implicitly blocks until that
+        specific lazy array (and its graph ancestors, including the
+        per-request cache writes for this step) is evaluated.  The
+        caller should have previously handed this pending's lazy_tokens
+        to ``mx.async_eval`` (or to a subsequent chained step that will
+        be async_eval'd).
+        """
+        raw = pending.lazy_tokens.tolist()
+        if not isinstance(raw, list):
+            raw = [raw]
+        next_tokens = [int(t) for t in raw]
+
+        for i, rid in enumerate(pending.req_ids):
             self._req_token_ids[rid].append(next_tokens[i])
+
+        self._decode_step_ct += 1
+        # TODO (changminbark): allow for flag configuration for clearing mx cache
+        if self._decode_step_ct % 256 == 0:
+            mx.clear_cache()
 
         return next_tokens
 

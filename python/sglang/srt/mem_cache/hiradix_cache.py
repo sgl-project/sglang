@@ -846,7 +846,7 @@ class HiRadixCache(RadixCache):
             return
 
         for child in node.children.values():
-            if child.evicted:
+            if child.backuped:
                 if node in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(node)
                 return
