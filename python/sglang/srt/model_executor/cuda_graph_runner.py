@@ -155,12 +155,12 @@ class DecodeInputBuffers(ForwardInputBuffers):
     seq_lens: torch.Tensor
     seq_lens_cpu: torch.Tensor
     out_cache_loc: torch.Tensor
+    out_cache_loc_swa: Optional[torch.Tensor]
     positions: torch.Tensor
     mrope_positions: torch.Tensor
     num_token_non_padded: torch.Tensor
     custom_mask: torch.Tensor
     next_token_logits_buffer: torch.Tensor
-    out_cache_loc_swa: Optional[torch.Tensor]
     mamba_track_indices: Optional[torch.Tensor]
     mamba_track_mask: Optional[torch.Tensor]
     global_num_tokens_gpu: torch.Tensor
