@@ -1,6 +1,5 @@
 import unittest
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.kits.kl_divergence_kit import KLDivergenceMixin
@@ -93,16 +92,6 @@ class TestQwen3NextMTPV2(GSM8KMixin, KLDivergenceMixin, DefaultServerBase):
         "--mamba-track-interval",
         "128",
     ]
-
-    @classmethod
-    def setUpClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(True)
-        super().setUpClass()
-
-    @classmethod
-    def tearDownClass(cls):
-        envs.SGLANG_ENABLE_SPEC_V2.set(False)
-        super().tearDownClass()
 
 
 if __name__ == "__main__":
