@@ -473,14 +473,11 @@ class MQALayer(nn.Module):
         if envs.SGLANG_DSV4_MODE.get() not in ("2604", "2601"):
             raise NotImplementedError
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            assert self.compress_ratio in {0, 4, 128}
-            if self.compress_ratio:
-                original_seq_len = rope_scaling["original_max_position_embeddings"]
-            else:
-                original_seq_len = 0
-        else:
+        assert self.compress_ratio in {0, 4, 128}
+        if self.compress_ratio:
             original_seq_len = rope_scaling["original_max_position_embeddings"]
+        else:
+            original_seq_len = 0
 
         freqs_cis = precompute_freqs_cis(
             dim=self.qk_rope_head_dim,
@@ -1076,8 +1073,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         input_ids_global: torch.Tensor,
     ) -> torch.Tensor:
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            assert deepseek_v4_moe_code_path_checker.observed == 0
+        assert deepseek_v4_moe_code_path_checker.observed == 0
 
         residual = hidden_states
         hidden_states, post, comb = self.hc_pre(
@@ -1146,9 +1142,8 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            assert deepseek_v4_moe_code_path_checker.observed == 1
-            deepseek_v4_moe_code_path_checker.observed = 0
+        assert deepseek_v4_moe_code_path_checker.observed == 1
+        deepseek_v4_moe_code_path_checker.observed = 0
 
         return hidden_states
 
@@ -1382,8 +1377,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         ):
             disable_reason = "2604 routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            disable_reason = "2604B checkpoint requires different clamping for shared and routed experts"
+        disable_reason = "2604B checkpoint requires different clamping for shared and routed experts"
 
         if disable_reason is not None:
             get_global_server_args().disable_shared_experts_fusion = True
@@ -1539,10 +1533,6 @@ class DeepseekV4ForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
         assert envs.SGLANG_DSV4_MODE.get() in ["2601", "2604"]
-        if envs.SGLANG_DSV4_MODE.get() == "2604":
-            assert envs.SGLANG_DSV4_2604_SUBMODE.get() in ["2604A", "2604B"]
-        else:
-            assert envs.SGLANG_DSV4_2604_SUBMODE.get() == ""
 
         if MOE_BIT_WISE_EQUAL_MODE:
             assert (

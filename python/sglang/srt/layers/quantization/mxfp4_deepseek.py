@@ -137,12 +137,9 @@ class DeepSeekMxfp4MoEMethod:
         self.moe_runner_config = moe_runner_config
 
         swiglu_limit = moe_runner_config.swiglu_limit
-        is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
-        assert is_2604b == (swiglu_limit is not None), (
-            f"swiglu_limit must be non-None iff submode=2604B "
-            f"(got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, "
-            f"swiglu_limit={swiglu_limit!r})"
-        )
+        assert (
+            swiglu_limit is not None
+        ), f"swiglu_limit must be non-None for 2604B (got {swiglu_limit!r})"
         self._gemm1_clamp_limit_tensor = (
             torch.full(
                 (layer.num_local_experts,),
@@ -415,9 +412,7 @@ class DeepSeekMxfp4MoEMethod:
                 num_tokens, out_hidden_size, dtype=torch.bfloat16, device=x_quant.device
             )
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" and (
-            self._gemm1_clamp_limit_tensor is not None
-        ):
+        if self._gemm1_clamp_limit_tensor is not None:
             deepseek_v4_moe_code_path_checker.observed += 1
 
         output = trtllm_fp4_block_scale_routed_moe(

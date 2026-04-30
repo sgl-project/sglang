@@ -545,36 +545,33 @@ def _fused_moe_kernel_sequence(
             # Two paths gated by SGLANG_OPT_SWIGLU_CLAMP_FUSION:
             #   fusion=True: clamp fused into act_and_mul_triton or silu_and_mul_clamp
             #   fusion=False: explicit clamp_ on intermediate_cache1 (path checker)
-            is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
-            assert is_2604b == (swiglu_limit is not None), (
-                f"swiglu_limit must be non-None iff submode=2604B "
-                f"(got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, swiglu_limit={swiglu_limit!r})"
-            )
+            assert (
+                swiglu_limit is not None
+            ), f"swiglu_limit must be non-None for 2604B (got {swiglu_limit!r})"
 
             swiglu_limit_for_triton: Optional[float] = None
             swiglu_limit_for_silu_and_mul_clamp: Optional[float] = None
-            if is_2604b:
-                assert swiglu_limit == 10
-                assert intermediate_cache1.shape == (total_tokens, N)
-                assert (
-                    _is_cuda or _is_hip
-                ), "DSV4 2604 submode 2604B only supports CUDA/HIP downstream"
+            assert swiglu_limit == 10
+            assert intermediate_cache1.shape == (total_tokens, N)
+            assert (
+                _is_cuda or _is_hip
+            ), "DSV4 2604 submode 2604B only supports CUDA/HIP downstream"
 
-                if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
-                    if filter_expert:
-                        swiglu_limit_for_triton = swiglu_limit
-                    else:
-                        assert (
-                            _is_cuda
-                        ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
-                        swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
+            if envs.SGLANG_OPT_SWIGLU_CLAMP_FUSION.get():
+                if filter_expert:
+                    swiglu_limit_for_triton = swiglu_limit
                 else:
-                    half = N // 2
-                    intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
-                    intermediate_cache1[:, half:].clamp_(
-                        min=-swiglu_limit, max=swiglu_limit
-                    )
-                    deepseek_v4_moe_code_path_checker.observed += 1
+                    assert (
+                        _is_cuda
+                    ), "fused silu_and_mul_clamp kernel is CUDA-only; HIP must disable SWIGLU_CLAMP_FUSION"
+                    swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
+            else:
+                half = N // 2
+                intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
+                intermediate_cache1[:, half:].clamp_(
+                    min=-swiglu_limit, max=swiglu_limit
+                )
+                deepseek_v4_moe_code_path_checker.observed += 1
 
             if _is_cuda or _is_hip or _is_xpu:
                 if not filter_expert:

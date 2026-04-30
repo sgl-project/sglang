@@ -656,8 +656,7 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-            assert hasattr(self, "shared_experts")
+        assert hasattr(self, "shared_experts")
 
     def get_moe_weights(self):
         return [
