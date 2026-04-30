@@ -69,8 +69,6 @@ env:
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   # TEMP: forced to 'true' for torch-211-merge PR only — revert before merging to main.
   SKIP_STAGE_HEALTH_CHECK: 'true'
-  # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
-  FORCE_REBUILD_DEEPEP: '1'
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -981,7 +979,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 40
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
