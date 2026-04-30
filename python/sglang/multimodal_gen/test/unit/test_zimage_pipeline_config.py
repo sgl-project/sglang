@@ -5,9 +5,6 @@ from unittest.mock import patch
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
-from sglang.test.ci.ci_register import register_cpu_ci
-
-register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
 
 
 class TestZImagePipelineConfig(unittest.TestCase):
