@@ -159,13 +159,13 @@ class SchedulerMetricsMixin:
                 self._mfu_log_write_bytes = 0.0
 
         if ENABLE_METRICS_DEVICE_TIMER:
-            self._device_timer_window_execution_s = 0.0
-            self._device_timer_window_start = time.perf_counter()
             self._device_timer_window_batch_count = 0
+            self._device_timer_window_gpu_time = 0
+            self._device_timer_window_start = None
             self._device_timer_gpu_busy_pct = 0.0
 
             def _wrap_execution_reporter(**kwargs):
-                self._device_timer_window_execution_s += kwargs["t"]
+                self._device_timer_window_gpu_time += kwargs["t"]
                 if self.enable_metrics:
                     self.metrics_collector.increment_gpu_execution_seconds(**kwargs)
 
@@ -392,7 +392,7 @@ class SchedulerMetricsMixin:
             msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
         if ENABLE_METRICS_DEVICE_TIMER:
-            msg += f", GPU busy: {self._device_timer_gpu_busy_pct:.1f}%"
+            msg += f", GPU busy: {self._device_timer_gpu_busy_pct:.2f}%"
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -583,7 +583,7 @@ class SchedulerMetricsMixin:
             self._mfu_log_write_bytes = 0.0
 
         if ENABLE_METRICS_DEVICE_TIMER:
-            msg += f", GPU busy: {self._device_timer_gpu_busy_pct:.1f}%"
+            msg += f", GPU busy: {self._device_timer_gpu_busy_pct:.2f}%"
 
         if self.is_stats_logging_rank:
             logger.info(msg)
@@ -934,14 +934,30 @@ class SchedulerMetricsMixin:
         ):
             yield
 
-        self._device_timer_window_batch_count += 1
         now = time.perf_counter()
-        elapsed = now - self._device_timer_window_start
-        if elapsed > 0:
-            self._device_timer_gpu_busy_pct = min(
-                self._device_timer_window_execution_s / elapsed * 100, 100.0
-            )
-        if self._device_timer_window_batch_count >= 10:
-            self._device_timer_window_execution_s = 0.0
+
+        if self._device_timer_window_batch_count == 0:
+            # Reset the window
             self._device_timer_window_start = now
+            self._device_timer_gpu_busy_pct = float("nan")
+            self._device_timer_window_gpu_time = 0.0
+        elif self._device_timer_window_batch_count <= 3:
+            # The window is too small, do not report
+            self._device_timer_gpu_busy_pct = float("nan")
+        else:
+            # The window is large enough, let us report
+            elapsed = now - self._device_timer_window_start
+            self._device_timer_gpu_busy_pct = (
+                self._device_timer_window_gpu_time / elapsed * 100
+            )
+
+        self._device_timer_window_batch_count += 1
+        if (
+            self._device_timer_window_batch_count
+            >= self.server_args.decode_log_interval // 2 + 1
+        ):
+            self._device_timer_window_batch_count = 0
+
+    def reset_device_timer_window(self: Scheduler):
+        if ENABLE_METRICS_DEVICE_TIMER:
             self._device_timer_window_batch_count = 0
