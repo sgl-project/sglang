@@ -10,7 +10,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
-from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
@@ -564,7 +563,7 @@ def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
 ) -> WatchdogRaw:
     def dump_info() -> str:
-        if scheduler.is_initializing or disable_request_logging():
+        if scheduler.is_initializing:
             return ""
         _, messages = scheduler._check_all_pools(scheduler.get_pool_stats())
         return (

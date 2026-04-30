@@ -153,11 +153,22 @@ class SchedulerMetricsMixin:
                 self._mfu_log_write_bytes = 0.0
 
             if ENABLE_METRICS_DEVICE_TIMER:
+                self._device_timer_log_execution_s = 0.0
+                self._device_timer_log_bubble_s = 0.0
+
+                def _wrap_execution_reporter(**kwargs):
+                    self._device_timer_log_execution_s += kwargs["t"]
+                    self.metrics_collector.increment_gpu_execution_seconds(**kwargs)
+
+                def _wrap_bubble_reporter(**kwargs):
+                    self._device_timer_log_bubble_s += kwargs["t"]
+                    self.metrics_collector.increment_gpu_overlap_wait_seconds(**kwargs)
+
                 self.forward_pass_device_timer = DeviceTimer(
-                    reporter=self.metrics_collector.increment_gpu_execution_seconds,
+                    reporter=_wrap_execution_reporter,
                 )
                 self.bubble_timer = GapTimer(
-                    reporter=self.metrics_collector.increment_gpu_overlap_wait_seconds,
+                    reporter=_wrap_bubble_reporter,
                 )
 
         self.init_kv_events(self.server_args.kv_events_config)
@@ -582,6 +593,12 @@ class SchedulerMetricsMixin:
             self._mfu_log_flops = 0.0
             self._mfu_log_read_bytes = 0.0
             self._mfu_log_write_bytes = 0.0
+
+        if ENABLE_METRICS_DEVICE_TIMER and gap_latency > 0:
+            gpu_util_pct = self._device_timer_log_execution_s / gap_latency * 100
+            msg += f", GPU util: {gpu_util_pct:.1f}%"
+            self._device_timer_log_execution_s = 0.0
+            self._device_timer_log_bubble_s = 0.0
 
         if self.is_stats_logging_rank:
             logger.info(msg)
