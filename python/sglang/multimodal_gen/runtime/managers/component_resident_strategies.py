@@ -27,9 +27,7 @@ def _module_to_local_device(
     module: nn.Module, *, dtype: torch.dtype | None = None
 ) -> None:
     device = get_local_torch_device()
-    tensor = next(module.parameters(), None)
-    if tensor is None:
-        tensor = next(module.buffers(), None)
+    tensor = _module_reference_tensor(module)
     if tensor is not None and tensor.device == device:
         if dtype is None or tensor.dtype == dtype:
             return
@@ -37,6 +35,24 @@ def _module_to_local_device(
         module.to(device, non_blocking=True)
     else:
         module.to(device, dtype=dtype, non_blocking=True)
+
+
+def _module_reference_tensor(module: nn.Module) -> torch.Tensor | None:
+    tensor = next(module.parameters(), None)
+    if tensor is None:
+        tensor = next(module.buffers(), None)
+    return tensor
+
+
+def _module_ready_on_local_device(
+    module: nn.Module, *, dtype: torch.dtype | None = None
+) -> bool:
+    tensor = _module_reference_tensor(module)
+    if tensor is None:
+        return True
+    if tensor.device != get_local_torch_device():
+        return False
+    return dtype is None or tensor.dtype == dtype
 
 
 class ComponentResidencyStrategy:
@@ -373,6 +389,10 @@ class VanillaD2HStrategy(ComponentResidencyStrategy):
 
     name = "vanilla"
 
+    def __init__(self) -> None:
+        self._prefetch_stream: object | None = None
+        self._ready_events: dict[str, object] = {}
+
     def prepare_for_use(
         self,
         module: nn.Module,
@@ -380,6 +400,39 @@ class VanillaD2HStrategy(ComponentResidencyStrategy):
         state: ResidencyState,
     ) -> None:
         _module_to_local_device(module, dtype=use.target_dtype)
+
+    def wait_for_use(
+        self,
+        module: nn.Module,
+        use: ComponentUse,
+        state: ResidencyState,
+    ) -> None:
+        ready_event = self._ready_events.get(use.component_name)
+        if ready_event is None or not current_platform.is_cuda():
+            return
+        torch.get_device_module().current_stream().wait_event(ready_event)
+
+    def prefetch_for_use(
+        self,
+        module: nn.Module,
+        use: ComponentUse,
+        state: ResidencyState,
+    ) -> bool:
+        if not current_platform.is_cuda():
+            self.prepare_for_use(module, use, state)
+            return True
+        if _module_ready_on_local_device(module, dtype=use.target_dtype):
+            return True
+        if self._prefetch_stream is None:
+            self._prefetch_stream = torch.get_device_module().Stream(
+                device=get_local_torch_device()
+            )
+        with torch.get_device_module().stream(self._prefetch_stream):
+            _module_to_local_device(module, dtype=use.target_dtype)
+            event = torch.get_device_module().Event()
+            event.record(self._prefetch_stream)
+        self._ready_events[use.component_name] = event
+        return True
 
     def enter(self, module: nn.Module) -> None:
         param = next(module.parameters(), None)
@@ -390,6 +443,24 @@ class VanillaD2HStrategy(ComponentResidencyStrategy):
         param = next(module.parameters(), None)
         if param is not None and param.device.type == "cuda":
             module.to("cpu", non_blocking=True)
+
+    def finish_use(
+        self,
+        module: nn.Module,
+        use: ComponentUse,
+        state: ResidencyState,
+    ) -> None:
+        self.wait_for_use(module, use, state)
+        self.exit(module)
+        self._ready_events.pop(use.component_name, None)
+
+    def prepare_after_request(
+        self,
+        module: nn.Module,
+        use: ComponentUse,
+        state: ResidencyState,
+    ) -> None:
+        self.prefetch_for_use(module, use, state)
 
     def finish_request(
         self,

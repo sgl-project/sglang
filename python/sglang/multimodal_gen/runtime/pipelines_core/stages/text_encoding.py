@@ -369,11 +369,12 @@ class TextEncodingStage(PipelineStage):
                 pooled_embeds_list.append(pooled_output.to(device=target_device))
 
             if return_attention_mask:
-                if has_postprocessed_attention_mask:
-                    mask_to_store = (
-                        postprocessed_attention_mask.to(device=target_device)
-                        if postprocessed_attention_mask is not None
-                        else None
+                if (
+                    has_postprocessed_attention_mask
+                    and postprocessed_attention_mask is not None
+                ):
+                    mask_to_store = postprocessed_attention_mask.to(
+                        device=target_device
                     )
                 elif attention_mask is not None:
                     mask_to_store = attention_mask.to(device=target_device)

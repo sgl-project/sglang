@@ -418,8 +418,10 @@ class ComponentResidencyManager:
             self._trace("skip_missing", use)
             return
         strategy = self.strategy_for(use.component_name, module)
-        if isinstance(strategy, VanillaD2HStrategy):
-            self._trace("prefetch_skip", use, strategy, module)
+        if isinstance(strategy, VanillaD2HStrategy) and self._active_use is not None:
+            # Avoid making two vanilla-offloaded heavy components resident before
+            # a budget-aware planner can prove the overlap is safe.
+            self._trace("prefetch_skip_active_vanilla", use, strategy, module)
             return
 
         self._uses_seen[use.component_name] = use
