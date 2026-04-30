@@ -171,10 +171,7 @@ class ComponentResidencyManager:
     ) -> None:
         self.pipeline = pipeline
         self.server_args = server_args
-        self.state = ResidencyState(
-            manager_mode=server_args.component_residency_manager,
-            trace_enabled=server_args.component_residency_trace,
-        )
+        self.state = ResidencyState(trace_enabled=False)
         self._stage_names_by_id: dict[int, str] = {}
         self._stage_uses_by_index: list[tuple[ComponentUse, ...]] = []
         self._ordered_uses: tuple[ComponentUse, ...] = ()
@@ -189,7 +186,7 @@ class ComponentResidencyManager:
 
     @property
     def enabled(self) -> bool:
-        return self.server_args.component_residency_manager != "disabled"
+        return True
 
     def refresh_pipeline(self, pipeline: ComponentResidencyPipeline) -> None:
         custom_strategies = dict(pipeline.component_residency_strategies)
@@ -229,10 +226,7 @@ class ComponentResidencyManager:
         """A hook called before processing an actual request"""
         self.refresh_server_args(server_args)
         self.state = ResidencyState(
-            stages=stages,
-            batch_is_warmup=batch.is_warmup,
-            manager_mode=server_args.component_residency_manager,
-            trace_enabled=server_args.component_residency_trace,
+            stages=stages, batch_is_warmup=batch.is_warmup, trace_enabled=False
         )
         self._active_use = None
         self._active_use_module = None
