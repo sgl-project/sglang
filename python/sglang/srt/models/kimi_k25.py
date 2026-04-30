@@ -743,42 +743,45 @@ class KimiK25ForConditionalGeneration(nn.Module):
         return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
-        """Load weights for the model, separating vision and language weights"""
+        """Load weights for the model, separating vision and language weights.
+
+        Language weights are streamed directly to avoid accumulating stale
+        tensor views when the RunAI distributed streamer reuses GPU buffers.
+        Vision weights are small (<1 GB) so they are cloned when batched.
+        """
         mapper = getattr(self, "hf_to_sglang_mapper", None)
         if mapper is not None:
             weights = mapper.apply(weights)
 
-        # Separate vision tower weights and language model weights
         vision_weights = []
-        language_weights = []
 
-        for name, loaded_weight in weights:
-            if "vision_tower" in name or "mm_projector" in name:
-                name = name.replace(r"wqkv.", r"attn.qkv_proj.")
-                name = name.replace(r"wo.", r"attn.proj.")
-                name = name.replace("mm_projector.proj.0", "mm_projector.linear_1")
-                name = name.replace("mm_projector.proj.2", "mm_projector.linear_2")
-                vision_weights.append((name, loaded_weight))
-            else:
-                name = name.replace("language_model.", "")
-                # All other weights go to language model
-                language_weights.append((name, loaded_weight))
+        def _stream_language_weights():
+            for name, loaded_weight in weights:
+                if "vision_tower" in name or "mm_projector" in name:
+                    name = name.replace(r"wqkv.", r"attn.qkv_proj.")
+                    name = name.replace(r"wo.", r"attn.proj.")
+                    name = name.replace("mm_projector.proj.0", "mm_projector.linear_1")
+                    name = name.replace("mm_projector.proj.2", "mm_projector.linear_2")
+                    if not self.config.language_only:
+                        vision_weights.append((name, loaded_weight.clone()))
+                else:
+                    name = name.replace("language_model.", "")
+                    yield (name, loaded_weight)
+
+        if not self.config.encoder_only:
+            self.language_model.load_weights(_stream_language_weights())
+        else:
+            for _ in _stream_language_weights():
+                pass
 
         if not self.config.language_only:
-            # Load vision tower weights
-            vision_state_dict = dict(vision_weights)
             params_dict = dict(self.named_parameters(remove_duplicate=False))
-            for name, loaded_weight in vision_state_dict.items():
+            for name, loaded_weight in vision_weights:
                 if name not in params_dict:
                     raise ValueError(f"Weight {name} not found in params_dict")
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                # loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
                 weight_loader(param, loaded_weight)
-
-        # Load language model weights
-        if not self.config.encoder_only and language_weights:
-            self.language_model.load_weights(language_weights)
 
     @classmethod
     def get_model_config_for_expert_location(cls, config: KimiK25Config):
