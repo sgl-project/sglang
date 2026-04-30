@@ -1625,23 +1625,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             envs.SGLANG_DSV4_MODE.get() == "2604"
             and not envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
         ):
-            if envs.SGLANG_FIX_DSV4_BASE_MODEL_LOAD.get():
-                weights = list(weights)
-                exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
-                if exists_wo_a_scale:
-                    logger.info("Execute dequant fp8 wo_a")
-                    weights = _dequant_fp8_wo_a(weights)
-                else:
-                    logger.info("Skip dequant fp8 wo_a")
+            weights = list(weights)
+            exists_wo_a_scale = any(n.endswith(".wo_a.scale") for n, t in weights)
+            if exists_wo_a_scale:
+                logger.info("Execute dequant fp8 wo_a")
+                weights = _dequant_fp8_wo_a(weights)
             else:
-                # ----------------------------- legacy code ------------------------------
-                if envs.SGLANG_DSV4_FP4_EXPERTS.get():
-                    weights = _dequant_fp8_wo_a(weights)
-                else:
-                    weights = (
-                        (n, t) for n, t in weights if not n.endswith(".wo_a.scale")
-                    )
-                # ------------------------------------------------------------------------
+                logger.info("Skip dequant fp8 wo_a")
 
         stacked_params_mapping = [
             ("gate_up_proj", "gate_proj", 0),
