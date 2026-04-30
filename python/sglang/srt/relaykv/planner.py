@@ -18,7 +18,9 @@ class RelayKVPlan:
     planned_cold_tokens: int
     available_kv_budget_mib: float
     kv_working_budget_tokens: int
+    kv_working_budget_source: str
     recent_window_tokens: int
+    anchor_blocks: int
     anchor_budget_tokens: int
     retrieval_budget_tokens: int
     retrieval_top_k_requested: int
@@ -133,7 +135,9 @@ def _budget_metadata(
     return {
         "available_kv_budget_mib": config.available_kv_budget_mib,
         "kv_working_budget_tokens": working_budget,
+        "kv_working_budget_source": reason,
         "recent_window_tokens": recent_window_tokens,
+        "anchor_blocks": anchor_block_count,
         "anchor_budget_tokens": anchor_budget_tokens,
         "retrieval_budget_tokens": retrieval_budget_tokens,
         "retrieval_top_k_requested": retrieval_top_k_requested,
@@ -177,7 +181,9 @@ def build_shadow_plan(
             planned_cold_tokens=0,
             available_kv_budget_mib=config.available_kv_budget_mib,
             kv_working_budget_tokens=0,
+            kv_working_budget_source="relaykv_disabled",
             recent_window_tokens=0,
+            anchor_blocks=config.anchor_blocks,
             anchor_budget_tokens=0,
             retrieval_budget_tokens=0,
             retrieval_top_k_requested=config.retrieval_top_k,
@@ -210,14 +216,15 @@ def build_shadow_plan(
     )
     anchor_page_count = min(anchor_block_count, total_pages)
     anchors = list(range(anchor_page_count))
-    anchor_ranges = _make_range(0, anchor_page_count)
+    anchor_token_end = min(anchor_page_count * page_size, seq_len)
+    anchor_ranges = _make_range(0, anchor_token_end)
 
     recent_tokens = min(config.recent_window, planned_resident, seq_len)
     recent_start = max(seq_len - recent_tokens, 0)
     recent_end = seq_len
     recent_ranges = _make_range(recent_start, recent_end)
 
-    cold_start = anchor_page_count
+    cold_start = anchor_token_end
     cold_end = recent_start
     if cold_end < cold_start:
         cold_end = cold_start
@@ -236,7 +243,9 @@ def build_shadow_plan(
         planned_cold_tokens=planned_cold,
         available_kv_budget_mib=budget_metadata["available_kv_budget_mib"],
         kv_working_budget_tokens=budget_metadata["kv_working_budget_tokens"],
+        kv_working_budget_source=budget_metadata["kv_working_budget_source"],
         recent_window_tokens=budget_metadata["recent_window_tokens"],
+        anchor_blocks=budget_metadata["anchor_blocks"],
         anchor_budget_tokens=budget_metadata["anchor_budget_tokens"],
         retrieval_budget_tokens=budget_metadata["retrieval_budget_tokens"],
         retrieval_top_k_requested=budget_metadata["retrieval_top_k_requested"],

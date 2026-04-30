@@ -70,7 +70,11 @@ def _assert_budget_plan(
     )
     if plan.kv_working_budget_tokens != expected_working_tokens:
         raise AssertionError(plan)
+    if plan.kv_working_budget_source != "estimated_from_available_kv_budget_mib":
+        raise AssertionError(plan)
     if plan.recent_window_tokens != 8192:
+        raise AssertionError(plan)
+    if plan.anchor_blocks != 128:
         raise AssertionError(plan)
     if plan.anchor_budget_tokens != 128:
         raise AssertionError(plan)
@@ -245,6 +249,10 @@ def main() -> None:
         kv_bytes_per_token=28672,
     )
     if explicit_plan.kv_working_budget_tokens != 2048:
+        raise AssertionError(explicit_plan)
+    if explicit_plan.kv_working_budget_source != "explicit_working_budget_tokens":
+        raise AssertionError(explicit_plan)
+    if explicit_plan.anchor_blocks != 64:
         raise AssertionError(explicit_plan)
     if explicit_plan.retrieval_top_k_effective != 960:
         raise AssertionError(explicit_plan)

@@ -53,7 +53,9 @@ RELAYKV_SHADOW_LOG_MEMORY_KEYS = {
 RELAYKV_SHADOW_LOG_BUDGET_KEYS = {
     "available_kv_budget_mib",
     "kv_working_budget_tokens",
+    "kv_working_budget_source",
     "recent_window_tokens",
+    "anchor_blocks",
     "anchor_budget_tokens",
     "retrieval_budget_tokens",
     "retrieval_top_k_requested",
