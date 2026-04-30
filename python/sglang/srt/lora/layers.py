@@ -876,6 +876,8 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         # initializes FusedMoE with its own moe_runner for base path
         super().__init__(base_layer, lora_backend)
 
+        lora_backend.is_moe_lora = True
+
         self.experts_shared_outer_loras: bool = False
         self.lora_use_virtual_experts: bool = False
         self.quant_method = base_layer.quant_method
@@ -949,46 +951,36 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
     def _get_lora_info(self):
         """Build LoRAInfo for the current batch."""
         from sglang.srt.lora.lora_moe_runners import LoRAInfo
+        from sglang.srt.model_executor.cuda_graph_runner import (
+            get_capture_lora_variant,
+            get_is_capture_mode,
+        )
 
         batch_info = self.lora_backend.batch_info
+
+        # CUDA graph capture uses dummy empty LoRA ids. Still build LoRAInfo
+        # for the LoRA graph variant so MoE LoRA hooks are recorded.
+        if not batch_info.has_active_lora and (
+            not get_is_capture_mode() or get_capture_lora_variant() == "nolora"
+        ):
+            return None
+
         lora_ranks = batch_info.lora_ranks
-
         max_lora_rank = self.down_lora_a_weights.shape[2]
-
         cg_buffers = getattr(self.lora_backend, "moe_cg_buffers", None)
-        wi = (
-            batch_info.req_weight_indices
-            if batch_info.req_weight_indices is not None
-            else batch_info.weight_indices
-        )
-        if cg_buffers is not None and batch_info.use_cuda_graph:
-            adapter_enabled = cg_buffers["adapter_enabled"]
-            adapter_enabled.zero_()
-            idx_buf = cg_buffers["weight_indices_long"]
-            idx_buf[: batch_info.bs] = wi[: batch_info.bs]
-            adapter_enabled.index_fill_(0, idx_buf[: batch_info.bs], 1)
-        else:
-            adapter_enabled = torch.zeros(
-                len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
-            )
-            adapter_enabled.index_fill_(0, wi.long(), 1)
-
-        seg_indptr = (
-            batch_info.req_seg_indptr
-            if batch_info.req_seg_indptr is not None
-            else batch_info.seg_indptr
-        )
-        req_to_lora = wi
+        moe_lora_info = batch_info.moe_lora_info
+        assert moe_lora_info is not None
 
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
             gate_up_lora_b_weights=self.gate_up_lora_b_weights,
             down_lora_a_weights=self.down_lora_a_weights,
             down_lora_b_weights=self.down_lora_b_weights,
-            seg_indptr=seg_indptr,
-            req_to_lora=req_to_lora,
+            seg_indptr=moe_lora_info.seg_indptr,
+            req_to_lora=moe_lora_info.req_to_lora,
             lora_ranks=lora_ranks,
-            adapter_enabled=adapter_enabled,
+            adapter_enabled=moe_lora_info.adapter_enabled,
+            token_lora_mapping=moe_lora_info.token_lora_mapping,
             max_lora_rank=max_lora_rank,
             num_experts=self.base_layer.num_experts,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
