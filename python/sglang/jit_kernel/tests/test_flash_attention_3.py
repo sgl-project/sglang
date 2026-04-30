@@ -10,6 +10,7 @@ from einops import rearrange, repeat
 
 apply_rotary_emb = None
 
+from sglang.jit_kernel.flash_attention_v3 import _is_fa3_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, suite="stage-b-kernel-unit-1-gpu-large")
@@ -19,21 +20,6 @@ register_cuda_ci(est_time=900, suite="nightly-kernel-1-gpu", nightly=True)
 def is_hopper():
     #  Only Hopper supports different V headdim
     return torch.cuda.get_device_properties(0).major == 9
-
-
-def is_fa3_supported(device=None) -> bool:
-    #  There some fa3 FYI
-    #  FA3 can fail without a enough shared memory for a some shapes, such as higher
-    #  hidden_dim or some special cases.
-    #  Right now, fa3 is supported for sm80/sm87 and sm86/sm89. The main different
-    #  Between sm80/sm87 and sm86/sm89 is the shared memory size. you can follow the link below for more information
-    #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
-    #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
-    #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
-    return (torch.version.cuda >= "12.3") and (
-        torch.cuda.get_device_capability(device)[0] == 9
-        or torch.cuda.get_device_capability(device)[0] == 8
-    )
 
 
 DISABLE_BACKWARD = True
@@ -467,8 +453,8 @@ def generate_qkv(
 
 
 @pytest.mark.skipif(
-    not is_fa3_supported(),
-    reason="flash_attn at sgl-kernel is only supported on sm90 or sm80",
+    not _is_fa3_supported(),
+    reason="flash_attn at sgl-kernel is only supported on CUDA sm90, sm80 or MUSA >= mp31",
 )
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
@@ -1039,8 +1025,8 @@ def _generate_block_kvcache(
 
 
 @pytest.mark.skipif(
-    not is_fa3_supported(),
-    reason="flash_attn at sgl-kernel is only supported on sm90 or sm80",
+    not _is_fa3_supported(),
+    reason="flash_attn at sgl-kernel is only supported on CUDA sm90, sm80 or MUSA >= mp31",
 )
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(

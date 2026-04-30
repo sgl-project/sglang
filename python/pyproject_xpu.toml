@@ -66,7 +66,6 @@ dependencies = [
   "transformers==5.6.0",
   "uvicorn",
   "uvloop",
-  # "xgrammar==0.1.24", , xgrammar depends on CUDA PyTorch and Triton only
   "smg-grpc-servicer>=0.5.0",
 ]
 
