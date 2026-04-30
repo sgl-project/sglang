@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.configs.deepseek_v4 import get_fp4_experts
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -820,9 +821,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
         self.with_bias = False
-        self.is_fp4_expert = (
-            envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        )
+        self.is_fp4_expert = get_fp4_experts()
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()

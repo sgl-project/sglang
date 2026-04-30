@@ -1,3 +1,17 @@
+from typing import Optional
+
+_fp4_experts: Optional[bool] = None
+
+
+def set_fp4_experts(value: bool) -> None:
+    global _fp4_experts
+    _fp4_experts = value
+
+
+def get_fp4_experts() -> bool:
+    return bool(_fp4_experts)
+
+
 class DeepSeekV4Config:
     """Configuration holder for DeepSeek V4 model parameters.
 
