@@ -279,6 +279,9 @@ RUN python3 -m pip install --no-cache-dir maturin \
     && python3 -m pip install --force-reinstall dist/*.whl \
     && rm -rf /root/.cache
 
+# General
+RUN echo "ulimit -n 65535" >> /etc/bash.bashrc
+
 # -----------------------
 # TileLang
 ENV DEBIAN_FRONTEND=noninteractive
@@ -554,6 +557,8 @@ ENV SGLANG_ROCM_FUSED_DECODE_MLA=1
 ENV SGLANG_SET_CPU_AFFINITY=1
 ENV SGLANG_USE_AITER=1
 ENV SGLANG_USE_ROCM700A=1
+ENV SGLANG_OPT_USE_TILELANG_INDEXER=true
+ENV SGLANG_HACK_FLASHMLA_BACKEND=tilelang
 
 ENV NCCL_MIN_NCHANNELS=112
 ENV ROCM_QUICK_REDUCE_QUANTIZATION=INT8
