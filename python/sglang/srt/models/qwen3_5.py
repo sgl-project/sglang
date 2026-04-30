@@ -464,7 +464,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
+        if (
+            self.num_v_heads // self.num_k_heads in [1, 2, 4]
+            and not _is_cpu
+            and not _is_npu
+        ):
             mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
                 projected_states_qkvz,
                 projected_states_ba,
@@ -488,6 +492,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             query, key, value, z, b, a = self.fix_query_key_value_ordering(
                 projected_states_qkvz, projected_states_ba
             )
+            b = b.contiguous()
+            a = a.contiguous()
 
             query, key, value = map(
                 lambda x: x.reshape(x.shape[0], -1), (query, key, value)
@@ -932,13 +938,12 @@ ALL_DECODER_LAYER_TYPES = {
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
-    if _is_gfx95 or _is_npu:
-        packed_modules_mapping = {
-            "qkv_proj": ["q_proj", "k_proj", "v_proj"],
-            "gate_up_proj": ["gate_proj", "up_proj"],
-            "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
-            "in_proj_ba": ["in_proj_b", "in_proj_a"],
-        }
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
+    }
 
     def __init__(
         self,
@@ -1377,9 +1382,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
 
 
 class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
-    if _is_gfx95 or _is_npu:
-        packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
-        hf_to_sglang_mapper = None
+
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+    hf_to_sglang_mapper = None
 
     def __init__(
         self,
@@ -1524,9 +1529,8 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
 class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
     """Qwen3.5 MoE Vision-Language Model."""
 
-    if _is_gfx95 or _is_npu:
-        packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
-        hf_to_sglang_mapper = None
+    packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
+    hf_to_sglang_mapper = None
 
     def __init__(
         self,

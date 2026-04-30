@@ -100,8 +100,9 @@ concurrency:
   # When called via workflow_call with run_all_tests=true, use a unique group per run to
   # avoid collisions with direct schedule/workflow_dispatch triggers. We use run_all_tests
   # (not github.event_name) to detect this, because github.event_name inherits from the caller.
-  group: pr-test-amd-rocm720-${{ inputs.run_all_tests && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
-  cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' }}
+  # Manual dispatch runs also get unique groups so they never cancel each other.
+  group: pr-test-amd-rocm720-${{ (inputs.run_all_tests || github.event_name == 'workflow_dispatch') && format('full-{0}', github.run_id) || inputs.pr_head_sha || inputs.ref || github.ref }}
+  cancel-in-progress: ${{ !inputs.run_all_tests && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   call-gate:
@@ -751,7 +752,7 @@ jobs:
           docker exec ci_sglang rocm-smi --showmeminfo vram 2>/dev/null || echo "rocm-smi not available"
 
       - name: Run diffusion server tests (2-GPU)
-        timeout-minutes: 80
+        timeout-minutes: 150
         run: |
           # AMD CI: All 2-GPU tests including LoRA
           # Tests: T2V, T2I, I2V, LoRA
