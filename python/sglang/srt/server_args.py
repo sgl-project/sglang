@@ -77,6 +77,10 @@ logger = logging.getLogger(__name__)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+MIMO_V2_MODEL_ARCHS = (
+    "MiMoV2ForCausalLM",
+    "MiMoV2FlashForCausalLM",
+)
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 
@@ -1631,7 +1635,10 @@ class ServerArgs:
         )
 
     def _handle_model_specific_adjustments(self):
-        from sglang.srt.configs.model_config import is_deepseek_nsa
+        from sglang.srt.configs.model_config import (
+            get_mimo_v2_fused_qkv_expected_tp_size,
+            is_deepseek_nsa,
+        )
 
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
@@ -1967,13 +1974,33 @@ class ServerArgs:
                     self.ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
-        elif any(
-            x in model_arch
-            for x in (
-                "MiMoV2ForCausalLM",
-                "MiMoV2FlashForCausalLM",
-            )
-        ):
+        elif model_arch in MIMO_V2_MODEL_ARCHS:
+            if model_arch == "MiMoV2ForCausalLM":
+                expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
+                    hf_config
+                )
+                attn_dp_size = self.dp_size if self.enable_dp_attention else 1
+                effective_attn_tp_size = (
+                    self.tp_size // attn_dp_size // self.attn_cp_size
+                )
+                if (
+                    expected_attn_tp_size is not None
+                    and effective_attn_tp_size != expected_attn_tp_size
+                ):
+                    raise ValueError(
+                        "MiMoV2ForCausalLM requires effective attention TP "
+                        f"size {expected_attn_tp_size} because its fused "
+                        "qkv_proj weights are "
+                        f"TP={expected_attn_tp_size}-interleaved; got "
+                        f"{effective_attn_tp_size} "
+                        f"(tp_size={self.tp_size}, dp_size={self.dp_size}, "
+                        f"enable_dp_attention={self.enable_dp_attention}, "
+                        f"attn_cp_size={self.attn_cp_size}). "
+                        "Set --tp, --dp, --enable-dp-attention, and "
+                        "--attention-context-parallel-size so the effective "
+                        f"attention TP size is {expected_attn_tp_size}."
+                    )
+
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True
                 logger.info(
@@ -2364,8 +2391,8 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda()
-            ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
+                is_cuda() or is_musa()
+            ), "Mamba extra_buffer is only supported on CUDA and MUSA devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
@@ -3683,6 +3710,12 @@ class ServerArgs:
         if self.disaggregation_mode == "decode":
             self.disable_radix_cache = True
             logger.warning("KV cache is forced as chunk cache for decode server")
+            if self.enable_mamba_extra_buffer():
+                logger.warning(
+                    "Mamba extra_buffer is disabled because decode disaggregation "
+                    "currently forces chunk cache. Falling back to no_buffer."
+                )
+                self.mamba_scheduler_strategy = "no_buffer"
 
         elif self.disaggregation_mode == "prefill":
             assert (
