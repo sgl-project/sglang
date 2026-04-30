@@ -23,7 +23,7 @@ from sglang.srt.layers.attention.nsa.utils import (
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
 )
-from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
+from sglang.srt.layers.communicator import get_attn_tp_context
 from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
@@ -894,15 +894,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             compress_ratio_override=compress_ratio_override,
         )
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
-        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
-        self.layer_scatter_modes = LayerScatterModes.init_new(
-            layer_id=layer_id,
-            num_layers=1 if is_nextn else config.num_hidden_layers,
-            is_layer_sparse=self.is_layer_sparse,
-            is_previous_layer_sparse=is_previous_layer_sparse,
-            is_next_layer_sparse=is_next_layer_sparse,
-        )
         self.mlp = deepseek_v2.DeepseekV2MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
