@@ -25,6 +25,7 @@ from .contracts import (
     SGLangTrueOnPolicyContract,
     SGLangTrueOnPolicyRuntimePolicy,
     get_true_on_policy_contract,
+    override_true_on_policy_runtime_policy_enabled,
     resolve_true_on_policy_runtime_policy,
     validate_true_on_policy_contract,
 )
@@ -36,6 +37,7 @@ __all__ = [
     "SGLangTrueOnPolicyContract",
     "SGLangTrueOnPolicyRuntimePolicy",
     "get_true_on_policy_contract",
+    "override_true_on_policy_runtime_policy_enabled",
     "get_on_policy_rms_norm_kwargs",
     "get_rl_on_policy_target",
     "get_moe_topk_tiebreak",

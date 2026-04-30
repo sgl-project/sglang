@@ -18,6 +18,7 @@ from sglang.srt.true_on_policy import (
     get_true_on_policy_contract,
     is_tp_invariant_target,
     is_true_on_policy_enabled,
+    override_true_on_policy_runtime_policy_enabled,
     patch_prefill_only_deterministic_inference_for_cuda_graph,
     resolve_true_on_policy_runtime_policy,
     should_disable_flashinfer_allreduce_fusion,
@@ -156,9 +157,8 @@ class TestOnPolicyServerArgs(unittest.TestCase):
         )
 
         self.assertTrue(result["enable_prefill_only_deterministic_inference"])
-        self.assertTrue(result["enable_deterministic_inference"])
+        self.assertFalse(result["enable_deterministic_inference"])
         self.assertIsNone(result["rl_on_policy_target"])
-        self.assertEqual(result["sampling_backend"], "pytorch")
 
     def test_cli_accepts_fsdp_and_fsdp_tp_targets(self):
         fsdp_tp_result = _run_server_args_script(
@@ -206,6 +206,25 @@ class TestOnPolicyServerArgs(unittest.TestCase):
             result["true_on_policy_contract"], QWEN3_DENSE_TRUE_ON_POLICY_V1
         )
         self.assertTrue(result["enable_deterministic_inference"])
+
+    def test_prefill_only_contract_does_not_force_decode_deterministic(self):
+        result = _run_server_args_script(
+            [
+                "--model-path",
+                "dummy",
+                "--attention-backend",
+                "triton",
+                "--true-on-policy-contract",
+                QWEN3_DENSE_TRUE_ON_POLICY_V1,
+                "--enable-prefill-only-deterministic-inference",
+            ]
+        )
+
+        self.assertEqual(
+            result["true_on_policy_contract"], QWEN3_DENSE_TRUE_ON_POLICY_V1
+        )
+        self.assertTrue(result["enable_prefill_only_deterministic_inference"])
+        self.assertFalse(result["enable_deterministic_inference"])
 
     def test_contract_tp_rollout_disables_flashinfer_allreduce_fusion(self):
         result = _run_server_args_script(
@@ -361,6 +380,22 @@ class TestOnPolicyHelpers(unittest.TestCase):
                     row_linear_enable_inv=True,
                 )
             )
+
+    def test_runtime_policy_override_disables_contract_paths_in_decode_context(self):
+        server_args = self._moe_contract_args(tp_size=1, ep_size=4)
+
+        self.assertTrue(is_true_on_policy_enabled(server_args))
+        self.assertTrue(should_use_deterministic_moe_routing(server_args))
+
+        with override_true_on_policy_runtime_policy_enabled(False):
+            policy = resolve_true_on_policy_runtime_policy(server_args)
+
+            self.assertFalse(policy.enabled)
+            self.assertFalse(is_true_on_policy_enabled(server_args))
+            self.assertFalse(should_use_deterministic_moe_routing(server_args))
+
+        self.assertTrue(is_true_on_policy_enabled(server_args))
+        self.assertTrue(should_use_deterministic_moe_routing(server_args))
 
     def test_contract_object_owns_sglang_runtime_policy_values(self):
         contract = get_true_on_policy_contract(QWEN3_DENSE_TRUE_ON_POLICY_V1)

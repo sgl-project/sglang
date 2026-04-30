@@ -25,6 +25,7 @@ import socket
 import threading
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple, Union
 
@@ -160,7 +161,10 @@ from sglang.srt.server_args import (
     set_global_server_args_for_scheduler,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.true_on_policy import is_tp_invariant_target
+from sglang.srt.true_on_policy import (
+    is_tp_invariant_target,
+    override_true_on_policy_runtime_policy_enabled,
+)
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     cpu_has_amx_support,
@@ -791,7 +795,11 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             from sglang.srt.batch_invariant_ops import enable_batch_invariant_mode
 
             enable_batch_invariant_mode()
-        if is_tp_invariant_target():
+        prefill_only_fast_decode = (
+            server_args.enable_prefill_only_deterministic_inference
+            and not server_args.enable_deterministic_inference
+        )
+        if is_tp_invariant_target(server_args) and not prefill_only_fast_decode:
             from sglang.srt.tp_invariant_ops import enable_tp_invariant_mode
 
             enable_tp_invariant_mode()
@@ -3021,7 +3029,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         with get_global_expert_distribution_recorder().with_forward_pass(
             self.forward_pass_id,
             forward_batch,
-        ) as recorder_outputs:
+        ) as recorder_outputs, self._prefill_only_deterministic_forward_context(
+            forward_batch
+        ):
             output = self._forward_raw(
                 forward_batch,
                 skip_attn_backend_init,
@@ -3075,6 +3085,57 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             dumper.step()
 
         return output
+
+    @contextmanager
+    def _prefill_only_deterministic_forward_context(
+        self, forward_batch: ForwardBatch
+    ):
+        fast_prefill_only = (
+            self.server_args.enable_prefill_only_deterministic_inference
+            and not self.server_args.enable_deterministic_inference
+        )
+        if not fast_prefill_only:
+            yield
+            return
+
+        if not forward_batch.is_prefill_only:
+            with override_true_on_policy_runtime_policy_enabled(False):
+                yield
+            return
+
+        from sglang.srt.batch_invariant_ops import (
+            disable_batch_invariant_mode,
+            enable_batch_invariant_mode,
+            is_batch_invariant_mode_enabled,
+        )
+        from sglang.srt.tp_invariant_ops import (
+            disable_tp_invariant_mode,
+            enable_tp_invariant_mode,
+            is_tp_invariant_mode_enabled,
+        )
+
+        batch_invariant_was_enabled = is_batch_invariant_mode_enabled()
+        tp_invariant_was_enabled = is_tp_invariant_mode_enabled()
+        tp_invariant_enabled_here = False
+
+        try:
+            self.server_args.enable_deterministic_inference = True
+            if not batch_invariant_was_enabled:
+                enable_batch_invariant_mode()
+            if is_tp_invariant_target(self.server_args) and not tp_invariant_was_enabled:
+                enable_tp_invariant_mode()
+                tp_invariant_enabled_here = True
+            with (
+                override_true_on_policy_runtime_policy_enabled(True),
+                envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(True),
+            ):
+                yield
+        finally:
+            self.server_args.enable_deterministic_inference = False
+            if not batch_invariant_was_enabled:
+                disable_batch_invariant_mode()
+            if tp_invariant_enabled_here:
+                disable_tp_invariant_mode()
 
     def _forward_raw(
         self,

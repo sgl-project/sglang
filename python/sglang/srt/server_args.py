@@ -3466,9 +3466,6 @@ class ServerArgs:
     def _handle_deterministic_inference(self):
         validate_true_on_policy_contract(self)
 
-        if self.enable_prefill_only_deterministic_inference:
-            self.enable_deterministic_inference = True
-
         if self.rl_on_policy_target is not None:
             logger.warning(
                 "Enable deterministic inference because of legacy rl_on_policy_target."
@@ -3476,10 +3473,16 @@ class ServerArgs:
             self.enable_deterministic_inference = True
 
         if self.true_on_policy_contract is not None:
-            logger.warning(
-                "Enable deterministic inference because of true_on_policy_contract."
-            )
-            self.enable_deterministic_inference = True
+            if self.enable_prefill_only_deterministic_inference:
+                logger.warning(
+                    "Enable deterministic prefill-only inference because of "
+                    "true_on_policy_contract."
+                )
+            else:
+                logger.warning(
+                    "Enable deterministic inference because of true_on_policy_contract."
+                )
+                self.enable_deterministic_inference = True
 
             # For VLM
             os.environ["SGLANG_VLM_CACHE_SIZE_MB"] = "0"

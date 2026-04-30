@@ -16,59 +16,64 @@ def _get_global_server_args() -> Any:
     return get_global_server_args()
 
 
-def get_rl_on_policy_target() -> Optional[str]:
-    return getattr(_get_global_server_args(), "rl_on_policy_target", None)
+def _get_server_args(server_args: Optional[Any] = None) -> Any:
+    return _get_global_server_args() if server_args is None else server_args
 
 
-def is_true_on_policy_enabled() -> bool:
-    return resolve_true_on_policy_runtime_policy(_get_global_server_args()).enabled
+def get_rl_on_policy_target(server_args: Optional[Any] = None) -> Optional[str]:
+    return getattr(_get_server_args(server_args), "rl_on_policy_target", None)
 
 
-def is_tp_invariant_target() -> bool:
+def is_true_on_policy_enabled(server_args: Optional[Any] = None) -> bool:
+    return resolve_true_on_policy_runtime_policy(_get_server_args(server_args)).enabled
+
+
+def is_tp_invariant_target(server_args: Optional[Any] = None) -> bool:
     return resolve_true_on_policy_runtime_policy(
-        _get_global_server_args()
+        _get_server_args(server_args)
     ).tp_invariant_row_linear
 
 
-def should_disable_reduce_scatter_for_on_policy() -> bool:
+def should_disable_reduce_scatter_for_on_policy(server_args: Optional[Any] = None) -> bool:
     return resolve_true_on_policy_runtime_policy(
-        _get_global_server_args()
+        _get_server_args(server_args)
     ).disable_reduce_scatter
 
 
-def should_disable_mlp_allreduce_fusion_for_on_policy() -> bool:
+def should_disable_mlp_allreduce_fusion_for_on_policy(server_args: Optional[Any] = None) -> bool:
     return resolve_true_on_policy_runtime_policy(
-        _get_global_server_args()
+        _get_server_args(server_args)
     ).disable_mlp_allreduce_fusion
 
 
-def should_disable_flashinfer_allreduce_fusion() -> bool:
+def should_disable_flashinfer_allreduce_fusion(server_args: Optional[Any] = None) -> bool:
     return resolve_true_on_policy_runtime_policy(
-        _get_global_server_args()
+        _get_server_args(server_args)
     ).disable_flashinfer_allreduce_fusion
 
 
-def should_force_bfloat16_dense_tensor_math() -> bool:
+def should_force_bfloat16_dense_tensor_math(server_args: Optional[Any] = None) -> bool:
     return resolve_true_on_policy_runtime_policy(
-        _get_global_server_args()
+        _get_server_args(server_args)
     ).force_bfloat16_dense_tensor_math
 
 
 def should_force_bfloat16_lm_head(
+    server_args: Optional[Any] = None,
     *,
     use_fp32_lm_head: bool = False,
 ) -> bool:
     return (
         resolve_true_on_policy_runtime_policy(
-            _get_global_server_args()
+            _get_server_args(server_args)
         ).force_bfloat16_lm_head
         and not use_fp32_lm_head
     )
 
 
-def should_disable_fused_qk_norm_mrope() -> bool:
+def should_disable_fused_qk_norm_mrope(server_args: Optional[Any] = None) -> bool:
     return resolve_true_on_policy_runtime_policy(
-        _get_global_server_args()
+        _get_server_args(server_args)
     ).disable_fused_qk_norm_mrope
 
 
@@ -89,12 +94,13 @@ def get_moe_topk_tiebreak(server_args: Optional[Any] = None) -> Optional[str]:
 
 
 def get_on_policy_rms_norm_kwargs(
+    server_args: Optional[Any] = None,
     *,
     weight_dtype: Optional[torch.dtype] = None,
     override_orig_dtype: Optional[torch.dtype] = None,
     fp32_residual: bool = False,
 ) -> dict[str, Any]:
-    if not is_true_on_policy_enabled():
+    if not is_true_on_policy_enabled(server_args):
         return {}
 
     kwargs: dict[str, Any] = {

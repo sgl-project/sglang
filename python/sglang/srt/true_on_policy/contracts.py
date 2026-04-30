@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
+import contextvars
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from sglang.srt.true_on_policy.schema import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
@@ -101,6 +103,24 @@ _CONTRACT_BY_NAME = {
     QWEN3_MOE_TRUE_ON_POLICY_CONTRACT.name: QWEN3_MOE_TRUE_ON_POLICY_CONTRACT,
 }
 
+_RUNTIME_POLICY_ENABLED_OVERRIDE: contextvars.ContextVar[Optional[bool]] = (
+    contextvars.ContextVar(
+        "sglang_true_on_policy_runtime_policy_enabled_override",
+        default=None,
+    )
+)
+
+
+@contextlib.contextmanager
+def override_true_on_policy_runtime_policy_enabled(
+    enabled: Optional[bool],
+) -> Iterator[None]:
+    token = _RUNTIME_POLICY_ENABLED_OVERRIDE.set(enabled)
+    try:
+        yield
+    finally:
+        _RUNTIME_POLICY_ENABLED_OVERRIDE.reset(token)
+
 
 def get_true_on_policy_contract(contract_name: str) -> SGLangTrueOnPolicyContract:
     try:
@@ -127,6 +147,9 @@ def validate_true_on_policy_contract(server_args: Any) -> None:
 def resolve_true_on_policy_runtime_policy(
     server_args: Any,
 ) -> SGLangTrueOnPolicyRuntimePolicy:
+    if _RUNTIME_POLICY_ENABLED_OVERRIDE.get() is False:
+        return DEFAULT_RUNTIME_POLICY
+
     contract_name = _contract_name_for(server_args)
     if contract_name is None:
         return DEFAULT_RUNTIME_POLICY
