@@ -1828,11 +1828,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                 for skipped_checking_pattern in skipped_checking_patterns
             )
         }
-        if os.environ.get("SGLANG_SKIP_CHECKPOINT_LOAD_CHECK", "0") == "0":
-            if unloaded_params:
-                raise RuntimeError(
-                    f"Some weights are not initialized from checkpoints: {unloaded_params}"
-                )
+        if unloaded_params:
+            raise RuntimeError(
+                f"Some weights are not initialized from checkpoints: {unloaded_params}"
+            )
 
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
