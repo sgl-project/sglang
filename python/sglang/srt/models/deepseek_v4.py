@@ -42,7 +42,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
-from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import get_layer_id
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
@@ -85,7 +84,6 @@ if TYPE_CHECKING:
         DeepseekV4BackendRadix,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
-    from sglang.srt.layers.rotary_embedding import RotaryEmbedding
     from sglang.srt.model_executor.forward_batch_info import (
         ForwardBatch,
         PPProxyTensors,
@@ -168,7 +166,6 @@ class Compressor(nn.Module):
         config: DeepSeekV4Config,
         layer_id: int,
         is_in_indexer: bool,
-        rotary_emb: RotaryEmbedding,
         freqs_cis: torch.Tensor,
         compress_ratio: Literal[0, 4, 128],
         head_dim: int,
@@ -200,7 +197,6 @@ class Compressor(nn.Module):
             params_dtype=wkv_gate_dtype,
         )
         self.norm = DeepseekRefRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
 
         self.ape_converted = False
@@ -290,7 +286,6 @@ class C4Indexer(nn.Module):
         self,
         config: DeepSeekV4Config,
         layer_id: int,
-        rotary_emb: RotaryEmbedding,
         freqs_cis: torch.Tensor,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
@@ -325,14 +320,12 @@ class C4Indexer(nn.Module):
             config,
             self.layer_id,
             True,
-            rotary_emb,
             freqs_cis,
             compress_ratio=4,
             head_dim=self.head_dim,
             rotate=True,
             prefix=add_prefix("compressor", prefix),
         )
-        self.rotary_emb = rotary_emb
         self.freqs_cis = freqs_cis
         self.weight_scale: float = self.softmax_scale * self.n_heads**-0.5
         self.alt_streams = alt_streams
@@ -434,16 +427,6 @@ class MQALayer(nn.Module):
 
         rope_base = config.compress_rope_theta if self.compress_ratio else rope_theta
 
-        self.rotary_emb = get_rope_wrapper(
-            head_size=self.rope_head_dim,
-            rotary_dim=self.rope_head_dim,
-            max_position=config.max_position_embeddings,
-            base=rope_base,
-            rope_scaling=rope_scaling,
-            is_neox_style=False,
-            device=get_global_server_args().device,
-        )
-
         from sglang.srt.layers.deepseek_v4_rope import precompute_freqs_cis
 
         assert self.compress_ratio in {0, 4, 128}
@@ -482,7 +465,6 @@ class MQALayer(nn.Module):
                 config,
                 layer_id=self.layer_id,
                 is_in_indexer=False,
-                rotary_emb=self.rotary_emb,
                 freqs_cis=freqs_cis,
                 compress_ratio=self.compress_ratio,
                 head_dim=self.head_dim,
@@ -492,7 +474,6 @@ class MQALayer(nn.Module):
             if self.compress_ratio == 4:
                 self.indexer = C4Indexer(
                     config,
-                    rotary_emb=self.rotary_emb,
                     freqs_cis=freqs_cis,
                     layer_id=layer_id,
                     quant_config=quant_config,
