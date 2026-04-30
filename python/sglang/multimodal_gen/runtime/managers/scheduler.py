@@ -22,6 +22,8 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorCheckerReqInput,
+    UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GetDisaggStatsReq,
@@ -35,6 +37,9 @@ from sglang.multimodal_gen.runtime.managers.cpu_worker import CPUWorker
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin import (
+    SchedulerPostTrainingMixin,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -57,7 +62,7 @@ MINIMUM_PICTURE_BASE64_FOR_WARMUP = "data:image/jpg;base64,iVBORw0KGgoAAAANSUhEU
 DEFAULT_PLACEHOLDER_PROMPT = "warmup"
 
 
-class Scheduler(SchedulerDisaggMixin):
+class Scheduler(SchedulerPostTrainingMixin, SchedulerDisaggMixin):
     """
     Runs the main event loop for the rank 0 worker.
     It listens for external requests via ZMQ and coordinates with other workers.
@@ -120,6 +125,10 @@ class Scheduler(SchedulerDisaggMixin):
             ShutdownReq: self._handle_shutdown,
             GetDisaggStatsReq: self._handle_get_disagg_stats,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
+            UpdateWeightFromTensorReqInput: self._handle_update_weights_from_tensor,
+            UpdateWeightFromTensorCheckerReqInput: (
+                self._handle_update_weights_from_tensor_checker
+            ),
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
         }
 
@@ -176,24 +185,7 @@ class Scheduler(SchedulerDisaggMixin):
         self._running = False
         return OutputBatch()
 
-    def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
-        """Handle update_weights_from_disk request for RL workflows."""
-        req = reqs[0]
-        success, message = self.worker.update_weights_from_disk(
-            model_path=req.model_path,
-            flush_cache=req.flush_cache,
-            target_modules=req.target_modules,
-        )
-        return OutputBatch(
-            output={"success": success, "message": message},
-            error=None if success else message,
-        )
-
-    def _handle_get_weights_checksum(self, reqs: List[Any]) -> OutputBatch:
-        """Handle get_weights_checksum request."""
-        req = reqs[0]
-        checksums = self.worker.get_weights_checksum(module_names=req.module_names)
-        return OutputBatch(output=checksums)
+    
 
     def _handle_generation(self, reqs: List[Req] | list[list[Req]]):
         if len(reqs) == 1 and isinstance(reqs[0], list):
