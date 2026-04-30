@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -20,6 +21,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+from sglang.srt.utils.torch_compile_utils import CompileConfig
 
 if TYPE_CHECKING:
     from sglang.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
@@ -33,6 +35,8 @@ _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_musa = is_musa()
 _is_mps = is_mps()
+logger = logging.getLogger(__name__)
+_logged_rope_local_compile_dynamic_override = False
 
 if _is_cuda:
     from sglang.jit_kernel.rope import apply_rope_with_cos_sin_cache_inplace
@@ -49,6 +53,8 @@ if _is_hip:
 
 class RotaryEmbedding(MultiPlatformOp):
     """Original rotary positional embedding."""
+
+    compile_config = CompileConfig(dynamic=True)
 
     def __init__(
         self,
@@ -200,10 +206,22 @@ class RotaryEmbedding(MultiPlatformOp):
         compile_options: Optional[dict] = None,
         compile_dynamic: bool = False,
     ) -> Callable:
+        global _logged_rope_local_compile_dynamic_override
+
         from sglang.srt.utils.torch_compile_utils import merge_mode_options
 
-        # forward_native can handled KV cache fusion.
-        # cache_loc varies across calls so we need dynamic compilation;
+        # forward_native can handle fused KV cache writes. cache_loc varies
+        # across calls, so local RoPE compile must use dynamic shapes even if
+        # an override tries to disable them.
+        if (
+            compile_dynamic is not True
+            and not _logged_rope_local_compile_dynamic_override
+        ):
+            logger.info(
+                "Forcing torch.compile(dynamic=True) for local RotaryEmbedding "
+                "compile because fused KV cache writes use dynamic cache_loc."
+            )
+            _logged_rope_local_compile_dynamic_override = True
         compile_dynamic = True
 
         # Merge compile_mode and compile_options.
