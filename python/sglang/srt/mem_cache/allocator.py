@@ -87,11 +87,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
                 (0,), dtype=self.release_pages.dtype, device=self.device
             )
 
-    def get_cpu_copy(self, *args, **kwargs):
+    def get_cpu_copy(self, indices, mamba_indices=None):
         # FIXME: reuse the get_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
 
-    def load_cpu_copy(self, *args, **kwargs):
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
         # FIXME: reuse the load_cpu_copy after paged allocator is implemented
         raise NotImplementedError()
 
@@ -164,11 +164,13 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         else:
             self.free_group.append(free_index)
 
-    def get_cpu_copy(self, indices, **kwargs):
-        return self._kvcache.get_cpu_copy(indices, **kwargs)
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
-        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices, **kwargs)
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        return self._kvcache.load_cpu_copy(
+            kv_cache_cpu, indices, mamba_indices=mamba_indices
+        )
 
 
 def alloc_extend_naive(
@@ -512,8 +514,10 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = []
         self.release_pages = torch.empty((0,), dtype=torch.int64, device=self.device)
 
-    def get_cpu_copy(self, indices, **kwargs):
-        return self._kvcache.get_cpu_copy(indices, **kwargs)
+    def get_cpu_copy(self, indices, mamba_indices=None):
+        return self._kvcache.get_cpu_copy(indices, mamba_indices=mamba_indices)
 
-    def load_cpu_copy(self, kv_cache_cpu, indices, **kwargs):
-        return self._kvcache.load_cpu_copy(kv_cache_cpu, indices, **kwargs)
+    def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None):
+        return self._kvcache.load_cpu_copy(
+            kv_cache_cpu, indices, mamba_indices=mamba_indices
+        )
