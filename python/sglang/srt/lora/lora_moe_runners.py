@@ -465,18 +465,23 @@ def _add_lora_gate_up_delta(
     r = lora_info.max_lora_rank
     gate_up_a = lora_info.gate_up_lora_a_weights
     gate_up_b = lora_info.gate_up_lora_b_weights
-    inter_size = gate_up_b.shape[2] // 2
-    M, top_k, gate_up_dim = intermediate_cache.shape
-    r = lora_info.max_lora_rank
-    gate_up_a = lora_info.gate_up_lora_a_weights
-    gate_up_b = lora_info.gate_up_lora_b_weights
-    inter_size = gate_up_b.shape[2] // 2
 
     if lora_info.experts_shared_outer_loras and not lora_info.lora_use_virtual_experts:
         gate_up_a = gate_up_a.expand(-1, lora_info.num_experts, -1, -1)
-    inter_size = gate_up_b.shape[2] // 2
-    lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
-    lora_b_stacked = [gate_up_b[:, :, :inter_size, :], gate_up_b[:, :, inter_size:, :]]
+
+    # Detect gated vs non-gated from A buffer rank dimension.
+    # Gated: A has 2*r rows (gate + up). Non-gated: A has 1*r rows (w1 only).
+    is_gated = gate_up_a.shape[2] > r
+    if is_gated:
+        inter_size = gate_up_b.shape[2] // 2
+        lora_a_stacked = [gate_up_a[:, :, :r, :], gate_up_a[:, :, r : 2 * r, :]]
+        lora_b_stacked = [
+            gate_up_b[:, :, :inter_size, :],
+            gate_up_b[:, :, inter_size:, :],
+        ]
+    else:
+        lora_a_stacked = [gate_up_a]
+        lora_b_stacked = [gate_up_b]
 
     if lora_info.lora_use_virtual_experts:
         merged_experts_fused_moe_lora_add(

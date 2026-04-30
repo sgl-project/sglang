@@ -454,9 +454,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_metric_collector_watchdog(self):
         # Metrics
         if self.enable_metrics:
+            engine_type = DisaggregationMode.to_engine_type(
+                self.server_args.disaggregation_mode
+            )
+
             labels = {
                 "model_name": self.server_args.served_model_name,
-                # TODO: Add lora name/path in the future,
+                "engine_type": engine_type,
             }
             if self.enable_priority_scheduling:
                 labels["priority"] = ""
@@ -838,7 +842,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if (
             self.validate_total_tokens
             and max_new_tokens is not None
-            and (max_new_tokens + input_token_num) >= _max_req_len
+            and (max_new_tokens + input_token_num) > _max_req_len
         ):
             if self.server_args.allow_auto_truncate:
                 logger.warning(
@@ -2094,7 +2098,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if all_drafts > 0:
                 # accept_rate: accepted_drafts / total_proposed_drafts (strict count, no bonus).
                 meta_info["spec_accept_rate"] = accepted_drafts / all_drafts
-                # accept_length: accepted_drafts / verify_ct (includes bonus token).
+                # accept_length: completion_tokens / verify_ct (includes bonus token).
                 meta_info["spec_accept_length"] = (
                     recv_obj.completion_tokens[i] / recv_obj.spec_verify_ct[i]
                 )
