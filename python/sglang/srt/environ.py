@@ -670,9 +670,6 @@ def _convert_SGL_to_SGLANG():
         "SGL_DISABLE_TP_MEMORY_INBALANCE_CHECK",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK",
     )
-    _print_deprecated_env(
-        "SGLANG_ADVANCED_CUDA_GRAPH_CAPTURE", "SGLANG_PREP_IN_CUDA_GRAPH"
-    )
     _print_deprecated_env("SGLANG_PER_TOKEN_GROUP_QUANT_8BIT_V2")
     _deprecated_ms_to_s = {
         "SGLANG_QUEUED_TIMEOUT_MS": "SGLANG_REQ_WAITING_TIMEOUT",
