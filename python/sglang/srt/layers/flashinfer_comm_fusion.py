@@ -308,7 +308,7 @@ def _preflight_check_workspace_memory(
         local_ok = False
 
     flag = torch.tensor([1 if local_ok else 0], dtype=torch.int32)
-    dist.all_reduce(flag, op=dist.ReduceOp.MIN, group=group)
+    dist.all_reduce(flag, op=dist.ReduceOp.BAND, group=group)
 
     logger.debug(
         "FlashInfer workspace preflight [rank %s]: probe=%.2f GB, "
