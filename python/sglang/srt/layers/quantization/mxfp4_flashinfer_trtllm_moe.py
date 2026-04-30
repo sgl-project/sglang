@@ -1,3 +1,4 @@
+
 from __future__ import annotations
 
 import logging
@@ -14,10 +15,13 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
+from sglang.srt.layers.moe.moe_runner.marlin import MarlinMoeQuantInfo
+from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
     is_flashinfer_available,
+    is_sm90_supported,
     log_info_on_rank0,
     set_weight_attrs,
 )
@@ -37,6 +41,8 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
+
+from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker
 from sglang.srt.environ import envs
 from sglang.srt.utils.common import get_bool_env_var
 
@@ -121,22 +127,30 @@ def _pack_topk_ids_triton_kernel(
     tl.store(out_ptr + offsets, packed, mask=mask)
 
 
-class Mxfp4FlashinferTrtllmMoEMethod:
+class DeepSeekMxfp4MoEMethod:
 
     def __init__(self, fp8_method, prefix: str):
         self._fp8 = fp8_method
         self.prefix = prefix
+        self.moe_runner_backend = get_moe_runner_backend()
         self.flashinfer_mxfp4_moe_precision = (
             get_global_server_args().flashinfer_mxfp4_moe_precision
         )
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
+        if self.moe_runner_backend.is_marlin():
+            from sglang.srt.layers.moe.moe_runner import MoeRunner
+
+            self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
         swiglu_limit = moe_runner_config.swiglu_limit
-        assert (
-            swiglu_limit is not None
-        ), f"swiglu_limit must be non-None for DeepSeek V4 (got {swiglu_limit!r})"
+        is_2604b_or_260415 = envs.SGLANG_DSV4_2604_SUBMODE.get() in ("2604B", "260415")
+        assert is_2604b_or_260415 == (swiglu_limit is not None), (
+            f"swiglu_limit must be non-None iff submode=2604B or 260415 "
+            f"(got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, "
+            f"swiglu_limit={swiglu_limit!r})"
+        )
         self._gemm1_clamp_limit_tensor = (
             torch.full(
                 (layer.num_local_experts,),
@@ -217,6 +231,38 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         self._fp8.process_weights_after_loading(layer)
 
         if getattr(layer, "_mega_moe_weights_built", False):
+            return
+
+        if self.moe_runner_backend.is_marlin():
+            from sglang.srt.layers.quantization.marlin_utils import (
+                check_moe_marlin_supports_layer,
+            )
+            from sglang.srt.layers.quantization.marlin_utils_fp4 import (
+                prepare_moe_mxfp4_layer_for_marlin,
+            )
+
+            if not is_sm90_supported():
+                raise RuntimeError(
+                    "DeepSeekV4 MXFP4 Marlin fallback requires Hopper/SM90 or above."
+                )
+            if not check_moe_marlin_supports_layer(layer, 32):
+                raise RuntimeError(
+                    "Current DeepSeekV4 MoE layer does not satisfy Marlin constraints."
+                )
+
+            # NOTE: the Marlin MoE runner consumes w13 in the checkpoint's
+            # native ``[w1; w3]`` order -- see ``silu_and_mul`` in
+            # fused_marlin_moe.py which expects ``gate = intermediate[:, :N]``
+            # (first half) and ``up = intermediate[:, N:]`` (second half).
+            # Unlike the flashinfer trtllm_fp4 kernel (which wants [w3, w1]),
+            # we must *not* call ``reorder_w1w3_to_w3w1`` here.
+
+            log_info_on_rank0(
+                logger,
+                f"Preparing DeepSeekV4 MXFP4 experts for Marlin backend (layer: {self.prefix})...",
+            )
+            prepare_moe_mxfp4_layer_for_marlin(layer)
+            layer._dsv4_mxfp4_backend = "marlin"
             return
 
         w13_w, w13_s = reorder_w1w3_to_w3w1(
@@ -334,6 +380,27 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
+        if self.moe_runner_backend.is_marlin():
+            from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+            from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+            topk_output = dispatch_output.topk_output
+            if not TopKOutputChecker.format_is_standard(topk_output):
+                raise ValueError(f"Unsupported topk output format: {topk_output.format}")
+
+            quant_info = MarlinMoeQuantInfo(
+                w13_qweight=layer.w13_weight,
+                w2_qweight=layer.w2_weight,
+                w13_scales=layer.w13_weight_scale_inv,
+                w2_scales=layer.w2_weight_scale_inv,
+                w13_g_idx_sort_indices=None,
+                w2_g_idx_sort_indices=None,
+                weight_bits=4,
+                is_k_full=True,
+            )
+            runner_output = self.runner.run(dispatch_output, quant_info=quant_info)
+            return StandardCombineInput(hidden_states=runner_output.hidden_states)
+
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
@@ -409,6 +476,11 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 num_tokens, out_hidden_size, dtype=torch.bfloat16, device=x_quant.device
             )
 
+        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B" and (
+            self._gemm1_clamp_limit_tensor is not None
+        ):
+            deepseek_v4_moe_code_path_checker.observed += 1
+
         output = trtllm_fp4_block_scale_routed_moe(
             topk_ids=packed_topk,
             routing_bias=None,
@@ -465,26 +537,3 @@ class Mxfp4FlashinferTrtllmMoEMethod:
 
         return StandardCombineInput(hidden_states=output)
 
-
-def maybe_fuse_routed_scale_and_shared_add(
-    experts,
-    routed: torch.Tensor,
-    shared: torch.Tensor | None,
-    routed_scaling_factor: float,
-) -> torch.Tensor:
-    # When MxFP4 fusion is on, the upstream `routed *= scale` is skipped and
-    # the scaling is folded into the shared-add via `shared.add_(routed,
-    # alpha=scale)`. With no shared output, the missing scale is applied
-    # in-place. Otherwise `routed` is already scale-final and we just add
-    # `shared` (or pass through if there is none).
-    fused = (
-        isinstance(experts.quant_method, Mxfp4FlashinferTrtllmMoEMethod)
-        and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
-    )
-    if fused:
-        if shared is not None:
-            return shared.add_(routed, alpha=routed_scaling_factor)
-        return routed.mul_(routed_scaling_factor)
-    if shared is not None:
-        routed += shared
-    return routed

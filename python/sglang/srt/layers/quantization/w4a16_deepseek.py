@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
 
 
-from sglang.srt.debug_utils.sunrise_debug_utils import sunrise_moe_code_path_checker
+from sglang.srt.debug_utils.deepseek_v4_debug_utils import deepseek_v4_moe_code_path_checker as sunrise_moe_code_path_checker
 from sglang.srt.environ import envs
 
 
@@ -126,12 +126,12 @@ class DeepSeekW4A16MoEMethod:
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
 
-        # Sanity check: v5 (260415) ckpt's HF config has swiglu_limit=10.0;
-        # v4 (260409) does not. Same check as mxfp4_deepseek.
+        # Sanity check: 2604B/260415 ckpt's HF config has swiglu_limit=10.0;
+        # 2604A does not. Same check as mxfp4_deepseek.
         swiglu_limit = moe_runner_config.swiglu_limit
-        is_260415 = envs.SGLANG_DSV4_2604_SUBMODE.get() == "260415"
-        assert is_260415 == (swiglu_limit is not None), (
-            f"swiglu_limit must be non-None iff submode=260415 "
+        is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() in ("2604B", "260415")
+        assert is_2604b == (swiglu_limit is not None), (
+            f"swiglu_limit must be non-None iff submode=2604B/260415 "
             f"(got submode={envs.SGLANG_DSV4_2604_SUBMODE.get()!r}, "
             f"swiglu_limit={swiglu_limit!r})"
         )
@@ -366,6 +366,17 @@ class DeepSeekW4A16MoEMethod:
                 f"Unsupported topk output format for W4A16 MoE: {topk_output.format}"
             )
 
+        # RC-X2: topk_weights renorm (DISABLED for testing - original code without renorm)
+        # topk_weights = topk_weights / topk_weights.sum(-1, keepdim=True)
+
+        # RSF fix: pre-multiply topk_weights by routed_scaling_factor (DSv4=1.5).
+        # cutlass_fused_moe treats token_final_scales as the FINAL output weight per expert,
+        # so it must include RSF. The post-hoc output.mul_(rsf) approach was wrong because
+        # it changes the weight*output sum semantics. Match marlin which passes RSF to kernel.
+        rsf_pre = layer.moe_runner_config.routed_scaling_factor
+        if rsf_pre is not None and rsf_pre != 1.0:
+            topk_weights = topk_weights * rsf_pre
+
         # Undo StandardDispatcher's global->local+sentinel mapping so the
         # flashinfer kernel (which expects global expert ids plus ep_rank/ep_size
         # for local filtering) gets what it wants. Mirror the mxfp4_deepseek
@@ -403,10 +414,7 @@ class DeepSeekW4A16MoEMethod:
         # DSv4 260415 ships a per-MoE-layer sanity counter that deepseek_v4.py
         # asserts is bumped exactly once per forward (see deepseek_v4.py:2014).
         # Mirror the mxfp4_deepseek bump so the checker is satisfied.
-        if envs.SGLANG_DSV4_2604_SUBMODE.get() == "260415" and (
-            self._swiglu_limit_tensor is not None
-        ):
-            sunrise_moe_code_path_checker.observed += 1
+        sunrise_moe_code_path_checker.observed += 1
 
         swiglu_limit_arg = (
             None
@@ -420,6 +428,13 @@ class DeepSeekW4A16MoEMethod:
                 torch_ref_cutlass_fused_moe as _moe_fn,
             )
 
+        # RC-X1 fix: pass full SwiGLU triplet (alpha=1, beta=0, limit)
+        # flashinfer test always passes all three; leaving alpha/beta None
+        # causes wrong activation behavior.
+        num_experts = layer.num_local_experts
+        swiglu_alpha_arg = torch.ones(num_experts, dtype=torch.float32, device=x.device)
+        swiglu_beta_arg = torch.zeros(num_experts, dtype=torch.float32, device=x.device)
+
         _moe_fn(
             input=x,
             token_selected_experts=topk_ids.to(torch.int32).contiguous(),
@@ -428,6 +443,8 @@ class DeepSeekW4A16MoEMethod:
             fc2_expert_weights=w2,
             output_dtype=torch.bfloat16,
             quant_scales=quant_scales_arg,
+            swiglu_alpha=swiglu_alpha_arg,
+            swiglu_beta=swiglu_beta_arg,
             swiglu_limit=swiglu_limit_arg,
             ep_size=layer.moe_ep_size,
             ep_rank=layer.moe_ep_rank,
@@ -439,13 +456,11 @@ class DeepSeekW4A16MoEMethod:
         )
         output = symm_output
 
-        # Apply routed_scaling_factor (DSv4 = 1.5). cutlass_fused_moe has no
-        # routed_scaling_factor parameter, so unless we hand this to the fused
-        # shared-add fast path, we multiply post-hoc. See mxfp4_deepseek for
-        # the same rationale.
-        if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
-            rsf = layer.moe_runner_config.routed_scaling_factor
-            if rsf is not None and rsf != 1.0:
-                output.mul_(rsf)
+        # Apply routed_scaling_factor: pre-multiplied into topk_weights above (RC-RSF),
+        # so skip post-hoc multiply to avoid double application.
+        # if not envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get():
+        #     rsf = layer.moe_runner_config.routed_scaling_factor
+        #     if rsf is not None and rsf != 1.0:
+        #         output.mul_(rsf)
 
         return StandardCombineInput(hidden_states=output)

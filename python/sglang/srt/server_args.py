@@ -113,7 +113,6 @@ QUANTIZATION_CHOICES = [
     "mxfp8",
     "gptq",
     "marlin",
-    "flashinfer_w4a16",
     "gptq_marlin",
     "awq_marlin",
     "bitsandbytes",

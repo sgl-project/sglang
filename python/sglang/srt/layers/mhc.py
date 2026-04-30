@@ -90,6 +90,35 @@ def hc_split_sinkhorn_kernel(hc: int, sinkhorn_iters: int, eps: float):
     return hc_split_sinkhorn_kernel_
 
 
+def _hc_split_sinkhorn_torch(mixes_flat, hc_scale, hc_base, hc_mult, sinkhorn_iters, eps):
+    """Pure PyTorch fallback for hc_split_sinkhorn_kernel."""
+    n = mixes_flat.shape[0]
+    mix_hc = (2 + hc_mult) * hc_mult
+    pre_j = torch.arange(hc_mult, device=mixes_flat.device)
+    post_j = torch.arange(hc_mult, device=mixes_flat.device)
+
+    pre = torch.sigmoid(mixes_flat[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]) + eps
+    post = 2 * torch.sigmoid(mixes_flat[:, hc_mult:2*hc_mult] * hc_scale[1] + hc_base[hc_mult:2*hc_mult])
+
+    comb_flat = mixes_flat[:, 2*hc_mult:] * hc_scale[2] + hc_base[2*hc_mult:]
+    comb = comb_flat.view(n, hc_mult, hc_mult)
+
+    row_max = comb.max(dim=2, keepdim=True).values
+    comb = torch.exp(comb - row_max)
+    row_sum = comb.sum(dim=2, keepdim=True)
+    comb = comb / row_sum + eps
+    col_sum = comb.sum(dim=1, keepdim=True)
+    comb = comb / (col_sum + eps)
+
+    for _ in range(sinkhorn_iters - 1):
+        row_sum = comb.sum(dim=2, keepdim=True)
+        comb = comb / (row_sum + eps)
+        col_sum = comb.sum(dim=1, keepdim=True)
+        comb = comb / (col_sum + eps)
+
+    return pre, post, comb
+
+
 def hc_split_sinkhorn(
     mixes: torch.Tensor,
     hc_scale: torch.Tensor,
