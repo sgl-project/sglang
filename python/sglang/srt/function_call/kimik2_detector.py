@@ -1,9 +1,16 @@
 import json
 import logging
 import re
-from typing import List, Literal, Union
+from typing import Any, List, Literal, Union
 
-from xgrammar import StructuralTag, get_model_structural_tag
+try:
+    from xgrammar import StructuralTag, get_model_structural_tag
+except ImportError:
+    StructuralTag = Any
+
+    def get_model_structural_tag(*args: Any, **kwargs: Any) -> Any:
+        return None
+
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector

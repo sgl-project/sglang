@@ -152,7 +152,7 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
-    def get_legacy_structure_tag(
+    def get_legacy_structural_tag(
         self, at_least_one: bool = False
     ) -> StructuralTagResponseFormat:
         """
@@ -228,25 +228,30 @@ class FunctionCallParser:
         )
 
         # Highest priority: model-native structural_tag when available.
-        if is_required or should_constrain_auto:
-            structural_tag = self.detector.get_structural_tag(
-                tools=self.tools,
-                thinking_mode=thinking_mode,
-                tool_choice=tool_choice,
-            )
-            if structural_tag is not None:
-                return ("structural_tag", structural_tag)
+        try:
+            if is_required or should_constrain_auto:
+                structural_tag = self.detector.get_structural_tag(
+                    tools=self.tools,
+                    thinking_mode=thinking_mode,
+                    tool_choice=tool_choice,
+                )
+                if structural_tag is not None:
+                    return ("structural_tag", structural_tag)
 
-            # Fallback to legacy structural tag if model-native tag is not supported.
-            if self.detector.supports_structural_tag():
-                # For "required"/named: always use structural_tag to preserve the
-                # model's native tool call format. Schema is only included when
-                # strict=True, per OpenAI protocol semantics.
-                # For "auto": only constrain when strict is enabled.
-                tag = self.get_legacy_structure_tag(at_least_one=is_required)
-                return ("structural_tag", tag)
-        elif tool_choice == "required" or isinstance(tool_choice, ToolChoice):
-            json_schema = get_json_schema_constraint(
-                self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
-            )
-            return ("json_schema", json_schema)
+                # Fallback to legacy structural tag if model-native tag is not supported.
+                if self.detector.supports_structural_tag():
+                    # For "required"/named: always use structural_tag to preserve the
+                    # model's native tool call format. Schema is only included when
+                    # strict=True, per OpenAI protocol semantics.
+                    # For "auto": only constrain when strict is enabled.
+                    tag = self.get_legacy_structural_tag(at_least_one=is_required)
+                    return ("structural_tag", tag)
+
+            if tool_choice == "required" or isinstance(tool_choice, ToolChoice):
+                json_schema = get_json_schema_constraint(
+                    self.tools, tool_choice, parallel_tool_calls=parallel_tool_calls
+                )
+                return ("json_schema", json_schema)
+        except Exception as e:
+            logger.error(f"Error getting structure constraint: {e}")
+            return None
