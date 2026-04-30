@@ -54,7 +54,7 @@ class PrefillDelayer:
             f"token_usage_low_watermark={self._token_usage_low_watermark}"
         )
         # The global_info contains four pieces of information:
-        # prefillable, token_watermark_force_allow, running_batch, and max_prefill_bs.
+        # prefillable, token_watermark_force_allow, new_prefill_requests_count, and max_prefill_bs.
         self.dp_size = dp_size
         self.enable_dp_attention = server_args.enable_dp_attention
         dp_size_dim = dp_size if self.enable_dp_attention else 1
@@ -78,17 +78,15 @@ class PrefillDelayer:
         self,
         local_prefillable: bool,
         token_usage: float,
-        running_batch: int = 0,
         max_prefill_bs: int = 0,
-        max_running_requests: int = 0,
+        new_prefill_requests_count: int = 0,
     ) -> _NegotiateOutput:
         out = self._negotiate_should_allow_prefill_pure(
             prev_state=self._curr_state,
             local_prefillable=local_prefillable,
             token_usage=token_usage,
-            running_batch=running_batch,
             max_prefill_bs=max_prefill_bs,
-            max_running_requests=max_running_requests,
+            new_prefill_requests_count=new_prefill_requests_count,
         )
         self._curr_state = out.next_state
         return out
@@ -99,9 +97,8 @@ class PrefillDelayer:
         prev_state: Optional[_State],
         local_prefillable: bool,
         token_usage: float,
-        running_batch: int = 0,
         max_prefill_bs: int = 0,
-        max_running_requests: int = 0,
+        new_prefill_requests_count: int = 0,
     ) -> _NegotiateOutput:
         # Compute local states
         local_token_watermark_force_allow = (
@@ -114,7 +111,7 @@ class PrefillDelayer:
         tp0_info = self._gather_info(
             local_prefillable=local_prefillable,
             local_token_watermark_force_allow=local_token_watermark_force_allow,
-            running_batch=running_batch,
+            new_prefill_requests_count=new_prefill_requests_count,
             max_prefill_bs=max_prefill_bs,
         )
         global_prefillable = tp0_info[:, 0]
@@ -142,7 +139,8 @@ class PrefillDelayer:
         if prefillable_status == "all":
             prev_delayed_count = prev_state.delayed_count if prev_state else 0
             if (
-                global_new_prefill_requests.min().item() < global_max_prefill_bs.max().item()
+                global_new_prefill_requests.min().item()
+                < global_max_prefill_bs.max().item()
             ):
                 if prev_delayed_count < self._max_delay_passes - 1:
                     # When the "num_new_prefill_requests < max_prefill_bs" condition is met,
@@ -207,7 +205,7 @@ class PrefillDelayer:
         self,
         local_prefillable: bool,
         local_token_watermark_force_allow: bool,
-        running_batch: int = 0,
+        new_prefill_requests_count: int = 0,
         max_prefill_bs: int = 0,
     ):
         local_info = torch.tensor(
@@ -252,17 +250,15 @@ class PrefillDelayerSinglePassExecutor:
     def negotiate_should_allow_prefill(
         self,
         local_prefillable: bool,
-        running_batch: int = 0,
         max_prefill_bs: int = 0,
-        max_running_requests: int = 0,
+        new_prefill_requests_count: int = 0,
     ) -> bool:
         if not self._called:
             self._result = self._prefill_delayer._negotiate_should_allow_prefill(
                 local_prefillable=local_prefillable,
                 token_usage=self._token_usage,
-                running_batch=running_batch,
                 max_prefill_bs=max_prefill_bs,
-                max_running_requests=max_running_requests,
+                new_prefill_requests_count=new_prefill_requests_count,
             )
         return self._result.output_allow
 
