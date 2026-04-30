@@ -67,9 +67,6 @@ def is_prefill_cp_in_seq_split():
     )
 
 
-_cp_bs_gt1_prefix_warned = False
-
-
 def can_cp_split(seq_len: int, cp_size: int, forward_batch):
     # Base conditions: CP must be enabled, size > 1, and this must be a
     # CP-extend (prefill) step. The seq_len // (cp_size * 2) check ensures
@@ -80,42 +77,27 @@ def can_cp_split(seq_len: int, cp_size: int, forward_batch):
         and cp_size > 1
         and forward_batch.forward_mode.is_context_parallel_extend()
         and is_prefill_context_parallel_enabled()
-        and forward_batch.seq_lens_cpu.shape[0] == 1
     ):
         return False
 
-    # Per-sequence guards for bs > 1.
+    # Per-sequence guards for bs > 1. Every sequence must be long enough for
+    # the 2*cp_size-way split. A sub-threshold request reaching this point
+    # means the scheduler failed to filter it out and a silent non-CP
+    # fallback would have masked the bug -- raise instead. Per-sequence
+    # radix-cache prefix is supported: prefix is baked into kv_len_prev/next
+    # via prefix_offsets[s] inside prepare_context_parallel_metadata.
     extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-    seq_lens_cpu = getattr(forward_batch, "seq_lens_cpu", None)
     if extend_lens is None:
         return True
-    bs = len(extend_lens)
 
-    # Every sequence must be long enough for the 2*cp_size-way split.
-    # We reject the whole batch rather than partially split; scheduler-level
-    # filtering is a v2 optimization.
     cp_min = cp_size * 2
-    for L in extend_lens:
+    for i, L in enumerate(extend_lens):
         if L < cp_min:
-            return False
-
-    # Radix-cache prefix + bs > 1 is a pre-existing silent bug (prefix_len
-    # fell back to 0 for bs != 1). Until the follow-up fix lands, gate CP
-    # off when any request has a non-zero cached prefix in a bs > 1 batch.
-    if bs > 1 and seq_lens_cpu is not None:
-        for i in range(bs):
-            prefix = int(seq_lens_cpu[i]) - int(extend_lens[i])
-            if prefix > 0:
-                global _cp_bs_gt1_prefix_warned
-                if not _cp_bs_gt1_prefix_warned:
-                    import logging
-
-                    logging.getLogger(__name__).warning(
-                        "Context parallel disabled for this batch: bs > 1 with "
-                        "non-zero radix-cache prefix is not supported yet."
-                    )
-                    _cp_bs_gt1_prefix_warned = True
-                return False
+            raise ValueError(
+                f"CP-prefill batch contains req[{i}] with extend_input_len={L} "
+                f"< cp_size*2={cp_min}. Scheduler must filter sub-threshold "
+                f"requests out of CP batches."
+            )
 
     return True
 
@@ -492,10 +474,11 @@ def prepare_context_parallel_metadata(
     bs = len(extend_seqs_len)
     cp_segment_num = cp_size * 2
 
-    # Prefix offset (radix cache hit length) per sequence. For bs > 1 this
-    # is intentionally NOT added into kv_len_prev/next here -- can_cp_split
-    # gates CP off when any prefix > 0 and bs > 1. For bs == 1 we keep the
-    # existing behavior of baking the prefix into FA cache_seqlens.
+    # Prefix offset (radix cache hit length) per sequence. For non-NSA
+    # (FlashAttention) the prefix is baked into kv_len_prev/next via
+    # prefix_offsets[s] below, so cache_seqlens correctly covers the cached
+    # prefix. NSA leaves bare cumulatives so its indexer can re-add the
+    # offset itself.
     if seqs_len is not None and len(seqs_len) == bs:
         prefix_offsets = [
             max(int(seqs_len[s]) - extend_seqs_len[s], 0) for s in range(bs)
