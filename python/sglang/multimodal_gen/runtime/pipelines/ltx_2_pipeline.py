@@ -22,7 +22,8 @@ from sglang.multimodal_gen.runtime.managers.component_manager import (
     ResidencyState,
 )
 from sglang.multimodal_gen.runtime.managers.component_resident_strategies import (
-    SnapshotStrategy, SnapshotModuleResidency,
+    SnapshotModuleResidency,
+    SnapshotStrategy,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
     ComposedPipelineBase,
