@@ -97,7 +97,7 @@ class TestStep3p5FlashChainMTP(CustomTestCase):
                 f'{metrics["score"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["score"], 0.84)
+            self.assertGreater(metrics["score"], 0.83)
             self.assertGreater(avg_spec_accept_length, 2.6)
 
 

@@ -121,14 +121,9 @@ class SchedulerMetricsMixin:
             self.attn_tp_rank == 0 or self.server_args.enable_metrics_for_all_schedulers
         )
         if self.enable_metrics:
-            if self.server_args.disaggregation_mode == DisaggregationMode.PREFILL.value:
-                engine_type = "prefill"
-            elif (
-                self.server_args.disaggregation_mode == DisaggregationMode.DECODE.value
-            ):
-                engine_type = "decode"
-            else:
-                engine_type = "unified"
+            engine_type = DisaggregationMode.to_engine_type(
+                self.server_args.disaggregation_mode
+            )
 
             labels = {
                 "model_name": self.server_args.served_model_name,

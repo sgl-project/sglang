@@ -71,7 +71,7 @@ class AdaptiveController:
     The worker only needs to:
       1. Call ``register()`` for the initial state, then ``init_states()``
          once during startup.
-      2. Call ``on_verify_complete(accept_lengths)`` after each decode verify.
+      2. Call ``on_verify_complete(num_accepted_drafts_per_req)`` after each decode verify.
     """
 
     def __init__(self, worker: AdaptiveSpecWorker, config_path: str | None = None):
@@ -107,9 +107,9 @@ class AdaptiveController:
             self._states[steps] = state
         self._activate(self.params.current_steps)
 
-    def on_verify_complete(self, accept_lengths: list[int]) -> None:
+    def on_verify_complete(self, num_accepted_drafts_per_req: list[int]) -> None:
         """Feed verify results; switch runtime state if EMA warrants it."""
-        if self.params.update(accept_lengths):
+        if self.params.update(num_accepted_drafts_per_req):
             self._activate(self.params.current_steps)
 
     def _activate(self, speculative_num_steps: int) -> None:
