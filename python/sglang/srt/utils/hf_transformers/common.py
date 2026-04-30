@@ -419,6 +419,7 @@ def _load_deepseek_v4_model(
         "hc_mult",
         "hc_sinkhorn_iters",
         "hc_eps",
+        "expert_dtype",
     ]:
         if key in raw_config and not hasattr(config, key):
             setattr(config, key, raw_config[key])
