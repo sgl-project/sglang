@@ -185,8 +185,9 @@ class RayDataParallelController(DataParallelController):
                         num_cpus=0,
                         num_gpus=1,
                         name=(
-                            f"sglang_scheduler_rank0node={self.rank0_node_ip}"
+                            f"sglang_scheduler_node{self.rank0_node_ip}"
                             f"_dp{actual_dp_rank}_pp{pp_rank}_tp{tp_rank}"
+                            f"_pg{self.pg.id.hex()[:8]}_bundle{bundle_idx}"
                         ),
                         scheduling_strategy=PlacementGroupSchedulingStrategy(
                             placement_group=self.pg,

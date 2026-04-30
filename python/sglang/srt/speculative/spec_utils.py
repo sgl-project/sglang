@@ -69,16 +69,17 @@ def create_extend_after_decode_spec_info(
     pid = tl.program_id(axis=0)
     offsets = tl.arange(0, bs_upper)
     seq_length = tl.load(seq_lens + pid)
-    accept_length = tl.load(accept_lens + pid)
+    # `accept_lens` includes the bonus token; load this req's value.
+    accept_len = tl.load(accept_lens + pid)
 
     accept_len_cumsum = tl.sum(
         tl.load(accept_lens + offsets, mask=offsets < pid, other=0)
     )
     positions_ptr = positions + accept_len_cumsum
-    mask = offsets < accept_length
-    tl.store(positions_ptr + offsets, seq_length - accept_length + offsets, mask)
+    mask = offsets < accept_len
+    tl.store(positions_ptr + offsets, seq_length - accept_len + offsets, mask)
 
-    accept_len_cumsum += accept_length - 1
+    accept_len_cumsum += accept_len - 1
     verified_id_data = tl.load(verified_id + accept_len_cumsum)
     tl.store(new_verified_id + pid, verified_id_data)
 
@@ -177,7 +178,8 @@ def assign_draft_cache_locs(
         mask = copy_offset < copy_len
         data = tl.load(out_cache_ptr + copy_offset, mask=mask)
         tl.store(token_pool + kv_start + copy_offset, data, mask=mask)
-    if page_size != 1 and topk != 1 and duplicate_cache_len > 0:
+    # XXX (MUSA): Triton issue: chained boolean operators (A or B or C) are not supported.
+    if (page_size != 1 and topk != 1) and duplicate_cache_len > 0:
         # Part 2: Copy indices into source_cache_loc and target_cache_loc
         # Expected output: src:[8,9,10,8,9,10...] tgt:[16,17,18,24,25,26...]
         prefix_len = tl.load(seq_lens + pid)
@@ -356,7 +358,7 @@ def align_evict_mask_to_page_size(
 def get_target_cache_loc(
     tgt_cache_loc,
     to_free_slots,
-    accept_length,
+    num_accepted_drafts,
     to_free_num_slots,
     out_cache_loc,
     num_verify_tokens: tl.constexpr,
@@ -368,9 +370,9 @@ def get_target_cache_loc(
     bs_offset = tl.arange(0, bs_upper)
 
     # write the first part to tgt_cache_loc
-    accept_len_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
+    accept_len_all = tl.load(num_accepted_drafts + bs_offset, mask=bs_offset < bid)
     tgt_cache_loc_start = tl.sum(accept_len_all) + bid
-    copy_len = tl.load(accept_length + bid) + 1
+    copy_len = tl.load(num_accepted_drafts + bid) + 1
     out_cache_loc_row = tl.load(
         out_cache_loc + bid * num_verify_tokens + offset, mask=offset < copy_len
     )
@@ -403,7 +405,7 @@ def get_src_tgt_cache_loc(
     seq_lens: torch.Tensor,
     out_cache_loc: torch.Tensor,
     accept_index: torch.Tensor,
-    accept_length: torch.Tensor,
+    num_accepted_drafts: torch.Tensor,
     draft_token_num: int,
     page_size: int,
 ):
@@ -411,7 +413,7 @@ def get_src_tgt_cache_loc(
     tgt_cache_loc = torch.empty_like(src_cache_loc)
     extended_len = seq_lens + draft_token_num
     keep_len = torch.minimum(
-        (seq_lens + accept_length + 1 + page_size - 1) // page_size * page_size,
+        (seq_lens + num_accepted_drafts + 1 + page_size - 1) // page_size * page_size,
         extended_len,
     )
     to_free_num_slots = extended_len - keep_len
@@ -422,23 +424,25 @@ def get_src_tgt_cache_loc(
 def filter_finished_cache_loc_kernel(
     out_cache_loc,
     tgt_cache_loc,
-    accept_length,
-    accept_length_filter,
+    num_accepted_drafts,
+    num_accepted_drafts_filter,
     bs_upper: tl.constexpr,
     num_verify_tokens_upper: tl.constexpr,
 ):
     bid = tl.program_id(0)
     bs_offset = tl.arange(0, bs_upper)
 
-    accept_length_all = tl.load(accept_length + bs_offset, mask=bs_offset < bid)
-    old_start = tl.sum(accept_length_all) + bid
-
-    accept_length_filter_all = tl.load(
-        accept_length_filter + bs_offset, mask=bs_offset < bid
+    num_accepted_drafts_all = tl.load(
+        num_accepted_drafts + bs_offset, mask=bs_offset < bid
     )
-    new_start = tl.sum(accept_length_filter_all)
+    old_start = tl.sum(num_accepted_drafts_all) + bid
 
-    copy_len = tl.load(accept_length_filter + bid)
+    num_accepted_drafts_filter_all = tl.load(
+        num_accepted_drafts_filter + bs_offset, mask=bs_offset < bid
+    )
+    new_start = tl.sum(num_accepted_drafts_filter_all)
+
+    copy_len = tl.load(num_accepted_drafts_filter + bid)
     copy_offset = tl.arange(0, num_verify_tokens_upper)
     value = tl.load(
         tgt_cache_loc + old_start + copy_offset, mask=copy_offset < copy_len
@@ -449,17 +453,17 @@ def filter_finished_cache_loc_kernel(
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
-def create_accept_length_filter(
-    accept_length: torch.Tensor,
+def create_num_accepted_drafts_filter(
+    num_accepted_drafts: torch.Tensor,
     unfinished_index_device: torch.Tensor,
     seq_lens: torch.Tensor,
 ):
-    accept_length_filter = torch.zeros_like(accept_length)
-    accept_length_filter[unfinished_index_device] = (
-        accept_length[unfinished_index_device] + 1
+    num_accepted_drafts_filter = torch.zeros_like(num_accepted_drafts)
+    num_accepted_drafts_filter[unfinished_index_device] = (
+        num_accepted_drafts[unfinished_index_device] + 1
     )
-    seq_lens.add_(accept_length + 1)
-    return accept_length_filter
+    seq_lens.add_(num_accepted_drafts + 1)
+    return num_accepted_drafts_filter
 
 
 @torch.compile(dynamic=True, disable=_is_npu)
@@ -516,7 +520,7 @@ def select_top_k_tokens(
 def generate_simulated_accept_index(
     accept_index,
     predict,
-    accept_length,
+    num_accepted_drafts,
     bs,
     spec_steps,
     simulate_acc_len: float = SIMULATE_ACC_LEN,
@@ -561,7 +565,7 @@ def generate_simulated_accept_index(
     sim_accept_index[:, :simulate_acc_len] = accept_indx_first_col + torch.arange(
         simulate_acc_len, device=accept_index.device
     )
-    accept_length.fill_(simulate_acc_len - 1)
+    num_accepted_drafts.fill_(simulate_acc_len - 1)
     predict.fill_(100)  # some legit token id
     return sim_accept_index
 
