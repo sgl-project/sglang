@@ -592,7 +592,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         extend_seq_lens = raw_metadata.extend_seq_lens
 
         seq_lens_casual, req_pool_indices_repeated = (
-            self.expend_extend_with_same_length(
+            self.expand_extend_with_same_length(
                 bs, num_draft_tokens, seq_lens, req_pool_indices
             )
         )
@@ -1154,7 +1154,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
 
         return seq_lens_casual, req_pool_indices_repeated
 
-    def expend_extend_with_same_length(
+    def expand_extend_with_same_length(
         self,
         bs: int,
         qo_len: int,
