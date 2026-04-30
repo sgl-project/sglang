@@ -1,10 +1,8 @@
 from typing import Callable, ClassVar, Collection, Optional, Tuple
 
-import torch
 from torch import nn
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils.torch_compile_utils import CompileConfig
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -14,6 +12,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
+from sglang.srt.utils.torch_compile_utils import CompileConfig, compile_callable
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -42,19 +41,14 @@ class MultiPlatformOp(nn.Module):
         compile_options: Optional[dict] = None,
         compile_dynamic: bool = False,
     ) -> Callable:
-        from sglang.srt.utils.torch_compile_utils import merge_mode_options
-
-        # Merge compile_mode and compile_options.
-        merged_options = merge_mode_options(compile_mode, compile_options)
-        return torch.compile(
+        return compile_callable(
             getattr(self, method_name),
-            options=merged_options,
-            dynamic=compile_dynamic,
+            compile_mode=compile_mode,
+            compile_options=compile_options,
+            compile_dynamic=compile_dynamic,
         )
 
-    def _matches_override_layers(
-        self, override_layers: Collection[str]
-    ) -> bool:
+    def _matches_override_layers(self, override_layers: Collection[str]) -> bool:
         """Check if any class in the MRO matches the override allowlist.
 
         This lets `--torch-compile-override-layers RotaryEmbedding` match all

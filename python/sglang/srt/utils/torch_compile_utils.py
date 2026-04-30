@@ -64,6 +64,20 @@ def merge_mode_options(
     return base
 
 
+def compile_callable(
+    fn: Callable,
+    compile_mode: Optional[str] = None,
+    compile_options: Optional[dict] = None,
+    compile_dynamic: object = False,
+) -> Callable:
+    """Compile a callable using SGLang's local torch.compile option policy."""
+    return torch.compile(
+        fn,
+        options=merge_mode_options(compile_mode, compile_options),
+        dynamic=compile_dynamic,
+    )
+
+
 def _resolve_base_compile_config(obj: object) -> tuple[str, dict, object]:
     """Resolve class-level + global default config for any object with a ``compile_config`` ClassVar."""
     mode = get_default_compile_mode()
@@ -138,14 +152,48 @@ def parse_compile_op_config(
     if not raw:
         return None
     parsed = json.loads(raw)
-    return {
-        name: CompileConfig(
-            mode=cfg.get("mode"),
-            options=cfg.get("options"),
-            dynamic=cfg["dynamic"] if "dynamic" in cfg else _UNSET,
+    if not isinstance(parsed, dict):
+        raise ValueError("expected a JSON object mapping names to config objects")
+
+    result: Dict[str, CompileConfig] = {}
+    allowed_keys = {"mode", "options", "dynamic"}
+    for name, cfg in parsed.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("config names must be non-empty strings")
+        if not isinstance(cfg, dict):
+            raise ValueError(f"config for {name!r} must be a JSON object")
+
+        unknown_keys = set(cfg) - allowed_keys
+        if unknown_keys:
+            raise ValueError(
+                f"config for {name!r} has unknown keys: {sorted(unknown_keys)}"
+            )
+
+        mode = cfg.get("mode")
+        if mode is not None and not isinstance(mode, str):
+            raise ValueError(f"config for {name!r} has non-string mode")
+
+        options = cfg.get("options")
+        if options is not None and not isinstance(options, dict):
+            raise ValueError(f"config for {name!r} has non-object options")
+
+        dynamic = cfg["dynamic"] if "dynamic" in cfg else _UNSET
+        if (
+            dynamic is not _UNSET
+            and dynamic is not True
+            and dynamic is not False
+            and dynamic is not None
+        ):
+            raise ValueError(
+                f"config for {name!r} dynamic must be true, false, or null"
+            )
+
+        result[name] = CompileConfig(
+            mode=mode,
+            options=options,
+            dynamic=dynamic,
         )
-        for name, cfg in parsed.items()
-    }
+    return result
 
 
 class CompilableRegionMixin:
@@ -153,7 +201,7 @@ class CompilableRegionMixin:
     under --torch-compile-scope local.
 
     Subclasses override ``get_compilable_regions`` to return a mapping from
-    region names (used in --torch-compile-override-layers) to the method name
+    region names (used in --torch-compile-override-regions) to the method name
     that should be compiled.  The ``_to_torch`` walk in cuda_graph_runner
     discovers these regions alongside ``MultiPlatformOp`` handling.
     """
@@ -188,12 +236,11 @@ class CompilableRegionMixin:
         """
         compile_dynamic = self._REGION_DYNAMIC.get(region_name, compile_dynamic)
 
-        # Merge compile_mode and compile_options.
-        merged_options = merge_mode_options(compile_mode, compile_options)
-        return torch.compile(
+        return compile_callable(
             getattr(self, method_name),
-            options=merged_options,
-            dynamic=compile_dynamic,
+            compile_mode=compile_mode,
+            compile_options=compile_options,
+            compile_dynamic=compile_dynamic,
         )
 
     def enter_region_compile(
@@ -221,9 +268,7 @@ class CompilableRegionMixin:
             compile_dynamic=compile_dynamic,
         )
         if not hasattr(self, "_compiled_region_originals"):
-            self._compiled_region_originals: dict[
-                str, tuple[str, object, bool]
-            ] = {}
+            self._compiled_region_originals: dict[str, tuple[str, object, bool]] = {}
         self._compiled_region_originals[region_name] = (
             method_name,
             original,

@@ -639,6 +639,7 @@ class ServerArgs:
     torch_compile_max_bs: int = 32
     torch_compile_scope: str = "full"
     torch_compile_override_layers: Optional[List[str]] = None
+    torch_compile_override_regions: Optional[List[str]] = None
     torch_compile_op_config: Optional[str] = None
     piecewise_cuda_graph_max_tokens: Optional[int] = None
     piecewise_cuda_graph_tokens: Optional[List[int]] = None
@@ -3600,15 +3601,39 @@ class ServerArgs:
                 "--torch-compile-override-layers has no effect without "
                 "--enable-torch-compile"
             )
+        if self.torch_compile_override_regions and not self.enable_torch_compile:
+            logger.warning(
+                "--torch-compile-override-regions has no effect without "
+                "--enable-torch-compile"
+            )
+        if self.torch_compile_override_regions and self.torch_compile_scope != "local":
+            logger.warning(
+                "--torch-compile-override-regions has no effect unless "
+                "--torch-compile-scope local is set"
+            )
         if (
             self.enable_torch_compile
             and self.torch_compile_scope == "local"
             and not self.torch_compile_override_layers
+            and not self.torch_compile_override_regions
         ):
             logger.warning(
                 "--torch-compile-scope local has no effect without "
-                "--torch-compile-override-layers"
+                "--torch-compile-override-layers or --torch-compile-override-regions"
             )
+        if self.torch_compile_op_config:
+            from sglang.srt.utils.torch_compile_utils import parse_compile_op_config
+
+            try:
+                parse_compile_op_config(self.torch_compile_op_config)
+            except ValueError as exc:
+                raise ValueError(f"Invalid --torch-compile-op-config: {exc}") from exc
+
+            if not self.enable_torch_compile:
+                logger.warning(
+                    "--torch-compile-op-config has no effect without "
+                    "--enable-torch-compile"
+                )
 
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
@@ -5521,7 +5546,7 @@ class ServerArgs:
             choices=["full", "local"],
             help="Set torch compile scope. `full` compiles the outer model "
             "forward, while `local` compiles only allowlisted MultiPlatformOp "
-            "layers and keeps the outer model forward eager.",
+            "layers or named regions and keeps the outer model forward eager.",
         )
         parser.add_argument(
             "--torch-compile-override-layers",
@@ -5533,10 +5558,18 @@ class ServerArgs:
             "`--torch-compile-override-layers UnquantizedFusedMoEMethod RMSNorm`.",
         )
         parser.add_argument(
+            "--torch-compile-override-regions",
+            type=str,
+            nargs="+",
+            metavar="REGION_NAME",
+            help="Allowlist named CompilableRegionMixin regions for local torch.compile. "
+            "Requires --enable-torch-compile --torch-compile-scope local.",
+        )
+        parser.add_argument(
             "--torch-compile-op-config",
             type=str,
             default=ServerArgs.torch_compile_op_config,
-            help='Per-op/region torch.compile config as a JSON string mapping '
+            help="Per-op/region torch.compile config as a JSON string mapping "
             'class or region names to {"mode": ..., "options": {...}, "dynamic": ...}. '
             '"dynamic" accepts true, false, or null (let Dynamo decide). '
             "Overrides the class-level defaults. Example: "

@@ -6,10 +6,10 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.utils.torch_compile_utils import CompilableRegionMixin
 from sglang.srt.utils.torch_compile_utils import (
-    CompileConfig,
     _UNSET,
+    CompilableRegionMixin,
+    CompileConfig,
     parse_compile_op_config,
     resolve_compile_config,
     resolve_region_compile_config,
@@ -301,7 +301,9 @@ class TestCompileConfig(CustomTestCase):
         self.assertIsInstance(cfg.mode, str)
         self.assertIsInstance(cfg.options, dict)
 
-    @patch.dict("os.environ", {"SGLANG_TORCH_COMPILE_MODE": "max-autotune-no-cudagraphs"})
+    @patch.dict(
+        "os.environ", {"SGLANG_TORCH_COMPILE_MODE": "max-autotune-no-cudagraphs"}
+    )
     def test_global_mode_from_env(self):
         op = DummyLayer()
         cfg = resolve_compile_config(op)
@@ -367,12 +369,6 @@ class TestCompileConfig(CustomTestCase):
         cfg = resolve_compile_config(op, overrides)
         self.assertEqual(cfg.mode, "sub-mode")
 
-    def test_unrelated_override_does_not_apply(self):
-        op = DummyLayer()
-        overrides = {"_OpWithCustomConfig": CompileConfig(mode="nope")}
-        cfg = resolve_compile_config(op)
-        self.assertNotEqual(cfg.mode, "nope")
-
     def test_dynamic_defaults_to_unset(self):
         op = DummyLayer()
         cfg = resolve_compile_config(op)
@@ -415,7 +411,9 @@ class TestCompileConfig(CustomTestCase):
         self.assertIsNone(parse_compile_op_config(""))
 
     def test_parse_compile_op_config_full(self):
-        raw = '{"RMSNorm": {"mode": "max-autotune", "options": {"combo_kernels": true}}}'
+        raw = (
+            '{"RMSNorm": {"mode": "max-autotune", "options": {"combo_kernels": true}}}'
+        )
         result = parse_compile_op_config(raw)
         self.assertIn("RMSNorm", result)
         self.assertEqual(result["RMSNorm"].mode, "max-autotune")
@@ -444,7 +442,9 @@ class TestCompileConfig(CustomTestCase):
 
 
 class _RegionModuleWithConfig(nn.Module, CompilableRegionMixin):
-    compile_config = CompileConfig(mode="reduce-overhead", options={"combo_kernels": True})
+    compile_config = CompileConfig(
+        mode="reduce-overhead", options={"combo_kernels": True}
+    )
 
     def __init__(self):
         super().__init__()
@@ -509,18 +509,14 @@ class TestRegionCompileConfig(CustomTestCase):
 
     def test_server_override_options(self):
         mod = _RegionModuleWithConfig()
-        overrides = {
-            "AlphaRegion": CompileConfig(options={"triton.enable_pdl": True})
-        }
+        overrides = {"AlphaRegion": CompileConfig(options={"triton.enable_pdl": True})}
         cfg = resolve_region_compile_config(mod, "AlphaRegion", overrides)
         self.assertEqual(cfg.mode, "reduce-overhead")
         self.assertEqual(cfg.options, {"triton.enable_pdl": True})
 
     def test_server_override_full(self):
         mod = _RegionModuleWithConfig()
-        overrides = {
-            "AlphaRegion": CompileConfig(mode="eager", options={"key": "val"})
-        }
+        overrides = {"AlphaRegion": CompileConfig(mode="eager", options={"key": "val"})}
         cfg = resolve_region_compile_config(mod, "AlphaRegion", overrides)
         self.assertEqual(cfg.mode, "eager")
         self.assertEqual(cfg.options, {"key": "val"})
@@ -533,9 +529,7 @@ class TestRegionCompileConfig(CustomTestCase):
 
     def test_enter_region_compile_accepts_mode(self):
         mod = _DummyRegionModule()
-        mod.enter_region_compile(
-            "TestRegion", compile_mode="reduce-overhead"
-        )
+        mod.enter_region_compile("TestRegion", compile_mode="reduce-overhead")
         self.assertTrue(mod.is_region_compiled("TestRegion"))
         mod.leave_region_compile("TestRegion")
         self.assertFalse(mod.is_region_compiled("TestRegion"))

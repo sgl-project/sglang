@@ -21,7 +21,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
 )
-from sglang.srt.utils.torch_compile_utils import CompileConfig
+from sglang.srt.utils.torch_compile_utils import CompileConfig, compile_callable
 
 if TYPE_CHECKING:
     from sglang.jit_kernel.rope import FusedSetKVBufferArg  # For type check-only
@@ -208,8 +208,6 @@ class RotaryEmbedding(MultiPlatformOp):
     ) -> Callable:
         global _logged_rope_local_compile_dynamic_override
 
-        from sglang.srt.utils.torch_compile_utils import merge_mode_options
-
         # forward_native can handle fused KV cache writes. cache_loc varies
         # across calls, so local RoPE compile must use dynamic shapes even if
         # an override tries to disable them.
@@ -224,12 +222,11 @@ class RotaryEmbedding(MultiPlatformOp):
             _logged_rope_local_compile_dynamic_override = True
         compile_dynamic = True
 
-        # Merge compile_mode and compile_options.
-        merged_options = merge_mode_options(compile_mode, compile_options)
-        return torch.compile(
+        return compile_callable(
             getattr(self, method_name),
-            options=merged_options,
-            dynamic=compile_dynamic,
+            compile_mode=compile_mode,
+            compile_options=compile_options,
+            compile_dynamic=compile_dynamic,
         )
 
     def forward_native(

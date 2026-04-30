@@ -63,14 +63,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.token_dispatcher.deepep import DeepEPBuffer
 from sglang.srt.layers.moe.utils import get_deepep_mode, get_moe_a2a_backend
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.utils.torch_compile_utils import (
-    CompilableRegionMixin,
-    CompileConfig,
-    _UNSET,
-    parse_compile_op_config,
-    resolve_compile_config,
-    resolve_region_compile_config,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -94,6 +86,14 @@ from sglang.srt.utils import (
     require_mlp_tp_gather,
 )
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
+from sglang.srt.utils.torch_compile_utils import (
+    _UNSET,
+    CompilableRegionMixin,
+    CompileConfig,
+    parse_compile_op_config,
+    resolve_compile_config,
+    resolve_region_compile_config,
+)
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 try:
@@ -111,6 +111,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 _has_foreach_copy = hasattr(torch, "_foreach_copy_")
+
 
 def _grouped_foreach_copy_(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> None:
     """Call torch._foreach_copy_ grouped by (dst_dtype, src_dtype) pairs."""
@@ -430,6 +431,7 @@ def _to_torch(
     num_tokens: int,
     compile_scope: str = "full",
     override_layers: Optional[Collection[str]] = None,
+    override_regions: Optional[Collection[str]] = None,
     compile_overrides: Optional[Dict[str, CompileConfig]] = None,
     compile_dynamic: bool = False,
 ):
@@ -456,7 +458,7 @@ def _to_torch(
         # normally, so region-level compile is skipped to avoid nesting.
         if compile_scope == "local" and isinstance(sub, CompilableRegionMixin):
             for region_name in sub.get_compilable_regions():
-                if override_layers is not None and region_name not in override_layers:
+                if override_regions is None or region_name not in override_regions:
                     continue
                 if reverse:
                     sub.leave_region_compile(region_name)
@@ -481,6 +483,7 @@ def _to_torch(
                 num_tokens,
                 compile_scope=compile_scope,
                 override_layers=override_layers,
+                override_regions=override_regions,
                 compile_overrides=compile_overrides,
                 compile_dynamic=compile_dynamic,
             )
@@ -494,12 +497,16 @@ def patch_model(
     tp_group: GroupCoordinator,
     compile_scope: str = "full",
     override_layers: Optional[List[str]] = None,
+    override_regions: Optional[List[str]] = None,
     compile_op_config: Optional[str] = None,
 ):
     """Patch the model to make it compatible with with torch.compile"""
     backup_ca_comm = None
     override_layer_set = (
         frozenset(override_layers) if override_layers is not None else None
+    )
+    override_region_set = (
+        frozenset(override_regions) if override_regions is not None else None
     )
     compile_dynamic = _is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE")
     compile_overrides = parse_compile_op_config(compile_op_config)
@@ -512,6 +519,7 @@ def patch_model(
                 num_tokens=num_tokens,
                 compile_scope=compile_scope,
                 override_layers=override_layer_set,
+                override_regions=override_region_set,
                 compile_overrides=compile_overrides,
                 compile_dynamic=compile_dynamic,
             )
@@ -542,6 +550,7 @@ def patch_model(
                 num_tokens=num_tokens,
                 compile_scope=compile_scope,
                 override_layers=override_layer_set,
+                override_regions=override_region_set,
                 compile_overrides=compile_overrides,
                 compile_dynamic=compile_dynamic,
             )
@@ -895,14 +904,16 @@ class CudaGraphRunner:
                         f"Capturing batches ({bs=} {avail_mem=:.2f} GB)"
                     )
 
+                server_args = self.model_runner.server_args
                 with patch_model(
                     self.model_runner.model,
                     bs in self.compile_bs,
                     num_tokens=bs * self.num_tokens_per_bs,
                     tp_group=self.model_runner.tp_group,
-                    compile_scope=self.model_runner.server_args.torch_compile_scope,
-                    override_layers=self.model_runner.server_args.torch_compile_override_layers,
-                    compile_op_config=self.model_runner.server_args.torch_compile_op_config,
+                    compile_scope=server_args.torch_compile_scope,
+                    override_layers=server_args.torch_compile_override_layers,
+                    override_regions=server_args.torch_compile_override_regions,
+                    compile_op_config=server_args.torch_compile_op_config,
                 ) as forward:
                     (
                         graph,
