@@ -225,41 +225,9 @@ def nsa_use_prefill_cp(forward_batch, nsa_enable_prefill_cp=None):
         and nsa_enable_prefill_cp
         and forward_batch.forward_mode.is_context_parallel_extend()
     ):
-        if envs.SGLANG_DEBUG_HACK_CP_ASSERT_PURE_EXTEND.get():
-            _assert_cp_pure_extend(forward_batch)
         return True
     else:
         return False
-
-
-def _assert_cp_pure_extend(forward_batch: "ForwardBatch") -> None:
-    """Debug assert: CP round-robin requires pure EXTEND batches.
-
-    Gated by SGLANG_DEBUG_HACK_CP_ASSERT_PURE_EXTEND. Raises if a request
-    in the batch has prior KV cache (extend_seq_lens != seq_lens), which
-    would silently cause domain mismatch under CP round-robin split.
-    """
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-
-    mode = forward_batch.forward_mode
-    assert mode == ForwardMode.EXTEND, (
-        f"SGLANG_DEBUG_HACK_CP_ASSERT_PURE_EXTEND: expected ForwardMode.EXTEND, got {mode}. "
-        "CP round-robin may be silently enabled on MIXED batches."
-    )
-
-    extend_lens = list(forward_batch.extend_seq_lens_cpu)
-    seq_lens = list(forward_batch.seq_lens_cpu.tolist())
-    assert len(extend_lens) == len(
-        seq_lens
-    ), f"extend_seq_lens_cpu ({len(extend_lens)}) != seq_lens_cpu ({len(seq_lens)})"
-    mismatched = [
-        (i, e, s) for i, (e, s) in enumerate(zip(extend_lens, seq_lens)) if e != s
-    ]
-    assert not mismatched, (
-        f"SGLANG_DEBUG_HACK_CP_ASSERT_PURE_EXTEND: found chunked-prefill continuation "
-        f"(extend_seq_lens != seq_lens) at {mismatched[:5]}{'...' if len(mismatched) > 5 else ''}. "
-        "A request has prior KV cache; CP round-robin may have domain mismatch."
-    )
 
 
 def assert_tensor_identical_across_cp_ranks(
