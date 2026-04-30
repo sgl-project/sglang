@@ -58,7 +58,6 @@ from sglang.srt.mem_cache.evict_policy import (
 )
 from sglang.srt.mem_cache.utils import (
     KVCacheEventMixin,
-    compute_node_hash_values,
     split_node_hash_value,
 )
 
@@ -805,6 +804,7 @@ class RadixCache(KVCacheEventMixin, BasePrefixCache):
                     continue
                 stack.append(child)
         return total_size
+
 
 if __name__ == "__main__":
     tree = RadixCache.create_simulated()

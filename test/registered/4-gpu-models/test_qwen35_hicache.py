@@ -139,7 +139,7 @@ class TestQwen35WithHiCache(CustomTestCase):
         sub.setsockopt_string(zmq.SUBSCRIBE, "kv-events")
 
         try:
-            time.sleep(0.2)
+            time.sleep(1.0)
             res = requests.post(
                 f"{self.base_url}/generate",
                 json={

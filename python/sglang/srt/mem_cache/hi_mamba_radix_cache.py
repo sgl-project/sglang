@@ -39,9 +39,8 @@ from sglang.srt.mem_cache.mamba_radix_cache import (
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
-    compute_node_hash_values,
-    split_node_hash_value,
 )
+from sglang.srt.mem_cache.utils import compute_node_hash_values, split_node_hash_value
 from sglang.srt.observability.metrics_collector import StorageMetricsCollector
 
 if TYPE_CHECKING:
