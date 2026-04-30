@@ -29,7 +29,6 @@ import collections
 import sys
 import unittest
 import unittest.mock
-from functools import partial
 from queue import Queue
 
 import torch
@@ -40,8 +39,6 @@ from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import (
     RadixKey,
     TreeNode,
-    _key_match_page_size1,
-    get_child_key,
 )
 
 # ---------------------------------------------------------------------------
@@ -67,9 +64,10 @@ def _create_test_hiradix_cache(host_memory_mode="buffer_only", page_size=1):
     cache.metrics_collector = None
     cache.eviction_strategy = LRUStrategy()
     cache.evictable_leaves = set()
-
-    cache.key_match_fn = _key_match_page_size1
-    cache.get_child_key_fn = partial(get_child_key, page_size=page_size)
+    cache.attn_cp_group = None
+    cache.attn_tp_group = None
+    cache.tp_world_size = 1
+    cache.tp_group = None
 
     # Root node
     root = TreeNode(priority=-sys.maxsize)
@@ -100,7 +98,7 @@ def _create_test_hiradix_cache(host_memory_mode="buffer_only", page_size=1):
     cache.enable_storage_metrics = False
     cache.storage_metrics_collector = None
     cache.hicache_storage_pass_prefix_keys = False
-    cache.prefetch_threshold = 0
+    cache.prefetch_threshold = 1
     cache.prefetch_stop_policy = "best_effort"
     cache.tp_world_size = 1
     cache.tp_group = None
@@ -129,7 +127,7 @@ def _make_node(cache, parent, token_ids, value_tensor=None):
     node.key = RadixKey(token_ids=token_ids)
     node.value = value_tensor
     node.hash_value = [f"h{t}" for t in token_ids]
-    child_key = cache.get_child_key_fn(node.key)
+    child_key = node.key.child_key(cache.page_size)
     parent.children[child_key] = node
     if value_tensor is not None:
         cache.evictable_size_ += len(value_tensor)
@@ -188,7 +186,7 @@ class TestBufferOnlyEvictionDeletesFromTree(unittest.TestCase):
 
     def test_eviction_deletes_node_from_tree(self):
         node = _make_node(self.cache, self.cache.root_node, [1], torch.tensor([10]))
-        child_key = self.cache.get_child_key_fn(node.key)
+        child_key = node.key.child_key(self.cache.page_size)
         self.assertIn(child_key, self.cache.root_node.children)
 
         self.cache.evict(EvictParams(num_tokens=1))
@@ -221,7 +219,7 @@ class TestCacheModeEvictBackuped(unittest.TestCase):
         cache = _create_test_hiradix_cache(host_memory_mode="cache")
         node = _make_node(cache, cache.root_node, [1, 2], torch.tensor([10, 11]))
         node.host_value = torch.tensor([20, 21])
-        child_key = cache.get_child_key_fn(node.key)
+        child_key = node.key.child_key(cache.page_size)
 
         result = cache._evict_backuped(node)
 
@@ -273,6 +271,7 @@ class TestPrefetchAnchorLockRef(unittest.TestCase):
         anchor = self._make_anchor()
         cc = self.cache.cache_controller
         cc.mem_pool_host.alloc = unittest.mock.Mock(return_value=None)
+        cc.mem_pool_host.available_size = unittest.mock.Mock(return_value=0)
 
         self.cache.prefetch_from_storage("req1", anchor, [5, 6, 7, 8], last_hash="h4")
 
