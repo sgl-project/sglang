@@ -384,7 +384,7 @@ constexpr auto FP8_E4M3_MAX = 224.0f;
 using FP8_TYPE = c10::Float8_e4m3fn;
 C10_HOST_DEVICE constexpr auto FP8_E4M3_MAX = std::numeric_limits<FP8_TYPE>::max();
 #else
-#error "fp8 is not supported in this processor (arch < gfx942)."
+#error "FP8 is not supported on this AMD GPU. Enable FP8 only for gfx942+ (CDNA3) or RDNA4 (gfx1200+)."
 #endif  // HIP_FP8_TYPE_E4M3
 #endif  // HIP_FP8_TYPE_FNUZ
 #endif  // USE_ROCM
