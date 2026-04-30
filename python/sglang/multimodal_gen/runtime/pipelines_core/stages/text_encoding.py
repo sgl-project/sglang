@@ -190,6 +190,9 @@ class TextEncodingStage(PipelineStage):
             else f"text_encoder_{encoder_index + 1}"
         )
         use = self._declared_component_use(component_name=component_name)
+        # TODO: Keep this begin-only interval until manager supports explicit
+        # declared-use interval grouping. Wrapping each encoder call separately
+        # can offload between positive and negative prompt encoding.
         manager.before_use(use)
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):

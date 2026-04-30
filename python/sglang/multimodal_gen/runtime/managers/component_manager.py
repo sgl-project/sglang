@@ -30,6 +30,9 @@ class ComponentUse:
     # Pipeline module key: transformer / video_dit / text_encoder / ...
     component_name: str
     # Model-specific phase for sequential components, e.g. stage1 or stage2.
+    # TODO: Replace this with ordered timeline identity. In an all-sequential
+    # pipeline, use-site identity should come from the declared ComponentUse
+    # order instead of a per-use `phase` field.
     phase: str | None = None
     # Whether the manager may prepare this component for the next request.
     preferred_ready_after_request: bool = False
