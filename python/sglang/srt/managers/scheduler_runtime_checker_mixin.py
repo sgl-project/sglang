@@ -555,6 +555,9 @@ class SchedulerRuntimeCheckerMixin:
         # reset token ratio
         self.new_token_ratio = self.init_new_token_ratio
 
+        # reset device timer window so idle time isn't counted
+        self.reset_device_timer_window()
+
         # sleep until next event
         self.maybe_sleep_on_idle()
 
