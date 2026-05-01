@@ -435,11 +435,6 @@ class CompressorPrefillPlan(NamedTuple):
     compress_plan: torch.Tensor
     write_plan: torch.Tensor
 
-    def copy_(self, other: CompressorPrefillPlan) -> None:
-        assert self.compress_ratio == other.compress_ratio
-        self.compress_plan.copy_(other.compress_plan)
-        self.write_plan.copy_(other.write_plan)
-
     @staticmethod
     def generate(
         compress_ratio: Literal[4, 128],
