@@ -1189,6 +1189,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         return self._routed_experts_weights_of_layer.value
 
     def determine_num_fused_shared_experts(self):
+        self.num_fused_shared_experts = 0
         if get_global_server_args().disable_shared_experts_fusion:
             return
 
@@ -1367,7 +1368,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=self.config.n_routed_experts + self.num_fused_shared_experts,
         )
 
         if self.quant_config and self.quant_config.get_name() == "w4afp8":
@@ -1399,6 +1400,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                 "hc_head_scale",
             ]
 
+        if self.num_fused_shared_experts > 0:
+            assert self.num_fused_shared_experts == 1
+            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
+
         with concurrent.futures.ThreadPoolExecutor() as executor:
             futures = []
             weight_names = []
@@ -1422,6 +1427,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                         )
                     ):
                         continue
+                    if (
+                        self.num_fused_shared_experts > 0
+                        and "mlp.shared_experts" in name
+                    ):
+                        name = name.replace(
+                            "mlp.shared_experts",
+                            f"mlp.experts.{self.config.n_routed_experts}",
+                        )
+
                     weight_names.append(name)
 
                     if not is_nextn:
