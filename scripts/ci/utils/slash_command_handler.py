@@ -13,6 +13,126 @@ from github import Auth, Github
 PERMISSIONS_FILE_PATH = ".github/CI_PERMISSIONS.json"
 
 
+MAINTENANCE_ISSUE_NUMBER = 21065
+
+
+def _check_rebase_gate(gh_repo, pr, token):
+    """
+    Pre-dispatch gate mirroring `.github/actions/check-maintenance/action.yml`.
+
+    Without this, /rerun-stage and /rerun-test would dispatch a workflow_run
+    on a PR that's behind a required base, the action would catch it, and
+    every job in the run would fail at the gate — wasting runner time and
+    producing N error annotations instead of one comment. Pre-checking here
+    short-circuits the dispatch and posts a single explanatory comment.
+
+    Mirrors the action's two independent modes driven by issue #21065:
+      (1) Full-pause: maintenance issue is OPEN
+      (2) Rebase-required: issue body contains `MIN_BASE_SHA: <sha>`
+    Both bypassed by the `bypass-maintenance` PR label.
+
+    Returns (allowed: bool, message: Optional[str]). When allowed=False,
+    caller MUST post `message` to the PR and skip dispatch.
+    Fail-open on API errors (matches the action's behavior).
+    """
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    repo_full_name = gh_repo.full_name
+
+    try:
+        issue_resp = requests.get(
+            f"https://api.github.com/repos/{repo_full_name}/issues/{MAINTENANCE_ISSUE_NUMBER}",
+            headers=headers,
+            timeout=15,
+        )
+        if issue_resp.status_code != 200:
+            print(
+                f"check_rebase_gate: issue fetch returned {issue_resp.status_code}; fail-open"
+            )
+            return True, None
+        issue_data = issue_resp.json()
+    except Exception as e:
+        print(f"check_rebase_gate: issue fetch failed ({e}); fail-open")
+        return True, None
+
+    issue_state = (issue_data.get("state") or "").lower()
+    issue_body = issue_data.get("body") or ""
+
+    min_base_sha = None
+    # First MIN_BASE_SHA: <sha> line wins. Match the action's parser:
+    # tolerate optional backticks and either ':' or '=' separator.
+    for line in issue_body.replace("\r", "").split("\n"):
+        m = re.match(
+            r"^\s*`?MIN_BASE_SHA`?\s*[:=]\s*`?([A-Fa-f0-9]+)`?",
+            line,
+        )
+        if m:
+            candidate = m.group(1)
+            if 7 <= len(candidate) <= 40:
+                min_base_sha = candidate
+            break
+
+    gate_active = (issue_state == "open") or bool(min_base_sha)
+    if not gate_active:
+        return True, None
+
+    bypass = any(
+        (lbl.name if hasattr(lbl, "name") else lbl.get("name")) == "bypass-maintenance"
+        for lbl in pr.get_labels()
+    )
+    if bypass:
+        print("check_rebase_gate: PR has bypass-maintenance label; allowing dispatch")
+        return True, None
+
+    if issue_state == "open":
+        msg = (
+            "## ⚠️ CI Maintenance Mode is Active\n"
+            "The CI infrastructure is currently under maintenance. "
+            "All PR CI runs are paused until maintenance is complete. "
+            "**Merging non-CI-fix PRs is prohibited during maintenance mode.**\n\n"
+            f"Follow [issue #{MAINTENANCE_ISSUE_NUMBER}]"
+            f"(https://github.com/{repo_full_name}/issues/{MAINTENANCE_ISSUE_NUMBER}) "
+            "for status updates. Re-run was not dispatched."
+        )
+        return False, msg
+
+    # MIN_BASE_SHA set, issue not OPEN — check rebase status.
+    pr_head_sha = pr.head.sha
+    try:
+        compare_resp = requests.get(
+            f"https://api.github.com/repos/{repo_full_name}/compare/{min_base_sha}...{pr_head_sha}",
+            headers=headers,
+            timeout=15,
+        )
+        if compare_resp.status_code != 200:
+            print(
+                f"check_rebase_gate: compare API returned {compare_resp.status_code}; fail-open"
+            )
+            return True, None
+        status = compare_resp.json().get("status", "unknown")
+    except Exception as e:
+        print(f"check_rebase_gate: compare API failed ({e}); fail-open")
+        return True, None
+
+    if status in ("ahead", "identical"):
+        return True, None
+
+    msg = (
+        "## ⚠️ Rebase Required Before Re-run\n"
+        f"A major update has landed on `main`. Your PR is `{status}` relative "
+        f"to required base commit `{min_base_sha[:12]}`.\n\n"
+        "**Re-run was not dispatched.** What to do:\n"
+        "- Rebase your branch onto the latest `main` and push again\n"
+        f"- Follow [issue #{MAINTENANCE_ISSUE_NUMBER}]"
+        f"(https://github.com/{repo_full_name}/issues/{MAINTENANCE_ISSUE_NUMBER}) for context\n"
+        "- CI-fix PRs may request the `bypass-maintenance` label to skip this check"
+    )
+    return False, msg
+
+
 def find_workflow_run_url(
     gh_repo,
     workflow_id,
@@ -343,6 +463,12 @@ def handle_rerun_stage(
             + "\n".join(f"- `{s}`" for s in amd_stages)
             + "\n\nOther stages will be added soon. For now, use `/rerun-failed-ci` for those stages."
         )
+        return False
+
+    allowed, gate_msg = _check_rebase_gate(gh_repo, pr, token)
+    if not allowed:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(gate_msg)
         return False
 
     try:
@@ -936,6 +1062,12 @@ def handle_rerun_test(
             "- `/rerun-test test_srt_endpoint.py`\n"
             "- `/rerun-test test_a.py test_b.py test_c.py` (multiple tests)"
         )
+        return False
+
+    allowed, gate_msg = _check_rebase_gate(gh_repo, pr, token)
+    if not allowed:
+        comment.create_reaction("confused")
+        pr.create_issue_comment(gate_msg)
         return False
 
     # Phase 1: Resolve all specs
