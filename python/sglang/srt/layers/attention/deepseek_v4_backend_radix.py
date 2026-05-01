@@ -323,7 +323,6 @@ class DSV4MetadataRawVerify:
     out_cache_loc: torch.Tensor
 
     extend_seq_lens: Optional[torch.Tensor] = None
-    real_metadata: Optional[DSV4MetadataRadix] = None
 
     def copy_(self, other: DSV4MetadataRawVerify):
         self.req_pool_indices.copy_(other.req_pool_indices)
@@ -338,8 +337,6 @@ class DSV4MetadataRawDecode:
     req_pool_indices: torch.Tensor
     seq_lens: torch.Tensor
     out_cache_loc: torch.Tensor
-
-    real_metadata: Optional[DSV4MetadataRadix] = None
 
     def copy_(self, other: DSV4MetadataRawDecode):
         self.req_pool_indices.copy_(other.req_pool_indices)
