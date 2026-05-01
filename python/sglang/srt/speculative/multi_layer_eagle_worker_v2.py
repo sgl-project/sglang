@@ -676,7 +676,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             if model_worker_batch.spec_info is None:
                 model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
                     device=self.device,
-                    hidden_size=self.target_worker.model_config.hidden_size,
+                    hidden_size=self.target_worker.model_config.spec_hidden_size,
                     dtype=self.target_worker.model_config.dtype,
                     topk=self.topk * self.speculative_num_steps,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
@@ -684,6 +684,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             draft_input: EagleDraftInput = model_worker_batch.spec_info
             verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
             assert verify_input.is_verify_input()
+            # Record a CUDA event after draft() GPU work is dispatched.
+            if self.plan_stream:
+                self._draft_done_event = torch.get_device_module(self.device).Event()
+                self._draft_done_event.record()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
@@ -707,6 +711,10 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         # Batch 1: Target verify
         # Prepare for target verify in a separate stream
         with self.plan_stream_ctx:
+            # Wait for the draft CUDA graph to finish before plan_stream
+            # begins its work.
+            if self.plan_stream and hasattr(self, "_draft_done_event"):
+                self.plan_stream.wait_event(self._draft_done_event)
             verify_forward_batch, can_run_cuda_graph = (
                 verify_input.prepare_for_v2_verify(
                     self.req_to_token_pool,
@@ -745,19 +753,19 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
         maybe_detect_nan(logits_output.next_token_logits, "verify: target model logits")
         (
             predict,
-            accept_length,
+            accept_lens,
             accept_index,
         ) = verify_input.sample(batch, logits_output)
-        new_seq_lens = batch.seq_lens + accept_length
+        new_seq_lens = batch.seq_lens + accept_lens
         verify_done = torch.get_device_module(self.device).Event()
         verify_done.record()
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
-            verified_id = torch.empty_like(accept_length, dtype=torch.int32)
+            verified_id = torch.empty_like(accept_lens, dtype=torch.int32)
             fill_new_verified_id[(bs,)](
                 all_verified_id,
-                accept_length,
+                accept_lens,
                 verified_id,
                 self.speculative_num_draft_tokens,
             )
@@ -780,7 +788,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             next_token_ids=predict,
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
-            accept_lens=accept_length,
+            accept_lens=accept_lens,
             routed_experts_output=forward_batch_output.routed_experts_output,
         )
 

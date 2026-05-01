@@ -34,7 +34,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import should_use_dp_reduce_scatterv
+from sglang.srt.layers.moe import should_skip_post_experts_all_reduce
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -192,11 +192,14 @@ class HYV3MoEFused(nn.Module):
                 hidden_states=hidden_states, topk_output=topk_output
             )
 
-        skip_post_reduce = should_use_dp_reduce_scatterv()
-        if self.ep_size > 1 and not skip_post_reduce:
+        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=False,
+        ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
-        if self.tp_size > 1 and not skip_post_reduce:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+        ):
             final_hidden_states = moe_tensor_model_parallel_all_reduce(
                 final_hidden_states
             )
@@ -224,11 +227,14 @@ class HYV3MoEFused(nn.Module):
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states = final_hidden_states + shared_output
 
-        skip_post_reduce = should_use_dp_reduce_scatterv()
-        if self.ep_size > 1 and not skip_post_reduce:
+        if self.ep_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=False,
+        ):
             final_hidden_states = moe_expert_parallel_all_reduce(final_hidden_states)
 
-        if self.tp_size > 1 and not skip_post_reduce:
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+        ):
             final_hidden_states = moe_tensor_model_parallel_all_reduce(
                 final_hidden_states
             )

@@ -317,8 +317,10 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         if _is_npu:
             for weight_name in ["w13_weight", "w2_weight"]:
                 weight = getattr(layer, weight_name)
-                weight.data = weight.data.transpose(1, 2)
-                weight.data = npu_format_cast(weight.data)
+                origin_weight = weight.data.transpose(1, 2)
+                new_weight = origin_weight.contiguous()
+                origin_weight.untyped_storage().resize_(0)
+                weight.data = npu_format_cast(new_weight)
 
         return
 
@@ -584,6 +586,9 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             from sgl_kernel import fused_experts
 
             topk_weights, topk_ids, _ = topk_output
+            if moe_runner_config.apply_router_weight_on_input:
+                x = x * topk_weights.to(x.dtype)
+                topk_weights = torch.ones_like(topk_weights)
             output = fused_experts(
                 x,
                 layer.w13_weight,

@@ -38,7 +38,7 @@ from sglang.srt.observability.req_time_stats import (
     SchedulerReqTimeStats,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import ImageData
+from sglang.srt.utils import ImageData, VideoData
 
 # Handle serialization of Image for pydantic
 if TYPE_CHECKING:
@@ -93,8 +93,9 @@ class SpeculativeDecodingMetricsMixin:
     # Verify count: number of verification forward passes
     spec_verify_ct: List[int]
 
-    # Accepted tokens: Number of accepted tokens during speculative decoding
-    spec_accepted_tokens: List[int]
+    # Accepted drafts: Number of accepted draft tokens during speculative decoding
+    # (strict drafts-only count, excludes the bonus token).
+    spec_accepted_drafts: List[int]
 
     # Acceptance histogram: List of lists, where each inner list represents histogram counts.
     # List index = number of accepted tokens in a step, List value = count of steps with that many accepted tokens.
@@ -117,7 +118,7 @@ class SessionParams:
 # Individual data item types for each modality
 ImageDataInputItem = Union[Image, str, ImageData, Dict]
 AudioDataInputItem = Union[str, Dict]
-VideoDataInputItem = Union[str, Dict]
+VideoDataInputItem = Union[str, VideoData, Dict]
 # Union type for any multimodal data item
 MultimodalDataInputItem = Union[
     ImageDataInputItem, VideoDataInputItem, AudioDataInputItem
@@ -1915,7 +1916,12 @@ class SpeculativeMetrics:
     """Speculative decoding metrics."""
 
     accept_length: float = field(
-        metadata={"metric": ("gauge", "Avg accepted tokens per step")}
+        metadata={
+            "metric": (
+                "gauge",
+                "Mean acceptance length (accepted drafts + bonus token per forward)",
+            )
+        }
     )
     accept_rate: float = field(
         metadata={"metric": ("gauge", "Speculative acceptance rate")}
