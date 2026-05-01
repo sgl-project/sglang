@@ -19,13 +19,24 @@ from .markers import get_marker_kwargs, get_marker_value
 logger = logging.getLogger(__name__)
 
 
-@pytest.fixture(scope="class")
+@pytest.fixture
 def setup_backend(request: pytest.FixtureRequest, model_pool: "ModelPool"):
-    """Class-scoped fixture that launches a router for each test class.
+    """Function-scoped fixture that launches a router for each test.
 
     Routers are cheap to start (~1-2s) compared to workers (~30-60s), so we
-    launch a fresh router per test class for isolation while reusing the
-    expensive workers from model_pool.
+    launch a fresh router per test for isolation while reusing the expensive
+    workers from the session-scoped model_pool fixture.
+
+    NOTE: This used to be ``scope="class"`` to amortize router startup across
+    tests in the same class. Class-scoped fixtures don't survive
+    pytest-parallel's ``--tests-per-worker N`` thread dispatch — its fixture-
+    finalize handling for non-function scopes is buggy (the project hasn't
+    had a real release since 2019). The class teardown silently never fired,
+    so model_pool references acquired in setup leaked indefinitely, blocking
+    eviction and deadlocking any subsequent test that needed a different
+    model. Function scope walks the canonical pytest finalize path for
+    every test, so each acquire is paired with a real release and the pool
+    can evict cleanly.
 
     Backend types:
     - "http", "grpc": Gets existing worker from model_pool, launches router
