@@ -576,7 +576,6 @@ class Envs:
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
     SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
-    SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM = EnvBool(True)  # verified in journal 2026-04-21-017
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
     # TODO(DSV4): @ispobock this has bug on main branch when retract
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)

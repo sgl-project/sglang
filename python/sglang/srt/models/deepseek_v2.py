@@ -691,8 +691,7 @@ class DeepseekV2MoE(nn.Module):
 
         if not self._enable_a2a_moe:
             if (
-                envs.SGLANG_OPT_ALLOW_SHARED_EXPERT_DUAL_STREAM.get()
-                and self.alt_stream is not None
+                self.alt_stream is not None
                 and self.num_fused_shared_experts == 0
                 and hidden_states.shape[0] > 0
                 and get_is_capture_mode()
