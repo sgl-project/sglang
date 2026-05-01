@@ -175,6 +175,7 @@ class TestEnableMetrics(CustomTestCase):
             "sglang:num_unique_running_routing_keys",
             "sglang:routing_key_running_req_count",
             "sglang:routing_key_all_req_count",
+            "sglang:avg_request_queue_latency",
         ]
         mfu_metrics = [
             "sglang:estimated_flops_per_gpu_total",
