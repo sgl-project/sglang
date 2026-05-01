@@ -183,6 +183,38 @@ class SchedulerMetricsMixin:
         # Bonus tokens updated elsewhere
         self.num_generated_tokens += num_accepted_drafts
 
+    def _get_adaptive_spec_metrics(self: Scheduler) -> dict[str, float | int]:
+        draft_worker = getattr(self, "draft_worker", None)
+        controller = getattr(draft_worker, "adaptive_controller", None)
+        if controller is None and draft_worker is not None:
+            nested_draft_worker = getattr(draft_worker, "draft_worker", None)
+            controller = getattr(nested_draft_worker, "adaptive_controller", None)
+        if controller is None:
+            return {
+                "enabled": 0,
+                "current_steps": 0,
+                "previous_steps": 0,
+                "num_tier_switches": 0,
+                "ema_accept_len": 0.0,
+                "last_batch_accept_len": 0.0,
+                "wasted_draft_ratio": 0.0,
+            }
+        return controller.get_metrics()
+
+    def _update_adaptive_spec_stats(self: Scheduler) -> None:
+        metrics = self._get_adaptive_spec_metrics()
+        self.stats.adaptive_spec_enabled = int(metrics["enabled"])
+        self.stats.adaptive_spec_current_steps = int(metrics["current_steps"])
+        self.stats.adaptive_spec_previous_steps = int(metrics["previous_steps"])
+        self.stats.adaptive_spec_num_tier_switches = int(metrics["num_tier_switches"])
+        self.stats.adaptive_spec_ema_accept_length = float(metrics["ema_accept_len"])
+        self.stats.adaptive_spec_last_batch_accept_length = float(
+            metrics["last_batch_accept_len"]
+        )
+        self.stats.adaptive_spec_wasted_draft_ratio = float(
+            metrics["wasted_draft_ratio"]
+        )
+
     def _init_estimated_perf_constants(self: Scheduler) -> None:
         model_config = self.model_config
         hf_text_config = model_config.hf_text_config
@@ -611,6 +643,7 @@ class SchedulerMetricsMixin:
             # Speculative decoding
             self.stats.spec_accept_rate = spec_accept_rate
             self.stats.spec_accept_length = spec_accept_length
+            self._update_adaptive_spec_stats()
 
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
@@ -839,13 +872,36 @@ class SchedulerMetricsMixin:
 
         speculative = None
         if include_all or "spec" in include:
-            if not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0:
+            adaptive_metrics = self._get_adaptive_spec_metrics()
+            has_spec_totals = (
+                not self.spec_algorithm.is_none() and self.spec_total_num_forward_ct > 0
+            )
+            if not self.spec_algorithm.is_none() and (
+                has_spec_totals or adaptive_metrics["enabled"]
+            ):
                 speculative = SpeculativeMetrics(
                     accept_length=(
                         self.spec_total_num_accepted_tokens
                         / self.spec_total_num_forward_ct
+                        if self.spec_total_num_forward_ct > 0
+                        else 0.0
                     ),
                     accept_rate=self.stats.spec_accept_rate,
+                    adaptive_enabled=int(adaptive_metrics["enabled"]),
+                    adaptive_current_steps=int(adaptive_metrics["current_steps"]),
+                    adaptive_previous_steps=int(adaptive_metrics["previous_steps"]),
+                    adaptive_num_tier_switches=int(
+                        adaptive_metrics["num_tier_switches"]
+                    ),
+                    adaptive_ema_accept_length=float(
+                        adaptive_metrics["ema_accept_len"]
+                    ),
+                    adaptive_last_batch_accept_length=float(
+                        adaptive_metrics["last_batch_accept_len"]
+                    ),
+                    adaptive_wasted_draft_ratio=float(
+                        adaptive_metrics["wasted_draft_ratio"]
+                    ),
                 )
 
         lora = None

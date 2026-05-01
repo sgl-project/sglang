@@ -115,6 +115,8 @@ class AdaptiveSpeculativeParams:
 
         # Initialize EMA at current steps - 1 (neutral starting point)
         self.ema_accept_len = float(self.current_steps - 1)
+        self.last_batch_accept_len = 0.0
+        self.last_batch_wasted_draft_ratio = 0.0
         self._batch_count = 0
 
         logger.info(
@@ -122,16 +124,26 @@ class AdaptiveSpeculativeParams:
             f"steps={self.current_steps}, candidate_steps={self.candidate_steps}"
         )
 
-    def update(self, num_accepted_drafts_per_req: list[int]) -> bool:
+    def update(
+        self,
+        num_accepted_drafts_per_req: list[int],
+        draft_capacity_per_req: int | None = None,
+    ) -> bool:
         """Update EMA with observed accept lengths. Returns True if params changed.
 
         Args:
             num_accepted_drafts_per_req: Per-request accepted draft token counts from last verify.
+            draft_capacity_per_req: Maximum accepted draft length per request for the
+                active tier before any update-triggered switch.
         """
         if not num_accepted_drafts_per_req:
             return False
 
         batch_avg = sum(num_accepted_drafts_per_req) / len(num_accepted_drafts_per_req)
+        self.last_batch_accept_len = batch_avg
+        self.last_batch_wasted_draft_ratio = self._compute_wasted_draft_ratio(
+            num_accepted_drafts_per_req, draft_capacity_per_req
+        )
         self.ema_accept_len = (
             1 - self.ema_alpha
         ) * self.ema_accept_len + self.ema_alpha * batch_avg
@@ -144,6 +156,26 @@ class AdaptiveSpeculativeParams:
             return False
 
         return self._recompute_params()
+
+    def _compute_wasted_draft_ratio(
+        self,
+        num_accepted_drafts_per_req: list[int],
+        draft_capacity_per_req: int | None,
+    ) -> float:
+        draft_capacity_per_req = (
+            self.current_steps
+            if draft_capacity_per_req is None
+            else max(0, draft_capacity_per_req)
+        )
+        total_draft_tokens = len(num_accepted_drafts_per_req) * draft_capacity_per_req
+        if total_draft_tokens == 0:
+            return 0.0
+
+        accepted_draft_tokens = sum(
+            min(max(num_accepted_drafts, 0), draft_capacity_per_req)
+            for num_accepted_drafts in num_accepted_drafts_per_req
+        )
+        return (total_draft_tokens - accepted_draft_tokens) / total_draft_tokens
 
     def _recompute_params(self) -> bool:
         """Recompute steps from EMA. Returns True if params changed."""
