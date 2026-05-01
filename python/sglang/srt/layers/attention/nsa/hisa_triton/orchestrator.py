@@ -19,13 +19,13 @@ from __future__ import annotations
 
 import os
 
+import deep_gemm
 import torch
 
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
     fp8_native_block_mean_pooling_grouped_interface,
     fp8_native_block_mean_pooling_interface,
     fp8_native_block_sparse_mqa_attn_return_logits_interface,
-    pool_mqa_attn_return_logits_fp8_interface,
 )
 from sglang.srt.layers.attention.nsa.hisa.fast_topk_runtime import (
     MAX_TOPK as _FAST_TOPK_MAX,
@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
     batch_pool_mqa_triton,
     block_mean_pooling_triton,
     block_sparse_mqa_triton,
+    force_maintain_logits_triton,
     paged_mean_pooling_triton,
     ragged_pool_mqa_triton,
     sparse_paged_mqa_triton,
@@ -271,25 +272,33 @@ def fp8_native_hierarchy_mqa_logits(
             k_fp8, k_scales, k_block_size,
         )
 
-    # 2) Block-MQA on blocked_k → tilelang. Per-stage A/B (test_stage2_ab.py)
-    # shows tilelang's pool_mqa_attn_return_logits_fp8 is 1.6x faster than
-    # ragged_pool_mqa_triton at all K (18.6μs vs 29.7μs wall-time): tilelang
-    # has lower launch overhead AND its [ks_min, ke_max] union skip + clean+
-    # maintain-as-separate-launch combination beats the triton fused mask
-    # approach end-to-end. Tilelang takes blocked cu_seqlen, so we have to
-    # add back 3 host-side PyTorch launches (~5-6μs cost) — net still ~7μs
-    # positive per orchestrator call. Refactor TODO: move ``// K`` into the
-    # tilelang kernel via a K_BLOCK_SIZE param to recover those.
+    # 2) Block-MQA on blocked_k → DeepGEMM ``fp8_mqa_logits``. Per-stage A/B
+    # (bench_pool_mqa_deepgemm_vs_tilelang.py) shows DeepGEMM beats tilelang
+    # 2.0-2.3x at sq=8192, ctx=128K across all K∈{16,32,64,128} including
+    # the .contiguous() copy (e.g. K=16: 2609μs → 1277μs). DeepSeek tuned this
+    # exact GEMM shape for the original NSA indexer; pooled K reuses the same
+    # ``Q [seq,H,D] @ K^T [N,D]`` path with weights+ReLU+sum-over-H fused in.
+    # ``clean_logits=True`` writes -inf outside [ks, ke), matching HISA's
+    # clean_logits_(). force_maintain (+inf at ks and ke-1) is not in DG, so
+    # we run a tiny stride-aware triton post-pass.
+    #
+    # Quirk: DG output has SM-aligned row stride padding (e.g. n_blocks=8192 →
+    # stride=8448). We slice [:, :n_blocks] as a view (no copy) — fast_topk_v2
+    # and torch.topk both read stride(0) correctly; the post-pass kernel is
+    # also stride-aware. Avoids a ~165μs .contiguous() copy at K=16.
     cu_seqlen_blocked_ks = cu_seqlen_ks // k_block_size
     cu_seqlen_blocked_ke = (cu_seqlen_ke + k_block_size - 1) // k_block_size
-    block_k_indexer_score = pool_mqa_attn_return_logits_fp8_interface(
-        q_fp8=q_fp8,
-        blocked_kv_fp8=blocked_k_fp8,
-        blocked_kv_scale=blocked_k_scale,
-        kv_block_size=k_block_size,
-        weights_f32=weights,
-        cu_seqlen_blocked_ks=cu_seqlen_blocked_ks,
-        cu_seqlen_blocked_ke=cu_seqlen_blocked_ke,
+    n_blocks = blocked_k_fp8.shape[0]
+    block_k_indexer_score = deep_gemm.fp8_mqa_logits(
+        q_fp8,
+        (blocked_k_fp8, blocked_k_scale),
+        weights,
+        cu_seqlen_blocked_ks,
+        cu_seqlen_blocked_ke,
+        clean_logits=True,
+    )[:, :n_blocks]
+    force_maintain_logits_triton(
+        block_k_indexer_score, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke,
     )
 
     # 3) Top-k over pool blocks. fast_topk_runtime at K∈{16,32} (1.45-1.83×),

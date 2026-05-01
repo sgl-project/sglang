@@ -2156,3 +2156,40 @@ def update_pool_for_completed_blocks_triton(
     )
 
 
+@triton.jit
+def _force_maintain_logits_kernel(
+    LOGITS_PTR,
+    CU_KS_PTR,
+    CU_KE_PTR,
+    stride_row,
+):
+    row = tl.program_id(0)
+    ks = tl.load(CU_KS_PTR + row)
+    ke = tl.load(CU_KE_PTR + row)
+    base = LOGITS_PTR + row * stride_row
+    pos_inf = float("inf")
+    tl.store(base + ks, pos_inf)
+    tl.store(base + (ke - 1), pos_inf)
+
+
+def force_maintain_logits_triton(
+    logits: torch.Tensor,         # [seq, n_blocks] f32, stride_row may exceed n_blocks
+    cu_seqlen_blocked_ks: torch.Tensor,  # [seq] i32
+    cu_seqlen_blocked_ke: torch.Tensor,  # [seq] i32
+) -> torch.Tensor:
+    """In-place +inf write at ks and ke-1 per row. Stride-aware so it can be
+    applied directly to a sliced view of DeepGEMM's SM-aligned output (where
+    ``stride(0) > shape(1)``), avoiding a ``.contiguous()`` copy.
+    """
+    assert logits.dtype == torch.float32
+    assert logits.dim() == 2 and logits.stride(1) == 1
+    seq = logits.shape[0]
+    if seq == 0:
+        return logits
+    _force_maintain_logits_kernel[(seq,)](
+        logits, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke,
+        logits.stride(0),
+    )
+    return logits
+
+
