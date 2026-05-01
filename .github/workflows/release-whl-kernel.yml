@@ -73,28 +73,6 @@ jobs:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}${{ matrix.arch == 'aarch64' && '-aarch64' || '' }}
           path: sgl-kernel/dist/*
 
-  release-cu129:
-    needs: build-cu129-matrix
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-*
-
-      - uses: ./.github/actions/release-kernel-wheel-index
-        with:
-          backend: cuda
-          version: '129'
-          whl-token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-          tag-name: ${{ inputs.tag_name }}
-
   build-cu130-matrix:
     if: |
       github.repository == 'sgl-project/sglang' &&
@@ -162,9 +140,23 @@ jobs:
           name: wheel-python${{ matrix.python-version }}-cuda${{ matrix.cuda-version }}${{ matrix.arch == 'aarch64' && '-aarch64' || '' }}
           path: sgl-kernel/dist/*
 
-  release-cu130:
-    needs: build-cu130-matrix
+  release-cuda:
+    # build-cu129-matrix and build-cu130-matrix are gated independently by the
+    # `target` input, so when (e.g.) target=cu129 only the cu129 build runs and
+    # the cu130 build is skipped. We list both as `needs:` and per-matrix-entry
+    # require that THIS version's build succeeded; the other being skipped is
+    # fine and just causes that matrix entry to skip too.
+    needs: [build-cu129-matrix, build-cu130-matrix]
+    if: |
+      !cancelled() && (
+        (matrix.version == '129' && needs.build-cu129-matrix.result == 'success') ||
+        (matrix.version == '130' && needs.build-cu130-matrix.result == 'success')
+      )
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['129', '130']
     steps:
       - uses: actions/checkout@v4
         with:
@@ -180,7 +172,7 @@ jobs:
       - uses: ./.github/actions/release-kernel-wheel-index
         with:
           backend: cuda
-          version: '130'
+          version: ${{ matrix.version }}
           whl-token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           tag-name: ${{ inputs.tag_name }}
 
@@ -212,9 +204,13 @@ jobs:
           name: wheel-python${{ matrix.python-version }}-rocm${{ matrix.rocm-version }}
           path: sgl-kernel/dist/*
 
-  release-rocm700:
+  release-rocm:
     needs: build-rocm-matrix
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['700', '720']
     steps:
       - uses: actions/checkout@v4
         with:
@@ -225,34 +221,12 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-*-rocm700
+          pattern: wheel-*-rocm${{ matrix.version }}
 
       - uses: ./.github/actions/release-kernel-wheel-index
         with:
           backend: rocm
-          version: '700'
-          whl-token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-          tag-name: ${{ inputs.tag_name }}
-
-  release-rocm720:
-    needs: build-rocm-matrix
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
-
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: sgl-kernel/dist/
-          merge-multiple: true
-          pattern: wheel-*-rocm720
-
-      - uses: ./.github/actions/release-kernel-wheel-index
-        with:
-          backend: rocm
-          version: '720'
+          version: ${{ matrix.version }}
           whl-token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           tag-name: ${{ inputs.tag_name }}
 
