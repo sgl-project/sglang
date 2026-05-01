@@ -267,7 +267,7 @@ class TopK(MultiPlatformOp):
         apply_routed_scaling_factor_on_output: Optional[bool] = False,
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
-        is_fp4_experts: bool = True,
+        is_fp4_experts: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -277,9 +277,9 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        # On flashinfer_mxfp4: True keeps STANDARD output for DeepSeekMxfp4MoEMethod,
-        # False routes through flashinfer's own mxfp4 path via BYPASSED.
-        # No effect off the mxfp4 backend.
+        # On flashinfer_mxfp4: True keeps STANDARD output for DeepSeekMxfp4MoEMethod
+        # (DSV4 mxfp4 ckpt path), False routes through flashinfer's own mxfp4 kernel
+        # via BYPASSED (e.g. GPT-OSS). No effect off the mxfp4 backend.
         self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
             top_k=top_k,

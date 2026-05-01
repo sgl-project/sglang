@@ -182,7 +182,7 @@ class ModelConfig:
         # DSV4 routed-expert layout: mxfp4-packed (True) or converted FP8 (False).
         # Detect failure raises here -- a silent default would later blow up as
         # a shape mismatch in Fp8MoEMethod.create_weights.
-        self.is_fp4_experts: bool = True
+        self.is_fp4_experts: bool = False
         if is_deepseek_v4(self.hf_config):
             from sglang.srt.configs.deepseek_v4 import detect_fp4_experts
 

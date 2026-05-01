@@ -552,7 +552,7 @@ class DeepseekV2MoE(nn.Module):
                     and (not get_moe_runner_backend().is_flashinfer_trtllm())
                     else None
                 ),
-                is_fp4_experts=getattr(quant_config, "is_fp4_experts", True),
+                is_fp4_experts=getattr(quant_config, "is_fp4_experts", False),
             )
 
         self.shared_experts_is_int8 = False
