@@ -182,15 +182,11 @@ jobs:
   gateway-e2e:
     name: ${{ matrix.name }}
     needs: build-wheel
-    # The `!matrix.disabled` clause lets us keep a matrix entry as a
-    # placeholder (e.g. `responses` below) while skipping its job
-    # instance until the runner-image gap is fixed.
-    if: |
-      (
-        github.event_name != 'pull_request' ||
-        (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
-        (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-      ) && !matrix.disabled
+    # `matrix.disabled` lets us keep a matrix entry as a placeholder
+    # (e.g. `responses` below) while skipping its job instance. Single-line
+    # ${{ }} form is required so the matrix context resolves at job-level
+    # if-evaluation; the literal-block form (`if: |`) failed to parse.
+    if: ${{ (github.event_name != 'pull_request' || (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')) && !matrix.disabled }}
     strategy:
       fail-fast: false
       matrix:
