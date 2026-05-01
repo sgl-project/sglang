@@ -37,16 +37,16 @@ class ServerSanityMixin:
     sanity_max_new_tokens_short: int = 64
     sanity_max_new_tokens_long: int = 128
 
-    def _sanity_generate(self, prompt: str, max_new_tokens: int) -> str:
+    def _sanity_generate(self, prompt: str, max_new_tokens: int, stop=None) -> str:
+        sampling_params = {
+            "temperature": 0.0,
+            "max_new_tokens": max_new_tokens,
+        }
+        if stop is not None:
+            sampling_params["stop"] = stop
         resp = requests.post(
             self.base_url + "/generate",
-            json={
-                "text": prompt,
-                "sampling_params": {
-                    "temperature": 0.0,
-                    "max_new_tokens": max_new_tokens,
-                },
-            },
+            json={"text": prompt, "sampling_params": sampling_params},
             timeout=_REQUEST_TIMEOUT,
         )
         self.assertEqual(resp.status_code, 200)
@@ -212,11 +212,19 @@ class ServerSanityMixin:
     def test_determinism_temp_zero(self):
         # Same prompt + temperature=0 must be deterministic. RNG state
         # corruption / cache mismatch / stream-mode divergence all show
-        # up as non-identical outputs across runs.
+        # up as non-identical outputs across runs. Stop on "\n" so the
+        # model emits just the answer word; longer continuations can
+        # drift on near-tie tokens via floating-point non-associativity
+        # in EP MoE / EAGLE spec paths, which isn't what this probe is
+        # meant to catch.
         prompt = "Q: What is the capital of France? Reply in one word.\nA:"
-        out1 = self._sanity_generate(prompt, self.sanity_max_new_tokens_short)
+        out1 = self._sanity_generate(
+            prompt, self.sanity_max_new_tokens_short, stop=["\n"]
+        )
         # Second call hits cache, also exercises the cache-hit path.
-        out2 = self._sanity_generate(prompt, self.sanity_max_new_tokens_short)
+        out2 = self._sanity_generate(
+            prompt, self.sanity_max_new_tokens_short, stop=["\n"]
+        )
         self.assertEqual(
             out1.strip(),
             out2.strip(),
