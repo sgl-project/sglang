@@ -33,7 +33,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
-from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+from sglang.srt.layers.deepseek_v4_rope import (
+    apply_rotary_emb_triton,
+    fused_norm_rope_inplace_triton,
+)
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     dp_gather_partial,
@@ -441,7 +444,6 @@ class Compressor(nn.Module):
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
             assert kv_compressed.dtype == torch.float32
-            kv_compressed = self.norm(kv_compressed)
 
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
@@ -449,9 +451,15 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            apply_rotary_emb_triton(
-                kv_compressed[..., -self.rope_head_dim :], freqs_cis
-            )
+            if _is_hip:
+                fused_norm_rope_inplace_triton(
+                    kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+                )
+            else:
+                kv_compressed = self.norm(kv_compressed)
+                apply_rotary_emb_triton(
+                    kv_compressed[..., -self.rope_head_dim :], freqs_cis
+                )
             del beg_idx, end_idx
 
             if self.rotate:
@@ -545,11 +553,19 @@ class Compressor(nn.Module):
             kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
-        kv_compressed = self.norm(kv_compressed)
-        self.print_tensor(kv_compressed, "kv_after_norm")
-        freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-        self.print_tensor(freqs_cis, "freqs_cis")
-        apply_rotary_emb_triton(kv_compressed[..., -self.rope_head_dim :], freqs_cis)
+        if _is_hip:
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            fused_norm_rope_inplace_triton(
+                kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+            )
+        else:
+            kv_compressed = self.norm(kv_compressed)
+            self.print_tensor(kv_compressed, "kv_after_norm")
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            self.print_tensor(freqs_cis, "freqs_cis")
+            apply_rotary_emb_triton(
+                kv_compressed[..., -self.rope_head_dim :], freqs_cis
+            )
         self.print_tensor(kv_compressed, "kv_after_rope")
         if self.rotate:
             kv_compressed = rotate_activation(kv_compressed)
@@ -666,7 +682,6 @@ class Compressor(nn.Module):
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
             assert kv_compressed.dtype == torch.float32
-            kv_compressed = self.norm(kv_compressed)
 
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
@@ -674,9 +689,15 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            apply_rotary_emb_triton(
-                kv_compressed[..., -self.rope_head_dim :], freqs_cis
-            )
+            if _is_hip:
+                fused_norm_rope_inplace_triton(
+                    kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+                )
+            else:
+                kv_compressed = self.norm(kv_compressed)
+                apply_rotary_emb_triton(
+                    kv_compressed[..., -self.rope_head_dim :], freqs_cis
+                )
             del beg_idx, end_idx
 
             if self.rotate:
@@ -758,11 +779,19 @@ class Compressor(nn.Module):
             kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
-        kv_compressed = self.norm(kv_compressed)
-        self.print_tensor(kv_compressed, "kv_after_norm")
-        freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-        self.print_tensor(freqs_cis, "freqs_cis")
-        apply_rotary_emb_triton(kv_compressed[..., -self.rope_head_dim :], freqs_cis)
+        if _is_hip:
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            fused_norm_rope_inplace_triton(
+                kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+            )
+        else:
+            kv_compressed = self.norm(kv_compressed)
+            self.print_tensor(kv_compressed, "kv_after_norm")
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            self.print_tensor(freqs_cis, "freqs_cis")
+            apply_rotary_emb_triton(
+                kv_compressed[..., -self.rope_head_dim :], freqs_cis
+            )
         self.print_tensor(kv_compressed, "kv_after_rope")
         if self.rotate:
             kv_compressed = rotate_activation(kv_compressed)
@@ -955,7 +984,6 @@ class Compressor(nn.Module):
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
             assert kv_compressed.dtype == torch.float32
-            kv_compressed = self.norm(kv_compressed)
 
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
@@ -963,9 +991,15 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            apply_rotary_emb_triton(
-                kv_compressed[..., -self.rope_head_dim :], freqs_cis
-            )
+            if _is_hip:
+                fused_norm_rope_inplace_triton(
+                    kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+                )
+            else:
+                kv_compressed = self.norm(kv_compressed)
+                apply_rotary_emb_triton(
+                    kv_compressed[..., -self.rope_head_dim :], freqs_cis
+                )
             del beg_idx, end_idx
 
             if self.rotate:
@@ -1055,11 +1089,19 @@ class Compressor(nn.Module):
             kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
-        kv_compressed = self.norm(kv_compressed)
-        self.print_tensor(kv_compressed, "kv_after_norm")
-        freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-        self.print_tensor(freqs_cis, "freqs_cis")
-        apply_rotary_emb_triton(kv_compressed[..., -self.rope_head_dim :], freqs_cis)
+        if _is_hip:
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            fused_norm_rope_inplace_triton(
+                kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+            )
+        else:
+            kv_compressed = self.norm(kv_compressed)
+            self.print_tensor(kv_compressed, "kv_after_norm")
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            self.print_tensor(freqs_cis, "freqs_cis")
+            apply_rotary_emb_triton(
+                kv_compressed[..., -self.rope_head_dim :], freqs_cis
+            )
         self.print_tensor(kv_compressed, "kv_after_rope")
         if self.rotate:
             kv_compressed = rotate_activation(kv_compressed)
