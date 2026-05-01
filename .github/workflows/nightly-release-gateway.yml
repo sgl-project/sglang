@@ -95,15 +95,22 @@ jobs:
           working-directory: bindings/python
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          args: --release --out dist --features vendored-openssl --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }} ${{ matrix.target == 'aarch64' && matrix.os == 'ubuntu' && '--zig' || '' }}
+          # 1. WINDOWS FIX: GitHub AI ki trick yahan lagayi hai
+          args: --release --out dist --features ${{ matrix.os == 'windows' && 'vendored-openssl,pyo3/generate-import-lib' || 'vendored-openssl' }} --interpreter ${{ matrix.interpreter || '3.9 3.10 3.11 3.12 3.13 3.14' }}
           rust-toolchain: stable
-          docker-options: -e CI
+          docker-options: -e CI -e CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc -e CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
           before-script-linux: |
-            pip install ziglang
             if command -v yum &> /dev/null; then
               yum update -y && yum install -y wget unzip gcc gcc-c++ perl-core make
+              if [ "${{ matrix.target }}" = "aarch64" ]; then
+                yum install -y gcc-aarch64-linux-gnu gcc-c++-aarch64-linux-gnu || true
+              fi
             elif command -v apt-get &> /dev/null; then
               apt-get update && apt-get install -y wget unzip gcc g++ perl make
+              if[ "${{ matrix.target }}" = "aarch64" ]; then
+                # 2. LINUX FIX: GitHub AI ka 'libc6-dev-arm64-cross' yahan add kiya hai
+                apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross || true
+              fi
             fi
             (cd /tmp && \
              wget https://github.com/protocolbuffers/protobuf/releases/download/v32.0/protoc-32.0-linux-x86_64.zip && \
