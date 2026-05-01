@@ -111,7 +111,6 @@ class HiSparseCoordinator:
         self._device_buffer_arange_i32 = torch.arange(
             self.device_buffer_size, dtype=torch.int32, device=device
         )
-        self._top_k_arange = torch.arange(self.top_k, device=device).unsqueeze(0)
 
         self.top_k_device_locs_buffer = torch.full(
             (max_num_reqs, self.top_k), -1, dtype=torch.int32, device=device
@@ -362,19 +361,6 @@ class HiSparseCoordinator:
             return
         self._backup_done_event.wait(device_module.current_stream())
         self._has_pending_backup = False
-
-    def get_front_topk_tokens(
-        self,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ) -> torch.Tensor:
-        compressed_seq_lens = seq_lens // self.compress_ratio
-        top_k_indices = self.req_to_device_buffer[req_pool_indices, : self.top_k].to(
-            torch.int32
-        )
-        mask = self._top_k_arange >= compressed_seq_lens.unsqueeze(1)
-        top_k_indices[mask] = -1
-        return top_k_indices
 
     def abort_staging_request(self, req: Req) -> None:
         self.ack_staging_queue = [
