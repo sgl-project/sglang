@@ -1566,6 +1566,24 @@ class Scheduler(
                         self.attn_cp_cpu_group,
                         src=self.attn_cp_group.ranks[0],
                     )
+                # When attn_tp_size == attn_cp_size == 1 (e.g. dp_size == tp_size),
+                # both inner broadcasts above are skipped, so ranks have no
+                # cross-group rendezvous before entering control handlers. The
+                # default (non-local-ctrl) path's tp_cpu_group broadcast provided
+                # that rendezvous unconditionally every iteration. Without it,
+                # weight-sync handlers (whose first action is barrier(tp_cpu_group))
+                # can deadlock on multi-node setups where ranks drift between
+                # iterations or where gloo TCP sockets idle out during long
+                # mooncake P2P transfers. Re-introduce the cross-node rendezvous
+                # only when there *is* a control message — empty-iter cost stays
+                # zero, preserving the perf benefit of local_control_broadcast.
+                if (
+                    control_reqs
+                    and self.attn_tp_size == 1
+                    and self.attn_cp_size == 1
+                    and self.tp_size != 1
+                ):
+                    torch.distributed.barrier(group=self.tp_cpu_group)
             elif self.tp_size != 1:
                 control_reqs = broadcast_pyobj(
                     control_reqs,
