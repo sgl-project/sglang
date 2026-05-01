@@ -1,9 +1,12 @@
 #!/bin/bash
 
-# DEPRECATED: This script will be migrated to python/sglang/cli/killall.py.
-# CI mode is already handled there. This script remains for local/non-CI usage.
+# DEPRECATED: This script is being migrated to python/sglang/cli/killall.py.
+# CI mode is already handled there. This script remains for local/non-CI usage
+# until the rocm/all/gpus modes are ported over.
 #
-# TODO: Migrate remaining modes (rocm, all, gpus) to killall.py and remove this file.
+# IMPORTANT: The pgrep pattern below MUST stay a superset of the pattern in
+# python/sglang/cli/killall.py (`_SGLANG_PROCESS_PATTERNS`). When you add a new
+# SGLang entry point, update both files in the same PR.
 #
 # Usage:
 #   ./killall_sglang.sh              - Kill SGLang processes only (NVIDIA mode)
@@ -11,11 +14,16 @@
 #   ./killall_sglang.sh all          - Kill all GPU processes (NVIDIA mode)
 #   ./killall_sglang.sh gpus 0,1,2,3 - Kill all processes on specific GPUs
 
+echo "[killall_sglang.sh] DEPRECATED: prefer 'python -m sglang.cli.killall' (CI mode)." >&2
+
+# Keep this in sync with cli/killall.py:_SGLANG_PROCESS_PATTERNS
+SGLANG_PROCESS_PATTERN='sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::|sglang serve'
+
 if [ "$1" = "rocm" ]; then
     echo "Running in ROCm mode"
 
     # Clean SGLang processes
-    pgrep -f 'sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::' | xargs -r kill -9
+    pgrep -f "$SGLANG_PROCESS_PATTERN" | xargs -r kill -9
 
 elif [ "$1" = "gpus" ] && [ -n "$2" ]; then
     # Kill all processes on specific GPUs only
@@ -39,7 +47,7 @@ else
     nvidia-smi
 
     # Clean SGLang processes
-    pgrep -f 'sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::' | xargs -r kill -9
+    pgrep -f "$SGLANG_PROCESS_PATTERN" | xargs -r kill -9
 
     # Clean all GPU processes if "all" argument is provided
     if [ "$1" = "all" ]; then

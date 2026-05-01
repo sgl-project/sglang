@@ -26,7 +26,8 @@ from pathlib import Path
 # Constants
 MEMORY_THRESHOLD_PCT = 10
 
-# Patterns matching SGLang process command lines (equivalent to pgrep -f in killall_sglang.sh)
+# Patterns matching SGLang process command lines (equivalent to pgrep -f in killall_sglang.sh).
+# Keep this in sync with scripts/killall_sglang.sh:SGLANG_PROCESS_PATTERN.
 _SGLANG_PROCESS_PATTERNS = re.compile(
     r"sglang::|sglang\.launch_server|sglang\.bench|sglang\.data_parallel|sglang\.srt|sgl_diffusion::|sglang serve"
 )
