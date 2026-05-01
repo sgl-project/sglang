@@ -232,6 +232,31 @@ class RelayKVHostBackupCopyResult:
         return payload
 
 
+@dataclass(frozen=True)
+class RelayKVPoolSnapshotResult:
+    runtime_policy_state: str
+    kv_pool_type: Optional[str]
+    snapshot_created: bool
+    snapshot_skipped_reason: str
+    source_shape: Optional[list[int]]
+    snapshot_shape: Optional[list[int]]
+    source_dtype: Optional[str]
+    snapshot_dtype: Optional[str]
+    source_device: Optional[str]
+    token_indices: list[int]
+    source_mutated: bool
+    fallback_candidate_noop_guard: bool
+    attention_override: bool
+    kv_cache_mutation: bool
+    scheduler_policy_noop: bool
+    snapshot_tensor: Optional[Any] = None
+
+    def to_log_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload.pop("snapshot_tensor", None)
+        return payload
+
+
 def _dtype_bytes(dtype: Any) -> Optional[int]:
     if dtype is None:
         return None
@@ -584,6 +609,159 @@ def copy_host_backup_candidate_for_smoke(
         kv_cache_mutation=False,
         scheduler_policy_noop=True,
         backup_tensor=backup_tensor,
+    )
+
+
+def _layer_buffer_from_list(buffer: Any, layer_idx: int, start_layer: int) -> Optional[Any]:
+    if not isinstance(buffer, list):
+        return None
+    local_idx = layer_idx - start_layer
+    if local_idx < 0 or local_idx >= len(buffer):
+        return None
+    return buffer[local_idx]
+
+
+def snapshot_kv_pool_for_host_backup_smoke(
+    *,
+    plan: RelayKVPlan,
+    token_to_kv_pool_allocator: Any,
+    token_indices: list[int],
+    layer_idx: int,
+) -> RelayKVPoolSnapshotResult:
+    """Create a small read-only KV pool snapshot for smoke tests only.
+
+    This does not call attention-facing getters, does not write back to the KV
+    pool, and does not free any KV slots. The returned tensor is only a source
+    payload for the smoke-only host backup copy helper.
+    """
+
+    state = plan.runtime_policy_state
+    fallback_noop = state == "fallback_candidate"
+    copy_candidate = state == "applied_candidate"
+    kv_object, base_reason = _resolve_kv_layout_object(token_to_kv_pool_allocator)
+    kv_pool_type = type(kv_object).__name__ if kv_object is not None else None
+
+    if not copy_candidate:
+        if fallback_noop:
+            skipped_reason = "fallback_candidate_noop_guard"
+        else:
+            skipped_reason = "runtime_policy_state_not_applied_candidate"
+        return RelayKVPoolSnapshotResult(
+            runtime_policy_state=state,
+            kv_pool_type=kv_pool_type,
+            snapshot_created=False,
+            snapshot_skipped_reason=skipped_reason,
+            source_shape=None,
+            snapshot_shape=None,
+            source_dtype=None,
+            snapshot_dtype=None,
+            source_device=None,
+            token_indices=list(token_indices),
+            source_mutated=False,
+            fallback_candidate_noop_guard=fallback_noop,
+            attention_override=False,
+            kv_cache_mutation=False,
+            scheduler_policy_noop=True,
+            snapshot_tensor=None,
+        )
+
+    if kv_object is None:
+        return RelayKVPoolSnapshotResult(
+            runtime_policy_state=state,
+            kv_pool_type=None,
+            snapshot_created=False,
+            snapshot_skipped_reason=base_reason,
+            source_shape=None,
+            snapshot_shape=None,
+            source_dtype=None,
+            snapshot_dtype=None,
+            source_device=None,
+            token_indices=list(token_indices),
+            source_mutated=False,
+            fallback_candidate_noop_guard=False,
+            attention_override=False,
+            kv_cache_mutation=False,
+            scheduler_policy_noop=True,
+            snapshot_tensor=None,
+        )
+
+    if not token_indices:
+        return RelayKVPoolSnapshotResult(
+            runtime_policy_state=state,
+            kv_pool_type=kv_pool_type,
+            snapshot_created=False,
+            snapshot_skipped_reason="token_indices_empty",
+            source_shape=None,
+            snapshot_shape=None,
+            source_dtype=None,
+            snapshot_dtype=None,
+            source_device=None,
+            token_indices=[],
+            source_mutated=False,
+            fallback_candidate_noop_guard=False,
+            attention_override=False,
+            kv_cache_mutation=False,
+            scheduler_policy_noop=True,
+            snapshot_tensor=None,
+        )
+
+    start_layer = int(getattr(kv_object, "start_layer", 0) or 0)
+    k_layer = _layer_buffer_from_list(getattr(kv_object, "k_buffer", None), layer_idx, start_layer)
+    v_layer = _layer_buffer_from_list(getattr(kv_object, "v_buffer", None), layer_idx, start_layer)
+    kv_layer = _layer_buffer_from_list(getattr(kv_object, "kv_buffer", None), layer_idx, start_layer)
+    source = k_layer if k_layer is not None else kv_layer
+    if source is None:
+        return RelayKVPoolSnapshotResult(
+            runtime_policy_state=state,
+            kv_pool_type=kv_pool_type,
+            snapshot_created=False,
+            snapshot_skipped_reason="kv_pool_layer_buffer_not_found",
+            source_shape=None,
+            snapshot_shape=None,
+            source_dtype=None,
+            snapshot_dtype=None,
+            source_device=None,
+            token_indices=list(token_indices),
+            source_mutated=False,
+            fallback_candidate_noop_guard=False,
+            attention_override=False,
+            kv_cache_mutation=False,
+            scheduler_policy_noop=True,
+            snapshot_tensor=None,
+        )
+
+    import torch
+
+    index = torch.tensor(token_indices, dtype=torch.long, device=source.device)
+    source_before = source.detach().clone()
+    v_before = v_layer.detach().clone() if v_layer is not None else None
+    if k_layer is not None and v_layer is not None:
+        k_snapshot = k_layer.index_select(0, index).detach()
+        v_snapshot = v_layer.index_select(0, index).detach()
+        snapshot = torch.stack((k_snapshot, v_snapshot), dim=1)
+    else:
+        snapshot = source.index_select(0, index).detach()
+    source_mutated = not bool(source.equal(source_before))
+    if v_layer is not None and v_before is not None:
+        source_mutated = source_mutated or not bool(v_layer.equal(v_before))
+
+    return RelayKVPoolSnapshotResult(
+        runtime_policy_state=state,
+        kv_pool_type=kv_pool_type,
+        snapshot_created=True,
+        snapshot_skipped_reason="",
+        source_shape=_tensor_shape_list(source),
+        snapshot_shape=_tensor_shape_list(snapshot),
+        source_dtype=str(getattr(source, "dtype", None)),
+        snapshot_dtype=str(getattr(snapshot, "dtype", None)),
+        source_device=str(getattr(source, "device", None)),
+        token_indices=list(token_indices),
+        source_mutated=source_mutated,
+        fallback_candidate_noop_guard=False,
+        attention_override=False,
+        kv_cache_mutation=False,
+        scheduler_policy_noop=True,
+        snapshot_tensor=snapshot,
     )
 
 
