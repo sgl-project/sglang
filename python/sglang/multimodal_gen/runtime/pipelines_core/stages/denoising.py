@@ -91,7 +91,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import dict_to_3d_list
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, dict_to_3d_list
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -201,11 +201,12 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         stage_name = self._component_stage_name(stage_name)
         uses: list[ComponentUse] = []
         if self.vae is not None:
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
             uses.append(
                 ComponentUse(
                     stage_name=stage_name,
                     component_name="vae",
-                    target_dtype=torch.bfloat16,
+                    target_dtype=vae_dtype,
                 )
             )
         for default_name, module in (
@@ -614,10 +615,11 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # TI2V specific preparations - before SP sharding
         if should_preprocess_for_wan_ti2v:
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
             with self.use_declared_component(
                 component_name="vae",
                 module=self.vae,
-                target_dtype=target_dtype,
+                target_dtype=vae_dtype,
             ) as vae:
                 assert vae is not None
                 self.vae = vae
@@ -625,6 +627,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                     self.vae,
                     latents,
                     target_dtype,
+                    vae_dtype,
                     batch,
                     server_args,
                 )
