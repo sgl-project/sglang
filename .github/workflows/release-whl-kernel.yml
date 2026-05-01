@@ -53,24 +53,10 @@ jobs:
             runner: arm-kernel-build-node
     runs-on: ${{ matrix.runner }}
     steps:
-      # Self-hosted build nodes retain the workspace across jobs. Prior builds
-      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
-      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
-      # container before checkout recreates the workspace.
-      - name: Clean workspace (remove root-owned files from prior runs)
-        run: |
-          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
-            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: "recursive"
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: ./.github/actions/prepare-kernel-build-workspace
         with:
           python-version: ${{ matrix.python-version }}
+          pr-number: ${{ inputs.pr_number }}
 
       - name: Build wheels
         run: |
@@ -102,41 +88,12 @@ jobs:
           merge-multiple: true
           pattern: wheel-*
 
-      - name: Set tag name
-        id: set_tag_name
-        run: |
-          if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-          else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - uses: ./.github/actions/release-kernel-wheel-index
         with:
-          tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
-          repository: sgl-project/whl
-          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-          files: |
-            sgl-kernel/dist/*
-
-      - name: Clone wheel index
-        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
-        env:
-          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-
-      - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --cuda 129
-
-      - name: Push wheel index
-        run: |
-          cd sgl-whl
-          git config --local user.name "sglang-bot"
-          git config --local user.email "sglangbot@gmail.com"
-          git add -A
-          git commit -m "update whl index"
-          git push
+          backend: cuda
+          version: '129'
+          whl-token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          tag-name: ${{ inputs.tag_name }}
 
   build-cu130-matrix:
     if: |
@@ -154,24 +111,10 @@ jobs:
             runner: arm-kernel-build-node
     runs-on: ${{ matrix.runner }}
     steps:
-      # Self-hosted build nodes retain the workspace across jobs. Prior builds
-      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
-      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
-      # container before checkout recreates the workspace.
-      - name: Clean workspace (remove root-owned files from prior runs)
-        run: |
-          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
-            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: "recursive"
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: ./.github/actions/prepare-kernel-build-workspace
         with:
           python-version: ${{ matrix.python-version }}
+          pr-number: ${{ inputs.pr_number }}
 
       - name: Build wheels
         run: |
@@ -234,41 +177,12 @@ jobs:
           merge-multiple: true
           pattern: wheel-*
 
-      - name: Set tag name
-        id: set_tag_name
-        run: |
-          if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-          else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - uses: ./.github/actions/release-kernel-wheel-index
         with:
-          tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
-          repository: sgl-project/whl
-          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-          files: |
-            sgl-kernel/dist/*
-
-      - name: Clone wheel index
-        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
-        env:
-          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-
-      - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --cuda 130
-
-      - name: Push wheel index
-        run: |
-          cd sgl-whl
-          git config --local user.name "sglang-bot"
-          git config --local user.email "sglangbot@gmail.com"
-          git add -A
-          git commit -m "update whl index"
-          git push
+          backend: cuda
+          version: '130'
+          whl-token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          tag-name: ${{ inputs.tag_name }}
 
   build-rocm-matrix:
     if: |
@@ -280,24 +194,10 @@ jobs:
         python-version: ["3.10"]
         rocm-version: ["700", "720"]
     steps:
-      # Self-hosted build nodes retain the workspace across jobs. Prior builds
-      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
-      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
-      # container before checkout recreates the workspace.
-      - name: Clean workspace (remove root-owned files from prior runs)
-        run: |
-          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
-            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
-
-      - uses: actions/checkout@v4
-        with:
-          submodules: "recursive"
-          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: ./.github/actions/prepare-kernel-build-workspace
         with:
           python-version: ${{ matrix.python-version }}
+          pr-number: ${{ inputs.pr_number }}
 
       - name: Build wheels
         run: |
@@ -327,41 +227,12 @@ jobs:
           merge-multiple: true
           pattern: wheel-*-rocm700
 
-      - name: Set tag name
-        id: set_tag_name
-        run: |
-          if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-          else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - uses: ./.github/actions/release-kernel-wheel-index
         with:
-          tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
-          repository: sgl-project/whl
-          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-          files: |
-            sgl-kernel/dist/*
-
-      - name: Clone wheel index
-        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
-        env:
-          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-
-      - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --rocm 700
-
-      - name: Push wheel index
-        run: |
-          cd sgl-whl
-          git config --local user.name "sglang-bot"
-          git config --local user.email "sglangbot@gmail.com"
-          git add -A
-          git commit -m "update whl index"
-          git push
+          backend: rocm
+          version: '700'
+          whl-token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          tag-name: ${{ inputs.tag_name }}
 
   release-rocm720:
     needs: build-rocm-matrix
@@ -378,41 +249,12 @@ jobs:
           merge-multiple: true
           pattern: wheel-*-rocm720
 
-      - name: Set tag name
-        id: set_tag_name
-        run: |
-          if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-          else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - uses: ./.github/actions/release-kernel-wheel-index
         with:
-          tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
-          repository: sgl-project/whl
-          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-          files: |
-            sgl-kernel/dist/*
-
-      - name: Clone wheel index
-        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
-        env:
-          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-
-      - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --rocm 720
-
-      - name: Push wheel index
-        run: |
-          cd sgl-whl
-          git config --local user.name "sglang-bot"
-          git config --local user.email "sglangbot@gmail.com"
-          git add -A
-          git commit -m "update whl index"
-          git push
+          backend: rocm
+          version: '720'
+          whl-token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          tag-name: ${{ inputs.tag_name }}
 
   build-musa43:
     if: |
@@ -424,18 +266,9 @@ jobs:
         python-version: ["3.10"]
         musa-version: ["43"]
     steps:
-      # Self-hosted build nodes retain the workspace across jobs. Prior builds
-      # leave root-owned artifacts under sgl-kernel/build/ that actions/checkout
-      # cannot remove, causing EACCES on rmdir. Wipe them via a throwaway root
-      # container before checkout recreates the workspace.
-      - name: Clean workspace (remove root-owned files from prior runs)
-        run: |
-          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
-            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
-
-      - uses: actions/checkout@v4
+      - uses: ./.github/actions/prepare-kernel-build-workspace
         with:
-          submodules: "recursive"
+          pr-number: ${{ inputs.pr_number }}
 
       - name: Build wheels
         run: |
@@ -458,6 +291,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_number && format('refs/pull/{0}/head', inputs.pr_number) || '' }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -466,38 +301,9 @@ jobs:
           merge-multiple: true
           pattern: wheel-*
 
-      - name: Set tag name
-        id: set_tag_name
-        run: |
-          if [ -z "${{ inputs.tag_name }}" ]; then
-            TAG_NAME="v$(cat sgl-kernel/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
-          else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Release
-        uses: softprops/action-gh-release@v2
+      - uses: ./.github/actions/release-kernel-wheel-index
         with:
-          tag_name: ${{ steps.set_tag_name.outputs.tag_name }}
-          repository: sgl-project/whl
-          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-          files: |
-            sgl-kernel/dist/*
-
-      - name: Clone wheel index
-        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
-        env:
-          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
-
-      - name: Update wheel index
-        run: python3 scripts/update_kernel_whl_index.py --musa 43
-
-      - name: Push wheel index
-        run: |
-          cd sgl-whl
-          git config --local user.name "sglang-bot"
-          git config --local user.email "sglangbot@gmail.com"
-          git add -A
-          git commit -m "update whl index"
-          git push
+          backend: musa
+          version: '43'
+          whl-token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          tag-name: ${{ inputs.tag_name }}
