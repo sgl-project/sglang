@@ -21,8 +21,8 @@ import torch
 
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
-    is_deepseek_compressed,
     is_deepseek_nsa,
+    is_deepseek_v4,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -463,7 +463,7 @@ def create_memory_pool_configurator(
     mr: ModelRunner,
 ) -> MemoryPoolConfigurator:
     """Factory: select the right configurator for the model architecture."""
-    if is_deepseek_compressed(mr.model_config.hf_config) and mr.is_hybrid_swa:
+    if is_deepseek_v4(mr.model_config.hf_config) and mr.is_hybrid_swa:
         return DSv4PoolConfigurator(mr)
     if mr.is_hybrid_swa:
         return HybridSWAPoolConfigurator(mr)
