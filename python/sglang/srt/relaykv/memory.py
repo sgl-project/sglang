@@ -205,6 +205,33 @@ class RelayKVPoolMappingObservation:
         return asdict(self)
 
 
+@dataclass(frozen=True)
+class RelayKVHostBackupCopyResult:
+    runtime_policy_state: str
+    host_backup_copy_candidate: bool
+    host_backup_copy_executed: bool
+    host_backup_copy_skipped_reason: str
+    source_shape: Optional[list[int]]
+    backup_shape: Optional[list[int]]
+    source_dtype: Optional[str]
+    backup_dtype: Optional[str]
+    source_device: Optional[str]
+    backup_device: Optional[str]
+    copy_numel: int
+    copy_nbytes: int
+    copy_equal: bool
+    fallback_candidate_noop_guard: bool
+    attention_override: bool
+    kv_cache_mutation: bool
+    scheduler_policy_noop: bool
+    backup_tensor: Optional[Any] = None
+
+    def to_log_dict(self) -> dict[str, Any]:
+        payload = asdict(self)
+        payload.pop("backup_tensor", None)
+        return payload
+
+
 def _dtype_bytes(dtype: Any) -> Optional[int]:
     if dtype is None:
         return None
@@ -237,6 +264,22 @@ def _tensor_shape_list(tensor: Any) -> Optional[list[int]]:
     if shape is None:
         return None
     return [int(dim) for dim in shape]
+
+
+def _tensor_numel(tensor: Any) -> int:
+    if tensor is None:
+        return 0
+    return int(getattr(tensor, "numel", lambda: 0)())
+
+
+def _tensor_nbytes(tensor: Any) -> int:
+    if tensor is None:
+        return 0
+    nbytes = getattr(tensor, "nbytes", None)
+    if nbytes is not None:
+        return int(nbytes)
+    element_size = getattr(tensor, "element_size", lambda: 0)()
+    return int(_tensor_numel(tensor) * element_size)
 
 
 def _extract_buffer_sample(buffer: Any) -> tuple[Optional[Any], Optional[int]]:
@@ -463,6 +506,84 @@ def estimate_host_backup_shadow_for_plan(
         host_backup_dry_copy_guard_ok=dry_copy_candidate,
         host_backup_dry_copy_would_run=dry_copy_candidate,
         host_backup_dry_copy_reason=dry_copy_reason,
+    )
+
+
+def copy_host_backup_candidate_for_smoke(
+    *,
+    plan: RelayKVPlan,
+    source_tensor: Any,
+) -> RelayKVHostBackupCopyResult:
+    """Copy a fake KV payload to CPU for smoke tests only.
+
+    This helper is intentionally not called by scheduler/attention/KV-cache runtime
+    code. It validates the host-backup copy mechanics on a tiny tensor while keeping
+    GPU KV ownership and attention behavior unchanged.
+    """
+
+    state = plan.runtime_policy_state
+    source_shape = _tensor_shape_list(source_tensor)
+    source_dtype = (
+        str(getattr(source_tensor, "dtype", None))
+        if getattr(source_tensor, "dtype", None) is not None
+        else None
+    )
+    source_device = (
+        str(getattr(source_tensor, "device", None))
+        if getattr(source_tensor, "device", None) is not None
+        else None
+    )
+    fallback_noop = state == "fallback_candidate"
+    copy_candidate = state == "applied_candidate"
+
+    if not copy_candidate:
+        if fallback_noop:
+            skipped_reason = "fallback_candidate_noop_guard"
+        else:
+            skipped_reason = "runtime_policy_state_not_applied_candidate"
+        return RelayKVHostBackupCopyResult(
+            runtime_policy_state=state,
+            host_backup_copy_candidate=False,
+            host_backup_copy_executed=False,
+            host_backup_copy_skipped_reason=skipped_reason,
+            source_shape=source_shape,
+            backup_shape=None,
+            source_dtype=source_dtype,
+            backup_dtype=None,
+            source_device=source_device,
+            backup_device=None,
+            copy_numel=0,
+            copy_nbytes=0,
+            copy_equal=False,
+            fallback_candidate_noop_guard=fallback_noop,
+            attention_override=False,
+            kv_cache_mutation=False,
+            scheduler_policy_noop=True,
+            backup_tensor=None,
+        )
+
+    backup_tensor = source_tensor.detach().to("cpu").clone()
+    source_cpu = source_tensor.detach().to("cpu")
+    copy_equal = bool(backup_tensor.equal(source_cpu))
+    return RelayKVHostBackupCopyResult(
+        runtime_policy_state=state,
+        host_backup_copy_candidate=True,
+        host_backup_copy_executed=True,
+        host_backup_copy_skipped_reason="",
+        source_shape=source_shape,
+        backup_shape=_tensor_shape_list(backup_tensor),
+        source_dtype=source_dtype,
+        backup_dtype=str(getattr(backup_tensor, "dtype", None)),
+        source_device=source_device,
+        backup_device=str(getattr(backup_tensor, "device", None)),
+        copy_numel=_tensor_numel(backup_tensor),
+        copy_nbytes=_tensor_nbytes(backup_tensor),
+        copy_equal=copy_equal,
+        fallback_candidate_noop_guard=False,
+        attention_override=False,
+        kv_cache_mutation=False,
+        scheduler_policy_noop=True,
+        backup_tensor=backup_tensor,
     )
 
 
