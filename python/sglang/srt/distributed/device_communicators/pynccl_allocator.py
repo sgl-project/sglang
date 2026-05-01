@@ -5,7 +5,12 @@ import traceback
 from contextlib import nullcontext
 
 import torch
-from torch.cuda.memory import CUDAPluggableAllocator
+from torch.cuda.memory import (
+    CUDAPluggableAllocator,
+    _cuda_beginAllocateCurrentThreadToPool,
+    _cuda_endAllocateToPool,
+    _cuda_releasePool,
+)
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
@@ -153,9 +158,9 @@ class SymmetricMemoryContext:
         group_coordinator: GroupCoordinator,
     ):
         self.group_coordinator = group_coordinator
-        self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
+        self._pool_id = get_nccl_mem_pool().id
+        self._device_index = torch.cuda.current_device()
         self.is_graph_capture = torch.cuda.is_current_stream_capturing()
-        self.exited = False
 
     def __enter__(self):
         assert (
@@ -174,11 +179,7 @@ class SymmetricMemoryContext:
                     _cur_device, _graph_pool_id
                 )
 
-        if self.exited:
-            # mempool ctx (@contextlib.contextmanager) is not re-entrant
-            self._mem_pool_ctx = torch.cuda.use_mem_pool(get_nccl_mem_pool())
-            self.exited = False
-        self._mem_pool_ctx.__enter__()
+        _cuda_beginAllocateCurrentThreadToPool(self._device_index, self._pool_id)
 
         # Set the env var to pass this argument to the C functions.
         os.environ["SGLANG_TMP_NCCL_COMM_VALUE"] = str(
@@ -191,7 +192,8 @@ class SymmetricMemoryContext:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        self._mem_pool_ctx.__exit__(exc_type, exc_val, exc_tb)
+        _cuda_endAllocateToPool(self._device_index, self._pool_id)
+        _cuda_releasePool(self._device_index, self._pool_id)
 
         if self.is_graph_capture:
             if after_2_8_0:
@@ -203,8 +205,6 @@ class SymmetricMemoryContext:
 
         global _active_symmetric_memory_context
         _active_symmetric_memory_context = None
-
-        self.exited = True
 
 
 def use_symmetric_memory(group_coordinator: GroupCoordinator, disabled: bool = False):

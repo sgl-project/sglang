@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -24,6 +25,29 @@ MAMBA_STATE_PER_REQ_PREFIX_CACHE = 3
 MAMBA_STATE_PER_REQ_NO_CACHE = 1
 
 logger = logging.getLogger(__name__)
+
+
+def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
+    # The page is guaranteed to be full except the last page.
+    if page_size == 1:
+        return kv_indices
+
+    return kv_indices[::page_size] // page_size
+
+
+def kv_to_page_num(num_kv_indices: int, page_size: int):
+    return (num_kv_indices + page_size - 1) // page_size
+
+
+def page_align_floor(length: int, page_size: int) -> int:
+    return (length // page_size) * page_size
+
+
+def maybe_cache_unfinished_req(req: Req, tree_cache: BasePrefixCache, **kwargs):
+    if getattr(req, "skip_radix_cache_insert", False):
+        return
+
+    tree_cache.cache_unfinished_req(req, **kwargs)
 
 
 @triton.jit
@@ -553,7 +577,10 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
             req.mamba_pool_idx = None
         return
 
-    tree_cache.cache_finished_req(req, is_insert=is_insert)
+    tree_cache.cache_finished_req(
+        req,
+        is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
+    )
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # and bookkeeping flag sync internally, then sets req_pool_idx = None.
