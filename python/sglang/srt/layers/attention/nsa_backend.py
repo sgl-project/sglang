@@ -310,6 +310,12 @@ class NativeSparseAttnBackend(
     NativeSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
     def supports_compiled_replay_prepare(self) -> bool:
+        # The compiled path needs a separate real_page_table buffer to avoid
+        # input aliasing. For page_size == 1 that buffer would duplicate the full
+        # page table and can consume too much GPU memory on long-context runs.
+        # Keep this enabled only for paged caches, where the duplicate is bounded
+        # by max_context_len / page_size. Long-context benchmarks were checked in
+        # https://github.com/sgl-project/sglang/pull/21878#discussion_r3163986440.
         return self.real_page_size > 1
 
     def get_cuda_graph_replay_metadata(self, bs: int) -> NSAMetadata:
