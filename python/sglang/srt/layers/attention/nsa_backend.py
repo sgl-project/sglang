@@ -1150,6 +1150,13 @@ class NativeSparseAttnBackend(
         seq_lens_cpu: Optional[torch.Tensor],
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
+        """Replay metadata init for compiled replay-prepare.
+
+        The compiled path passes the pre-exported CUDA graph metadata object in
+        explicitly. Looking it up or allocating it inside torch.compile makes
+        Dynamo observe changing Python metadata objects and can trigger frequent
+        recompilations.
+        """
         if not torch.compiler.is_compiling():
             assert seq_lens_cpu is not None
             self.set_nsa_prefill_impl(forward_batch=None)
