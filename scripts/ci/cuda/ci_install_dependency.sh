@@ -285,19 +285,11 @@ install_sglang_kernel() {
         $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
 
-    # Reinstall sglang-kernel with matching CUDA version if needed
-    SGL_KERNEL_FULL_VER=$(pip show sglang-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    SGL_KERNEL_CUDA_VER=$(printf '%s' "$SGL_KERNEL_FULL_VER" | sed -n 's/.*+//p')
-    echo "Detected sglang-kernel version: ${SGL_KERNEL_FULL_VER} (CUDA tag: ${SGL_KERNEL_CUDA_VER:-none})"
-    if [ -n "$SGL_KERNEL_CUDA_VER" ] && [ "$SGL_KERNEL_CUDA_VER" != "$CU_VERSION" ]; then
-        SGL_KERNEL_VER="${SGL_KERNEL_FULL_VER%+*}"
-        echo "Reinstalling sglang-kernel==${SGL_KERNEL_VER} from ${CU_VERSION} index to match torch..."
-        if [ "$CU_MAJOR" = "13" ]; then
-            $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VER}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-        else
-            $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-        fi
-    fi
+    # install_sglang above pulls sglang-kernel from PyPI, whose default wheel
+    # tracks one CUDA version (currently cu130). Force-reinstall from the
+    # CU_VERSION-matched sglang wheel index so runners on a different CUDA
+    # (e.g. h20 / cu129) get a wheel linked against the right libnvrtc.
+    $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VERSION_FROM_SRT}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
 
     mark_step_done "${FUNCNAME[0]}"
 }
