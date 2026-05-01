@@ -24,58 +24,6 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 
-def make_swa_ring_buffer_indices(
-    forward_batch: ForwardBatch,
-    device: torch.device,
-    *,
-    max_seq_len: int,
-    swa_window_size: int,
-) -> torch.Tensor:
-    SWA_WINDOW = swa_window_size
-    extend_num_tokens = forward_batch.extend_num_tokens
-    assert extend_num_tokens is not None
-    if envs.SGLANG_OPT_USE_TILELANG_SWA_PREPARE.get():
-        seq_lens = forward_batch.seq_lens
-        extend_lens = forward_batch.extend_seq_lens
-        assert extend_lens is not None
-        seq_lens_k = seq_lens.to(torch.int32)
-        seq_lens_q = extend_lens.to(torch.int32)
-        swa_indices = torch.empty(
-            (extend_num_tokens, SWA_WINDOW), device=device, dtype=torch.int32
-        )
-        return tilelang_make_swa_prefill_indices(
-            seq_lens_k=seq_lens_k,
-            seq_lens_q=seq_lens_q,
-            swa_indices=swa_indices,
-        )
-    seq_lens = forward_batch.seq_lens_cpu
-    extend_lens = forward_batch.extend_seq_lens_cpu
-    assert seq_lens is not None and extend_lens is not None
-    batch_size = len(seq_lens)
-    num_tokens = extend_num_tokens
-    swa_indices = torch.full((num_tokens, swa_window_size), -1, **_HOST_INT32_KWARGS)
-    cum_qo_len = 0
-    abs_pos_buf = torch.arange(max_seq_len, dtype=torch.int32)
-    for seq_idx, (kv_len, qo_len) in enumerate(zip(seq_lens.tolist(), extend_lens)):
-        old_kv_start = seq_idx * SWA_WINDOW
-        new_kv_start = batch_size * SWA_WINDOW + cum_qo_len
-        prefix_len = kv_len - qo_len
-        for curr_seq_qo_idx in range(qo_len):
-            end_abs_pos = prefix_len + curr_seq_qo_idx + 1
-            start_abs_pos = max(end_abs_pos - SWA_WINDOW, 0)
-            chosen_abs_positions = abs_pos_buf[start_abs_pos:end_abs_pos]
-            torch.where(
-                chosen_abs_positions < prefix_len,
-                old_kv_start + chosen_abs_positions % SWA_WINDOW,
-                new_kv_start + (chosen_abs_positions - prefix_len),
-                out=swa_indices[
-                    cum_qo_len + curr_seq_qo_idx, : end_abs_pos - start_abs_pos
-                ],
-            )
-        cum_qo_len += qo_len
-    return swa_indices.to(device, non_blocking=True)
-
-
 def prepare_swa_ring_buffer_cache(
     swa_k: torch.Tensor,
     forward_batch: ForwardBatch,
