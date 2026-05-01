@@ -56,6 +56,14 @@ RUN --mount=type=secret,id=github_token \
     conda activate py${PYTHON_VERSION} && \
     pip3 install torch==2.11.0+xpu torchao torchvision torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
 
+# Install Rust toolchain (for setuptools-rust-built extensions, e.g. sglang-grpc).
+# Minimum supported version: 1.85 (first stable with edition 2024).
+# Installed as user 'sdp' so $HOME/.cargo is writable without root.
+ENV PATH="/home/sdp/.cargo/bin:${PATH}"
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path \
+    && rustc --version && cargo --version
+
 RUN --mount=type=secret,id=github_token \
     cd /home/sdp && \
     . /home/sdp/miniforge3/bin/activate && \
