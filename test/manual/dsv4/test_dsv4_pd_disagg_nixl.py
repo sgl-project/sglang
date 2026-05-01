@@ -21,7 +21,6 @@ from sglang.test.test_utils import (
 DSV4_FLASH_MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
 
 DSV4_FLASH_ENV = {
-    "SGLANG_DSV4_FP4_EXPERTS": "0",
     # MTP num_draft_tokens=4 scales dispatch by ~4x; 256 overflows at bs=128.
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
 }

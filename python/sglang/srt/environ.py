@@ -555,7 +555,6 @@ class Envs:
     SGLANG_REASONING_EFFORT = EnvStr("")
 
     SGLANG_DSV4_ISOLATE = EnvInt(False)
-    SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)  # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint
     SGLANG_OPT_HISPARSE_C4_SHRINK = EnvInt(1)
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)

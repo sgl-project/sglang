@@ -140,8 +140,12 @@ class Fp8Config(QuantizationConfig):
         weight_block_size: List[int] = None,
         packed_modules_mapping: Optional[Dict[str, List[str]]] = None,
         use_mxfp8: bool = False,
+        is_fp4_experts: bool = False,
     ) -> None:
         super().__init__()
+        # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
+        # model_loader from ModelConfig. Default False off the DSV4 path.
+        self.is_fp4_experts = is_fp4_experts
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -252,14 +256,9 @@ class Fp8Config(QuantizationConfig):
                     layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
                 )
 
-            from sglang.srt.environ import envs
-
             fp8_method = Fp8MoEMethod(self)
 
-            if (
-                envs.SGLANG_DSV4_FP4_EXPERTS.get()
-                and get_moe_runner_backend().is_flashinfer_mxfp4()
-            ):
+            if self.is_fp4_experts and get_moe_runner_backend().is_flashinfer_mxfp4():
                 from sglang.srt.layers.quantization.mxfp4_deepseek import (
                     DeepSeekMxfp4MoEMethod,
                 )
@@ -814,7 +813,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.block_quant = (
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
-        self.is_fp4_expert = envs.SGLANG_DSV4_FP4_EXPERTS.get()
+        self.is_fp4_expert = self.quant_config.is_fp4_experts
         self.with_bias = False
         if get_moe_runner_backend().is_cutlass():
             assert (
@@ -1769,6 +1768,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_scale=w13_scale,
                 w2_scale=w2_scale,
                 block_shape=block_shape,
+                is_fp4_experts=self.is_fp4_expert,
             )
         elif (
             self.runner.runner_backend.is_flashinfer_trtllm()

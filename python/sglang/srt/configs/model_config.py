@@ -179,11 +179,26 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
-        # Auto-detect FP4 vs FP8 routed-expert storage for DeepSeek V4
+        # DSV4 routed-expert layout: mxfp4-packed (True) or converted FP8 (False).
+        # Detect failure raises here -- a silent default would later blow up as
+        # a shape mismatch in Fp8MoEMethod.create_weights.
+        self.is_fp4_experts: bool = False
         if is_deepseek_v4(self.hf_config):
-            from sglang.srt.configs.deepseek_v4 import maybe_auto_set_fp4_experts
+            from sglang.srt.configs.deepseek_v4 import detect_fp4_experts
 
-            maybe_auto_set_fp4_experts(self.model_path)
+            detected = detect_fp4_experts(self.model_path)
+            if detected is None:
+                raise ValueError(
+                    f"Could not auto-detect DSV4 routed-expert layout from "
+                    f"{self.model_path!r}. Download the checkpoint locally if "
+                    "remote; otherwise the safetensors header is missing a "
+                    "routed-expert weight with dtype U8/I8/F4 or F8_E4M3."
+                )
+            self.is_fp4_experts = detected
+            logger.info(
+                "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
+                self.is_fp4_experts,
+            )
 
         # Check model type
         self.attention_chunk_size = getattr(
