@@ -71,9 +71,6 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
-MOE_BIT_WISE_EQUAL_MODE = False
-ATTN_BIT_WISE_EQUAL_MODE = False
-COMPRESSOR_BIT_WISE_EQUAL_MODE = False
 _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
@@ -1363,29 +1360,20 @@ class DeepseekV4ForCausalLM(nn.Module):
         name = name.replace(".attn_norm.", ".input_layernorm.")
         name = name.replace(".ffn_norm.", ".post_attention_layernorm.")
 
-        if not ATTN_BIT_WISE_EQUAL_MODE:
-            if "self_attn" in name and (
-                "compressor" not in name or not COMPRESSOR_BIT_WISE_EQUAL_MODE
-            ):
-                name = name.replace(".scale", ".weight_scale_inv")
+        if "self_attn" in name:
+            name = name.replace(".scale", ".weight_scale_inv")
 
-        if not MOE_BIT_WISE_EQUAL_MODE:
-            name = name.replace(".gate.tid2eid", ".topk.tid2eid")
-            name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
-            name = name.replace(".w1.", ".gate_proj.")
-            name = name.replace(".w2.", ".down_proj.")
-            name = name.replace(".w3.", ".up_proj.")
-            if "mlp" in name:
-                name = name.replace(".scale", ".weight_scale_inv")
+        name = name.replace(".gate.tid2eid", ".topk.tid2eid")
+        name = name.replace(".gate.bias", ".gate.e_score_correction_bias")
+        name = name.replace(".w1.", ".gate_proj.")
+        name = name.replace(".w2.", ".down_proj.")
+        name = name.replace(".w3.", ".up_proj.")
+        if "mlp" in name:
+            name = name.replace(".scale", ".weight_scale_inv")
 
         return name
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        if MOE_BIT_WISE_EQUAL_MODE:
-            assert (
-                self.num_fused_shared_experts == 0
-            ), "use --disable-shared-experts-fusion for MoE bit-wise equal mode"
-
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
 
@@ -1547,8 +1535,6 @@ class DeepseekV4ForCausalLM(nn.Module):
                         break
                     else:
                         for mapping in expert_params_mapping:
-                            if MOE_BIT_WISE_EQUAL_MODE:
-                                continue
                             param_name, weight_name, expert_id, shard_id = mapping
                             if weight_name not in name:
                                 continue
