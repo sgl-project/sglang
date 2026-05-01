@@ -214,15 +214,6 @@ class Compressor(nn.Module):
 
         return ret
 
-    @staticmethod
-    def compute_state_len(seq_len: int, ratio: int):
-        return seq_len % ratio + (ratio == 4) * ratio
-
-    @staticmethod
-    def compute_state_len_indices(seq_len: int, ratio: int):
-        state_len = seq_len % ratio + (ratio == 4) * ratio
-        return torch.arange(seq_len - state_len, seq_len).clamp(min=-1)
-
     def forward(self, x: torch.Tensor, forward_batch: ForwardBatch) -> torch.Tensor:
         if forward_batch.forward_mode.is_idle():
             assert x.shape[0] == 0
