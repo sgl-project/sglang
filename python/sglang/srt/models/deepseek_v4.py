@@ -71,8 +71,6 @@ from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 
-from sglang.srt.environ import envs
-
 MOE_BIT_WISE_EQUAL_MODE = False
 ATTN_BIT_WISE_EQUAL_MODE = False
 COMPRESSOR_BIT_WISE_EQUAL_MODE = False
