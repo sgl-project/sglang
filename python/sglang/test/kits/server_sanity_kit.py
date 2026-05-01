@@ -210,18 +210,14 @@ class ServerSanityMixin:
         self.assertGreater(len(out), 0)
 
     def test_determinism_temp_zero(self):
-        # Same prompt + temperature=0 must be deterministic. RNG state
-        # corruption / cache mismatch / stream-mode divergence all show
-        # up as non-identical outputs across runs. Stop on "\n" so the
-        # model emits just the answer word; longer continuations can
-        # drift on near-tie tokens via floating-point non-associativity
-        # in EP MoE / EAGLE spec paths, which isn't what this probe is
-        # meant to catch.
+        # temp=0 must be byte-identical across runs. Stop on "\n" so we
+        # only compare the answer word; long continuations drift on
+        # near-tie tokens (EP MoE / EAGLE spec) and aren't the point.
         prompt = "Q: What is the capital of France? Reply in one word.\nA:"
         out1 = self._sanity_generate(
             prompt, self.sanity_max_new_tokens_short, stop=["\n"]
         )
-        # Second call hits cache, also exercises the cache-hit path.
+        # Second call exercises cache-hit path.
         out2 = self._sanity_generate(
             prompt, self.sanity_max_new_tokens_short, stop=["\n"]
         )
