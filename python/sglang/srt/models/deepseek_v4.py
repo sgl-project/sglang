@@ -1112,7 +1112,6 @@ class DeepseekV4Model(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
-        pp_proxy_tensors: Optional[PPProxyTensors],
     ) -> torch.Tensor:
         total_num_layers = self.end_layer - self.start_layer
         device = input_embeds.device if input_embeds is not None else input_ids.device
@@ -1263,7 +1262,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
             hidden_states = self.model.forward(
-                input_ids, positions, forward_batch, input_embeds, pp_proxy_tensors
+                input_ids, positions, forward_batch, input_embeds
             )
         aux_hidden_states = None
         pre_hc_head = None
