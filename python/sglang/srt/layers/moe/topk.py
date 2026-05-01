@@ -267,6 +267,7 @@ class TopK(MultiPlatformOp):
         apply_routed_scaling_factor_on_output: Optional[bool] = False,
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
+        is_fp4_experts: bool = False,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -276,6 +277,9 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
+        # flashinfer_mxfp4 backend only: True → STANDARD (DeepSeekMxfp4MoEMethod
+        # consumes), False → BYPASSED (flashinfer's own mxfp4 kernel). No-op otherwise.
+        self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
@@ -323,8 +327,7 @@ class TopK(MultiPlatformOp):
         elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
         elif get_moe_runner_backend().is_flashinfer_trtllm() or (
-            get_moe_runner_backend().is_flashinfer_mxfp4()
-            and not envs.SGLANG_DSV4_FP4_EXPERTS.get()
+            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
         ):
             output_format = TopKOutputFormat.BYPASSED
         else:
