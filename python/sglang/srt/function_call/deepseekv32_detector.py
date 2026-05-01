@@ -188,35 +188,54 @@ class DeepSeekV32Detector(BaseFormatDetector):
         """
         One-time parsing: Detects and parses tool calls in the provided text.
 
+        Accepts both shapes the model may emit:
+
+        1. Wrapped (model's natural format, used by `tool_choice="auto"`):
+           ``<｜DSML｜function_calls>...invokes...</｜DSML｜function_calls>``
+        2. Bare invokes (no outer wrapper): emitted when the structural_tag
+           grammar is enforced with ``at_least_one=True`` (i.e.,
+           ``tool_choice="required"``/named/strict). The grammar built from
+           ``structure_info()`` only constrains the inner ``<｜DSML｜invoke>``
+           pattern, so the surrounding ``<｜DSML｜function_calls>`` wrapper
+           is omitted and the model jumps straight to the trigger.
+
+        Mirrors the (already permissive) behavior of
+        ``parse_streaming_increment``; without this, tool calls produced under
+        ``tool_choice="required"`` silently disappear in the non-streaming path.
+
         :param text: The complete text to parse.
         :param tools: List of available tools.
-        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        :return: ParseResult with leading prose in ``normal_text`` and any
+            extracted tool calls in ``calls``.
         """
-        idx = text.find(self.bot_token)
-        normal_text = text[:idx].strip() if idx != -1 else text
-        if self.bot_token not in text:
-            return StreamingParseResult(normal_text=normal_text, calls=[])
+        invoke_token = "<｜DSML｜invoke"
+        bot_idx = text.find(self.bot_token)
+        invoke_idx = text.find(invoke_token)
 
-        calls = []
+        # Tool-call section starts at whichever marker appears first.
+        if bot_idx != -1 and (invoke_idx == -1 or bot_idx <= invoke_idx):
+            section_start = bot_idx
+        elif invoke_idx != -1:
+            section_start = invoke_idx
+        else:
+            return StreamingParseResult(normal_text=text, calls=[])
+
+        normal_text = text[:section_start].strip()
+
         try:
-            # Extract content between function_calls tags
-            function_calls_match = re.search(
-                self.function_calls_regex,
-                text,
-                re.DOTALL,
+            # Prefer the explicit wrapper for scoping when the closing tag is
+            # also present; otherwise scan from the first invoke to end of text.
+            # `invoke_regex` already handles both complete and (terminal-only)
+            # incomplete invokes via its `(... | $)` end alternative.
+            wrapper_match = re.search(self.function_calls_regex, text, re.DOTALL)
+            scope = (
+                wrapper_match.group(1) if wrapper_match else text[section_start:]
             )
-            if not function_calls_match:
-                return StreamingParseResult(normal_text=normal_text, calls=[])
 
-            function_calls_content = function_calls_match.group(1)
-
-            # Find all invoke blocks
-            for invoke_match in re.finditer(
-                self.invoke_regex, function_calls_content, re.DOTALL
-            ):
+            calls = []
+            for invoke_match in re.finditer(self.invoke_regex, scope, re.DOTALL):
                 func_name, invoke_content, _ = self._unpack_invoke_match(invoke_match)
                 func_args = self._parse_parameters_from_xml(invoke_content)
-                # construct match_result for parse_base_json
                 match_result = {"name": func_name, "parameters": json.loads(func_args)}
                 calls.extend(self.parse_base_json(match_result, tools))
 

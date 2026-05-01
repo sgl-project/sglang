@@ -1518,6 +1518,90 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         params = json.loads(call.parameters)
         self.assertEqual(params, {})
 
+    def test_detect_and_parse_bare_invoke_json(self):
+        """Bare `<｜DSML｜invoke>` block without the outer `<｜DSML｜function_calls>`
+        wrapper must still parse correctly.
+
+        This is the shape the model emits when the structural_tag grammar built
+        from `structure_info()` is enforced with `at_least_one=True` (i.e., for
+        `tool_choice="required"`/named/strict): the grammar only constrains the
+        inner `<｜DSML｜invoke ...>...</｜DSML｜invoke>` pattern, so the surrounding
+        `<｜DSML｜function_calls>` wrapper is omitted. The streaming path already
+        accepts this shape; the non-streaming path must too, otherwise tool calls
+        silently disappear (returns empty `calls`).
+        """
+        text = (
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">\n'
+            '{"city": "San Francisco"}\n'
+            "</｜DSML｜invoke>"
+        )
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_favorite_tourist_spot")
+        self.assertEqual(json.loads(call.parameters), {"city": "San Francisco"})
+
+    def test_detect_and_parse_bare_invoke_xml(self):
+        """Bare `<｜DSML｜invoke>` (no outer wrapper) with XML parameter tags."""
+        text = (
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">'
+            '<｜DSML｜parameter name="city" string="true">San Francisco</｜DSML｜parameter>'
+            "</｜DSML｜invoke>"
+        )
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_favorite_tourist_spot")
+        self.assertEqual(json.loads(call.parameters), {"city": "San Francisco"})
+
+    def test_detect_and_parse_bare_invoke_multiple(self):
+        """Multiple consecutive bare `<｜DSML｜invoke>` blocks without the outer
+        wrapper must all be extracted (mirrors `parse_streaming_increment`)."""
+        text = (
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">'
+            '{"city": "San Francisco"}'
+            "</｜DSML｜invoke>"
+            '<｜DSML｜invoke name="search">'
+            '{"query": "WebNav benchmark", "topn": 10, "source": "web"}'
+            "</｜DSML｜invoke>"
+        )
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_favorite_tourist_spot")
+        self.assertEqual(
+            json.loads(result.calls[0].parameters), {"city": "San Francisco"}
+        )
+        self.assertEqual(result.calls[1].name, "search")
+        self.assertEqual(
+            json.loads(result.calls[1].parameters),
+            {"query": "WebNav benchmark", "topn": 10, "source": "web"},
+        )
+
+    def test_detect_and_parse_bare_invoke_with_preceding_text(self):
+        """Bare invoke preceded by free text - the prose must end up in
+        `normal_text` and the invoke must be extracted as a tool call."""
+        text = (
+            "Let me look that up for you.\n"
+            '<｜DSML｜invoke name="get_favorite_tourist_spot">'
+            '{"city": "San Francisco"}'
+            "</｜DSML｜invoke>"
+        )
+
+        result = self.detector.detect_and_parse(text, self.tools)
+
+        self.assertEqual(len(result.calls), 1)
+        self.assertIn("Let me look that up for you.", result.normal_text)
+        self.assertNotIn("DSML", result.normal_text)
+        call = result.calls[0]
+        self.assertEqual(call.name, "get_favorite_tourist_spot")
+        self.assertEqual(json.loads(call.parameters), {"city": "San Francisco"})
+
     def test_streaming_no_parameters(self):
         """Test streaming parsing of function calls with no parameters.
 
