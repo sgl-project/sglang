@@ -10,6 +10,12 @@ name: Probe API Rate Limit
 
 on:
   workflow_dispatch:
+  # Also runs on any push that touches this file. Lets us probe from a
+  # feature branch before the file lands on the default branch (which
+  # is required for plain workflow_dispatch). Remove once merged to main.
+  push:
+    paths:
+      - .github/workflows/probe-rate-limit.yml
 
 permissions:
   contents: read
