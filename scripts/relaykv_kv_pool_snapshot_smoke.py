@@ -8,7 +8,7 @@ import torch
 from sglang.srt.relaykv import RelayKVConfig, make_shadow_plan
 from sglang.srt.relaykv.memory import (
     copy_host_backup_candidate_for_smoke,
-    snapshot_kv_pool_for_host_backup_smoke,
+    snapshot_mha_kv_pool_readonly_for_smoke,
 )
 
 
@@ -25,16 +25,6 @@ class _FakeMHATokenToKVPool:
                 8, 2, 8
             ),
         ]
-
-
-class _FakeAllocator:
-    page_size = 1
-
-    def __init__(self, kvcache: _FakeMHATokenToKVPool) -> None:
-        self._kvcache = kvcache
-
-    def get_kvcache(self) -> _FakeMHATokenToKVPool:
-        return self._kvcache
 
 
 def _relaykv_config() -> RelayKVConfig:
@@ -150,7 +140,7 @@ def _merge_snapshot_and_copy_logs(
 def main() -> None:
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    allocator = _FakeAllocator(_FakeMHATokenToKVPool(device=device))
+    kv_pool = _FakeMHATokenToKVPool(device=device)
     token_indices = [2, 3, 4, 5]
 
     applied_plan = make_shadow_plan(
@@ -171,11 +161,11 @@ def main() -> None:
     if fallback_plan.runtime_policy_state != "fallback_candidate":
         raise AssertionError(fallback_plan)
 
-    applied_snapshot = snapshot_kv_pool_for_host_backup_smoke(
-        plan=applied_plan,
-        token_to_kv_pool_allocator=allocator,
+    applied_snapshot = snapshot_mha_kv_pool_readonly_for_smoke(
+        kv_pool=kv_pool,
         token_indices=token_indices,
         layer_idx=0,
+        runtime_policy_state=applied_plan.runtime_policy_state,
     )
     if applied_snapshot.snapshot_tensor is None:
         raise AssertionError(applied_snapshot)
@@ -184,16 +174,16 @@ def main() -> None:
         source_tensor=applied_snapshot.snapshot_tensor,
     )
 
-    fallback_snapshot = snapshot_kv_pool_for_host_backup_smoke(
-        plan=fallback_plan,
-        token_to_kv_pool_allocator=allocator,
+    fallback_snapshot = snapshot_mha_kv_pool_readonly_for_smoke(
+        kv_pool=kv_pool,
         token_indices=token_indices,
         layer_idx=0,
+        runtime_policy_state=fallback_plan.runtime_policy_state,
     )
     fallback_source = (
         applied_snapshot.snapshot_tensor
         if applied_snapshot.snapshot_tensor is not None
-        else allocator.get_kvcache().k_buffer[0][:1]
+        else kv_pool.k_buffer[0][:1]
     )
     fallback_copy = copy_host_backup_candidate_for_smoke(
         plan=fallback_plan,

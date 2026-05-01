@@ -17,7 +17,7 @@ import torch
 from sglang.srt.relaykv import RelayKVConfig, make_shadow_plan
 from sglang.srt.relaykv.memory import (
     copy_host_backup_candidate_for_smoke,
-    snapshot_kv_pool_for_host_backup_smoke,
+    snapshot_mha_kv_pool_readonly_for_smoke,
 )
 
 
@@ -37,16 +37,6 @@ class _ObservedMHATokenToKVPool:
                 9, 2, 8
             ),
         ]
-
-
-class _ObservedAllocator:
-    page_size = 1
-
-    def __init__(self, kvcache: Any) -> None:
-        self._kvcache = kvcache
-
-    def get_kvcache(self) -> Any:
-        return self._kvcache
 
 
 def _relaykv_config() -> RelayKVConfig:
@@ -137,41 +127,6 @@ def _try_actual_mha_pool(device: str) -> tuple[Any, dict[str, object]]:
         return _ObservedMHATokenToKVPool(device=device), status
 
 
-def _shape(tensor: Any) -> list[int] | None:
-    shape = getattr(tensor, "shape", None)
-    if shape is None:
-        return None
-    return [int(dim) for dim in shape]
-
-
-def _layout_observation(pool: Any, *, layer_idx: int, token_indices: list[int]) -> dict[str, object]:
-    k_buffer = getattr(pool, "k_buffer", None)
-    v_buffer = getattr(pool, "v_buffer", None)
-    has_k_buffer = isinstance(k_buffer, list) and len(k_buffer) > layer_idx
-    has_v_buffer = isinstance(v_buffer, list) and len(v_buffer) > layer_idx
-    k_tensor = k_buffer[layer_idx] if has_k_buffer else None
-    v_tensor = v_buffer[layer_idx] if has_v_buffer else None
-    if has_k_buffer and has_v_buffer:
-        observed_layout = "mha_split_kv"
-    elif hasattr(pool, "kv_buffer"):
-        observed_layout = "combined_kv"
-    else:
-        observed_layout = None
-    return {
-        "observed_layout": observed_layout,
-        "has_k_buffer": has_k_buffer,
-        "has_v_buffer": has_v_buffer,
-        "k_shape": _shape(k_tensor),
-        "v_shape": _shape(v_tensor),
-        "k_dtype": str(getattr(k_tensor, "dtype", None)) if k_tensor is not None else None,
-        "v_dtype": str(getattr(v_tensor, "dtype", None)) if v_tensor is not None else None,
-        "k_device": str(getattr(k_tensor, "device", None)) if k_tensor is not None else None,
-        "v_device": str(getattr(v_tensor, "device", None)) if v_tensor is not None else None,
-        "layer_idx": layer_idx,
-        "token_indices": token_indices,
-    }
-
-
 def _merge_logs(
     base: dict[str, object],
     snapshot_log: dict[str, object],
@@ -181,6 +136,18 @@ def _merge_logs(
     payload.update(
         {
             "runtime_policy_state": snapshot_log["runtime_policy_state"],
+            "kv_pool_type": snapshot_log["kv_pool_type"],
+            "observed_layout": snapshot_log["observed_layout"],
+            "has_k_buffer": snapshot_log["has_k_buffer"],
+            "has_v_buffer": snapshot_log["has_v_buffer"],
+            "k_shape": snapshot_log["k_shape"],
+            "v_shape": snapshot_log["v_shape"],
+            "k_dtype": snapshot_log["k_dtype"],
+            "v_dtype": snapshot_log["v_dtype"],
+            "k_device": snapshot_log["k_device"],
+            "v_device": snapshot_log["v_device"],
+            "layer_idx": snapshot_log["layer_idx"],
+            "token_indices": snapshot_log["token_indices"],
             "snapshot_created": snapshot_log["snapshot_created"],
             "snapshot_shape": snapshot_log["snapshot_shape"],
             "backup_shape": copy_log["backup_shape"],
@@ -251,11 +218,6 @@ def main() -> None:
     layer_idx = 0
     token_indices = [2, 3, 4, 5]
     pool, pool_status = _try_actual_mha_pool(device)
-    allocator = _ObservedAllocator(pool)
-    observation = {
-        **pool_status,
-        **_layout_observation(pool, layer_idx=layer_idx, token_indices=token_indices),
-    }
 
     applied_plan = make_shadow_plan(
         2535,
@@ -270,11 +232,11 @@ def main() -> None:
         request_id="actual-kv-pool-observation-fallback",
     )
 
-    applied_snapshot = snapshot_kv_pool_for_host_backup_smoke(
-        plan=applied_plan,
-        token_to_kv_pool_allocator=allocator,
+    applied_snapshot = snapshot_mha_kv_pool_readonly_for_smoke(
+        kv_pool=pool,
         token_indices=token_indices,
         layer_idx=layer_idx,
+        runtime_policy_state=applied_plan.runtime_policy_state,
     )
     if applied_snapshot.snapshot_tensor is None:
         raise AssertionError(applied_snapshot)
@@ -283,11 +245,11 @@ def main() -> None:
         source_tensor=applied_snapshot.snapshot_tensor,
     )
 
-    fallback_snapshot = snapshot_kv_pool_for_host_backup_smoke(
-        plan=fallback_plan,
-        token_to_kv_pool_allocator=allocator,
+    fallback_snapshot = snapshot_mha_kv_pool_readonly_for_smoke(
+        kv_pool=pool,
         token_indices=token_indices,
         layer_idx=layer_idx,
+        runtime_policy_state=fallback_plan.runtime_policy_state,
     )
     fallback_copy = copy_host_backup_candidate_for_smoke(
         plan=fallback_plan,
@@ -295,12 +257,12 @@ def main() -> None:
     )
 
     applied_log = _merge_logs(
-        observation,
+        pool_status,
         applied_snapshot.to_log_dict(),
         applied_copy.to_log_dict(),
     )
     fallback_log = _merge_logs(
-        observation,
+        pool_status,
         fallback_snapshot.to_log_dict(),
         fallback_copy.to_log_dict(),
     )
