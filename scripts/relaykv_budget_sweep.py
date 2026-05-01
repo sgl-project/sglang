@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import signal
 from collections.abc import Iterable
 from typing import Any
 
 from sglang.srt.relaykv import RelayKVConfig, make_shadow_plan
+from sglang.srt.relaykv.metrics import summarize_policy_events
 
 
 KV_BYTES_PER_TOKEN = 28672
@@ -46,45 +48,41 @@ COLUMNS = (
 )
 
 
-def _plans() -> Iterable[dict[str, Any]]:
+def _plans() -> Iterable[Any]:
     for available_mib in AVAILABLE_KV_BUDGET_MIB:
         for recent_window in RECENT_WINDOWS:
             for anchor_blocks in ANCHOR_BLOCKS:
                 for retrieval_top_k in RETRIEVAL_TOP_K:
-                    yield _row(
-                        make_shadow_plan(
-                            SEQ_LEN,
-                            RelayKVConfig(
-                                enabled=True,
-                                mode="shadow",
-                                available_kv_budget_mib=available_mib,
-                                recent_window=recent_window,
-                                anchor_blocks=anchor_blocks,
-                                budget_block_size=BUDGET_BLOCK_SIZE,
-                                retrieval_top_k=retrieval_top_k,
-                            ),
-                            kv_bytes_per_token=KV_BYTES_PER_TOKEN,
-                        )
+                    yield make_shadow_plan(
+                        SEQ_LEN,
+                        RelayKVConfig(
+                            enabled=True,
+                            mode="shadow",
+                            available_kv_budget_mib=available_mib,
+                            recent_window=recent_window,
+                            anchor_blocks=anchor_blocks,
+                            budget_block_size=BUDGET_BLOCK_SIZE,
+                            retrieval_top_k=retrieval_top_k,
+                        ),
+                        kv_bytes_per_token=KV_BYTES_PER_TOKEN,
                     )
 
     for working_budget_tokens in WORKING_BUDGET_TOKENS:
         for recent_window in RECENT_WINDOWS:
             for anchor_blocks in ANCHOR_BLOCKS:
                 for retrieval_top_k in RETRIEVAL_TOP_K:
-                    yield _row(
-                        make_shadow_plan(
-                            SEQ_LEN,
-                            RelayKVConfig(
-                                enabled=True,
-                                mode="shadow",
-                                kv_working_budget_tokens=working_budget_tokens,
-                                recent_window=recent_window,
-                                anchor_blocks=anchor_blocks,
-                                budget_block_size=BUDGET_BLOCK_SIZE,
-                                retrieval_top_k=retrieval_top_k,
-                            ),
-                            kv_bytes_per_token=KV_BYTES_PER_TOKEN,
-                        )
+                    yield make_shadow_plan(
+                        SEQ_LEN,
+                        RelayKVConfig(
+                            enabled=True,
+                            mode="shadow",
+                            kv_working_budget_tokens=working_budget_tokens,
+                            recent_window=recent_window,
+                            anchor_blocks=anchor_blocks,
+                            budget_block_size=BUDGET_BLOCK_SIZE,
+                            retrieval_top_k=retrieval_top_k,
+                        ),
+                        kv_bytes_per_token=KV_BYTES_PER_TOKEN,
                     )
 
 
@@ -135,7 +133,12 @@ def _print_markdown_table(rows: Iterable[dict[str, Any]]) -> None:
 
 def main() -> None:
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
-    _print_markdown_table(_plans())
+    plans = list(_plans())
+    _print_markdown_table(_row(plan) for plan in plans)
+    print(
+        "relaykv_policy_summary="
+        + json.dumps(summarize_policy_events(plans), sort_keys=True)
+    )
 
 
 if __name__ == "__main__":

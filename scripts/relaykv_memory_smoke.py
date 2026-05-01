@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import torch
 
 from sglang.srt.relaykv import RelayKVConfig, make_shadow_plan
@@ -11,6 +13,7 @@ from sglang.srt.relaykv.memory import (
     observe_request_kv_pool_mapping,
     validate_shadow_log_schema,
 )
+from sglang.srt.relaykv.metrics import summarize_policy_events
 
 
 class _FakeModelConfig:
@@ -375,6 +378,38 @@ def main() -> None:
     if full_fit_plan.policy_reason != "full_kv_fits":
         raise AssertionError(full_fit_plan)
 
+    shadow_plan = make_shadow_plan(
+        1024,
+        RelayKVConfig(
+            enabled=True,
+            mode="shadow",
+            available_kv_budget_mib=512.0,
+            recent_window=256,
+            anchor_blocks=1,
+            budget_block_size=128,
+            retrieval_top_k=2,
+        ),
+    )
+    if shadow_plan.runtime_policy_state != "shadow":
+        raise AssertionError(shadow_plan)
+
+    applied_plan = make_shadow_plan(
+        4096,
+        RelayKVConfig(
+            enabled=True,
+            mode="shadow",
+            kv_working_budget_tokens=3072,
+            recent_window=512,
+            anchor_blocks=2,
+            budget_block_size=128,
+            retrieval_top_k=4,
+        ),
+    )
+    if applied_plan.runtime_policy_state != "applied_candidate":
+        raise AssertionError(applied_plan)
+    if applied_plan.risk_level != "normal":
+        raise AssertionError(applied_plan)
+
     late_layer_plan = make_shadow_plan(
         4096,
         RelayKVConfig(
@@ -396,8 +431,21 @@ def main() -> None:
     if late_layer_plan.layer_idx != 27:
         raise AssertionError(late_layer_plan)
 
+    summary = summarize_policy_events(
+        [full_fit_plan, shadow_plan, applied_plan, plan, explicit_plan, late_layer_plan]
+    )
+    if summary["relaykv_policy_off_count"] != 2:
+        raise AssertionError(summary)
+    if summary["relaykv_policy_shadow_count"] != 1:
+        raise AssertionError(summary)
+    if summary["relaykv_policy_applied_candidate_count"] != 1:
+        raise AssertionError(summary)
+    if summary["relaykv_policy_fallback_candidate_count"] != 2:
+        raise AssertionError(summary)
+
     print("relaykv_memory_smoke: ok")
     print(payload)
+    print("relaykv_policy_summary=" + json.dumps(summary, sort_keys=True))
 
 
 if __name__ == "__main__":
