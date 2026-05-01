@@ -10,14 +10,14 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.platforms import _load_platform_class, _resolve_platform
-from sglang.srt.platforms.cuda import CudaDeviceMixin
+from sglang.srt.platforms.cuda import CudaDeviceMixin, CudaSRTPlatform
 from sglang.srt.platforms.device_mixin import (
     CpuArchEnum,
     DeviceCapability,
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import CudaSRTPlatform, SRTPlatform
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -272,6 +272,13 @@ class TestCudaDeviceMixin(CustomTestCase):
         self.assertEqual(base.get_device_name(1), "NVIDIA H100")
         mock_get_device_name.assert_called_once_with(1)
 
+    @patch("torch.cuda.get_device_properties")
+    def test_default_get_device_uuid_uses_cuda(self, mock_get_device_properties):
+        mock_get_device_properties.return_value.uuid = "1234"
+        base = CudaSRTPlatform()
+        self.assertEqual(base.get_device_uuid(1), "1234")
+        mock_get_device_properties.assert_called_once_with(1)
+
     @patch("torch.cuda.get_device_capability", return_value=(9, 0))
     def test_default_get_device_capability_uses_cuda(self, mock_get_device_capability):
         base = CudaSRTPlatform()
@@ -299,6 +306,25 @@ class TestCudaDeviceMixin(CustomTestCase):
     def test_default_distributed_backend_is_nccl(self):
         base = CudaSRTPlatform()
         self.assertEqual(base.get_torch_distributed_backend_str(), "nccl")
+
+    @patch("torch.cuda.manual_seed_all")
+    @patch("torch.manual_seed")
+    @patch("sglang.srt.platforms.device_mixin.np.random.seed")
+    @patch("sglang.srt.platforms.device_mixin.random.seed")
+    def test_default_seed_everything_seeds_cuda(
+        self, mock_random_seed, mock_np_seed, mock_torch_seed, mock_cuda_seed
+    ):
+        CudaSRTPlatform.seed_everything(123)
+        mock_random_seed.assert_called_once_with(123)
+        mock_np_seed.assert_called_once_with(123)
+        mock_torch_seed.assert_called_once_with(123)
+        mock_cuda_seed.assert_called_once_with(123)
+
+    def test_cuda_srt_platform_capabilities(self):
+        base = CudaSRTPlatform()
+        self.assertTrue(base.supports_fp8())
+        self.assertTrue(base.support_cuda_graph())
+        self.assertTrue(base.support_piecewise_cuda_graph())
 
 
 class TestSRTPlatformOverrides(CustomTestCase):
@@ -446,6 +472,23 @@ class TestResolvePlatformAutoDiscover(CustomTestCase):
         mock_is_cuda_available.return_value = False
         mock_load.return_value = {}
         result = _resolve_platform()
+        self.assertIsInstance(result, SRTPlatform)
+        self.assertNotIsInstance(result, CudaSRTPlatform)
+
+    @patch("sglang.srt.platforms.load_plugins_by_group")
+    @patch("sglang.srt.platforms.torch")
+    @patch("sglang.srt.platforms.envs")
+    def test_no_plugin_rocm_does_not_activate_cuda_fallback(
+        self, mock_envs, mock_torch, mock_load
+    ):
+        """ROCm exposes torch.cuda but must not use the CUDA fallback platform."""
+        mock_envs.SGLANG_PLATFORM.get.return_value = ""
+        mock_torch.cuda.is_available.return_value = True
+        mock_torch.version.hip = "6.0"
+        mock_load.return_value = {}
+
+        result = _resolve_platform()
+
         self.assertIsInstance(result, SRTPlatform)
         self.assertNotIsInstance(result, CudaSRTPlatform)
 

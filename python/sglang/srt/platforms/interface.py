@@ -10,11 +10,10 @@ Out-of-tree platforms register via setuptools entry_points under the
 "sglang.srt.platforms" group and should subclass SRTPlatform.
 """
 
-from sglang.srt.platforms.cuda import CudaDeviceMixin
 from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 
 # Re-export for convenience
-__all__ = ["CudaSRTPlatform", "SRTPlatform", "PlatformEnum"]
+__all__ = ["SRTPlatform", "PlatformEnum"]
 
 
 class SRTPlatform(DeviceMixin):
@@ -127,7 +126,3 @@ class SRTPlatform(DeviceMixin):
         E.g. "cuda", "npu", "hip", "xpu", "cpu".
         """
         return "native"
-
-
-class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
-    """Default in-tree CUDA SRT platform."""

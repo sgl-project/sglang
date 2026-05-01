@@ -9,6 +9,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
+from sglang.srt.platforms.interface import SRTPlatform
 
 
 class CudaDeviceMixin(DeviceMixin):
@@ -35,6 +36,9 @@ class CudaDeviceMixin(DeviceMixin):
     def get_device_name(self, device_id: int = 0) -> str:
         return str(torch.cuda.get_device_name(device_id))
 
+    def get_device_uuid(self, device_id: int = 0) -> str:
+        return str(torch.cuda.get_device_properties(device_id).uuid)
+
     def get_device_capability(self, device_id: int = 0) -> DeviceCapability:
         major, minor = torch.cuda.get_device_capability(device_id)
         return DeviceCapability(major, minor)
@@ -50,3 +54,22 @@ class CudaDeviceMixin(DeviceMixin):
 
     def get_torch_distributed_backend_str(self) -> str:
         return "nccl"
+
+    @classmethod
+    def seed_everything(cls, seed: int | None = None) -> None:
+        if seed is not None:
+            super().seed_everything(seed)
+            torch.cuda.manual_seed_all(seed)
+
+
+class CudaSRTPlatform(CudaDeviceMixin, SRTPlatform):
+    """Default in-tree CUDA SRT platform."""
+
+    def supports_fp8(self) -> bool:
+        return True
+
+    def support_cuda_graph(self) -> bool:
+        return True
+
+    def support_piecewise_cuda_graph(self) -> bool:
+        return True
