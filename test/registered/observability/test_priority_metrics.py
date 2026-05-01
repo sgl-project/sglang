@@ -1,12 +1,19 @@
+"""GPU smoke test for priority metrics — drives a real Qwen3-0.6B server,
+sends HTTP requests with `priority` set, and verifies the `/metrics` scrape
+exposes the expected priority label dimension.
+
+Pure-logic tests (fold helper, QueueCount.from_reqs, PrefillStats plumbing,
+ServerArgs validation, in-process collect_metrics fold) live in
+test/registered/unit/observability/test_priority_metrics.py.
+"""
+
 import unittest
 from typing import Dict, List
-from unittest.mock import Mock
 
 import requests
 from prometheus_client.parser import text_string_to_metric_families
 from prometheus_client.samples import Sample
 
-from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
@@ -39,46 +46,9 @@ def _get_samples_by_name(metrics: Dict[str, List[Sample]], name: str) -> List[Sa
     return metrics.get(name, [])
 
 
-def _get_sample_value_by_labels(samples: List[Sample], labels: Dict[str, str]) -> float:
-    for sample in samples:
-        if all(sample.labels.get(k) == v for k, v in labels.items()):
-            return sample.value
-    raise KeyError(f"No sample found with labels {labels}")
-
-
-class TestQueueCount(CustomTestCase):
-    """Unit tests for QueueCount (no server needed)."""
-
-    def test_queue_count_from_reqs(self):
-        """QueueCount correctly counts per-priority breakdown."""
-        reqs = [
-            Mock(priority=1),
-            Mock(priority=1),
-            Mock(priority=5),
-            Mock(priority=5),
-            Mock(priority=10),
-        ]
-        qc = QueueCount.from_reqs(reqs, enable_priority_scheduling=True)
-        self.assertEqual(qc.total, 5)
-        self.assertEqual(qc.by_priority, {1: 2, 5: 2, 10: 1})
-
-    def test_queue_count_from_reqs_disabled(self):
-        """Priority scheduling disabled → no breakdown."""
-        reqs = [Mock(priority=1), Mock(priority=5)]
-        qc = QueueCount.from_reqs(reqs, enable_priority_scheduling=False)
-        self.assertEqual(qc.total, 2)
-        self.assertIsNone(qc.by_priority)
-
-    def test_queue_count_empty(self):
-        """Empty request list."""
-        qc = QueueCount.from_reqs([], enable_priority_scheduling=True)
-        self.assertEqual(qc.total, 0)
-        self.assertEqual(qc.by_priority, {})
-
-
 class TestPriorityMetrics(CustomTestCase):
-    """Test that priority-based metrics are correctly emitted when
-    --enable-priority-scheduling is enabled."""
+    """End-to-end: priority label dimension is exposed on gauges and
+    histograms when --enable-priority-scheduling is set."""
 
     @classmethod
     def setUpClass(cls):

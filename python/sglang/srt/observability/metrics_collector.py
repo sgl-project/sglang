@@ -40,6 +40,19 @@ SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STAT
 logger = logging.getLogger(__name__)
 
 
+def fold_priority_label(priority: Optional[int], bucket_size: int) -> Optional[int]:
+    """Fold a raw integer priority into the lower bound of its Prometheus label bucket.
+
+    Bucket size K=1 (default) is the identity function — original behavior. K>1
+    bounds metric cardinality by collapsing priorities that share floor(p/K).
+    None passes through unchanged so that the existing `priority="None"` label
+    semantics for unset-default-priority is preserved.
+    """
+    if priority is None or bucket_size <= 1:
+        return priority
+    return (priority // bucket_size) * bucket_size
+
+
 @dataclass
 class QueueCount:
     """Holds both the total count and optional per-priority breakdown for a queue."""
@@ -48,12 +61,22 @@ class QueueCount:
     by_priority: Optional[Dict[int, int]] = None
 
     @classmethod
-    def from_reqs(cls, reqs: List[Req], enable_priority_scheduling: bool = False):
+    def from_reqs(
+        cls,
+        reqs: List[Req],
+        enable_priority_scheduling: bool = False,
+        priority_label_bucket_size: int = 1,
+    ):
         # NOTE: If requests have priority=None (no --default-priority-value set),
         # Counter will produce {None: N}, resulting in priority="None" Prometheus labels.
         # Set --default-priority-value when enabling priority scheduling to avoid this.
         by_priority = (
-            dict(Counter(req.priority for req in reqs))
+            dict(
+                Counter(
+                    fold_priority_label(req.priority, priority_label_bucket_size)
+                    for req in reqs
+                )
+            )
             if enable_priority_scheduling
             else None
         )
