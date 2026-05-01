@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 import torch
 from torch import fx
+
 try:
     from torch.fx.experimental.symbolic_shapes import definitely_true
 except ImportError:
@@ -44,9 +45,7 @@ def _arg(
 
 def _is_cuda_2d_tensor(val: Any) -> bool:
     return (
-        isinstance(val, torch.Tensor)
-        and val.device.type == "cuda"
-        and val.dim() == 2
+        isinstance(val, torch.Tensor) and val.device.type == "cuda" and val.dim() == 2
     )
 
 
@@ -70,10 +69,10 @@ def _scale_shape_matches(scale: torch.Tensor, dim: Any) -> bool:
     if scale.dim() == 1:
         return _is_one(scale.shape[0]) or _same_dim(scale.shape[0], dim)
     if scale.dim() == 2:
-        return (_is_one(scale.shape[0]) and _is_one(scale.shape[1])) or (
-            _same_dim(scale.shape[0], dim) and _is_one(scale.shape[1])
-        ) or (
-            _is_one(scale.shape[0]) and _same_dim(scale.shape[1], dim)
+        return (
+            (_is_one(scale.shape[0]) and _is_one(scale.shape[1]))
+            or (_same_dim(scale.shape[0], dim) and _is_one(scale.shape[1]))
+            or (_is_one(scale.shape[0]) and _same_dim(scale.shape[1], dim))
         )
     return False
 
