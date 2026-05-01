@@ -8,6 +8,7 @@ from diffusers.image_processor import VaeImageProcessor
 from diffusers.utils.torch_utils import randn_tensor
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -117,13 +118,9 @@ class QwenImageLayeredBeforeDenoisingStage(PipelineStage):
         self.vae = vae.to(torch.bfloat16)
         from transformers import Qwen2_5_VLForConditionalGeneration
 
-        self.text_encoder = (
-            Qwen2_5_VLForConditionalGeneration.from_pretrained(
-                model_path, subfolder="text_encoder"
-            )
-            .to(get_local_torch_device())
-            .to(torch.bfloat16)
-        )
+        self.text_encoder = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+            model_path, subfolder="text_encoder"
+        ).to(torch.bfloat16)
         self.tokenizer = tokenizer
         self.processor = processor
         self.transformer = transformer
@@ -157,6 +154,17 @@ explanation, and highlight it in the caption with quotation marks\n3. Maintain a
 generalizations\n - Describe all visible information in the image, while do not add information not explicitly shown in
 the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>assistant\n"""
         self.default_sample_size = 128
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(
+                stage_name, "qwen_layered_text_encoder", target_dtype=torch.bfloat16
+            ),
+            ComponentUse(stage_name, "vae", target_dtype=torch.bfloat16),
+        ]
 
     # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage.QwenImagePipeline._extract_masked_hidden
     def _extract_masked_hidden(self, hidden_states: torch.Tensor, mask: torch.Tensor):
@@ -300,21 +308,23 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
 
     # Copied from diffusers.pipelines.qwenimage.pipeline_qwenimage_edit.QwenImageEditPipeline._encode_vae_image
     def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
-        self.vae = self.vae.to(get_local_torch_device())
-        if isinstance(generator, list):
-            image_latents = [
-                retrieve_latents(
-                    self.vae.encode(image[i : i + 1]),
-                    generator=generator[i],
-                    sample_mode="argmax",
+        with self.use_declared_component(component_name="vae", module=self.vae) as vae:
+            assert vae is not None
+            self.vae = vae
+            if isinstance(generator, list):
+                image_latents = [
+                    retrieve_latents(
+                        self.vae.encode(image[i : i + 1]),
+                        generator=generator[i],
+                        sample_mode="argmax",
+                    )
+                    for i in range(image.shape[0])
+                ]
+                image_latents = torch.cat(image_latents, dim=0)
+            else:
+                image_latents = retrieve_latents(
+                    self.vae.encode(image), generator=generator, sample_mode="argmax"
                 )
-                for i in range(image.shape[0])
-            ]
-            image_latents = torch.cat(image_latents, dim=0)
-        else:
-            image_latents = retrieve_latents(
-                self.vae.encode(image), generator=generator, sample_mode="argmax"
-            )
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.latent_channels, 1, 1, 1)
@@ -326,7 +336,6 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
             .to(image_latents.device, image_latents.dtype)
         )
         image_latents = (image_latents - latents_mean) / latents_std
-        self.vae.to("cpu")
         return image_latents
 
     def prepare_latents(
@@ -447,20 +456,26 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         image = image.to(dtype=torch.bfloat16)
 
         prompt = batch.prompt
-        if not prompt or prompt.isspace():
-            prompt = self.get_image_caption(
-                prompt_image, use_en_prompt=use_en_prompt, device=device
+        with self.use_declared_component(
+            component_name="qwen_layered_text_encoder",
+            module=self.text_encoder,
+        ) as text_encoder:
+            assert text_encoder is not None
+            self.text_encoder = text_encoder
+            if not prompt or prompt.isspace():
+                prompt = self.get_image_caption(
+                    prompt_image, use_en_prompt=use_en_prompt, device=device
+                )
+
+            prompt_embeds, prompt_embeds_mask = self.encode_prompt(
+                prompt=prompt,
+                device=device,
             )
 
-        prompt_embeds, prompt_embeds_mask = self.encode_prompt(
-            prompt=prompt,
-            device=device,
-        )
-
-        negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
-            prompt=batch.negative_prompt,
-            device=device,
-        )
+            negative_prompt_embeds, negative_prompt_embeds_mask = self.encode_prompt(
+                prompt=batch.negative_prompt,
+                device=device,
+            )
 
         num_channels_latents = self.transformer.config.in_channels // 4
         latents, image_latents = self.prepare_latents(
