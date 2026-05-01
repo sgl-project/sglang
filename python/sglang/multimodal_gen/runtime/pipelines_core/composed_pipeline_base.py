@@ -21,6 +21,11 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
 )
+from sglang.multimodal_gen.runtime.managers.component_manager import (
+    ComponentResidencyManager,
+    ComponentResidencyStrategy,
+    get_global_component_residency_manager,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
 )
@@ -91,7 +96,9 @@ class ComposedPipelineBase(ABC):
         self.model_path: str = model_path
         self._stages: list[PipelineStage] = []
         self._stage_name_mapping: dict[str, PipelineStage] = {}
+        self.component_residency_strategies: dict[str, ComponentResidencyStrategy] = {}
         self.executor = executor or self.build_executor(server_args=server_args)
+        self.component_residency_manager: ComponentResidencyManager | None = None
 
         if required_config_modules is not None:
             self._required_config_modules = required_config_modules
@@ -738,4 +745,34 @@ class ComposedPipelineBase(ABC):
                 main_process_only=True,
             )
 
+        self.component_residency_manager = get_global_component_residency_manager(
+            self, server_args
+        )
+        self.executor.component_residency_manager = self.component_residency_manager
+
         return self.executor.execute_with_profiling(self.stages, batch, server_args)
+
+    @torch.no_grad()
+    def forward_batch(
+        self,
+        batches: list[Req],
+        server_args: ServerArgs,
+    ):
+        if len(batches) == 1:
+            return [self.forward(batches[0], server_args)]
+
+        if self.is_lora_set() and not self.is_lora_effective():
+            logger.warning(
+                "LoRA adapter is set, but not effective. Please make sure the LoRA weights are merged"
+            )
+
+        if not batches[0].is_warmup and not batches[0].suppress_logs:
+            logger.info(
+                "Running grouped pipeline stages: %s",
+                list(self._stage_name_mapping.keys()),
+                main_process_only=True,
+            )
+
+        return self.executor.execute_group_with_profiling(
+            self.stages, batches, server_args
+        )
