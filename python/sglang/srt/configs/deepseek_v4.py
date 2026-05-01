@@ -1,17 +1,27 @@
 import logging
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 from transformers import PretrainedConfig
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 logger = logging.getLogger(__name__)
 
 
-def detect_fp4_experts(model_path: str) -> Optional[bool]:
-    """True for mxfp4-packed (U8/I8/F4), False for converted FP8 (F8_E4M3),
-    None if not determinable (remote / no matching key / unexpected dtype)."""
+def maybe_auto_set_fp4_experts(model_path: str) -> None:
+    """Auto-set SGLANG_DSV4_FP4_EXPERTS based on the checkpoint's routed-
+    expert weight dtype.
+
+    mxfp4-packed experts are stored as ``U8`` in safetensors; FP4-to-FP8
+    converted experts are stored as ``F8_E4M3``. The flag defaults to True
+    (mxfp4); only flip it automatically when we can positively identify the
+    converted-FP8 layout. Explicit env settings always win.
+    """
+    if envs.SGLANG_DSV4_FP4_EXPERTS.is_set():
+        return
+
     from sglang.srt.model_loader.weight_utils import (
         probe_routed_expert_weight_dtype,
     )
@@ -19,18 +29,36 @@ def detect_fp4_experts(model_path: str) -> Optional[bool]:
     try:
         dtype = probe_routed_expert_weight_dtype(model_path)
     except Exception as e:
-        logger.warning("Failed to probe routed-expert dtype for %s: %s", model_path, e)
-        return None
+        logger.warning(
+            "Failed to probe routed-expert dtype for %s; keeping "
+            "SGLANG_DSV4_FP4_EXPERTS default. Reason: %s",
+            model_path,
+            e,
+        )
+        return
     if dtype is None:
-        return None
+        return
+    # Packed mxfp4 expert weights are stored as int8/uint8 (or native F4);
+    # the FP4-to-FP8 conversion path writes F8_E4M3. Anything else is
+    # unexpected for DeepSeek V4, so leave the env alone and log it.
     if dtype in ("U8", "I8", "F4"):
-        return True
-    if dtype == "F8_E4M3":
-        return False
-    logger.warning(
-        "Unexpected routed-expert safetensors dtype=%s for DeepSeek V4", dtype
+        is_fp4_experts = True
+    elif dtype == "F8_E4M3":
+        is_fp4_experts = False
+    else:
+        logger.warning(
+            "Unexpected routed-expert safetensors dtype=%s for DeepSeek V4; "
+            "keeping SGLANG_DSV4_FP4_EXPERTS default.",
+            dtype,
+        )
+        return
+    envs.SGLANG_DSV4_FP4_EXPERTS.set(is_fp4_experts)
+    logger.info(
+        "Auto-detected routed-expert safetensors dtype=%s; "
+        "SGLANG_DSV4_FP4_EXPERTS=%s",
+        dtype,
+        is_fp4_experts,
     )
-    return None
 
 
 @dataclass(kw_only=True)

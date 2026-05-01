@@ -23,6 +23,7 @@ from _common import Dsv4ProAime25TestBase, multinode_args
 
 MODEL = "sgl-project/DeepSeek-V4-Pro-FP8"
 H200_FP8_PRO_ENV = {
+    "SGLANG_DSV4_FP4_EXPERTS": "0",
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
 }
 
