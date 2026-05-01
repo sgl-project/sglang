@@ -16,6 +16,12 @@ on:
   push:
     paths:
       - .github/workflows/probe-rate-limit.yml
+  # Hourly snapshot of the GITHUB_TOKEN bucket. Schedule events only
+  # fire workflows from the default branch, so this only runs once
+  # this file is on `main`. 24 hourly runs is enough to characterize
+  # daily traffic against the 15,000/hr ceiling.
+  schedule:
+    - cron: '45 * * * *'
 
 permissions:
   contents: read
