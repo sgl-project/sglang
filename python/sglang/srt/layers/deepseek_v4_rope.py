@@ -7,7 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils.common import maybe_torch_compile
 
 tilelang.set_log_level("WARNING")
 
@@ -58,21 +57,6 @@ def precompute_freqs_cis(
     freqs = torch.outer(t, freqs)
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
-
-
-@maybe_torch_compile
-def apply_rotary_emb(
-    x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = False
-) -> torch.Tensor:
-    y = x
-    x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
-    if inverse:
-        freqs_cis = freqs_cis.conj()
-    if x.ndim == 3:
-        freqs_cis = freqs_cis.unsqueeze(1)
-    x = torch.view_as_real(x * freqs_cis).flatten(-2)
-    y.copy_(x)
-    return y
 
 
 @triton.jit
