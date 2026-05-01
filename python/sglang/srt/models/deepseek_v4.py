@@ -539,7 +539,6 @@ class MQALayer(nn.Module):
         self,
         q: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
@@ -562,7 +561,6 @@ class MQALayer(nn.Module):
         self,
         x: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
-        freqs_cis: Optional[torch.Tensor] = None,
         qkv_a: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if qkv_a is not None:
@@ -587,7 +585,6 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4BackendRadix,
-        freqs_cis: Optional[torch.Tensor] = None,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert self.alt_streams is not None
@@ -624,7 +621,7 @@ class MQALayer(nn.Module):
         with torch.cuda.stream(stream_kv):
             if qkv_a_ready is not None:
                 stream_kv.wait_event(qkv_a_ready)
-            kv = self._compute_kv(x, positions, freqs_cis, qkv_a=qkv_a)
+            kv = self._compute_kv(x, positions, qkv_a=qkv_a)
             if self.overlap_store_cache:
                 attn_backend.store_cache(
                     layer_id=self.layer_id,
@@ -640,7 +637,7 @@ class MQALayer(nn.Module):
                     x, forward_batch, self.layer_id, self.compressor
                 )
 
-        q = self._compute_q_b(q_lora, positions, freqs_cis)
+        q = self._compute_q_b(q_lora, positions)
         if q_out is not None:
             q_out.copy_(q)
 
@@ -656,7 +653,6 @@ class MQALayer(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         attn_backend: DeepseekV4BackendRadix,
-        freqs_cis: Optional[torch.Tensor] = None,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.fuse_wqa_wkv:
@@ -731,8 +727,6 @@ class MQALayer(nn.Module):
         if TYPE_CHECKING:
             assert isinstance(attn_backend, DeepseekV4BackendRadix)
 
-        freqs_cis = None
-
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
             and self.alt_streams is not None
@@ -750,11 +744,11 @@ class MQALayer(nn.Module):
 
         if enable_multi_stream:
             q, kv = self._forward_prepare_multi_stream(
-                x, positions, forward_batch, attn_backend, freqs_cis, q_out
+                x, positions, forward_batch, attn_backend, q_out
             )
         else:
             q, kv = self._forward_prepare(
-                x, positions, forward_batch, attn_backend, freqs_cis, q_out
+                x, positions, forward_batch, attn_backend, q_out
             )
 
         o = attn_backend.forward(
