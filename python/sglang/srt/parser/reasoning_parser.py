@@ -528,6 +528,28 @@ class Gemma4Detector(BaseReasoningFormatDetector):
         self.think_start_self_label = "thought\n"
 
 
+class PoolsideV1Detector(Qwen3Detector):
+    """
+    Detector for poolside Laguna-XS.2 (poolside_v1 series).
+
+    Envelope: `<think>...</think>...response` — identical to Qwen3, hence
+    the subclass relationship.
+
+    Request dispatch is *not* Qwen3-style. Qwen3 defaults to thinking ON
+    and is disabled by `enable_thinking=False`; Laguna's chat template
+    defaults `enable_thinking` to `false`, so `serving_chat.py` routes
+    `poolside_v1` through the Mimo-style branch (require explicit
+    `enable_thinking=True`). When the server constructs this detector with
+    `force_reasoning=True`, the model output begins inside reasoning and
+    the first `</think>` ends it.
+
+    vLLM's poolside_v1 reasoning parser does a backward `<assistant>` scan
+    over input_ids to scope `</think>` to the current turn. SGLang's parser
+    only sees the model's generated text (no chat history), so the scope
+    concern is automatic — this is a thin subclass for registry visibility.
+    """
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -548,6 +570,7 @@ class ReasoningParser:
         "kimi": KimiDetector,
         "kimi_k2": KimiK2Detector,
         "mimo": Qwen3Detector,
+        "poolside_v1": PoolsideV1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
         "minimax": Qwen3Detector,

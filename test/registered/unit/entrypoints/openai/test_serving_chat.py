@@ -919,6 +919,26 @@ class ServingChatTestCase(unittest.TestCase):
                 req.reasoning_effort = effort
                 self.assertEqual(chat._get_reasoning_from_request(req), expected)
 
+    def test_poolside_v1_enable_thinking_dispatch(self):
+        """Laguna chat template defaults `enable_thinking=false`. Parser must
+        follow that default — must NOT return True via the generic fallback."""
+        tm = _MockTokenizerManager()
+        tm.server_args.reasoning_parser = "poolside_v1"
+        chat = OpenAIServingChat(tm, _MockTemplateManager())
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "hi"}]
+        )
+        cases = [
+            (None, False),  # no chat_template_kwargs → non-thinking (default)
+            ({}, False),  # empty kwargs → non-thinking
+            ({"enable_thinking": False}, False),  # explicit off
+            ({"enable_thinking": True}, True),  # explicit on
+        ]
+        for kwargs, expected in cases:
+            with self.subTest(kwargs=kwargs):
+                req.chat_template_kwargs = kwargs
+                self.assertEqual(chat._get_reasoning_from_request(req), expected)
+
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""

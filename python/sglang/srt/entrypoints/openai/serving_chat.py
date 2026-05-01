@@ -676,8 +676,15 @@ class OpenAIServingChat(OpenAIServingBase):
             prompt = conv.get_prompt()
             if self._get_reasoning_from_request(
                 request
-            ) and self.reasoning_parser not in ["qwen3", "qwen3-thinking", "glm4"]:
-                # qwen3 and glm4 think internally without a leading <think> token
+            ) and self.reasoning_parser not in [
+                "qwen3",
+                "qwen3-thinking",
+                "glm4",
+                "poolside_v1",
+            ]:
+                # qwen3, glm4, and poolside_v1 emit `<think>` themselves via the
+                # HF chat template (poolside via add_generation_prompt) — don't
+                # double-prepend.
                 prompt += "<think>"  # Note(Xinyuan): hard code thinking token
 
         image_data = conv.image_data if conv.image_data else None
@@ -1399,8 +1406,11 @@ class OpenAIServingChat(OpenAIServingBase):
                 not request.chat_template_kwargs
                 or request.chat_template_kwargs.get("enable_thinking") is not False
             )
-        if self.reasoning_parser in ["mimo"]:
-            # Models that require explicit enable thinking (enable_thinking=True)
+        if self.reasoning_parser in ["mimo", "poolside_v1"]:
+            # Models that require explicit enable thinking (enable_thinking=True).
+            # Laguna's chat template defaults `enable_thinking` to false, so the
+            # parser must follow that default rather than the generic `return
+            # True` fallback.
             return (
                 request.chat_template_kwargs is not None
                 and request.chat_template_kwargs.get("enable_thinking") is True
