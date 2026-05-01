@@ -353,14 +353,10 @@ def maybe_init_custom_mem_pool(
 
 
 def is_swa_like_pool(pool: Any) -> bool:
-    """True for KV pools that share the SWA full->swa mapping interface
-    (`swa_kv_pool`, `register_mapping`, `translate_loc_from_full_to_swa`,
-    `set_swa_loc`, `get_state_buf_infos`).
-    """
-    from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
-    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+    """True for KV pools that share the SWA full->swa mapping interface."""
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 
-    return isinstance(pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
+    return isinstance(pool, BaseSWAKVPool)
 
 
 def convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:

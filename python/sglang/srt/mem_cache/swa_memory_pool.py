@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import torch
 
@@ -9,7 +9,7 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
 from sglang.srt.mem_cache.utils import is_swa_like_pool, maybe_init_custom_mem_pool
 from sglang.srt.utils import is_npu
@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 GB = 1024 * 1024 * 1024
 
 
-class SWAKVPool(KVCache):
+class SWAKVPool(BaseSWAKVPool):
     """KV cache with separate pools for full and SWA attention layers."""
 
     def __init__(
@@ -239,7 +239,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         page_size: int,
         dtype: torch.dtype,
         device: str,
-        kvcache: Union[SWAKVPool, DeepSeekV4TokenToKVPool],
+        kvcache: BaseSWAKVPool,
         need_sort: bool,
     ):
         assert is_swa_like_pool(kvcache)
