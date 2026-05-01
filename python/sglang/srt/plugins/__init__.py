@@ -19,6 +19,7 @@ from sglang.srt.environ import envs
 from sglang.srt.plugins.hook_registry import (
     HookRegistry,
     HookSource,
+    HookType,
     _current_plugin_source,
 )
 
@@ -100,6 +101,40 @@ def _get_excluded_dists() -> set[str]:
     return {ep.dist.name for ep in platform_eps if ep.dist and ep.name != selected}
 
 
+def _log_unimplemented_oot_placeholders() -> None:
+    """Log OOT hook placeholders that the active OOT platform did not replace."""
+    from sglang.srt.platforms import current_platform
+    from sglang.srt.utils.oot import get_oot_hook_placeholders
+
+    if not current_platform.is_out_of_tree():
+        return
+
+    for placeholder in get_oot_hook_placeholders():
+        hooks = HookRegistry._hooks.get(placeholder.target, [])
+        has_replace = any(
+            hook_type == HookType.REPLACE for hook_type, _, _ in hooks
+        )
+        if has_replace:
+            continue
+
+        message = (
+            "OOT platform %s did not register a REPLACE hook for %s "
+            "placeholder %s. Reason: %s"
+        )
+        args = (
+            current_platform.device_name,
+            placeholder.requirement,
+            placeholder.target,
+            placeholder.reason,
+        )
+        if placeholder.requirement == "required":
+            logger.warning(message, *args)
+        elif placeholder.requirement == "recommended":
+            logger.info(message, *args)
+        else:
+            logger.debug(message, *args)
+
+
 def load_plugins():
     """
     Load and execute all general plugins, then apply registered hooks.
@@ -136,6 +171,8 @@ def load_plugins():
             logger.exception("Failed to execute general plugin: %s", name)
         finally:
             _current_plugin_source.reset(token)
+
+    _log_unimplemented_oot_placeholders()
 
     # Apply all registered hooks (idempotent — already-patched targets are skipped).
     HookRegistry.apply_hooks()
