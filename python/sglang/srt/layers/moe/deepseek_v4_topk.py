@@ -12,22 +12,12 @@ from sglang.srt.eplb.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.utils import (
-    cpu_has_amx_support,
-    get_bool_env_var,
     get_compiler_backend,
-    is_cpu,
-    is_cuda,
-    is_hip,
     is_npu,
 )
 
 logger = logging.getLogger(__name__)
-_is_cuda = is_cuda()
-_is_hip = is_hip()
-_is_cpu = is_cpu()
-_is_cpu_amx_available = cpu_has_amx_support()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 
 from sglang.srt.layers.moe.topk import (
