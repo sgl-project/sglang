@@ -149,7 +149,9 @@ class MambaAttnBackendBase(AttentionBackend):
         self.retrieve_parent_token_list = []
         self.cached_cuda_graph_decode_query_start_loc: torch.Tensor = None
         self.cached_cuda_graph_verify_query_start_loc: torch.Tensor = None
-        self.conv_states_shape: tuple[int, int] = None
+        self.conv_states_shape: tuple[int, int] = (
+            self.req_to_token_pool.mamba_pool.mamba_cache.conv[0].shape
+        )
 
     def _forward_metadata(self, forward_batch: ForwardBatch):
         bs = forward_batch.batch_size

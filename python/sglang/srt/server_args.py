@@ -2240,7 +2240,10 @@ class ServerArgs:
             self._handle_mamba_radix_cache(
                 model_arch=model_arch,
                 support_mamba_cache=True,
-                support_mamba_cache_extra_buffer=False,
+                # Allow extra_buffer so DFLASH spec-v2 can run with radix cache.
+                # Requires the Mamba2/ShortConv attn backend + intermediate_conv_window
+                # tape to rollback partial verifies; turn off if rollback isn't wired.
+                support_mamba_cache_extra_buffer=True,
                 sm100_default_attention_backend="flashinfer",
             )
             assert self.attention_backend != "triton", (
