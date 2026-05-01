@@ -142,12 +142,10 @@ class ReqToTokenPool:
         self.max_context_len = max_context_len
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # Buffer holds size+1 rows: row 0 is the padding slot, rows 1..size
-            # are user-allocatable. Mirrors KV pool's padding slot 0 design so
-            # cuda-graph padded batches (req_pool_indices[raw_bs:] = 0) route
-            # dummy reqs through the unowned slot 0; req_to_token[0, :] stays
-            # zero throughout, and downstream KV writes land in the padding
-            # slot without corrupting real state.
+            # +1 row for padding slot 0 (mirrors KV pool): cuda-graph padded
+            # batches default req_pool_indices to 0, so routing dummies through
+            # unowned slot 0 keeps req_to_token[0, :] zero and downstream writes
+            # harmless.
             self.req_to_token = torch.zeros(
                 (size + 1, max_context_len), dtype=torch.int32, device=device
             )
@@ -546,7 +544,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
-        # +1 to match parent ReqToTokenPool's padding row (row 0 is padding).
+        # +1 to match parent's padding row.
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             size + 1, dtype=torch.int32, device=self.device
         )
