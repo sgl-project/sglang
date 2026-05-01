@@ -73,6 +73,10 @@ dependencies = [
   "tqdm",
   "mistral_common>=1.11.0",
   "transformers==5.6.0",
+  # tokenizers 0.23.0rc renamed RobertaProcessing(cls=...) to cls_token=...,
+  # which transformers 5.6.0's CLIP tokenizer still calls with cls=. Pin to
+  # the 0.22.x line until transformers catches up.
+  "tokenizers>=0.22,<0.23",
   "uvicorn",
   "uvloop",
   "watchfiles",
