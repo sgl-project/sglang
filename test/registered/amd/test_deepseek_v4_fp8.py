@@ -31,7 +31,7 @@ register_amd_ci(
 )
 
 DEEPSEEK_V4_FP8_MODEL_PATH = os.environ.get(
-    "DEEPSEEK_V4_FP8_MODEL_PATH", "deepseek-ai/DeepSeek-V4-Flash-FP8"
+    "DEEPSEEK_V4_FP8_MODEL_PATH", "sgl-project/DeepSeek-V4-Flash-FP8"
 )
 SERVER_LAUNCH_TIMEOUT = 3600
 
