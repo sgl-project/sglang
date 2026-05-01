@@ -28,7 +28,10 @@ from sglang.srt.mem_cache.memory_pool import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool, SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.unified_cache_components.tree_component import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.mem_cache.unified_radix_cache import (
+    UnifiedRadixCache,
+    UnifiedTreeNode,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import (
     ServerArgs,
@@ -870,6 +873,30 @@ class UnifiedRadixCacheSuite:
             DecLockRefParams(swa_uuid_for_lock=lock_result.swa_uuid_for_lock),
         )
         tree.sanity_check()
+
+    def test_tombstone_cleanup_respects_locked_parent(self):
+        tree, _, _ = build_fixture(self.cfg)
+        parent = UnifiedTreeNode(self.cfg.components)
+        deleted = UnifiedTreeNode(self.cfg.components)
+
+        parent.key = RadixKey(self._make_seq(1, 1))
+        deleted.key = RadixKey(self._make_seq(1000, 1))
+        parent.parent = tree.root_node
+        deleted.parent = parent
+        parent.component_data[ComponentType.FULL].value = torch.arange(
+            self.cfg.page_size, dtype=torch.int64, device=tree.device
+        )
+        parent.component_data[ComponentType.FULL].lock_ref = 1
+        parent_key = parent.key.child_key(tree.page_size)
+        tree.root_node.children[parent_key] = parent
+
+        tracker = {ct: 0 for ct in tree.tree_components}
+
+        tree._iteratively_delete_tombstone_leaf(deleted, tracker)
+
+        self.assertIn(parent_key, tree.root_node.children)
+        self.assertIs(tree.root_node.children[parent_key], parent)
+        self.assertTrue(all(evicted == 0 for evicted in tracker.values()))
 
     def test_internal_readonly_does_not_modify_tree(self):
         """Verify readonly match does not modify tree structure (no split)."""
