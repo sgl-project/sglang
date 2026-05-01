@@ -57,6 +57,7 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.disaggregation.utils import (
     DisaggregationMode,
+    FAKE_BOOTSTRAP_HOST,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
@@ -2884,10 +2885,21 @@ class Scheduler(
             return self._run_batch_prebuilt(batch)
 
         # Run forward
+        layer_ready_callback = None
+        if (
+            self.disaggregation_mode == DisaggregationMode.PREFILL
+            and batch.forward_mode.is_extend_without_speculative()
+            and self.disagg_prefill_bootstrap_queue is not None
+        ):
+            kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
+            if kv_mgr is not None:
+                layer_ready_callback = kv_mgr.maybe_prepare_async_kv(self, batch)
+
         if self.is_generation:
             if self.spec_algorithm.is_none() or self.enable_overlap:
                 # In most cases, we use the model worker batch to run the forward.
                 worker_batch_or_batch = batch.get_model_worker_batch()
+                worker_batch_or_batch.layer_ready_callback = layer_ready_callback
             else:
                 # In speculative decoding v1 (non-overlap) case, we use the batch directly.
                 # TODO(lsyin): delete this branch after unifying the abstraction.
@@ -2939,7 +2951,9 @@ class Scheduler(
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
             elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
+                batch_result = self.tp_worker.forward_batch_split_prefill(
+                    batch, layer_ready_callback=layer_ready_callback
+                )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
             else:
                 kwargs = (

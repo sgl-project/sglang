@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -535,9 +535,14 @@ class TpModelWorker(BaseTpWorker):
                 expert_distribution_metrics=out.expert_distribution_metrics,
             )
 
-    def forward_batch_split_prefill(self, batch: ScheduleBatch):
+    def forward_batch_split_prefill(
+        self,
+        batch: ScheduleBatch,
+        layer_ready_callback: Optional[Callable[[int], None]] = None,
+    ):
         if batch.split_index == 0:
             model_worker_batch = batch.get_model_worker_batch()
+            model_worker_batch.layer_ready_callback = layer_ready_callback
             forward_batch = ForwardBatch.init_new(model_worker_batch, self.model_runner)
             batch.split_forward_batch = forward_batch
             batch.seq_lens_cpu_cache = model_worker_batch.seq_lens_cpu

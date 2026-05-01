@@ -72,6 +72,47 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def get_mamba_pool_state_tensor_counts(mamba_pool: Any) -> tuple[int, int]:
+    """Get basic mamba cache layout from a `mamba_pool`-like object.
+
+    This helper centralizes the reflection logic used by both:
+    - `HybridLinearAttnBackend` (mamba state count for index/layout decisions)
+    - `MooncakeAsyncKVManager` (debug bookkeeping for state tensors)
+
+    Returns:
+        (num_mamba_layers, state_tensors_per_layer)
+    """
+
+    if mamba_pool is None:
+        return 0, 0
+
+    num_layers = int(getattr(mamba_pool, "num_mamba_layers", 0) or 0)
+    if num_layers <= 0:
+        return 0, 0
+
+    mamba_cache = getattr(mamba_pool, "mamba_cache", None)
+    if mamba_cache is None:
+        return num_layers, 0
+
+    state_tensors: list[Any] = []
+    try:
+        fields_dict = vars(mamba_cache)
+    except TypeError:
+        fields_dict = {}
+
+    for field in fields_dict:
+        # Skip ephemeral fields that do not represent persistent per-layer states.
+        if field in ("intermediate_ssm", "intermediate_conv_window"):
+            continue
+        value = getattr(mamba_cache, field)
+        if isinstance(value, list):
+            state_tensors.extend(value)
+        else:
+            state_tensors.append(value)
+
+    return num_layers, len(state_tensors)
+
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()

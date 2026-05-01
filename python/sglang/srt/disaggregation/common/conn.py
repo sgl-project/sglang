@@ -175,6 +175,14 @@ class CommonKVManager(BaseKVManager):
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
 
+    def maybe_prepare_async_kv(self, sch, batch):
+        """Optional hook for layerwise async KV transfers.
+
+        Default implementation returns None (feature unsupported).
+        """
+
+        return None
+
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
 
