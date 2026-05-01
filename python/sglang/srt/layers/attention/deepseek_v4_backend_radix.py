@@ -143,7 +143,6 @@ class DSV4AttnMetadataRadix:
     c4_sparse_page_indices: torch.Tensor = field(init=False)
 
     c128_out_loc: Optional[torch.Tensor] = None
-    c128_positions: Optional[torch.Tensor] = None
     c128_page_indices: Optional[torch.Tensor] = None
     c128_topk_lengths_clamp1: Optional[torch.Tensor] = None
 
@@ -178,7 +177,6 @@ class DSV4AttnMetadataRadix:
                 "raw_out_loc",
                 "seq_lens_casual",
                 "positions_casual",
-                "c128_positions",
                 "c4_out_loc",
                 "c128_out_loc",
                 "page_table",
@@ -210,7 +208,7 @@ class DSV4AttnMetadataRadix:
             self.c4_topk_lengths_raw,
             self.c4_topk_lengths_clamp1,
             self.c128_out_loc,
-            self.c128_positions,
+            _,
             self.c128_topk_lengths_clamp1,
             self.c128_page_indices,
         ) = _init_compressed_metadata_triton(
@@ -233,7 +231,6 @@ class DSV4AttnMetadataRadix:
         "page_table",
         "c4_topk_lengths_raw",
         "c4_topk_lengths_clamp1",
-        "c128_positions",
         "c128_page_indices",
         "c128_topk_lengths_clamp1",
     ]
