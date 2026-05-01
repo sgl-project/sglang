@@ -524,10 +524,6 @@ class CompressorDecodePlan(NamedTuple):
     compress_ratio: int
     seq_lens: torch.Tensor
 
-    def copy_(self, other: CompressorDecodePlan) -> None:
-        assert self.compress_ratio == other.compress_ratio
-        self.seq_lens.copy_(other.seq_lens)
-
     @property
     def is_decode(self) -> bool:
         return True
