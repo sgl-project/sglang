@@ -24,27 +24,6 @@ from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 
-def expand_seq_lens(
-    *,
-    seq_lens: List[int],
-    extend_seq_lens: List[int],
-    device: torch.device,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    num_tokens = sum(extend_seq_lens)
-    seq_lens_expanded = torch.empty(num_tokens, **_HOST_INT32_KWARGS)
-    expanded_idx_to_unexpanded_idx = torch.empty(num_tokens, **_HOST_INT32_KWARGS)
-    offset = 0
-    for i, (kv_len, qo_len) in enumerate(zip(seq_lens, extend_seq_lens)):
-        out = seq_lens_expanded[offset : offset + qo_len]
-        offset += qo_len
-        torch.arange(kv_len - qo_len + 1, kv_len + 1, out=out)
-        expanded_idx_to_unexpanded_idx[offset - qo_len : offset].fill_(i)
-    return (
-        seq_lens_expanded.to(device, non_blocking=True),
-        expanded_idx_to_unexpanded_idx.to(device, non_blocking=True),
-    )
-
-
 def make_swa_ring_buffer_indices(
     forward_batch: ForwardBatch,
     device: torch.device,
