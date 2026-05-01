@@ -199,6 +199,11 @@ class LayerwiseOffloadManager:
 
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
 
+        # Keep non-layer parameters resident on GPU. Layer tensors have already
+        # been replaced by tiny device placeholders, so this does not reload the
+        # offloaded layer weights.
+        self.model.to(self.device)
+
         # prefetch the first layer for warm-up
         self.prepare_for_next_req(non_blocking=False)
 

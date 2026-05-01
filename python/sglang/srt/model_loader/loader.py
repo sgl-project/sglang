@@ -2409,9 +2409,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
 
         # --- Transport-specific transfer ---
         if transport == "nixl":
-            self._transfer_via_nixl(
-                model, nixl_mgr, source_worker, tp_rank
-            )
+            self._transfer_via_nixl(model, nixl_mgr, source_worker, tp_rank)
         else:
             self._transfer_via_transfer_engine(
                 model, transfer_engine, source_worker, tp_rank
@@ -2556,8 +2554,7 @@ class RemoteInstanceModelLoader(BaseModelLoader):
         )
 
         logger.info(
-            "ModelExpress [nixl]: transferred %d tensors, "
-            "%.2f GB in %.2fs",
+            "ModelExpress [nixl]: transferred %d tensors, " "%.2f GB in %.2fs",
             matched,
             total_bytes / 1e9,
             duration,

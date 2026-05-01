@@ -1113,11 +1113,6 @@ def w8a8_block_fp8_matmul_deepgemm(
     # Deepgemm only supports output tensor type as bfloat16
     assert C.dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
 
-    if _is_musa:
-        # XXX (MUSA): `deep_gemm_fp8_fp8_bf16_nt` on MUSA requires contiguous tensors
-        As = As.contiguous()
-        Bs = Bs.contiguous()
-
     deep_gemm_fp8_fp8_bf16_nt(A, As, B, Bs, C)
 
     return C

@@ -37,6 +37,10 @@ from sglang.multimodal_gen.runtime.loader.weights_updater import (
     WeightsUpdater,
     get_updatable_modules,
 )
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
+    OffloadableDiTMixin,
+    iter_materialized_weights,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -47,10 +51,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import (
-    OffloadableDiTMixin,
-    iter_materialized_weights,
-)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     globally_suppress_loggers,
