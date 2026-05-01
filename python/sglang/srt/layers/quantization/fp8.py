@@ -51,7 +51,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
     scaled_fp8_quant,
 )
 from sglang.srt.layers.quantization.fp8_utils import (
-    _use_aiter_gfx95,
+    _use_aiter_bpreshuffle_gfx95,
     apply_fp8_linear,
     can_auto_enable_marlin_fp8,
     cutlass_fp8_supported,
@@ -86,6 +86,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_hip,
+    is_musa,
     is_npu,
     is_sm90_supported,
     is_sm100_supported,
@@ -104,6 +105,7 @@ if TYPE_CHECKING:
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_musa = is_musa()
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -184,6 +186,9 @@ class Fp8Config(QuantizationConfig):
         return [torch.bfloat16, torch.half]
 
     def get_min_capability(self) -> int:
+        if _is_musa:
+            return 31
+
         return 100 if self.use_mxfp8 else 80
 
     @classmethod
@@ -509,7 +514,7 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.weight_scale_inv.data = weight_scale.data
 
         if (
-            _use_aiter_gfx95
+            _use_aiter_bpreshuffle_gfx95
             and self.w8a8_block_fp8_linear is aiter_w8a8_block_fp8_linear
         ):
             n, k = layer.weight.shape
@@ -1693,6 +1698,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             num_local_experts = int(getattr(layer, "num_local_experts"))
             moe_ep_rank = int(getattr(layer, "moe_ep_rank"))
 
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                get_activation_type,
+            )
+
+            activation_type = get_activation_type(self.moe_runner_config.activation)
+
             quant_info = FlashInferTrtllmFp8MoeQuantInfo(
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
@@ -1733,6 +1744,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     if not self.block_quant
                     else None
                 ),
+                activation_type=activation_type,
             )
         elif self.runner.runner_backend.is_triton():
             quant_info = self.get_triton_quant_info(layer)

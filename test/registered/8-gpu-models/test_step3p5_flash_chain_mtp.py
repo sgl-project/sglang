@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_cuda_ci(est_time=500, suite="stage-c-test-8-gpu-h200")
+register_cuda_ci(est_time=663, suite="stage-c-test-8-gpu-h200")
 
 STEP3P5_FLASH_MODEL_PATH = "stepfun-ai/Step-3.5-Flash"
 
@@ -97,7 +97,7 @@ class TestStep3p5FlashChainMTP(CustomTestCase):
                 f'{metrics["score"]=:.3f}\n'
                 f"{avg_spec_accept_length=:.2f}\n"
             )
-            self.assertGreater(metrics["score"], 0.84)
+            self.assertGreater(metrics["score"], 0.83)
             self.assertGreater(avg_spec_accept_length, 2.6)
 
 

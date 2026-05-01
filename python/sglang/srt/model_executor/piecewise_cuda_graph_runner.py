@@ -42,6 +42,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
+    get_attention_cp_size,
     get_attention_tp_rank,
     get_attention_tp_size,
     set_dp_buffer_len,
@@ -58,7 +59,12 @@ from sglang.srt.model_executor.forward_batch_info import (
     PPProxyTensors,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
-from sglang.srt.utils import get_available_gpu_memory, is_npu, log_info_on_rank0
+from sglang.srt.utils import (
+    get_available_gpu_memory,
+    is_npu,
+    log_info_on_rank0,
+    require_gathered_buffer,
+)
 
 # Suppress Dynamo warning about tracing through lru_cache-wrapped functions (e.g., is_arch_support_pdl).
 warnings.filterwarnings("ignore", message=".*lru_cache.*", module="torch._dynamo")
@@ -189,6 +195,21 @@ class PiecewiseCudaGraphRunner:
 
         # Batch sizes to capture
         self.capture_num_tokens = self.compile_config.get_capture_sizes()
+        # When the layer communicator scatters/gathers across the attention TP
+        # group (e.g. with --moe-dense-tp-size 1), the model's reduce_scatter
+        # requires the token count to be divisible by attn_tp_size * attn_cp_size.
+        # Drop captures that would violate this (mirrors the filter used by
+        # the regular CUDA graph runner in get_batch_sizes_to_capture).
+        if require_gathered_buffer(self.model_runner.server_args):
+            mul_base = self.attn_tp_size
+            attn_cp_size = get_attention_cp_size()
+            if mul_base % attn_cp_size != 0:
+                mul_base *= attn_cp_size
+            filtered = [n for n in self.capture_num_tokens if n % mul_base == 0]
+            assert (
+                len(filtered) > 0
+            ), f"No piecewise CUDA graph capture sizes are multiples of {mul_base}"
+            self.capture_num_tokens = filtered
         log_info_on_rank0(
             logger, f"Capture cuda graph num tokens {self.capture_num_tokens}"
         )
@@ -798,6 +819,18 @@ class PiecewiseCudaGraphRunner:
                     **kwargs,
                 )
                 if isinstance(output, LogitsProcessorOutput):
+                    # Preserve mm_input_embeds when speculative decoding is
+                    # enabled. The speculative draft's prefill path
+                    # (eagle_worker_v2._draft_extend_for_prefill) reads
+                    # mm_input_embeds off this LogitsProcessorOutput to reuse
+                    # the target's encoder embeddings instead of re-embedding
+                    # multimodal placeholder token ids.
+                    mm_input_embeds = None
+                    if (
+                        self.model_runner.spec_algorithm.is_speculative()
+                        and output.mm_input_embeds is not None
+                    ):
+                        mm_input_embeds = output.mm_input_embeds[: self.raw_num_tokens]
                     return LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[
                             : self.raw_num_tokens
@@ -807,6 +840,7 @@ class PiecewiseCudaGraphRunner:
                             if output.hidden_states is not None
                             else None
                         ),
+                        mm_input_embeds=mm_input_embeds,
                     )
                 elif isinstance(output, EmbeddingPoolerOutput):
                     return output
