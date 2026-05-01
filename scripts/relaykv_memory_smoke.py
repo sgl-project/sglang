@@ -13,7 +13,7 @@ from sglang.srt.relaykv.memory import (
     observe_request_kv_pool_mapping,
     validate_shadow_log_schema,
 )
-from sglang.srt.relaykv.metrics import summarize_policy_events
+from sglang.srt.relaykv.metrics import policy_event_payload, summarize_policy_events
 
 
 class _FakeModelConfig:
@@ -442,9 +442,32 @@ def main() -> None:
         raise AssertionError(summary)
     if summary["relaykv_policy_fallback_candidate_count"] != 2:
         raise AssertionError(summary)
+    fallback_event = policy_event_payload(
+        plan,
+        extra={
+            "phase": "prefill",
+            "request_index": 0,
+            "scheduler_policy_noop": True,
+            "kv_cache_mutation": False,
+            "attention_override": False,
+            "host_backup_copy": False,
+        },
+    )
+    if fallback_event["runtime_policy_action"] != "log_only_noop":
+        raise AssertionError(fallback_event)
+    if fallback_event["fallback_candidate_noop_guard"] is not True:
+        raise AssertionError(fallback_event)
+    if fallback_event["kv_cache_mutation"] is not False:
+        raise AssertionError(fallback_event)
+    applied_event = policy_event_payload(applied_plan)
+    if applied_event["applied_candidate_log_only"] is not True:
+        raise AssertionError(applied_event)
+    if applied_event["runtime_policy_action"] != "log_only_noop":
+        raise AssertionError(applied_event)
 
     print("relaykv_memory_smoke: ok")
     print(payload)
+    print("relaykv_runtime_policy_event=" + json.dumps(fallback_event, sort_keys=True))
     print("relaykv_policy_summary=" + json.dumps(summary, sort_keys=True))
 
 

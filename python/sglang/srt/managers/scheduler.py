@@ -175,7 +175,12 @@ from sglang.srt.relaykv.memory import (
     observe_kv_layout_for_host_backup,
     observe_request_kv_pool_mapping,
 )
-from sglang.srt.relaykv.metrics import log_shadow_plan, should_log
+from sglang.srt.relaykv.metrics import (
+    log_policy_event,
+    log_policy_summary,
+    log_shadow_plan,
+    should_log,
+)
 from sglang.srt.relaykv.planner import make_shadow_plan
 from sglang.srt.managers.scheduler_dp_attn_mixin import SchedulerDPAttnMixin
 from sglang.srt.managers.scheduler_input_blocker import SchedulerInputBlocker
@@ -2705,8 +2710,9 @@ class Scheduler(
             "host_backup_planned": config.host_backup_shadow,
             "host_backup_dry_copy": config.host_backup_dry_copy,
         }
+        policy_plans = []
 
-        for req in reqs:
+        for request_index, req in enumerate(reqs):
             step_idx = req.extend_batch_idx if phase == "prefill" else req.decode_batch_idx
             if not should_log(step_idx, config.log_interval):
                 continue
@@ -2735,6 +2741,7 @@ class Scheduler(
                 request_id=req.rid,
                 kv_bytes_per_token=kv_bytes_per_token,
             )
+            policy_plans.append(plan)
             memory_estimate = estimate_kv_memory_for_plan(
                 plan,
                 model_config=self.model_config,
@@ -2775,6 +2782,28 @@ class Scheduler(
                 plan,
                 prefix=f"relaykv_shadow_plan_{phase}",
                 extra=extra,
+            )
+            if plan.runtime_policy_state in (
+                "applied_candidate",
+                "fallback_candidate",
+            ):
+                log_policy_event(
+                    plan,
+                    prefix=f"relaykv_runtime_policy_event_{phase}",
+                    extra={
+                        "phase": phase,
+                        "request_index": request_index,
+                        "step_idx": step_idx,
+                        "scheduler_policy_noop": True,
+                        "kv_cache_mutation": False,
+                        "attention_override": False,
+                        "host_backup_copy": False,
+                    },
+                )
+        if policy_plans:
+            log_policy_summary(
+                policy_plans,
+                prefix=f"relaykv_runtime_policy_summary_{phase}",
             )
 
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:

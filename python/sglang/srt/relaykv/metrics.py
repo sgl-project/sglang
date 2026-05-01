@@ -11,6 +11,19 @@ from .planner import RelayKVPlan
 logger = logging.getLogger(__name__)
 
 POLICY_STATES = ("off", "shadow", "applied_candidate", "fallback_candidate")
+POLICY_EVENT_LOG_KEYS = (
+    "runtime_policy_state",
+    "request_id",
+    "layer_idx",
+    "full_kv_fits",
+    "budget_pressure",
+    "available_kv_budget_tokens",
+    "estimated_full_kv_tokens",
+    "resident_budget_tokens",
+    "coverage_ratio",
+    "risk_level",
+    "policy_reason",
+)
 
 
 def log_shadow_plan(
@@ -90,4 +103,29 @@ def log_policy_summary(
     prefix: str = "relaykv_policy_summary",
 ) -> None:
     payload = summarize_policy_events(events)
+    logger.info("%s=%s", prefix, json.dumps(payload, sort_keys=True))
+
+
+def policy_event_payload(
+    event: RelayKVPlan | Mapping[str, Any],
+    *,
+    extra: Optional[Dict[str, Any]] = None,
+) -> dict[str, Any]:
+    payload = {key: _event_value(event, key) for key in POLICY_EVENT_LOG_KEYS}
+    state = payload["runtime_policy_state"]
+    payload["runtime_policy_action"] = "log_only_noop"
+    payload["applied_candidate_log_only"] = state == "applied_candidate"
+    payload["fallback_candidate_noop_guard"] = state == "fallback_candidate"
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def log_policy_event(
+    event: RelayKVPlan | Mapping[str, Any],
+    *,
+    prefix: str = "relaykv_runtime_policy_event",
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    payload = policy_event_payload(event, extra=extra)
     logger.info("%s=%s", prefix, json.dumps(payload, sort_keys=True))
