@@ -10,15 +10,20 @@ from .config import RelayKVConfig
 class RelayKVPlan:
     relaykv_enabled: bool
     mode: str
+    runtime_policy_state: str
     request_id: Optional[str]
     seq_len: int
     page_size: int
+    full_kv_fits: Optional[bool]
+    available_kv_budget_tokens: int
+    estimated_full_kv_tokens: int
     resident_budget_tokens: int
     planned_resident_tokens: int
     planned_cold_tokens: int
     available_kv_budget_mib: float
     kv_working_budget_tokens: int
     kv_working_budget_source: str
+    recent_window: int
     recent_window_tokens: int
     budget_block_size: int
     anchor_blocks: int
@@ -27,6 +32,12 @@ class RelayKVPlan:
     retrieval_block_budget: int
     retrieval_top_k_requested: int
     retrieval_top_k_effective: int
+    budget_pressure: bool
+    coverage_ratio: float
+    risk_level: str
+    policy_reason: str
+    layer_idx: Optional[int]
+    prompt_risk: str
     budget_overflow: bool
     budget_policy_reason: str
     anchor_pages: List[int]
@@ -131,6 +142,7 @@ def _budget_metadata(
         "available_kv_budget_mib": config.available_kv_budget_mib,
         "kv_working_budget_tokens": working_budget,
         "kv_working_budget_source": reason,
+        "recent_window": config.recent_window,
         "recent_window_tokens": recent_window_tokens,
         "budget_block_size": budget_block_size,
         "anchor_blocks": anchor_block_count,
@@ -144,6 +156,74 @@ def _budget_metadata(
     }
 
 
+def _policy_metadata(
+    *,
+    relaykv_enabled: bool,
+    mode: str,
+    seq_len: int,
+    working_budget_tokens: int,
+    retrieval_top_k_requested: int,
+    retrieval_top_k_effective: int,
+    coverage_ratio: float,
+    budget_policy_reason: str,
+    layer_idx: Optional[int],
+    total_layers: Optional[int],
+) -> dict[str, Any]:
+    full_kv_fits = None
+    if working_budget_tokens > 0:
+        full_kv_fits = seq_len <= working_budget_tokens
+
+    budget_pressure = bool(full_kv_fits is False)
+    top_k_clipped = retrieval_top_k_effective < retrieval_top_k_requested
+    low_coverage = coverage_ratio < 0.75 if seq_len > 0 else False
+    late_layer = False
+    if layer_idx is not None and total_layers and total_layers > 0:
+        late_layer = layer_idx >= int(total_layers * 0.75)
+
+    risk_reasons = []
+    if low_coverage:
+        risk_reasons.append("low_coverage_ratio")
+    if top_k_clipped:
+        risk_reasons.append("retrieval_top_k_effective_below_requested")
+    if late_layer:
+        risk_reasons.append("late_layer")
+
+    risk_level = "high" if risk_reasons else "normal"
+    prompt_risk = "unknown"
+
+    if not relaykv_enabled or mode == "off":
+        runtime_policy_state = "off"
+        policy_reason = "relaykv_disabled"
+    elif full_kv_fits is True:
+        runtime_policy_state = "off"
+        policy_reason = "full_kv_fits"
+    elif full_kv_fits is None:
+        runtime_policy_state = "shadow"
+        policy_reason = "insufficient_budget_metadata"
+    elif risk_level == "high":
+        runtime_policy_state = "fallback_candidate"
+        policy_reason = "budget_pressure_high_risk_" + "_and_".join(risk_reasons)
+    else:
+        runtime_policy_state = "applied_candidate"
+        policy_reason = "budget_pressure_normal_risk"
+
+    if runtime_policy_state in ("shadow", "applied_candidate", "fallback_candidate"):
+        policy_reason = f"{policy_reason}; budget_policy={budget_policy_reason}"
+
+    return {
+        "runtime_policy_state": runtime_policy_state,
+        "full_kv_fits": full_kv_fits,
+        "available_kv_budget_tokens": working_budget_tokens,
+        "estimated_full_kv_tokens": seq_len,
+        "budget_pressure": budget_pressure,
+        "coverage_ratio": coverage_ratio,
+        "risk_level": risk_level,
+        "policy_reason": policy_reason,
+        "layer_idx": layer_idx,
+        "prompt_risk": prompt_risk,
+    }
+
+
 def build_shadow_plan(
     *,
     config: RelayKVConfig,
@@ -151,6 +231,8 @@ def build_shadow_plan(
     page_size: int = 1,
     request_id: Optional[str] = None,
     kv_bytes_per_token: Optional[int] = None,
+    layer_idx: Optional[int] = None,
+    total_layers: Optional[int] = None,
 ) -> RelayKVPlan:
     """Build a deterministic shadow resident/cold plan.
 
@@ -170,15 +252,20 @@ def build_shadow_plan(
         return RelayKVPlan(
             relaykv_enabled=False,
             mode="off",
+            runtime_policy_state="off",
             request_id=request_id,
             seq_len=seq_len,
             page_size=page_size,
+            full_kv_fits=True,
+            available_kv_budget_tokens=0,
+            estimated_full_kv_tokens=seq_len,
             resident_budget_tokens=0,
             planned_resident_tokens=seq_len,
             planned_cold_tokens=0,
             available_kv_budget_mib=config.available_kv_budget_mib,
             kv_working_budget_tokens=0,
             kv_working_budget_source="relaykv_disabled",
+            recent_window=0,
             recent_window_tokens=0,
             budget_block_size=config.budget_block_size,
             anchor_blocks=config.anchor_blocks,
@@ -187,6 +274,12 @@ def build_shadow_plan(
             retrieval_block_budget=0,
             retrieval_top_k_requested=config.retrieval_top_k,
             retrieval_top_k_effective=0,
+            budget_pressure=False,
+            coverage_ratio=1.0 if seq_len > 0 else 0.0,
+            risk_level="normal",
+            policy_reason="relaykv_disabled",
+            layer_idx=layer_idx,
+            prompt_risk="unknown",
             budget_overflow=False,
             budget_policy_reason="relaykv_disabled",
             anchor_pages=[],
@@ -227,22 +320,41 @@ def build_shadow_plan(
     cold_end = recent_start
     if cold_end < cold_start:
         cold_end = cold_start
-    cold_candidate_ranges = _make_range(cold_start, cold_end)
+    cold_candidate_ranges = (
+        [] if planned_cold <= 0 else _make_range(cold_start, cold_end)
+    )
 
     ratio = (planned_resident / seq_len) if seq_len > 0 else 0.0
+    policy_metadata = _policy_metadata(
+        relaykv_enabled=True,
+        mode=config.mode,
+        seq_len=seq_len,
+        working_budget_tokens=budget_metadata["kv_working_budget_tokens"],
+        retrieval_top_k_requested=budget_metadata["retrieval_top_k_requested"],
+        retrieval_top_k_effective=budget_metadata["retrieval_top_k_effective"],
+        coverage_ratio=ratio,
+        budget_policy_reason=budget_metadata["budget_policy_reason"],
+        layer_idx=layer_idx,
+        total_layers=total_layers,
+    )
 
     return RelayKVPlan(
         relaykv_enabled=True,
         mode=config.mode,
+        runtime_policy_state=policy_metadata["runtime_policy_state"],
         request_id=request_id,
         seq_len=seq_len,
         page_size=page_size,
+        full_kv_fits=policy_metadata["full_kv_fits"],
+        available_kv_budget_tokens=policy_metadata["available_kv_budget_tokens"],
+        estimated_full_kv_tokens=policy_metadata["estimated_full_kv_tokens"],
         resident_budget_tokens=budget_metadata["kv_working_budget_tokens"],
         planned_resident_tokens=planned_resident,
         planned_cold_tokens=planned_cold,
         available_kv_budget_mib=budget_metadata["available_kv_budget_mib"],
         kv_working_budget_tokens=budget_metadata["kv_working_budget_tokens"],
         kv_working_budget_source=budget_metadata["kv_working_budget_source"],
+        recent_window=budget_metadata["recent_window"],
         recent_window_tokens=budget_metadata["recent_window_tokens"],
         budget_block_size=budget_metadata["budget_block_size"],
         anchor_blocks=budget_metadata["anchor_blocks"],
@@ -251,6 +363,12 @@ def build_shadow_plan(
         retrieval_block_budget=budget_metadata["retrieval_block_budget"],
         retrieval_top_k_requested=budget_metadata["retrieval_top_k_requested"],
         retrieval_top_k_effective=budget_metadata["retrieval_top_k_effective"],
+        budget_pressure=policy_metadata["budget_pressure"],
+        coverage_ratio=policy_metadata["coverage_ratio"],
+        risk_level=policy_metadata["risk_level"],
+        policy_reason=policy_metadata["policy_reason"],
+        layer_idx=policy_metadata["layer_idx"],
+        prompt_risk=policy_metadata["prompt_risk"],
         budget_overflow=budget_metadata["budget_overflow"],
         budget_policy_reason=budget_metadata["budget_policy_reason"],
         anchor_pages=anchors,
@@ -268,6 +386,8 @@ def make_shadow_plan(
     page_size: int = 1,
     request_id: Optional[str] = None,
     kv_bytes_per_token: Optional[int] = None,
+    layer_idx: Optional[int] = None,
+    total_layers: Optional[int] = None,
 ) -> RelayKVPlan:
     return build_shadow_plan(
         config=config,
@@ -275,4 +395,6 @@ def make_shadow_plan(
         page_size=page_size,
         request_id=request_id,
         kv_bytes_per_token=kv_bytes_per_token,
+        layer_idx=layer_idx,
+        total_layers=total_layers,
     )

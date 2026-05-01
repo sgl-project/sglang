@@ -51,9 +51,15 @@ RELAYKV_SHADOW_LOG_MEMORY_KEYS = {
 }
 
 RELAYKV_SHADOW_LOG_BUDGET_KEYS = {
+    "runtime_policy_state",
+    "full_kv_fits",
+    "available_kv_budget_tokens",
+    "estimated_full_kv_tokens",
     "available_kv_budget_mib",
     "kv_working_budget_tokens",
     "kv_working_budget_source",
+    "resident_budget_tokens",
+    "recent_window",
     "recent_window_tokens",
     "budget_block_size",
     "anchor_blocks",
@@ -62,6 +68,12 @@ RELAYKV_SHADOW_LOG_BUDGET_KEYS = {
     "retrieval_block_budget",
     "retrieval_top_k_requested",
     "retrieval_top_k_effective",
+    "budget_pressure",
+    "coverage_ratio",
+    "risk_level",
+    "policy_reason",
+    "layer_idx",
+    "prompt_risk",
     "budget_overflow",
     "budget_policy_reason",
 }

@@ -18,6 +18,10 @@ ANCHOR_BLOCKS = (0, 4, 8)
 RETRIEVAL_TOP_K = (0, 2, 4, 8)
 
 COLUMNS = (
+    "runtime_policy_state",
+    "full_kv_fits",
+    "available_kv_budget_tokens",
+    "estimated_full_kv_tokens",
     "budget_source",
     "available_kv_budget_mib",
     "kv_working_budget_tokens",
@@ -25,6 +29,7 @@ COLUMNS = (
     "planned_resident_tokens",
     "planned_cold_tokens",
     "estimated_resident_ratio",
+    "recent_window",
     "recent_window_tokens",
     "anchor_blocks",
     "budget_block_size",
@@ -33,6 +38,9 @@ COLUMNS = (
     "retrieval_block_budget",
     "retrieval_top_k_requested",
     "retrieval_top_k_effective",
+    "budget_pressure",
+    "risk_level",
+    "policy_reason",
     "budget_overflow",
     "budget_policy_reason",
 )
@@ -82,6 +90,10 @@ def _plans() -> Iterable[dict[str, Any]]:
 
 def _row(plan: Any) -> dict[str, Any]:
     return {
+        "runtime_policy_state": plan.runtime_policy_state,
+        "full_kv_fits": plan.full_kv_fits,
+        "available_kv_budget_tokens": plan.available_kv_budget_tokens,
+        "estimated_full_kv_tokens": plan.estimated_full_kv_tokens,
         "budget_source": plan.kv_working_budget_source,
         "available_kv_budget_mib": _format_mib(plan.available_kv_budget_mib),
         "kv_working_budget_tokens": plan.kv_working_budget_tokens,
@@ -89,6 +101,7 @@ def _row(plan: Any) -> dict[str, Any]:
         "planned_resident_tokens": plan.planned_resident_tokens,
         "planned_cold_tokens": plan.planned_cold_tokens,
         "estimated_resident_ratio": f"{plan.estimated_resident_ratio:.4f}",
+        "recent_window": plan.recent_window,
         "recent_window_tokens": plan.recent_window_tokens,
         "anchor_blocks": plan.anchor_blocks,
         "budget_block_size": plan.budget_block_size,
@@ -97,6 +110,9 @@ def _row(plan: Any) -> dict[str, Any]:
         "retrieval_block_budget": plan.retrieval_block_budget,
         "retrieval_top_k_requested": plan.retrieval_top_k_requested,
         "retrieval_top_k_effective": plan.retrieval_top_k_effective,
+        "budget_pressure": str(plan.budget_pressure).lower(),
+        "risk_level": plan.risk_level,
+        "policy_reason": plan.policy_reason,
         "budget_overflow": str(plan.budget_overflow).lower(),
         "budget_policy_reason": plan.budget_policy_reason,
     }

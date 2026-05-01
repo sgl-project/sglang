@@ -157,6 +157,24 @@ def main() -> None:
         raise AssertionError(estimate)
     _assert_close(estimate.planned_resident_kv_mib, 28.0)
     _assert_close(estimate.planned_cold_kv_mib, 41.316)
+    if plan.runtime_policy_state != "fallback_candidate":
+        raise AssertionError(plan)
+    if plan.full_kv_fits is not False:
+        raise AssertionError(plan)
+    if plan.available_kv_budget_tokens != 1024:
+        raise AssertionError(plan)
+    if plan.estimated_full_kv_tokens != 2535:
+        raise AssertionError(plan)
+    if plan.budget_pressure is not True:
+        raise AssertionError(plan)
+    if plan.risk_level != "high":
+        raise AssertionError(plan)
+    if "low_coverage_ratio" not in plan.policy_reason:
+        raise AssertionError(plan)
+    if plan.recent_window != 768:
+        raise AssertionError(plan)
+    if plan.prompt_risk != "unknown":
+        raise AssertionError(plan)
 
     estimate_from_model = estimate_kv_memory_for_plan(
         plan,
@@ -331,6 +349,52 @@ def main() -> None:
         raise AssertionError(explicit_plan)
     if explicit_plan.retrieval_top_k_effective != 0:
         raise AssertionError(explicit_plan)
+    if explicit_plan.runtime_policy_state != "fallback_candidate":
+        raise AssertionError(explicit_plan)
+    if explicit_plan.risk_level != "high":
+        raise AssertionError(explicit_plan)
+
+    full_fit_plan = make_shadow_plan(
+        1024,
+        RelayKVConfig(
+            enabled=True,
+            mode="shadow",
+            kv_working_budget_tokens=2048,
+            recent_window=512,
+            anchor_blocks=2,
+            budget_block_size=128,
+            retrieval_top_k=4,
+        ),
+    )
+    if full_fit_plan.runtime_policy_state != "off":
+        raise AssertionError(full_fit_plan)
+    if full_fit_plan.full_kv_fits is not True:
+        raise AssertionError(full_fit_plan)
+    if full_fit_plan.budget_pressure is not False:
+        raise AssertionError(full_fit_plan)
+    if full_fit_plan.policy_reason != "full_kv_fits":
+        raise AssertionError(full_fit_plan)
+
+    late_layer_plan = make_shadow_plan(
+        4096,
+        RelayKVConfig(
+            enabled=True,
+            mode="shadow",
+            kv_working_budget_tokens=4096,
+            recent_window=1024,
+            anchor_blocks=4,
+            budget_block_size=128,
+            retrieval_top_k=4,
+        ),
+        layer_idx=27,
+        total_layers=28,
+    )
+    if late_layer_plan.runtime_policy_state != "off":
+        raise AssertionError(late_layer_plan)
+    if late_layer_plan.risk_level != "high":
+        raise AssertionError(late_layer_plan)
+    if late_layer_plan.layer_idx != 27:
+        raise AssertionError(late_layer_plan)
 
     print("relaykv_memory_smoke: ok")
     print(payload)
