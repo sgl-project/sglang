@@ -234,6 +234,12 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        # Inject DSV4-specific model state into Fp8Config so downstream readers
+        # don't reach for the global env / server_args.
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+
+        if isinstance(quant_config, Fp8Config):
+            quant_config.is_fp4_experts = model_config.is_fp4_experts
         if not _is_npu:
             major, minor = get_device_capability()
 

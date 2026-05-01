@@ -115,6 +115,10 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    # DSV4 mxfp4 routed-expert weight layout. When True the deep_gemm wrapper
+    # is called with recipe_a=(1,128), recipe_b=(1,32). Set by Fp8MoEMethod
+    # from its own quant_config; default False for non-DSV4 paths.
+    is_fp4_experts: bool = False
 
 
 class DeepGemmRunnerCore(MoeRunnerCore):
@@ -171,6 +175,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         K = hidden_states_shape[1]
         scale_block_size = 128
 
+        # DSV4 mxfp4 expert layout requires a non-default GEMM recipe.
+        recipe_a, recipe_b = (
+            ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
+        )
+
         w13_weight_fp8 = (
             quant_info.w13_weight,
             quant_info.w13_scale,
@@ -190,6 +199,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w13_weight_fp8,
             gateup_output,
             m_indices,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
         )
 
         dispose_tensor(hidden_states)
@@ -264,6 +275,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             w2_weight_fp8,
             down_output,
             m_indices,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
         )
 
         return down_output
@@ -285,6 +298,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         w2_weight = quant_info.w2_weight
         w13_scale = quant_info.w13_scale
         w2_scale = quant_info.w2_scale
+
+        # DSV4 mxfp4 expert layout requires a non-default GEMM recipe.
+        recipe_a, recipe_b = (
+            ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
+        )
 
         hidden_states_device = running_state["hidden_states_device"]
 
@@ -314,6 +332,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gateup_output,
             masked_m,
             expected_m,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
         )
         dispose_tensor(hidden_states)
         dispose_tensor(hidden_states_scale)
@@ -384,6 +404,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_output,
             masked_m,
             expected_m,
+            recipe_a=recipe_a,
+            recipe_b=recipe_b,
             **gemm_overlap_args_dict,
         )
         meta_overlap_args = running_state.get("meta_overlap_args", None)

@@ -267,6 +267,7 @@ class TopK(MultiPlatformOp):
         apply_routed_scaling_factor_on_output: Optional[bool] = False,
         output_format: Optional[TopKOutputFormat] = None,
         fused_shared_experts_scaling_factor: Optional[float] = None,
+        is_fp4_experts: bool = True,
     ):
         # NOTE: scoring_func is not used for now, but we keep it for future use
         # see https://github.com/sgl-project/sglang/pull/4505 for more details
@@ -276,6 +277,12 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
+        # DSV4 mxfp4 routed-expert layout flag. Default True matches the prior
+        # SGLANG_DSV4_FP4_EXPERTS env default, which suppresses BYPASSED format
+        # selection on the flashinfer_mxfp4 backend. DSV4 paths loading the
+        # FP4-to-FP8 converted checkpoint pass False; non-DSV4 paths can leave
+        # the default since the flag only matters on the mxfp4 backend.
+        self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
             top_k=top_k,
             use_grouped_topk=use_grouped_topk,
@@ -323,8 +330,7 @@ class TopK(MultiPlatformOp):
         elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
         elif get_moe_runner_backend().is_flashinfer_trtllm() or (
-            get_moe_runner_backend().is_flashinfer_mxfp4()
-            and not envs.SGLANG_DSV4_FP4_EXPERTS.get()
+            get_moe_runner_backend().is_flashinfer_mxfp4() and not self.is_fp4_experts
         ):
             output_format = TopKOutputFormat.BYPASSED
         else:
