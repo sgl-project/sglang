@@ -957,11 +957,14 @@ class Qwen3_5ForCausalLM(nn.Module):
         head_dim = config.head_dim or (config.hidden_size // config.num_attention_heads)
 
         if module_name == "qkv_proj":
+            from sglang.srt.lora.utils import get_qkv_lora_kv_total
+
             attn_output_gate = getattr(config, "attn_output_gate", True)
             q_heads = config.num_attention_heads * (2 if attn_output_gate else 1)
+            kv_total_replicated = get_qkv_lora_kv_total(config.num_key_value_heads)
             return (
                 config.hidden_size,
-                head_dim * (q_heads + config.num_key_value_heads * 2),
+                head_dim * (q_heads + kv_total_replicated * 2),
             )
         elif module_name == "o_proj":
             return config.num_attention_heads * head_dim, config.hidden_size

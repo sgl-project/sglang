@@ -778,10 +778,12 @@ class NemotronHForCausalLM(nn.Module):
         )
 
         if module_name == "qkv_proj":
+            from sglang.srt.lora.utils import get_qkv_lora_kv_total
+
+            kv_total_replicated = get_qkv_lora_kv_total(config.num_key_value_heads)
             return (
                 hidden_size,
-                head_dim
-                * (config.num_attention_heads + config.num_key_value_heads * 2),
+                head_dim * (config.num_attention_heads + kv_total_replicated * 2),
             )
         elif module_name == "o_proj":
             return (

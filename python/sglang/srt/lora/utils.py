@@ -54,6 +54,29 @@ class LoRAType(Enum):
     LORA_B = 1
 
 
+def get_qkv_lora_kv_total(num_key_value_heads: int) -> int:
+    """Return the kv-head count the LoRA qkv buffer must reserve for, accounting
+    for KV-head replication when ``tp_size > num_key_value_heads``.
+
+    Asserts that DP-attention / context-parallel are off, because the rest of
+    the LoRA path assumes ``attn_tp_size == tp_size`` (the mem_pool divides
+    buffer shapes by global ``tp_size``, not ``attn_tp_size``).
+    """
+    from sglang.srt.distributed import get_tensor_model_parallel_world_size
+    from sglang.srt.layers.dp_attention import get_attention_tp_size
+
+    tp_size = get_tensor_model_parallel_world_size()
+    attn_tp_size = get_attention_tp_size()
+    assert attn_tp_size == tp_size, (
+        f"LoRA qkv sizing assumes attn_tp_size == tp_size, got "
+        f"attn_tp_size={attn_tp_size}, tp_size={tp_size}. DP-attention or "
+        f"context-parallel is not supported with LoRA today (the mem_pool "
+        f"sizes buffers by global tp_size; see lora/mem_pool.py)."
+    )
+    kv_heads_per_rank = max(1, num_key_value_heads // tp_size)
+    return kv_heads_per_rank * tp_size
+
+
 def get_hidden_dim(
     module_name: str,
     config: AutoConfig,
@@ -79,8 +102,9 @@ def get_hidden_dim(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
         if module_name == "qkv_proj":
+            kv_total_replicated = get_qkv_lora_kv_total(config.num_key_value_heads)
             return config.hidden_size, head_dim * (
-                config.num_attention_heads + config.num_key_value_heads * 2
+                config.num_attention_heads + kv_total_replicated * 2
             )
         elif module_name == "o_proj":
             o_head_dim = getattr(config, "v_head_dim", None) or head_dim
