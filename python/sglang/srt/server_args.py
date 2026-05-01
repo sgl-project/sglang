@@ -128,6 +128,7 @@ QUANTIZATION_CHOICES = [
     "compressed-tensors",  # for Ktransformers
     "modelslim",  # for NPU
     "quark_int4fp8_moe",
+    "auto-round-int8",
     "unquant",
 ]
 
