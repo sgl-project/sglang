@@ -13,6 +13,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
 )
 from sglang.srt.utils import (
     get_compiler_backend,
+    is_hip,
     is_npu,
 )
 
