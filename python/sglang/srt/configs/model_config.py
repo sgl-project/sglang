@@ -180,19 +180,28 @@ class ModelConfig:
         self._config_draft_model()
 
         # FP4 vs FP8 routed-expert storage for DeepSeek V4. Default True
-        # (mxfp4) for DSV4 paths; non-DSV4 callers should not read this.
-        # Auto-detected by probing the safetensors header.
+        # (mxfp4) for non-DSV4 paths where the value is not consumed; DSV4
+        # paths must successfully auto-detect or the load is rejected (a
+        # silent fallback would later blow up as a tensor shape mismatch
+        # in Fp8MoEMethod.create_weights).
         self.is_fp4_experts: bool = True
         if is_deepseek_v4(self.hf_config):
             from sglang.srt.configs.deepseek_v4 import detect_fp4_experts
 
             detected = detect_fp4_experts(self.model_path)
-            if detected is not None:
-                self.is_fp4_experts = detected
-                logger.info(
-                    "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
-                    self.is_fp4_experts,
+            if detected is None:
+                raise ValueError(
+                    f"Could not auto-detect DSV4 routed-expert layout from "
+                    f"{self.model_path!r}. Expected the safetensors header to "
+                    "expose a routed-expert weight with dtype U8/I8/F4 "
+                    "(mxfp4-packed) or F8_E4M3 (converted FP8). If the model "
+                    "is remote, ensure it's been downloaded locally first."
                 )
+            self.is_fp4_experts = detected
+            logger.info(
+                "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
+                self.is_fp4_experts,
+            )
 
         # Check model type
         self.attention_chunk_size = getattr(
