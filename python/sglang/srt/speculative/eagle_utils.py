@@ -79,23 +79,26 @@ def sgl_build_tree_kernel_efficient_triton(
             // topk
         )
         parent_position = 0
+        found = 0
 
-        if parent_tb_idx > 0:
+        if parent_tb_idx == 0:
+            found = 1
+        else:
             parent_token_idx = tl.load(
                 parent_list_ptr + batch_idx * parent_list_stride + parent_tb_idx
             )
 
             # Find parent position
-            found = 0
             for pp in range(draft_token_num - 1):
-                sel_idx = tl.load(
-                    selected_index_ptr + batch_idx * selected_index_stride + pp
-                )
-                if sel_idx == parent_token_idx and found == 0:
-                    parent_position = pp + 1
-                    found = 1
+                if found == 0:
+                    sel_idx = tl.load(
+                        selected_index_ptr + batch_idx * selected_index_stride + pp
+                    )
+                    if sel_idx == parent_token_idx:
+                        parent_position = pp + 1
+                        found = 1
 
-        if parent_position < draft_token_num:
+        if found == 1:
             # Update next token links
             next_tok_addr = (
                 retrive_next_token_ptr + batch_idx * draft_token_num + parent_position
@@ -164,17 +167,17 @@ def sgl_build_tree_kernel_efficient_triton(
                         # Find cur_position for next iteration
                         found = 0
                         for cp in range(draft_token_num - 1):
-                            if (
-                                tl.load(
-                                    selected_index_ptr
-                                    + batch_idx * selected_index_stride
-                                    + cp
-                                )
-                                == parent_token_idx
-                                and found == 0
-                            ):
-                                cur_position = cp
-                                found = 1
+                            if found == 0:
+                                if (
+                                    tl.load(
+                                        selected_index_ptr
+                                        + batch_idx * selected_index_stride
+                                        + cp
+                                    )
+                                    == parent_token_idx
+                                ):
+                                    cur_position = cp
+                                    found = 1
 
             tl.store(
                 positions_ptr + batch_idx * draft_token_num + draft_token_idx,
@@ -540,6 +543,17 @@ def build_tree_kernel_efficient(
                 tree_mask_mode,
             )
         except (AttributeError, RuntimeError):
+            # Reinitialize buffers to original state in case Triton partially corrupted them
+            if tree_mask_mode == TreeMaskMode.QLEN_ONLY:
+                tree_mask.fill_(True)
+            elif tree_mask_mode == TreeMaskMode.QLEN_ONLY_BITPACKING:
+                tree_mask.fill_(0)
+            elif tree_mask_mode == TreeMaskMode.FULL_MASK:
+                tree_mask.fill_(True)
+            retrive_index.fill_(-1)
+            retrive_next_token.fill_(-1)
+            retrive_next_sibling.fill_(-1)
+
             # Fallback to PyTorch implementation
             sgl_build_tree_kernel_efficient_pytorch(
                 parent_list,
@@ -764,6 +778,10 @@ def verify_tree_greedy_func(
                 target_predict=target_predict,
             )
         except (AttributeError, RuntimeError):
+            # Reinitialize buffers to original state in case Triton partially corrupted them
+            accept_index.fill_(-1)
+            accept_token_num.fill_(0)
+
             # Fallback to PyTorch implementation
             verify_tree_greedy_pytorch(
                 predicts=predicts,
