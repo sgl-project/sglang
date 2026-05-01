@@ -701,12 +701,20 @@ class TboForwardBatchPreparer:
             "spec_algorithm",
             "capture_hidden_mode",
             "padded_static_len",
-            "mrope_positions",  # only used by qwen2-vl, thus not care
             "split_index",  # for split prefill
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
         ]:
             output_dict[key] = getattr(batch, key)
+
+        mrope_positions = getattr(batch, "mrope_positions")
+        if mrope_positions is not None:
+            output_dict["mrope_positions"] = mrope_positions[
+                :, start_token_index:end_token_index
+            ]
+        else:
+            output_dict["mrope_positions"] = None
+
         if not batch.forward_mode.is_target_verify():
             assert (
                 _compute_extend_num_tokens(batch.input_ids, batch.forward_mode)
