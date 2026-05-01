@@ -66,9 +66,7 @@ DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit-2511"
 DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Layered"
 
 # JoyAI image editing models
-DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST = (
-    "jdopensource/JoyAI-Image-Edit-Diffusers"
-)
+DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST = "jdopensource/JoyAI-Image-Edit-Diffusers"
 
 # FLUX image generation models
 DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.1-dev"

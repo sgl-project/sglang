@@ -160,7 +160,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "joyai_image_edit_ti2i",
         DiffusionServerArgs(model_path=DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST),
         TI2I_sampling_params,
-        run_perf_check=False,
         run_consistency_check=False,
     ),
     # Upscaling (Real-ESRGAN 4×) for T2I
