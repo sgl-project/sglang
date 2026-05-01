@@ -811,7 +811,6 @@ class DeepseekV4DecoderLayer(nn.Module):
             alt_streams=alt_streams,
             compress_ratio_override=compress_ratio_override,
         )
-        self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         self.mlp = deepseek_v2.DeepseekV2MoE(
             config=config,
             quant_config=moe_quant_config_override or quant_config,
@@ -840,15 +839,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
         self.rms_norm_eps = config.rms_norm_eps
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
-
-    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
-        first_k_dense_replace = 0
-        moe_layer_freq = 1
-        return is_nextn or (
-            self.config.n_routed_experts is not None
-            and layer_id >= first_k_dense_replace
-            and layer_id % moe_layer_freq == 0
-        )
 
     def hc_pre(
         self,
