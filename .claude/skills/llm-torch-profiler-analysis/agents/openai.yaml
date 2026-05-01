@@ -1,0 +1,4 @@
+interface:
+  display_name: "Unified LLM Torch Profiler"
+  short_description: "Three-table profiler triage for SGLang, vLLM, and TensorRT-LLM"
+  default_prompt: "Use $llm-torch-profiler-analysis to inspect or capture a torch profiler trace from SGLang, vLLM, or TensorRT-LLM. Return the three-table triage report."
