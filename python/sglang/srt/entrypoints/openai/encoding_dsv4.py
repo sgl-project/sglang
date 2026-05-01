@@ -151,7 +151,7 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
 
     try:
         arguments = json.loads(tool_call["arguments"])
-    except Exception:
+    except Exception as err:
         arguments = {"arguments": tool_call["arguments"]}
 
     for k, v in arguments.items():
