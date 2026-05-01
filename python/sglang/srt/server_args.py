@@ -184,8 +184,6 @@ NSA_CHOICES = [
 
 RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru"]
 
-RL_ON_POLICY_TARGET_CHOICES = ["fsdp", "fsdp_tp"]
-
 MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
@@ -279,10 +277,6 @@ def add_radix_supported_deterministic_attention_backend_choices(choices):
 
 def add_radix_eviction_policy_choices(choices):
     RADIX_EVICTION_POLICY_CHOICES.extend(choices)
-
-
-def add_rl_on_policy_target_choices(choices):
-    RL_ON_POLICY_TARGET_CHOICES.extend(choices)
 
 
 def add_mamba_ssm_dtype_choices(choices):
@@ -674,7 +668,6 @@ class ServerArgs:
     numa_node: Optional[List[int]] = None
     enable_deterministic_inference: bool = False
     enable_prefill_only_deterministic_inference: bool = False
-    rl_on_policy_target: Optional[str] = None
     true_on_policy_contract: Optional[str] = None
     enable_attn_tp_input_scattered: bool = False
     gc_threshold: Optional[List[int]] = None
@@ -3466,12 +3459,6 @@ class ServerArgs:
     def _handle_deterministic_inference(self):
         validate_true_on_policy_contract(self)
 
-        if self.rl_on_policy_target is not None:
-            logger.warning(
-                "Enable deterministic inference because of legacy rl_on_policy_target."
-            )
-            self.enable_deterministic_inference = True
-
         if self.true_on_policy_contract is not None:
             if self.enable_prefill_only_deterministic_inference:
                 logger.warning(
@@ -5728,13 +5715,6 @@ class ServerArgs:
             "--enable-prefill-only-deterministic-inference",
             action="store_true",
             help="Enable prefill-only deterministic inference mode with batch invariant ops.",
-        )
-        parser.add_argument(
-            "--rl-on-policy-target",
-            type=str,
-            default=ServerArgs.rl_on_policy_target,
-            choices=RL_ON_POLICY_TARGET_CHOICES,
-            help="The training system that SGLang needs to match for true on-policy.",
         )
         parser.add_argument(
             "--true-on-policy-contract",

@@ -366,7 +366,8 @@ click [Server Arguments](https://docs.sglang.io/advanced_features/server_argumen
 | `--scheduler-recv-`<br/>`interval`                      | `1`      | Type: int                      |      A2, A3      |
 | `--numa-node`                                           | `None`   | List[int]                      |      A2, A3      |
 | `--enable-deterministic-`<br/>`inference`               | `False`  | bool flag<br/> (set to enable) |     Planned      |
-| `--rl-on-policy-target`                                 | `None`   | `fsdp`                         |     Planned      |
+| `--enable-prefill-only-`<br/>`deterministic-inference`  | `False`  | bool flag<br/> (set to enable) |     Planned      |
+| `--true-on-policy-`<br/>`contract`                      | `None`   | Type: str                      |     Planned      |
 | `--enable-layerwise-`<br/>`nvtx-marker`                 | `False`  | bool flag<br/> (set to enable) | Special for GPU  |
 | `--enable-attn-tp-`<br/>`input-scattered`               | `False`  | bool flag<br/> (set to enable) |   Experimental   |
 | `--enable-nsa-prefill-`<br/>`context-parallel`          | `False`  | bool flag<br/> (set to enable) |      A2, A3      |

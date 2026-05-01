@@ -1,9 +1,9 @@
 """True-on-policy runtime contract helpers."""
 
 from .config import (
+    DeterministicInferenceScope,
     ROW_LINEAR_INV_BLOCK_K,
     get_on_policy_rms_norm_kwargs,
-    get_rl_on_policy_target,
     get_moe_topk_tiebreak,
     is_tp_invariant_target,
     is_true_on_policy_enabled,
@@ -32,6 +32,7 @@ from .contracts import (
 )
 
 __all__ = [
+    "DeterministicInferenceScope",
     "QWEN3_DENSE_TRUE_ON_POLICY_V1",
     "QWEN3_MOE_TRUE_ON_POLICY_V1",
     "ROW_LINEAR_INV_BLOCK_K",
@@ -40,7 +41,6 @@ __all__ = [
     "get_true_on_policy_contract",
     "override_true_on_policy_runtime_policy_enabled",
     "get_on_policy_rms_norm_kwargs",
-    "get_rl_on_policy_target",
     "get_moe_topk_tiebreak",
     "is_tp_invariant_target",
     "is_true_on_policy_enabled",

@@ -162,9 +162,9 @@ from sglang.srt.server_args import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.true_on_policy import (
+    DeterministicInferenceScope,
     is_tp_invariant_target,
     override_true_on_policy_runtime_policy_enabled,
-    patch_prefill_only_deterministic_attention_backend,
 )
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -3104,40 +3104,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 yield
             return
 
-        from sglang.srt.batch_invariant_ops import (
-            disable_batch_invariant_mode,
-            enable_batch_invariant_mode,
-            is_batch_invariant_mode_enabled,
-        )
-        from sglang.srt.tp_invariant_ops import (
-            disable_tp_invariant_mode,
-            enable_tp_invariant_mode,
-            is_tp_invariant_mode_enabled,
-        )
-
-        batch_invariant_was_enabled = is_batch_invariant_mode_enabled()
-        tp_invariant_was_enabled = is_tp_invariant_mode_enabled()
-        tp_invariant_enabled_here = False
-
-        try:
-            self.server_args.enable_deterministic_inference = True
-            if not batch_invariant_was_enabled:
-                enable_batch_invariant_mode()
-            if is_tp_invariant_target(self.server_args) and not tp_invariant_was_enabled:
-                enable_tp_invariant_mode()
-                tp_invariant_enabled_here = True
-            with (
-                patch_prefill_only_deterministic_attention_backend(self.attn_backend),
-                override_true_on_policy_runtime_policy_enabled(True),
-                envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(True),
-            ):
-                yield
-        finally:
-            self.server_args.enable_deterministic_inference = False
-            if not batch_invariant_was_enabled:
-                disable_batch_invariant_mode()
-            if tp_invariant_enabled_here:
-                disable_tp_invariant_mode()
+        with DeterministicInferenceScope(self.server_args, attn_backend=self.attn_backend):
+            yield
 
     def _forward_raw(
         self,

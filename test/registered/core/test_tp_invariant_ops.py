@@ -28,6 +28,7 @@ from sglang.srt.tp_invariant_ops import (
     matmul_tp_persistent,
     moe_sum_tree_reduce,
     set_tp_invariant_mode,
+    stable_topk,
     tree_all_reduce_sum,
 )
 from sglang.srt.tp_invariant_ops.tp_invariant_ops import (
@@ -860,6 +861,34 @@ class TestDistributedTreeAllReduce(unittest.TestCase):
         finally:
             if own_pg:
                 dist.destroy_process_group()
+
+
+class TestStableTopK(unittest.TestCase):
+    """stable_topk must break ties by smaller expert id and match SGLang ↔ Megatron."""
+
+    def test_exact_ties_resolved_by_smaller_expert_id(self):
+        scores = torch.zeros(1, 8)
+        _, ids = stable_topk(scores, top_k=4)
+        self.assertTrue(torch.equal(ids[0].sort().values, torch.tensor([0, 1, 2, 3])))
+
+    def test_partial_ties_preserve_real_ordering(self):
+        scores = torch.tensor([[0.1, 0.5, 0.5, 0.2, 0.5, 0.05, 0.5, 0.0]])
+        _, ids = stable_topk(scores, top_k=3)
+        self.assertEqual(set(ids[0].tolist()), {1, 2, 4})
+
+    def test_returns_original_precision_scores(self):
+        scores = torch.tensor([[0.9, 0.1, 0.7, 0.4]], dtype=torch.bfloat16)
+        gathered, ids = stable_topk(scores, top_k=2)
+        self.assertEqual(gathered.dtype, scores.dtype)
+        self.assertTrue(torch.equal(ids[0].sort().values, torch.tensor([0, 2])))
+
+    def test_deterministic_across_runs(self):
+        torch.manual_seed(0)
+        scores = torch.randn(64, 128)
+        a_vals, a_ids = stable_topk(scores, top_k=8)
+        b_vals, b_ids = stable_topk(scores, top_k=8)
+        self.assertTrue(torch.equal(a_vals, b_vals))
+        self.assertTrue(torch.equal(a_ids, b_ids))
 
 
 if __name__ == "__main__":

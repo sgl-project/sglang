@@ -120,15 +120,7 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
 
 
-def _stable_topk(scores: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
-    expert_ids = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.float32)
-    scores_fp32 = scores.float()
-    tie_step = torch.finfo(torch.float32).eps * scores_fp32.abs().clamp_min(
-        1.0 / scores.shape[-1]
-    )
-    scores_for_topk = scores_fp32 - expert_ids.view(1, -1) * tie_step
-    _, selected_ids = torch.topk(scores_for_topk, top_k, dim=-1)
-    return torch.gather(scores, dim=-1, index=selected_ids), selected_ids
+from sglang.srt.tp_invariant_ops import stable_topk as _stable_topk
 
 
 def compute_yarn_parameters(

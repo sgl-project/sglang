@@ -9,6 +9,31 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
+_MATMUL_K_BLOCK = 128
+
+
+def _is_power_of_two(value: int) -> bool:
+    return value > 0 and (value & (value - 1)) == 0
+
+
+def _fixed_tree_sum_tensors(values: list[torch.Tensor]) -> torch.Tensor:
+    if not values:
+        raise ValueError("values must not be empty")
+
+    result = [value.clone() for value in values]
+    world_size = len(result)
+    level = 1
+    while (1 << (level - 1)) < world_size:
+        step = 1 << level
+        half = step >> 1
+        for left in range(0, world_size, step):
+            right = left + half
+            if right < world_size:
+                result[left] += result[right]
+        level += 1
+    return result[0]
+
+
 # Triton's constexpr tree unrolling causes deep AST recursion in the JIT
 # compiler.  The two-level tree (v2) bounds compilation depth to
 # max(log2(SUBTREE), log2(E/SUBTREE)) instead of log2(E), but we still
@@ -556,24 +581,39 @@ def matmul_tp_persistent_optim(
     )
 
 
+def stable_topk(scores: torch.Tensor, top_k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Deterministic, batch-invariant top-k with stable expert-id tie-break.
+
+    Subtracts ``expert_id * eps * |score|`` from each score so equal scores are
+    broken by the smaller expert id. Megatron keeps the same formula locally so
+    core routing does not depend on importing SGLang.
+
+    Returns the gathered original-precision scores and selected expert indices.
+    """
+    expert_ids = torch.arange(scores.shape[-1], device=scores.device, dtype=torch.float32)
+    scores_fp32 = scores.float()
+    tie_step = torch.finfo(torch.float32).eps * scores_fp32.abs().clamp_min(
+        1.0 / scores.shape[-1]
+    )
+    scores_for_topk = scores_fp32 - expert_ids.view(1, -1) * tie_step
+    _, selected_ids = torch.topk(scores_for_topk, top_k, dim=-1)
+    return torch.gather(scores, dim=-1, index=selected_ids), selected_ids
+
+
 def tree_all_reduce_sum(x: torch.Tensor, device_group=None) -> torch.Tensor:
-    rank = dist.get_rank(device_group)
+    if not dist.is_initialized():
+        return x.clone()
+
     world_size = dist.get_world_size(device_group)
 
-    if world_size & (world_size - 1) != 0:
+    if not _is_power_of_two(world_size):
         raise ValueError(
             "world_size must be a power of 2 in order to use all_reduce_sum."
         )
 
     result = [torch.zeros_like(x) for _ in range(world_size)]
     dist.all_gather(result, x, group=device_group)
-
-    for level in range(1, world_size.bit_length()):
-        for left in range(0, world_size, 1 << level):
-            right = left + (1 << (level - 1))
-            result[left] += result[right]
-
-    return result[0]
+    return _fixed_tree_sum_tensors(result)
 
 
 def tree_all_reduce_sum_optim(x: torch.Tensor, device_group=None) -> torch.Tensor:
