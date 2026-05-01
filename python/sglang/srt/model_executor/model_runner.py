@@ -3191,38 +3191,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
         return output
 
-    def _maybe_rebalance_after_rank_fault(
-        self,
-        output: ModelRunnerOutput,
-        forward_batch: ForwardBatch,
-        skip_attn_backend_init: bool,
-        pp_proxy_tensors: Optional[PPProxyTensors],
-        reinit_attn_backend: bool,
-        split_forward_count: int,
-    ) -> ModelRunnerOutput:
-        elastic_ep_state = ElasticEPStateManager.instance()
-        if (
-            elastic_ep_state is not None
-            and not elastic_ep_state.is_active_equal_last()
-        ):
-            elastic_ep_state.snapshot_active_to_last()
-            elastic_ep_state.sync_active_to_cpu()
-            logging.info("EPLB due to rank faults")
-            gen = self.eplb_manager.rebalance()
-            while True:
-                try:
-                    next(gen)
-                except StopIteration:
-                    break
-            output = self._forward_raw(
-                forward_batch,
-                skip_attn_backend_init,
-                pp_proxy_tensors,
-                reinit_attn_backend,
-                split_forward_count,
-            )
-        return output
-
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -3455,6 +3423,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     dtype=torch.uint8,
                     device=self.device,
                 )
+
+    def _maybe_rebalance_after_rank_fault(
+        self,
+        output: ModelRunnerOutput,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        reinit_attn_backend: bool,
+        split_forward_count: int,
+    ) -> ModelRunnerOutput:
+        elastic_ep_state = ElasticEPStateManager.instance()
+        if elastic_ep_state is not None and not elastic_ep_state.is_active_equal_last():
+            elastic_ep_state.snapshot_active_to_last()
+            elastic_ep_state.sync_active_to_cpu()
+            logging.info("EPLB due to rank faults")
+            gen = self.eplb_manager.rebalance()
+            while True:
+                try:
+                    next(gen)
+                except StopIteration:
+                    break
+            output = self._forward_raw(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+        return output
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
