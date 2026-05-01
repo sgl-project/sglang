@@ -1,25 +1,6 @@
-"""Triton fused kernel for the OLD-path c4 (ratio=4, overlap=True) compressor decode.
-
-Replaces the dozens of torch ops in
-``deepseek_v4.py:Compressor.compress_decode_old`` with a single launch when
-running on ROCm. Uses the existing OLD state-pool layout, so no env-var or
-pool-shape change is needed.
-
-Pool layout (c4):
-    state [max_num_reqs, ratio*coff, 2*head_dim*coff]
-        = [max_num_reqs, 8, 4*head_dim]
-Each slot holds 4 head_dim-wide sections in the order
-    [kv_overlap | kv_normal | score_overlap | score_normal]
-
-Compression for a token at seq_len % 4 == 0 reads 8 (kv, score) blocks:
-    slot i in [0, 4): overlap half  -> kv at [0,head_dim), score at [2,3)*head_dim
-    slot i in [4, 8): normal  half  -> kv at [head_dim,2*head_dim),
-                                       score at [3,4)*head_dim
-ape ``[ratio=4, 2*head_dim]`` is (already-hotfixed) and split the same way:
-    overlap half  : ape[ratio_idx, :head_dim]
-    normal  half  : ape[ratio_idx, head_dim:]
-where ratio_idx = i % 4.
-"""
+# Fused compressor decode kernels for the OLD path on ROCm.
+# c4: 8 blocks register softmax + overlap shift.
+# c128: online softmax over 128 blocks.
 
 from typing import Optional
 
@@ -178,26 +159,7 @@ def fused_compress_c4_decode_old_triton(
     head_dim: int,
     out: Optional[torch.Tensor] = None,  # [bs, head_dim] fp32
 ) -> torch.Tensor:
-    """Fused c4 (ratio=4, overlap=True) compress for the OLD path.
-
-    Accepts the ``KVAndScoreOld`` ``kv`` views directly. Their ``data_ptr`` is
-    the start of the underlying contiguous ``[..., 4*head_dim]`` allocation
-    (with score the second 2*head_dim section). Stride info from the kv view
-    is used to locate slots; the kernel addresses the whole 4*head_dim slot
-    region (kv + score) of the underlying tensor.
-
-    Replaces this slice of ``compress_decode_old``::
-
-        pool[req, write_pos] = kv_and_scores
-        kv_to_compress = pool[req]
-        if should_shift: pool[req, :4] = kv_to_compress[:, 4:]
-        kv_to_compress.score += ape
-        kv_to_compress = overlap_transform_decode(kv_to_compress)
-        kv_compressed = (kv * softmax(score, dim=1)).sum(dim=1)
-
-    Norm + RoPE on top of the returned tensor are done by the caller (already
-    fused in fused_norm_rope_inplace_triton).
-    """
+    """Fused c4 (ratio=4, overlap=True) compress for the OLD path."""
     bs = kv_score_input_kv.size(0)
     # The "kv" tensors are 2*head_dim views of a 4*head_dim contiguous parent
     # so per-row stride must equal 4*head_dim.
@@ -247,5 +209,159 @@ def fused_compress_c4_decode_old_triton(
         out.stride(0),
         HEAD_DIM=head_dim,
         HEAD_DIM_BLOCK=HEAD_DIM_BLOCK,
+    )
+    return out
+
+
+# ---------------------------------------------------------------------------
+# c128 (ratio=128, overlap=False)
+# ---------------------------------------------------------------------------
+
+
+@triton.jit
+def _compress_c128_decode_old_kernel(
+    pool_kv_ptr,  # [N, 128, 2*head_dim] view: pool stride along slot = 2*head_dim
+    kv_score_input_kv_ptr,  # [bs, 2*head_dim]    view: row stride = 2*head_dim
+    ape_ptr,  # [128, head_dim]
+    out_ptr,  # [bs, head_dim]
+    seq_lens_ptr,
+    req_pool_indices_ptr,
+    stride_pool_req,
+    stride_pool_slot,
+    stride_input_row,
+    stride_ape_row,
+    stride_out_row,
+    HEAD_DIM: tl.constexpr,
+    HEAD_DIM_BLOCK: tl.constexpr,
+    NUM_SLOTS: tl.constexpr,  # 128
+):
+    pid = tl.program_id(0)
+    seq_len = tl.load(seq_lens_ptr + pid).to(tl.int32)
+    req = tl.load(req_pool_indices_ptr + pid).to(tl.int64)
+    write_pos = (seq_len - 1) % NUM_SLOTS
+
+    elem_offs = tl.arange(0, HEAD_DIM_BLOCK)
+    elem_mask = elem_offs < HEAD_DIM
+
+    in_base = pid.to(tl.int64) * stride_input_row
+    pool_req_base = req * stride_pool_req
+
+    # === 1. Write current token (kv, score) into pool slot `write_pos`. ===
+    write_slot_base = pool_req_base + write_pos.to(tl.int64) * stride_pool_slot
+    for sec in tl.static_range(2):  # 0=kv, 1=score
+        x = tl.load(
+            kv_score_input_kv_ptr + in_base + sec * HEAD_DIM + elem_offs,
+            mask=elem_mask,
+            other=0.0,
+        )
+        tl.store(
+            pool_kv_ptr + write_slot_base + sec * HEAD_DIM + elem_offs,
+            x,
+            mask=elem_mask,
+        )
+
+    # === 2. Online safe softmax + weighted sum across NUM_SLOTS slots. ===
+    # Slots that haven't been filled yet still have score=-inf from clear(),
+    # so softmax naturally masks them out -- no special-case needed.
+    NEG_BIG = -1.0e9
+    running_max = tl.full((HEAD_DIM_BLOCK,), NEG_BIG, tl.float32)
+    running_sum = tl.zeros((HEAD_DIM_BLOCK,), tl.float32)
+    weighted = tl.zeros((HEAD_DIM_BLOCK,), tl.float32)
+
+    for slot in tl.range(0, NUM_SLOTS):
+        slot_base = pool_req_base + slot * stride_pool_slot
+        kv_b = tl.load(
+            pool_kv_ptr + slot_base + 0 * HEAD_DIM + elem_offs,
+            mask=elem_mask,
+            other=0.0,
+        )
+        score_b = tl.load(
+            pool_kv_ptr + slot_base + 1 * HEAD_DIM + elem_offs,
+            mask=elem_mask,
+            other=NEG_BIG,
+        )
+        ape_b = tl.load(
+            ape_ptr + slot * stride_ape_row + elem_offs,
+            mask=elem_mask,
+            other=0.0,
+        )
+
+        s = score_b + ape_b
+        new_max = tl.maximum(running_max, s)
+        factor = tl.exp(running_max - new_max)
+        running_sum = running_sum * factor
+        weighted = weighted * factor
+        e = tl.exp(s - new_max)
+        running_sum = running_sum + e
+        weighted = weighted + kv_b * e
+        running_max = new_max
+
+    result = weighted / running_sum
+    tl.store(
+        out_ptr + pid.to(tl.int64) * stride_out_row + elem_offs,
+        result,
+        mask=elem_mask,
+    )
+
+
+def fused_compress_c128_decode_old_triton(
+    pool_kv: torch.Tensor,  # [max_num_reqs, 128, head_dim] view of underlying [..., 2*head_dim]
+    kv_score_input_kv: torch.Tensor,  # [bs, head_dim]                view of underlying [..., 2*head_dim]
+    ape: torch.Tensor,  # [128, head_dim] fp32
+    seq_lens: torch.Tensor,  # [bs] int
+    req_pool_indices: torch.Tensor,  # [bs] int
+    head_dim: int,
+    out: Optional[torch.Tensor] = None,  # [bs, head_dim] fp32
+) -> torch.Tensor:
+    """Fused c128 (ratio=128, overlap=False) compress for the OLD path."""
+    NUM_SLOTS = 128
+    bs = kv_score_input_kv.size(0)
+    assert pool_kv.dim() == 3 and pool_kv.dtype == torch.float32
+    assert pool_kv.shape[1] == NUM_SLOTS and pool_kv.shape[2] == head_dim
+    assert pool_kv.stride(2) == 1 and pool_kv.stride(1) == 2 * head_dim, (
+        f"pool_kv must be a view of [N, 128, 2*head_dim] underlying contiguous tensor; "
+        f"got strides {pool_kv.stride()}"
+    )
+    assert kv_score_input_kv.shape == (bs, head_dim)
+    assert kv_score_input_kv.dtype == torch.float32
+    assert (
+        kv_score_input_kv.stride(1) == 1 and kv_score_input_kv.stride(0) == 2 * head_dim
+    ), (
+        f"kv_score_input_kv must be a view of [bs, 2*head_dim] underlying contiguous tensor; "
+        f"got strides {kv_score_input_kv.stride()}"
+    )
+    assert (
+        ape.shape == (NUM_SLOTS, head_dim)
+        and ape.dtype == torch.float32
+        and ape.is_contiguous()
+    )
+    assert seq_lens.shape == (bs,) and req_pool_indices.shape == (bs,)
+
+    if out is None:
+        out = kv_score_input_kv.new_empty((bs, head_dim))
+    else:
+        assert out.shape == (bs, head_dim)
+        assert out.dtype == torch.float32 and out.is_contiguous()
+
+    if bs == 0:
+        return out
+
+    HEAD_DIM_BLOCK = triton.next_power_of_2(head_dim)
+    grid = (bs,)
+    _compress_c128_decode_old_kernel[grid](
+        pool_kv,
+        kv_score_input_kv,
+        ape,
+        out,
+        seq_lens,
+        req_pool_indices,
+        pool_kv.stride(0),
+        pool_kv.stride(1),
+        kv_score_input_kv.stride(0),
+        ape.stride(0),
+        out.stride(0),
+        HEAD_DIM=head_dim,
+        HEAD_DIM_BLOCK=HEAD_DIM_BLOCK,
+        NUM_SLOTS=NUM_SLOTS,
     )
     return out

@@ -1047,6 +1047,19 @@ class Compressor(nn.Module):
                 req_pool_indices=req_pool_indices.to(torch.int32),
                 head_dim=self.head_dim,
             )
+        elif _is_hip and self.ratio == 128 and not self.overlap:
+            from sglang.srt.layers.attention.compressed.fused_compress_old_triton import (
+                fused_compress_c128_decode_old_triton,
+            )
+
+            kv_compressed = fused_compress_c128_decode_old_triton(
+                pool_kv=kv_and_score_states_pool.kv,
+                kv_score_input_kv=kv_and_scores.kv,
+                ape=self.ape,
+                seq_lens=seq_lens.to(torch.int32),
+                req_pool_indices=req_pool_indices.to(torch.int32),
+                head_dim=self.head_dim,
+            )
         else:
             write_pos = (seq_lens - 1) % self.ratio + self.overlap * self.ratio
             kv_and_score_states_pool[req_pool_indices, write_pos] = kv_and_scores
