@@ -2,18 +2,9 @@ import ast
 import json
 import logging
 import re
-from typing import Any, List, Literal, Optional, Union
+from typing import Any, List, Optional
 
-try:
-    from xgrammar import StructuralTag, get_model_structural_tag
-except ImportError:
-    StructuralTag = Any
-
-    def get_model_structural_tag(*args: Any, **kwargs: Any) -> Any:
-        return None
-
-
-from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -477,26 +468,10 @@ class Qwen3CoderDetector(BaseFormatDetector):
         return StreamingParseResult(calls=calls, normal_text=normal_text)
 
     def supports_structural_tag(self) -> bool:
-        return False
+        return True
 
     def structure_info(self) -> _GetInfoFunc:
         raise NotImplementedError
 
-    def get_structural_tag(
-        self,
-        tools: Union[List[Tool], None] = None,
-        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
-        thinking_mode: bool = True,
-    ) -> StructuralTag:
-        converted_tools = [tool.model_dump() for tool in tools]
-        converted_tool_choice = (
-            tool_choice.model_dump()
-            if isinstance(tool_choice, ToolChoice)
-            else tool_choice
-        )
-        return get_model_structural_tag(
-            model="qwen_coder",
-            tools=converted_tools,
-            tool_choice=converted_tool_choice,
-            reasoning=thinking_mode,
-        )
+    def get_structural_tag_name(self) -> str:
+        return "qwen_coder"

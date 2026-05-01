@@ -1,16 +1,5 @@
 import logging
-from typing import Any, List, Literal, Union
 
-try:
-    from xgrammar import StructuralTag, get_model_structural_tag
-except ImportError:
-    StructuralTag = Any
-
-    def get_model_structural_tag(*args: Any, **kwargs: Any) -> Any:
-        return None
-
-
-from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 
 logger = logging.getLogger(__name__)
@@ -74,21 +63,5 @@ class DeepSeekV4Detector(DeepSeekV32Detector):
         self.eot_token = "</｜DSML｜tool_calls>"
         self.function_calls_regex = r"<｜DSML｜tool_calls>(.*?)</｜DSML｜tool_calls>"
 
-    def get_structural_tag(
-        self,
-        tools: Union[List[Tool], None] = None,
-        tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
-        thinking_mode: bool = True,
-    ) -> StructuralTag:
-        converted_tools = [tool.model_dump() for tool in tools]
-        converted_tool_choice = (
-            tool_choice.model_dump()
-            if isinstance(tool_choice, ToolChoice)
-            else tool_choice
-        )
-        return get_model_structural_tag(
-            model="deepseek_v4",
-            tools=converted_tools,
-            tool_choice=converted_tool_choice,
-            reasoning=thinking_mode,
-        )
+    def get_structural_tag_name(self) -> str:
+        return "deepseek_v4"

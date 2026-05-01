@@ -8,9 +8,10 @@ from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 try:
-    from xgrammar import StructuralTag
+    from xgrammar import StructuralTag, get_model_structural_tag
 except ImportError:
     StructuralTag = Any
+    get_model_structural_tag = None
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
 from sglang.srt.environ import envs
@@ -367,6 +368,10 @@ class BaseFormatDetector(ABC):
         """
         raise NotImplementedError()
 
+    def get_structural_tag_name(self) -> Optional[str]:
+        """Return the XGrammar model name for native structural tags, if supported."""
+        return None
+
     def get_structural_tag(
         self,
         tools: Union[List[Tool], None] = None,
@@ -384,4 +389,19 @@ class BaseFormatDetector(ABC):
         Returns:
             StructuralTag if this detector supports model-native tags, otherwise None
         """
-        return None
+        structural_tag_name = self.get_structural_tag_name()
+        if not structural_tag_name or get_model_structural_tag is None:
+            return None
+
+        converted_tools = [tool.model_dump() for tool in tools or []]
+        converted_tool_choice = (
+            tool_choice.model_dump()
+            if isinstance(tool_choice, ToolChoice)
+            else tool_choice
+        )
+        return get_model_structural_tag(
+            model=structural_tag_name,
+            tools=converted_tools,
+            tool_choice=converted_tool_choice,
+            reasoning=thinking_mode,
+        )
