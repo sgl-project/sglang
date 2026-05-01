@@ -182,11 +182,28 @@ jobs:
   gateway-e2e:
     name: ${{ matrix.name }}
     needs: build-wheel
-    # `matrix.disabled` lets us keep a matrix entry as a placeholder
-    # (e.g. `responses` below) while skipping its job instance. Single-line
-    # ${{ }} form is required so the matrix context resolves at job-level
-    # if-evaluation; the literal-block form (`if: |`) failed to parse.
-    if: ${{ (github.event_name != 'pull_request' || (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) || (github.event.action == 'labeled' && github.event.label.name == 'run-ci')) && !matrix.disabled }}
+    if: |
+      github.event_name != 'pull_request' ||
+      (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
+      (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    # The `responses` matrix entry is intentionally omitted. It needs
+    # `docker run gvenzl/oracle-xe` + `docker run shoofio/brave-search-mcp-sse`
+    # on the runner host, but the 2-/4-gpu-h100 runners are themselves
+    # containers without a Docker daemon. Re-enable by adding back:
+    #   - name: responses
+    #     runner: 2-gpu-h100
+    #     timeout: 45
+    #     test_dirs: "e2e_test/responses"
+    #     extra_deps: ""
+    #     env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
+    #     reruns: "--reruns 2 --reruns-delay 5"
+    #     setup_oracle: true
+    #     setup_brave: true
+    #     parallel_opts: ""
+    # plus the Oracle Instant Client / `gvenzl/oracle-xe` /
+    # `shoofio/brave-search-mcp-sse` setup + cleanup steps (see commit
+    # cf346bb15 for the exact step bodies) once a runner with
+    # `docker.sock` (or binary-installed deps) is available.
     strategy:
       fail-fast: false
       matrix:
@@ -202,22 +219,6 @@ jobs:
             reruns: ""
             upload_benchmarks: true
             parallel_opts: ""  # No parallel for benchmarks (performance measurement)
-          - name: responses
-            # Disabled: needs `docker run gvenzl/oracle-xe` and
-            # `docker run shoofio/brave-search-mcp-sse`, but the
-            # 2-/4-gpu-h100 runners are themselves containers without a
-            # Docker daemon. Re-enable by dropping `disabled: true` and
-            # restoring the Oracle/Brave setup + cleanup steps once a
-            # runner with docker.sock (or binary-installed deps) is
-            # available.
-            disabled: true
-            runner: 2-gpu-h100
-            timeout: 45
-            test_dirs: "e2e_test/responses"
-            extra_deps: ""
-            env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
-            reruns: "--reruns 2 --reruns-delay 5"
-            parallel_opts: ""
           - name: e2e
             runner: 2-gpu-h100
             timeout: 45
