@@ -544,14 +544,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
-        # +1 to match parent's padding row.
+        # Indexed by req_pool_idx, so size from parent's req_to_token (covers
+        # all req slots incl. the padding row), not from mamba pool size.
+        req_pool_size = self.req_to_token.shape[0]
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
-            size + 1, dtype=torch.int32, device=self.device
+            req_pool_size, dtype=torch.int32, device=self.device
         )
         if enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
-                    (size + 1, self.mamba_ping_pong_track_buffer_size),
+                    (req_pool_size, self.mamba_ping_pong_track_buffer_size),
                     dtype=torch.int32,
                     device=self.device,
                 )
