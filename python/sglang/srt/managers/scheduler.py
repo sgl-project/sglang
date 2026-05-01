@@ -3427,7 +3427,6 @@ class Scheduler(
             ret["avg_spec_accept_length"] = (
                 self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
             )
-
         if RECORD_STEP_TIME:
             ret["step_time_dict"] = self.step_time_dict
 

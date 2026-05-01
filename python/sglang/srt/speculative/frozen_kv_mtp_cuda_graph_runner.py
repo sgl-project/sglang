@@ -87,18 +87,18 @@ class FrozenKVMTPCudaGraphRunner:
             self.draft_attn_backend.get_cuda_graph_seq_len_fill_value()
         )
         seq_lens_cpu = torch.full(
-            (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+            (self.max_num_token,), self.seq_len_fill_value, dtype=torch.int32
         )
 
         if self.enable_torch_compile:
             set_torch_compile_config()
 
         with torch.device(model_runner.device):
-            req_pool_indices = torch.zeros((self.max_bs,), dtype=torch.int64)
+            req_pool_indices = torch.zeros((self.max_num_token,), dtype=torch.int64)
             positions = torch.zeros((self.max_num_token,), dtype=torch.int64)
             mrope_positions = torch.zeros((3, self.max_num_token), dtype=torch.int64)
             seq_lens = torch.full(
-                (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32
+                (self.max_num_token,), self.seq_len_fill_value, dtype=torch.int32
             )
             topk_p = torch.zeros((self.max_bs, self.topk), dtype=torch.float32)
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
@@ -150,9 +150,15 @@ class FrozenKVMTPCudaGraphRunner:
 
     def can_run(self, forward_batch: ForwardBatch):
         if self.require_mlp_tp_gather:
-            cuda_graph_bs = max(forward_batch.global_num_tokens_cpu) // self.topk
+            cuda_graph_bs = max(forward_batch.global_num_tokens_cpu) // (
+                self.topk * self.topk
+            )
         else:
-            cuda_graph_bs = forward_batch.batch_size
+            cuda_graph_bs = (
+                forward_batch.batch_size // self.topk
+                if self.topk > 1
+                else forward_batch.batch_size
+            )
 
         is_bs_supported = (
             cuda_graph_bs in self.graphs
@@ -190,53 +196,54 @@ class FrozenKVMTPCudaGraphRunner:
         buffers = self.buffers
         graph = self._create_graph()
         stream = self.stream
-        num_tokens = num_seqs * self.num_tokens_per_bs
+        request_bs = num_seqs
+        expanded_bs = request_bs * self.num_tokens_per_bs
 
-        req_pool_indices = buffers.req_pool_indices[:num_seqs]
-        positions = buffers.positions[:num_tokens]
-        mrope_positions = buffers.mrope_positions[:, :num_tokens]
-        seq_lens = buffers.seq_lens[:num_seqs]
-        seq_lens_cpu = buffers.seq_lens_cpu[:num_seqs]
-        topk_p = buffers.topk_p[:num_seqs]
-        topk_index = buffers.topk_index[:num_seqs]
-        hidden_states = buffers.hidden_states[:num_seqs]
+        req_pool_indices = buffers.req_pool_indices[:expanded_bs]
+        positions = buffers.positions[:expanded_bs]
+        mrope_positions = buffers.mrope_positions[:, :expanded_bs]
+        seq_lens = buffers.seq_lens[:expanded_bs]
+        seq_lens_cpu = buffers.seq_lens_cpu[:expanded_bs]
+        topk_p = buffers.topk_p[:request_bs]
+        topk_index = buffers.topk_index[:request_bs]
+        hidden_states = buffers.hidden_states[:request_bs]
 
         if self.require_mlp_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
-                    [num_tokens] * self.dp_size,
+                    [expanded_bs] * self.dp_size,
                     dtype=torch.int32,
                     device=buffers.positions.device,
                 )
             )
             buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
-                    [num_tokens] * self.dp_size,
+                    [expanded_bs] * self.dp_size,
                     dtype=torch.int32,
                     device=buffers.positions.device,
                 )
             )
             global_num_tokens = buffers.global_num_tokens_gpu
             global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
-            global_dp_buffer_len = num_tokens * self.dp_size
+            global_dp_buffer_len = expanded_bs * self.dp_size
         elif self.require_attn_tp_gather:
             buffers.global_num_tokens_gpu.copy_(
                 torch.tensor(
-                    [num_tokens],
+                    [expanded_bs],
                     dtype=torch.int32,
                     device=buffers.positions.device,
                 )
             )
             buffers.global_num_tokens_for_logprob_gpu.copy_(
                 torch.tensor(
-                    [num_tokens],
+                    [expanded_bs],
                     dtype=torch.int32,
                     device=buffers.positions.device,
                 )
             )
             global_num_tokens = buffers.global_num_tokens_gpu
             global_num_tokens_for_logprob = buffers.global_num_tokens_for_logprob_gpu
-            global_dp_buffer_len = num_tokens
+            global_dp_buffer_len = expanded_bs
         else:
             global_num_tokens = None
             global_num_tokens_for_logprob = None
@@ -254,7 +261,7 @@ class FrozenKVMTPCudaGraphRunner:
 
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.DECODE,
-            batch_size=num_seqs,
+            batch_size=expanded_bs,
             input_ids=None,
             req_pool_indices=req_pool_indices,
             seq_lens=seq_lens,
@@ -284,7 +291,7 @@ class FrozenKVMTPCudaGraphRunner:
             forward_batch.dp_local_start_pos = forward_batch.dp_local_num_tokens = None
             set_dp_buffer_len(
                 global_dp_buffer_len,
-                num_tokens,
+                expanded_bs,
                 forward_batch.dp_padding_mode.is_max_len(),
             )
             set_is_extend_in_batch(False)
@@ -312,49 +319,64 @@ class FrozenKVMTPCudaGraphRunner:
         self.deepep_adapter.replay()
         buffers = self.buffers
 
-        raw_bs = forward_batch.batch_size
-        raw_num_token = raw_bs * self.num_tokens_per_bs
+        raw_expanded_bs = forward_batch.batch_size
+        raw_bs = (
+            raw_expanded_bs // self.num_tokens_per_bs
+            if self.topk > 1
+            else raw_expanded_bs
+        )
+        raw_num_token = raw_expanded_bs
 
         if self.require_mlp_tp_gather:
             max_num_tokens = max(forward_batch.global_num_tokens_cpu)
-            max_batch_size = max_num_tokens // self.num_tokens_per_bs
+            max_batch_size = max_num_tokens // (
+                self.num_tokens_per_bs * self.num_tokens_per_bs
+            )
             index = bisect.bisect_left(self.capture_bs, max_batch_size)
         else:
             index = bisect.bisect_left(self.capture_bs, raw_bs)
 
         bs = self.capture_bs[index]
+        expanded_bs = bs * self.num_tokens_per_bs
         if bs != raw_bs:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.positions.zero_()
 
-        num_tokens = bs * self.num_tokens_per_bs
-        buffers.seq_lens[:raw_bs].copy_(forward_batch.seq_lens)
+        num_tokens = expanded_bs
+        buffers.seq_lens[:raw_expanded_bs].copy_(forward_batch.seq_lens)
         buffers.positions[:raw_num_token].copy_(forward_batch.positions)
+        if forward_batch.mrope_positions is not None:
+            buffers.mrope_positions[:, :raw_num_token].copy_(
+                forward_batch.mrope_positions
+            )
         buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
-        buffers.req_pool_indices[:raw_bs].copy_(forward_batch.req_pool_indices)
+        buffers.req_pool_indices[:raw_expanded_bs].copy_(forward_batch.req_pool_indices)
 
         if self.require_gathered_buffer:
-            buffers.global_num_tokens_gpu.fill_(bs * self.num_tokens_per_bs)
-            buffers.global_num_tokens_for_logprob_gpu.fill_(bs * self.num_tokens_per_bs)
+            buffers.global_num_tokens_gpu.fill_(expanded_bs)
+            buffers.global_num_tokens_for_logprob_gpu.fill_(expanded_bs)
 
         if bs != raw_bs:
-            forward_batch.batch_size = bs
-            forward_batch.seq_lens = buffers.seq_lens[:bs]
-            forward_batch.req_pool_indices = buffers.req_pool_indices[:bs]
+            forward_batch.batch_size = expanded_bs
+            forward_batch.seq_lens = buffers.seq_lens[:expanded_bs]
+            forward_batch.req_pool_indices = buffers.req_pool_indices[:expanded_bs]
             forward_batch.positions = buffers.positions[:num_tokens]
+            if forward_batch.mrope_positions is not None:
+                forward_batch.mrope_positions = buffers.mrope_positions[:, :num_tokens]
 
         if forward_batch.seq_lens_cpu is not None:
             if bs != raw_bs:
                 buffers.seq_lens_cpu.fill_(self.seq_len_fill_value)
-            buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
-            forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:bs]
+            buffers.seq_lens_cpu[:raw_expanded_bs].copy_(forward_batch.seq_lens_cpu)
+            forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:expanded_bs]
 
         self.frozen_kv_mtp_worker._init_frozen_kv_metadata_replay_cuda_graph(
             forward_batch,
-            bs,
-            forward_batch.seq_lens_sum + (bs - raw_bs) * self.seq_len_fill_value,
+            expanded_bs,
+            forward_batch.seq_lens_sum
+            + (expanded_bs - raw_expanded_bs) * self.seq_len_fill_value,
         )
 
         self.raw_bs = raw_bs
@@ -364,11 +386,15 @@ class FrozenKVMTPCudaGraphRunner:
 
         if bs != raw_bs:
             out = self._postprocess_output_to_raw_bs(out, raw_bs)
-            forward_batch.batch_size = raw_bs
+            forward_batch.batch_size = raw_expanded_bs
             forward_batch.positions = buffers.positions[:raw_num_token]
-            forward_batch.seq_lens = buffers.seq_lens[:raw_bs]
-            forward_batch.req_pool_indices = buffers.req_pool_indices[:raw_bs]
+            forward_batch.seq_lens = buffers.seq_lens[:raw_expanded_bs]
+            forward_batch.req_pool_indices = buffers.req_pool_indices[:raw_expanded_bs]
+            if forward_batch.mrope_positions is not None:
+                forward_batch.mrope_positions = buffers.mrope_positions[
+                    :, :raw_num_token
+                ]
             if forward_batch.seq_lens_cpu is not None:
-                forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_bs]
+                forward_batch.seq_lens_cpu = buffers.seq_lens_cpu[:raw_expanded_bs]
 
         return out

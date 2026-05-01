@@ -9,7 +9,7 @@ Implements the validation plan in
   ``FrozenKVMTPCudaGraphRunner`` for the recurrent draft loop), including
   normal padding to the nearest captured batch size.
 * config D (MTP + ``topk=5``): tree-shaped verify path with the Frozen-KV
-  draft loop running eager.
+  draft CUDA graph runner.
 
 Pass criterion: GSM8K score in MTP configs is within
 ``gsm8k_score_drop_tolerance`` of A, and ``avg_spec_accept_length`` is above
@@ -83,9 +83,15 @@ def ensure_checkpoint(path: str, label: str) -> None:
         )
 
 
+def get_server_info(base_url: str) -> Dict:
+    response = requests.get(base_url + "/server_info", timeout=10)
+    response.raise_for_status()
+    return response.json()
+
+
 def get_avg_spec_accept_length(base_url: str) -> Optional[float]:
     try:
-        info = requests.get(base_url + "/server_info", timeout=10).json()
+        info = get_server_info(base_url)
     except Exception:
         return None
     internal_states = info.get("internal_states") or []
@@ -97,14 +103,8 @@ def get_avg_spec_accept_length(base_url: str) -> Optional[float]:
     return float(val)
 
 
-def get_server_info(base_url: str) -> Dict:
-    response = requests.get(base_url + "/server_info", timeout=10)
-    response.raise_for_status()
-    return response.json()
-
-
 class Gemma4MTPGSM8KMixin:
-    """GSM8K harness for no-MTP, topk=1 MTP, and topk=5 MTP.
+    """GSM8K harness for no-MTP, topk=1 MTP, and topk>1 MTP.
 
     ``setUpClass`` launches the target-only baseline (config A) and records
     the score. The MTP tests launch separate servers, run GSM8K, assert the
@@ -172,8 +172,8 @@ class Gemma4MTPGSM8KMixin:
         # NEXTN is resolved to Frozen-KV MTP for Gemma4 assistant drafts.
         # For topk=1, do not override --cuda-graph-bs; the test should
         # exercise the default capture set and padding-to-captured-batch-size
-        # behavior. For topk>1, the target still uses CUDA graph where
-        # available, while the Frozen-KV MTP draft loop currently runs eager.
+        # behavior. The topk>1 test also exercises the Frozen-KV MTP draft
+        # CUDA graph path with a wider query fan-out per request.
         return [
             "--speculative-algorithm",
             "NEXTN",
@@ -273,14 +273,15 @@ class Gemma4MTPGSM8KMixin:
                 )
             metrics = run_eval(self._gsm8k_args(self.base_url))
             mtp_score = float(metrics["score"])
-            avg_accept = get_avg_spec_accept_length(self.base_url) or 0.0
+            avg_accept = get_avg_spec_accept_length(self.base_url)
         finally:
             self._stop_process(process)
 
+        avg_accept_for_print = avg_accept if avg_accept is not None else 0.0
         print(
             f"[{self.model_pair.name}/{label}] target_score={self.target_score:.4f}"
             f" mtp_score={mtp_score:.4f}"
-            f" avg_spec_accept_length={avg_accept:.4f}"
+            f" avg_spec_accept_length={avg_accept_for_print:.4f}"
         )
 
         tol = self.model_pair.gsm8k_score_drop_tolerance
@@ -318,9 +319,9 @@ class Gemma4MTPGSM8KMixin:
         )
 
     def test_gsm8k_mtp_topk5(self) -> None:
-        """Top-k fan-out: tree-shaped verify with eager Frozen-KV draft loop."""
+        """Top-k fan-out: tree-shaped verify with Frozen-KV draft CUDA graph."""
         self._run_mtp_gsm8k(
-            label="mtp-topk5-eager-draft",
+            label="mtp-topk5-cuda-graph",
             topk=5,
             num_draft_tokens=16,
         )

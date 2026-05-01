@@ -254,6 +254,12 @@ class FrozenKVMTPWorker(TpModelWorker):
         """
         seq_lens = forward_batch.seq_lens
         positions = torch.clamp(seq_lens - 1, min=0).to(torch.int64)
+        if (
+            self.topk > 1
+            and forward_batch.positions is not None
+            and forward_batch.positions.numel() == positions.numel() * self.topk
+        ):
+            positions = positions.repeat_interleave(self.topk, dim=0)
         if forward_batch.positions is None:
             forward_batch.positions = positions
         else:
@@ -332,7 +338,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         with self._frozen_kv_target_view(forward_batch):
             self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
                 forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
+                forward_batch.positions.numel(),
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
                 encoder_lens=None,
@@ -363,13 +369,6 @@ class FrozenKVMTPWorker(TpModelWorker):
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:
-            return
-        if self.topk != 1:
-            logger.info(
-                "Frozen-KV MTP draft CUDA graph currently supports topk=1 only; "
-                "running topk=%s draft loop eagerly.",
-                self.topk,
-            )
             return
         if self.target_worker.device != "cuda":
             logger.info(
