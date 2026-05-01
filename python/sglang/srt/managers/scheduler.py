@@ -699,9 +699,17 @@ class Scheduler(
         else:
             self.model_worker = self.draft_worker
 
-        # Install device timer on model runner for fwd occupancy tracking
+        # Install device timer on model runners for fwd occupancy tracking
         if hasattr(self, "forward_pass_device_timer"):
-            self.tp_worker.model_runner.device_timer = self.forward_pass_device_timer
+            timer = self.forward_pass_device_timer
+            self.tp_worker.model_runner.device_timer = timer
+            if self.draft_worker is not None:
+                dw = getattr(self.draft_worker, "draft_worker", None)
+                if dw is not None:
+                    if hasattr(dw, "draft_runner"):
+                        dw.draft_runner.device_timer = timer
+                    for r in getattr(dw, "draft_runner_list", []):
+                        r.device_timer = timer
 
         # Get token and memory info from the model worker
         (
