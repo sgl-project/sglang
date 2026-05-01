@@ -241,7 +241,7 @@ class GPUWorker:
                 raise ValueError(
                     "Grouped execute_forward does not support return_req=True"
                 )
-            # batched reqs is only possible with `num_outputs_per_prompt > 1` now
+            # grouped reqs currently come only from expanded num_outputs_per_prompt
             self._validate_group_forward_reqs(batch)
             return self._execute_forward_batch(batch)
 
@@ -294,6 +294,7 @@ class GPUWorker:
 
             start_time = time.monotonic()
 
+            # capture memory baseline for each req in grouped forward on rank-0
             request_metrics = [
                 item.metrics for item in log_reqs if item.metrics is not None
             ]
@@ -311,6 +312,8 @@ class GPUWorker:
                     )
                 result = forward_fn()
 
+            # disagg roles return raw Req so callers can keep and transfer intermediate tensors
+            # before converting it to OutputBatch
             if return_req and isinstance(result, Req):
                 return result
 
@@ -334,6 +337,8 @@ class GPUWorker:
             for metrics in output_metrics:
                 metrics.total_duration_ms = duration_ms
 
+            # file-path-only responses avoid serializing generated tensors between
+            # scheduler_client and gpu_worker.
             if req.save_output and req.return_file_paths_only:
                 save_output_paths(output_batch)
                 output_batch.output = None
@@ -350,6 +355,7 @@ class GPUWorker:
                 if not req.is_warmup:
                     PerformanceLogger.log_request_summary(metrics=output_batch.metrics)
 
+            # dump per-request perf report to the server-mode file path.
             if (
                 req.perf_dump_path is not None
                 and not req.is_warmup
