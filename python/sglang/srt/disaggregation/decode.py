@@ -758,9 +758,31 @@ class DecodePreallocQueue:
 
             allocatable_tokens -= required_tokens_for_request
             hisparse_req_budget -= 1
+
+            # Check if req_pool_idx is valid before calling _pre_alloc to avoid resource leaks
+            # _pre_alloc allocates req_pool_idx and KV cache slots, which need to be freed on error
+            req_pool_idx = decode_req.req.req_pool_idx
+            if (
+                req_pool_idx is None
+                or req_pool_idx < 0
+                or req_pool_idx >= self.req_to_token_pool.size
+            ):
+                logger.error(
+                    f"Aborting request {decode_req.req.rid} in pop_preallocated: "
+                    f"invalid req_pool_idx={req_pool_idx} (pool size={self.req_to_token_pool.size}). "
+                    "This may indicate a bug in request lifecycle."
+                )
+                prepare_abort(
+                    decode_req.req,
+                    "Invalid req_pool_idx in preallocation",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                continue
+
             dst_kv_indices = self._pre_alloc(decode_req.req)
 
             origin_input_len = len(decode_req.req.origin_input_ids)
+
             if self.scheduler.enable_hisparse:
                 # Must cast to int32 for ZMQ serialization — from_zmq reads np.int32.
                 kv_indices = (
