@@ -314,3 +314,13 @@ git commit -m "Add RelayKV actual KV pool observation smoke"
 
 git push mine relaykv-host-backup-shadow
 ```
+## 追記: flashinfer cache/log path workaround
+
+追加調査により、`flashinfer/jit/env.py` は import 時に `FLASHINFER_WORKSPACE_BASE` を読むことが分かった。
+
+default は `Path.home()` であり、この環境では `/home/rinsa/.cache/flashinfer/.../flashinfer_jit.log` への書き込みが `Read-only file system` で失敗していた。
+
+`XDG_CACHE_HOME` や `FLASHINFER_CACHE_DIR` では回避できず、以下が有効だった。
+
+```bash
+FLASHINFER_WORKSPACE_BASE=/tmp/relaykv_flashinfer_cache
