@@ -93,8 +93,7 @@ class CLIBase(unittest.TestCase):
         dst_dir = os.path.join(artifact_dir, "cli")
         os.makedirs(dst_dir, exist_ok=True)
         dst_name = "".join(
-            c if c.isalnum() or c in "._-" else "_"
-            for c in os.path.basename(path)
+            c if c.isalnum() or c in "._-" else "_" for c in os.path.basename(path)
         )
         dst = os.path.join(dst_dir, dst_name)
         shutil.copy2(path, dst)
