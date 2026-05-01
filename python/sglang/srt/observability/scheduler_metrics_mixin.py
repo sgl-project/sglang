@@ -166,7 +166,7 @@ class SchedulerMetricsMixin:
             def _wrap_execution_reporter(**kwargs):
                 self._device_timer_window_gpu_time += kwargs["t"]
                 if self.enable_metrics:
-                    self.metrics_collector.increment_gpu_execution_seconds(**kwargs)
+                    self.metrics_collector.increment_forward_execution_seconds(**kwargs)
 
             self.forward_pass_device_timer = DeviceTimer(
                 reporter=_wrap_execution_reporter,
@@ -931,7 +931,9 @@ class SchedulerMetricsMixin:
             self.fwd_occupancy = float("nan")
         else:
             cpu_time = now - self._device_timer_window_start
-            self.fwd_occupancy = self._device_timer_window_gpu_time / cpu_time * 100
+            self.fwd_occupancy = min(
+                self._device_timer_window_gpu_time / cpu_time * 100, 100
+            )
         # ratio = self._device_timer_window_gpu_time / cpu_time if cpu_time > 0 else float("nan")
         # print(f"{self._device_timer_window_batch_count=} {self.fwd_occupancy=}, {self._device_timer_window_gpu_time=}, {cpu_time=}, {ratio=}")
         self._device_timer_window_batch_count += 1

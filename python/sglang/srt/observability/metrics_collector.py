@@ -735,10 +735,10 @@ class SchedulerMetricsCollector:
             ),
             labelnames=list(labels.keys()) + ["mode"],
         )
-        self.gpu_execution_seconds_total = Counter(
-            name="sglang:gpu_execution_seconds_total",
+        self.forward_execution_seconds_total = Counter(
+            name="sglang:forward_execution_seconds_total",
             documentation=(
-                "Total time that GPU is busy executing a workload. "
+                "Total time that GPU is busy executing model forward passes. "
                 "Refer to ForwardMode for category labels."
             ),
             labelnames=list(labels.keys()) + ["category"],
@@ -776,10 +776,11 @@ class SchedulerMetricsCollector:
             ),
             labelnames=list(labels.keys()) + ["mode", "num_prefill_ranks"],
         )
-        self.dp_cooperation_gpu_execution_seconds_total = Counter(
-            name="sglang:dp_cooperation_gpu_execution_seconds_total",
+        self.dp_cooperation_forward_execution_seconds_total = Counter(
+            name="sglang:dp_cooperation_forward_execution_seconds_total",
             documentation=(
-                "Total time that GPU is busy executing a workload with labels about DP cooperation. "
+                "Total time that GPU is busy executing model forward passes, "
+                "with labels about DP cooperation. "
                 "Refer to ForwardMode for category labels."
             ),
             labelnames=list(labels.keys()) + ["category", "num_prefill_ranks"],
@@ -1013,15 +1014,17 @@ class SchedulerMetricsCollector:
                     **dp_cooperation_info.to_labels(),
                 ).inc(delta)
 
-    def increment_gpu_execution_seconds(
+    def increment_forward_execution_seconds(
         self,
         category: str,
         t: float,
         dp_cooperation_info: Optional[DPCooperationInfo] = None,
     ):
-        self.gpu_execution_seconds_total.labels(**self.labels, category=category).inc(t)
+        self.forward_execution_seconds_total.labels(
+            **self.labels, category=category
+        ).inc(t)
         if dp_cooperation_info is not None:
-            self.dp_cooperation_gpu_execution_seconds_total.labels(
+            self.dp_cooperation_forward_execution_seconds_total.labels(
                 **self.labels,
                 category=category,
                 **dp_cooperation_info.to_labels(),
