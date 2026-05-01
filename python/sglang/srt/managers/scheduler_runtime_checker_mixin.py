@@ -439,18 +439,12 @@ class SchedulerRuntimeCheckerMixin:
 
     def _check_req_pool(self: Scheduler):
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            req_total_size = (
+            expected_free = (
                 self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
             )
         else:
-            req_total_size = self.req_to_token_pool.size
+            expected_free = self.req_to_token_pool.size
 
-        # dsv4: non-DECODE reserves slot 0 (free_slots = range(1, size)),
-        # so the expected-free count is one less than total in those modes.
-        if self.disaggregation_mode == DisaggregationMode.DECODE:
-            expected_free = req_total_size
-        else:
-            expected_free = req_total_size - 1
         session_req_count = self._session_held_req_count()
         if len(self.req_to_token_pool.free_slots) + session_req_count != expected_free:
             msg = (

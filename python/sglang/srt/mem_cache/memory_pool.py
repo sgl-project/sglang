@@ -142,11 +142,17 @@ class ReqToTokenPool:
         self.max_context_len = max_context_len
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
+            # Buffer holds size+1 rows: row 0 is the padding slot, rows 1..size
+            # are user-allocatable. Mirrors KV pool's padding slot 0 design so
+            # cuda-graph padded batches (req_pool_indices[raw_bs:] = 0) route
+            # dummy reqs through the unowned slot 0; req_to_token[0, :] stays
+            # zero throughout, and downstream KV/swa/state writes land in
+            # padding slots without corrupting real state.
             self.req_to_token = torch.zeros(
-                (size, max_context_len), dtype=torch.int32, device=device
+                (size + 1, max_context_len), dtype=torch.int32, device=device
             )
 
-        self.free_slots = list(range(1, size))
+        self.free_slots = list(range(1, size + 1))
 
     def write(self, indices, values):
         self.req_to_token[indices] = values
@@ -186,7 +192,7 @@ class ReqToTokenPool:
         req.req_pool_idx = None
 
     def clear(self):
-        self.free_slots = list(range(1, self.size))
+        self.free_slots = list(range(1, self.size + 1))
 
 
 class MambaPool:
@@ -541,13 +547,14 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
+        # +1 to match parent ReqToTokenPool's padding row (row 0 is padding).
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
-            size, dtype=torch.int32, device=self.device
+            size + 1, dtype=torch.int32, device=self.device
         )
         if enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
-                    (size, self.mamba_ping_pong_track_buffer_size),
+                    (size + 1, self.mamba_ping_pong_track_buffer_size),
                     dtype=torch.int32,
                     device=self.device,
                 )
