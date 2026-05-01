@@ -50,7 +50,6 @@ class DeepSeekV4SingleKVPool(KVCache):
         enable_memory_saver: bool,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
-        is_swa_pool: Optional[bool] = False,
     ):
         super().__init__(
             size,
@@ -69,19 +68,7 @@ class DeepSeekV4SingleKVPool(KVCache):
         self.quantize_block_size = 64
         self.rope_storage_dtype = torch.bfloat16
         self.k_with_scale_buffer_dtype = torch.int8
-        self.is_swa_pool = is_swa_pool
         self._create_buffers()
-
-    @property
-    def page_size(self):
-        if self.is_swa_pool:
-            assert self._page_size == 256, "SWA KV pool page size not correct!"
-
-        return self._page_size
-
-    @page_size.setter
-    def page_size(self, value: int):
-        self._page_size = value
 
     def _create_buffers(self):
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
@@ -150,9 +137,6 @@ class DeepSeekV4SingleKVPool(KVCache):
         )
 
     def get_key_buffer(self, layer_id: int):
-        if self.store_dtype != self.dtype:
-            return self.kv_buffer[layer_id - self.start_layer].view(self.dtype)
-
         return self.kv_buffer[layer_id]
 
     def set_kv_buffer(self, *args, **kwargs) -> None:
@@ -438,7 +422,6 @@ class DeepSeekV4TokenToKVPool(KVCache):
             layer_num,
             device,
             enable_memory_saver,
-            is_swa_pool=True,
         )
 
         c4_kv_pool_type = DeepSeekV4SingleKVPool
