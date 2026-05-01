@@ -77,6 +77,10 @@ logger = logging.getLogger(__name__)
 
 # Define constants
 DEFAULT_UVICORN_ACCESS_LOG_EXCLUDE_PREFIXES = ()
+MIMO_V2_MODEL_ARCHS = (
+    "MiMoV2ForCausalLM",
+    "MiMoV2FlashForCausalLM",
+)
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 
@@ -179,6 +183,7 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "flashinfer_mxfp4",
     "flashinfer_cutedsl",
     "cutlass",
+    "aiter",
 ]
 
 MOE_A2A_BACKEND_CHOICES = [
@@ -522,6 +527,7 @@ class ServerArgs:
     speculative_draft_model_quantization: Optional[str] = None
     speculative_adaptive: bool = False
     speculative_adaptive_config: Optional[str] = None
+    speculative_skip_dp_mlp_sync: bool = False
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -1631,7 +1637,10 @@ class ServerArgs:
         )
 
     def _handle_model_specific_adjustments(self):
-        from sglang.srt.configs.model_config import is_deepseek_nsa
+        from sglang.srt.configs.model_config import (
+            get_mimo_v2_fused_qkv_expected_tp_size,
+            is_deepseek_nsa,
+        )
 
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
             return
@@ -1967,13 +1976,33 @@ class ServerArgs:
                     self.ep_size == 1
                 ), "Triton kernel MoE is only supported when ep_size == 1"
 
-        elif any(
-            x in model_arch
-            for x in (
-                "MiMoV2ForCausalLM",
-                "MiMoV2FlashForCausalLM",
-            )
-        ):
+        elif model_arch in MIMO_V2_MODEL_ARCHS:
+            if model_arch == "MiMoV2ForCausalLM":
+                expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(
+                    hf_config
+                )
+                attn_dp_size = self.dp_size if self.enable_dp_attention else 1
+                effective_attn_tp_size = (
+                    self.tp_size // attn_dp_size // self.attn_cp_size
+                )
+                if (
+                    expected_attn_tp_size is not None
+                    and effective_attn_tp_size != expected_attn_tp_size
+                ):
+                    raise ValueError(
+                        "MiMoV2ForCausalLM requires effective attention TP "
+                        f"size {expected_attn_tp_size} because its fused "
+                        "qkv_proj weights are "
+                        f"TP={expected_attn_tp_size}-interleaved; got "
+                        f"{effective_attn_tp_size} "
+                        f"(tp_size={self.tp_size}, dp_size={self.dp_size}, "
+                        f"enable_dp_attention={self.enable_dp_attention}, "
+                        f"attn_cp_size={self.attn_cp_size}). "
+                        "Set --tp, --dp, --enable-dp-attention, and "
+                        "--attention-context-parallel-size so the effective "
+                        f"attention TP size is {expected_attn_tp_size}."
+                    )
+
             if self.speculative_algorithm == "EAGLE":
                 self.enable_multi_layer_eagle = True
                 logger.info(
@@ -2364,8 +2393,8 @@ class ServerArgs:
                 )
 
             assert (
-                is_cuda()
-            ), "Mamba extra_buffer is only supported on CUDA devices with FLA backend"
+                is_cuda() or is_musa()
+            ), "Mamba extra_buffer is only supported on CUDA and MUSA devices with FLA backend"
             if self.speculative_num_draft_tokens is not None:
                 assert (
                     self.mamba_track_interval >= self.speculative_num_draft_tokens
@@ -2656,10 +2685,23 @@ class ServerArgs:
             )
             self.attention_backend = "triton"
 
-        if self.attention_backend == "intel_xpu":
-            if self.page_size not in [32, 64, 128]:
+        prefill_backend, decode_backend = self.get_attention_backends()
+        if self.use_mla_backend() and prefill_backend == "intel_xpu":
+            raise ValueError(
+                "intel_xpu backend is only supported on decode for MLA models, please set --decode-attention-backend to intel_xpu and do not set --attention-backend or --prefill-attention-backend to intel_xpu for prefill instead use triton."
+            )
+
+        if decode_backend == "intel_xpu":
+            if self.use_mla_backend():
+                supported_page_sizes = [16, 32, 64, 128]
+                msg = "Intel XPU attention backend for MLA Decode"
+            else:
+                supported_page_sizes = [64, 128]
+                msg = "Intel XPU attention backend"
+
+            if self.page_size not in supported_page_sizes:
                 logger.warning(
-                    f"Intel XPU attention backend only supports page_size of 32, 64 or 128, changing page_size from {self.page_size} to 128."
+                    f"{msg} only supports page_sizes of {supported_page_sizes}, changing page_size from {self.page_size} to 128."
                 )
                 self.page_size = 128
 
@@ -3259,6 +3301,12 @@ class ServerArgs:
 
         if self.speculative_algorithm == "NEXTN":
             self.speculative_algorithm = "EAGLE"
+
+        if self.speculative_skip_dp_mlp_sync:
+            assert self.speculative_algorithm == "EAGLE", (
+                "--speculative-skip-dp-mlp-sync is only supported with "
+                f"speculative_algorithm == EAGLE, got {self.speculative_algorithm}."
+            )
 
         if self.speculative_algorithm == "DFLASH":
             if self.enable_dp_attention:
@@ -5456,6 +5504,13 @@ class ServerArgs:
             type=str,
             help="Path to a JSON config file for adaptive speculative decoding tuning knobs ",
             default=ServerArgs.speculative_adaptive_config,
+        )
+        parser.add_argument(
+            "--speculative-skip-dp-mlp-sync",
+            action="store_true",
+            default=ServerArgs.speculative_skip_dp_mlp_sync,
+            help="Skip the extra MLP sync that the scheduler performs before merging a new batch "
+            "when speculative decoding + DP attention are both enabled.",
         )
 
         # Multi-layer Eagle speculative decoding
