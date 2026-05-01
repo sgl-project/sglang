@@ -26,19 +26,36 @@ runs:
           exit 0
         fi
 
-        # Fetch issue state and body. Capture stderr to a temp file so a
-        # silent failure doesn't get swallowed — earlier observed the action
-        # falsely reporting "no MIN_BASE_SHA" because gh failed and we hid
-        # the error with `2>/dev/null`. Fail-open is preserved (CI proceeds
-        # if we can't read the issue), but the cause is now visible in logs.
-        GH_STDERR_FILE=$(mktemp)
-        ISSUE_JSON=$(gh issue view "$MAINTENANCE_ISSUE" --repo "$REPO" --json state,body 2>"$GH_STDERR_FILE" || true)
+        # Use curl + jq instead of `gh` because self-hosted GPU runners
+        # don't have the gh CLI installed. Without this, the action
+        # silently fell through to "Proceeding with CI" on every GPU
+        # job — the rebase gate only fired on ubuntu-latest jobs that
+        # had gh pre-installed. curl+jq are reliably available on every
+        # Linux runner.
+        gh_api() {
+          local path="$1"
+          local err_file="$2"
+          curl --silent --show-error --fail \
+            --max-time 30 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/$path" 2>"$err_file"
+        }
+
+        # Fetch issue state and body. Fail-open: if we can't read the issue
+        # (network blip, missing token scope), CI proceeds.
+        ERR_FILE=$(mktemp)
+        ISSUE_JSON=$(gh_api "repos/$REPO/issues/$MAINTENANCE_ISSUE" "$ERR_FILE" || true)
         if [[ -z "$ISSUE_JSON" ]]; then
-          echo "⚠️  gh issue view returned empty. stderr was:"
-          cat "$GH_STDERR_FILE" || true
+          echo "⚠️  Issue fetch returned empty. curl stderr was:"
+          cat "$ERR_FILE" || true
         fi
-        rm -f "$GH_STDERR_FILE"
+        rm -f "$ERR_FILE"
         ISSUE_STATE=$(printf '%s' "$ISSUE_JSON" | jq -r '.state // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
+        # Issues API returns state in lowercase ("open"/"closed"); normalize
+        # to uppercase so existing comparisons against "OPEN" still work.
+        ISSUE_STATE=$(printf '%s' "$ISSUE_STATE" | tr '[:lower:]' '[:upper:]')
         ISSUE_BODY=$(printf '%s' "$ISSUE_JSON" | jq -r '.body // ""' 2>/dev/null || echo "")
         echo "DEBUG: ISSUE_STATE=$ISSUE_STATE  body_length=${#ISSUE_BODY}"
 
@@ -69,10 +86,15 @@ runs:
           exit 0
         fi
 
-        # bypass-maintenance label bypasses both gates.
+        # bypass-maintenance label bypasses both gates. PR labels live on
+        # the issue resource (PRs are issues with extra metadata in the
+        # GH API), so we hit the same /issues/{n} endpoint.
         if [[ -n "$PR_NUMBER" ]]; then
-          HAS_BYPASS=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json labels --jq '[.labels[].name] | map(select(. == "bypass-maintenance")) | length' 2>/dev/null || echo "0")
-          if [[ "$HAS_BYPASS" -gt 0 ]]; then
+          ERR_FILE=$(mktemp)
+          PR_JSON=$(gh_api "repos/$REPO/issues/$PR_NUMBER" "$ERR_FILE" || true)
+          rm -f "$ERR_FILE"
+          HAS_BYPASS=$(printf '%s' "$PR_JSON" | jq -r '[.labels[]?.name] | map(select(. == "bypass-maintenance")) | length' 2>/dev/null || echo "0")
+          if [[ "${HAS_BYPASS:-0}" -gt 0 ]]; then
             echo "✅ PR #$PR_NUMBER has 'bypass-maintenance' label. Bypassing maintenance + rebase checks."
             exit 0
           fi
@@ -84,12 +106,14 @@ runs:
             echo "✅ Not a PR context; skipping rebase check."
           else
             # Use GitHub compare API: status is "ahead"/"identical" when MIN_BASE_SHA is reachable from PR head.
-            # On 4xx (e.g., nonexistent SHA) gh api prints the error JSON to stdout before exiting non-zero,
-            # so keep the `|| COMPARE_STATUS=UNKNOWN` outside the subshell — otherwise --jq '.status' extracts
-            # the HTTP status code ("404") from the error body and concatenates with "UNKNOWN", bypassing the
-            # fail-open branch and incorrectly blocking CI.
-            COMPARE_STATUS=$(gh api "repos/$REPO/compare/$MIN_BASE_SHA...$PR_HEAD_SHA" --jq '.status' 2>/dev/null) \
-              || COMPARE_STATUS="UNKNOWN"
+            ERR_FILE=$(mktemp)
+            COMPARE_JSON=$(gh_api "repos/$REPO/compare/$MIN_BASE_SHA...$PR_HEAD_SHA" "$ERR_FILE" || true)
+            if [[ -z "$COMPARE_JSON" ]]; then
+              echo "⚠️  Compare API failed. curl stderr was:"
+              cat "$ERR_FILE" || true
+            fi
+            rm -f "$ERR_FILE"
+            COMPARE_STATUS=$(printf '%s' "$COMPARE_JSON" | jq -r '.status // "UNKNOWN"' 2>/dev/null || echo "UNKNOWN")
             COMPARE_STATUS="${COMPARE_STATUS:-UNKNOWN}"
 
             case "$COMPARE_STATUS" in
