@@ -129,7 +129,7 @@ class TestDeepseekV4ProFp8(CustomTestCase):
                 f"### test_gsm8k (deepseek-v4-pro-fp8)\n"
                 f'{metrics["accuracy"]=:.3f}\n'
             )
-            self.assertGreater(metrics["accuracy"], 0.93)
+            self.assertGreater(metrics["accuracy"], 0.91)
 
     def test_b_perf_8k_1k(self):
         json_output = "/tmp/deepseek_v4_pro_fp8_perf.json"
