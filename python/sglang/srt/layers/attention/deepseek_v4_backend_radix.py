@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import enum
 import functools
 import logging
 import warnings
@@ -354,10 +355,20 @@ class DSV4MetadataRawDecode:
 
 _DSV4_RAW_TYPES = (DSV4MetadataRawVerify, DSV4MetadataRawDecode)
 
+class _GraphBucket(enum.Enum):
+    DECODE_OR_IDLE = "decode_or_idle"
+    TARGET_VERIFY = "target_verify"
+    DRAFT_EXTEND = "draft_extend"
 
-@dataclass
-class _DecodeCudaGraphSharedData:
-    pass
+    @classmethod
+    def of(cls, forward_mode: ForwardMode) -> _GraphBucket:
+        if forward_mode.is_decode_or_idle():
+            return cls.DECODE_OR_IDLE
+        if forward_mode.is_target_verify():
+            return cls.TARGET_VERIFY
+        if forward_mode.is_draft_extend(include_v2=True):
+            return cls.DRAFT_EXTEND
+        raise NotImplementedError(f"unsupported {forward_mode=}")
 
 
 class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBackend):
@@ -741,14 +752,13 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         self.forward_metadata = metadata
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int) -> None:
-        self.decode_cuda_graph_shared_data = _DecodeCudaGraphSharedData()
-        self.decode_cuda_graph_metadata_of_bs: Dict[
-            int, Union[DSV4MetadataRadix, DSV4MetadataRawDecode]
-        ] = {}
-        self.target_verify_cuda_graph_metadata_of_bs: Dict[
-            int, Union[DSV4MetadataRadix, DSV4MetadataRawVerify]
-        ] = {}
-        self.draft_extend_cuda_graph_metadata_of_bs: Dict[int, DSV4MetadataRadix] = {}
+        self.cuda_graph_metadata_of_bucket_and_bs: Dict[
+            _GraphBucket,
+            Dict[
+                int,
+                Union[DSV4MetadataRadix, DSV4MetadataRawDecode, DSV4MetadataRawVerify],
+            ],
+        ] = {bucket: {} for bucket in _GraphBucket}
         self.draft_extend_num_tokens_per_bs = (
             max_num_tokens // max_bs if max_bs > 0 else 1
         )
@@ -766,22 +776,17 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         assert req_pool_indices.size(0) == bs
         assert seq_lens.size(0) == bs
 
-        if forward_mode.is_decode_or_idle():
-
+        bucket = _GraphBucket.of(forward_mode)
+        raw_type: Optional[type] = None
+        if bucket == _GraphBucket.DECODE_OR_IDLE:
             metadata = self.init_forward_metadata_decode(
                 max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=torch.zeros_like(seq_lens),
             )
-
-            self.decode_cuda_graph_metadata_of_bs[bs] = metadata
-            self.forward_metadata = metadata
-
-            self._current_capture_raw = (
-                metadata if isinstance(metadata, DSV4MetadataRawDecode) else None
-            )
-        elif forward_mode.is_target_verify():
+            raw_type = DSV4MetadataRawDecode
+        elif bucket == _GraphBucket.TARGET_VERIFY:
             out_cache_loc = torch.zeros(num_tokens, **self.cuda_int32_kwargs)
             metadata = self.init_forward_metadata_target_verify(
                 max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
@@ -790,13 +795,8 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 out_cache_loc=out_cache_loc,
                 use_prefill_cuda_graph=True,
             )
-            self.target_verify_cuda_graph_metadata_of_bs[bs] = metadata
-            self.forward_metadata = metadata
-
-            self._current_capture_raw = (
-                metadata if isinstance(metadata, DSV4MetadataRawVerify) else None
-            )
-        elif forward_mode.is_draft_extend(include_v2=True):
+            raw_type = DSV4MetadataRawVerify
+        elif bucket == _GraphBucket.DRAFT_EXTEND:
             num_tokens_per_bs = num_tokens // bs
             metadata = self.init_forward_metadata_draft_extend(
                 max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
@@ -806,10 +806,15 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 num_tokens_per_bs=num_tokens_per_bs,
                 use_prefill_cuda_graph=True,
             )
-            self.draft_extend_cuda_graph_metadata_of_bs[bs] = metadata
-            self.forward_metadata = metadata
         else:
             raise NotImplementedError(f"{forward_mode=} not supported yet")
+
+        self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs] = metadata
+        self.forward_metadata = metadata
+        if raw_type is not None:
+            self._current_capture_raw = (
+                metadata if isinstance(metadata, raw_type) else None
+            )
 
     def init_forward_metadata_replay_cuda_graph(
         self,
@@ -824,11 +829,13 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         out_cache_loc: Optional[torch.Tensor] = None,
         actual_forward_mode: Optional[ForwardMode] = None,
     ) -> None:
+        bucket = _GraphBucket.of(forward_mode)
+
         if actual_forward_mode == ForwardMode.IDLE and envs.SGLANG_FIX_PD_IDLE.get():
             logger.debug(
                 f"[IDLE replay] bs={bs}, "
                 f"local_seq_lens_len={len(seq_lens)}, "
-                f"has_graph={bs in self.decode_cuda_graph_metadata_of_bs}"
+                f"has_graph={bs in self.cuda_graph_metadata_of_bucket_and_bs[_GraphBucket.DECODE_OR_IDLE]}"
             )
             device = seq_lens.device
             seq_lens = torch.ones(bs, dtype=seq_lens.dtype, device=device)
@@ -844,13 +851,12 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
-        if forward_mode.is_decode_or_idle():
+        actual_max_seq_len = seq_lens_cpu.max().item()
+        chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
+        assert actual_max_seq_len <= chosen_max_seq_len
+
+        if bucket == _GraphBucket.DECODE_OR_IDLE:
             assert out_cache_loc is not None
-            actual_max_seq_len = seq_lens_cpu.max().item()
-
-            chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
-            assert actual_max_seq_len <= chosen_max_seq_len
-
             assert len(out_cache_loc.shape) == 1, f"{out_cache_loc.shape=}"
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
@@ -858,22 +864,14 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 mode="constant",
                 value=0,
             )
-
             temp_metadata = self.init_forward_metadata_decode(
                 max_seq_len=chosen_max_seq_len,
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
             )
-
-            chosen_metadata = self.decode_cuda_graph_metadata_of_bs[bs]
-            chosen_metadata.copy_(temp_metadata)
-            self.forward_metadata = chosen_metadata
-        elif forward_mode.is_target_verify():
+        elif bucket == _GraphBucket.TARGET_VERIFY:
             assert out_cache_loc is not None
-            actual_max_seq_len = seq_lens_cpu.max().item()
-            chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
-            assert actual_max_seq_len <= chosen_max_seq_len
             num_tokens = self.speculative_num_draft_tokens * bs
             out_cache_loc_padded = torch.nn.functional.pad(
                 out_cache_loc,
@@ -888,13 +886,7 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 out_cache_loc=out_cache_loc_padded,
                 use_prefill_cuda_graph=True,
             )
-            chosen_metadata = self.target_verify_cuda_graph_metadata_of_bs[bs]
-            chosen_metadata.copy_(temp_metadata)
-            self.forward_metadata = chosen_metadata
-        elif forward_mode.is_draft_extend(include_v2=True):
-            actual_max_seq_len = seq_lens_cpu.max().item()
-            chosen_max_seq_len = self.MAX_SEQ_LEN_FOR_CAPTURE
-            assert actual_max_seq_len <= chosen_max_seq_len
+        elif bucket == _GraphBucket.DRAFT_EXTEND:
             num_tokens_per_bs = self.draft_extend_num_tokens_per_bs
             temp_metadata = self.init_forward_metadata_draft_extend(
                 max_seq_len=chosen_max_seq_len,
@@ -904,11 +896,12 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
                 num_tokens_per_bs=num_tokens_per_bs,
                 use_prefill_cuda_graph=True,
             )
-            chosen_metadata = self.draft_extend_cuda_graph_metadata_of_bs[bs]
-            chosen_metadata.copy_(temp_metadata)
-            self.forward_metadata = chosen_metadata
         else:
             raise NotImplementedError
+
+        self.replay_cuda_graph_metadata_from(
+            bs=bs, temp_metadata=temp_metadata, bucket=bucket
+        )
 
     def replay_cuda_graph_metadata_from(
         self,
@@ -918,22 +911,11 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
             DSV4MetadataRawVerify,
             DSV4MetadataRawDecode,
         ],
-        forward_mode: ForwardMode,
+        bucket: _GraphBucket,
     ) -> None:
-        if forward_mode.is_decode_or_idle():
-            chosen_metadata = self.decode_cuda_graph_metadata_of_bs[bs]
-            chosen_metadata.copy_(temp_metadata)
-            self.forward_metadata = chosen_metadata
-        elif forward_mode.is_target_verify():
-            chosen_metadata = self.target_verify_cuda_graph_metadata_of_bs[bs]
-            chosen_metadata.copy_(temp_metadata)
-            self.forward_metadata = chosen_metadata
-        elif forward_mode.is_draft_extend(include_v2=True):
-            chosen_metadata = self.draft_extend_cuda_graph_metadata_of_bs[bs]
-            chosen_metadata.copy_(temp_metadata)
-            self.forward_metadata = chosen_metadata
-        else:
-            raise NotImplementedError
+        chosen_metadata = self.cuda_graph_metadata_of_bucket_and_bs[bucket][bs]
+        chosen_metadata.copy_(temp_metadata)
+        self.forward_metadata = chosen_metadata
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -1305,7 +1287,7 @@ class DeepseekV4MultiStepBackend(DeepseekV4BackendRadix):
             self.attn_backends[i].replay_cuda_graph_metadata_from(
                 bs=bs,
                 temp_metadata=temp_metadata,
-                forward_mode=ForwardMode.DECODE,
+                bucket=_GraphBucket.DECODE_OR_IDLE,
             )
 
 
