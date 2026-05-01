@@ -83,7 +83,7 @@ _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
-if _is_cuda or _is_musa:
+if _is_cuda:
     from sgl_kernel import moe_fused_gate
 
     try:
@@ -126,7 +126,7 @@ if _is_cuda or _is_musa:
     except ImportError as e:
         pass
 
-if _is_cuda or _is_hip or _is_xpu or _is_musa:
+if _is_cuda or _is_hip or _is_xpu:
     from sgl_kernel import topk_softmax
 
     try:
@@ -139,6 +139,13 @@ if _use_aiter:
         from aiter.fused_moe import fused_topk as aiter_fused_topk
     except ImportError:
         raise ImportError("aiter is required when SGLANG_USE_AITER is set to True")
+if _is_musa:
+    try:
+        from mate import moe_fused_gate
+    except ImportError as e:
+        raise ImportError("mate is required for the biased grouped topk.")
+
+    from sglang.srt.hardware_backend.musa.kernels.topk import topk_sigmoid, topk_softmax
 
 # -------------------------------- TopKConfig ---------------------------------------
 
@@ -538,13 +545,24 @@ def fused_topk(
                 renormalize,
             )
     elif scoring_func == "sigmoid":
-        topk_sigmoid(
-            topk_weights,
-            topk_ids,
-            gating_output,
-            renormalize,
-            correction_bias,
-        )
+        if _use_aiter and correction_bias is not None:
+            aiter_biased_grouped_topk(
+                gating_output,
+                correction_bias.to(dtype=gating_output.dtype),
+                topk_weights,
+                topk_ids,
+                num_expert_group=1,
+                topk_group=1,
+                need_renorm=renormalize,
+            )
+        else:
+            topk_sigmoid(
+                topk_weights,
+                topk_ids,
+                gating_output,
+                renormalize,
+                correction_bias,
+            )
     else:
         raise ValueError(f"Invalid scoring function: {scoring_func}")
 
@@ -853,7 +871,7 @@ def biased_grouped_topk_gpu(
         return topk_weights, topk_ids
 
     elif (
-        (_is_cuda or _is_musa)
+        _is_cuda
         # moe_fused_gate kernel ensures that num_experts/num_expert_group does not exceed MAX_VPT=32 now. And when kernel can handle MAX_VPT > 32, we can remove this assertion.
         and experts_per_group <= 32
         and is_power_of_two(num_experts)
@@ -891,6 +909,21 @@ def biased_grouped_topk_gpu(
             routed_scaling_factor if routed_scaling_factor is not None else 1.0,
         )
         return topk_weights, topk_ids
+    elif _is_musa and (
+        gating_output.shape[1] // num_expert_group <= 32
+        or (num_expert_group == 1 and gating_output.shape[1] in {160, 256, 384})
+    ):
+        topk_weights, topk_ids = moe_fused_gate(
+            gating_output.to(dtype=torch.float32),
+            correction_bias,
+            num_expert_group,
+            topk_group,
+            topk,
+            num_fused_shared_experts,
+            routed_scaling_factor if routed_scaling_factor is not None else 1.0,
+            True,
+            apply_routed_scaling_factor_on_output,
+        )
     else:
         # Use optimized path for Kimi K2 (384 experts with num_expert_group=1)
         num_experts = gating_output.shape[1]
@@ -902,6 +935,30 @@ def biased_grouped_topk_gpu(
                 renormalize=renormalize,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
+        elif (
+            _is_cuda
+            and num_expert_group == 1
+            and topk_group == 1
+            and num_fused_shared_experts == 0
+            and num_experts <= 512
+            and topk <= 8
+        ):
+            from sglang.jit_kernel.grouped_topk import grouped_topk as jit_grouped_topk
+
+            scaling = (
+                routed_scaling_factor if routed_scaling_factor is not None else 1.0
+            )
+            if not apply_routed_scaling_factor_on_output:
+                scaling = 1.0
+            return jit_grouped_topk(
+                gating_output.to(dtype=torch.float32),
+                correction_bias.to(dtype=torch.float32),
+                num_expert_group,
+                topk_group,
+                topk,
+                renormalize,
+                scaling,
             )
         else:
             return biased_grouped_topk_impl(

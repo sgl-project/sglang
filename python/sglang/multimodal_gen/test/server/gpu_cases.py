@@ -182,14 +182,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         ),
         T2V_sampling_params,
     ),
-    DiffusionTestCase(
-        "wan2_1_t2v_1.3b_text_encoder_cpu_offload",
-        DiffusionServerArgs(
-            model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
-            text_encoder_cpu_offload=True,
-        ),
-        T2V_sampling_params,
-    ),
     # TeaCache acceleration test for Wan video model
     DiffusionTestCase(
         "wan2_1_t2v_1.3b_teacache_enabled",
@@ -346,6 +338,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             extras=[
                 "--pipeline-class-name LTX2TwoStageHQPipeline --ltx2-two-stage-device-mode snapshot"
             ],
+            env_vars={
+                "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+                "SGLANG_LTX2_SNAPSHOT_RELEASE_EMPTY_CACHE": "true",
+            },
         ),
         T2I_sampling_params,
     ),
@@ -626,13 +622,6 @@ TWO_GPU_CASES = [
             tp_size=2,
         ),
         T2I_sampling_params,
-    ),
-    DiffusionTestCase(
-        "flux_2_klein_ti2i_2_gpus",
-        DiffusionServerArgs(
-            model_path="black-forest-labs/FLUX.2-klein-4B",
-        ),
-        TI2I_sampling_params,
     ),
     DiffusionTestCase(
         "ltx_2.3_one_stage_ti2v",

@@ -812,7 +812,7 @@
                 "46": 42.62,
                 "47": 5.33,
                 "48": 189.41,
-                "49": 43.03
+                "49": 177.01
             },
             "expected_e2e_ms": 4956.71,
             "expected_avg_denoise_ms": 85.38,
@@ -949,72 +949,6 @@
             "expected_e2e_ms": 9305.91,
             "expected_avg_denoise_ms": 144.79,
             "expected_median_denoise_ms": 145.57,
-            "estimated_full_test_time_s": 129.3
-        },
-        "wan2_1_t2v_1.3b_text_encoder_cpu_offload": {
-            "stages_ms": {
-                "DecodingStage": 675.91,
-                "TextEncodingStage": 1072.93,
-                "TimestepPreparationStage": 2.43,
-                "LatentPreparationStage": 0.14,
-                "InputValidationStage": 0.07,
-                "DenoisingStage": 7221.86
-            },
-            "denoise_step_ms": {
-                "0": 128.64,
-                "1": 108.46,
-                "2": 140.93,
-                "3": 140.8,
-                "4": 141.21,
-                "5": 141.84,
-                "6": 141.56,
-                "7": 142.35,
-                "8": 142.08,
-                "9": 141.68,
-                "10": 141.69,
-                "11": 141.46,
-                "12": 141.39,
-                "13": 141.36,
-                "14": 141.65,
-                "15": 141.55,
-                "16": 142.02,
-                "17": 141.53,
-                "18": 140.98,
-                "19": 142.4,
-                "20": 141.84,
-                "21": 141.3,
-                "22": 141.41,
-                "23": 141.47,
-                "24": 141.78,
-                "25": 141.6,
-                "26": 142.19,
-                "27": 141.09,
-                "28": 141.2,
-                "29": 141.22,
-                "30": 141.2,
-                "31": 141.23,
-                "32": 141.41,
-                "33": 141.5,
-                "34": 141.56,
-                "35": 141.51,
-                "36": 141.25,
-                "37": 141.49,
-                "38": 141.56,
-                "39": 141.52,
-                "40": 141.17,
-                "41": 141.83,
-                "42": 141.72,
-                "43": 142.31,
-                "44": 141.56,
-                "45": 141.91,
-                "46": 141.93,
-                "47": 141.9,
-                "48": 141.52,
-                "49": 141.34
-            },
-            "expected_e2e_ms": 9296.17,
-            "expected_avg_denoise_ms": 144.33,
-            "expected_median_denoise_ms": 144.84,
             "estimated_full_test_time_s": 129.3
         },
         "wan2_1_t2v_1.3b_cfg_parallel": {
@@ -2185,27 +2119,6 @@
             "expected_median_denoise_ms": 151.72,
             "estimated_full_test_time_s": 129.3
         },
-        "flux_2_klein_ti2i_2_gpus": {
-            "stages_ms": {
-                "InputValidationStage": 35.39,
-                "DecodingStage": 6.68,
-                "TextEncodingStage": 160.46,
-                "TimestepPreparationStage": 27.82,
-                "LatentPreparationStage": 0.4,
-                "DenoisingStage": 364.99,
-                "ImageVAEEncodingStage": 65.69
-            },
-            "denoise_step_ms": {
-                "0": 30.19,
-                "1": 63.04,
-                "2": 89.37,
-                "3": 89.7
-            },
-            "expected_e2e_ms": 827.17,
-            "expected_avg_denoise_ms": 68.93,
-            "expected_median_denoise_ms": 77.89,
-            "estimated_full_test_time_s": 120.8
-        },
         "flux_2_image_t2i_upscaling_4x": {
             "stages_ms": {
                 "TextEncodingStage": 494.65,
@@ -2642,7 +2555,7 @@
                 "LTX2AVLatentPreparationStage": 0.33,
                 "LTX2ImageEncodingStage": 0.04,
                 "LTX2AVDenoisingStage": 25873.2,
-                "LTX2UpsampleStage": 216.72,
+                "LTX2UpsampleStage": 752.07,
                 "LTX2RefinementStage": 2553.3,
                 "LTX2AVDecodingStage": 585.0,
                 "per_frame_generation": null

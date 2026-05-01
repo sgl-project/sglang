@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.fla.fused_sigmoid_gating_recurrent import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=7, suite="stage-b-test-1-gpu-large")
 
 
 def _make_noncontiguous_ab(batch, num_heads, dtype=torch.bfloat16, device="cuda"):

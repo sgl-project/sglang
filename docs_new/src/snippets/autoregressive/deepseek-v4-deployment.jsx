@@ -4,6 +4,7 @@ export const DeepSeekV4Deployment = () => {
   //
   //   Hardware (quantization determined by GPU generation):
   //     B200  → FP4 weights, Flash TP=4 / Pro TP=8 single-node
+  //     GB200 → FP4 weights, Flash TP=4 / Pro TP=8 2-node
   //     GB300 → FP4 weights, Flash TP=4 / Pro TP=4 single-node
   //     H200  → FP8 weights, Flash TP=4 / Pro TP=16 2-node
   //   Model variant → HF slug:
@@ -26,8 +27,11 @@ export const DeepSeekV4Deployment = () => {
       title: "Hardware Platform",
       items: [
         { id: "b200",  label: "B200 (FP4)",  default: true  },
+        { id: "b300",  label: "B300 (FP4)",  default: false  },
+        { id: "gb200", label: "GB200 (FP4)", default: false },
         { id: "gb300", label: "GB300 (FP4)", default: false },
         { id: "h200",  label: "H200 (FP8)",  default: false },
+        { id: "h200-fp4", label: "H200 (FP4)", default: false },
       ],
     },
     modelSize: {
@@ -67,7 +71,19 @@ export const DeepSeekV4Deployment = () => {
     },
   };
 
-  const resolveItems = (option) => option.items;
+  // Recipes that are not supported on the H200 (FP4) Marlin path.
+  const H200_FP4_UNSUPPORTED_RECIPES = new Set(["cp", "pd-disagg"]);
+
+  const resolveItems = (option, vals) => {
+    if (option.name === "recipe" && vals && vals.hardware === "h200-fp4") {
+      return option.items.map((it) =>
+        H200_FP4_UNSUPPORTED_RECIPES.has(it.id)
+          ? { ...it, disabled: true, disabledReason: "Not supported on H200 (FP4)" }
+          : it
+      );
+    }
+    return option.items;
+  };
 
   const getInitialState = () => {
     const initialState = {};
@@ -101,7 +117,19 @@ export const DeepSeekV4Deployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      // Switching to H200 (FP4) while cp / pd-disagg is selected: fall back
+      // to low-latency since those recipes are not supported on this path.
+      if (
+        optionName === "hardware" &&
+        value === "h200-fp4" &&
+        H200_FP4_UNSUPPORTED_RECIPES.has(next.recipe)
+      ) {
+        next.recipe = "low-latency";
+      }
+      return next;
+    });
   };
 
   // ============================================================================
@@ -137,11 +165,18 @@ export const DeepSeekV4Deployment = () => {
     "b200|big":    { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 8,  multinode: false },
     "gb300|small": { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4,  multinode: false },
     "gb300|big":   { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 4,  multinode: false },
+    "gb200|small": { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4,  multinode: false },
+    "gb200|big":   { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 8,  multinode: true, nnodes: 2 },
     // H200 needs an FP8-only Instruct ckpt (deepseek-ai's Flash/Pro repos ship
     // FP4-mixed weights that Hopper can't run). sgl-project publishes FP8
     // repackagings for both variants.
     "h200|small":  { slug: "sgl-project/DeepSeek-V4-Flash-FP8",        tp: 4,  multinode: false },
     "h200|big":    { slug: "sgl-project/DeepSeek-V4-Pro-FP8",          tp: 16, multinode: true, nnodes: 2 },
+    // H200 (FP4) runs the original FP4-mixed Instruct repos through the Marlin
+    // MoE runner: experts are dequantized from FP4 to FP16 at runtime, so a
+    // single-node TP=4 / TP=8 deployment fits Flash / Pro on Hopper.
+    "h200-fp4|small": { slug: "deepseek-ai/DeepSeek-V4-Flash", tp: 4, multinode: false },
+    "h200-fp4|big":   { slug: "deepseek-ai/DeepSeek-V4-Pro",   tp: 8, multinode: false },
   };
   // Per (hardware, modelSize) PD role TP (from allinone _PD_SPEC).
   const PD_TP_SPEC = {
@@ -149,6 +184,8 @@ export const DeepSeekV4Deployment = () => {
     "b200|big":    { tp: 8,  multinode: false },
     "gb300|small": { tp: 4,  multinode: false },
     "gb300|big":   { tp: 4,  multinode: false },
+    "gb200|small": { tp: 4,  multinode: false },
+    "gb200|big":   { tp: 8,  multinode: true, nnodes: 2 },
     "h200|small":  { tp: 4,  multinode: false },
     "h200|big":    { tp: 16, multinode: true, nnodes: 2 },
   };
@@ -164,6 +201,7 @@ export const DeepSeekV4Deployment = () => {
     "b200|small|balanced",
     "b200|small|max-throughput",
     "b200|small|cp",
+    "b200|small|pd-disagg",
     "b200|big|low-latency",
     "b200|big|balanced",
     "b200|big|max-throughput",
@@ -171,7 +209,45 @@ export const DeepSeekV4Deployment = () => {
     "h200|small|low-latency",
     "h200|small|balanced",
     "h200|small|max-throughput",
+    "gb300|small|low-latency",
+    "gb300|big|low-latency",
+    "gb300|small|balanced",
+    "gb300|big|balanced",
+    "gb300|small|max-throughput",
+    "gb300|big|max-throughput",
+    "h200|small|cp",
+    "h200|small|pd-disagg",
+    "h200|big|low-latency",
+    "h200|big|balanced",
+    "h200|big|max-throughput",
+    "h200|big|pd-disagg",
+    "gb300|small|cp",
+    "gb300|big|cp",
+    "gb300|small|pd-disagg",
+    "gb300|big|pd-disagg",
+    "gb200|small|low-latency",
+    "gb200|small|balanced",
+    "gb200|small|max-throughput",
+    "gb200|small|cp",
+    "gb200|big|low-latency",
+    "gb200|big|balanced",
+    "gb200|big|max-throughput",
+    "h200-fp4|small|low-latency",
+    "h200-fp4|small|balanced",
+    "h200-fp4|small|max-throughput",
+    "h200-fp4|big|low-latency",
+    "h200-fp4|big|balanced",
+    "h200-fp4|big|max-throughput",
   ]);
+  // Recipes whose command is intentionally not yet provided (e.g. blocked by an
+  // upstream limitation). Showing a minimal placeholder is friendlier to users
+  // than emitting a commented-out invalid command.
+  const TBD_RECIPES = new Set([
+    "h200|big|cp",
+    "gb200|small|pd-disagg",
+    "gb200|big|pd-disagg",
+  ]);
+  const TBD_PLACEHOLDER = "# to be provided";
   const BEING_VERIFIED_NOTE =
     "# NOTE: this recipe is being verified on the latest checkpoint";
 
@@ -203,7 +279,9 @@ export const DeepSeekV4Deployment = () => {
   // === SHARED END ===
 
   const generateCommand = () => {
-    const { hardware, modelSize, recipe, reasoningParser, toolcall } = values;
+    const { hardware: rawHardware, modelSize, recipe, reasoningParser, toolcall } = values;
+    // B300 usage is identical to B200 — alias so we don't duplicate every spec entry.
+    const hardware = rawHardware === "b300" ? "b200" : rawHardware;
     const specKey = `${hardware}|${modelSize}`;
     const spec = HW_SIZE_SPEC[specKey];
     const { slug, tp, multinode, nnodes } = spec;
@@ -213,26 +291,71 @@ export const DeepSeekV4Deployment = () => {
       return buildPDDisaggCommand(hardware, modelSize);
     }
 
+    // H200 (FP4) Marlin path: dedicated branch — Hopper runs the FP4-mixed
+    // Instruct repos through the Marlin MoE runner, so it doesn't share envs
+    // or flags with either the FP8 H200 path or the Blackwell paths.
+    //   Flash: TP=4, single node       Pro: TP=8, single node
+    //   low-latency:    MTP 3 / 1 / 4 (steps / topk / draft-tokens)
+    //   balanced:       MTP 1 / 1 / 2
+    //   max-throughput: MTP disabled
+    if (hardware === "h200-fp4") {
+      const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+      if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
+
+      const fp4Flags = [
+        "  --trust-remote-code",
+        `  --model-path ${slug}`,
+        `  --tp ${tp}`,
+        "  --moe-runner-backend marlin",
+      ];
+      if (recipe === "low-latency") {
+        fp4Flags.push("  --speculative-algo EAGLE");
+        fp4Flags.push("  --speculative-num-steps 3");
+        fp4Flags.push("  --speculative-eagle-topk 1");
+        fp4Flags.push("  --speculative-num-draft-tokens 4");
+      } else if (recipe === "balanced") {
+        fp4Flags.push("  --speculative-algo EAGLE");
+        fp4Flags.push("  --speculative-num-steps 1");
+        fp4Flags.push("  --speculative-eagle-topk 1");
+        fp4Flags.push("  --speculative-num-draft-tokens 2");
+      }
+      if (isBig) fp4Flags.push("  --mem-fraction-static 0.88");
+      if (toolcall === "enabled") fp4Flags.push("  --tool-call-parser deepseekv4");
+      if (reasoningParser === "enabled") fp4Flags.push("  --reasoning-parser deepseek-v4");
+      fp4Flags.push("  --host 0.0.0.0");
+      fp4Flags.push("  --port 30000");
+
+      const fp4Cmd = `sglang serve \\\n${fp4Flags.join(" \\\n")}`;
+      return VERIFIED_RECIPES.has(verifyKey)
+        ? fp4Cmd
+        : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(fp4Cmd)}`;
+    }
+
     // ---- env ----
     // _LAUNCH_HEAD always prepends these:
-    const COMMON_ENV = ["SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
     // Per-hardware env (whitelist #1: NVSHMEM removed for B200).
     const HW_ENV = {
       h200:  ["SGLANG_DSV4_FP4_EXPERTS=0"],   // allinone _ENV_H200
       b200:  [],                              // _ENV_B200 minus NVSHMEM
       gb300: [],                              // _ENV_GB300
+      // GB200 multinode needs NCCL MNNVL for cross-node NVLink communication.
+      gb200: multinode ? ["NCCL_MNNVL_ENABLE=1", "NCCL_CUMEM_ENABLE=1"] : [],
     }[hardware];
 
     // Recipe-specific env (matches allinone exactly, taking size into account).
     const recipeEnv = [];
     if (recipe === "low-latency") {
-      // H200 big low-latency has extra dispatch-token cap (allinone line 233).
+      // Big low-latency dispatch-token cap.
       if (hardware === "h200" && isBig) {
         recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128");
+      } else if (hardware === "gb200" && isBig) {
+        recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
       }
     } else if (recipe === "balanced") {
       if (hardware === "h200") {
-        recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
+        recipeEnv.push(isBig
+          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
+          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
       } else {
         // Blackwell: small=1024, big=256 (allinone ternary).
         recipeEnv.push(isBig
@@ -241,7 +364,9 @@ export const DeepSeekV4Deployment = () => {
       }
     } else if (recipe === "max-throughput") {
       if (hardware === "h200") {
-        recipeEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
+        recipeEnv.push(isBig
+          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128"
+          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256");
       } else {
         recipeEnv.push(isBig
           ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
@@ -272,6 +397,7 @@ export const DeepSeekV4Deployment = () => {
       // allinone:
       //   H200 small: pure TP + MTP_314
       //   H200 big:   DP-attn + DeepEP + MTP_314 + cg=32 max-run=64 + multi-node + mem-frac 0.82
+      //   GB200 big:  pure TP + multinode + flashinfer_mxfp4 + MTP_314 + mem-frac 0.82 (no DP-attn/DeepEP)
       //   Blackwell:  TP + flashinfer_mxfp4 + MTP_314 + chunked-prefill-size 4096 + autotune-fix
       //               Big Blackwell additionally: mem-frac 0.82
       flags.push(`  --tp ${tp}`);
@@ -287,8 +413,8 @@ export const DeepSeekV4Deployment = () => {
         flags.push("  --moe-runner-backend flashinfer_mxfp4");
       }
       if (hardware === "h200" && isBig) {
-        flags.push("  --cuda-graph-max-bs 32");
-        flags.push("  --max-running-requests 64");
+        flags.push("  --cuda-graph-max-bs 8");
+        flags.push("  --max-running-requests 32");
       }
       // MTP 3/4
       flags.push("  --speculative-algo EAGLE");
@@ -299,7 +425,7 @@ export const DeepSeekV4Deployment = () => {
         flags.push("  --chunked-prefill-size 4096");
         flags.push("  --disable-flashinfer-autotune");
       }
-      if (isBig) flags.push("  --mem-fraction-static 0.82");
+      if (isBig) flags.push("  --mem-fraction-static 0.88");
     } else if (recipe === "balanced") {
       // allinone balanced: TP + DP + DP-attn + DeepEP + MTP_112.
       //   H200 small: cg=128 max-run=128  |  H200 big: cg=128 max-run=128 (same)
@@ -314,8 +440,19 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --speculative-num-steps 1");
       flags.push("  --speculative-eagle-topk 1");
       flags.push("  --speculative-num-draft-tokens 2");
-      if (isBig) flags.push("  --mem-fraction-static 0.82");
-      if (hardware === "h200") {
+      if (hardware === "h200" && isBig) {
+        flags.push("  --mem-fraction-static 0.88");
+      } else if (isBig && hardware === "gb300") {
+        flags.push("  --mem-fraction-static 0.9");
+      } else if (isBig && hardware === "gb200") {
+        flags.push("  --mem-fraction-static 0.78");
+      } else if (isBig) {
+        flags.push("  --mem-fraction-static 0.82");
+      }
+      if (hardware === "h200" && isBig) {
+        flags.push("  --cuda-graph-max-bs 8");
+        flags.push("  --max-running-requests 32");
+      } else if (hardware === "h200") {
         flags.push("  --cuda-graph-max-bs 128");
         flags.push("  --max-running-requests 128");
       } else if (isBig && hardware === "b200") {
@@ -324,6 +461,9 @@ export const DeepSeekV4Deployment = () => {
       } else if (isBig && hardware === "gb300") {
         flags.push("  --cuda-graph-max-bs 128");
         flags.push("  --max-running-requests 256");
+      } else if (isBig && hardware === "gb200") {
+        flags.push("  --cuda-graph-max-bs 64");
+        flags.push("  --max-running-requests 128");
       }
       // allinone H200 gates DEEPEP_LARGE_SMS_FLAG on !multinode — only H200 big
       // is multi-node; all Blackwell cells get the flag unconditionally.
@@ -338,7 +478,15 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --enable-dp-attention");
       if (multinode) flags.push(...multiNodeFlags(nnodes));
       flags.push("  --moe-a2a-backend deepep");
-      if (isBig) flags.push("  --mem-fraction-static 0.82");
+      if (hardware === "h200" && isBig) {
+        flags.push("  --mem-fraction-static 0.88");
+      } else if (isBig && hardware === "gb300") {
+        flags.push("  --mem-fraction-static 0.9");
+      } else if (isBig && hardware === "gb200") {
+        flags.push("  --mem-fraction-static 0.78");
+      } else if (isBig) {
+        flags.push("  --mem-fraction-static 0.82");
+      }
       if (hardware === "h200") {
         flags.push("  --cuda-graph-max-bs 128");
         flags.push("  --max-running-requests 256");
@@ -347,6 +495,9 @@ export const DeepSeekV4Deployment = () => {
         flags.push("  --max-running-requests 256");
       } else if (isBig && hardware === "gb300") {
         flags.push("  --cuda-graph-max-bs 128");
+        flags.push("  --max-running-requests 256");
+      } else if (isBig && hardware === "gb200") {
+        flags.push("  --cuda-graph-max-bs 64");
         flags.push("  --max-running-requests 256");
       }
       if (!multinode) flags.push(DEEPEP_LARGE_SMS_FLAG);
@@ -360,7 +511,17 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --enable-nsa-prefill-context-parallel");
       flags.push("  --nsa-prefill-cp-mode round-robin-split");
       flags.push("  --chunked-prefill-size 16384");
-      flags.push("  --mem-fraction-static 0.78");
+      // GB300 big CP needs higher mem-fraction-static: Pro 1.6T weights at
+      // tp=4 are ~224 GB/card on a 273 GB GB300, so 0.78 leaves a negative
+      // KV pool (init_memory_pool fails: "Not enough memory ... weights
+      // 224 GB > static target 213 GB"). 0.88 gives weights 224 + KV 16 +
+      // runtime 33. Other Blackwell tp=8 paths fit fine at 0.78.
+      // Verified on 2026-04-25 (journal 2026-04-25-001 Cell B, Δ4).
+      if (hardware === "gb300" && isBig) {
+        flags.push("  --mem-fraction-static 0.88");
+      } else {
+        flags.push("  --mem-fraction-static 0.78");
+      }
       // allinone _CP_FLAGS has --max-running-requests 1024; Blackwell big cp overrides
       // to 256. Human directed (2026-04-24) to emit only one value — keep 256 override
       // for big Blackwell, else the default 1024.
@@ -381,12 +542,56 @@ export const DeepSeekV4Deployment = () => {
     flags.push("  --host 0.0.0.0");
     flags.push("  --port 30000");
 
-    // Assemble: [HW env] [recipe env] [common env] \ sglang serve \ flags...
-    const envAll = [...HW_ENV, ...recipeEnv, ...COMMON_ENV];
+    // Assemble: [HW env] [recipe env] \ sglang serve \ flags...
+    const envAll = [...HW_ENV, ...recipeEnv];
     const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
     const base = `${envBlock}sglang serve \\\n${flags.join(" \\\n")}`;
-    const withMultinode = multinode ? prependMultiNodeNote(base, nnodes) : base;
+    // GB200 multinode may need machine-specific NVSHMEM / Gloo env vars;
+    // emit them as commented hints above the env block so users know to check.
+    let cmd = base;
+    if (hardware === "gb200" && multinode) {
+      cmd =
+        `# The following env vars may be needed depending on your cluster:\n` +
+        `#   GLOO_SOCKET_IFNAME=<your-nic>\n` +
+        `#   NVSHMEM_ENABLE_NIC_PE_MAPPING=1\n` +
+        `#   NVSHMEM_HCA_LIST=<your-hca-list>\n` +
+        cmd;
+    }
+    const withMultinode = multinode ? prependMultiNodeNote(cmd, nnodes) : cmd;
+
+    // H200 Pro low-latency: show BOTH a single-node (TP=8 marlin) variant
+    // and the existing multi-node (TP=16 DP-attn + DeepEP) variant.
+    if (hardware === "h200" && isBig && recipe === "low-latency") {
+      const singleFlags = [
+        "  --trust-remote-code",
+        "  --model-path deepseek-ai/DeepSeek-V4-Pro",
+        "  --tp 8",
+        "  --moe-runner-backend marlin",
+        "  --speculative-algo EAGLE",
+        "  --speculative-num-steps 3",
+        "  --speculative-eagle-topk 1",
+        "  --speculative-num-draft-tokens 4",
+        "  --chunked-prefill-size 4096",
+        "  --disable-flashinfer-autotune",
+        "  --mem-fraction-static 0.88",
+      ];
+      if (toolcall === "enabled") singleFlags.push("  --tool-call-parser deepseekv4");
+      if (reasoningParser === "enabled") singleFlags.push("  --reasoning-parser deepseek-v4");
+      singleFlags.push("  --host 0.0.0.0");
+      singleFlags.push("  --port 30000");
+      const singleNodeCmd = `sglang serve \\\n${singleFlags.join(" \\\n")}`;
+      const combined =
+        `# --- Single-Node (TP=8, Marlin) ---\n${singleNodeCmd}\n\n` +
+        `# --- Multi-Node (2 nodes, TP=16, DP-Attn + DeepEP) ---\n${withMultinode}`;
+      const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+      if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
+      return VERIFIED_RECIPES.has(verifyKey)
+        ? combined
+        : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(combined)}`;
+    }
+
     const verifyKey = `${hardware}|${modelSize}|${recipe}`;
+    if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
     return VERIFIED_RECIPES.has(verifyKey)
       ? withMultinode
       : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(withMultinode)}`;
@@ -409,30 +614,51 @@ export const DeepSeekV4Deployment = () => {
   //   --max-running-requests 256 only on decode (PD decode can't retract).
   //   No flashinfer_mxfp4 / autotune-fix / MTP / mem-fraction-static on PD (allinone omits).
   // ============================================================================
-  const buildPDDisaggCommand = (hardware, modelSize) => {
+  const buildPDDisaggCommand = (rawHardware, modelSize) => {
+    // B300 usage is identical to B200 — alias so we don't duplicate every spec entry.
+    const hardware = rawHardware === "b300" ? "b200" : rawHardware;
     const specKey = `${hardware}|${modelSize}`;
     const { tp: pdTp, multinode, nnodes } = PD_TP_SPEC[specKey];
     const slug = HW_SIZE_SPEC[specKey].slug;
-    const ibDevice = { h200: "mlx5_0", b200: "mlx5_7", gb300: "" }[hardware];
+    const ibDevice = { h200: "mlx5_0", b200: "mlx5_7", gb300: "", gb200: "" }[hardware];
     const isGB300 = hardware === "gb300";
-    const isBlackwell = hardware === "b200" || isGB300;
+    const isBlackwell = hardware === "b200" || hardware === "gb200" || isGB300;
 
     const HW_ENV = {
       h200:  ["SGLANG_DSV4_FP4_EXPERTS=0"],
       b200:  [],
       gb300: [],
+      gb200: [],
     }[hardware];
     // Whitelist #5: only SGLANG_MOONCAKE_CUSTOM_MEM_POOL kept; MC_FORCE_MNNVL /
-    // NCCL_MNNVL_ENABLE / NCCL_CUMEM_ENABLE stripped (personal-cluster topology).
+    // NCCL_MNNVL_ENABLE / NCCL_CUMEM_ENABLE may also be needed depending on the
+    // GB300 cluster's NVLink/IB topology — see §3.2 "Configuration Tips" note.
     const MNNVL_ENV = isGB300 ? ["SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True"] : [];
-    const COMMON_ENV = ["SGLANG_JIT_DEEPGEMM_PRECOMPILE=0"];
 
     const buildRole = (mode, port, distPort) => {
       const roleEnv = [];
       if (hardware === "b200" && mode === "decode") {
         roleEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
       }
-      const envAll = [...HW_ENV, ...roleEnv, ...MNNVL_ENV, ...COMMON_ENV];
+      // GB300 PD needs DeepEP dispatch buffer cap on BOTH prefill + decode;
+      // without it, the first forward fails `deep_ep.cpp:1233` assertion
+      // `x.size(0) <= num_max_dispatch_tokens_per_rank`. The cap also
+      // co-moves with --max-running-requests below: 256 for big (which
+      // uses --max-running-requests 128, per-rank=32 ≤ 256), 1024 for
+      // small (--max-running-requests 256, per-rank=64 ≤ 1024).
+      // Verified on 2026-04-25 (journal 2026-04-25-001 §C/§D).
+      if (isGB300) {
+        roleEnv.push(modelSize === "big"
+          ? "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=256"
+          : "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=1024");
+      }
+      // H200 Pro PD: tp=16 multinode + DeepEP needs the dispatch buffer cap on
+      // BOTH prefill + decode (matches production playground LWS for the same
+      // hw/model combo). Verified on 2026-04-25 (journal 2026-04-25-014).
+      if (hardware === "h200" && modelSize === "big") {
+        roleEnv.push("SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128");
+      }
+      const envAll = [...HW_ENV, ...roleEnv, ...MNNVL_ENV];
       const envBlock = envAll.length ? envAll.join(" \\\n") + " \\\n" : "";
 
       const flags = [];
@@ -442,12 +668,50 @@ export const DeepSeekV4Deployment = () => {
       flags.push(`  --dp ${pdTp}`);
       flags.push("  --enable-dp-attention");
       if (multinode) flags.push(...multiNodeFlags(nnodes));
-      if (isBlackwell) flags.push("  --moe-a2a-backend deepep");
+      // H200 Pro PD also needs deepep: at tp=16 the FP8 block_n=128 doesn't
+      // divide moe intermediate_size_per_partition (3072 / 16 = 192) so MoE
+      // experts must be kept on a single rank rather than TP-sharded. Verified
+      // on 2026-04-25 (journal 2026-04-25-014, candidate cookbook Bug L).
+      if (isBlackwell || (hardware === "h200" && modelSize === "big")) {
+        flags.push("  --moe-a2a-backend deepep");
+      }
       flags.push(`  --disaggregation-mode ${mode}`);
       flags.push("  --disaggregation-transfer-backend mooncake");
       if (ibDevice) flags.push(`  --disaggregation-ib-device ${ibDevice}`);
-      if (!isGB300) flags.push(`  --dist-init-addr 127.0.0.1:${distPort}`);
-      if (mode === "decode") flags.push("  --max-running-requests 256");
+      // Same-host PD bootstrap addr; for multinode PD (h200 big tp=16 across 2
+      // nodes) skip this — argparse would override the multinode dist-init-addr
+      // already emitted by multiNodeFlags above. Verified 2026-04-25 (journal
+      // 2026-04-25-014). sglang falls back to its own bootstrap port (default
+      // 8998) which works for cross-node mooncake handshake.
+      if (!isGB300 && !multinode) flags.push(`  --dist-init-addr 127.0.0.1:${distPort}`);
+      // H200 Pro PD memory-budget: cookbook defaults give available_gpu_memory
+      // ~17.93 GB after weights but reserve target = (1 - mem_fraction_static)
+      // × 138 GB = 87 GB → "Not enough memory" at memory profile. mem-frac 0.90
+      // and cg-max-bs 128 verified on 2026-04-25 (journal 2026-04-25-014). 128
+      // matches gb300|big|pd decode and gives larger decode batching headroom;
+      // CG capture takes ~1 hr (one-time, vs ~5 min for cg=64) but runtime
+      // throughput is better.
+      if (hardware === "h200" && modelSize === "big") {
+        flags.push("  --cuda-graph-max-bs 128");
+        flags.push("  --mem-fraction-static 0.9");
+      }
+      if (mode === "decode") {
+        // GB300 big PD decode is the most memory-pressured PD role: Pro 1.6T
+        // weights at tp=4 take ~224 GB/card on a 273 GB GB300; runtime needs
+        // headroom for DeepEP buffer + mooncake KV recv + CG private pool.
+        // Cookbook defaults (mem-frac 0.874, cg_max_bs 512, max-running 256)
+        // OOM during CG capture. mem-frac sweep at 0.83 / 0.87 / 0.89 / 0.91
+        // all pass static validation; 0.9 picked as the default — leaves
+        // ~14 GB / GPU post-CG headroom for mooncake transfer + activation
+        // peaks while giving ~1M-token KV pool.
+        if (isGB300 && modelSize === "big") {
+          flags.push("  --max-running-requests 128");
+          flags.push("  --mem-fraction-static 0.9");
+          flags.push("  --cuda-graph-max-bs 128");
+        } else {
+          flags.push("  --max-running-requests 256");
+        }
+      }
       flags.push("  --host 0.0.0.0");
       flags.push(`  --port ${port}`);
 
@@ -463,17 +727,21 @@ export const DeepSeekV4Deployment = () => {
 
     const prefill = `${prefillHeader}\n${buildRole("prefill", 30000, 30335)}`;
     const decode  = `${decodeHeader}\n${buildRole("decode",  30001, 30435)}`;
+    // Router addresses prefill / decode by their reachable hostnames / IPs.
+    // Substitute <prefill-host> / <decode-host> with the actual hosts before
+    // running. On a same-host deployment, both can be 127.0.0.1.
     const router  = `# --- Router (port 8000) ---
 python3 -m sglang_router.launch_router \\
   --pd-disaggregation \\
-  --prefill http://127.0.0.1:30000 \\
-  --decode http://127.0.0.1:30001 \\
+  --prefill http://<prefill-host>:30000 \\
+  --decode http://<decode-host>:30001 \\
   --host 0.0.0.0 --port 8000 \\
   --disable-circuit-breaker \\
   --health-check-interval-secs 999999`;
 
     const full = `${prefill}\n\n${decode}\n\n${router}`;
     const verifyKey = `${hardware}|${modelSize}|pd-disagg`;
+    if (TBD_RECIPES.has(verifyKey)) return TBD_PLACEHOLDER;
     return VERIFIED_RECIPES.has(verifyKey)
       ? full
       : `${BEING_VERIFIED_NOTE}\n${commentOutCommand(full)}`;
@@ -533,7 +801,7 @@ python3 -m sglang_router.launch_router \\
   return (
     <div style={containerStyle} className="not-prose">
       {Object.entries(options).map(([key, option]) => {
-        const items = resolveItems(option);
+        const items = resolveItems(option, values);
         return (
           <div key={key} style={cardStyle}>
             <div style={titleStyle}>{option.title}</div>

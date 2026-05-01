@@ -69,8 +69,8 @@ class Req:
     # Primary encoder embeddings
     prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
     negative_prompt_embeds: list[torch.Tensor] | None = None
-    prompt_attention_mask: list[torch.Tensor] | None = None
-    negative_attention_mask: list[torch.Tensor] | None = None
+    prompt_attention_mask: list[torch.Tensor | None] | None = None
+    negative_attention_mask: list[torch.Tensor | None] | None = None
     clip_embedding_pos: list[torch.Tensor] | None = None
     clip_embedding_neg: list[torch.Tensor] | None = None
 
@@ -128,6 +128,14 @@ class Req:
     paired_timesteps: torch.Tensor | None = None
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
+
+    # request-local scheduler used by timestep/denoising stages.
+    # This is optional because the normal worker path executes one request at a time, so it can
+    # point at the stage-local scheduler and preserve warmup/device caches.
+    # Request-local cloned schedulers are only needed when a request can run
+    # concurrently with another request or outlive the stage-local scheduler
+    # state, such as grouped execution or disaggregation.
+    scheduler: Any | None = None
 
     eta: float = 0.0
     sigmas: list[float] | None = None
@@ -357,6 +365,7 @@ class OutputBatch:
 
     # logged metrics info, directly from Req.timings
     metrics: Optional["RequestMetrics"] = None
+    metrics_list: Optional[list[Optional["RequestMetrics"]]] = None
 
     # For ComfyUI integration: noise prediction from denoising stage
     noise_pred: torch.Tensor | None = None

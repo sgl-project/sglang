@@ -141,6 +141,7 @@ class CommonKVManager(BaseKVManager):
             )
             self.register_to_bootstrap()
             self.transfer_infos = {}
+            self.req_to_decode_prefix_len: Dict[int, int] = {}
             self.decode_kv_args_table = {}
             self.pp_group = get_pp_group()
             # If a timeout happens on the prefill side, it means prefill instances
@@ -179,6 +180,12 @@ class CommonKVManager(BaseKVManager):
         return self.request_status[bootstrap_room]
 
     def update_status(self, bootstrap_room: int, status: KVPoll):
+        if (
+            status == KVPoll.Failed
+            and self.disaggregation_mode == DisaggregationMode.PREFILL
+            and hasattr(self, "req_to_decode_prefix_len")
+        ):
+            self.req_to_decode_prefix_len.pop(bootstrap_room, None)
         if bootstrap_room not in self.request_status:
             self.request_status[bootstrap_room] = status
         else:
@@ -488,6 +495,12 @@ class CommonKVSender(BaseKVSender):
         logger.debug(
             f"CommonKVSender init with num_kv_indices: {num_kv_indices} and aux_index: {aux_index}"
         )
+
+    def pop_decode_prefix_len(self) -> int:
+        return 0
+
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0
 
     def send(
         self,

@@ -2,7 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 # Code adapted from SGLang https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/lora/layers.py
-
+import os
 
 import torch
 from torch import nn
@@ -37,10 +37,17 @@ torch._dynamo.config.recompile_limit = 64
 
 
 LORA_MERGE_CHUNK_BYTES = 32 * 1024 * 1024
+LoRAWeightEntry = tuple[
+    torch.nn.Parameter,
+    torch.nn.Parameter,
+    str | None,
+    float,
+    int | None,
+    int | None,
+]
 
 
 class BaseLayerWithLoRA(nn.Module):
-
     def __init__(
         self,
         base_layer: nn.Module,
@@ -60,9 +67,7 @@ class BaseLayerWithLoRA(nn.Module):
         self.disable_lora: bool = True
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
-        self.lora_weights_list: list[
-            tuple[torch.nn.Parameter, torch.nn.Parameter, str | None, float]
-        ] = []
+        self.lora_weights_list: list[LoRAWeightEntry] = []
         self.lora_path: str | None = None
         self.strength: float = 1.0
 
@@ -147,7 +152,16 @@ class BaseLayerWithLoRA(nn.Module):
             self.strength = 1.0
 
         # Add to list for multi-LoRA support
-        self.lora_weights_list.append((lora_A_param, lora_B_param, lora_path, strength))
+        self.lora_weights_list.append(
+            (
+                lora_A_param,
+                lora_B_param,
+                lora_path,
+                strength,
+                self.lora_rank,
+                self.lora_alpha,
+            )
+        )
 
         # Set backward compatibility attributes to point to the last LoRA (for single LoRA case)
         # This ensures backward compatibility while supporting multiple LoRA
@@ -166,29 +180,27 @@ class BaseLayerWithLoRA(nn.Module):
     def _merge_lora_into_data(
         self,
         data: torch.Tensor,
-        lora_list: list[
-            tuple[torch.nn.Parameter, torch.nn.Parameter, str | None, float]
-        ],
+        lora_list: list[LoRAWeightEntry],
     ) -> None:
         """
         Merge all LoRA adapters into the data tensor in-place.
 
         Args:
             data: The base weight tensor to merge LoRA into (modified in-place)
-            lora_list: List of (lora_A, lora_B, lora_path, lora_strength) tuples
+            lora_list: List of (lora_A, lora_B, lora_path, lora_strength, rank, alpha) tuples
         """
         # Merge all LoRA adapters in order
-        for lora_A, lora_B, _, lora_strength in lora_list:
+        for lora_A, lora_B, _, lora_strength, lora_rank, lora_alpha in lora_list:
             lora_A_sliced = self.slice_lora_a_weights(lora_A.to(data))
             lora_B_sliced = self.slice_lora_b_weights(lora_B.to(data))
 
             scale = lora_strength
             if (
-                self.lora_alpha is not None
-                and self.lora_rank is not None
-                and self.lora_alpha != self.lora_rank
+                lora_alpha is not None
+                and lora_rank is not None
+                and lora_alpha != lora_rank
             ):
-                scale *= self.lora_alpha / self.lora_rank
+                scale *= lora_alpha / lora_rank
 
             if not isinstance(lora_B_sliced, torch.Tensor):
                 lora_delta = lora_B_sliced @ lora_A_sliced
@@ -222,6 +234,17 @@ class BaseLayerWithLoRA(nn.Module):
                 chunk_delta = lora_B_2d[start:end] @ lora_A_sliced
                 data_2d[start:end].add_(chunk_delta, alpha=scale)
 
+    def _should_merge_in_fp32(
+        self,
+        lora_list: list[LoRAWeightEntry],
+    ) -> bool:
+        if os.getenv("SGLANG_DIFFUSION_LORA_MERGE_FP32", "0") != "1":
+            return False
+        for _, _, lora_path, _, _, _ in lora_list:
+            if lora_path and "distilled-lora" in lora_path.lower():
+                return False
+        return True
+
     @torch.no_grad()
     def merge_lora_weights(self, strength: float | None = None) -> None:
         if strength is not None:
@@ -236,10 +259,21 @@ class BaseLayerWithLoRA(nn.Module):
         # Use lora_weights_list if available, otherwise fall back to single LoRA for backward compatibility
         lora_list = self.lora_weights_list if self.lora_weights_list else []
         if not lora_list and self.lora_A is not None and self.lora_B is not None:
-            lora_list = [(self.lora_A, self.lora_B, self.lora_path, self.strength)]
+            lora_list = [
+                (
+                    self.lora_A,
+                    self.lora_B,
+                    self.lora_path,
+                    self.strength,
+                    self.lora_rank,
+                    self.lora_alpha,
+                )
+            ]
 
         if not lora_list:
             raise ValueError("LoRA weights not set. Please set them first.")
+
+        merge_in_fp32 = self._should_merge_in_fp32(lora_list)
 
         if isinstance(self.base_layer.weight, DTensor):
             mesh = self.base_layer.weight.data.device_mesh
@@ -257,10 +291,19 @@ class BaseLayerWithLoRA(nn.Module):
             data = self.base_layer.weight.data.to(
                 get_local_torch_device()
             ).full_tensor()
+            target_dtype = data.dtype
+            if (
+                merge_in_fp32
+                and data.is_floating_point()
+                and data.dtype != torch.float32
+            ):
+                data = data.to(torch.float32)
 
             self._merge_lora_into_data(data, lora_list)
 
-            unsharded_base_layer.weight = nn.Parameter(data.to(current_device))
+            unsharded_base_layer.weight = nn.Parameter(
+                data.to(current_device, dtype=target_dtype)
+            )
             if isinstance(getattr(self.base_layer, "bias", None), DTensor):
                 unsharded_base_layer.bias = nn.Parameter(
                     self.base_layer.bias.to(get_local_torch_device(), non_blocking=True)
@@ -282,10 +325,19 @@ class BaseLayerWithLoRA(nn.Module):
         else:
             current_device = self.base_layer.weight.data.device
             data = self.base_layer.weight.data.to(get_local_torch_device())
+            target_dtype = data.dtype
+            if (
+                merge_in_fp32
+                and data.is_floating_point()
+                and data.dtype != torch.float32
+            ):
+                data = data.to(torch.float32)
 
             self._merge_lora_into_data(data, lora_list)
 
-            self.base_layer.weight.data = data.to(current_device, non_blocking=True)
+            self.base_layer.weight.data = data.to(
+                current_device, dtype=target_dtype, non_blocking=True
+            )
 
         self.merged = True
 
@@ -342,7 +394,6 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
 
 
 class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
-
     def __init__(
         self,
         base_layer: ColumnParallelLinear,
@@ -400,7 +451,6 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
 
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-
     def __init__(
         self,
         base_layer: MergedColumnParallelLinear,
@@ -422,7 +472,6 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-
     def __init__(
         self,
         base_layer: QKVParallelLinear,
@@ -455,7 +504,6 @@ class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
-
     def __init__(
         self,
         base_layer: RowParallelLinear,
