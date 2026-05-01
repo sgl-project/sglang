@@ -1,4 +1,11 @@
 {
+    "842974287": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
+    },
     "1pikachu": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
@@ -812,6 +819,13 @@
         "reason": "top contributor"
     },
     "liz-badada": {
+        "can_tag_run_ci_label": true,
+        "can_rerun_failed_ci": true,
+        "can_rerun_stage": true,
+        "cooldown_interval_minutes": 60,
+        "reason": "custom override"
+    },
+    "luccafong": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
         "can_rerun_stage": true,
