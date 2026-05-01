@@ -894,5 +894,62 @@ class TestToolChoiceLfm2(TestToolChoiceLlama32):
         cls.tokenizer = get_tokenizer(cls.model)
 
 
+class TestToolChoiceWithConstrainedDecoding(TestToolChoiceLlama32):
+    """Test tool_choice with grammar backend (structural_tag + constrained decoding).
+
+    Verifies that tool_choice="required" with strict=True produces valid
+    tool calls when the grammar backend is enabled.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.flaky_tests = {
+            "test_multi_tool_scenario_auto",
+            "test_multi_tool_scenario_required",
+        }
+
+        cls.model = "meta-llama/Llama-3.2-1B-Instruct"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.api_key = "sk-123456"
+
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            api_key=cls.api_key,
+            other_args=[
+                "--tool-call-parser",
+                "llama3",
+                "--grammar-backend",
+                "xgrammar",
+            ],
+        )
+        cls.base_url += "/v1"
+        cls.tokenizer = get_tokenizer(cls.model)
+
+    def test_tool_choice_required_strict_finish_reason(self):
+        """Verify tool_choice=required with strict=True produces finish_reason=tool_calls."""
+        response = self.client.chat.completions.create(
+            model=self.model_name,
+            messages=[{"role": "user", "content": "What is the weather in NYC?"}],
+            tools=self.get_test_tools(),
+            tool_choice="required",
+            extra_body={"strict": True},
+            max_tokens=256,
+        )
+        choice = response.choices[0]
+        self.assertEqual(
+            choice.finish_reason,
+            "tool_calls",
+            f"Expected finish_reason='tool_calls', got '{choice.finish_reason}'",
+        )
+        self.assertIsNotNone(choice.message.tool_calls)
+        self.assertGreater(len(choice.message.tool_calls), 0)
+        # Verify the tool call has valid JSON arguments
+        for tc in choice.message.tool_calls:
+            self.assertIsNotNone(tc.function.name)
+            json.loads(tc.function.arguments)
+
+
 if __name__ == "__main__":
     unittest.main()

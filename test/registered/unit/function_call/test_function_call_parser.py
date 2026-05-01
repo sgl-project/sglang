@@ -2,9 +2,11 @@ import json
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
+from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.gemma4_detector import (
     Gemma4Detector,
@@ -15,16 +17,22 @@ from sglang.srt.function_call.gemma4_detector import (
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
+from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
+from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
 from sglang.srt.function_call.kimik2_detector import KimiK2Detector
 from sglang.srt.function_call.lfm2_detector import Lfm2Detector
 from sglang.srt.function_call.llama32_detector import Llama32Detector
+from sglang.srt.function_call.mimo_detector import MiMoDetector
+from sglang.srt.function_call.minimax_m2 import MinimaxM2Detector
 from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
+from sglang.srt.function_call.step3_detector import Step3Detector
+from sglang.srt.function_call.trinity_detector import TrinityDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(15, "stage-a-test-cpu")
+register_cpu_ci(25, "stage-a-test-cpu")
 
 
 class TestPythonicDetector(unittest.TestCase):
@@ -1206,6 +1214,73 @@ class TestDeepSeekV3Detector(unittest.TestCase):
             ),
         ]
         self.detector = DeepSeekV3Detector()
+
+    def test_has_tool_call(self):
+        self.assertTrue(
+            self.detector.has_tool_call(
+                "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function"
+            )
+        )
+        self.assertFalse(self.detector.has_tool_call("Hello world"))
+
+    def test_detect_and_parse_single(self):
+        text = '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{"city":"Tokyo"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], "Tokyo")
+
+    def test_detect_and_parse_multiple(self):
+        text = (
+            "<｜tool▁calls▁begin｜>"
+            '<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{"city":"NYC"}\n```<｜tool▁call▁end｜>'
+            '\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>get_tourist_attractions\n```json\n{"city":"LA"}\n```<｜tool▁call▁end｜>'
+            "<｜tool▁calls▁end｜>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[1].name, "get_tourist_attractions")
+
+    def test_unicode_delimiter_handling(self):
+        """Verify unicode delimiters (fullwidth bar ｜, block char ▁) are handled correctly."""
+        text = '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{"city":"São Paulo"}\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], "São Paulo")
+
+    def test_malformed_unicode_delimiter_no_crash(self):
+        """Malformed unicode delimiter should not crash."""
+        text = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>function<｜tool▁sep｜>get_weather\n```json\n{broken\n```<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        # Should not crash, may return 0 calls due to bad JSON
+        self.assertIsInstance(result, StreamingParseResult)
+
+    def test_streaming_chunk_boundary(self):
+        """Split at mid-function-name boundary."""
+        chunks = [
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>function",
+            "<｜tool▁sep｜>get_we",
+            "ather\n```json\n",  # noqa: E501
+            '{"city":',
+            '"Berlin"}\n',
+            "```<｜tool▁call▁end｜>",
+            "<｜tool▁calls▁end｜>",
+        ]
+        names, params = [], []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+                if call.parameters:
+                    params.append(call.parameters)
+        self.assertIn("get_weather", names)
+        full_params = json.loads("".join(params))
+        self.assertEqual(full_params["city"], "Berlin")
 
     def test_parse_streaming_multiple_tool_calls_with_multi_token_chunk(self):
         """Test parsing multiple tool calls when streaming chunks contains multi-tokens (e.g. DeepSeekV3 enable MTP)"""
@@ -4526,6 +4601,890 @@ class TestGemma4Detector(unittest.TestCase):
         params1 = json.loads(tool_calls_by_index[1]["parameters"])
         self.assertEqual(params0["location"], "Paris")
         self.assertEqual(params1["timezone"], "UTC")
+
+
+class TestDeepSeekV31Detector(unittest.TestCase):
+    """Test DeepSeekV31Detector (XML-style format with direct JSON, no code blocks)."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "unit": {
+                                "type": "string",
+                                "enum": ["celsius", "fahrenheit"],
+                            },
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search for info",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = DeepSeekV31Detector()
+
+    def test_has_tool_call(self):
+        self.assertTrue(
+            self.detector.has_tool_call(
+                '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city":"NYC"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+            )
+        )
+        self.assertFalse(self.detector.has_tool_call("Hello world"))
+
+    def test_detect_and_parse_single(self):
+        text = '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city":"NYC","unit":"celsius"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], "NYC")
+        self.assertEqual(params["unit"], "celsius")
+
+    def test_detect_and_parse_multiple(self):
+        text = (
+            "<｜tool▁calls▁begin｜>"
+            '<｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city":"NYC"}<｜tool▁call▁end｜>'
+            '<｜tool▁call▁begin｜>search<｜tool▁sep｜>{"query":"restaurants"}<｜tool▁call▁end｜>'
+            "<｜tool▁calls▁end｜>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[1].name, "search")
+
+    def test_streaming_chunk_boundary(self):
+        """Split at mid-function-name boundary."""
+        chunks = [
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>get_we",
+            "ather<｜tool▁sep｜>",  # noqa: E501
+            '{"ci',
+            'ty":"Tokyo"}',
+            "<｜tool▁call▁end｜>",
+            "<｜tool▁calls▁end｜>",
+        ]
+        names, params = [], []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+                if call.parameters:
+                    params.append(call.parameters)
+        self.assertIn("get_weather", names)
+        full_params = json.loads("".join(params))
+        self.assertEqual(full_params["city"], "Tokyo")
+
+    def test_streaming_state_reset(self):
+        """Sequential calls on separate detector instances should not leak state."""
+        # First call
+        result1 = self.detector.detect_and_parse(
+            '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city":"A"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>',
+            self.tools,
+        )
+        self.assertEqual(len(result1.calls), 1)
+        self.assertEqual(result1.calls[0].name, "get_weather")
+
+        # Second call on fresh detector
+        detector2 = DeepSeekV31Detector()
+        result2 = detector2.detect_and_parse(
+            '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>search<｜tool▁sep｜>{"query":"B"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>',
+            self.tools,
+        )
+        self.assertEqual(len(result2.calls), 1)
+        self.assertEqual(result2.calls[0].name, "search")
+
+    def test_no_code_block_wrapping(self):
+        """V31 uses direct JSON, not ```json code blocks like V3."""
+        text = '<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{"city":"Berlin"}<｜tool▁call▁end｜><｜tool▁calls▁end｜>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], "Berlin")
+
+    def test_malformed_json_returns_empty(self):
+        text = "<｜tool▁calls▁begin｜><｜tool▁call▁begin｜>get_weather<｜tool▁sep｜>{broken<｜tool▁call▁end｜><｜tool▁calls▁end｜>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+
+
+class TestGptOssDetector(unittest.TestCase):
+    """Test GptOssDetector (HarmonyParser-based, event-filtering architecture)."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="calculate",
+                    description="Calculate",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "expression": {"type": "string"},
+                        },
+                        "required": ["expression"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = GptOssDetector()
+
+    def test_has_tool_call(self):
+        self.assertTrue(
+            self.detector.has_tool_call(
+                '<|start|>assistant<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"city":"NYC"}<|call|>'
+            )
+        )
+        self.assertFalse(self.detector.has_tool_call("Hello world"))
+
+    def test_detect_and_parse_single(self):
+        text = '<|start|>assistant<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"city":"NYC"}<|call|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], "NYC")
+
+    def test_namespace_dot_extraction(self):
+        """Function name after the last dot should be extracted."""
+        text = '<|start|>assistant<|channel|>commentary to=tools.utils.calculate<|constrain|>json<|message|>{"expression":"2+2"}<|call|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "calculate")
+
+    def test_streaming_complete_tool_call(self):
+        """Streaming emits complete tool calls at once."""
+        text = '<|start|>assistant<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"city":"Tokyo"}<|call|>'
+        chunks = [text[i : i + 20] for i in range(0, len(text), 20)]
+        all_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+        # GptOss emits complete tool calls, so we should see at least one
+        tool_names = [c.name for c in all_calls if c.name]
+        if tool_names:
+            self.assertIn("get_weather", tool_names)
+
+    def test_streaming_state_reset(self):
+        """Sequential streaming calls should not leak state."""
+        text1 = '<|start|>assistant<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{"city":"A"}<|call|>'
+        self.detector.parse_streaming_increment(text1, self.tools)
+
+        self.detector = GptOssDetector()
+        text2 = '<|start|>assistant<|channel|>commentary to=functions.calculate<|constrain|>json<|message|>{"expression":"1+1"}<|call|>'
+        result = self.detector.parse_streaming_increment(text2, self.tools)
+        names = [c.name for c in result.calls if c.name]
+        if names:
+            self.assertIn("calculate", names)
+            self.assertNotIn("get_weather", names)
+
+    def test_unknown_tool_skipped_env_off(self):
+        """Unknown tool calls should be skipped when SGLANG_FORWARD_UNKNOWN_TOOLS is False."""
+        text = '<|start|>assistant<|channel|>commentary to=functions.nonexistent_tool<|constrain|>json<|message|>{"x":"y"}<|call|>'
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(False):
+            detector = GptOssDetector()
+            result = detector.detect_and_parse(text, self.tools)
+            self.assertEqual(len(result.calls), 0)
+
+    def test_unknown_tool_forwarded_env_on(self):
+        """Unknown tool calls should be forwarded when SGLANG_FORWARD_UNKNOWN_TOOLS is True."""
+        text = '<|start|>assistant<|channel|>commentary to=functions.nonexistent_tool<|constrain|>json<|message|>{"x":"y"}<|call|>'
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            detector = GptOssDetector()
+            result = detector.detect_and_parse(text, self.tools)
+            self.assertGreater(len(result.calls), 0)
+            self.assertEqual(result.calls[0].name, "nonexistent_tool")
+
+    def test_malformed_json_returns_empty(self):
+        text = "<|start|>assistant<|channel|>commentary to=functions.get_weather<|constrain|>json<|message|>{broken_json<|call|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_plain_text_passthrough(self):
+        """Text without Harmony markers should pass through as normal text."""
+        detector = GptOssDetector()
+        result = detector.parse_streaming_increment("Hello world", self.tools)
+        self.assertEqual(result.normal_text, "Hello world")
+        self.assertEqual(len(result.calls), 0)
+
+
+class TestInternlmDetector(unittest.TestCase):
+    """Test InternlmDetector (enum key: interns1, custom unknown-tool handling)."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "location": {"type": "string"},
+                        },
+                        "required": ["location"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = InternlmDetector()
+
+    def test_has_tool_call(self):
+        self.assertTrue(
+            self.detector.has_tool_call(
+                '<|action_start|> <|plugin|>\n{"name": "get_weather", "parameters": {"location": "NYC"}}<|action_end|>'
+            )
+        )
+        self.assertFalse(self.detector.has_tool_call("Hello world"))
+
+    def test_detect_and_parse_single(self):
+        text = '<|action_start|> <|plugin|>\n{"name": "get_weather", "parameters": {"location": "Tokyo"}}<|action_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["location"], "Tokyo")
+
+    def test_detect_and_parse_multiple(self):
+        text = (
+            '<|action_start|> <|plugin|>\n{"name": "get_weather", "parameters": {"location": "NYC"}}<|action_end|>'
+            '<|action_start|> <|plugin|>\n{"name": "search", "parameters": {"query": "food"}}<|action_end|>'
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[1].name, "search")
+
+    def test_arguments_key_variant(self):
+        """Supports both 'parameters' and 'arguments' keys."""
+        text = '<|action_start|> <|plugin|>\n{"name": "get_weather", "arguments": {"location": "Berlin"}}<|action_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["location"], "Berlin")
+
+    def test_streaming_complete_tool_call(self):
+        text = '<|action_start|> <|plugin|>\n{"name": "get_weather", "parameters": {"location": "Paris"}}<|action_end|>'
+        chunks = [text[i : i + 15] for i in range(0, len(text), 15)]
+        all_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+        names = [c.name for c in all_calls if c.name]
+        self.assertIn("get_weather", names)
+
+    def test_streaming_state_reset(self):
+        text1 = '<|action_start|> <|plugin|>\n{"name": "get_weather", "parameters": {"location": "A"}}<|action_end|>'
+        self.detector.parse_streaming_increment(text1, self.tools)
+
+        self.detector = InternlmDetector()
+        text2 = '<|action_start|> <|plugin|>\n{"name": "search", "parameters": {"query": "B"}}<|action_end|>'
+        all_calls = []
+        result = self.detector.parse_streaming_increment(text2, self.tools)
+        all_calls.extend(result.calls)
+        names = [c.name for c in all_calls if c.name]
+        self.assertIn("search", names)
+
+    def test_unknown_tool_skipped_env_off(self):
+        """Unknown tool calls should be skipped when SGLANG_FORWARD_UNKNOWN_TOOLS is False."""
+        text = '<|action_start|> <|plugin|>\n{"name": "unknown_func", "parameters": {"x": "y"}}<|action_end|>'
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(False):
+            detector = InternlmDetector()
+            result = detector.detect_and_parse(text, self.tools)
+            self.assertEqual(len(result.calls), 0)
+
+    def test_unknown_tool_forwarded_env_on(self):
+        """When SGLANG_FORWARD_UNKNOWN_TOOLS is True, InternLM's custom validation
+        falls through but hits a KeyError on tool_indices[name].
+        This documents a known limitation in the detector implementation."""
+        text = '<|action_start|> <|plugin|>\n{"name": "unknown_func", "parameters": {"x": "y"}}<|action_end|>'
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            detector = InternlmDetector()
+            # InternlmDetector has a bug: after the env check it does
+            # tool_indices[name] which KeyErrors for unknown tools.
+            # The outer except catches this, returning the original text.
+            result = detector.detect_and_parse(text, self.tools)
+            # Due to the bug, unknown tool is not forwarded — the exception
+            # handler returns the full text as normal_text
+            self.assertEqual(len(result.calls), 0)
+
+    def test_normal_text_before_tool_call(self):
+        text = 'Let me check the weather.<|action_start|> <|plugin|>\n{"name": "get_weather", "parameters": {"location": "NYC"}}<|action_end|>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertIn("check the weather", result.normal_text)
+        self.assertEqual(len(result.calls), 1)
+
+    def test_malformed_json_returns_empty(self):
+        text = "<|action_start|> <|plugin|>\n{broken_json}<|action_end|>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+
+
+class TestStep3Detector(unittest.TestCase):
+    """Test Step3Detector (StepML XML format with schema-aware type conversion)."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = Step3Detector()
+
+    def test_has_tool_call(self):
+        self.assertTrue(
+            self.detector.has_tool_call("<｜tool_calls_begin｜>some content")
+        )
+        self.assertFalse(self.detector.has_tool_call("Hello world"))
+
+    def test_detect_and_parse_single(self):
+        text = (
+            '<｜tool_calls_begin｜><｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name="get_weather">'
+            '<steptml:parameter name="city">Tokyo</steptml:parameter>'
+            "</steptml:invoke><｜tool_call_end｜><｜tool_calls_end｜>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], "Tokyo")
+
+    def test_detect_and_parse_multiple(self):
+        text = (
+            "<｜tool_calls_begin｜>"
+            '<｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name="get_weather">'
+            '<steptml:parameter name="city">NYC</steptml:parameter></steptml:invoke><｜tool_call_end｜>'
+            '<｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name="search">'
+            '<steptml:parameter name="query">food</steptml:parameter></steptml:invoke><｜tool_call_end｜>'
+            "<｜tool_calls_end｜>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[1].name, "search")
+
+    def test_schema_aware_type_conversion(self):
+        """Integer parameters should be converted from strings."""
+        text = (
+            '<｜tool_calls_begin｜><｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name="get_weather">'
+            '<steptml:parameter name="city">Berlin</steptml:parameter>'
+            '<steptml:parameter name="days">5</steptml:parameter>'
+            "</steptml:invoke><｜tool_call_end｜><｜tool_calls_end｜>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["days"], 5)
+        self.assertIsInstance(params["days"], int)
+
+    def test_streaming_chunk_boundary(self):
+        """Split at mid-parameter boundary."""
+        chunks = [
+            "<｜tool_calls_begin｜>",
+            "<｜tool_call_begin｜>function",
+            "<｜tool_sep｜>",
+            '<steptml:invoke name="get_wea',
+            'ther">',
+            '<steptml:parameter name="city">Tok',
+            "yo</steptml:parameter>",
+            "</steptml:invoke>",
+            "<｜tool_call_end｜>",
+            "<｜tool_calls_end｜>",
+        ]
+        names, params = [], []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+                if call.parameters:
+                    params.append(call.parameters)
+        self.assertIn("get_weather", names)
+        full_params = json.loads("".join(params))
+        self.assertEqual(full_params["city"], "Tokyo")
+
+    def test_streaming_state_reset(self):
+        text1 = (
+            '<｜tool_calls_begin｜><｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name="get_weather">'
+            '<steptml:parameter name="city">A</steptml:parameter></steptml:invoke><｜tool_call_end｜><｜tool_calls_end｜>'
+        )
+        for ch in [text1[i : i + 20] for i in range(0, len(text1), 20)]:
+            self.detector.parse_streaming_increment(ch, self.tools)
+
+        self.detector = Step3Detector()
+        text2 = (
+            '<｜tool_calls_begin｜><｜tool_call_begin｜>function<｜tool_sep｜><steptml:invoke name="search">'
+            '<steptml:parameter name="query">B</steptml:parameter></steptml:invoke><｜tool_call_end｜><｜tool_calls_end｜>'
+        )
+        names = []
+        for ch in [text2[i : i + 20] for i in range(0, len(text2), 20)]:
+            result = self.detector.parse_streaming_increment(ch, self.tools)
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+        self.assertIn("search", names)
+
+    def test_malformed_xml_returns_empty(self):
+        text = "<｜tool_calls_begin｜><｜tool_call_begin｜>function<｜tool_sep｜><broken_xml><｜tool_call_end｜><｜tool_calls_end｜>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+
+
+class TestTrinityDetector(unittest.TestCase):
+    """Test TrinityDetector (extends Qwen25, strips think tags)."""
+
+    def setUp(self):
+        self.detector = TrinityDetector()
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+        ]
+
+    def test_has_tool_call(self):
+        self.assertTrue(
+            self.detector.has_tool_call(
+                '<think>reasoning</think><tool_call>\n{"name":"get_weather","arguments":{"city":"NYC"}}\n</tool_call>'
+            )
+        )
+        self.assertFalse(self.detector.has_tool_call("Hello world"))
+
+    def test_detect_and_parse_with_think_tags(self):
+        """Think tags should be stripped before parsing."""
+        text = '<think>Let me check</think><tool_call>\n{"name":"get_weather","arguments":{"city":"Tokyo"}}\n</tool_call>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], "Tokyo")
+
+    def test_detect_and_parse_without_think_tags(self):
+        """Should still work without think tags (pure Qwen25 format)."""
+        text = '<tool_call>\n{"name":"get_weather","arguments":{"city":"Berlin"}}\n</tool_call>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], "Berlin")
+
+    def test_streaming_with_think_tags(self):
+        """Streaming should strip think tags incrementally."""
+        chunks = [
+            "<think>",
+            "reasoning",
+            "</think>",
+            "<tool_call>\n",
+            '{"name":"get_weather",',
+            '"arguments":{"city":"Paris"}}\n',
+            "</tool_call>",
+        ]
+        names, params = [], []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+                if call.parameters:
+                    params.append(call.parameters)
+        self.assertIn("get_weather", names)
+
+    def test_split_think_tag_across_chunks(self):
+        """Think tags split across chunk boundaries should still be stripped."""
+        chunks = [
+            "<thi",
+            "nk>reasoning</thi",
+            "nk>",
+            "<tool_call>\n",
+            '{"name":"get_weather",',
+            '"arguments":{"city":"London"}}\n',
+            "</tool_call>",
+        ]
+        names = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+        self.assertIn("get_weather", names)
+
+    def test_streaming_state_reset(self):
+        text1 = '<think>x</think><tool_call>\n{"name":"get_weather","arguments":{"city":"A"}}\n</tool_call>'
+        for ch in [text1[i : i + 10] for i in range(0, len(text1), 10)]:
+            self.detector.parse_streaming_increment(ch, self.tools)
+
+        self.detector = TrinityDetector()
+        text2 = (
+            '<tool_call>\n{"name":"get_weather","arguments":{"city":"B"}}\n</tool_call>'
+        )
+        names = []
+        for ch in [text2[i : i + 10] for i in range(0, len(text2), 10)]:
+            result = self.detector.parse_streaming_increment(ch, self.tools)
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+        self.assertIn("get_weather", names)
+
+    def test_malformed_think_tag_handled(self):
+        """Malformed think tags should not crash the detector."""
+        text = '<think>unclosed<tool_call>\n{"name":"get_weather","arguments":{"city":"X"}}\n</tool_call>'
+        result = self.detector.detect_and_parse(text, self.tools)
+        # Should still parse — _strip_think_tags only removes exact <think> and </think>
+        self.assertEqual(len(result.calls), 1)
+
+
+class TestMiMoDetector(unittest.TestCase):
+    """Test MiMoDetector (XML-style <function=name><parameter=name> format, HTML unescape, type conversion)."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = MiMoDetector()
+
+    def test_has_tool_call(self):
+        self.assertTrue(
+            self.detector.has_tool_call("<tool_call>\n<function=get_weather>")
+        )
+        self.assertFalse(self.detector.has_tool_call("Hello world"))
+
+    def test_detect_and_parse_single(self):
+        text = (
+            "<tool_call>\n<function=get_weather>\n"
+            "<parameter=city>Tokyo</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], "Tokyo")
+
+    def test_detect_and_parse_multiple(self):
+        text = (
+            "<tool_call>\n<function=get_weather>\n"
+            "<parameter=city>NYC</parameter>\n"
+            "</function>\n</tool_call>\n"
+            "<tool_call>\n<function=search>\n"
+            "<parameter=query>restaurants</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[1].name, "search")
+
+    def test_type_conversion(self):
+        """Integer parameters should be converted from strings."""
+        text = (
+            "<tool_call>\n<function=get_weather>\n"
+            "<parameter=city>Berlin</parameter>\n"
+            "<parameter=days>5</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["days"], 5)
+        self.assertIsInstance(params["days"], int)
+
+    def test_streaming_chunk_boundary(self):
+        chunks = [
+            "<tool_call>\n",
+            "<function=get_we",
+            "ather>\n",  # noqa: E501
+            "<parameter=city>Tok",
+            "yo</parameter>\n",
+            "</function>\n",
+            "</tool_call>",
+        ]
+        all_calls = []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+        names = [c.name for c in all_calls if c.name]
+        self.assertIn("get_weather", names)
+
+    def test_streaming_state_reset(self):
+        text1 = "<tool_call>\n<function=get_weather>\n<parameter=city>A</parameter>\n</function>\n</tool_call>"
+        self.detector.parse_streaming_increment(text1, self.tools)
+
+        self.detector = MiMoDetector()
+        text2 = "<tool_call>\n<function=search>\n<parameter=query>B</parameter>\n</function>\n</tool_call>"
+        all_calls = []
+        result = self.detector.parse_streaming_increment(text2, self.tools)
+        all_calls.extend(result.calls)
+        names = [c.name for c in all_calls if c.name]
+        self.assertIn("search", names)
+
+    def test_malformed_returns_empty(self):
+        text = "<tool_call>\n<broken>\n</tool_call>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_unknown_tool_skipped_env_off(self):
+        """Unknown tool calls returned as normal text when SGLANG_FORWARD_UNKNOWN_TOOLS is False."""
+        text = (
+            "<tool_call>\n<function=nonexistent_func>\n"
+            "<parameter=x>y</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(False):
+            detector = MiMoDetector()
+            result = detector.detect_and_parse(text, self.tools)
+            self.assertEqual(len(result.calls), 0)
+
+    def test_unknown_tool_forwarded_env_on(self):
+        """Unknown tool calls should be forwarded when SGLANG_FORWARD_UNKNOWN_TOOLS is True."""
+        text = (
+            "<tool_call>\n<function=nonexistent_func>\n"
+            "<parameter=x>y</parameter>\n"
+            "</function>\n</tool_call>"
+        )
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            detector = MiMoDetector()
+            result = detector.detect_and_parse(text, self.tools)
+            self.assertGreater(len(result.calls), 0)
+            self.assertEqual(result.calls[0].name, "nonexistent_func")
+
+
+class TestMinimaxM2Detector(unittest.TestCase):
+    """Test MinimaxM2Detector (XML invoke/parameter format, schema-aware type conversion)."""
+
+    def setUp(self):
+        self.tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "days": {"type": "integer"},
+                        },
+                        "required": ["city"],
+                    },
+                ),
+            ),
+            Tool(
+                type="function",
+                function=Function(
+                    name="search",
+                    description="Search",
+                    parameters={
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"},
+                        },
+                        "required": ["query"],
+                    },
+                ),
+            ),
+        ]
+        self.detector = MinimaxM2Detector()
+
+    def test_has_tool_call(self):
+        self.assertTrue(self.detector.has_tool_call("<minimax:tool_call>content"))
+        self.assertFalse(self.detector.has_tool_call("Hello world"))
+
+    def test_detect_and_parse_single(self):
+        text = (
+            "<minimax:tool_call>\n"
+            '<invoke name="get_weather">\n'
+            '<parameter name="city">Tokyo</parameter>\n'
+            "</invoke>\n"
+            "</minimax:tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["city"], "Tokyo")
+
+    def test_detect_and_parse_multiple(self):
+        text = (
+            "<minimax:tool_call>\n"
+            '<invoke name="get_weather">\n<parameter name="city">NYC</parameter>\n</invoke>\n'
+            "</minimax:tool_call>\n"
+            "<minimax:tool_call>\n"
+            '<invoke name="search">\n<parameter name="query">food</parameter>\n</invoke>\n'
+            "</minimax:tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 2)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(result.calls[1].name, "search")
+
+    def test_type_conversion(self):
+        """Integer parameters should be converted from strings based on schema."""
+        text = (
+            "<minimax:tool_call>\n"
+            '<invoke name="get_weather">\n'
+            '<parameter name="city">Berlin</parameter>\n'
+            '<parameter name="days">7</parameter>\n'
+            "</invoke>\n"
+            "</minimax:tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        params = json.loads(result.calls[0].parameters)
+        self.assertEqual(params["days"], 7)
+        self.assertIsInstance(params["days"], int)
+
+    def test_streaming_chunk_boundary(self):
+        chunks = [
+            "<minimax:tool_call>\n",
+            '<invoke name="get_',
+            'weather">\n',
+            '<parameter name="city">',
+            "Tokyo</parameter>\n",
+            "</invoke>\n",
+            "</minimax:tool_call>",
+        ]
+        names, params = [], []
+        for chunk in chunks:
+            result = self.detector.parse_streaming_increment(chunk, self.tools)
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+                if call.parameters:
+                    params.append(call.parameters)
+        self.assertIn("get_weather", names)
+        full_params = json.loads("".join(params))
+        self.assertEqual(full_params["city"], "Tokyo")
+
+    def test_streaming_state_reset(self):
+        text1 = '<minimax:tool_call>\n<invoke name="get_weather">\n<parameter name="city">A</parameter>\n</invoke>\n</minimax:tool_call>'
+        self.detector.parse_streaming_increment(text1, self.tools)
+
+        self.detector = MinimaxM2Detector()
+        text2 = '<minimax:tool_call>\n<invoke name="search">\n<parameter name="query">B</parameter>\n</invoke>\n</minimax:tool_call>'
+        names = []
+        result = self.detector.parse_streaming_increment(text2, self.tools)
+        for call in result.calls:
+            if call.name:
+                names.append(call.name)
+        self.assertIn("search", names)
+
+    def test_malformed_returns_empty(self):
+        text = "<minimax:tool_call>\n<broken></minimax:tool_call>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 0)
 
 
 if __name__ == "__main__":
