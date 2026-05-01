@@ -97,6 +97,46 @@ def summarize_policy_events(
     }
 
 
+def summarize_candidate_events(
+    events: Iterable[RelayKVPlan | Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Summarize candidate runtime event payloads and their no-op guards."""
+
+    candidate_counts = Counter({"applied_candidate": 0, "fallback_candidate": 0})
+    noop_guard_counts = Counter(
+        {
+            "fallback_candidate_noop_guard_true": 0,
+            "applied_candidate_log_only_true": 0,
+            "scheduler_policy_noop_true": 0,
+            "kv_cache_mutation_false": 0,
+            "attention_override_false": 0,
+            "host_backup_copy_false": 0,
+        }
+    )
+
+    for event in events:
+        state = str(_event_value(event, "runtime_policy_state") or "unknown")
+        if state in candidate_counts:
+            candidate_counts[state] += 1
+        if _event_value(event, "fallback_candidate_noop_guard") is True:
+            noop_guard_counts["fallback_candidate_noop_guard_true"] += 1
+        if _event_value(event, "applied_candidate_log_only") is True:
+            noop_guard_counts["applied_candidate_log_only_true"] += 1
+        if _event_value(event, "scheduler_policy_noop") is True:
+            noop_guard_counts["scheduler_policy_noop_true"] += 1
+        if _event_value(event, "kv_cache_mutation") is False:
+            noop_guard_counts["kv_cache_mutation_false"] += 1
+        if _event_value(event, "attention_override") is False:
+            noop_guard_counts["attention_override_false"] += 1
+        if _event_value(event, "host_backup_copy") is False:
+            noop_guard_counts["host_backup_copy_false"] += 1
+
+    return {
+        "candidate_event_counts": dict(candidate_counts),
+        "noop_guard_counts": dict(noop_guard_counts),
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
