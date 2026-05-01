@@ -20,6 +20,7 @@ import asyncio
 import builtins
 import ctypes
 import functools
+import gc
 import importlib
 import inspect
 import io
