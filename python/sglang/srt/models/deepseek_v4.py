@@ -101,12 +101,6 @@ class DeepseekRefRMSNorm(nn.Module):
         return out
 
 
-@maybe_torch_compile
-def rms_normalize(x: torch.Tensor, eps: float) -> torch.Tensor:
-    x *= torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
-    return x
-
-
 @triton.jit
 def _rms_normalize_kernel(
     x_ptr,
