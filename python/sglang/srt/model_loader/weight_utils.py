@@ -44,6 +44,7 @@ from sglang.srt.distributed import (
     get_tensor_model_parallel_world_size,
     get_world_group,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_rank
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -124,6 +125,52 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
         if _ROUTED_EXPERT_KEY_RE.search(k):
             return meta.get("dtype")
     return None
+
+
+def maybe_auto_set_dsv4_fp4_experts(model_path: str) -> None:
+    """Auto-set SGLANG_DSV4_FP4_EXPERTS based on the checkpoint's routed-
+    expert weight dtype.
+
+    mxfp4-packed experts are stored as ``U8`` in safetensors; FP4-to-FP8
+    converted experts are stored as ``F8_E4M3``. The flag defaults to True
+    (mxfp4); only flip it automatically when we can positively identify the
+    converted-FP8 layout. Explicit env settings always win.
+    """
+    if envs.SGLANG_DSV4_FP4_EXPERTS.is_set():
+        return
+    try:
+        dtype = probe_routed_expert_weight_dtype(model_path)
+    except Exception as e:
+        logger.warning(
+            "Failed to probe routed-expert dtype for %s; keeping "
+            "SGLANG_DSV4_FP4_EXPERTS default. Reason: %s",
+            model_path,
+            e,
+        )
+        return
+    if dtype is None:
+        return
+    # Packed mxfp4 expert weights are stored as int8/uint8 (or native F4);
+    # the FP4-to-FP8 conversion path writes F8_E4M3. Anything else is
+    # unexpected for DeepSeek V4, so leave the env alone and log it.
+    if dtype in ("U8", "I8", "F4"):
+        is_fp4_experts = True
+    elif dtype == "F8_E4M3":
+        is_fp4_experts = False
+    else:
+        logger.warning(
+            "Unexpected routed-expert safetensors dtype=%s for DeepSeek V4; "
+            "keeping SGLANG_DSV4_FP4_EXPERTS default.",
+            dtype,
+        )
+        return
+    envs.SGLANG_DSV4_FP4_EXPERTS.set(is_fp4_experts)
+    logger.info(
+        "Auto-detected routed-expert safetensors dtype=%s; "
+        "SGLANG_DSV4_FP4_EXPERTS=%s",
+        dtype,
+        is_fp4_experts,
+    )
 
 
 # Block size for sequential checkpoint prefetch reads (page cache warming).

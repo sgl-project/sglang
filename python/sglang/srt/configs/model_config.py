@@ -181,9 +181,11 @@ class ModelConfig:
 
         # Auto-detect FP4 vs FP8 routed-expert storage for DeepSeek V4
         if is_deepseek_v4(self.hf_config):
-            from sglang.srt.configs.deepseek_v4 import maybe_auto_set_fp4_experts
+            from sglang.srt.model_loader.weight_utils import (
+                maybe_auto_set_dsv4_fp4_experts,
+            )
 
-            maybe_auto_set_fp4_experts(self.model_path)
+            maybe_auto_set_dsv4_fp4_experts(self.model_path)
 
         # Check model type
         self.attention_chunk_size = getattr(
