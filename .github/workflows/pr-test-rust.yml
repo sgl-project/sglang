@@ -23,8 +23,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
   SGLANG_IS_IN_CI: true
 
 jobs:
@@ -34,6 +32,14 @@ jobs:
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
+    # sccache is only installed on the GitHub-hosted runners that run this
+    # job and `unit-tests`; setting RUSTC_WRAPPER workflow-wide leaks it to
+    # gateway-e2e on the self-hosted GPU runners (which don't have sccache),
+    # so any pip-install that compiles a Rust extension would fail with
+    # `could not execute process \`sccache rustc\``.
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -121,6 +127,9 @@ jobs:
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
