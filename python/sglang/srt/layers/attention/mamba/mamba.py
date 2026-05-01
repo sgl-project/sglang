@@ -1,3 +1,4 @@
+import logging
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -29,7 +30,12 @@ from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_npu,
+    set_weight_attrs,
+)
 
 if is_cuda():
     from sglang.srt.layers.attention.mamba.causal_conv1d import (
@@ -51,6 +57,8 @@ elif is_npu():
     )
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], None]
+
+logger = logging.getLogger(__name__)
 
 
 def mamba_v2_sharded_weight_loader(
@@ -81,6 +89,14 @@ def mamba_v2_sharded_weight_loader(
                 weight_full_dim_list.append(
                     int(full_dim / full_dim_sum * loaded_weight.size(0))
                 )
+            assert sum(weight_full_dim_list) == loaded_weight.size(
+                0
+            ), f"Padding the loaded weight failed due to sizes are not divisible cleanly from {weight_full_dim_list} to {loaded_weight.size(0)}"
+            if loaded_weight.size(0) < full_dim_sum and tp_rank == 0:
+                logger.warning(
+                    f"[ZERO-PADDING] Loaded_weight.dim(0) size:{loaded_weight.size(0)} is padding to {full_dim_sum}"
+                    f", where original sizes of {weight_full_dim_list} will be updated to {full_dim_list}",
+                )
 
         # - iterate over the shard specs
         for full_dim, extra, duplicate_groups in shard_spec:
@@ -110,7 +126,7 @@ def mamba_v2_sharded_weight_loader(
 
             # CPU logic of padding size for qwen3-next
             # TODO : make this common for all mamba.
-            if is_cpu() and loaded_weight.size(0) % tp_size != 0:
+            if is_cpu() and (loaded_weight.size(0) < full_dim_sum):
                 import copy
 
                 loaded_weight_ = copy.deepcopy(loaded_weight)

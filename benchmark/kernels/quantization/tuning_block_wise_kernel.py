@@ -16,6 +16,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import random
 import time
 from datetime import datetime
 from typing import Any, Dict, List
@@ -104,12 +105,15 @@ def w8a8_block_matmul(
         N, config["BLOCK_SIZE_N"]
     )
 
+    extra_kernel_args = {}
     if A.dtype == torch.float8_e4m3fnuz or A.dtype == torch.float8_e4m3fn:
         kernel = (
             _w8a8_block_fp8_matmul_unrolledx4
             if (_is_hip == True and num_workgroups <= get_device_core_count())
             else _w8a8_block_fp8_matmul
         )
+        # set masking flag required by kernel arguments
+        extra_kernel_args["needs_masking"] = needs_masking
     else:
         kernel = _w8a8_block_int8_matmul
 
@@ -135,7 +139,7 @@ def w8a8_block_matmul(
         Bs.stride(1),
         Bs.stride(0),
         **config,
-        needs_masking=needs_masking,
+        **extra_kernel_args,
     )
 
     return C
@@ -237,7 +241,7 @@ def benchmark_config(
     end_event = torch.get_device_module().Event(enable_timing=True)
 
     latencies: List[float] = []
-    for i in range(num_iters):
+    for _ in range(num_iters):
         torch.get_device_module().synchronize()
         start_event.record()
         run()
@@ -349,6 +353,7 @@ def save_configs(
             existing_configs = {int(k): v for k, v in existing_configs.items()}
 
         existing_configs.update(configs)
+        existing_configs = dict(sorted(existing_configs.items()))
 
         with open(config_file_path, "w") as f:
             json.dump(existing_configs, f, indent=4)
@@ -381,7 +386,6 @@ def tune_on_gpu(args_dict):
     ]
 
     start = time.perf_counter()
-    results = {}
     for shape in tqdm(weight_shapes, desc=f"GPU {gpu_id} - Shapes"):
         N, K = shape[0], shape[1]
         print(f"[GPU {gpu_id}] Tune for weight shape of `N: {N}, K: {K}`")
@@ -406,6 +410,8 @@ def tune_on_gpu(args_dict):
 
 def distribute_batch_sizes(batch_sizes, num_gpus):
     """Distribute batch sizes across available GPUs."""
+    # shuffle to distribute workload more evenly and minimize bottleneck effects
+    random.shuffle(batch_sizes)
     batches_per_gpu = []
     for i in range(num_gpus):
         start_idx = i * len(batch_sizes) // num_gpus
@@ -424,7 +430,7 @@ def main(args):
 
     torch.get_device_module().init()
 
-    if args.batch_size is None:
+    if args.batch_sizes is None:
         batch_sizes = [
             1,
             2,
@@ -446,8 +452,7 @@ def main(args):
             4096,
         ]
     else:
-        batch_sizes = [args.batch_size]
-        num_gpus = 1  # If only one batch size, use only one GPU
+        batch_sizes = args.batch_sizes
 
     # Support manual N and K specification
     if args.N is not None and args.K is not None:
@@ -514,7 +519,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--block-n", type=int, default=128)
     parser.add_argument("--block-k", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, required=False)
+    parser.add_argument("--batch-sizes", nargs="+", type=int, required=False)
     parser.add_argument(
         "--save-path", type=str, default="python/sglang/srt/layers/quantization/configs"
     )

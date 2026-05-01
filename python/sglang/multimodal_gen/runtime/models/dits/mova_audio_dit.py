@@ -18,8 +18,8 @@ from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 
 # Reuse common functions and classes from mova_video_dit
 from .mova_video_dit import DiTBlock, precompute_freqs_cis, sinusoidal_embedding_1d

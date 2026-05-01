@@ -28,7 +28,6 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 from .fused_moe_triton_config import get_config_dtype_str, try_get_optimal_moe_config
 from .fused_moe_triton_kernels import (
-    act_and_mul_triton,
     invoke_fused_moe_kernel,
     moe_sum_reduce_triton,
     support_tensor_descriptor,
@@ -313,7 +312,7 @@ def _swiglu_silu_clamp_mul(x, gemm1_limit):
 
 
 @torch.compile
-def _swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
+def swiglu_gpt_oss_sigmoid_alpha(x, gemm1_alpha, gemm1_limit):
     # NOTE: This variant uses gemm1_alpha, unlike _swiglu_silu_clamp_mul.
     # At present, only GPT-OSS uses this variant.
     gate, up = x[..., ::2], x[..., 1::2]
@@ -522,7 +521,7 @@ def _fused_moe_kernel_sequence(
         # - gemm1_alpha == None and gemm1_limit != None: silu+clamp+mul(limit-only)
         if gemm1_alpha is not None:
             assert gemm1_limit is not None
-            intermediate_cache2 = _swiglu_gpt_oss_sigmoid_alpha(
+            intermediate_cache2 = swiglu_gpt_oss_sigmoid_alpha(
                 intermediate_cache1.view(-1, N), gemm1_alpha, gemm1_limit
             )
         elif gemm1_limit is not None:
@@ -530,18 +529,17 @@ def _fused_moe_kernel_sequence(
                 intermediate_cache1.view(-1, N), gemm1_limit
             )
         elif _is_cuda or _is_hip or _is_xpu:
-            if not filter_expert:
-                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                act_and_mul_triton(
+            if filter_expert and _is_cuda:
+                # HIP/XPU fall through to the unfiltered path: the down kernel
+                # zeros filtered rows without reading their input.
+                silu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
-                    config,
-                    topk_ids,
-                    expert_ids,
-                    down_moe_use_tma,
-                    activation,
+                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
+                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
+            else:
+                silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         elif _is_musa:
             intermediate_cache2 = _silu_and_mul_musa(intermediate_cache1.view(-1, N))
         else:
@@ -558,18 +556,15 @@ def _fused_moe_kernel_sequence(
         assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu"
         assert gemm1_limit is None, "gemm1_limit is not supported for gelu"
         if _is_cuda or _is_hip:
-            if not filter_expert:
-                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
-            else:
-                act_and_mul_triton(
+            if filter_expert and _is_cuda:
+                gelu_and_mul(
                     intermediate_cache1.view(-1, N),
                     intermediate_cache2,
-                    config,
-                    topk_ids,
-                    expert_ids,
-                    down_moe_use_tma,
-                    activation,
+                    expert_ids=(expert_ids if down_moe_use_tma else topk_ids.view(-1)),
+                    expert_step=(config["BLOCK_SIZE_M"] if down_moe_use_tma else 1),
                 )
+            else:
+                gelu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
         else:
             if _has_vllm_ops:
                 vllm_ops.gelu_and_mul(

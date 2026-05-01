@@ -275,13 +275,19 @@ jobs:
           artifact-suffix: component-accuracy
 
   multimodal-gen-test-1-b200:
-    if: |
-      (inputs.target_stage == 'multimodal-gen-test-1-b200') ||
-      (
-        !inputs.target_stage &&
-        ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-        inputs.multimodal_gen == 'true'
-      )
+    # TODO: Temporarily disabled (`if: false`) — deterministically failing
+    # with `RobertaProcessing.__new__() got an unexpected keyword argument
+    # 'cls'` (tokenizer/transformers compatibility) and blocking CI.
+    # Restore the original `if:` condition (commented below) once the
+    # underlying fix lands.
+    if: false
+    # if: |
+    #   (inputs.target_stage == 'multimodal-gen-test-1-b200') ||
+    #   (
+    #     !inputs.target_stage &&
+    #     ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+    #     inputs.multimodal_gen == 'true'
+    #   )
     runs-on: ${{ inputs.b200_runner }}
     timeout-minutes: 240
     steps:
