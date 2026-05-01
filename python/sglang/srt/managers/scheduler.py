@@ -907,8 +907,12 @@ class Scheduler(
 
         if self.enable_hisparse:
             # Coordinator was created inside ModelRunner.initialize() before CUDA graph capture
+            # For non-NSA algorithms, hisparse_coordinator is None.
             self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
-            self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
+            if self.hisparse_coordinator is not None:
+                self.hisparse_coordinator.set_decode_producer_stream(
+                    self.forward_stream
+                )
 
         if (
             server_args.disaggregation_mode == "decode"
@@ -2406,7 +2410,7 @@ class Scheduler(
             self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
-        if self.enable_hisparse:
+        if self.enable_hisparse and self.hisparse_coordinator is not None:
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
@@ -2419,7 +2423,7 @@ class Scheduler(
             self.running_batch.batch_is_full = False
 
         if (
-            not self.enable_hisparse
+            not (self.enable_hisparse and self.hisparse_coordinator is not None)
             and self.last_batch
             and self.last_batch.forward_mode.is_extend()
         ):
@@ -3197,7 +3201,7 @@ class Scheduler(
                     idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
             # HiSparse: staging requests transitioning prefill -> decode
-            if self.enable_hisparse:
+            if self.enable_hisparse and self.hisparse_coordinator is not None:
                 idle &= not self.hisparse_coordinator.has_ongoing_staging()
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
@@ -3444,7 +3448,7 @@ class Scheduler(
             self.send_to_tokenizer.send_output(AbortReq(rid=req.rid), req)
             # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
             if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if self.enable_hisparse:
+                if self.enable_hisparse and self.hisparse_coordinator is not None:
                     self.hisparse_coordinator.request_finished(req)
                 release_kv_cache(req, self.tree_cache)
             # For disaggregation prefill mode, free the metadata buffer index

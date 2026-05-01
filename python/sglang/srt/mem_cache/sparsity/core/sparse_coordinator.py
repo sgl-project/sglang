@@ -267,9 +267,11 @@ class SparseCoordinator:
         )
 
     def _compute_sparse_mask(self, req_pool_indices):
-        mask = (
-            self.states.prompt_lens[req_pool_indices]
-            >= self.config.min_sparse_prompt_len
-        )
-
+        min_len = self.config.min_sparse_prompt_len
+        if min_len is None:
+            # No minimum length requirement – apply sparse attention to all requests.
+            return torch.ones(
+                len(req_pool_indices), dtype=torch.bool, device=self.device
+            )
+        mask = self.states.prompt_lens[req_pool_indices] >= min_len
         return mask
