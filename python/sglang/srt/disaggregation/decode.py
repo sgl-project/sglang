@@ -55,6 +55,7 @@ from sglang.srt.managers.schedule_policy import match_prefix_for_req
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, EvictParams
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     page_align_floor,
@@ -67,7 +68,6 @@ from sglang.srt.mem_cache.memory_pool import (
     NSATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.utils import is_swa_like_pool
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -371,7 +371,7 @@ class DecodePreallocQueue:
             kv_args.state_data_lens = state_data_lens
             kv_args.state_item_lens = state_item_lens
 
-            if is_swa_like_pool(self.token_to_kv_pool):
+            if isinstance(self.token_to_kv_pool, BaseSWAKVPool):
                 kv_args.state_type = "swa"
             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 kv_args.state_type = "mamba"
@@ -853,7 +853,7 @@ class DecodePreallocQueue:
                     .cpu()
                     .numpy()
                 ]
-            elif is_swa_like_pool(self.token_to_kv_pool):
+            elif isinstance(self.token_to_kv_pool, BaseSWAKVPool):
                 seq_len = len(decode_req.req.origin_input_ids)
                 window_size = self.scheduler.sliding_window_size
 

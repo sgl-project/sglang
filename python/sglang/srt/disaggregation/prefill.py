@@ -47,6 +47,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
@@ -55,7 +56,6 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
-from sglang.srt.mem_cache.utils import is_swa_like_pool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
 if TYPE_CHECKING:
@@ -197,7 +197,7 @@ class PrefillBootstrapQueue:
             kv_args.state_data_lens = state_data_lens
             kv_args.state_item_lens = state_item_lens
 
-            if is_swa_like_pool(self.token_to_kv_pool):
+            if isinstance(self.token_to_kv_pool, BaseSWAKVPool):
                 kv_args.state_type = "swa"
             elif isinstance(self.token_to_kv_pool, HybridLinearKVPool):
                 kv_args.state_type = "mamba"
@@ -835,7 +835,9 @@ class SchedulerDisaggregationPrefillMixin:
                     .cpu()
                     .numpy()
                 ]
-            elif is_swa_like_pool(self.token_to_kv_pool_allocator.get_kvcache()):
+            elif isinstance(
+                self.token_to_kv_pool_allocator.get_kvcache(), BaseSWAKVPool
+            ):
                 seq_len = len(req.fill_ids)
                 window_size = self.sliding_window_size
                 window_start = max(0, seq_len - window_size)
