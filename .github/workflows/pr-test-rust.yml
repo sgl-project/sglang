@@ -289,18 +289,19 @@ jobs:
         run: |
           python3 -m pip install pytest pytest-rerunfailures httpx openai grpcio grpcio-health-checking numpy
           if [ -n "${{ matrix.extra_deps }}" ]; then
-            # Install extras with --no-deps. Without this, --upgrade
-            # cascades through transitive deps; e.g. genai-bench's
-            # oci/locust pull in transformers<5 which requires
-            # huggingface_hub<1.0 — downgrading the 1.11.0 that
-            # ci_install_dependency.sh settled on and breaking
-            # `kernels` (requires huggingface_hub>=1.3.0,<2.0).
-            python3 -m pip --no-cache-dir install --no-deps ${{ matrix.extra_deps }}
-            # genai-bench's runtime deps not already provided by sglang's
-            # install. No --upgrade so existing pins stay put.
             if echo "${{ matrix.extra_deps }}" | grep -q "genai-bench"; then
+              # genai-bench's transitive deps (oci/locust) pull
+              # transformers<5 which requires huggingface_hub<1.0 — that
+              # downgrades the 1.11.0 ci_install_dependency.sh settled on
+              # and breaks `kernels` (requires huggingface_hub>=1.3.0,<2.0).
+              # Install --no-deps and supply the runtime deps explicitly.
+              python3 -m pip --no-cache-dir install --no-deps ${{ matrix.extra_deps }}
               python3 -m pip --no-cache-dir install \
                 locust click rich tenacity oci openpyxl gevent matplotlib
+            else
+              # Other extras (e.g. pytest-parallel, which legitimately
+              # needs tblib) — normal install path.
+              python3 -m pip --no-cache-dir install --upgrade ${{ matrix.extra_deps }}
             fi
           fi
 

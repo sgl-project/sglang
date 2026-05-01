@@ -127,11 +127,27 @@ def wait_for_workers_ready(
 
 
 def detect_ib_device() -> str | None:
-    """Detect first active InfiniBand device (e.g., mlx5_0).
+    """Detect first active InfiniBand device.
+
+    Enumerates `/sys/class/infiniband/` (the canonical device list that
+    sglang's `_validate_ib_devices` checks against) and returns the first
+    one in PORT_ACTIVE state. Avoids guessing `mlx5_<N>` aliases — on
+    runners where the real names are `mlx5_ib<N>`/`mlx5_eth<N>`, the
+    legacy `mlx5_<N>` form succeeds at `ibv_devinfo` (alias resolution)
+    but is then rejected by sglang's validation.
 
     Returns:
-        Device name if found (e.g., "mlx5_0"), None otherwise.
+        Device name (e.g., "mlx5_ib0"), or None if nothing is active.
     """
+    ib_dir = "/sys/class/infiniband"
+    try:
+        candidates = sorted(os.listdir(ib_dir))
+    except FileNotFoundError:
+        return None
+
+    if not candidates:
+        return None
+
     try:
         subprocess.run(
             ["ibv_devinfo", "-l"],
@@ -142,8 +158,7 @@ def detect_ib_device() -> str | None:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return None
 
-    for i in range(12):
-        dev = f"mlx5_{i}"
+    for dev in candidates:
         try:
             res = subprocess.run(
                 ["ibv_devinfo", dev],
@@ -151,11 +166,12 @@ def detect_ib_device() -> str | None:
                 text=True,
                 timeout=2,
             )
-            if res.returncode == 0 and "state:" in res.stdout:
-                for line in res.stdout.splitlines():
-                    if "state:" in line and "PORT_ACTIVE" in line:
-                        logger.info("Detected IB device: %s", dev)
-                        return dev
+            if res.returncode != 0:
+                continue
+            for line in res.stdout.splitlines():
+                if "state:" in line and "PORT_ACTIVE" in line:
+                    logger.info("Detected IB device: %s", dev)
+                    return dev
         except Exception:
             pass
     return None
