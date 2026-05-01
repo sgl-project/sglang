@@ -218,9 +218,11 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             quant_config,
             prefix=add_prefix("language_model", prefix),
         )
+        self.lm_head = self.language_model.embed_tokens
 
         # Create logits processor for the multimodal model
         self.logits_processor = LogitsProcessor(config.text_config)
+        self.capture_aux_hidden_states = False
 
         self.post_init()
 
@@ -236,8 +238,19 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
 
+    def get_output_embeddings(self) -> nn.Module:
+        return self.lm_head
+
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
+
+    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.language_model.layers_to_capture = [val + 1 for val in layer_ids]
 
     def prepare_attn_masks(
         self,
@@ -568,10 +581,17 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             per_layer_inputs=per_layer_inputs,
             **kwargs,
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
 
         # Process hidden states through logits processor
         return self.logits_processor(
-            input_ids, hidden_states, self.language_model.embed_tokens, forward_batch
+            input_ids,
+            hidden_states,
+            self.lm_head,
+            forward_batch,
+            aux_hidden_states,
         )
 
     def tie_weights(self, recompute_mapping=False):

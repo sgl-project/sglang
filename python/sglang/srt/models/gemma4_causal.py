@@ -600,6 +600,7 @@ class Gemma4TextModel(PreTrainedModel):
         super().__init__(config=config)
         self.config = config
         self.quant_config = quant_config
+        self.layers_to_capture = []
         self.vocab_size = config.vocab_size
         self.padding_idx = getattr(config, "pad_token_id", None)
 
@@ -758,6 +759,7 @@ class Gemma4TextModel(PreTrainedModel):
         per_layer_inputs = self.project_per_layer_inputs(input_embeds, per_layer_inputs)
 
         hidden_states = input_embeds
+        aux_hidden_states = []
 
         for layer_idx, layer in enumerate(self.layers):
             if per_layer_inputs is not None:
@@ -773,12 +775,16 @@ class Gemma4TextModel(PreTrainedModel):
             )
             hidden_states = layer_outputs[0]
             residual = layer_outputs[1] if len(layer_outputs) > 1 else None
+            if layer_idx + 1 in self.layers_to_capture:
+                aux_hidden_states.append(hidden_states.clone())
 
         if residual is None:
             hidden_states = self.norm(hidden_states)
         else:
             hidden_states, _ = self.norm(hidden_states, residual)
-        return hidden_states
+        if len(aux_hidden_states) == 0:
+            return hidden_states
+        return hidden_states, aux_hidden_states
 
 
 class Gemma4ForCausalLM(PreTrainedModel):
@@ -836,6 +842,7 @@ class Gemma4ForCausalLM(PreTrainedModel):
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
         self.logits_processor = LogitsProcessor(config)
+        self.capture_aux_hidden_states = False
 
         if self.config.tie_word_embeddings:
             self.lm_head = self.model.embed_tokens
@@ -851,11 +858,22 @@ class Gemma4ForCausalLM(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def get_output_embeddings(self) -> nn.Module:
+        return self.lm_head
+
     def get_attention_sliding_window_size(self):
         return get_attention_sliding_window_size(self.config)
 
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
+
+    def set_dflash_layers_to_capture(self, layer_ids: list[int]):
+        if layer_ids is None:
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
+        self.capture_aux_hidden_states = True
+        self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
     @torch.no_grad()
     def forward(
@@ -875,8 +893,11 @@ class Gemma4ForCausalLM(PreTrainedModel):
             per_layer_inputs,
             **kwargs,
         )
+        aux_hidden_states = None
+        if self.capture_aux_hidden_states:
+            hidden_states, aux_hidden_states = hidden_states
         return self.logits_processor(
-            input_ids, hidden_states, self.lm_head, forward_batch
+            input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
         )
 
     def _get_k_eq_v_layers(self) -> set:

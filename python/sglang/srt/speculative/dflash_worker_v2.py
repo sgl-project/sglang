@@ -263,14 +263,9 @@ class DFlashWorkerV2(DFlashWorker):
         target_model = self.target_worker.model_runner.model
         embed_module = target_model.get_input_embeddings()
         lm_head = getattr(target_model, "lm_head", None)
-        if (
-            lm_head is None
-            or not hasattr(lm_head, "weight")
-            or not hasattr(lm_head, "shard_indices")
-        ):
+        if lm_head is None or not hasattr(lm_head, "weight"):
             raise RuntimeError(
-                "DFLASH requires the target model to expose a vocab-parallel `lm_head` with `weight` and "
-                "`shard_indices` attributes."
+                "DFLASH requires the target model to expose `lm_head` with `weight`."
             )
 
         block_size = int(self.block_size)
