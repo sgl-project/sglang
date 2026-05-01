@@ -55,11 +55,6 @@ class DeepseekV4ModelNextN(nn.Module):
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rms_norm_eps = config.rms_norm_eps
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mooncake():
-            self.enable_a2a_moe = True
-        else:
-            self.enable_a2a_moe = False
-
         self.hc_eps = config.hc_eps
         self.hc_mult = hc_mult = config.hc_mult
         hc_dim = hc_mult * config.hidden_size
