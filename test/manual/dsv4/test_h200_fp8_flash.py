@@ -1,8 +1,8 @@
 """H200 (FP8) x DeepSeek-V4-Flash.
 
-Uses the FP8-repackaged repo (sgl-project/DeepSeek-V4-Flash-FP8) and
-the SGLANG_DSV4_FP4_EXPERTS=0 env that the cookbook generator emits
-for H200 FP8 cells. Covers Low-Latency, Balanced, Max-Throughput, CP.
+Uses the FP8-repackaged repo (sgl-project/DeepSeek-V4-Flash-FP8); the
+routed-expert layout is auto-detected from the safetensors header. Covers
+Low-Latency, Balanced, Max-Throughput, CP.
 """
 
 import os
@@ -13,7 +13,6 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _common import DEEPEP_LARGE_SMS_CONFIG, Dsv4FlashAime25TestBase
 
 MODEL = "sgl-project/DeepSeek-V4-Flash-FP8"
-H200_FP8_ENV = {"SGLANG_DSV4_FP4_EXPERTS": "0"}
 
 
 class TestH200Fp8FlashLowLatency(Dsv4FlashAime25TestBase):
@@ -31,7 +30,6 @@ class TestH200Fp8FlashLowLatency(Dsv4FlashAime25TestBase):
         "--speculative-num-draft-tokens",
         "4",
     ]
-    EXTRA_ENV = dict(H200_FP8_ENV)
 
 
 class TestH200Fp8FlashBalanced(Dsv4FlashAime25TestBase):
@@ -61,7 +59,6 @@ class TestH200Fp8FlashBalanced(Dsv4FlashAime25TestBase):
         DEEPEP_LARGE_SMS_CONFIG,
     ]
     EXTRA_ENV = {
-        **H200_FP8_ENV,
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
     }
 
@@ -85,7 +82,6 @@ class TestH200Fp8FlashMaxThroughput(Dsv4FlashAime25TestBase):
         DEEPEP_LARGE_SMS_CONFIG,
     ]
     EXTRA_ENV = {
-        **H200_FP8_ENV,
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
     }
 
@@ -111,7 +107,6 @@ class TestH200Fp8FlashCP(Dsv4FlashAime25TestBase):
         DEEPEP_LARGE_SMS_CONFIG,
     ]
     EXTRA_ENV = {
-        **H200_FP8_ENV,
         "SGLANG_OPT_USE_JIT_INDEXER_METADATA": "1",
         "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
     }

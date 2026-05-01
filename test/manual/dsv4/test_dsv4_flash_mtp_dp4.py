@@ -34,7 +34,6 @@ from sglang.test.test_utils import (
 DSV4_FLASH_MODEL_PATH = "sgl-project/DeepSeek-V4-Flash-FP8"
 
 DSV4_FLASH_ENV = {
-    "SGLANG_DSV4_FP4_EXPERTS": "0",
     # MTP runs ~num_draft_tokens forward passes per step, so the deepep
     # dispatch input size scales by that factor. Default 256 (used by the
     # plain server) overflows once cuda-graph-max-bs * num_draft_tokens

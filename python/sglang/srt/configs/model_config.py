@@ -181,22 +181,18 @@ class ModelConfig:
 
         # FP4 vs FP8 routed-expert storage for DeepSeek V4. Default True
         # (mxfp4) for DSV4 paths; non-DSV4 callers should not read this.
-        # User override via SGLANG_DSV4_FP4_EXPERTS wins; otherwise auto-detect
-        # by probing the safetensors header.
+        # Auto-detected by probing the safetensors header.
         self.is_fp4_experts: bool = True
         if is_deepseek_v4(self.hf_config):
-            if envs.SGLANG_DSV4_FP4_EXPERTS.is_set():
-                self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
-            else:
-                from sglang.srt.configs.deepseek_v4 import detect_fp4_experts
+            from sglang.srt.configs.deepseek_v4 import detect_fp4_experts
 
-                detected = detect_fp4_experts(self.model_path)
-                if detected is not None:
-                    self.is_fp4_experts = detected
-                    logger.info(
-                        "Auto-detected DSV4 routed-expert layout: " "is_fp4_experts=%s",
-                        self.is_fp4_experts,
-                    )
+            detected = detect_fp4_experts(self.model_path)
+            if detected is not None:
+                self.is_fp4_experts = detected
+                logger.info(
+                    "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
+                    self.is_fp4_experts,
+                )
 
         # Check model type
         self.attention_chunk_size = getattr(
