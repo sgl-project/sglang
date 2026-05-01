@@ -9,7 +9,7 @@ grpc-client = []
 grpc-server = []
 
 vendored-openssl = ["openssl/vendored"]
- 
+
 [lints.rust]
 unused_qualifications = "warn"
 
