@@ -260,19 +260,6 @@ class PagedCoreMetadata(CoreMetadata):
 
 
 @dataclass
-class RaggedCoreMetadata(CoreMetadata):
-    swa_ragged_indices: torch.Tensor
-    swa_c4_ragged_indices: torch.Tensor
-    swa_c128_ragged_indices: torch.Tensor
-
-
-@dataclass
-class RaggedIndexerMetadata(IndexerMetadata):
-    c4_k_start: torch.Tensor
-    c4_k_finish: torch.Tensor
-
-
-@dataclass
 class DeepseekV4Metadata:
     core_metadata: CoreMetadata
     indexer_metadata: IndexerMetadata
