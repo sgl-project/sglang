@@ -85,7 +85,7 @@ if torch.version.hip is not None:
             rank: int, world_size: int, qr_max_size: Optional[int] = None
         ) -> int:
             return torch.ops.sgl_kernel.init_custom_qr.default(
-                world_size, rank, qr_max_size
+                rank, world_size, qr_max_size
             )
 
         def qr_get_handle(fa: int) -> torch.Tensor:
@@ -96,13 +96,13 @@ if torch.version.hip is not None:
 
         def qr_all_reduce(
             fa: int,
-            profile: int,
             inp: torch.Tensor,
             out: torch.Tensor,
-            cast_bf162half: bool,
+            quant_level: int,
+            cast_bf2half: bool = False,
         ) -> None:
             torch.ops.sgl_kernel.qr_all_reduce.default(
-                fa, profile, inp, out, cast_bf162half
+                fa, inp, out, quant_level, cast_bf2half
             )
 
         def qr_destroy(fa: int) -> None:
