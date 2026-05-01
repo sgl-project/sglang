@@ -439,14 +439,14 @@ class SchedulerRuntimeCheckerMixin:
 
     def _check_req_pool(self: Scheduler):
         if self.disaggregation_mode == DisaggregationMode.DECODE:
-            expected_free = (
+            req_total_size = (
                 self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
             )
         else:
-            expected_free = self.req_to_token_pool.size
+            req_total_size = self.req_to_token_pool.size
 
         session_req_count = self._session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != expected_free:
+        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
             msg = (
                 "req_to_token_pool memory leak detected!"
                 f"available_size={len(self.req_to_token_pool.free_slots)}, "
