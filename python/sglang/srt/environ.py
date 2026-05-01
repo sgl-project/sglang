@@ -569,7 +569,6 @@ class Envs:
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(True)
     SGLANG_FIX_ATTN_BACKEND_IDLE = EnvBool(True)
     SGLANG_FIX_PD_IDLE = EnvBool(True)
-    SGLANG_FIX_SWA_CHUNKED_REQ_DOUBLE_FREE = EnvBool(True)
     SGLANG_OPT_V4_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)  # usually not useful
     SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
     SGLANG_OPT_USE_OVERLAP_STORE_CACHE = EnvBool(True)

@@ -2415,10 +2415,7 @@ class Scheduler(
             # only finished requests to running_batch.
             chunked_req_to_exclude.add(self.chunked_req)
 
-            if (
-                not envs.SGLANG_FIX_SWA_CHUNKED_REQ_DOUBLE_FREE.get()
-                or self._chunked_req_scheduled_last_iter
-            ):
+            if self._chunked_req_scheduled_last_iter:
                 self.stash_chunked_request(self.chunked_req)
 
         # HiSparse has its own prefill-to-decode transition; skip last_batch merge.
