@@ -664,7 +664,7 @@ class WanTransformerBlock_VSA(nn.Module):
             bias=True,
             gather_output=True,
             quant_config=quant_config,
-            prefix=add_prefix("to_gate_compress", prefix),
+            prefix=add_prefix("attn1.to_gate_compress", prefix),
         )
 
         self.to_out = ColumnParallelLinear(
