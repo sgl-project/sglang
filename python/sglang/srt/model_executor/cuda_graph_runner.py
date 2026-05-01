@@ -1409,13 +1409,13 @@ class CudaGraphRunner:
     def _mark_compiled_replay_prepare_dynamic_dims(
         self,
         forward_batch: ForwardBatch,
-        pp_proxy_tensors: Optional[PPProxyTensors],
         bs: int,
     ) -> None:
         # Keep unbacked bounds stable across all captured batch sizes. These
         # bounds are only Dynamo shape metadata and do not allocate larger
-        # tensors. This compiled helper mostly performs copies/fills, so a
-        # less size-specialized kernel is preferable to recompiling per bs.
+        # tensors. Only NSA decode currently opts into compiled replay prepare,
+        # so mark the tensors that determine copy_bs/copy_num_token and NSA
+        # decode metadata.
         max_bs = max(self.capture_bs)
         max_num_token = max_bs * self.num_tokens_per_bs
 
@@ -1432,19 +1432,7 @@ class CudaGraphRunner:
             max_size=max_num_token,
         )
         _mark_unbacked_dim(
-            forward_batch.out_cache_loc_swa,
-            0,
-            shape_id="replay_num_token",
-            max_size=max_num_token,
-        )
-        _mark_unbacked_dim(
             forward_batch.positions,
-            0,
-            shape_id="replay_num_token",
-            max_size=max_num_token,
-        )
-        _mark_unbacked_dim(
-            forward_batch.input_embeds,
             0,
             shape_id="replay_num_token",
             max_size=max_num_token,
@@ -1458,40 +1446,6 @@ class CudaGraphRunner:
         _mark_unbacked_dim(
             forward_batch.seq_lens_cpu, 0, shape_id="replay_bs", max_size=max_bs
         )
-        _mark_unbacked_dim(
-            forward_batch.encoder_lens, 0, shape_id="replay_bs", max_size=max_bs
-        )
-        _mark_unbacked_dim(
-            forward_batch.mamba_track_indices, 0, shape_id="replay_bs", max_size=max_bs
-        )
-        _mark_unbacked_dim(
-            forward_batch.mamba_track_mask, 0, shape_id="replay_bs", max_size=max_bs
-        )
-        _mark_unbacked_dim(
-            forward_batch.mrope_positions,
-            1,
-            shape_id="replay_num_token",
-            max_size=max_num_token,
-        )
-
-        ngram_embedding_info = forward_batch.ngram_embedding_info
-        if ngram_embedding_info is not None:
-            _mark_unbacked_dim(
-                ngram_embedding_info.column_starts,
-                0,
-                shape_id="replay_bs",
-                max_size=max_bs,
-            )
-            _mark_unbacked_dim(
-                ngram_embedding_info.req_lens,
-                0,
-                shape_id="replay_bs",
-                max_size=max_bs,
-            )
-
-        if pp_proxy_tensors is not None:
-            for key, tensor in pp_proxy_tensors.tensors.items():
-                _mark_unbacked_dim(tensor, 0, shape_id=f"replay_pp_{key}")
 
     def replay_prepare(
         self,
@@ -1527,9 +1481,7 @@ class CudaGraphRunner:
             replay_metadata = self._get_compiled_replay_metadata(attn_backend, bs)
             # Mark dynamic dims for the compiled path to avoid runtime recompilation
             # due to metadata changes.
-            self._mark_compiled_replay_prepare_dynamic_dims(
-                forward_batch, pp_proxy_tensors, bs
-            )
+            self._mark_compiled_replay_prepare_dynamic_dims(forward_batch, bs)
             with self._compiled_replay_prepare_config_context():
                 self._populate_from_forward_batch_and_init_attn_backend_compiled(
                     forward_batch=forward_batch,
