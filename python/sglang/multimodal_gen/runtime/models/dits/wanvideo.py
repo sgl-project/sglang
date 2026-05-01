@@ -1221,21 +1221,13 @@ class WanTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
 
         # Determine boundary step
-        is_boundary_step = self.cnt < start_skipping-1 or self.cnt >= end_skipping+1
+        is_boundary_step = self.cnt < start_skipping - 1 or self.cnt >= end_skipping + 1
 
         timestep_proj = kwargs["timestep_proj"]
         temb = kwargs["temb"]
         modulated_inp = timestep_proj if use_ret_steps else temb
 
         self.is_cfg_negative = ctx.is_cfg_negative
-
-        print(f"\ncurrent_timestep={ctx.current_timestep}")
-        print(f"Teacache step {self.cnt}: {'NEGATIVE' if self.is_cfg_negative else 'POSITIVE'} CFG branch")
-        # previous_modulated_input = self.previous_modulated_input_negative if self.is_cfg_negative else self.previous_modulated_input
-        # previous_residual = self.previous_residual_negative if self.is_cfg_negative else self.previous_residual
-        # accumulated_rel_l1_distance = self.accumulated_rel_l1_distance_negative if self.is_cfg_negative else self.accumulated_rel_l1_distance
-        # print(f"{previous_modulated_input=}\n{previous_residual=}\n{accumulated_rel_l1_distance=}")
-        print(f"in_skip_window={not is_boundary_step}, start_skipping={start_skipping}, end_skipping={end_skipping}")
 
         # Use shared helper to compute cache decision
         should_calc = self._compute_teacache_decision(
