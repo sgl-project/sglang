@@ -98,11 +98,6 @@ class CoreMetadata:
     c4_out_loc: torch.Tensor
     c128_out_loc: torch.Tensor
 
-    def init_swa_slice(self, swa_slice: torch.Tensor):
-        assert self.swa_slice is None, "can only update once"
-        self.swa_slice = swa_slice
-        self.swa_out_loc_sliced = self.swa_out_loc_sliced[swa_slice]
-
     def copy_(self, other):
         raise NotImplementedError
 
