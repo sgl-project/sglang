@@ -10,12 +10,12 @@ name: Probe API Rate Limit
 
 on:
   workflow_dispatch:
-  # Also runs on any push that touches this file. Lets us probe from a
-  # feature branch before the file lands on the default branch (which
-  # is required for plain workflow_dispatch). Remove once merged to main.
+  # Triggers on any push to the probe branch (including empty commits).
+  # Used to drive an external hourly cadence before the workflow lands
+  # on the default branch (where the schedule trigger would take over).
   push:
-    paths:
-      - .github/workflows/probe-rate-limit.yml
+    branches:
+      - ci-probe-rate-limit
   # Hourly snapshot of the GITHUB_TOKEN bucket. Schedule events only
   # fire workflows from the default branch, so this only runs once
   # this file is on `main`. 24 hourly runs is enough to characterize
