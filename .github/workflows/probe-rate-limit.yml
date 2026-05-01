@@ -1,0 +1,44 @@
+name: Probe API Rate Limit
+
+# Manual probe to inspect the repo's GITHUB_TOKEN rate-limit bucket.
+# GitHub doesn't expose another repo's rate-limit status to outside callers,
+# so the only way to observe the GITHUB_TOKEN bucket is to authenticate as it
+# from inside a workflow run. Trigger this manually before/during peak CI to
+# see how much of the 1000/hr budget is currently consumed.
+#
+# Usage: Actions tab → "Probe API Rate Limit" → Run workflow.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Snapshot GITHUB_TOKEN bucket
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DATA=$(curl -sH "Authorization: Bearer $GH_TOKEN" \
+                       -H "Accept: application/vnd.github+json" \
+                       https://api.github.com/rate_limit)
+          NOW=$(date +%s)
+          echo "$DATA" | jq --argjson now "$NOW" '
+            .resources.core
+            | { limit, used, remaining,
+                reset_at: (.reset | strftime("%Y-%m-%dT%H:%M:%SZ")),
+                reset_in_min: ((.reset - $now) / 60 | floor),
+                pct_used: (.used / .limit * 100 | floor) }
+          '
+
+          {
+            echo "## GITHUB_TOKEN rate limit snapshot"
+            echo ""
+            echo "\`\`\`json"
+            echo "$DATA" | jq --argjson now "$NOW" '.resources.core | { limit, used, remaining, reset_at: (.reset | strftime("%Y-%m-%dT%H:%M:%SZ")), reset_in_min: ((.reset - $now) / 60 | floor), pct_used: (.used / .limit * 100 | floor) }'
+            echo "\`\`\`"
+          } >> "$GITHUB_STEP_SUMMARY"
