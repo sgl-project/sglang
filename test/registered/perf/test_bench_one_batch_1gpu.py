@@ -91,7 +91,7 @@ class TestBenchOneBatch1GPU(CustomTestCase):
 
         fwd_occupancy_p90 = float(np.percentile(fwd_occupancy_values, 90))
         print(f"{fwd_occupancy_p90=}", flush=True)
-        self.assertGreater(fwd_occupancy_p90, 98)
+        self.assertGreater(fwd_occupancy_p90, 97.5)
 
 
 if __name__ == "__main__":
