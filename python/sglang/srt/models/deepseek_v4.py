@@ -243,6 +243,8 @@ class Compressor(nn.Module):
 
     @cached_property
     def use_fused_compress(self) -> bool:
+        if _is_hip:
+            return False
         if (
             envs.SGLANG_OPT_USE_FUSED_PAGED_COMPRESS.get()
             and envs.SGLANG_OPT_DPSK_V4_RADIX.get()
@@ -252,6 +254,10 @@ class Compressor(nn.Module):
             envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
             and not envs.SGLANG_OPT_DPSK_V4_RADIX.get()
         )
+
+    @cached_property
+    def use_hip_fused_compress(self) -> bool:
+        return _is_hip and envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
 
     def apply_ape_hotfix(self):
         assert not self.ape_converted
@@ -451,7 +457,7 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            if _is_hip:
+            if self.use_hip_fused_compress:
                 fused_norm_rope_inplace_triton(
                     kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
                 )
@@ -553,7 +559,7 @@ class Compressor(nn.Module):
             kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
-        if _is_hip:
+        if self.use_hip_fused_compress:
             freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
@@ -689,7 +695,7 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            if _is_hip:
+            if self.use_hip_fused_compress:
                 fused_norm_rope_inplace_triton(
                     kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
                 )
@@ -779,7 +785,7 @@ class Compressor(nn.Module):
             kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
-        if _is_hip:
+        if self.use_hip_fused_compress:
             freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
@@ -991,7 +997,7 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            if _is_hip:
+            if self.use_hip_fused_compress:
                 fused_norm_rope_inplace_triton(
                     kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
                 )
@@ -1034,7 +1040,7 @@ class Compressor(nn.Module):
         req_pool_indices = forward_batch.req_pool_indices
 
         bs = kv_and_scores.kv.size(0)
-        if _is_hip and self.ratio == 4 and self.overlap:
+        if self.use_hip_fused_compress and self.ratio == 4 and self.overlap:
             from sglang.srt.layers.attention.compressed.fused_compress_old_triton import (
                 fused_compress_c4_decode_old_triton,
             )
@@ -1047,7 +1053,7 @@ class Compressor(nn.Module):
                 req_pool_indices=req_pool_indices.to(torch.int32),
                 head_dim=self.head_dim,
             )
-        elif _is_hip and self.ratio == 128 and not self.overlap:
+        elif self.use_hip_fused_compress and self.ratio == 128 and not self.overlap:
             from sglang.srt.layers.attention.compressed.fused_compress_old_triton import (
                 fused_compress_c128_decode_old_triton,
             )
@@ -1117,7 +1123,7 @@ class Compressor(nn.Module):
                 * kv_and_score_to_compress.score.softmax(dim=1)
             ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
-        if _is_hip:
+        if self.use_hip_fused_compress:
             freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
             fused_norm_rope_inplace_triton(
                 kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
