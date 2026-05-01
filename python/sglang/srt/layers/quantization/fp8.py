@@ -1175,11 +1175,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     build_mega_moe_experts_weights(layer)
                     return
 
-                if (
-                    envs.SGLANG_OPT_DEEPGEMM_SCALE_CONVERT_AT_INIT.get()
-                    and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-                    and will_use_deepgemm
-                ):
+                if deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0 and will_use_deepgemm:
                     from deep_gemm import transform_sf_into_required_layout
 
                     for scale_param, weight_param in [
