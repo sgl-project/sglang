@@ -400,6 +400,11 @@ def _build_nvfp4_config_from_safetensors_files(
 
     for module_bfl in exclude_bfl_modules:
         raw_weight_name = f"{module_bfl}.weight"
+        # Some runtime models (e.g. Wan MLP) construct the linear with the
+        # checkpoint-side BFL prefix; others (e.g. FLUX.2 proj_out) use the
+        # mapped SGLang prefix. Appending both forms makes is_layer_excluded
+        # match regardless of which convention the runtime uses internally.
+        exclude_modules.append(module_bfl)
         if mapping_fn is not None:
             mapped, _, _ = mapping_fn(raw_weight_name)
             if mapped != raw_weight_name:
@@ -411,12 +416,12 @@ def _build_nvfp4_config_from_safetensors_files(
         if reverse_mapping_fn is not None:
             reverse_mapped, _, _ = reverse_mapping_fn(raw_weight_name)
             if reverse_mapped != raw_weight_name:
-                # Input is in SGLang form (only the reverse rule matched); the
-                # model is keyed by SGLang names, so excludes must use module_bfl.
-                exclude_modules.append(module_bfl)
+                exclude_modules.append(
+                    reverse_mapped[: -len(".weight")]
+                    if reverse_mapped.endswith(".weight")
+                    else reverse_mapped
+                )
                 continue
-
-        exclude_modules.append(module_bfl)
 
     exclude_modules = sorted(set(exclude_modules))
 
