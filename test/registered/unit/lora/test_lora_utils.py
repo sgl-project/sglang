@@ -45,17 +45,27 @@ class TestGetNormalizedTargetModules(unittest.TestCase):
     def test_lm_head_aliases(self):
         for alias in ["lm_head", "output", "unembed_tokens"]:
             with self.subTest(alias=alias):
-                self.assertIn("lm_head", get_normalized_target_modules([alias]))
+                self.assertEqual(get_normalized_target_modules([alias]), {"lm_head"})
 
     def test_embed_tokens_aliases(self):
         for alias in ["embed_tokens", "vocab_emb", "embeddings", "word_embeddings"]:
             with self.subTest(alias=alias):
-                self.assertIn("embed_tokens", get_normalized_target_modules([alias]))
+                self.assertEqual(
+                    get_normalized_target_modules([alias]), {"embed_tokens"}
+                )
 
     def test_prefixed_module_names_stripped(self):
         """Names like 'feed_forward.gate_proj' should still normalize correctly."""
         result = get_normalized_target_modules(["feed_forward.gate_proj"])
-        self.assertIn("gate_up_proj", result)
+        self.assertEqual(result, {"gate_up_proj"})
+
+    def test_fused_qkv_a_proj_aliases(self):
+        for alias in ["q_a_proj", "kv_a_proj_with_mqa"]:
+            with self.subTest(alias=alias):
+                self.assertEqual(
+                    get_normalized_target_modules([alias]),
+                    {"fused_qkv_a_proj_with_mqa"},
+                )
 
     def test_all_sentinel_string(self):
         self.assertEqual(get_normalized_target_modules("all"), {"all"})
@@ -95,6 +105,15 @@ class TestGetStackedMultiply(unittest.TestCase):
 
     def test_in_proj_qkvz(self):
         self.assertEqual(get_stacked_multiply("in_proj_qkvz"), 4)
+
+    def test_base_model_override(self):
+        """Model can override the multiplier via get_stacked_multiply method."""
+
+        class MockModel:
+            def get_stacked_multiply(self, name):
+                return 10
+
+        self.assertEqual(get_stacked_multiply("qkv_proj", base_model=MockModel()), 10)
 
 
 class TestGetTargetModuleName(unittest.TestCase):
