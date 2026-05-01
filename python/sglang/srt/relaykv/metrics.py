@@ -107,10 +107,12 @@ def summarize_candidate_events(
         {
             "fallback_candidate_noop_guard_true": 0,
             "applied_candidate_log_only_true": 0,
+            "dry_copy_candidate_true": 0,
             "scheduler_policy_noop_true": 0,
             "kv_cache_mutation_false": 0,
             "attention_override_false": 0,
             "host_backup_copy_false": 0,
+            "host_backup_copy_executed_false": 0,
         }
     )
 
@@ -122,6 +124,8 @@ def summarize_candidate_events(
             noop_guard_counts["fallback_candidate_noop_guard_true"] += 1
         if _event_value(event, "applied_candidate_log_only") is True:
             noop_guard_counts["applied_candidate_log_only_true"] += 1
+        if _event_value(event, "dry_copy_candidate") is True:
+            noop_guard_counts["dry_copy_candidate_true"] += 1
         if _event_value(event, "scheduler_policy_noop") is True:
             noop_guard_counts["scheduler_policy_noop_true"] += 1
         if _event_value(event, "kv_cache_mutation") is False:
@@ -130,6 +134,8 @@ def summarize_candidate_events(
             noop_guard_counts["attention_override_false"] += 1
         if _event_value(event, "host_backup_copy") is False:
             noop_guard_counts["host_backup_copy_false"] += 1
+        if _event_value(event, "host_backup_copy_executed") is False:
+            noop_guard_counts["host_backup_copy_executed_false"] += 1
 
     return {
         "candidate_event_counts": dict(candidate_counts),
@@ -153,9 +159,28 @@ def policy_event_payload(
 ) -> dict[str, Any]:
     payload = {key: _event_value(event, key) for key in POLICY_EVENT_LOG_KEYS}
     state = payload["runtime_policy_state"]
-    payload["runtime_policy_action"] = "log_only_noop"
+    dry_copy_candidate = state == "applied_candidate"
+    payload["runtime_policy_action"] = (
+        "dry_copy_candidate_log_only" if dry_copy_candidate else "log_only_noop"
+    )
+    payload["dry_copy_candidate"] = dry_copy_candidate
     payload["applied_candidate_log_only"] = state == "applied_candidate"
     payload["fallback_candidate_noop_guard"] = state == "fallback_candidate"
+    payload["scheduler_policy_noop"] = True
+    payload["kv_cache_mutation"] = False
+    payload["attention_override"] = False
+    payload["host_backup_copy"] = False
+    payload["host_backup_copy_executed"] = False
+    if dry_copy_candidate:
+        payload["host_backup_copy_skipped_reason"] = (
+            "dry_copy_candidate_metadata_only_no_host_backup_copy"
+        )
+    elif state == "fallback_candidate":
+        payload["host_backup_copy_skipped_reason"] = "fallback_candidate_noop_guard"
+    else:
+        payload["host_backup_copy_skipped_reason"] = (
+            "runtime_policy_state_not_applied_candidate"
+        )
     if extra:
         payload.update(extra)
     return payload

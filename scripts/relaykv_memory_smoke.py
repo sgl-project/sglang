@@ -210,11 +210,16 @@ def main() -> None:
         raise AssertionError(host_backup_estimate)
     if host_backup_estimate.host_backup_copy_target_reason != "metadata_only_no_tensor_copy_range_token_mismatch":
         raise AssertionError(host_backup_estimate)
-    if host_backup_estimate.host_backup_dry_copy_guard_ok is not True:
+    if host_backup_estimate.host_backup_dry_copy_candidate is not False:
         raise AssertionError(host_backup_estimate)
-    if host_backup_estimate.host_backup_dry_copy_would_run is not True:
+    if host_backup_estimate.host_backup_dry_copy_guard_ok is not False:
         raise AssertionError(host_backup_estimate)
-    if host_backup_estimate.host_backup_dry_copy_reason != "guard_only_no_tensor_copy":
+    if host_backup_estimate.host_backup_dry_copy_would_run is not False:
+        raise AssertionError(host_backup_estimate)
+    if (
+        host_backup_estimate.host_backup_dry_copy_reason
+        != "runtime_policy_fallback_candidate_noop"
+    ):
         raise AssertionError(host_backup_estimate)
     layout_observation = observe_kv_layout_for_host_backup(
         token_to_kv_pool_allocator=_FakeAllocator(),
@@ -409,6 +414,29 @@ def main() -> None:
         raise AssertionError(applied_plan)
     if applied_plan.risk_level != "normal":
         raise AssertionError(applied_plan)
+    applied_memory_estimate = estimate_kv_memory_for_plan(
+        applied_plan,
+        model_config=_FakeModelConfig(),
+        kv_dtype="torch.bfloat16",
+    )
+    applied_host_backup_estimate = estimate_host_backup_shadow_for_plan(
+        applied_plan,
+        memory_estimate=applied_memory_estimate,
+        host_backup_shadow=True,
+        host_backup_max_mib=0.0,
+        host_backup_dry_copy=True,
+    )
+    if applied_host_backup_estimate.host_backup_dry_copy_candidate is not True:
+        raise AssertionError(applied_host_backup_estimate)
+    if applied_host_backup_estimate.host_backup_dry_copy_guard_ok is not True:
+        raise AssertionError(applied_host_backup_estimate)
+    if applied_host_backup_estimate.host_backup_dry_copy_would_run is not True:
+        raise AssertionError(applied_host_backup_estimate)
+    if (
+        applied_host_backup_estimate.host_backup_dry_copy_reason
+        != "dry_copy_candidate_metadata_only_no_tensor_copy"
+    ):
+        raise AssertionError(applied_host_backup_estimate)
 
     late_layer_plan = make_shadow_plan(
         4096,
@@ -455,14 +483,28 @@ def main() -> None:
     )
     if fallback_event["runtime_policy_action"] != "log_only_noop":
         raise AssertionError(fallback_event)
+    if fallback_event["dry_copy_candidate"] is not False:
+        raise AssertionError(fallback_event)
     if fallback_event["fallback_candidate_noop_guard"] is not True:
+        raise AssertionError(fallback_event)
+    if fallback_event["host_backup_copy"] is not False:
+        raise AssertionError(fallback_event)
+    if fallback_event["host_backup_copy_executed"] is not False:
+        raise AssertionError(fallback_event)
+    if fallback_event["host_backup_copy_skipped_reason"] != "fallback_candidate_noop_guard":
         raise AssertionError(fallback_event)
     if fallback_event["kv_cache_mutation"] is not False:
         raise AssertionError(fallback_event)
     applied_event = policy_event_payload(applied_plan)
     if applied_event["applied_candidate_log_only"] is not True:
         raise AssertionError(applied_event)
-    if applied_event["runtime_policy_action"] != "log_only_noop":
+    if applied_event["dry_copy_candidate"] is not True:
+        raise AssertionError(applied_event)
+    if applied_event["runtime_policy_action"] != "dry_copy_candidate_log_only":
+        raise AssertionError(applied_event)
+    if applied_event["host_backup_copy"] is not False:
+        raise AssertionError(applied_event)
+    if applied_event["host_backup_copy_executed"] is not False:
         raise AssertionError(applied_event)
 
     print("relaykv_memory_smoke: ok")

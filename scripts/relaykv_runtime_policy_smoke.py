@@ -164,11 +164,14 @@ def main() -> None:
         raise AssertionError(candidate_summary)
     if noop_counts["applied_candidate_log_only_true"] != 1:
         raise AssertionError(candidate_summary)
+    if noop_counts["dry_copy_candidate_true"] != 1:
+        raise AssertionError(candidate_summary)
     for key in (
         "scheduler_policy_noop_true",
         "kv_cache_mutation_false",
         "attention_override_false",
         "host_backup_copy_false",
+        "host_backup_copy_executed_false",
     ):
         if noop_counts[key] != 3:
             raise AssertionError(candidate_summary)
