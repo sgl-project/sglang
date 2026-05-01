@@ -137,7 +137,6 @@ class DSV4AttnMetadataRadix:
 
     c4_sparse_topk: int
     c4_out_loc: Optional[torch.Tensor] = None
-    c4_positions: Optional[torch.Tensor] = None
     c4_topk_lengths_raw: Optional[torch.Tensor] = None
     c4_topk_lengths_clamp1: Optional[torch.Tensor] = None
     c4_sparse_topk_lengths: torch.Tensor = field(init=False)
@@ -179,7 +178,6 @@ class DSV4AttnMetadataRadix:
                 "raw_out_loc",
                 "seq_lens_casual",
                 "positions_casual",
-                "c4_positions",
                 "c128_positions",
                 "c4_out_loc",
                 "c128_out_loc",
@@ -208,7 +206,7 @@ class DSV4AttnMetadataRadix:
 
         (
             self.c4_out_loc,
-            self.c4_positions,
+            _,
             self.c4_topk_lengths_raw,
             self.c4_topk_lengths_clamp1,
             self.c128_out_loc,
@@ -233,7 +231,6 @@ class DSV4AttnMetadataRadix:
         "swa_page_indices",
         "swa_topk_lengths",
         "page_table",
-        "c4_positions",
         "c4_topk_lengths_raw",
         "c4_topk_lengths_clamp1",
         "c128_positions",
