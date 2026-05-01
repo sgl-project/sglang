@@ -352,6 +352,17 @@ def maybe_init_custom_mem_pool(
         return False, None, None
 
 
+def is_swa_like_pool(pool: Any) -> bool:
+    """True for KV pools that share the SWA full->swa mapping interface
+    (`swa_kv_pool`, `register_mapping`, `translate_loc_from_full_to_swa`,
+    `set_swa_loc`, `get_state_buf_infos`).
+    """
+    from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    return isinstance(pool, (SWAKVPool, DeepSeekV4TokenToKVPool))
+
+
 def convert_to_bigram_key(tokens: List[int]) -> List[Tuple[int, int]]:
     # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
     # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]

@@ -11,7 +11,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVCache, MHATokenToKVPool
-from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.mem_cache.utils import is_swa_like_pool, maybe_init_custom_mem_pool
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import get_num_new_pages
 
@@ -242,7 +242,7 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         kvcache: Union[SWAKVPool, DeepSeekV4TokenToKVPool],
         need_sort: bool,
     ):
-        assert isinstance(kvcache, (SWAKVPool, DeepSeekV4TokenToKVPool))
+        assert is_swa_like_pool(kvcache)
         self._size_full = size
         self._size_swa = size_swa
         self.dtype = dtype
