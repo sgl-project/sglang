@@ -5,9 +5,25 @@ from typing import Any, Iterator, Optional
 
 import torch
 
-from sglang.srt.true_on_policy.contracts import resolve_true_on_policy_runtime_policy
+from sglang.srt.true_on_policy.contracts import (
+    override_true_on_policy_runtime_policy_enabled,
+    resolve_true_on_policy_runtime_policy,
+)
 
 ROW_LINEAR_INV_BLOCK_K = 128
+
+_ATTENTION_BACKEND_CHILD_ATTRS = (
+    "attn_backend",
+    "decode_backend",
+    "full_attn_backend",
+    "linear_attn_backend",
+    "prefill_backend",
+    "primary",
+)
+_ATTENTION_BACKEND_CHILD_LIST_ATTRS = (
+    "attn_backend_list",
+    "attn_backends",
+)
 
 
 def _get_global_server_args() -> Any:
@@ -143,6 +159,51 @@ def should_use_tp_invariant_tree_all_reduce(
     return policy_enabled
 
 
+def _iter_attention_backend_tree(attn_backend: Any) -> Iterator[Any]:
+    seen: set[int] = set()
+    stack = [attn_backend]
+    while stack:
+        backend = stack.pop()
+        if backend is None:
+            continue
+        backend_id = id(backend)
+        if backend_id in seen:
+            continue
+        seen.add(backend_id)
+        yield backend
+
+        for attr in _ATTENTION_BACKEND_CHILD_ATTRS:
+            child = getattr(backend, attr, None)
+            if child is not None:
+                stack.append(child)
+        for attr in _ATTENTION_BACKEND_CHILD_LIST_ATTRS:
+            children = getattr(backend, attr, None)
+            if children is None:
+                continue
+            stack.extend(child for child in children if child is not None)
+
+
+@contextlib.contextmanager
+def patch_prefill_only_deterministic_attention_backend(
+    attn_backend: Optional[Any],
+) -> Iterator[None]:
+    """Temporarily match full deterministic attention metadata for prefill scoring."""
+    saved_num_splits: list[tuple[Any, Any]] = []
+    if attn_backend is None:
+        yield
+        return
+
+    try:
+        for backend in _iter_attention_backend_tree(attn_backend):
+            if hasattr(backend, "num_splits"):
+                saved_num_splits.append((backend, backend.num_splits))
+                backend.num_splits = 1
+        yield
+    finally:
+        for backend, num_splits in reversed(saved_num_splits):
+            backend.num_splits = num_splits
+
+
 @contextlib.contextmanager
 def patch_prefill_only_deterministic_inference_for_cuda_graph(
     server_args: Any,
@@ -166,7 +227,8 @@ def patch_prefill_only_deterministic_inference_for_cuda_graph(
         if attn_backend is not None and hasattr(attn_backend, "num_splits"):
             attn_backend.num_splits = 0
 
-        yield True
+        with override_true_on_policy_runtime_policy_enabled(False):
+            yield True
     finally:
         if attn_backend is not None and hasattr(attn_backend, "num_splits"):
             attn_backend.num_splits = saved_num_splits

@@ -85,7 +85,6 @@ from sglang.srt.true_on_policy import (
     get_moe_topk_tiebreak,
     get_on_policy_rms_norm_kwargs,
     should_disable_fused_qk_norm_mrope,
-    should_force_bfloat16_dense_tensor_math,
     should_use_deterministic_moe_combine,
     should_use_deterministic_moe_routing,
 )
@@ -343,10 +342,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
 
         # router_logits: (num_tokens, n_experts)
         router_hidden_states = hidden_states
-        if should_use_deterministic_moe_routing():
-            gate_weight = getattr(self.gate, "weight", None)
-            if gate_weight is not None and router_hidden_states.dtype != gate_weight.dtype:
-                router_hidden_states = router_hidden_states.to(gate_weight.dtype)
+        gate_weight = getattr(self.gate, "weight", None)
+        if (
+            gate_weight is not None
+            and router_hidden_states.dtype != gate_weight.dtype
+        ):
+            router_hidden_states = router_hidden_states.to(gate_weight.dtype)
         router_logits, _ = self.gate(router_hidden_states)
         if should_use_deterministic_moe_routing():
             routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
@@ -367,13 +368,12 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(hidden_states, router_logits)
 
         expert_hidden_states = router_hidden_states
-        if should_use_deterministic_moe_routing():
-            expert_weight = getattr(self.experts, "w13_weight", None)
-            if (
-                expert_weight is not None
-                and expert_hidden_states.dtype != expert_weight.dtype
-            ):
-                expert_hidden_states = expert_hidden_states.to(expert_weight.dtype)
+        expert_weight = getattr(self.experts, "w13_weight", None)
+        if (
+            expert_weight is not None
+            and expert_hidden_states.dtype != expert_weight.dtype
+        ):
+            expert_hidden_states = expert_hidden_states.to(expert_weight.dtype)
         final_hidden_states = self.experts(expert_hidden_states, topk_output)
 
         if (
@@ -722,10 +722,7 @@ class Qwen3MoeAttention(nn.Module):
             not _is_npu
             or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
         ):
-            if (
-                should_force_bfloat16_dense_tensor_math()
-                and hidden_states.dtype != self.qkv_proj.weight.dtype
-            ):
+            if hidden_states.dtype != self.qkv_proj.weight.dtype:
                 hidden_states = hidden_states.to(self.qkv_proj.weight.dtype)
             return self.forward_prepare_native(
                 positions=positions,
@@ -745,7 +742,7 @@ class Qwen3MoeAttention(nn.Module):
             return hidden_states
 
         q, k, v, fb = inner_state
-        if should_force_bfloat16_dense_tensor_math() and q.dtype != v.dtype:
+        if q.dtype != v.dtype:
             q = q.to(v.dtype)
             k = k.to(v.dtype)
 

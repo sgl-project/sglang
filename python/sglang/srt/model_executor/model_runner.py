@@ -164,6 +164,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.true_on_policy import (
     is_tp_invariant_target,
     override_true_on_policy_runtime_policy_enabled,
+    patch_prefill_only_deterministic_attention_backend,
 )
 from sglang.srt.utils import (
     MultiprocessingSerializer,
@@ -3126,6 +3127,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 enable_tp_invariant_mode()
                 tp_invariant_enabled_here = True
             with (
+                patch_prefill_only_deterministic_attention_backend(self.attn_backend),
                 override_true_on_policy_runtime_policy_enabled(True),
                 envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(True),
             ):
