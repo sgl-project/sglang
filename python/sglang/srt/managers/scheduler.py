@@ -185,7 +185,7 @@ from sglang.srt.managers.scheduler_update_weights_mixin import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult, validate_input_length
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import maybe_cache_unfinished_req, release_kv_cache
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -799,6 +799,24 @@ class Scheduler(
                 "Radix cache is disabled for multimodal models with the "
                 "Transformers backend to avoid multimodal prefix-cache mismatches."
             )
+
+        # Decode radix cache is unsupported with hybrid SWA/SSM models —
+        # these use specialized memory pools incompatible with the
+        # prefix-match-and-lock allocation path.
+        if (
+            server_args.disaggregation_decode_enable_radix_cache
+            and server_args.disaggregation_mode == "decode"
+        ):
+            if self.is_hybrid_swa:
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                    "with sliding window attention (SWA) models"
+                )
+            if self.is_hybrid_ssm:
+                raise ValueError(
+                    "--disaggregation-decode-enable-radix-cache is incompatible "
+                    "with Mamba/SSM models"
+                )
 
         effective_chunked_prefill_size = server_args.chunked_prefill_size
         if self.model_config.is_multimodal and uses_transformers_backend:
@@ -2344,7 +2362,7 @@ class Scheduler(
             self.handle_embedding_request(tokenized_req)
 
     def stash_chunked_request(self, req: Req):
-        self.tree_cache.cache_unfinished_req(req, chunked=True)
+        maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
     def _build_hisparse_decode_batch(self, reqs):
         """Build a ScheduleBatch for hisparse requests transitioning from staging to decode."""
