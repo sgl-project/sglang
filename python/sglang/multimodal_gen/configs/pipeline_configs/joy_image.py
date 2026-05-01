@@ -232,7 +232,12 @@ class JoyImageEditPipelineConfig(ImagePipelineConfig):
         scale = max(bh / h, bw / w)
         resize_h, resize_w = math.ceil(h * scale), math.ceil(w * scale)
 
-        img = img.resize((resize_w, resize_h), Image.LANCZOS)
+        img = TF.resize(
+            img,
+            (resize_h, resize_w),
+            interpolation=TF.InterpolationMode.BILINEAR,
+            antialias=True,
+        )
         img = TF.center_crop(img, target_size)
         return img
 

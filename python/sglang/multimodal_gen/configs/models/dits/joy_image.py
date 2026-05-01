@@ -22,6 +22,7 @@ class JoyImageArchConfig(DiTArchConfig):
             r"^condition_embedder\.time_embedder\.linear_2\.(.*)$": r"condition_embedder.time_embedder.mlp.fc_out.\1",
             r"^condition_embedder\.time_proj\.(.*)$": r"condition_embedder.time_modulation.linear.\1",
             # Double blocks mappings
+            r"^double_blocks\.(\d+)\.attn\.(.*)$": r"double_blocks.\1.\2",
             r"^double_blocks\.(\d+)\.img_mlp\.net\.0\.proj\.(.*)$": r"double_blocks.\1.img_mlp.fc_in.\2",
             r"^double_blocks\.(\d+)\.img_mlp\.net\.2\.(.*)$": r"double_blocks.\1.img_mlp.fc_out.\2",
             r"^double_blocks\.(\d+)\.txt_mlp\.net\.0\.proj\.(.*)$": r"double_blocks.\1.txt_mlp.fc_in.\2",
