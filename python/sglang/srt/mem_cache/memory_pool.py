@@ -402,7 +402,7 @@ class MambaPool:
         self.copy_from(src_index, dst_index)
         return dst_index
 
-    def get_cpu_copy(self, indices, **kwargs):
+    def get_cpu_copy(self, indices):
         current_platform.synchronize()
         conv_cpu = [
             conv[:, indices].to("cpu", non_blocking=True)
