@@ -540,13 +540,19 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
+        # The mapping is indexed by req_pool_idx (range [0, self.size)), so it must
+        # be sized by req_to_token pool size, NOT the mamba pool size. Otherwise,
+        # when max_running_requests > max_mamba_cache_size, indexing OOBs silently
+        # in CUDA (only the assertion message prints; subsequent corrupted reads
+        # surface as 'unspecified launch failure' in unrelated kernels).
+        mapping_size = max(self.size, size)
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
-            size, dtype=torch.int32, device=self.device
+            mapping_size, dtype=torch.int32, device=self.device
         )
         if enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
-                    (size, self.mamba_ping_pong_track_buffer_size),
+                    (mapping_size, self.mamba_ping_pong_track_buffer_size),
                     dtype=torch.int32,
                     device=self.device,
                 )
