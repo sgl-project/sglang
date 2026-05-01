@@ -5,11 +5,17 @@ on:
     branches: [ main ]
     paths:
       - "sgl-model-gateway/**"
+      - ".github/workflows/pr-test-rust.yml"
+      - "scripts/ci/cuda/ci_install_dependency.sh"
+      - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened, labeled]
     paths:
       - "sgl-model-gateway/**"
+      - ".github/workflows/pr-test-rust.yml"
+      - "scripts/ci/cuda/ci_install_dependency.sh"
+      - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
   workflow_dispatch:
 
 concurrency:
@@ -344,7 +350,11 @@ jobs:
   summarize-benchmarks:
     needs: gateway-e2e
     runs-on: ubuntu-latest
-    if: success()
+    # Disabled while e2e tests are skipped in
+    # sgl-model-gateway/e2e_test/fixtures/hooks.py — no benchmarks run, so the
+    # genai-bench-results-all-policies artifact is never produced and the
+    # download step would fail. Re-enable together with the skip removal.
+    if: false
 
     steps:
     - name: Checkout code

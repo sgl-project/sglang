@@ -69,8 +69,8 @@ class Req:
     # Primary encoder embeddings
     prompt_embeds: list[torch.Tensor] | torch.Tensor = field(default_factory=list)
     negative_prompt_embeds: list[torch.Tensor] | None = None
-    prompt_attention_mask: list[torch.Tensor] | None = None
-    negative_attention_mask: list[torch.Tensor] | None = None
+    prompt_attention_mask: list[torch.Tensor | None] | None = None
+    negative_attention_mask: list[torch.Tensor | None] | None = None
     clip_embedding_pos: list[torch.Tensor] | None = None
     clip_embedding_neg: list[torch.Tensor] | None = None
 

@@ -77,6 +77,42 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 IGNORE_EOS_RESERVE_TOKENS = 1
 
 
+def match_prefix_for_req(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    token_ids: Optional[List[int]] = None,
+    *,
+    cow_mamba: bool = False,
+    include_req: bool = False,
+):
+    if token_ids is None:
+        token_ids = req.origin_input_ids + req.output_ids
+
+    match_result = tree_cache.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+            cow_mamba=cow_mamba,
+            req=req if include_req else None,
+        )
+    )
+    (
+        req.prefix_indices,
+        req.last_node,
+        req.last_host_node,
+        req.host_hit_length,
+    ) = (
+        match_result.device_indices,
+        match_result.last_device_node,
+        match_result.last_host_node,
+        match_result.host_hit_length,
+    )
+    if match_result.mamba_branching_seqlen is not None:
+        req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+    if match_result.cache_protected_len is not None:
+        req.cache_protected_len = match_result.cache_protected_len
+    return match_result
+
+
 class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
 
@@ -195,23 +231,7 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
-            # NOTE: the prefix_indices must always be aligned with last_node
-            match_result = self.tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
-                )
-            )
-            (
-                r.prefix_indices,
-                r.last_node,
-                r.last_host_node,
-                r.host_hit_length,
-            ) = (
-                match_result.device_indices,
-                match_result.last_device_node,
-                match_result.last_host_node,
-                match_result.host_hit_length,
-            )
+            match_result = match_prefix_for_req(self.tree_cache, r, prefix_ids)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
