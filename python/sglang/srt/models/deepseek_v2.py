@@ -662,8 +662,6 @@ class DeepseekV2MoE(nn.Module):
         )
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
-        assert hasattr(self, "shared_experts")
-
     def get_moe_weights(self):
         return [
             x.data
