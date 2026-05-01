@@ -639,6 +639,21 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Set workspace directory
 WORKDIR /sgl-workspace/sglang
 
+# Keep build provenance at the end so metadata changes do not invalidate build layers.
+ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_URL=
+ARG SGLANG_IMAGE_TAG=local/sglang:dev
+ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
+LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
+      org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
+
 ########################################################
 ########## Runtime Image ##############################
 ########################################################
@@ -781,6 +796,21 @@ COPY --from=framework_final /usr/src/gdrdrv-2.5.1 /usr/src/gdrdrv-2.5.1
 RUN ln -sf /usr/lib/$(uname -m)-linux-gnu/libmlx5.so.1 /usr/lib/$(uname -m)-linux-gnu/libmlx5.so
 
 WORKDIR /sgl-workspace/sglang
+
+# Keep build provenance at the end so metadata changes do not invalidate build layers.
+ARG SGLANG_BUILD_COMMIT=unknown
+ARG SGLANG_BUILD_URL=
+ARG SGLANG_IMAGE_TAG=local/sglang:dev
+ENV SGLANG_BUILD_COMMIT=${SGLANG_BUILD_COMMIT:-unknown} \
+    SGLANG_BUILD_URL=${SGLANG_BUILD_URL:-} \
+    SGLANG_IMAGE_TAG=${SGLANG_IMAGE_TAG:-local/sglang:dev}
+LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
+      org.opencontainers.image.revision="${SGLANG_BUILD_COMMIT}" \
+      org.opencontainers.image.version="${SGLANG_IMAGE_TAG}" \
+      org.opencontainers.image.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.build.commit="${SGLANG_BUILD_COMMIT}" \
+      ai.sglang.build.url="${SGLANG_BUILD_URL}" \
+      ai.sglang.image.tag="${SGLANG_IMAGE_TAG}"
 
 # Default command
 CMD ["/bin/bash"]
