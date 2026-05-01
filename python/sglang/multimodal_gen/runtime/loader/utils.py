@@ -207,8 +207,34 @@ def _clean_hf_config_inplace(model_config: dict) -> None:
 
 
 def _list_safetensors_files(model_path: str) -> list[str]:
-    """List all .safetensors files under a directory."""
-    return sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
+    """List all .safetensors files under a directory.
+
+    If a safetensors index file is present, verifies that every shard listed
+    in the index actually exists on disk and raises RuntimeError for any that
+    are missing (e.g. an interrupted download).
+    """
+    found = sorted(glob.glob(os.path.join(str(model_path), "*.safetensors")))
+
+    index_path = os.path.join(
+        str(model_path), "diffusion_pytorch_model.safetensors.index.json"
+    )
+    if os.path.exists(index_path):
+        import json
+
+        with open(index_path) as f:
+            index = json.load(f)
+        expected_shards = sorted(set(index.get("weight_map", {}).values()))
+        found_basenames = {os.path.basename(p) for p in found}
+        missing = [s for s in expected_shards if s not in found_basenames]
+        if missing:
+            raise RuntimeError(
+                f"Checkpoint at '{model_path}' is incomplete — the following "
+                f"shard(s) listed in the index are missing from disk: "
+                f"{missing}. Re-download the checkpoint (e.g. "
+                f"`huggingface-cli download {os.path.basename(model_path)}`)."
+            )
+
+    return found
 
 
 BYTES_PER_GB = 1024**3
