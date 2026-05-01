@@ -433,6 +433,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For hisparse
     hisparse_coordinator: Optional[HiSparseCoordinator] = None
+    hisparse_use_swap: bool = False
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
@@ -489,6 +490,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             dimensions=batch.dimensions,
             return_hidden_states_before_norm=batch.return_hidden_states_before_norm,
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
+            hisparse_use_swap=batch.hisparse_use_swap,
             rids=[req.rid for req in batch.reqs],
         )
         device = model_runner.device

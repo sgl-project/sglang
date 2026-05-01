@@ -78,6 +78,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
     top_k = extra_config.pop("top_k", 2048)
     device_buffer_size = extra_config.pop("device_buffer_size", 2 * top_k)
     host_to_device_ratio = extra_config.pop("host_to_device_ratio", 2)
+    dynamic = extra_config.pop("dynamic", False)
 
     if device_buffer_size < top_k:
         raise ValueError(
@@ -93,6 +94,7 @@ def _parse_sparse_config(server_args) -> SparseConfig:
         top_k=top_k,
         device_buffer_size=device_buffer_size,
         host_to_device_ratio=host_to_device_ratio,
+        dynamic=dynamic,
         algorithm=algorithm,
         backend=backend,
         page_size=page_size,

@@ -53,6 +53,9 @@ def load_cache_to_device_buffer_mla(
     page_size: int = 1,
     block_size: int = 256,
     num_real_reqs: torch.Tensor | None = None,
+    req_to_token: torch.Tensor | None = None,
+    full_to_hisparse_device_index_mapping: torch.Tensor | None = None,
+    req_is_swap: torch.Tensor | None = None,
 ) -> None:
     assert (
         hot_buffer_size >= num_top_k
@@ -63,6 +66,14 @@ def load_cache_to_device_buffer_mla(
     )
 
     empty = torch.empty(0)
+    if req_to_token is None:
+        req_to_token = torch.empty(0, dtype=torch.int32, device=top_k_tokens.device)
+    if full_to_hisparse_device_index_mapping is None:
+        full_to_hisparse_device_index_mapping = torch.empty(
+            0, dtype=torch.int64, device=top_k_tokens.device
+        )
+    if req_is_swap is None:
+        req_is_swap = torch.empty(0, dtype=torch.int8, device=top_k_tokens.device)
 
     if num_real_reqs is None:
         num_real_reqs = torch.tensor(
@@ -79,6 +90,9 @@ def load_cache_to_device_buffer_mla(
         device_buffer,
         empty,
         top_k_device_locs,
+        req_to_token,
+        full_to_hisparse_device_index_mapping,
+        req_is_swap,
         req_pool_indices,
         seq_lens,
         lru_slots,

@@ -399,6 +399,39 @@ class NativeSparseAttnBackend(
         )
         return page_table[:, strided_indices] // page_size
 
+    def _use_hisparse_swap_path(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            forward_batch.hisparse_coordinator is not None
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.hisparse_coordinator.forward_batch_uses_swap(
+                forward_batch
+            )
+        )
+
+    def _use_hisparse_resident_path(self, forward_batch: ForwardBatch) -> bool:
+        return (
+            forward_batch.hisparse_coordinator is not None
+            and forward_batch.hisparse_coordinator.dynamic
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and not forward_batch.hisparse_coordinator.forward_batch_uses_swap(
+                forward_batch
+            )
+        )
+
+    def set_hisparse_cuda_graph_replay(self, coordinator, use_swap: bool) -> None:
+        self._cuda_graph_hisparse_coordinator = coordinator
+        if coordinator is not None and getattr(coordinator, "dynamic", False):
+            self._cuda_graph_hisparse_variant = "swap" if use_swap else "resident"
+        else:
+            self._cuda_graph_hisparse_variant = None
+
+    def _cuda_graph_metadata_key(self, bs: int):
+        hisparse_variant = getattr(self, "_cuda_graph_hisparse_variant", None)
+        return (bs, hisparse_variant) if hisparse_variant is not None else bs
+
+    def _get_cuda_graph_metadata(self, bs: int):
+        return self.decode_cuda_graph_metadata[self._cuda_graph_metadata_key(bs)]
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         batch_size = forward_batch.batch_size
@@ -612,6 +645,13 @@ class NativeSparseAttnBackend(
                 )
         else:
             assert False, f"Unsupported {forward_batch.forward_mode = }"
+
+        if self._use_hisparse_resident_path(forward_batch):
+            page_table = (
+                forward_batch.token_to_kv_pool.translate_loc_to_hisparse_device(
+                    page_table
+                )
+            )
 
         indexer_k_start_end, token_to_batch_idx = self._cal_indexer_k_start_end(
             forward_batch, bs_idx_cpu
@@ -955,7 +995,7 @@ class NativeSparseAttnBackend(
             real_page_table=real_page_table,
             nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
         )
-        self.decode_cuda_graph_metadata[bs] = metadata
+        self.decode_cuda_graph_metadata[self._cuda_graph_metadata_key(bs)] = metadata
         self.forward_metadata = metadata
 
     def init_forward_metadata_replay_cuda_graph(
@@ -980,7 +1020,7 @@ class NativeSparseAttnBackend(
         req_pool_indices = req_pool_indices[:bs]
 
         # Normal Decode
-        metadata: NSAMetadata = self.decode_cuda_graph_metadata[bs]
+        metadata: NSAMetadata = self._get_cuda_graph_metadata(bs)
         if forward_mode.is_decode_or_idle():
             # Normal Decode
             max_len = int(seq_lens_cpu.max().item())
@@ -991,6 +1031,11 @@ class NativeSparseAttnBackend(
                 torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
             )
             page_indices = self.req_to_token[req_pool_indices, :max_len]
+            if getattr(self, "_cuda_graph_hisparse_variant", None) == "resident":
+                coordinator = self._cuda_graph_hisparse_coordinator
+                page_indices = coordinator.mem_pool_device.translate_loc_to_hisparse_device(
+                    page_indices
+                )
             metadata.page_table_1[:, :max_len].copy_(page_indices)
             nsa_cache_seqlens = compute_nsa_seqlens(
                 cache_seqlens, nsa_index_topk=self.nsa_index_topk
@@ -1141,7 +1186,7 @@ class NativeSparseAttnBackend(
         """
         self.set_nsa_prefill_impl(forward_batch=None)
 
-        metadata = self.decode_cuda_graph_metadata[bs]
+        metadata = self._get_cuda_graph_metadata(bs)
 
         # Track whether fused kernel succeeded
         fused_kernel_succeeded = False
@@ -1557,7 +1602,7 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
 
-        if forward_batch.hisparse_coordinator is not None:
+        if self._use_hisparse_swap_path(forward_batch):
             page_table_1 = forward_batch.hisparse_coordinator.swap_in_selected_pages(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -2215,10 +2260,7 @@ class NativeSparseAttnBackend(
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> NSAIndexerMetadata:
-        force_unfused = (
-            forward_batch.hisparse_coordinator is not None
-            and forward_batch.forward_mode.is_decode_or_idle()
-        )
+        force_unfused = self._use_hisparse_swap_path(forward_batch)
         return NSAIndexerMetadata(
             attn_metadata=self.forward_metadata,
             topk_transform_method=self.get_topk_transform_method(
@@ -2311,9 +2353,9 @@ class NativeSparseAttnMultiStepBackend:
                         fused_metadata_copy_multi_cuda,
                     )
 
-                    metadata0 = self.attn_backends[0].decode_cuda_graph_metadata[bs]
-                    metadata1 = self.attn_backends[1].decode_cuda_graph_metadata[bs]
-                    metadata2 = self.attn_backends[2].decode_cuda_graph_metadata[bs]
+                    metadata0 = self.attn_backends[0]._get_cuda_graph_metadata(bs)
+                    metadata1 = self.attn_backends[1]._get_cuda_graph_metadata(bs)
+                    metadata2 = self.attn_backends[2]._get_cuda_graph_metadata(bs)
 
                     # Set nsa_prefill_impl for first 3 backends (required by the method)
                     for i in range(3):
