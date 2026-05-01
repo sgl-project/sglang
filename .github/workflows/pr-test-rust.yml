@@ -235,10 +235,18 @@ jobs:
             runner: 2-gpu-h100
             timeout: 45
             test_dirs: "e2e_test/router e2e_test/embeddings"
-            extra_deps: "pytest-parallel py"  # py is required for pytest-parallel with newer pytest
+            extra_deps: ""
             env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
             reruns: "--reruns 2 --reruns-delay 5"
-            parallel_opts: "--workers 1 --tests-per-worker 4"  # Thread-based parallelism
+            # Run tests serially. pytest-parallel (unmaintained since 2019)
+            # has buggy fixture-finalize handling under thread dispatch:
+            # both class- and function-scoped fixture references leaked
+            # between tests, leaving model_pool instances pinned at
+            # _ref_count > 0 and deadlocking later tests that needed
+            # eviction (50+ min hangs). On a 2-GPU runner with 5 distinct
+            # model:mode combos in router+embeddings, the suite is
+            # eviction-bound anyway, so the parallel speedup was illusory.
+            parallel_opts: ""
           - name: chat-completions
             runner: 2-gpu-h100
             timeout: 45
