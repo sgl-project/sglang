@@ -46,12 +46,12 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)  # pylint: disable=invalid-name
@@ -616,6 +616,9 @@ class QwenImageCrossAttention(nn.Module):
         **cross_attention_kwargs,
     ):
         seq_len_txt = encoder_hidden_states.shape[1]
+        attn_mask = cross_attention_kwargs.get("attn_mask")
+        if attn_mask is None:
+            attn_mask = cross_attention_kwargs.get("attention_mask")
 
         img_query, img_key, img_value, txt_query, txt_key, txt_value = (
             _get_qkv_projections(self, hidden_states, encoder_hidden_states)
@@ -680,6 +683,7 @@ class QwenImageCrossAttention(nn.Module):
             joint_query,
             joint_key,
             joint_value,
+            attn_mask=attn_mask,
             num_replicated_prefix=seq_len_txt,
         )
 
@@ -1223,6 +1227,8 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         if isinstance(encoder_hidden_states, list):
             encoder_hidden_states = encoder_hidden_states[0]
+        if isinstance(encoder_hidden_states_mask, list):
+            encoder_hidden_states_mask = encoder_hidden_states_mask[0]
 
         hidden_states = self.img_in(hidden_states)
 
@@ -1237,6 +1243,21 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
 
         encoder_hidden_states = self.txt_norm(encoder_hidden_states)
         encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+        block_attention_kwargs = attention_kwargs.copy() if attention_kwargs else {}
+        if encoder_hidden_states_mask is not None:
+            encoder_hidden_states_mask = encoder_hidden_states_mask.to(
+                device=hidden_states.device, dtype=torch.bool
+            )
+            batch_size, image_seq_len = hidden_states.shape[:2]
+            image_mask = torch.ones(
+                (batch_size, image_seq_len),
+                dtype=torch.bool,
+                device=hidden_states.device,
+            )
+            block_attention_kwargs["attn_mask"] = torch.cat(
+                [encoder_hidden_states_mask, image_mask], dim=1
+            )
 
         temb = self.time_text_embed(timestep, hidden_states, additional_t_cond)
 
@@ -1257,7 +1278,7 @@ class QwenImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
                 temb_img_silu=temb_img_silu,
                 temb_txt_silu=temb_txt_silu,
                 image_rotary_emb=image_rotary_emb,
-                joint_attention_kwargs=attention_kwargs,
+                joint_attention_kwargs=block_attention_kwargs,
                 modulate_index=modulate_index,
             )
 

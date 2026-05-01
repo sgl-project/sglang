@@ -219,6 +219,7 @@ def init_distributed_environment(
                 current_platform.is_mps()
                 or current_platform.is_musa()
                 or current_platform.is_npu()
+                or current_platform.is_cpu()
                 or current_platform.is_xpu()
             )
             else dict(device_id=device_id)

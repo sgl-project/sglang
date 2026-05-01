@@ -42,7 +42,6 @@ CASE_THRESHOLDS: Dict[str, Dict[ComponentType, float]] = {
     "flux_2_image_t2i": {ComponentType.TRANSFORMER: 0.99},
     "flux_2_image_t2i_layerwise_offload": {ComponentType.TRANSFORMER: 0.99},
     "flux_2_image_t2i_2_gpus": {ComponentType.TRANSFORMER: 0.99},
-    "flux_2_klein_ti2i_2_gpus": {ComponentType.TRANSFORMER: 0.975},
     "flux_2_ti2i": {ComponentType.TRANSFORMER: 0.99},
     "flux_2_t2i_customized_vae_path": {ComponentType.TRANSFORMER: 0.99},
     "fast_hunyuan_video": {ComponentType.TRANSFORMER: 0.99},
@@ -140,17 +139,6 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
         ),
         ComponentType.TEXT_ENCODER: ComponentSkip(
             "Representative text encoder accuracy is already covered by flux_2_image_t2i for the same source component and topology"
-        ),
-    },
-    "wan2_1_t2v_1.3b_text_encoder_cpu_offload": {
-        ComponentType.VAE: ComponentSkip(
-            "Representative VAE accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
-        ),
-        ComponentType.TRANSFORMER: ComponentSkip(
-            "Representative transformer accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
-        ),
-        ComponentType.TEXT_ENCODER: ComponentSkip(
-            "Representative text encoder accuracy is already covered by wan2_1_t2v_1.3b for the same source component and topology"
         ),
     },
     "wan2_1_t2v_1.3b_teacache_enabled": {

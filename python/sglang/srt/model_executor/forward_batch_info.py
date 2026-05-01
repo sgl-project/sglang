@@ -351,6 +351,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     encoder_lens: Optional[torch.Tensor] = None
     encoder_lens_cpu: Optional[List[int]] = None
     encoder_out_cache_loc: Optional[torch.Tensor] = None
+    cross_attention_custom_mask: Optional[torch.Tensor] = None
 
     # For LoRA
     lora_ids: Optional[List[str]] = None
@@ -395,6 +396,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # Whether this batch is prefill-only (no token generation needed)
     is_prefill_only: bool = False
+
+    # Pre-computed delimiter indices for multi-item scoring (CPU tensors, one per request)
+    multi_item_delimiter_indices: Optional[List[torch.Tensor]] = None
 
     # Speculative decoding
     spec_info: Optional[SpecInput] = None
@@ -468,6 +472,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             can_run_dp_cuda_graph=batch.can_run_dp_cuda_graph,
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
+            multi_item_delimiter_indices=batch.multi_item_delimiter_indices,
             lora_ids=batch.lora_ids,
             sampling_info=batch.sampling_info,
             req_to_token_pool=model_runner.req_to_token_pool,
@@ -994,9 +999,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 spec_info.topk_index = self._pad_tensor_to_size(
                     spec_info.topk_index, bs
                 )
-            if spec_info.accept_length is not None:
-                spec_info.accept_length = self._pad_tensor_to_size(
-                    spec_info.accept_length, bs
+            if spec_info.num_accepted_drafts is not None:
+                spec_info.num_accepted_drafts = self._pad_tensor_to_size(
+                    spec_info.num_accepted_drafts, bs
+                )
+                spec_info.num_accepted_tokens = self._pad_tensor_to_size(
+                    spec_info.num_accepted_tokens, bs
                 )
             spec_info.hidden_states = self._pad_tensor_to_size(
                 spec_info.hidden_states, num_tokens
@@ -1040,7 +1048,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 ]
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
             elif self.forward_mode.is_draft_extend():  # draft extend
-                self.spec_info.accept_length = self.spec_info.accept_length[:bs]
+                self.spec_info.num_accepted_drafts = self.spec_info.num_accepted_drafts[
+                    :bs
+                ]
+                self.spec_info.num_accepted_tokens = self.spec_info.num_accepted_tokens[
+                    :bs
+                ]
                 logits_output.next_token_logits = logits_output.next_token_logits[:bs]
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
             elif self.forward_mode.is_draft_extend_v2():  # draft extend_v2
