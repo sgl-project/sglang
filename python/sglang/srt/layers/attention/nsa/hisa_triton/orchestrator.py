@@ -36,6 +36,7 @@ from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
     batch_pool_mqa_triton,
     block_mean_pooling_triton,
     block_sparse_mqa_triton,
+    force_maintain_logits_decode_triton,
     force_maintain_logits_triton,
     paged_mean_pooling_triton,
     ragged_pool_mqa_triton,
@@ -110,26 +111,60 @@ def fp8_native_hierarchy_paged_mqa_logits(
     k_block_size: int,
     pool_page_size: int,
     block_topk: int,
+    max_seq_len: int,                   # max ctx in tokens (= block_tables.shape[1] * 64 in production)
+    schedule_metadata: torch.Tensor,    # DG pool-domain schedule, computed by caller (graph-stable buffer)
+    paged_block_size: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     # 1) Tail-pool refresh is *skipped*. Stage 2's force_maintain at
-    # ``pool_idx == k_e - 1`` (kernels.py: _batch_decode_pool_mqa_kernel)
+    # ``pool_idx == k_e - 1`` (force_maintain_logits_decode_triton below)
     # always assigns +inf to the tail block — so the tail's actual mean-pool
     # value never affects topk selection. Stage 4 reads raw KV cache for the
     # selected blocks, not pool_k_pages, so a stale tail in pool_k_pages
-    # also doesn't contaminate the final logits. Saves ~7-10 μs/layer per
-    # decode step. ``update_pool_for_completed_blocks_*`` (called from the
-    # store-side hook in pool_k_cache.py) still keeps non-tail blocks fresh.
+    # also doesn't contaminate the final logits.
 
-    # 2) Block-MQA — triton port of paged pool_k_pages reader.
+    # 2) Block-MQA via DG ``fp8_paged_mqa_logits``. pool_k_pages is page-level
+    # SoA (bytes [0, ps*D) = fp8, bytes [ps*D, ps*(D+4)) = f32 scales),
+    # identical to sglang's main index_k kv-cache layout (sgl_kernel
+    # fused_store_index_cache.cuh:70-72). DG handles SoA via TWO TMA
+    # descriptors (``tensor_map_kv`` + ``tensor_map_kv_scales``) reading
+    # different sub-regions of the same buffer — the ``[N_pp, ps, 1, D+4]``
+    # 4D view is just for DG to compute page-level pitch.
+    #
+    # ``schedule_metadata`` is computed once per forward by the caller
+    # (HisaIndexer; mirrors nsa_indexer.py:478-483 — getattr-fallback)
+    # so that all 61 layers share a stable buffer captured into the
+    # cuda graph. ``force_maintain_logits_decode_triton`` takes only ke
+    # (no cu_ks tensor) — saves the per-call zeros_like alloc.
+    #
+    # Speed (test_dg_decode.py speed_compare, schedule precomputed):
+    #   eager full orch: ~8% slower than triton stage-2
+    #   graph-replay:    0.74-0.98× of triton (worst at B=1 short ctx;
+    #                    near-tied at B=32 ctx≥64K, the production sweet spot)
+    # Trade: simpler maintenance (DG vs hand-tuned triton kernel), at
+    # ~5-10% decode-stage cost in the favorable shapes; weigh vs e2e.
     num_pool_blocks_per_req = (context_lens + k_block_size - 1) // k_block_size
-    block_k_indexer_score = batch_decode_pool_mqa_triton(
-        q_fp8=q_fp8,
-        pool_k_pages=pool_k_pages,
-        pool_page_tables=pool_page_tables,
-        weights_f32=weights,
-        context_lens_pool=num_pool_blocks_per_req,
-        pool_page_size=pool_page_size,
-    )  # [B, 1, max_pool_pages * pool_page_size] f32
+    pool_k_view = pool_k_pages.view(
+        pool_k_pages.shape[0], pool_page_size, 1, q_fp8.shape[-1] + 4,
+    )
+    weights_2d = weights if weights.dim() == 2 else weights.view(-1, weights.shape[-1])
+    # Max pool blocks across the batch, derived from the main-KV table capacity:
+    # max_seq_len tokens / k_block_size, rounded up. Tighter than reading from
+    # pool_page_tables.shape (which carries the pool allocator's outer padding).
+    max_pool_seq_len = (max_seq_len + k_block_size - 1) // k_block_size
+    block_k_indexer_score = deep_gemm.fp8_paged_mqa_logits(
+        q_fp8,                      # [B, 1, H, D]
+        pool_k_view,                # [N_pp, pool_page_size, 1, D+4]
+        weights_2d,                 # [B, H]
+        num_pool_blocks_per_req,    # [B] i32 — pool-block "context_lens"
+        pool_page_tables,           # [B, max_pp] i32
+        schedule_metadata,
+        max_pool_seq_len,
+        clean_logits=True,
+    )  # [B*1, max_pool_seq_len] f32 (-inf past num_pool_blocks_per_req)
+    force_maintain_logits_decode_triton(
+        block_k_indexer_score, num_pool_blocks_per_req,
+    )
+    block_k_indexer_score = block_k_indexer_score.unsqueeze(1)  # [B, 1, max_pool_seq_len]
 
     # 3) Top-k over pool blocks.
     topk_block_indices = _stage3_topk_decode(block_k_indexer_score, block_topk)

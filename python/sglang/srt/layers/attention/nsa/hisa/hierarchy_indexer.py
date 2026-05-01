@@ -534,23 +534,51 @@ class HisaIndexer(MultiPlatformOp):
             pool_page_tables = kv_pool.get_pool_page_tables(
                 forward_batch.req_pool_indices,
             )  # [B, max_pool_pages_per_req] int32 (full col cap)
-            orch = (
-                fp8_native_hierarchy_paged_mqa_logits
-                if use_triton
-                else fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache
-            )
-            block_sparse_logits, topk_block_indices = orch(
-                q_fp8=q_fp8[:q_offset],
-                kv_cache_fp8=kv_cache_fp8,
-                pool_k_pages=pool_k_pages,
-                pool_page_tables=pool_page_tables[:q_offset].contiguous(),
-                weights=weights[:q_offset],
-                context_lens=seqlens_32[:q_offset],
-                block_tables=block_tables[:q_offset],
-                k_block_size=self.hisa_k_block_size,
-                pool_page_size=kv_pool.pool_page_size,
-                block_topk=self.hisa_block_topk,
-            )
+            if use_triton:
+                # Pool-domain DG schedule_metadata. Same getattr-fallback pattern
+                # as the main paged path (nsa_indexer.py:478-483) — backend may
+                # pre-compute it once per forward; otherwise we build it here.
+                pool_schedule = getattr(
+                    metadata, "pool_paged_mqa_schedule_metadata", None,
+                )
+                if pool_schedule is None and _is_cuda:
+                    npbpr = (
+                        seqlens_32[:q_offset] + self.hisa_k_block_size - 1
+                    ) // self.hisa_k_block_size
+                    pool_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                        npbpr, kv_pool.pool_page_size, self.sm_count,
+                    )
+                block_sparse_logits, topk_block_indices = (
+                    fp8_native_hierarchy_paged_mqa_logits(
+                        q_fp8=q_fp8[:q_offset],
+                        kv_cache_fp8=kv_cache_fp8,
+                        pool_k_pages=pool_k_pages,
+                        pool_page_tables=pool_page_tables[:q_offset].contiguous(),
+                        weights=weights[:q_offset],
+                        context_lens=seqlens_32[:q_offset],
+                        block_tables=block_tables[:q_offset],
+                        k_block_size=self.hisa_k_block_size,
+                        pool_page_size=kv_pool.pool_page_size,
+                        block_topk=self.hisa_block_topk,
+                        max_seq_len=max_seq_len,
+                        schedule_metadata=pool_schedule,
+                    )
+                )
+            else:
+                block_sparse_logits, topk_block_indices = (
+                    fp8_native_hierarchy_paged_mqa_logits_tilelang_with_pool_cache(
+                        q_fp8=q_fp8[:q_offset],
+                        kv_cache_fp8=kv_cache_fp8,
+                        pool_k_pages=pool_k_pages,
+                        pool_page_tables=pool_page_tables[:q_offset].contiguous(),
+                        weights=weights[:q_offset],
+                        context_lens=seqlens_32[:q_offset],
+                        block_tables=block_tables[:q_offset],
+                        k_block_size=self.hisa_k_block_size,
+                        pool_page_size=kv_pool.pool_page_size,
+                        block_topk=self.hisa_block_topk,
+                    )
+                )
         else:
             block_sparse_logits, topk_block_indices = (
                 fp8_native_hierarchy_paged_mqa_logits_tilelang_legacy(

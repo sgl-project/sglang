@@ -2166,10 +2166,11 @@ def _force_maintain_logits_kernel(
     row = tl.program_id(0)
     ks = tl.load(CU_KS_PTR + row)
     ke = tl.load(CU_KE_PTR + row)
-    base = LOGITS_PTR + row * stride_row
-    pos_inf = float("inf")
-    tl.store(base + ks, pos_inf)
-    tl.store(base + (ke - 1), pos_inf)
+    if ks < ke:
+        base = LOGITS_PTR + row * stride_row
+        pos_inf = float("inf")
+        tl.store(base + ks, pos_inf)
+        tl.store(base + (ke - 1), pos_inf)
 
 
 def force_maintain_logits_triton(
@@ -2189,6 +2190,48 @@ def force_maintain_logits_triton(
     _force_maintain_logits_kernel[(seq,)](
         logits, cu_seqlen_blocked_ks, cu_seqlen_blocked_ke,
         logits.stride(0),
+    )
+    return logits
+
+
+@triton.jit
+def _force_maintain_logits_decode_kernel(
+    LOGITS_PTR,
+    CU_KE_PTR,
+    stride_row,
+):
+    row = tl.program_id(0)
+    ke = tl.load(CU_KE_PTR + row)
+    if ke > 0:
+        base = LOGITS_PTR + row * stride_row
+        pos_inf = float("inf")
+        tl.store(base, pos_inf)             # ks = 0 (implicit)
+        tl.store(base + (ke - 1), pos_inf)  # last valid pool block
+
+
+def force_maintain_logits_decode_triton(
+    logits: torch.Tensor,                  # [B, max_seq_len] f32 (or [B, 1, max_seq_len])
+    num_pool_blocks_per_req: torch.Tensor,  # [B] i32
+) -> torch.Tensor:
+    """Decode-specific force_maintain: writes +inf at pool block 0 and at
+    ``num_pool_blocks_per_req - 1`` per row. ``ks`` is implicitly 0 — for
+    paged decode, every request's pool blocks start at logical index 0 in
+    its own pool_page_table. Avoids the per-call cu_ks_zero alloc that
+    ``force_maintain_logits_triton`` requires.
+    """
+    assert logits.dtype == torch.float32
+    if logits.dim() == 3:
+        B, S, L = logits.shape
+        logits_2d = logits.view(B * S, L)
+    else:
+        logits_2d = logits
+    assert logits_2d.dim() == 2 and logits_2d.stride(1) == 1
+    seq = logits_2d.shape[0]
+    if seq == 0:
+        return logits
+    _force_maintain_logits_decode_kernel[(seq,)](
+        logits_2d, num_pool_blocks_per_req,
+        logits_2d.stride(0),
     )
     return logits
 
