@@ -3539,6 +3539,12 @@ class ServerArgs:
 
             self.disable_overlap_schedule = True
             self.enable_mixed_chunk = False
+            if not self.disable_radix_cache:
+                self.disable_radix_cache = True
+                logger.warning(
+                    "Radix cache is disabled because NGRAM speculative decoding "
+                    "can reuse KV from canceled or in-flight requests."
+                )
             self.speculative_eagle_topk = self.speculative_ngram_max_bfs_breadth
             if self.speculative_num_draft_tokens is None:
                 self.speculative_num_draft_tokens = 12
