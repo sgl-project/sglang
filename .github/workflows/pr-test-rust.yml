@@ -307,8 +307,8 @@ jobs:
               python3 -m pip --no-cache-dir install \
                 locust click rich tenacity oci openpyxl gevent matplotlib
             else
-              # Other extras (e.g. pytest-parallel, which legitimately
-              # needs tblib) — normal install path.
+              # Other extras with well-behaved transitive deps —
+              # normal --upgrade install path.
               python3 -m pip --no-cache-dir install --upgrade ${{ matrix.extra_deps }}
             fi
           fi
