@@ -115,9 +115,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
-    # DSV4 mxfp4 routed-expert weight layout. When True the deep_gemm wrapper
-    # is called with recipe_a=(1,128), recipe_b=(1,32). Set by Fp8MoEMethod
-    # from its own quant_config; default False for non-DSV4 paths.
+    # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
 
 
@@ -175,7 +173,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         K = hidden_states_shape[1]
         scale_block_size = 128
 
-        # DSV4 mxfp4 expert layout requires a non-default GEMM recipe.
         recipe_a, recipe_b = (
             ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
         )
@@ -299,7 +296,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         w13_scale = quant_info.w13_scale
         w2_scale = quant_info.w2_scale
 
-        # DSV4 mxfp4 expert layout requires a non-default GEMM recipe.
         recipe_a, recipe_b = (
             ((1, 128), (1, 32)) if quant_info.is_fp4_experts else (None, None)
         )

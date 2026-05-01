@@ -179,11 +179,9 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
-        # FP4 vs FP8 routed-expert storage for DeepSeek V4. Default True
-        # (mxfp4) for non-DSV4 paths where the value is not consumed; DSV4
-        # paths must successfully auto-detect or the load is rejected (a
-        # silent fallback would later blow up as a tensor shape mismatch
-        # in Fp8MoEMethod.create_weights).
+        # DSV4 routed-expert layout: mxfp4-packed (True) or converted FP8 (False).
+        # Detect failure raises here -- a silent default would later blow up as
+        # a shape mismatch in Fp8MoEMethod.create_weights.
         self.is_fp4_experts: bool = True
         if is_deepseek_v4(self.hf_config):
             from sglang.srt.configs.deepseek_v4 import detect_fp4_experts
@@ -192,10 +190,9 @@ class ModelConfig:
             if detected is None:
                 raise ValueError(
                     f"Could not auto-detect DSV4 routed-expert layout from "
-                    f"{self.model_path!r}. Expected the safetensors header to "
-                    "expose a routed-expert weight with dtype U8/I8/F4 "
-                    "(mxfp4-packed) or F8_E4M3 (converted FP8). If the model "
-                    "is remote, ensure it's been downloaded locally first."
+                    f"{self.model_path!r}. Download the checkpoint locally if "
+                    "remote; otherwise the safetensors header is missing a "
+                    "routed-expert weight with dtype U8/I8/F4 or F8_E4M3."
                 )
             self.is_fp4_experts = detected
             logger.info(

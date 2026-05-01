@@ -10,14 +10,8 @@ logger = logging.getLogger(__name__)
 
 
 def detect_fp4_experts(model_path: str) -> Optional[bool]:
-    """Detect routed-expert weight layout from the checkpoint's safetensors
-    header.
-
-    Returns ``True`` for mxfp4-packed experts (stored as ``U8``/``I8``/``F4``),
-    ``False`` for FP4-to-FP8 converted experts (stored as ``F8_E4M3``), or
-    ``None`` when the layout can't be determined (remote model, no matching
-    weight key, unexpected dtype).
-    """
+    """True for mxfp4-packed (U8/I8/F4), False for converted FP8 (F8_E4M3),
+    None if not determinable (remote / no matching key / unexpected dtype)."""
     from sglang.srt.model_loader.weight_utils import (
         probe_routed_expert_weight_dtype,
     )

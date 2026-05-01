@@ -277,12 +277,9 @@ class TopK(MultiPlatformOp):
             assert num_expert_group is not None and topk_group is not None
 
         self.layer_id = layer_id
-        # DSV4 mxfp4 routed-expert layout flag. On the flashinfer_mxfp4 backend,
-        # True keeps the STANDARD topk output (consumed by DeepSeekMxfp4MoEMethod);
-        # False switches to BYPASSED so flashinfer's own mxfp4 path takes the
-        # router output directly. Off the mxfp4 backend the flag has no effect.
-        # DSV4 paths derive this from quant_config; other callers can leave the
-        # default.
+        # On flashinfer_mxfp4: True keeps STANDARD output for DeepSeekMxfp4MoEMethod,
+        # False routes through flashinfer's own mxfp4 path via BYPASSED.
+        # No effect off the mxfp4 backend.
         self.is_fp4_experts = is_fp4_experts
         self.topk_config = TopKConfig(
             top_k=top_k,

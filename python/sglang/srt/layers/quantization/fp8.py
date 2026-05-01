@@ -143,9 +143,8 @@ class Fp8Config(QuantizationConfig):
         is_fp4_experts: bool = False,
     ) -> None:
         super().__init__()
-        # DSV4-specific: routed-expert weights stored as packed mxfp4 (True)
-        # vs FP4-to-FP8 converted (False). Set by the model_loader from
-        # model_config; default False for non-DSV4 paths.
+        # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
+        # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
