@@ -9,13 +9,13 @@ from sglang.srt.utils.custom_op import register_custom_op
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_SIZE_SEQ': 1}, num_warps=8),
-        triton.Config({'BLOCK_SIZE_SEQ': 2}, num_warps=8),
-        triton.Config({'BLOCK_SIZE_SEQ': 4}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_SEQ': 8}, num_warps=4),
-        triton.Config({'BLOCK_SIZE_SEQ': 16}, num_warps=4),
+        triton.Config({"BLOCK_SIZE_SEQ": 1}, num_warps=8),
+        triton.Config({"BLOCK_SIZE_SEQ": 2}, num_warps=8),
+        triton.Config({"BLOCK_SIZE_SEQ": 4}, num_warps=4),
+        triton.Config({"BLOCK_SIZE_SEQ": 8}, num_warps=4),
+        triton.Config({"BLOCK_SIZE_SEQ": 16}, num_warps=4),
     ],
-    key=['SEQ', 'DIM'],
+    key=["SEQ", "DIM"],
 )
 # Adapted from https://github.com/ModelTC/LightX2V/blob/main/lightx2v/common/ops/norm/triton_ops.py#L905-L956
 @triton.jit
@@ -58,7 +58,7 @@ def _triton_one_pass_rms_norm_cuda(
     y_view = y.reshape(-1, shape[-1])
     S, D = x_view.shape
 
-    grid=lambda Meta:(triton.cdiv(S,Meta['BLOCk_SIZE_SEQ']),)
+    grid = lambda Meta: (triton.cdiv(S, Meta["BLOCk_SIZE_SEQ"]),)
 
     with torch.get_device_module().device(x.device):
         _rms_norm_tiled_onepass[grid](
