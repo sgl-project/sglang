@@ -1393,6 +1393,14 @@ class CudaGraphRunner:
         use_foreach_copy: bool = False,
     ):
         """Lazily compile and call _populate_from_forward_batch_and_init_attn_backend."""
+
+        # Inside the compiled helper, derive real batch/token counts from
+        # forward_batch tensor shapes (use_forward_batch_shape=True) instead of raw_bs/raw_num_token.
+        # Those real request sizes vary within the same captured CUDA
+        # graph bucket; using Python ints for them would make Dynamo
+        # specialize and recompile.
+
+        # We also remove the condition bs != raw_bs (always_fill_padding=True) for the same reason.
         self._populate_from_forward_batch_and_init_attn_backend(
             forward_batch=forward_batch,
             pp_proxy_tensors=pp_proxy_tensors,
