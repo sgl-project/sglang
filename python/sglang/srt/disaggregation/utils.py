@@ -35,6 +35,14 @@ class DisaggregationMode(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
 
+    @staticmethod
+    def to_engine_type(mode: str) -> str:
+        if mode == DisaggregationMode.PREFILL.value:
+            return "prefill"
+        elif mode == DisaggregationMode.DECODE.value:
+            return "decode"
+        return "unified"
+
 
 #########################
 # Synchronization
@@ -429,26 +437,6 @@ def get_kv_class(
         return class_mapping.get(class_type)
 
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
-
-
-#########################
-# KV Pages
-#########################
-
-
-def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
-    # 1. The page is guaranteed to be full except the last page.
-    # 2. page index = kv_index // page_size
-    # The return vector is kv_indices[::page_size] // page_size
-    if page_size == 1:  # shortcut
-        return kv_indices
-
-    return kv_indices[::page_size] // page_size
-
-
-def kv_to_page_num(num_kv_indices: int, page_size: int):
-    # ceil(num_kv_indices / page_size)
-    return (num_kv_indices + page_size - 1) // page_size
 
 
 def page_indices_to_cp_rank_page_indices(

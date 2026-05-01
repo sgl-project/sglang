@@ -160,11 +160,8 @@ clean_site_packages() {
         set -x
     fi
 
-    # Install protoc
-    bash "${SCRIPT_DIR}/../utils/install_protoc.sh"
-
-    # Install Rust toolchain (needed by setuptools-rust, e.g. the native gRPC extension)
-    bash "${SCRIPT_DIR}/../utils/install_rustup.sh"
+    # Install protoc + Rust toolchain (needed by setuptools-rust, e.g. the native gRPC extension)
+    bash "${SCRIPT_DIR}/../utils/install_rust_protoc.sh"
     export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 
     mark_step_done "${FUNCNAME[0]}"
@@ -236,6 +233,16 @@ install_sglang() {
     fi
     echo "Installing python extras: [${EXTRAS}]"
     $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+
+    # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
+    # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
+    # If the file is missing, force-reinstall the wheel before downstream steps.
+    SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
+    if [ ! -f "$SITE_PACKAGES/nvidia/cusparselt/lib/libcusparseLt.so.0" ] \
+       && pip show nvidia-cusparselt-cu13 >/dev/null 2>&1; then
+        echo "WARNING: nvidia-cusparselt-cu13 metadata present but libcusparseLt.so.0 missing — reinstalling"
+        $PIP_CMD install --reinstall nvidia-cusparselt-cu13 $PIP_INSTALL_SUFFIX
+    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -370,12 +377,26 @@ stabilize_flashinfer_jit_paths() {
 install_extra_deps() {
     if [ "$CU_MAJOR" = "13" ]; then
         MOONCAKE_PKG="mooncake-transfer-engine-cuda13==0.3.10.post2"
+        MOONCAKE_STALE_PKG="mooncake-transfer-engine"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc"
     else
         MOONCAKE_PKG="mooncake-transfer-engine==0.3.10.post2"
+        MOONCAKE_STALE_PKG="mooncake-transfer-engine-cuda13"
         EXTRA_NVIDIA_SPECS="nvidia-cuda-nvrtc-cu12"
     fi
+    # Both variants own the same mooncake/ package files and bin/ scripts
+    # (mooncake_master, etc.). Uninstalling the stale variant deletes shared
+    # files that the live variant's RECORD still references, so we force a
+    # reinstall to restore them — pip would otherwise see "already satisfied"
+    # and skip.
+    if pip show ${MOONCAKE_STALE_PKG} >/dev/null 2>&1; then
+        $PIP_UNINSTALL_CMD ${MOONCAKE_STALE_PKG} $PIP_UNINSTALL_SUFFIX || true
+        $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    fi
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+
+    # Best-effort NIXL install for decode-radix disaggregation coverage.
+    $PIP_CMD install nixl $PIP_INSTALL_SUFFIX || echo "Warning: nixl install failed; continuing without nixl"
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git

@@ -60,6 +60,7 @@ from sglang.multimodal_gen.runtime.layers.attention.STA_configuration import (
 from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader import (
     TransformerLoader,
 )
+from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
@@ -87,11 +88,10 @@ from sglang.multimodal_gen.runtime.post_training.rollout_denoising_mixin import 
     RolloutDenoisingMixin,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.utils import dict_to_3d_list
+from sglang.multimodal_gen.utils import PRECISION_TO_TYPE, dict_to_3d_list
 from sglang.srt.utils.common import get_compiler_backend
 
 logger = init_logger(__name__)
@@ -194,6 +194,49 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self._cache_dit_enabled = False
         self._cached_num_steps = None
         self._is_warmed_up = False
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        uses: list[ComponentUse] = []
+        if self.vae is not None:
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name="vae",
+                    target_dtype=vae_dtype,
+                )
+            )
+        for default_name, module in (
+            ("transformer", self.transformer),
+            ("transformer_2", self.transformer_2),
+        ):
+            if module is None:
+                continue
+            component_name = self._component_name_for_stage_module(module, default_name)
+            uses.append(
+                ComponentUse(
+                    stage_name=stage_name,
+                    component_name=component_name,
+                    phase=component_name,
+                    preferred_ready_after_request=component_name == "transformer",
+                    memory_intensive=True,
+                )
+            )
+        return uses
+
+    def _component_name_for_stage_module(
+        self, module: nn.Module | None, default_name: str
+    ) -> str:
+        pipeline = self.pipeline() if self.pipeline else None
+        if pipeline is None or module is None:
+            return default_name
+        for name, candidate in pipeline.modules.items():
+            if candidate is module:
+                return name
+        return default_name
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -572,13 +615,22 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # TI2V specific preparations - before SP sharding
         if should_preprocess_for_wan_ti2v:
-            seq_len, z, reserved_frames_masks = prepare_wan_ti2v_latents(
-                self.vae,
-                latents,
-                target_dtype,
-                batch,
-                server_args,
-            )
+            vae_dtype = PRECISION_TO_TYPE[server_args.pipeline_config.vae_precision]
+            with self.use_declared_component(
+                component_name="vae",
+                module=self.vae,
+                target_dtype=vae_dtype,
+            ) as vae:
+                assert vae is not None
+                self.vae = vae
+                seq_len, z, reserved_frames_masks = prepare_wan_ti2v_latents(
+                    self.vae,
+                    latents,
+                    target_dtype,
+                    vae_dtype,
+                    batch,
+                    server_args,
+                )
         else:
             seq_len, z, reserved_frames_masks = (
                 None,
@@ -621,6 +673,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             {
                 "encoder_hidden_states_2": batch.clip_embedding_pos,
                 "encoder_attention_mask": batch.prompt_attention_mask,
+                "encoder_hidden_states_mask": batch.prompt_attention_mask,
             }
             | server_args.pipeline_config.prepare_pos_cond_kwargs(
                 batch,
@@ -641,6 +694,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 {
                     "encoder_hidden_states_2": batch.clip_embedding_neg,
                     "encoder_attention_mask": batch.negative_attention_mask,
+                    "encoder_hidden_states_mask": batch.negative_attention_mask,
                 }
                 | server_args.pipeline_config.prepare_neg_cond_kwargs(
                     batch,
@@ -763,7 +817,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, batch: Req
     ) -> Callable[[Any], bool] | list[Callable[[Any], bool]]:
         """Return the prompt-embedding validator used by verify_input."""
-        del batch
         return V.list_not_empty
 
     def _get_negative_prompt_embeds_validator(
@@ -926,9 +979,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         ):
             self.save_sta_search_results(batch)
 
-        # Capture references before potential deletion on MPS
-        dits = list(filter(None, [self.transformer, self.transformer_2]))
-
         # deallocate transformer if on mps
         pipeline = self.pipeline() if self.pipeline else None
         if torch.backends.mps.is_available() and not is_warmup:
@@ -944,14 +994,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "Memory after deallocating transformer: %s",
                 torch.mps.current_allocated_memory(),
             )
-
-        # reset offload managers with prefetching first layer for next forward
-        for dit in dits:
-            if isinstance(dit, OffloadableDiTMixin):
-                # release all DiT weights to avoid peak VRAM usage, which may increasing the latency for next req
-                # TODO: should be make this an option?
-                for manager in dit.layerwise_offload_managers:
-                    manager.release_all()
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         """Shard latents for Sequence Parallelism if applicable."""
@@ -1024,35 +1066,32 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if profiler:
             profiler.step_denoising_step()
 
-    def _manage_device_placement(
+    def _manage_dit_use_site(
         self,
-        model_to_use: nn.Module,
-        model_to_offload: nn.Module | None,
-        server_args: ServerArgs,
-    ):
+        current_model: nn.Module,
+        current_phase: str,
+        batch: Req,
+    ) -> None:
         """
-        Manages the offload / load behavior of dit
+        manage dit's residency by reporting the active sequential use
+
+        only applicable for dual-dit architecture like Wan
+
+        Args:
+            current_model: the next active dit, transformer_1 or transformer_2
         """
-        if not server_args.dit_cpu_offload:
-            return
+        manager = self._component_residency_manager
 
-        # FSDP manages offloading internally
-        if server_args.use_fsdp_inference:
-            return
-
-        # Offload the unused model if it's on CUDA
-        if (
-            model_to_offload is not None
-            and next(model_to_offload.parameters()).device.type == "cuda"
-        ):
-            model_to_offload.to("cpu")
-
-        # Load the model to use if it's on CPU
-        if (
-            model_to_use is not None
-            and next(model_to_use.parameters()).device.type == "cpu"
-        ):
-            model_to_use.to(get_local_torch_device())
+        component_name = manager.component_name_for_module(current_model, current_phase)
+        phase = str(batch.extra.get("ltx2_phase", current_phase))
+        use = ComponentUse(
+            stage_name=self._active_component_stage_name(),
+            component_name=component_name,
+            phase=phase,
+            preferred_ready_after_request=component_name == "transformer",
+            memory_intensive=True,
+        )
+        manager.begin_use(use)
 
     def _select_and_manage_model(
         self,
@@ -1064,15 +1103,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if boundary_timestep is None or t_int >= boundary_timestep:
             # High-noise stage
             current_model = self.transformer
-            model_to_offload = self.transformer_2
             current_guidance_scale = batch.guidance_scale
+            current_phase = "transformer"
         else:
             # Low-noise stage
             current_model = self.transformer_2
-            model_to_offload = self.transformer
             current_guidance_scale = batch.guidance_scale_2
+            current_phase = "transformer_2"
 
-        self._manage_device_placement(current_model, model_to_offload, server_args)
+        self._manage_dit_use_site(current_model, current_phase, batch)
 
         assert current_model is not None, "The model for the current step is not set."
         return current_model, current_guidance_scale
@@ -1192,6 +1231,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "average time per step: %.4f seconds",
                 (denoising_end_time - denoising_start_time) / len(ctx.timesteps),
             )
+
+        self._finish_active_component_use()
 
         # Rollout postprocessing must run BEFORE _finalize_denoising_loop so
         # the final scheduler.step output (ctx.latents) is still SP-sharded and

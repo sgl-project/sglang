@@ -1160,22 +1160,12 @@ class LTX2DenoisingStage(DenoisingStage):
         self, ctx: LTX2DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Reset the mirrored audio scheduler before the shared loop begins."""
-        if ctx.stage in ("stage1", "stage2"):
+        if is_ltx2_two_stage_pipeline_name(
+            server_args.pipeline_class_name
+        ) and ctx.stage in ("stage1", "stage2"):
             pipeline = self.pipeline() if self.pipeline else None
-            switch_lora_phase = (
-                getattr(pipeline, "switch_lora_phase", None)
-                if pipeline is not None
-                else None
-            )
-            if callable(switch_lora_phase):
-                switch_lora_phase(ctx.stage, batch=batch)
-            ensure_phase_ready = (
-                getattr(pipeline, "ensure_ltx2_phase_ready", None)
-                if pipeline is not None
-                else None
-            )
-            if callable(ensure_phase_ready):
-                ensure_phase_ready(ctx.stage)
+            if pipeline is not None:
+                pipeline.switch_lora_phase(ctx.stage, batch=batch)
         super()._before_denoising_loop(ctx, batch, server_args)
         if ctx.audio_scheduler is None:
             raise ValueError("LTX-2 audio scheduler was not prepared.")
@@ -1194,7 +1184,6 @@ class LTX2DenoisingStage(DenoisingStage):
     ):
         """Preserve the legacy LTX-2 attention-metadata contract."""
         # Legacy LTX-2 paths used the plain attention-metadata builder call here.
-        del ctx, t_int, timesteps_cpu
         return self._build_attn_metadata(step_index, batch, server_args)
 
     def _run_denoising_step(
@@ -1446,6 +1435,9 @@ class LTX2DenoisingStage(DenoisingStage):
                 and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
             )
         )
+        skip_v2a_cross_attn_for_video_gt = bool(
+            batch.extra.get("ltx2_skip_v2a_cross_attn_for_video_gt", False)
+        )
 
         def evaluate_stage1_guided_x0(
             *,
@@ -1476,6 +1468,9 @@ class LTX2DenoisingStage(DenoisingStage):
                                 encoder_hidden_states=encoder_hidden_states,
                                 audio_encoder_hidden_states=audio_encoder_hidden_states,
                                 encoder_attention_mask=encoder_attention_mask,
+                                disable_v2a_cross_attn=(
+                                    skip_v2a_cross_attn_for_video_gt
+                                ),
                             )
                         )
                         v_neg, a_v_neg = step.current_model(
@@ -1485,6 +1480,9 @@ class LTX2DenoisingStage(DenoisingStage):
                                 encoder_hidden_states=negative_encoder_hidden_states,
                                 audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
                                 encoder_attention_mask=negative_encoder_attention_mask,
+                                disable_v2a_cross_attn=(
+                                    skip_v2a_cross_attn_for_video_gt
+                                ),
                             )
                         )
 
@@ -1509,6 +1507,9 @@ class LTX2DenoisingStage(DenoisingStage):
                                     ),
                                     skip_audio_self_attn_blocks=tuple(
                                         stage1_guider_params["audio_stg_blocks"]
+                                    ),
+                                    disable_v2a_cross_attn=(
+                                        skip_v2a_cross_attn_for_video_gt
                                     ),
                                 )
                             )
@@ -1539,12 +1540,14 @@ class LTX2DenoisingStage(DenoisingStage):
                             encoder_hidden_states=encoder_hidden_states,
                             audio_encoder_hidden_states=audio_encoder_hidden_states,
                             encoder_attention_mask=encoder_attention_mask,
+                            disable_v2a_cross_attn=skip_v2a_cross_attn_for_video_gt,
                         ),
                         LTX2GuidancePassSpec(
                             name="neg",
                             encoder_hidden_states=negative_encoder_hidden_states,
                             audio_encoder_hidden_states=negative_audio_encoder_hidden_states,
                             encoder_attention_mask=negative_encoder_attention_mask,
+                            disable_v2a_cross_attn=skip_v2a_cross_attn_for_video_gt,
                         ),
                     ]
                     if need_perturbed:
@@ -1560,6 +1563,7 @@ class LTX2DenoisingStage(DenoisingStage):
                                 skip_audio_self_attn_blocks=tuple(
                                     stage1_guider_params["audio_stg_blocks"]
                                 ),
+                                disable_v2a_cross_attn=skip_v2a_cross_attn_for_video_gt,
                             )
                         )
                     if need_modality:
@@ -1981,7 +1985,6 @@ class LTX2DenoisingStage(DenoisingStage):
 
     def _get_prompt_embeds_validator(self, batch: Req):
         """Allow either tensor or list prompt embeddings for LTX-2 prompts."""
-        del batch
         return lambda x: V.is_tensor(x) or V.list_not_empty(x)
 
     def _get_negative_prompt_embeds_validator(self, batch: Req):
