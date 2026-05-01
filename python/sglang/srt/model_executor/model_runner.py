@@ -329,13 +329,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
         self.device = server_args.device
-        self.physical_gpu_id = gpu_id
-        self.gpu_id = (
-            0
-            if self.device == "neuron"
-            and os.environ.get("NEURON_RT_VISIBLE_CORES") is not None
-            else gpu_id
-        )
+        self.gpu_id = gpu_id
         self.tp_rank = tp_rank
         self.tp_size = tp_size
         self.moe_ep_rank = moe_ep_rank

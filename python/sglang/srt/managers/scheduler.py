@@ -387,7 +387,6 @@ class Scheduler(
         self.max_recv_per_poll = envs.SGLANG_SCHEDULER_MAX_RECV_PER_POLL.get()
         self.enable_hisparse = server_args.enable_hisparse
         self.hisparse_coordinator: Optional[HiSparseCoordinator] = None
-        self.check_neuron_visible_cores()
 
         # Distributed rank info
         self.attn_tp_rank, self.attn_tp_size, self.attn_dp_rank = (
@@ -474,32 +473,6 @@ class Scheduler(
         self.grammar_manager = GrammarManager(self)
 
         self.is_initializing = False
-
-    def check_neuron_visible_cores(self):
-        if self.server_args.device != "neuron":
-            return
-
-        visible_cores = os.environ.get("NEURON_RT_VISIBLE_CORES")
-        message = (
-            "Neuron scheduler core isolation: "
-            f"pid={os.getpid()} tp_rank={self.tp_rank} gpu_id={self.gpu_id} "
-            f"NEURON_RT_VISIBLE_CORES={visible_cores}"
-        )
-        logger.info(message)
-        print(f"[sglang-neuron] {message}", flush=True)
-
-        if visible_cores is None:
-            logger.warning(
-                "NEURON_RT_VISIBLE_CORES is not set in the scheduler process. "
-                "Neuron runtime may try to allocate all cores."
-            )
-            return
-        expected = str(self.gpu_id)
-        if visible_cores != expected:
-            logger.warning(
-                "NEURON_RT_VISIBLE_CORES does not match scheduler gpu_id: "
-                f"expected {expected}, got {visible_cores}."
-            )
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
@@ -1411,9 +1384,8 @@ class Scheduler(
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         # Not every torch device module exposes the StreamContext class directly.
-        # For example, torch.get_device_module("neuron") returns torch_neuronx.neuron,
-        # which provides stream(...) but not StreamContext. Prefer the class when it
-        # exists and fall back to the portable helper otherwise.
+        # Prefer the class when it exists and fall back to the portable helper
+        # otherwise.
         stream_context = getattr(self.device_module, "StreamContext", None)
         if stream_context is not None:
             stream_context = stream_context(self.schedule_stream)

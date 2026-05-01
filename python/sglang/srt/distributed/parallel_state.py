@@ -57,6 +57,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.oot import get_oot_group_coordinator_device, is_oot
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -275,6 +276,8 @@ class GroupCoordinator:
             self.device = torch.device(f"xpu:{local_rank}")
         elif _is_musa:
             self.device = torch.device(f"musa:{local_rank}")
+        elif is_oot():
+            self.device = get_oot_group_coordinator_device(local_rank)
         else:
             self.device = torch.device("cpu")
         self.device_module = torch.get_device_module(self.device)
@@ -1428,7 +1431,7 @@ def init_model_parallel_group(
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=(
-            not (_is_npu or _is_xpu or backend == "mooncake")
+            not (_is_npu or _is_xpu or is_oot() or backend == "mooncake")
             if use_pynccl is None
             else use_pynccl
         ),

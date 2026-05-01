@@ -2069,8 +2069,12 @@ def direct_register_custom_op(
 
     try:
         my_lib.define(op_name + schema_str)
+        from sglang.srt.utils.oot import is_oot
+
         if is_npu():
             # https://github.com/sgl-project/sglang/pull/12287/files#r2499583982
+            my_lib.impl(op_name, op_func, "PrivateUse1")
+        elif is_oot():
             my_lib.impl(op_name, op_func, "PrivateUse1")
         elif is_xpu():
             my_lib.impl(op_name, op_func, "XPU")

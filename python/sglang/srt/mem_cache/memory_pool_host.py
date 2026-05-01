@@ -37,15 +37,15 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     NSATokenToKVPool,
 )
-from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_mps, is_npu, is_xpu
+from sglang.srt.utils.oot import is_oot
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 _is_mps = is_mps()
-_is_neuron = current_platform.device_name == "neuron"
-if not (_is_npu or _is_xpu or _is_mps or _is_neuron):
+_is_oot = is_oot()
+if not (_is_npu or _is_xpu or _is_mps or _is_oot):
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer,
         transfer_kv_all_layer_direct_lf_pf,
