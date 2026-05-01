@@ -7,10 +7,11 @@ use axum::{
     http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
 };
+use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine};
+use bytes::Bytes;
 use futures_util::StreamExt;
 use memchr::memmem;
 use reqwest::Client;
-use serde::Serialize;
 use serde_json::{json, Value};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tracing::{debug, error, warn};
@@ -40,7 +41,9 @@ use crate::{
     routers::{
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, RouterTrait,
+        header_utils,
+        http::{body_raw_to_value, parse_sglang_extensions},
+        RouterTrait,
     },
 };
 
@@ -60,9 +63,16 @@ struct PDRequestContext<'a> {
     batch_size: Option<usize>,
     is_stream: bool,
     return_logprob: bool,
+    return_routed_experts: bool,
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+}
+
+impl PDRequestContext<'_> {
+    fn needs_prefill_json_merge(&self) -> bool {
+        !self.is_stream && (self.return_logprob || self.return_routed_experts)
+    }
 }
 
 impl PDRouter {
@@ -274,10 +284,10 @@ impl PDRouter {
         Ok(original)
     }
 
-    async fn execute_dual_dispatch<T: Serialize + Clone>(
+    async fn execute_dual_dispatch(
         &self,
         headers: Option<&HeaderMap>,
-        original_request: &T,
+        request_json: Value,
         context: PDRequestContext<'_>,
     ) -> Response {
         let start_time = Instant::now();
@@ -295,9 +305,9 @@ impl PDRouter {
             endpoint,
             bool_to_static_str(context.is_stream),
         );
-        // Clone request once outside the retry loop, then use Arc to share across attempts
-        // This avoids O(retries) clones by sharing the same data
-        let shared_request = Arc::new(original_request.clone());
+        // Share the JSON across retry attempts via Arc to avoid O(retries)
+        // clones of potentially large multimodal payloads.
+        let shared_request = Arc::new(request_json);
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             {
@@ -327,10 +337,7 @@ impl PDRouter {
                             decode.url()
                         );
 
-                        let mut json_request = match serde_json::to_value(shared_request.as_ref()) {
-                            Ok(v) => v,
-                            Err(e) => return Self::handle_serialization_error(e),
-                        };
+                        let mut json_request = (*shared_request).clone();
 
                         json_request = match Self::inject_bootstrap_into_value(
                             json_request,
@@ -444,7 +451,7 @@ impl PDRouter {
                 "data: {{'error': {}}}",
                 serde_json::to_string(&error_payload).unwrap_or_default()
             );
-            let error_stream = tokio_stream::once(Ok(axum::body::Bytes::from(sse_data)));
+            let error_stream = tokio_stream::once(Ok(Bytes::from(sse_data)));
 
             let decode_url = decode.url().to_string();
             self.create_streaming_response(
@@ -601,12 +608,12 @@ impl PDRouter {
                 }
 
                 // Process prefill response
-                let prefill_body = if context.return_logprob {
+                let prefill_body = if context.needs_prefill_json_merge() {
                     match self
                         .process_prefill_response(
                             prefill_result,
                             prefill.url(),
-                            context.return_logprob,
+                            context.needs_prefill_json_merge(),
                         )
                         .await
                     {
@@ -627,12 +634,26 @@ impl PDRouter {
                 if context.is_stream {
                     // Streaming response
                     let prefill_logprobs = if context.return_logprob {
-                        prefill_body
-                            .as_ref()
-                            .and_then(|body| serde_json::from_slice::<Value>(body).ok())
-                            .and_then(|json| {
-                                json.pointer("/meta_info/input_token_logprobs").cloned()
-                            })
+                        prefill_body.as_ref().and_then(|body| {
+                            // On parse failure the client won't get
+                            // prefill logprobs merged into the stream;
+                            // warn so this is visible in logs (the
+                            // value is still `None` so the stream
+                            // degrades gracefully).
+                            match serde_json::from_slice::<Value>(body) {
+                                Ok(json) => {
+                                    json.pointer("/meta_info/input_token_logprobs").cloned()
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "streaming prefill logprobs unavailable: \
+                                         failed to parse prefill body as JSON: {}",
+                                        e
+                                    );
+                                    None
+                                }
+                            }
+                        })
                     } else {
                         None
                     };
@@ -651,11 +672,12 @@ impl PDRouter {
                     )
                 } else {
                     // Non-streaming response
-                    if context.return_logprob {
+                    if context.needs_prefill_json_merge() {
                         self.process_non_streaming_response(
                             res,
                             status,
                             context.return_logprob,
+                            context.return_routed_experts,
                             prefill_body,
                         )
                         .await
@@ -833,7 +855,7 @@ impl PDRouter {
     #[allow(clippy::too_many_arguments)]
     fn create_streaming_response(
         &self,
-        stream: impl futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + 'static,
+        stream: impl futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
         status: StatusCode,
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
@@ -897,13 +919,15 @@ impl PDRouter {
         AttachedBody::wrap_response(response, guards)
     }
 
-    // Helper to process non-streaming decode response with logprob merging
+    // Helper to process non-streaming decode response, merging prefill metadata
+    // (logprobs and/or routed_experts) into decode's JSON when requested.
     async fn process_non_streaming_response(
         &self,
         res: reqwest::Response,
         status: StatusCode,
         return_logprob: bool,
-        prefill_body: Option<bytes::Bytes>,
+        return_routed_experts: bool,
+        prefill_body: Option<Bytes>,
     ) -> Response {
         let response = res.bytes().await;
         let decode_body = match response {
@@ -914,7 +938,7 @@ impl PDRouter {
             }
         };
 
-        if !return_logprob {
+        if !return_logprob && !return_routed_experts {
             return (status, decode_body).into_response();
         }
 
@@ -922,16 +946,24 @@ impl PDRouter {
             return (status, decode_body).into_response();
         };
 
-        // Merge logprobs from prefill and decode
+        // Parse both bodies and merge prefill metadata (logprobs and/or
+        // routed_experts) into decode's JSON. Parse failure here means the
+        // client requested merged data but will receive decode-only — log as
+        // an error so it surfaces in dashboards, then degrade gracefully.
         let (Ok(prefill_json), Ok(mut decode_json)) = (
             serde_json::from_slice::<Value>(&prefill_body),
             serde_json::from_slice::<Value>(&decode_body),
         ) else {
-            warn!("Failed to parse responses for logprob merging");
+            error!("pd_response_parse_failed: returning decode-only response");
             return (status, decode_body).into_response();
         };
 
-        Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
+        Self::merge_prefill_json(
+            &prefill_json,
+            &mut decode_json,
+            return_logprob,
+            return_routed_experts,
+        );
 
         // Return merged response
         match serde_json::to_vec(&decode_json) {
@@ -943,13 +975,15 @@ impl PDRouter {
         }
     }
 
-    // Helper to process prefill response and extract body if needed for logprobs
+    // Helper to process prefill response and extract its body when prefill
+    // metadata needs to be merged into the decode response (logprobs or
+    // routed_experts).
     async fn process_prefill_response(
         &self,
         prefill_result: Result<reqwest::Response, reqwest::Error>,
         prefill_url: &str,
-        return_logprob: bool,
-    ) -> Result<(StatusCode, Option<bytes::Bytes>), Response> {
+        need_merge_prefill: bool,
+    ) -> Result<(StatusCode, Option<Bytes>), Response> {
         // Check prefill result first - it's critical for disaggregated mode
         let prefill_response = match prefill_result {
             Ok(response) => response,
@@ -1017,18 +1051,27 @@ impl PDRouter {
             return Err(error_response);
         }
 
-        // Read prefill body if needed for logprob merging
-        let prefill_body = if return_logprob {
+        // Read prefill body when the caller needs to merge prefill metadata back into decode.
+        let prefill_body = if need_merge_prefill {
             match prefill_response.bytes().await {
                 Ok(body) => Some(body),
                 Err(e) => {
-                    warn!("Failed to read prefill response body for logprobs: {}", e);
+                    // Client explicitly asked for merged data
+                    // (logprobs/routed_experts); without the prefill
+                    // body the response will silently degrade to
+                    // decode-only. Log as error so this surfaces in
+                    // dashboards.
+                    error!(
+                        "prefill_body_read_failed: caller wanted PD merge but \
+                         couldn't read prefill body, will return decode-only: {}",
+                        e
+                    );
                     None
                 }
             }
         } else {
-            // For non-logprob requests, just consume the response without storing
-            debug!("Consuming prefill response body (non-logprob request)");
+            // For passthrough requests, just consume the response without storing.
+            debug!("Consuming prefill response body (no PD merge requested)");
             match prefill_response.bytes().await {
                 Ok(_) => debug!("Prefill response consumed successfully"),
                 Err(e) => warn!("Error consuming prefill response: {}", e),
@@ -1092,12 +1135,107 @@ impl PDRouter {
         false
     }
 
+    /// Merge `routed_experts` from prefill into the decode response.
+    ///
+    /// SGLang's RL extension ships expert ids as a base64-packed byte
+    /// string. The decode worker echoes the prefill's leading bytes
+    /// (first `prefill_len` bytes of decode are the same as prefill)
+    /// and appends per-token expert ids in the suffix. To produce the
+    /// merged stream the gateway concatenates `prefill_bytes ++
+    /// decode_bytes[prefill_len..]` and writes that back into
+    /// `decode_json["routed_experts"]`. Returns `true` when a merge
+    /// happened, `false` if either side was missing or unparsable.
+    ///
+    /// Caller (`merge_prefill_json`) walks two known envelopes for this
+    /// field: `meta_info.routed_experts` on `/generate` responses, and
+    /// `sglext.routed_experts` on OpenAI-compatible responses. The
+    /// `sglext` envelope is a typed contract upstream — see
+    /// `python/sglang/srt/entrypoints/openai/protocol.py::SglExt`,
+    /// which currently carries `routed_experts` and
+    /// `cached_tokens_details` and is hung off `CompletionResponse`,
+    /// `ChatCompletionResponse`, and their streaming variants.
+    fn merge_routed_experts_in_json(prefill_json: &Value, decode_json: &mut Value) -> bool {
+        let (Some(prefill_routed_experts), Some(decode_routed_experts)) = (
+            prefill_json.get("routed_experts").and_then(Value::as_str),
+            decode_json.get("routed_experts").and_then(Value::as_str),
+        ) else {
+            return false;
+        };
+
+        // Base64 decode failures here mean the client asked for merged
+        // routed_experts but will receive only the decode-side payload (or
+        // none, depending on which side failed). Log as error so data-integrity
+        // events show up in dashboards, then leave decode_json untouched.
+        let prefill_bytes = match BASE64_STANDARD.decode(prefill_routed_experts) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                error!(
+                    "routed_experts_decode_failed (prefill): merge skipped: {}",
+                    error
+                );
+                return false;
+            }
+        };
+
+        let decode_bytes = match BASE64_STANDARD.decode(decode_routed_experts) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                error!(
+                    "routed_experts_decode_failed (decode): merge skipped: {}",
+                    error
+                );
+                return false;
+            }
+        };
+
+        let suffix = decode_bytes.get(prefill_bytes.len()..).unwrap_or_default();
+        let mut merged = Vec::with_capacity(prefill_bytes.len() + suffix.len());
+        merged.extend_from_slice(&prefill_bytes);
+        merged.extend_from_slice(suffix);
+
+        if let Some(obj) = decode_json.as_object_mut() {
+            obj.insert(
+                "routed_experts".to_string(),
+                Value::String(BASE64_STANDARD.encode(merged)),
+            );
+            return true;
+        }
+
+        false
+    }
+
+    fn merge_prefill_json(
+        prefill_json: &Value,
+        decode_json: &mut Value,
+        merge_logprobs: bool,
+        merge_routed_experts: bool,
+    ) {
+        if merge_logprobs {
+            Self::merge_logprobs_in_json(prefill_json, decode_json);
+        }
+
+        if merge_routed_experts {
+            if let (Some(prefill_meta), Some(decode_meta)) = (
+                prefill_json.get("meta_info"),
+                decode_json.get_mut("meta_info"),
+            ) {
+                Self::merge_routed_experts_in_json(prefill_meta, decode_meta);
+            }
+
+            if let (Some(prefill_sglext), Some(decode_sglext)) =
+                (prefill_json.get("sglext"), decode_json.get_mut("sglext"))
+            {
+                Self::merge_routed_experts_in_json(prefill_sglext, decode_sglext);
+            }
+        }
+    }
+
     // Simple helper to merge logprobs in streaming responses
     // Optimized to reduce allocations in the merge path
     fn merge_streaming_logprobs(
         prefill_logprobs: Option<Value>,
         decode_chunk: &[u8],
-    ) -> Result<bytes::Bytes, ()> {
+    ) -> Result<Bytes, ()> {
         // Skip non-data chunks
         let chunk_str = std::str::from_utf8(decode_chunk).map_err(|_| ())?;
         if !chunk_str.starts_with("data: ") || chunk_str.contains("[DONE]") {
@@ -1132,7 +1270,7 @@ impl PDRouter {
             "data: {}\n\n",
             serde_json::to_string(&decode_json).unwrap_or_default()
         );
-        Ok(bytes::Bytes::from(merged_str))
+        Ok(Bytes::from(merged_str))
     }
 }
 
@@ -1249,6 +1387,7 @@ impl RouterTrait for PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
+        body_raw: Option<&Bytes>,
         model_id: Option<&str>,
     ) -> Response {
         let is_stream = body.stream;
@@ -1262,23 +1401,53 @@ impl RouterTrait for PDRouter {
 
         let batch_size = Self::get_generate_batch_size(body);
 
+        let extensions = match parse_sglang_extensions(body_raw) {
+            Ok(ext) => ext,
+            Err(resp) => return resp,
+        };
+
+        if is_stream && extensions.return_routed_experts {
+            return error::bad_request(
+                "streaming_routed_experts_unsupported",
+                "return_routed_experts is not supported with stream=true on PD mode \
+                 (the streaming SSE path does not merge routed_experts across \
+                 prefill/decode); send the request with stream=false to receive \
+                 merged routed_experts",
+            );
+        }
+
+        // Prefer the raw request JSON so SGLang extension fields the typed
+        // GenerateRequest dropped survive through to the backend.
+        let body_json = body_raw_to_value(body_raw);
+
         let context = PDRequestContext {
             route: "/generate",
             batch_size,
             is_stream,
             return_logprob,
+            return_routed_experts: extensions.return_routed_experts,
             request_text,
             model_id,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        let request_json = match body_json {
+            Some(v) => v,
+            None => match serde_json::to_value(body) {
+                Ok(v) => v,
+                Err(e) => return Self::handle_serialization_error(e),
+            },
+        };
+
+        self.execute_dual_dispatch(headers, request_json, context)
+            .await
     }
 
     async fn route_chat(
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
+        body_raw: Option<&Bytes>,
         model_id: Option<&str>,
     ) -> Response {
         let is_stream = body.stream;
@@ -1304,17 +1473,44 @@ impl RouterTrait for PDRouter {
         // Calculate batch size
         let batch_size = Self::get_chat_batch_size(body);
 
+        let extensions = match parse_sglang_extensions(body_raw) {
+            Ok(ext) => ext,
+            Err(resp) => return resp,
+        };
+
+        if is_stream && extensions.return_routed_experts {
+            return error::bad_request(
+                "streaming_routed_experts_unsupported",
+                "return_routed_experts is not supported with stream=true on PD mode \
+                 (the streaming SSE path does not merge routed_experts across \
+                 prefill/decode); send the request with stream=false to receive \
+                 merged routed_experts",
+            );
+        }
+
+        let body_json = body_raw_to_value(body_raw);
+
         let context = PDRequestContext {
             route: "/v1/chat/completions",
             batch_size,
             is_stream,
             return_logprob,
+            return_routed_experts: extensions.return_routed_experts,
             request_text,
             model_id,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        let request_json = match body_json {
+            Some(v) => v,
+            None => match serde_json::to_value(body) {
+                Ok(v) => v,
+                Err(e) => return Self::handle_serialization_error(e),
+            },
+        };
+
+        self.execute_dual_dispatch(headers, request_json, context)
+            .await
     }
 
     async fn route_completion(
@@ -1343,12 +1539,19 @@ impl RouterTrait for PDRouter {
             batch_size,
             is_stream,
             return_logprob,
+            return_routed_experts: false,
             request_text,
             model_id,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        let request_json = match serde_json::to_value(body) {
+            Ok(v) => v,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+
+        self.execute_dual_dispatch(headers, request_json, context)
+            .await
     }
 
     async fn route_rerank(
@@ -1369,12 +1572,19 @@ impl RouterTrait for PDRouter {
             batch_size: None,
             is_stream: false,
             return_logprob: false,
+            return_routed_experts: false,
             request_text: req_text,
             model_id,
             headers: headers.cloned(),
         };
 
-        self.execute_dual_dispatch(headers, body, context).await
+        let request_json = match serde_json::to_value(body) {
+            Ok(v) => v,
+            Err(e) => return Self::handle_serialization_error(e),
+        };
+
+        self.execute_dual_dispatch(headers, request_json, context)
+            .await
     }
 
     async fn route_embeddings(
@@ -1558,7 +1768,7 @@ mod tests {
             assert_eq!(prefill_ref.load(), 1);
             assert_eq!(decode_ref.load(), 1);
 
-            tx.send(bytes::Bytes::from("test data")).unwrap();
+            tx.send(Bytes::from("test data")).unwrap();
 
             sleep(Duration::from_millis(10)).await;
 
@@ -1575,5 +1785,286 @@ mod tests {
         // Guards dropped when response dropped
         assert_eq!(prefill_ref.load(), 0);
         assert_eq!(decode_ref.load(), 0);
+    }
+
+    // ---------- needs_prefill_json_merge ----------
+
+    fn make_ctx(
+        is_stream: bool,
+        return_logprob: bool,
+        return_routed_experts: bool,
+    ) -> PDRequestContext<'static> {
+        PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size: None,
+            is_stream,
+            return_logprob,
+            return_routed_experts,
+            request_text: None,
+            model_id: None,
+            headers: None,
+        }
+    }
+
+    #[test]
+    fn needs_prefill_json_merge_streaming_is_always_false() {
+        // Streaming responses are merged in the SSE pipeline, not here, so
+        // needs_prefill_json_merge() must short-circuit even when flags are on.
+        assert!(!make_ctx(true, true, true).needs_prefill_json_merge());
+        assert!(!make_ctx(true, true, false).needs_prefill_json_merge());
+        assert!(!make_ctx(true, false, true).needs_prefill_json_merge());
+    }
+
+    #[test]
+    fn needs_prefill_json_merge_non_streaming_gates_on_either_flag() {
+        assert!(!make_ctx(false, false, false).needs_prefill_json_merge());
+        assert!(make_ctx(false, true, false).needs_prefill_json_merge());
+        assert!(make_ctx(false, false, true).needs_prefill_json_merge());
+        assert!(make_ctx(false, true, true).needs_prefill_json_merge());
+    }
+
+    // ---------- merge_routed_experts_in_json ----------
+
+    fn b64(bytes: &[u8]) -> String {
+        BASE64_STANDARD.encode(bytes)
+    }
+
+    fn decode_b64(s: &str) -> Vec<u8> {
+        BASE64_STANDARD.decode(s).expect("valid base64")
+    }
+
+    #[test]
+    fn merge_routed_experts_concatenates_prefill_prefix_with_decode_suffix() {
+        // Decode echoes prefill's leading bytes and appends per-token expert
+        // ids; merging must yield prefill_bytes ++ decode_bytes[prefill_len..].
+        let prefill_bytes = vec![1u8, 2, 3, 4];
+        let decode_bytes = vec![1u8, 2, 3, 4, 9, 9, 9];
+        let prefill = json!({ "routed_experts": b64(&prefill_bytes) });
+        let mut decode = json!({ "routed_experts": b64(&decode_bytes) });
+
+        assert!(PDRouter::merge_routed_experts_in_json(
+            &prefill,
+            &mut decode
+        ));
+
+        let merged = decode_b64(decode["routed_experts"].as_str().unwrap());
+        assert_eq!(merged, vec![1u8, 2, 3, 4, 9, 9, 9]);
+        // prefill input is untouched
+        assert_eq!(
+            decode_b64(prefill["routed_experts"].as_str().unwrap()),
+            prefill_bytes
+        );
+    }
+
+    #[test]
+    fn merge_routed_experts_when_decode_shorter_keeps_prefill_only() {
+        // Defensive: decode shorter than prefill (shouldn't happen in practice)
+        // — suffix slice is empty so the merged value equals prefill_bytes.
+        let prefill_bytes = vec![10u8, 20, 30, 40];
+        let decode_bytes = vec![10u8, 20];
+        let prefill = json!({ "routed_experts": b64(&prefill_bytes) });
+        let mut decode = json!({ "routed_experts": b64(&decode_bytes) });
+
+        assert!(PDRouter::merge_routed_experts_in_json(
+            &prefill,
+            &mut decode
+        ));
+
+        let merged = decode_b64(decode["routed_experts"].as_str().unwrap());
+        assert_eq!(merged, prefill_bytes);
+    }
+
+    #[test]
+    fn merge_routed_experts_returns_false_when_field_missing() {
+        let prefill_only = json!({ "routed_experts": b64(&[1u8, 2]) });
+        let mut decode_no_field = json!({ "other": "x" });
+        assert!(!PDRouter::merge_routed_experts_in_json(
+            &prefill_only,
+            &mut decode_no_field
+        ));
+
+        let prefill_no_field = json!({ "other": "x" });
+        let mut decode_only = json!({ "routed_experts": b64(&[1u8, 2]) });
+        assert!(!PDRouter::merge_routed_experts_in_json(
+            &prefill_no_field,
+            &mut decode_only
+        ));
+        // decode_only stays untouched on missing-prefill side
+        assert_eq!(
+            decode_b64(decode_only["routed_experts"].as_str().unwrap()),
+            vec![1u8, 2]
+        );
+    }
+
+    #[test]
+    fn merge_routed_experts_returns_false_on_invalid_base64() {
+        let prefill = json!({ "routed_experts": "!!!not-base64!!!" });
+        let mut decode = json!({ "routed_experts": b64(&[1u8]) });
+        assert!(!PDRouter::merge_routed_experts_in_json(
+            &prefill,
+            &mut decode
+        ));
+
+        let prefill = json!({ "routed_experts": b64(&[1u8]) });
+        let mut decode = json!({ "routed_experts": "!!!not-base64!!!" });
+        assert!(!PDRouter::merge_routed_experts_in_json(
+            &prefill,
+            &mut decode
+        ));
+    }
+
+    #[test]
+    fn merge_routed_experts_returns_false_when_value_not_string() {
+        // routed_experts is documented as a base64 string. If a server emits
+        // it as an array or number, treat as missing and bail out cleanly.
+        let prefill = json!({ "routed_experts": [1, 2, 3] });
+        let mut decode = json!({ "routed_experts": b64(&[1u8]) });
+        assert!(!PDRouter::merge_routed_experts_in_json(
+            &prefill,
+            &mut decode
+        ));
+    }
+
+    // ---------- merge_prefill_json ----------
+
+    #[test]
+    fn merge_prefill_json_logprobs_only_does_not_touch_routed_experts() {
+        let prefill_logprobs = json!([1.0, 2.0]);
+        let prefill = json!({
+            "meta_info": {
+                "input_token_logprobs": prefill_logprobs.clone(),
+                "routed_experts": b64(&[7u8, 7])
+            },
+            "sglext": { "routed_experts": b64(&[8u8, 8]) }
+        });
+        let mut decode = json!({
+            "meta_info": {
+                "input_token_logprobs": [3.0],
+                "routed_experts": b64(&[7u8, 7, 9])
+            },
+            "sglext": { "routed_experts": b64(&[8u8, 8, 9]) }
+        });
+
+        PDRouter::merge_prefill_json(&prefill, &mut decode, true, false);
+
+        // Logprobs merged: prefill ++ decode
+        assert_eq!(
+            decode["meta_info"]["input_token_logprobs"],
+            json!([1.0, 2.0, 3.0])
+        );
+        // Routed experts untouched on both meta_info and sglext
+        assert_eq!(
+            decode_b64(decode["meta_info"]["routed_experts"].as_str().unwrap()),
+            vec![7u8, 7, 9]
+        );
+        assert_eq!(
+            decode_b64(decode["sglext"]["routed_experts"].as_str().unwrap()),
+            vec![8u8, 8, 9]
+        );
+    }
+
+    #[test]
+    fn merge_prefill_json_routed_experts_only_does_not_touch_logprobs() {
+        let prefill = json!({
+            "meta_info": {
+                "input_token_logprobs": [1.0, 2.0],
+                "routed_experts": b64(&[1u8, 2])
+            },
+            "sglext": { "routed_experts": b64(&[3u8, 4]) }
+        });
+        let mut decode = json!({
+            "meta_info": {
+                "input_token_logprobs": [3.0],
+                "routed_experts": b64(&[1u8, 2, 5])
+            },
+            "sglext": { "routed_experts": b64(&[3u8, 4, 6]) }
+        });
+
+        PDRouter::merge_prefill_json(&prefill, &mut decode, false, true);
+
+        // Logprobs untouched (decode-only value preserved)
+        assert_eq!(decode["meta_info"]["input_token_logprobs"], json!([3.0]));
+        // Both routed_experts locations were merged
+        assert_eq!(
+            decode_b64(decode["meta_info"]["routed_experts"].as_str().unwrap()),
+            vec![1u8, 2, 5]
+        );
+        assert_eq!(
+            decode_b64(decode["sglext"]["routed_experts"].as_str().unwrap()),
+            vec![3u8, 4, 6]
+        );
+    }
+
+    #[test]
+    fn merge_prefill_json_both_flags_merges_both() {
+        let prefill = json!({
+            "meta_info": {
+                "input_token_logprobs": [0.5, 0.25],
+                "routed_experts": b64(&[1u8, 2])
+            },
+            "sglext": { "routed_experts": b64(&[10u8]) }
+        });
+        let mut decode = json!({
+            "meta_info": {
+                "input_token_logprobs": [0.1],
+                "routed_experts": b64(&[1u8, 2, 3])
+            },
+            "sglext": { "routed_experts": b64(&[10u8, 11]) }
+        });
+
+        PDRouter::merge_prefill_json(&prefill, &mut decode, true, true);
+
+        assert_eq!(
+            decode["meta_info"]["input_token_logprobs"],
+            json!([0.5, 0.25, 0.1])
+        );
+        assert_eq!(
+            decode_b64(decode["meta_info"]["routed_experts"].as_str().unwrap()),
+            vec![1u8, 2, 3]
+        );
+        assert_eq!(
+            decode_b64(decode["sglext"]["routed_experts"].as_str().unwrap()),
+            vec![10u8, 11]
+        );
+    }
+
+    #[test]
+    fn merge_prefill_json_both_false_is_noop() {
+        let prefill = json!({
+            "meta_info": {
+                "input_token_logprobs": [0.5],
+                "routed_experts": b64(&[1u8])
+            }
+        });
+        let original_decode = json!({
+            "meta_info": {
+                "input_token_logprobs": [0.1],
+                "routed_experts": b64(&[1u8, 2])
+            }
+        });
+        let mut decode = original_decode.clone();
+
+        PDRouter::merge_prefill_json(&prefill, &mut decode, false, false);
+
+        assert_eq!(decode, original_decode);
+    }
+
+    #[test]
+    fn merge_prefill_json_routed_experts_handles_missing_sections() {
+        // Only meta_info present; sglext absent on both sides.
+        let prefill = json!({
+            "meta_info": { "routed_experts": b64(&[1u8, 2]) }
+        });
+        let mut decode = json!({
+            "meta_info": { "routed_experts": b64(&[1u8, 2, 3]) }
+        });
+
+        PDRouter::merge_prefill_json(&prefill, &mut decode, false, true);
+
+        assert_eq!(
+            decode_b64(decode["meta_info"]["routed_experts"].as_str().unwrap()),
+            vec![1u8, 2, 3]
+        );
+        assert!(decode.get("sglext").is_none());
     }
 }

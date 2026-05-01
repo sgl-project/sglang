@@ -6,6 +6,7 @@ use axum::{
     middleware,
     response::IntoResponse,
 };
+use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, Criterion};
 use http_body_util::BodyExt;
 use smg::{
@@ -27,6 +28,7 @@ impl RouterTrait for MockRouter {
         &self,
         _headers: Option<&HeaderMap>,
         _body: &ChatCompletionRequest,
+        _body_raw: Option<&Bytes>,
         _model_id: Option<&str>,
     ) -> Response<Body> {
         StatusCode::OK.into_response()
@@ -43,13 +45,13 @@ async fn mock_next_streaming(_req: Request<Body>) -> Response<Body> {
     tokio::spawn(async move {
         // Send first chunk immediately
         let _ = tx
-            .send(Ok::<_, std::io::Error>(bytes::Bytes::from("chunk 1 ")))
+            .send(Ok::<_, std::io::Error>(Bytes::from("chunk 1 ")))
             .await;
         // Simulate generation delay
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         // Send final chunk
         let _ = tx
-            .send(Ok::<_, std::io::Error>(bytes::Bytes::from("chunk 2")))
+            .send(Ok::<_, std::io::Error>(Bytes::from("chunk 2")))
             .await;
     });
 

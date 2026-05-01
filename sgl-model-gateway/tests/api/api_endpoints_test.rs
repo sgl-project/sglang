@@ -41,6 +41,8 @@ mod health_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -85,6 +87,8 @@ mod health_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             },
             MockWorkerConfig {
                 port: 18004,
@@ -92,6 +96,8 @@ mod health_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             },
         ])
         .await;
@@ -118,6 +124,8 @@ mod health_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -154,6 +162,8 @@ mod generation_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -195,6 +205,8 @@ mod generation_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -231,6 +243,8 @@ mod generation_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 1.0, // Always fail
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -262,6 +276,8 @@ mod generation_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -307,6 +323,8 @@ mod model_info_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -345,6 +363,8 @@ mod model_info_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -390,6 +410,8 @@ mod model_info_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -503,6 +525,8 @@ mod model_info_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             },
             MockWorkerConfig {
                 port: 18205,
@@ -510,6 +534,8 @@ mod model_info_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             },
         ])
         .await;
@@ -547,6 +573,8 @@ mod model_info_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 1.0, // Always fail
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -584,6 +612,8 @@ mod router_policy_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             },
             MockWorkerConfig {
                 port: 18802,
@@ -591,6 +621,8 @@ mod router_policy_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             },
         ])
         .await;
@@ -626,6 +658,8 @@ mod router_policy_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -656,6 +690,8 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -695,6 +731,8 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -736,6 +774,8 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -785,6 +825,8 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -834,6 +876,8 @@ mod responses_endpoint_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -932,6 +976,8 @@ mod responses_endpoint_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             },
             MockWorkerConfig {
                 port: 18961,
@@ -939,6 +985,8 @@ mod responses_endpoint_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             },
         ])
         .await;
@@ -1006,6 +1054,8 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -1043,6 +1093,8 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -1097,6 +1149,8 @@ mod error_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             }],
         )
         .await;
@@ -1116,6 +1170,8 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -1154,6 +1210,8 @@ mod error_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -1192,6 +1250,8 @@ mod cache_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -1230,6 +1290,8 @@ mod cache_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             },
             MockWorkerConfig {
                 port: 18503,
@@ -1237,6 +1299,8 @@ mod cache_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             },
         ])
         .await;
@@ -1300,6 +1364,8 @@ mod load_balancing_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             },
             MockWorkerConfig {
                 port: 18602,
@@ -1307,6 +1373,8 @@ mod load_balancing_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             },
         ])
         .await;
@@ -1354,6 +1422,8 @@ mod pd_mode_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         });
 
         let mut decode_worker = MockWorker::new(MockWorkerConfig {
@@ -1362,6 +1432,8 @@ mod pd_mode_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         });
 
         let prefill_url = prefill_worker.start().await.unwrap();
@@ -1416,6 +1488,8 @@ mod request_id_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -1535,6 +1609,8 @@ mod request_id_tests {
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
                 fail_rate: 0.0,
+                routed_experts_b64: None,
+                always_emit_routed_experts: false,
             }],
         )
         .await;
@@ -1578,6 +1654,8 @@ mod rerank_tests {
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
             fail_rate: 0.0,
+            routed_experts_b64: None,
+            always_emit_routed_experts: false,
         }])
         .await;
 
@@ -1623,6 +1701,338 @@ mod rerank_tests {
         for result in results {
             assert!(result.get("document").is_some());
         }
+
+        ctx.shutdown().await;
+    }
+}
+
+/// SGLang extension fields (`return_routed_experts`, `routed_dp_rank`, etc.)
+/// must reach the backend in unified (non-PD) mode too — same SGLang
+/// server, same wire contract, just no prefill/decode merge step. The
+/// gateway forwards the raw request bytes (instead of re-serialising the
+/// typed struct) so unknown fields aren't lost to the typed-deserialize-
+/// then-reserialize round-trip.
+#[cfg(test)]
+mod sglang_extension_tests {
+    use super::*;
+
+    /// `return_routed_experts: true` against a unified backend should
+    /// surface the field in the response. This is pure passthrough — no
+    /// merge — so the test is satisfied by the field arriving back from
+    /// the worker (which echoes whatever `routed_experts_b64` it was
+    /// configured with).
+    #[tokio::test]
+    async fn test_unified_generate_forwards_routed_experts() {
+        let expected_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [10u8, 20, 30]);
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18120,
+            routed_experts_b64: Some(expected_b64.clone()),
+            ..MockWorkerConfig::default()
+        }])
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "text": "hi",
+            "return_routed_experts": true,
+            "stream": false,
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            body.pointer("/meta_info/routed_experts")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_b64.as_str()),
+            "unified /generate should pass routed_experts through (got: {body})"
+        );
+
+        // The backend must have actually seen the flag — proves the
+        // gateway didn't strip it during the typed-struct round-trip.
+        let received = &ctx.workers[0].recorded_requests()[0];
+        assert_eq!(received.get("return_routed_experts"), Some(&json!(true)));
+
+        ctx.shutdown().await;
+    }
+
+    /// Same shape for `/v1/chat/completions`.
+    #[tokio::test]
+    async fn test_unified_chat_forwards_routed_experts() {
+        let expected_b64 =
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, [40u8, 50, 60]);
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18121,
+            routed_experts_b64: Some(expected_b64.clone()),
+            ..MockWorkerConfig::default()
+        }])
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "return_routed_experts": true,
+            "stream": false,
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(
+            body.pointer("/sglext/routed_experts")
+                .and_then(serde_json::Value::as_str),
+            Some(expected_b64.as_str()),
+            "unified chat completion should pass routed_experts through (got: {body})"
+        );
+
+        let received = &ctx.workers[0].recorded_requests()[0];
+        assert_eq!(received.get("return_routed_experts"), Some(&json!(true)));
+
+        ctx.shutdown().await;
+    }
+
+    /// Companion of the PD passthrough test: unknown SGLang fields
+    /// (`routed_dp_rank` and any future-named field) must survive the
+    /// gateway round-trip in unified mode too.
+    #[tokio::test]
+    async fn test_unified_forwards_unknown_sglang_extensions() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18122,
+            ..MockWorkerConfig::default()
+        }])
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "text": "hi",
+            "stream": false,
+            "routed_dp_rank": 3,
+            "some_future_field": {"nested": [1, 2, 3]},
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &ctx.workers[0].recorded_requests()[0];
+        assert_eq!(received.get("routed_dp_rank"), Some(&json!(3)));
+        assert_eq!(
+            received.get("some_future_field"),
+            Some(&json!({"nested": [1, 2, 3]})),
+        );
+
+        ctx.shutdown().await;
+    }
+
+    /// Mirrors the PD test: malformed extension types must yield 400.
+    /// The PD path returned 400 from day one; the unified path was added
+    /// in this PR so without an explicit test a regression here would
+    /// be invisible.
+    #[tokio::test]
+    async fn test_unified_chat_rejects_invalid_extension_type() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18123,
+            ..MockWorkerConfig::default()
+        }])
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "return_routed_experts": "yes",
+            "stream": false,
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        ctx.shutdown().await;
+    }
+
+    /// Companion of the chat reject test, covering `/generate`. Each
+    /// route does its own `parse_sglang_extensions` call.
+    #[tokio::test]
+    async fn test_unified_generate_rejects_invalid_extension_type() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18124,
+            ..MockWorkerConfig::default()
+        }])
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "text": "hi",
+            "return_routed_experts": "yes",
+            "stream": false,
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        ctx.shutdown().await;
+    }
+
+    /// `dp_aware: true` takes a separate code path inside
+    /// `Router::send_typed_request` — it parses the body into a
+    /// `serde_json::Value` and injects `data_parallel_rank`. A
+    /// regression that read from `to_value(typed_req)` again instead of
+    /// from `body_raw_to_value` would silently strip every SGLang
+    /// extension field for dp-aware deployments while every other
+    /// unified test would still pass. The mock worker advertises
+    /// `dp_size: 1` via /server_info, so a single backend yields one
+    /// DPAwareWorker at rank 0.
+    #[tokio::test]
+    async fn test_unified_dp_aware_forwards_extensions() {
+        let port: u16 = 18125;
+        let config = RouterConfig::builder()
+            .regular_mode(vec![format!("http://127.0.0.1:{port}")])
+            .random_policy()
+            .enable_dp_aware()
+            .host("127.0.0.1")
+            .port(3850)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![MockWorkerConfig {
+                port,
+                ..MockWorkerConfig::default()
+            }],
+        )
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "text": "hi",
+            "stream": false,
+            "return_routed_experts": true,
+            "routed_dp_rank": 7,
+            "some_future_field": "preserved",
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let received = &ctx.workers[0].recorded_requests()[0];
+        assert_eq!(
+            received.get("data_parallel_rank"),
+            Some(&json!(0)),
+            "dp_aware path must inject data_parallel_rank"
+        );
+        assert_eq!(
+            received.get("return_routed_experts"),
+            Some(&json!(true)),
+            "extension fields must survive the dp_aware JSON re-injection"
+        );
+        assert_eq!(received.get("routed_dp_rank"), Some(&json!(7)));
+        assert_eq!(received.get("some_future_field"), Some(&json!("preserved")));
+
+        ctx.shutdown().await;
+    }
+
+    /// Unified router has no merge step, so streaming + return_routed_experts
+    /// should *not* be rejected (unlike PD where the SSE pipeline can't
+    /// merge prefill/decode bytes). The SGLang server emits the SglExt
+    /// envelope on each stream chunk (see `ChatCompletionStreamResponse`
+    /// upstream); the gateway just proxies SSE bytes unchanged. This
+    /// test pins that contract: 200 OK + the flag actually reached the
+    /// backend (proving the gateway didn't silently drop it during the
+    /// streaming setup).
+    #[tokio::test]
+    async fn test_unified_chat_streaming_forwards_routed_experts() {
+        let ctx = AppTestContext::new(vec![MockWorkerConfig {
+            port: 18126,
+            ..MockWorkerConfig::default()
+        }])
+        .await;
+        let app = ctx.create_app().await;
+
+        let payload = json!({
+            "model": "mock-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "return_routed_experts": true,
+            "stream": true,
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "unified streaming + return_routed_experts must not be rejected"
+        );
+
+        let received = &ctx.workers[0].recorded_requests()[0];
+        assert_eq!(
+            received.get("return_routed_experts"),
+            Some(&json!(true)),
+            "the streaming setup must still forward the flag to the backend"
+        );
+        assert_eq!(received.get("stream"), Some(&json!(true)));
 
         ctx.shutdown().await;
     }

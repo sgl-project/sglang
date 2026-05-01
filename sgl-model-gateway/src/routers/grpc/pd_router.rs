@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use axum::{http::HeaderMap, response::Response};
+use bytes::Bytes;
 use tracing::debug;
 
 use super::{context::SharedComponents, pipeline::RequestPipeline};
@@ -224,6 +225,7 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
+        _body_raw: Option<&Bytes>,
         model_id: Option<&str>,
     ) -> Response {
         self.route_generate_impl(headers, body, model_id).await
@@ -233,6 +235,7 @@ impl RouterTrait for GrpcPDRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
+        _body_raw: Option<&Bytes>,
         model_id: Option<&str>,
     ) -> Response {
         self.route_chat_impl(headers, body, model_id).await

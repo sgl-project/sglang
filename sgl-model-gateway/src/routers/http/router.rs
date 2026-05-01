@@ -7,6 +7,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use reqwest::Client;
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -38,7 +39,9 @@ use crate::{
     routers::{
         error::{self, extract_error_code_from_response},
         grpc::utils::{error_type_from_status, route_to_endpoint},
-        header_utils, RouterTrait,
+        header_utils,
+        http::{body_raw_to_value, parse_sglang_extensions},
+        RouterTrait,
     },
 };
 
@@ -194,6 +197,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
+        body_raw: Option<&Bytes>,
         route: &'static str,
         model_id: Option<&str>,
     ) -> Response {
@@ -218,7 +222,9 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_typed_request_once(
+                        headers, typed_req, body_raw, route, model_id, is_stream, &text,
+                    )
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -273,6 +279,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
+        body_raw: Option<&Bytes>,
         route: &'static str,
         model_id: Option<&str>,
         is_stream: bool,
@@ -310,6 +317,7 @@ impl Router {
             .send_typed_request(
                 headers,
                 typed_req,
+                body_raw,
                 route,
                 worker.url(),
                 is_stream,
@@ -486,6 +494,7 @@ impl Router {
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
+        body_raw: Option<&Bytes>,
         route: &'static str,
         worker_url: &str,
         is_stream: bool,
@@ -497,6 +506,13 @@ impl Router {
 
         // Static key string to avoid per-request allocations
         const DP_RANK_KEY: &str = "data_parallel_rank";
+
+        // Prefer the raw client bytes so SGLang extension fields (e.g.
+        // `return_routed_experts`) the typed struct dropped on deserialise
+        // still reach the backend. Falls back to the typed payload when
+        // the raw bytes aren't valid JSON or aren't available (callers
+        // that don't extract them from the request).
+        let body_value_from_raw = body_raw_to_value(body_raw);
 
         let mut request_builder = if self.dp_aware {
             let (worker_url_prefix, dp_rank) = match Self::extract_dp_rank(worker_url) {
@@ -510,14 +526,17 @@ impl Router {
                 }
             };
 
-            let mut json_val = match serde_json::to_value(typed_req) {
-                Ok(j) => j,
-                Err(e) => {
-                    return error::bad_request(
-                        "serialization_failed",
-                        format!("Convert into serde_json::Value failed: {}", e),
-                    );
-                }
+            let mut json_val = match body_value_from_raw {
+                Some(v) => v,
+                None => match serde_json::to_value(typed_req) {
+                    Ok(j) => j,
+                    Err(e) => {
+                        return error::bad_request(
+                            "serialization_failed",
+                            format!("Convert into serde_json::Value failed: {}", e),
+                        );
+                    }
+                },
             };
 
             if let Some(map) = json_val.as_object_mut() {
@@ -539,6 +558,10 @@ impl Router {
 
             self.client
                 .post(format!("{}{}", worker_url_prefix, route))
+                .json(&json_val)
+        } else if let Some(json_val) = body_value_from_raw {
+            self.client
+                .post(format!("{}{}", worker_url, route))
                 .json(&json_val)
         } else {
             self.client
@@ -739,9 +762,18 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         body: &GenerateRequest,
+        body_raw: Option<&Bytes>,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/generate", model_id)
+        // Validate SGLang extension types up front (e.g. reject
+        // `return_routed_experts: "yes"` as 400) so the unified router
+        // surfaces the same input-validation contract as the PD router.
+        // The parsed value is unused here — the unified path is pure
+        // passthrough — but the parse-side-effect still runs.
+        if let Err(resp) = parse_sglang_extensions(body_raw) {
+            return resp;
+        }
+        self.route_typed_request(headers, body, body_raw, "/generate", model_id)
             .await
     }
 
@@ -749,11 +781,24 @@ impl RouterTrait for Router {
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
+        body_raw: Option<&Bytes>,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+        if let Err(resp) = parse_sglang_extensions(body_raw) {
+            return resp;
+        }
+        self.route_typed_request(headers, body, body_raw, "/v1/chat/completions", model_id)
             .await
     }
+
+    // route_completion / route_responses / route_embeddings /
+    // route_classify / route_rerank pass `None` for `body_raw` because
+    // their handlers in `server.rs` consume the body via the
+    // `Json<T>` extractor, which never preserves the original bytes.
+    // SGLang extension fields on these endpoints (e.g. `regex`,
+    // `min_tokens`, `lora_path` on /v1/completions) are therefore
+    // dropped on this path; thread `body_raw` through if/when SGLang
+    // RL or similar features start needing them on completions etc.
 
     async fn route_completion(
         &self,
@@ -761,7 +806,7 @@ impl RouterTrait for Router {
         body: &CompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/completions", model_id)
+        self.route_typed_request(headers, body, None, "/v1/completions", model_id)
             .await
     }
 
@@ -771,7 +816,7 @@ impl RouterTrait for Router {
         body: &ResponsesRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/responses", model_id)
+        self.route_typed_request(headers, body, None, "/v1/responses", model_id)
             .await
     }
 
@@ -796,7 +841,7 @@ impl RouterTrait for Router {
         body: &EmbeddingRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/embeddings", model_id)
+        self.route_typed_request(headers, body, None, "/v1/embeddings", model_id)
             .await
     }
 
@@ -806,7 +851,7 @@ impl RouterTrait for Router {
         body: &ClassifyRequest,
         model_id: Option<&str>,
     ) -> Response {
-        self.route_typed_request(headers, body, "/v1/classify", model_id)
+        self.route_typed_request(headers, body, None, "/v1/classify", model_id)
             .await
     }
 
@@ -817,7 +862,7 @@ impl RouterTrait for Router {
         model_id: Option<&str>,
     ) -> Response {
         let response = self
-            .route_typed_request(headers, body, "/v1/rerank", model_id)
+            .route_typed_request(headers, body, None, "/v1/rerank", model_id)
             .await;
         if response.status().is_success() {
             match Self::build_rerank_response(body, response).await {

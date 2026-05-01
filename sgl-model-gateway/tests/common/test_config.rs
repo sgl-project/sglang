@@ -240,10 +240,7 @@ impl TestWorkerConfig {
     pub fn healthy(port: u16) -> MockWorkerConfig {
         MockWorkerConfig {
             port,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
+            ..MockWorkerConfig::default()
         }
     }
 
@@ -256,10 +253,8 @@ impl TestWorkerConfig {
     pub fn unhealthy(port: u16) -> MockWorkerConfig {
         MockWorkerConfig {
             port,
-            worker_type: WorkerType::Regular,
             health_status: HealthStatus::Unhealthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
+            ..MockWorkerConfig::default()
         }
     }
 
@@ -267,10 +262,8 @@ impl TestWorkerConfig {
     pub fn slow(port: u16, delay_ms: u64) -> MockWorkerConfig {
         MockWorkerConfig {
             port,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
             response_delay_ms: delay_ms,
-            fail_rate: 0.0,
+            ..MockWorkerConfig::default()
         }
     }
 
@@ -285,10 +278,8 @@ impl TestWorkerConfig {
     pub fn flaky(port: u16, fail_rate: f32) -> MockWorkerConfig {
         MockWorkerConfig {
             port,
-            worker_type: WorkerType::Regular,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
             fail_rate,
+            ..MockWorkerConfig::default()
         }
     }
 
@@ -297,9 +288,7 @@ impl TestWorkerConfig {
         MockWorkerConfig {
             port,
             worker_type: WorkerType::Decode,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
+            ..MockWorkerConfig::default()
         }
     }
 
@@ -308,9 +297,7 @@ impl TestWorkerConfig {
         MockWorkerConfig {
             port,
             worker_type: WorkerType::Prefill,
-            health_status: HealthStatus::Healthy,
-            response_delay_ms: 0,
-            fail_rate: 0.0,
+            ..MockWorkerConfig::default()
         }
     }
 }

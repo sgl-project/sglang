@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
 use data_connector::{ConversationId, ListParams, ResponseId, SortOrder};
 use futures_util::{future::join_all, StreamExt};
 use serde_json::{json, to_value, Value};
@@ -471,6 +472,7 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
+        _body_raw: Option<&Bytes>,
         model_id: Option<&str>,
     ) -> Response {
         let start = Instant::now();

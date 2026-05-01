@@ -6,37 +6,16 @@ use reqwest::RequestBuilder;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::core::{model_type::Endpoint, ProviderType};
+use crate::{
+    core::{model_type::Endpoint, ProviderType},
+    sglang_extensions::EXTENSION_FIELD_NAMES,
+};
 
-const SGLANG_FIELDS: &[&str] = &[
-    "request_id",
-    "priority",
-    "top_k",
-    "min_p",
-    "min_tokens",
-    "regex",
-    "ebnf",
-    "json_schema",
-    "stop_token_ids",
-    "no_stop_trim",
-    "ignore_eos",
-    "continue_final_message",
-    "skip_special_tokens",
-    "lora_path",
-    "session_params",
-    "separate_reasoning",
-    "stream_reasoning",
-    "chat_template",
-    "chat_template_kwargs",
-    "return_hidden_states",
-    "repetition_penalty",
-    "sampling_seed",
-    "backend_url",
-];
-
+/// Strip every SGLang extension field from the request payload before
+/// forwarding to OpenAI (which would 400 on unknown fields).
 fn strip_sglang_fields(payload: &mut Value) {
     if let Some(obj) = payload.as_object_mut() {
-        for field in SGLANG_FIELDS {
+        for field in EXTENSION_FIELD_NAMES {
             obj.remove(*field);
         }
     }
@@ -248,5 +227,96 @@ impl ProviderRegistry {
 
     pub fn default_provider_arc(&self) -> Arc<dyn Provider> {
         Arc::clone(&self.default_provider)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn strip_sglang_fields_removes_every_known_extension() {
+        // Build a payload that sets every EXTENSION_FIELD_NAMES entry alongside two
+        // standard OpenAI fields. After stripping, only the OpenAI fields
+        // should remain — otherwise we'd forward unknown fields to OpenAI's
+        // API and get a 400 back.
+        let mut payload = json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+
+        let payload_obj = payload.as_object_mut().unwrap();
+        for field in EXTENSION_FIELD_NAMES {
+            payload_obj.insert((*field).to_string(), json!("sentinel"));
+        }
+
+        strip_sglang_fields(&mut payload);
+
+        let remaining: Vec<&str> = payload
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(remaining, vec!["model", "messages"]);
+    }
+
+    #[test]
+    fn strip_sglang_fields_strips_every_new_extension_field() {
+        // Spot-check the fields added in the SGLang RL extension PR. If a
+        // new field name is misspelled in EXTENSION_FIELD_NAMES, this test fires.
+        let new_fields = [
+            "return_routed_experts",
+            "return_cached_tokens_details",
+            "return_prompt_token_ids",
+            "return_meta_info",
+            "input_ids",
+            "stop_regex",
+            "custom_logit_processor",
+            "custom_params",
+            "max_dynamic_patch",
+            "min_dynamic_patch",
+            "rid",
+            "extra_key",
+            "cache_salt",
+            "bootstrap_host",
+            "bootstrap_port",
+            "bootstrap_room",
+            "routed_dp_rank",
+            "disagg_prefill_dp_rank",
+            "data_parallel_rank",
+        ];
+
+        for field in new_fields {
+            assert!(
+                EXTENSION_FIELD_NAMES.contains(&field),
+                "{field} missing from EXTENSION_FIELD_NAMES — would leak to OpenAI"
+            );
+
+            let mut payload = json!({ "model": "gpt-4o", field: 1 });
+            strip_sglang_fields(&mut payload);
+            assert!(
+                payload.get(field).is_none(),
+                "strip_sglang_fields did not remove {field}",
+            );
+        }
+    }
+
+    #[test]
+    fn strip_sglang_fields_preserves_unknown_keys() {
+        // Custom passthrough fields the user adds but aren't in EXTENSION_FIELD_NAMES
+        // should survive the strip — only known SGLang extension keys are
+        // removed.
+        let mut payload = json!({
+            "model": "gpt-4o",
+            "custom_user_metadata": {"trace_id": "abc"},
+            "return_routed_experts": true,
+        });
+
+        strip_sglang_fields(&mut payload);
+
+        assert!(payload.get("custom_user_metadata").is_some());
+        assert!(payload.get("return_routed_experts").is_none());
     }
 }

@@ -635,7 +635,9 @@ async fn test_unsupported_endpoints() {
         rid: None,
     };
 
-    let response = router.route_generate(None, &generate_request, None).await;
+    let response = router
+        .route_generate(None, &generate_request, None, None)
+        .await;
     assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
 
     let completion_request = create_minimal_completion_request();
@@ -666,7 +668,7 @@ async fn test_openai_router_chat_completion_with_mock() {
     chat_request.temperature = Some(0.7);
 
     // Route the request
-    let response = router.route_chat(None, &chat_request, None).await;
+    let response = router.route_chat(None, &chat_request, None, None).await;
 
     // Should get a successful response from mock server
     assert_eq!(response.status(), StatusCode::OK);
@@ -709,7 +711,7 @@ async fn test_openai_e2e_with_server() {
                         serde_json::from_str(&body_str).unwrap();
 
                     router
-                        .route_chat(Some(&parts.headers), &chat_request, None)
+                        .route_chat(Some(&parts.headers), &chat_request, None, None)
                         .await
                 }
             }
@@ -769,7 +771,7 @@ async fn test_openai_router_chat_streaming_with_mock() {
     });
     let chat_request: ChatCompletionRequest = serde_json::from_value(val).unwrap();
 
-    let response = router.route_chat(None, &chat_request, None).await;
+    let response = router.route_chat(None, &chat_request, None, None).await;
     assert_eq!(response.status(), StatusCode::OK);
 
     // Should be SSE
@@ -806,7 +808,7 @@ async fn test_openai_router_circuit_breaker() {
 
     // First few requests should fail and record failures
     for _ in 0..3 {
-        let response = router.route_chat(None, &chat_request, None).await;
+        let response = router.route_chat(None, &chat_request, None, None).await;
         // Should get either an error or circuit breaker response
         assert!(
             response.status() == StatusCode::INTERNAL_SERVER_ERROR
