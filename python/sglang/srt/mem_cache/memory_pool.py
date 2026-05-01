@@ -142,16 +142,13 @@ class ReqToTokenPool:
         self.max_context_len = max_context_len
         self.device = device
         with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-            # Buffer holds size+1 rows: row 0 is the padding slot, rows 1..size
-            # are user-allocatable. Mirrors KV pool's padding slot 0 design so
-            # cuda-graph padded batches (req_pool_indices[raw_bs:] = 0) route
-            # dummy reqs through the unowned slot 0; req_to_token[0, :] stays
-            # zero throughout, and downstream KV/swa/state writes land in
-            # padding slots without corrupting real state.
+            # +1 row for padding slot 0 (mirrors KV pool): cuda-graph padded
+            # batches default req_pool_indices to 0, so routing dummies through
+            # unowned slot 0 keeps req_to_token[0, :] zero and downstream writes
+            # harmless.
             self.req_to_token = torch.zeros(
                 (size + 1, max_context_len), dtype=torch.int32, device=device
             )
-
         self.free_slots = list(range(1, size + 1))
 
     def write(self, indices, values):
@@ -516,7 +513,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
-            size=mamba_size,
+            mamba_size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
@@ -527,7 +524,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def _init_mamba_pool(
         self,
-        size: int,
+        mamba_size: int,
         mamba_spec_state_size: int,
         cache_params: BaseLinearStateParams,
         mamba_layer_ids: List[int],
@@ -536,7 +533,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_num_draft_tokens: int = None,
     ):
         self.mamba_pool = MambaPool(
-            size=size,
+            size=mamba_size,
             spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
@@ -547,14 +544,16 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
-        # +1 to match parent ReqToTokenPool's padding row (row 0 is padding).
+        # Indexed by req_pool_idx, so size from the req pool buffer
+        # (self.req_to_token.shape[0]), not from the mamba state pool size.
+        req_pool_size = self.req_to_token.shape[0]
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
-            size + 1, dtype=torch.int32, device=self.device
+            req_pool_size, dtype=torch.int32, device=self.device
         )
         if enable_mamba_extra_buffer:
             self.req_index_to_mamba_ping_pong_track_buffer_mapping: torch.Tensor = (
                 torch.zeros(
-                    (size + 1, self.mamba_ping_pong_track_buffer_size),
+                    (req_pool_size, self.mamba_ping_pong_track_buffer_size),
                     dtype=torch.int32,
                     device=self.device,
                 )
