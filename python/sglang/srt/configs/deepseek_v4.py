@@ -6,7 +6,7 @@ from transformers import PretrainedConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 
 
-@dataclass
+@dataclass(kw_only=True)
 class DeepSeekV4Config(PretrainedConfig):
     architectures: List[str]
     attention_bias: bool = False
