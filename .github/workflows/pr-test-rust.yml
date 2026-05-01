@@ -31,7 +31,10 @@ jobs:
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    runs-on: ubuntu-latest
+    # Pin to 22.04 so the wheel auditwheel-tags as manylinux_2_35; the
+    # self-hosted GPU runners are Ubuntu 22.04 (glibc 2.35) and reject
+    # manylinux_2_39 wheels produced on ubuntu-latest (Ubuntu 24.04).
+    runs-on: ubuntu-22.04
     # sccache is only installed on the GitHub-hosted runners that run this
     # job and `unit-tests`; setting RUSTC_WRAPPER workflow-wide leaks it to
     # gateway-e2e on the self-hosted GPU runners (which don't have sccache),
