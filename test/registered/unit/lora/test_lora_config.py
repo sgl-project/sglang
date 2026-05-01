@@ -252,9 +252,8 @@ class TestGetLoraConfig(CustomTestCase):
 
             # snapshot_download is called by both get_lora_config and get_added_tokens_config
             self.assertEqual(mock_download.call_count, 2)
-            mock_download.assert_called_with(
-                "hf-adapter/repo", allow_patterns=["*.json"]
-            )
+            expected_call = mock.call("hf-adapter/repo", allow_patterns=["*.json"])
+            mock_download.assert_has_calls([expected_call, expected_call])
             self.assertEqual(lora_config.r, 4)
             self.assertEqual(lora_config.target_modules, ["v_proj"])
 
