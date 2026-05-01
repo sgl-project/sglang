@@ -715,7 +715,6 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        debug_return_kv: bool = False,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
             assert (
