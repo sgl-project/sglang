@@ -1,4 +1,0 @@
-interface:
-  display_name: "LLM Serving Auto Benchmark"
-  short_description: "Framework-independent LLM serving benchmark workflow"
-  default_prompt: "Use $llm-serving-auto-benchmark to compare LLM serving frameworks such as SGLang, vLLM, and TensorRT-LLM for one model under the same workload and SLA. Return per-framework best command tables, a cross-framework performance comparison table, failed candidate notes, and artifact paths."

@@ -1,4 +1,0 @@
-interface:
-  display_name: "SGLang SOTA Performance"
-  short_description: "Benchmark, profile, and patch SGLang to reach SOTA"
-  default_prompt: "Use $sglang-sota-performance for MODEL to find best SGLang, vLLM, and TensorRT-LLM serving commands, compare them fairly, profile SGLang if it is slower, patch the bottleneck, and revalidate real-model performance."

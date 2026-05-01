@@ -1,4 +1,0 @@
-interface:
-  display_name: "SGLang Serving Debug"
-  short_description: "Debug SGLang serving problems"
-  default_prompt: "Use $sglang-prod-incident-triage to debug an SGLang serving problem and return one short debug note with what was checked, the best current guess, and the next step."
