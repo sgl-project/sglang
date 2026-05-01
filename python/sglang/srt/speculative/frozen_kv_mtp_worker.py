@@ -700,8 +700,8 @@ class FrozenKVMTPWorker(TpModelWorker):
             topk=self.topk,
             draft_token_num=self.speculative_num_draft_tokens,
             capture_hidden_mode=CaptureHiddenMode.FULL,
-            seq_lens_sum=forward_batch.seq_lens_sum,
-            seq_lens_cpu=forward_batch.seq_lens_cpu,
+            seq_lens_sum=batch.seq_lens_sum,
+            seq_lens_cpu=batch.seq_lens_cpu,
         )
 
     def draft_forward(
