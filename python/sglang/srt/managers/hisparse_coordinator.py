@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 class HiSparseAct(NamedTuple):
+    start_event: device_module.Event
     finish_event: device_module.Event
     req: Req
 
@@ -183,7 +184,7 @@ class HiSparseCoordinator:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
 
-        self.ack_staging_queue.append(HiSparseAct(finish_event, req))
+        self.ack_staging_queue.append(HiSparseAct(start_event, finish_event, req))
 
     def alloc_device_buffer(self, req: Req) -> None:
         prefill_len = len(req.fill_ids)
@@ -228,7 +229,7 @@ class HiSparseCoordinator:
             return ready_reqs
 
         finish_count = 0
-        for finish_event, _ in self.ack_staging_queue:
+        for _, finish_event, _ in self.ack_staging_queue:
             if not finish_event.query():
                 break
             finish_count += 1
@@ -241,7 +242,7 @@ class HiSparseCoordinator:
             )
         finish_count = int(queue_size.item())
         while finish_count > 0:
-            _, req = self.ack_staging_queue.pop(0)
+            _, _, req = self.ack_staging_queue.pop(0)
             self.alloc_device_buffer(req)
             self._skip_first_backup[req.req_pool_idx] = True
             req.hisparse_staging = False
