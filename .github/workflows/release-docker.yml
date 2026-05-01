@@ -50,6 +50,6 @@ jobs:
       tag_config: |
         [
           {"cuda": "cu130", "tags": ["v${{ needs.resolve-version.outputs.version }}", "latest"]}
-          {"cuda": "cu129", "tags": ["v${{ needs.resolve-version.outputs.version }}", "latest-cu129"]},
+          {"cuda": "cu129", "tags": ["v${{ needs.resolve-version.outputs.version }}-cu129", "latest-cu129"]},
         ]
     secrets: inherit
