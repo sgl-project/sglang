@@ -1158,23 +1158,27 @@ class CudaGraphRunner:
             and hasattr(torch._inductor.config, "combo_kernels")
             and self._get_replay_attn_backend().supports_compiled_replay_prepare()
         )
-        if result:
-            try:
-                # Avoid graph breaks from .item() calls (e.g. seq_lens_cpu.max().item())
-                # by capturing them as unbacked symbolic ints in the FX graph. Without
-                # this, dynamo splits the compiled region into multiple sub-graphs.
-                torch._dynamo.config.capture_scalar_outputs = True
-
-                torch._dynamo.config.accumulated_cache_size_limit = max(
-                    torch._dynamo.config.accumulated_cache_size_limit, 1024
-                )
-                torch._dynamo.config.cache_size_limit = max(
-                    torch._dynamo.config.cache_size_limit, 1024
-                )
-            except Exception:
-                result = False
         self._can_compile_replay_prepare_cache = result
         return result
+
+    @contextmanager
+    def _compiled_replay_prepare_config_context(self):
+        # Avoid graph breaks from .item() calls (e.g. seq_lens_cpu.max().item())
+        # by capturing them as unbacked symbolic ints in the FX graph. Keep this
+        # scoped to replay-prepare compilation so other Dynamo users are not
+        # affected by the more permissive cache and scalar-output settings.
+        dynamo_patches = {
+            "capture_scalar_outputs": True,
+            "accumulated_cache_size_limit": max(
+                torch._dynamo.config.accumulated_cache_size_limit, 128
+            ),
+        }
+        if hasattr(torch._dynamo.config, "cache_size_limit"):
+            dynamo_patches["cache_size_limit"] = max(
+                torch._dynamo.config.cache_size_limit, 128
+            )
+        with torch._dynamo.config.patch(dynamo_patches):
+            yield
 
     def _populate_from_forward_batch_and_init_attn_backend(
         self,
@@ -1256,7 +1260,17 @@ class CudaGraphRunner:
                 seq_lens_cpu=buffers.seq_lens_cpu,
             )
 
-    @torch.compile(fullgraph=True, dynamic=True, options={"combo_kernels": True, "cpp_wrapper": True if (envs.SGLANG_TORCH_COMPILE_CPP_WRAPPER.get() and hasattr(torch._inductor.config, "cpp_wrapper")) else False})
+    @torch.compile(
+        fullgraph=True,
+        dynamic=True,
+        options={
+            "combo_kernels": True,
+            "cpp_wrapper": bool(
+                envs.SGLANG_TORCH_COMPILE_CPP_WRAPPER.get()
+                and hasattr(torch._inductor.config, "cpp_wrapper")
+            ),
+        },
+    )
     def _populate_from_forward_batch_and_init_attn_backend_compiled(
         self,
         forward_batch: ForwardBatch,
@@ -1400,16 +1414,17 @@ class CudaGraphRunner:
             self._mark_compiled_replay_prepare_dynamic_dims(
                 forward_batch, pp_proxy_tensors, bs
             )
-            self._populate_from_forward_batch_and_init_attn_backend_compiled(
-                forward_batch=forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-                buffers=buffers,
-                raw_bs=raw_bs,
-                raw_num_token=raw_num_token,
-                bs=bs,
-                replay_metadata=replay_metadata,
-                use_foreach_copy=False,
-            )
+            with self._compiled_replay_prepare_config_context():
+                self._populate_from_forward_batch_and_init_attn_backend_compiled(
+                    forward_batch=forward_batch,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                    buffers=buffers,
+                    raw_bs=raw_bs,
+                    raw_num_token=raw_num_token,
+                    bs=bs,
+                    replay_metadata=replay_metadata,
+                    use_foreach_copy=False,
+                )
         else:
             self._populate_from_forward_batch_and_init_attn_backend(
                 forward_batch=forward_batch,
