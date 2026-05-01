@@ -215,9 +215,10 @@ def pytest_collection_modifyitems(
             _max_test_gpu_requirement = test_gpus
             _max_test_name = item.nodeid
 
-        # Skip tests whose GPU need exceeds the runner's capacity. Lets a 2-GPU
-        # runner collect a suite that includes 4-GPU tests without aborting.
-        if available_gpus > 0 and test_gpus > available_gpus:
+        # Mark over-capacity tests as skipped (including when available_gpus
+        # is 0) so pytest_collection_finish can detect the all-skipped case
+        # and fail loudly instead of passing green with zero tests run.
+        if test_gpus > available_gpus:
             item.add_marker(
                 pytest.mark.skip(
                     reason=(
@@ -228,14 +229,12 @@ def pytest_collection_modifyitems(
                 )
             )
 
-    # Drop pool requirements for any model whose single-worker tp exceeds
-    # capacity — those workers can never be launched on this runner.
-    if available_gpus > 0:
-        for key in list(_worker_counts.keys()):
-            spec = MODEL_SPECS.get(key[0], {})
-            if spec.get("tp", 1) > available_gpus:
-                del _worker_counts[key]
-        _first_seen_order[:] = [k for k in _first_seen_order if k in _worker_counts]
+    # Prune workers that can never launch on this runner.
+    for key in list(_worker_counts.keys()):
+        spec = MODEL_SPECS.get(key[0], {})
+        if spec.get("tp", 1) > available_gpus:
+            del _worker_counts[key]
+    _first_seen_order[:] = [k for k in _first_seen_order if k in _worker_counts]
 
     # Log results
     if _worker_counts:
@@ -321,7 +320,8 @@ def _count_gpus_without_cuda() -> int:
     """
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
     if cvd is not None:
-        return len([d for d in cvd.split(",") if d.strip()])
+        # CUDA treats "-1" as "no devices"; don't count it as one.
+        return len([d for d in cvd.split(",") if d.strip() and d.strip() != "-1"])
 
     import subprocess
 
@@ -374,7 +374,9 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     """Validate GPU requirements after test collection."""
     from infra import ENV_SKIP_MODEL_POOL
 
-    if not _worker_counts:
+    # _max_test_gpu_requirement survives pruning; _worker_counts may be
+    # emptied above when no test fits, and we still want the loud-fail.
+    if _max_test_gpu_requirement == 0:
         return
 
     if os.environ.get(ENV_SKIP_MODEL_POOL, "").lower() in ("1", "true", "yes"):
