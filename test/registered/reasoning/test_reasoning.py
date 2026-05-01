@@ -72,6 +72,53 @@ class TestEnableThinking(
         self.assertIn("reasoning_content", data["choices"][0]["message"])
         self.assertIsNotNone(data["choices"][0]["message"]["reasoning_content"])
 
+    def test_json_schema_parallel_sampling_keeps_content(self):
+        json_schema = {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string"},
+                "judge_result": {"type": "boolean"},
+            },
+            "required": ["reason", "judge_result"],
+            "additionalProperties": False,
+        }
+        response = requests.post(
+            f"{self.base_url}/v1/chat/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            json={
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "Judge if this is positive: 'Great product!'",
+                    }
+                ],
+                "temperature": 0.6,
+                "max_tokens": 256,
+                "n": 2,
+                "chat_template_kwargs": {"enable_thinking": True},
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "judge_result",
+                        "schema": json_schema,
+                    },
+                },
+            },
+        )
+
+        self.assertEqual(response.status_code, 200, f"Failed with: {response.text}")
+        data = response.json()
+
+        self.assertEqual(len(data["choices"]), 2)
+        for choice in data["choices"]:
+            message = choice["message"]
+            self.assertIsNotNone(message["content"])
+            self.assertIsInstance(message["content"], str)
+            payload = json.loads(message["content"])
+            self.assertIsInstance(payload["reason"], str)
+            self.assertIsInstance(payload["judge_result"], bool)
+
     def test_chat_completion_without_reasoning(self):
         # Test non-streaming with "enable_thinking": False, reasoning_content should be empty
         client = requests.post(
