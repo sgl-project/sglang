@@ -200,7 +200,7 @@ jobs:
 
   # Single tail job: aggregate all backend wheels, publish them to the wheel
   # repo's GH Release once, then regenerate every backend's pip index in one
-  # `git clone -> commit -> push`. Replaces the four parallel release-* jobs
+  # `git clone -> commit -> push`. Replaces the per-backend release-* jobs
   # that each cloned/pushed the index repo and could race on the push.
   release-and-update-index:
     needs: [build-cu129-matrix, build-cu130-matrix, build-rocm-matrix, build-musa43]
@@ -236,6 +236,17 @@ jobs:
           merge-multiple: true
           pattern: wheel-*
 
+      - name: Verify wheels were downloaded
+        run: |
+          set -euo pipefail
+          count=$(find sgl-kernel/dist -maxdepth 1 -name '*.whl' -type f | wc -l)
+          echo "Downloaded ${count} wheel file(s):"
+          ls -lh sgl-kernel/dist/ || true
+          if [ "${count}" -eq 0 ]; then
+            echo "::error::No wheels in sgl-kernel/dist/ — at least one build job reported success but produced no downloadable artifacts. Refusing to publish an empty release."
+            exit 1
+          fi
+
       - name: Publish wheels to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -243,6 +254,7 @@ jobs:
           repository: sgl-project/whl
           token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
           files: sgl-kernel/dist/*
+          fail_on_unmatched_files: true
 
       - name: Clone wheel index
         env:
@@ -272,12 +284,18 @@ jobs:
       - name: Push wheel index
         working-directory: sgl-whl
         run: |
+          set -euo pipefail
           git config --local user.name "sglang-bot"
           git config --local user.email "sglangbot@gmail.com"
           git add -A
+          # The job's `if:` already required at least one build to succeed, and
+          # every successful backend's update_kernel_whl_index.py invocation
+          # appends to its own backend's index.html. So an empty staged diff
+          # here means an update step ran against an empty/wrong sgl-kernel/dist
+          # — fail loudly rather than silently push nothing.
           if git diff --cached --quiet; then
-            echo "No index changes to push"
-            exit 0
+            echo "::error::No index changes after running update_kernel_whl_index.py for every successful backend; one or more update steps must have produced zero entries. Investigate sgl-kernel/dist contents."
+            exit 1
           fi
           git commit -m "update whl index"
           git push
