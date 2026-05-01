@@ -99,11 +99,15 @@ class TestGetStackedMultiply(unittest.TestCase):
 
 class TestGetTargetModuleName(unittest.TestCase):
     def test_exact_match(self):
-        self.assertEqual(get_target_module_name("qkv_proj", {"qkv_proj", "o_proj"}), "qkv_proj")
+        self.assertEqual(
+            get_target_module_name("qkv_proj", {"qkv_proj", "o_proj"}), "qkv_proj"
+        )
 
     def test_substring_match(self):
         # "gate_up_proj" is substring of "model.layers.0.gate_up_proj"
-        result = get_target_module_name("model.layers.0.gate_up_proj", {"gate_up_proj", "o_proj"})
+        result = get_target_module_name(
+            "model.layers.0.gate_up_proj", {"gate_up_proj", "o_proj"}
+        )
         self.assertEqual(result, "gate_up_proj")
 
     def test_longest_match_wins(self):
