@@ -298,6 +298,7 @@ class MoEGate(nn.Module):
     ):
         super().__init__()
         self.is_nextn = is_nextn
+        self.is_deepseek_v4 = is_deepseek_v4
         self.weight = nn.Parameter(
             torch.empty((config.n_routed_experts, config.hidden_size))
         )
@@ -342,8 +343,12 @@ class MoEGate(nn.Module):
         if get_global_server_args().enable_deterministic_inference:
             return F.linear(hidden_states, self.weight, None)
 
-        if False:
-            pass
+        if (
+            not self.is_deepseek_v4
+            and forward_batch is not None
+            and nsa_use_prefill_cp(forward_batch)
+        ):
+            logits = F.linear(hidden_states, self.weight, None)
         else:
             # NOTE: For some unknown reason, router_gemm seems degrade accept length.
             if (
