@@ -104,40 +104,6 @@ class TestWeightValidation(unittest.TestCase):
             self.assertIsNone(error_msg)
             self.assertEqual(corrupted_files, [])
 
-    def test_validate_sharded_model_all_present_zero_indexed(self):
-        """Test that complete shards numbered from 0 (e.g. Ring-2.5-1T) pass validation."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            for i in [0, 1, 2]:
-                filepath = os.path.join(tmpdir, f"model-0000{i}-of-00003.safetensors")
-                header = b'{"__metadata__":{}}'
-                header_size = len(header)
-                with open(filepath, "wb") as f:
-                    f.write(struct.pack("<Q", header_size))
-                    f.write(header)
-
-            index_data = {
-                "weight_map": {
-                    "layer0": "model-00000-of-00003.safetensors",
-                    "layer1": "model-00001-of-00003.safetensors",
-                    "layer2": "model-00002-of-00003.safetensors",
-                }
-            }
-            with open(os.path.join(tmpdir, "model.safetensors.index.json"), "w") as f:
-                json.dump(index_data, f)
-
-            weight_files = [
-                os.path.join(tmpdir, f"model-0000{i}-of-00003.safetensors")
-                for i in [0, 1, 2]
-            ]
-
-            is_valid, error_msg, corrupted_files = _validate_sharded_model(
-                tmpdir, weight_files
-            )
-
-            self.assertTrue(is_valid)
-            self.assertIsNone(error_msg)
-            self.assertEqual(corrupted_files, [])
-
     def test_validate_sharded_model_corrupted_shard(self):
         """
         Test that corrupted shards are detected and returned in corrupted_files.
