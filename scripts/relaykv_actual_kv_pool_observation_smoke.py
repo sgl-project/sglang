@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
+from pathlib import Path
 import signal
 import traceback
 from typing import Any
+
+# flashinfer.jit.env reads FLASHINFER_WORKSPACE_BASE at import time. Set it
+# before any SGLang imports so smoke-only JIT logs go to a writable /tmp path.
+os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", "/tmp/relaykv_flashinfer_cache")
 
 import torch
 
@@ -59,24 +65,53 @@ def _error_reason(exc: BaseException) -> str:
     return "".join(traceback.format_exception_only(type(exc), exc)).strip()
 
 
+def _configure_flashinfer_cache() -> dict[str, object]:
+    # flashinfer.jit.env uses FLASHINFER_WORKSPACE_BASE at import time and writes
+    # flashinfer_jit.log below it. Keep smoke-only import artifacts in /tmp.
+    workspace_base = os.environ.setdefault(
+        "FLASHINFER_WORKSPACE_BASE", "/tmp/relaykv_flashinfer_cache"
+    )
+    cache_path = Path(workspace_base) / ".cache" / "flashinfer"
+    try:
+        cache_path.mkdir(parents=True, exist_ok=True)
+        probe_path = cache_path / ".relaykv_write_probe"
+        probe_path.write_text("ok", encoding="utf-8")
+        probe_path.unlink()
+        writable = True
+        error = ""
+    except OSError as exc:
+        writable = False
+        error = _error_reason(exc)
+    return {
+        "flashinfer_cache_env": "FLASHINFER_WORKSPACE_BASE",
+        "flashinfer_cache_path": str(cache_path),
+        "flashinfer_cache_path_writable": writable,
+        "flashinfer_cache_probe_error": error,
+    }
+
+
 def _try_actual_mha_pool(device: str) -> tuple[Any, dict[str, object]]:
+    flashinfer_cache_status = _configure_flashinfer_cache()
     status: dict[str, object] = {
         "kv_pool_type": None,
         "kv_pool_import_ok": False,
-        "kv_pool_import_reason": "",
+        "kv_pool_import_error_type": "",
+        "kv_pool_import_error": "",
         "kv_pool_instantiate_ok": False,
-        "kv_pool_instantiate_reason": "",
-        "using_fake_compatible_pool": False,
+        "kv_pool_instantiate_error_type": "",
+        "kv_pool_instantiate_error": "",
+        "fallback_used": False,
+        **flashinfer_cache_status,
     }
     try:
         module = importlib.import_module("sglang.srt.mem_cache.memory_pool")
         pool_cls = getattr(module, "MHATokenToKVPool")
         status["kv_pool_import_ok"] = True
-        status["kv_pool_import_reason"] = "ok"
     except BaseException as exc:
-        status["kv_pool_import_reason"] = _error_reason(exc)
+        status["kv_pool_import_error_type"] = type(exc).__name__
+        status["kv_pool_import_error"] = _error_reason(exc)
         status["kv_pool_type"] = "_ObservedMHATokenToKVPool"
-        status["using_fake_compatible_pool"] = True
+        status["fallback_used"] = True
         return _ObservedMHATokenToKVPool(device=device), status
 
     try:
@@ -93,12 +128,12 @@ def _try_actual_mha_pool(device: str) -> tuple[Any, dict[str, object]]:
         )
         status["kv_pool_type"] = type(pool).__name__
         status["kv_pool_instantiate_ok"] = True
-        status["kv_pool_instantiate_reason"] = "ok"
         return pool, status
     except BaseException as exc:
         status["kv_pool_type"] = "_ObservedMHATokenToKVPool"
-        status["kv_pool_instantiate_reason"] = _error_reason(exc)
-        status["using_fake_compatible_pool"] = True
+        status["kv_pool_instantiate_error_type"] = type(exc).__name__
+        status["kv_pool_instantiate_error"] = _error_reason(exc)
+        status["fallback_used"] = True
         return _ObservedMHATokenToKVPool(device=device), status
 
 
