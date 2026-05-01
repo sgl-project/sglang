@@ -8,11 +8,14 @@ This module contains implementations of prompt encoding stages for diffusion pip
 """
 
 import inspect
+from dataclasses import dataclass
+from typing import Any
 
 import torch
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
@@ -28,6 +31,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+@dataclass(frozen=True)
+class TextEncodingFingerprint:
+    prompt: Any
+    negative_prompt: Any
+    do_classifier_free_guidance: bool
+    prompt_template: Any
+    max_sequence_length: int | None
+
+
 class TextEncodingStage(PipelineStage):
     """
     Stage for encoding text prompts into embeddings for diffusion models.
@@ -35,6 +47,18 @@ class TextEncodingStage(PipelineStage):
     This stage handles the encoding of text prompts into the embedding space
     expected by the diffusion model.
     """
+
+    deduplicated_output_fields = (
+        "prompt_embeds",
+        "negative_prompt_embeds",
+        "prompt_attention_mask",
+        "negative_attention_mask",
+        "pooled_embeds",
+        "neg_pooled_embeds",
+        "clip_embedding_pos",
+        "clip_embedding_neg",
+        "is_prompt_processed",
+    )
 
     def __init__(self, text_encoders, tokenizers) -> None:
         """
@@ -44,6 +68,19 @@ class TextEncodingStage(PipelineStage):
         super().__init__()
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
+
+    def component_uses(
+        self, server_args: ServerArgs, stage_name: str | None = None
+    ) -> list[ComponentUse]:
+        stage_name = self._component_stage_name(stage_name)
+        return [
+            ComponentUse(
+                stage_name=stage_name,
+                component_name="text_encoder" if i == 0 else f"text_encoder_{i + 1}",
+                preferred_ready_after_request=i == 0,
+            )
+            for i in range(len(self.text_encoders))
+        ]
 
     @torch.no_grad()
     def forward(
@@ -107,6 +144,17 @@ class TextEncodingStage(PipelineStage):
 
         return batch
 
+    def build_dedup_fingerprint(
+        self, batch: Req, server_args: ServerArgs
+    ) -> TextEncodingFingerprint:
+        return TextEncodingFingerprint(
+            prompt=self.freeze_for_dedup(batch.prompt),
+            negative_prompt=self.freeze_for_dedup(batch.negative_prompt),
+            do_classifier_free_guidance=bool(batch.do_classifier_free_guidance),
+            prompt_template=self.freeze_for_dedup(batch.prompt_template),
+            max_sequence_length=batch.max_sequence_length,
+        )
+
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """Verify text encoding stage inputs."""
         result = VerificationResult()
@@ -131,6 +179,21 @@ class TextEncodingStage(PipelineStage):
         tok_kwargs = tokenizer_kwargs | kwargs
 
         return tok_kwargs
+
+    def _manage_text_encoder_use(self, encoder_index: int) -> None:
+        manager = self._component_residency_manager
+        if manager is None:
+            return
+        component_name = (
+            "text_encoder"
+            if encoder_index == 0
+            else f"text_encoder_{encoder_index + 1}"
+        )
+        use = self._declared_component_use(component_name=component_name)
+        # TODO: Keep this begin-only interval until manager supports explicit
+        # declared-use interval grouping. Wrapping each encoder call separately
+        # can offload between positive and negative prompt encoding.
+        manager.before_use(use)
 
     def _forward_text_encoder(self, text_encoder, encoder_forward_kwargs):
         if not getattr(text_encoder, "uses_sglang_forward_context", True):
@@ -217,7 +280,7 @@ class TextEncodingStage(PipelineStage):
         embeds_list: list[torch.Tensor] = []
         pooled_embeds_list: list[torch.Tensor] = []
 
-        attn_masks_list: list[torch.Tensor] = []
+        attn_masks_list: list[torch.Tensor | None] = []
 
         preprocess_funcs = server_args.pipeline_config.preprocess_text_funcs
         postprocess_funcs = server_args.pipeline_config.postprocess_text_funcs
@@ -274,6 +337,7 @@ class TextEncodingStage(PipelineStage):
                 encoder_forward_kwargs["attention_mask"] = attention_mask
             if "use_cache" in inspect.signature(text_encoder.forward).parameters:
                 encoder_forward_kwargs["use_cache"] = False
+            self._manage_text_encoder_use(i)
             outputs: BaseEncoderOutput = self._forward_text_encoder(
                 text_encoder, encoder_forward_kwargs
             )
@@ -283,7 +347,14 @@ class TextEncodingStage(PipelineStage):
             if "pipeline_config" in postprocess_sig.parameters:
                 # required by models like LTX
                 postprocess_kwargs["pipeline_config"] = server_args.pipeline_config
+            if "return_attention_mask" in postprocess_sig.parameters:
+                postprocess_kwargs["return_attention_mask"] = return_attention_mask
             prompt_embeds = postprocess_func(outputs, text_inputs, **postprocess_kwargs)
+            has_postprocessed_attention_mask = False
+            postprocessed_attention_mask = None
+            if isinstance(prompt_embeds, tuple):
+                prompt_embeds, postprocessed_attention_mask = prompt_embeds
+                has_postprocessed_attention_mask = True
             if dtype is not None:
                 prompt_embeds = prompt_embeds.to(device=target_device, dtype=dtype)
             else:
@@ -298,11 +369,26 @@ class TextEncodingStage(PipelineStage):
                 pooled_embeds_list.append(pooled_output.to(device=target_device))
 
             if return_attention_mask:
-                mask_to_store = (
-                    attention_mask.to(device=target_device)
-                    if attention_mask is not None
-                    else torch.ones(input_ids.shape[:2], device=target_device)
-                )
+                if has_postprocessed_attention_mask:
+                    mask_to_store = (
+                        postprocessed_attention_mask.to(device=target_device)
+                        if postprocessed_attention_mask is not None
+                        else None
+                    )
+                elif attention_mask is not None and list(attention_mask.shape) == list(
+                    prompt_embeds.shape[:2]
+                ):
+                    mask_to_store = attention_mask.to(device=target_device)
+                else:
+                    mask_to_store = torch.ones(
+                        prompt_embeds.shape[:2],
+                        device=target_device,
+                        dtype=(
+                            attention_mask.dtype
+                            if attention_mask is not None
+                            else torch.long
+                        ),
+                    )
                 attn_masks_list.append(mask_to_store)
 
         # Shape results according to return_type
@@ -331,13 +417,23 @@ class TextEncodingStage(PipelineStage):
                 )
         stacked_embeds = torch.stack(embeds_list, dim=0)
         if return_attention_mask:
-            base_mask_shape = list(attn_masks_list[0].shape)
-            for m in attn_masks_list[1:]:
+            stackable_masks = [
+                (
+                    mask
+                    if mask is not None
+                    else torch.ones(
+                        embed.shape[:2], device=embed.device, dtype=torch.long
+                    )
+                )
+                for embed, mask in zip(embeds_list, attn_masks_list, strict=True)
+            ]
+            base_mask_shape = list(stackable_masks[0].shape)
+            for m in stackable_masks[1:]:
                 if list(m.shape) != base_mask_shape:
                     raise ValueError(
-                        f"Cannot stack attention masks with differing shapes: {[list(m.shape) for m in attn_masks_list]}"
+                        f"Cannot stack attention masks with differing shapes: {[list(m.shape) for m in stackable_masks]}"
                     )
-            stacked_masks = torch.stack(attn_masks_list, dim=0)
+            stacked_masks = torch.stack(stackable_masks, dim=0)
             return stacked_embeds, stacked_masks
         return stacked_embeds
 

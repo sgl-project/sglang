@@ -83,6 +83,7 @@ class TraceThreadInfo:
     thread_label: str
     tp_rank: int
     dp_rank: int
+    pp_rank: int
 
 
 @dataclass
@@ -223,7 +224,10 @@ def get_otlp_span_exporter(endpoint):
 
 # Should be called by each tracked thread.
 def trace_set_thread_info(
-    thread_label: str, tp_rank: Optional[int] = None, dp_rank: Optional[int] = None
+    thread_label: str,
+    tp_rank: Optional[int] = None,
+    dp_rank: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ):
     if not opentelemetry_initialized:
         return
@@ -238,6 +242,7 @@ def trace_set_thread_info(
         thread_label=thread_label,
         tp_rank=tp_rank,
         dp_rank=dp_rank,
+        pp_rank=pp_rank,
     )
 
 
@@ -292,6 +297,10 @@ class TraceReqContext:
         thread_name = f"{thread_info.thread_label}"
         if thread_info.tp_rank is not None:
             thread_name += f" [TP {thread_info.tp_rank}] "
+        if thread_info.pp_rank is not None:
+            thread_name += f" [PP {thread_info.pp_rank}] "
+        if thread_info.dp_rank is not None:
+            thread_name += f" [DP {thread_info.dp_rank}] "
         thread_name += f"(host:{thread_info.host_id[:8]} | pid:{self.pid})"
         thread_context.thread_span = tracer.start_span(
             name=thread_name,
@@ -299,8 +308,15 @@ class TraceReqContext:
             context=self.root_span_context,
         )
 
+        rank_attrs = {}
         if thread_info.tp_rank is not None:
-            thread_context.thread_span.set_attributes({"tp_rank": thread_info.tp_rank})
+            rank_attrs["tp_rank"] = thread_info.tp_rank
+        if thread_info.pp_rank is not None:
+            rank_attrs["pp_rank"] = thread_info.pp_rank
+        if thread_info.dp_rank is not None:
+            rank_attrs["dp_rank"] = thread_info.dp_rank
+        if rank_attrs:
+            thread_context.thread_span.set_attributes(rank_attrs)
 
         thread_context.thread_span.set_attributes(
             {

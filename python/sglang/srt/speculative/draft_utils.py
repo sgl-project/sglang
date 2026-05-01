@@ -1,7 +1,7 @@
 import logging
 
 from sglang.srt.server_args import ServerArgs, get_global_server_args
-from sglang.srt.utils.common import is_blackwell
+from sglang.srt.utils.common import is_blackwell, is_musa
 
 logger = logging.getLogger(__name__)
 
@@ -142,9 +142,14 @@ class DraftBackendFactory:
         )
 
     def _create_fa_decode_backend(self, fa_impl_ver: int = 3):
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionMultiStepBackend,
-        )
+        if not is_musa():
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionMultiStepBackend,
+            )
+        else:
+            from sglang.srt.hardware_backend.musa.attention.flashattention_backend import (
+                MusaFlashAttentionMultiStepBackend as FlashAttentionMultiStepBackend,
+            )
 
         return FlashAttentionMultiStepBackend(
             self.draft_model_runner,
@@ -225,10 +230,14 @@ class DraftBackendFactory:
         return AiterAttnBackend(self.draft_model_runner, skip_prefill=False)
 
     def _create_fa_prefill_backend(self, fa_impl_ver: int = 3):
-        from sglang.srt.layers.attention.flashattention_backend import (
-            FlashAttentionBackend,
-        )
-
+        if not is_musa():
+            from sglang.srt.layers.attention.flashattention_backend import (
+                FlashAttentionBackend,
+            )
+        else:
+            from sglang.srt.hardware_backend.musa.attention.flashattention_backend import (
+                MusaFlashAttentionBackend as FlashAttentionBackend,
+            )
         return FlashAttentionBackend(
             self.draft_model_runner, skip_prefill=False, fa_impl_ver=fa_impl_ver
         )

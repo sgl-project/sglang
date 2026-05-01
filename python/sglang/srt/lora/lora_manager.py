@@ -311,6 +311,8 @@ class LoRAManager:
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
         for i, uid in enumerate(forward_batch.lora_ids):
+            if uid not in self.memory_pool.uid_to_buffer_id:
+                continue
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
             if uid is not None:
                 lora = self.loras[uid]
@@ -620,6 +622,7 @@ class LoRAManager:
             self.base_hf_config,
             self.load_config,
             self.lora_backend,
+            base_model=self.base_model,
         )
         lora_adapter.initialize_weights()
 
@@ -641,6 +644,7 @@ class LoRAManager:
             self.base_hf_config,
             self.load_config,
             self.lora_backend,
+            base_model=self.base_model,
         )
         lora_adapter.initialize_weights_from_tensors(tensors)
         self.loras[lora_ref.lora_id] = lora_adapter
