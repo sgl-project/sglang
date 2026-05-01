@@ -262,8 +262,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install SGLang dependencies
-        env:
-          USE_VENV: "1"
         run: |
           bash scripts/ci/cuda/ci_install_dependency.sh
 
@@ -297,10 +295,6 @@ jobs:
         with:
           name: genai-bench-results-all-policies
           path: sgl-model-gateway/benchmark_**/
-
-      - name: Cleanup venv
-        if: always()
-        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   docker-build-test:
     if: |
