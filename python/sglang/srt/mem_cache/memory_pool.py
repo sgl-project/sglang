@@ -513,7 +513,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.start_layer = start_layer if start_layer is not None else 0
         self.layer_transfer_counter = None
         self._init_mamba_pool(
-            size=mamba_size,
+            mamba_size=mamba_size,
             mamba_spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
@@ -524,7 +524,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
 
     def _init_mamba_pool(
         self,
-        size: int,
+        mamba_size: int,
         mamba_spec_state_size: int,
         cache_params: BaseLinearStateParams,
         mamba_layer_ids: List[int],
@@ -533,7 +533,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         speculative_num_draft_tokens: int = None,
     ):
         self.mamba_pool = MambaPool(
-            size=size,
+            size=mamba_size,
             spec_state_size=mamba_spec_state_size,
             cache_params=cache_params,
             mamba_layer_ids=mamba_layer_ids,
@@ -544,8 +544,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         self.device = device
-        # Indexed by req_pool_idx, so size from parent's req_to_token (covers
-        # all req slots incl. the padding row), not from mamba pool size.
+        # Indexed by req_pool_idx, so size from the req pool buffer
+        # (self.req_to_token.shape[0]), not from the mamba state pool size.
         req_pool_size = self.req_to_token.shape[0]
         self.req_index_to_mamba_index_mapping: torch.Tensor = torch.zeros(
             req_pool_size, dtype=torch.int32, device=self.device
