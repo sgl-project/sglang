@@ -9,7 +9,7 @@ from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
-    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+    pass
 
 
 """

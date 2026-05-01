@@ -346,6 +346,7 @@ class DSV4MetadataRawDecode:
 
 _DSV4_RAW_TYPES = (DSV4MetadataRawVerify, DSV4MetadataRawDecode)
 
+
 class _GraphBucket(enum.Enum):
     DECODE_OR_IDLE = "decode_or_idle"
     TARGET_VERIFY = "target_verify"

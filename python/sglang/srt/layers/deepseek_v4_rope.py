@@ -7,7 +7,6 @@ import torch
 import triton
 import triton.language as tl
 
-
 tilelang.set_log_level("WARNING")
 
 pass_configs = {

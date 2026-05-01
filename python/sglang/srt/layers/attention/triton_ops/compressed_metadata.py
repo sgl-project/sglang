@@ -198,5 +198,3 @@ def init_compressed_metadata(
         page_size,
         compute_page_indices,
     )
-
-
