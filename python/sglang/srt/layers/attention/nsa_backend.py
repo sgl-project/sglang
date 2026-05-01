@@ -310,7 +310,7 @@ class NativeSparseAttnBackend(
     NativeSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
 ):
     def supports_compiled_replay_prepare(self) -> bool:
-        return True
+        return self.real_page_size > 1
 
     def get_cuda_graph_replay_metadata(self, bs: int) -> NSAMetadata:
         return self.decode_cuda_graph_metadata[bs]
@@ -408,23 +408,6 @@ class NativeSparseAttnBackend(
             self.workspace_buffer = global_workspace_buffer
         else:
             self.workspace_buffer = None
-
-        # Cache deep_gemm.get_num_sms() so it's a plain int constant visible
-        # to torch.compile (calling the op inside the compiled region would
-        # cause a graph break because it returns a non-Tensor).
-        # Also cache the function reference to avoid `import` inside compiled code.
-        self._deep_gemm_num_sms: Optional[int] = None
-        self._deep_gemm_get_paged_mqa_logits_metadata = None
-        if is_cuda():
-            try:
-                import deep_gemm
-
-                self._deep_gemm_num_sms = deep_gemm.get_num_sms()
-                self._deep_gemm_get_paged_mqa_logits_metadata = (
-                    deep_gemm.get_paged_mqa_logits_metadata
-                )
-            except (ImportError, ModuleNotFoundError):
-                pass
 
     def get_device_int32_arange(self, l: int) -> torch.Tensor:
         if l > len(self._arange_buf):
@@ -836,28 +819,6 @@ class NativeSparseAttnBackend(
                 dtype=torch.int32,
                 device=self.device,
             ),
-            # Separate buffer for real_page_table to avoid storage aliasing
-            # with page_table (which triggers merge_view_inputs in torch.compile)
-            "real_page_table": torch.zeros(
-                max_num_tokens,
-                (self.max_context_len + (self.speculative_num_draft_tokens or 0))
-                // self.real_page_size
-                + 1,
-                dtype=torch.int32,
-                device=self.device,
-            ),
-            # Separate buffer for nsa_seqlens_expanded to avoid aliasing
-            # with cache_seqlens (in decode, seqlens_expanded = cache_seqlens)
-            "nsa_seqlens_expanded": torch.ones(
-                max_num_tokens, dtype=torch.int32, device=self.device
-            ),
-            # Separate buffers for NSA-specific metadata
-            "nsa_cache_seqlens": torch.ones(
-                max_num_tokens, dtype=torch.int32, device=self.device
-            ),
-            "nsa_cu_seqlens_k": torch.zeros(
-                max_num_tokens + 1, dtype=torch.int32, device=self.device
-            ),
             "flashmla_metadata": (
                 self._compute_flashmla_metadata(
                     cache_seqlens=torch.ones(
@@ -869,6 +830,68 @@ class NativeSparseAttnBackend(
                 else None
             ),
         }
+        if self._should_use_compiled_replay_prepare_metadata():
+            self._init_compiled_replay_prepare_cuda_graph_state(max_num_tokens)
+
+    def _should_use_compiled_replay_prepare_metadata(self) -> bool:
+        return (
+            envs.SGLANG_TORCH_COMPILE_REPLAY_PREPARE.get()
+            and hasattr(torch._inductor.config, "combo_kernels")
+            and self.supports_compiled_replay_prepare()
+        )
+
+    def _init_compiled_replay_prepare_cuda_graph_state(self, max_num_tokens: int):
+        # Extra buffers used only by the compiled replay-prepare path. Keep them
+        # out of the default CUDA graph state so the normal path keeps the same
+        # aliasing/storage behavior as the eager implementation.
+        self.decode_cuda_graph_metadata.update(
+            {
+                "real_page_table": torch.zeros(
+                    max_num_tokens,
+                    (self.max_context_len + (self.speculative_num_draft_tokens or 0))
+                    // self.real_page_size
+                    + 1,
+                    dtype=torch.int32,
+                    device=self.device,
+                ),
+                "nsa_seqlens_expanded": torch.ones(
+                    max_num_tokens, dtype=torch.int32, device=self.device
+                ),
+                "nsa_cache_seqlens": torch.ones(
+                    max_num_tokens, dtype=torch.int32, device=self.device
+                ),
+                "nsa_cu_seqlens_k": torch.zeros(
+                    max_num_tokens + 1, dtype=torch.int32, device=self.device
+                ),
+            }
+        )
+
+        # Cache deep_gemm.get_num_sms() as a plain int for torch.compile. Calling
+        # the op inside the compiled region would graph break because it returns
+        # a non-Tensor.
+        self._compiled_deep_gemm_num_sms: Optional[int] = None
+        self._compiled_deep_gemm_get_paged_mqa_logits_metadata = None
+        if is_cuda():
+            try:
+                import deep_gemm
+
+                self._compiled_deep_gemm_num_sms = deep_gemm.get_num_sms()
+                self._compiled_deep_gemm_get_paged_mqa_logits_metadata = (
+                    deep_gemm.get_paged_mqa_logits_metadata
+                )
+            except (ImportError, ModuleNotFoundError):
+                pass
+
+    def _get_compiled_paged_mqa_schedule_metadata(
+        self, seqlens_32: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        get_metadata = getattr(
+            self, "_compiled_deep_gemm_get_paged_mqa_logits_metadata", None
+        )
+        num_sms = getattr(self, "_compiled_deep_gemm_num_sms", None)
+        if get_metadata is None or num_sms is None:
+            return None
+        return get_metadata(seqlens_32, 64, num_sms)
 
     def init_forward_metadata_capture_cuda_graph(
         self,
@@ -882,40 +905,41 @@ class NativeSparseAttnBackend(
     ):
         self.set_nsa_prefill_impl(forward_batch=None)
 
+        # Currently only decode is supported for the compiled replay-prepare path.
+        #TODO (mattteochen): support prefill/extend/target_verify/draft_extend.
+        if (
+            forward_mode.is_decode_or_idle()
+            and self._should_use_compiled_replay_prepare_metadata()
+        ):
+            self._init_forward_metadata_capture_cuda_graph_compiled(
+                bs,
+                num_tokens,
+                seq_lens,
+            )
+            return
+
         """Initialize forward metadata for capturing CUDA graph."""
         if forward_mode.is_decode_or_idle():
             # Normal Decode
-            # Use pre-allocated buffers to avoid storage aliasing
-            # (which triggers merge_view_inputs overhead in torch.compile)
-            cache_seqlens_int32 = self.decode_cuda_graph_metadata["cache_seqlens"][
-                :bs
-            ]
-            cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
-            cu_seqlens_k = self.decode_cuda_graph_metadata["cu_seqlens_k"][: bs + 1]
-            cu_seqlens_k.copy_(compute_cu_seqlens(cache_seqlens_int32))
+            # Get sequence information
+            cache_seqlens_int32 = seq_lens.to(torch.int32)
+            cu_seqlens_k = compute_cu_seqlens(cache_seqlens_int32)
 
             # Use max context length for seq_len_k
             page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
             max_seqlen_q = 1
             max_seqlen_k = page_table_1.shape[1]
 
+            # Precompute page table
+            # Precompute cumulative sequence lengths
+
             # NOTE(dark): this is always arange, since we are decoding
             cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][: bs + 1]
-            nsa_cache_seqlens_int32 = self.decode_cuda_graph_metadata[
-                "nsa_cache_seqlens"
-            ][:bs]
-            nsa_cache_seqlens_int32.copy_(
-                compute_nsa_seqlens(
-                    cache_seqlens_int32, nsa_index_topk=self.nsa_index_topk
-                )
+            nsa_cache_seqlens_int32 = compute_nsa_seqlens(
+                cache_seqlens_int32, nsa_index_topk=self.nsa_index_topk
             )
 
-            # Use separate buffer for nsa_seqlens_expanded to avoid aliasing
-            # with cache_seqlens_int32
-            seqlens_expanded = self.decode_cuda_graph_metadata[
-                "nsa_seqlens_expanded"
-            ][:bs]
-            seqlens_expanded.copy_(cache_seqlens_int32)
+            seqlens_expanded = cache_seqlens_int32
             nsa_extend_seq_lens_list = [1] * num_tokens
             if self.nsa_decode_impl == "flashmla_kv":
                 flashmla_metadata = self.decode_cuda_graph_metadata[
@@ -929,21 +953,6 @@ class NativeSparseAttnBackend(
                 )
             else:
                 flashmla_metadata = None
-
-            nsa_cu_seqlens_k = self.decode_cuda_graph_metadata["nsa_cu_seqlens_k"][
-                : bs + 1
-            ]
-            nsa_cu_seqlens_k.copy_(compute_cu_seqlens(nsa_cache_seqlens_int32))
-            nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
-
-            # Use separate buffer for real_page_table to avoid aliasing
-            # with page_table_1 (when page_size == 1, _transform_table_1_to_real
-            # returns the same tensor)
-            real_page_table_src = self._transform_table_1_to_real(page_table_1)
-            real_page_table = self.decode_cuda_graph_metadata["real_page_table"][
-                : real_page_table_src.shape[0], : real_page_table_src.shape[1]
-            ]
-            real_page_table.copy_(real_page_table_src)
         elif forward_mode.is_target_verify() or forward_mode.is_draft_extend(
             include_v2=True
         ):
@@ -1005,9 +1014,9 @@ class NativeSparseAttnBackend(
             else:
                 flashmla_metadata = None
 
-            nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens_int32)
-            nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
-            real_page_table = self._transform_table_1_to_real(page_table_1)
+        nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens_int32)
+        nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
+        real_page_table = self._transform_table_1_to_real(page_table_1)
 
         paged_mqa_schedule_metadata = None
         if is_cuda() and (
@@ -1052,6 +1061,83 @@ class NativeSparseAttnBackend(
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
+    def _init_forward_metadata_capture_cuda_graph_compiled(
+        self,
+        bs: int,
+        num_tokens: int,
+        seq_lens: torch.Tensor,
+    ):
+        assert self.real_page_size > 1
+        cache_seqlens_int32 = self.decode_cuda_graph_metadata["cache_seqlens"][:bs]
+        cache_seqlens_int32.copy_(seq_lens.to(torch.int32))
+        cu_seqlens_k = self.decode_cuda_graph_metadata["cu_seqlens_k"][: bs + 1]
+        cu_seqlens_k.copy_(compute_cu_seqlens(cache_seqlens_int32))
+
+        page_table_1 = self.decode_cuda_graph_metadata["page_table"][:bs, :]
+        max_seqlen_q = 1
+        max_seqlen_k = page_table_1.shape[1]
+
+        cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][: bs + 1]
+        nsa_cache_seqlens_int32 = self.decode_cuda_graph_metadata["nsa_cache_seqlens"][
+            :bs
+        ]
+        nsa_cache_seqlens_int32.copy_(
+            compute_nsa_seqlens(
+                cache_seqlens_int32, nsa_index_topk=self.nsa_index_topk
+            )
+        )
+
+        seqlens_expanded = self.decode_cuda_graph_metadata["nsa_seqlens_expanded"][:bs]
+        seqlens_expanded.copy_(cache_seqlens_int32)
+        nsa_extend_seq_lens_list = [1] * num_tokens
+
+        if self.nsa_decode_impl == "flashmla_kv":
+            flashmla_metadata = self.decode_cuda_graph_metadata[
+                "flashmla_metadata"
+            ].slice(slice(0, num_tokens + 1))
+            flashmla_metadata.copy_(
+                self._compute_flashmla_metadata(
+                    cache_seqlens=nsa_cache_seqlens_int32,
+                    seq_len_q=1,
+                )
+            )
+        else:
+            flashmla_metadata = None
+
+        nsa_cu_seqlens_k = self.decode_cuda_graph_metadata["nsa_cu_seqlens_k"][
+            : bs + 1
+        ]
+        nsa_cu_seqlens_k.copy_(compute_cu_seqlens(nsa_cache_seqlens_int32))
+        nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
+
+        real_page_table_src = self._transform_table_1_to_real(page_table_1)
+        real_page_table = self.decode_cuda_graph_metadata["real_page_table"][
+            : real_page_table_src.shape[0], : real_page_table_src.shape[1]
+        ]
+        real_page_table.copy_(real_page_table_src)
+
+        metadata = NSAMetadata(
+            page_size=self.real_page_size,
+            cache_seqlens_int32=cache_seqlens_int32,
+            max_seq_len_q=max_seqlen_q,
+            max_seq_len_k=max_seqlen_k,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            page_table_1=page_table_1,
+            flashmla_metadata=flashmla_metadata,
+            paged_mqa_schedule_metadata=self._get_compiled_paged_mqa_schedule_metadata(
+                cache_seqlens_int32
+            ),
+            nsa_cache_seqlens_int32=nsa_cache_seqlens_int32,
+            nsa_cu_seqlens_q=nsa_cu_seqlens_q,
+            nsa_cu_seqlens_k=nsa_cu_seqlens_k,
+            nsa_seqlens_expanded=seqlens_expanded,
+            real_page_table=real_page_table,
+            nsa_extend_seq_lens_list=nsa_extend_seq_lens_list,
+        )
+        self.decode_cuda_graph_metadata[bs] = metadata
+        self.forward_metadata = metadata
+
     def init_forward_metadata_replay_cuda_graph_with_metadata(
         self,
         metadata: NSAMetadata,
@@ -1068,18 +1154,15 @@ class NativeSparseAttnBackend(
             assert seq_lens_cpu is not None
             self.set_nsa_prefill_impl(forward_batch=None)
 
+        assert self.real_page_size > 1
         bs = metadata.cache_seqlens_int32.shape[0]
-        self._init_forward_metadata_replay_cuda_graph_impl(
+        self._init_forward_metadata_replay_cuda_graph_compiled(
             metadata,
             bs,
             req_pool_indices,
             seq_lens,
-            seq_lens_sum,
-            encoder_lens,
             forward_mode,
-            spec_info,
             seq_lens_cpu,
-            out_cache_loc,
         )
 
     def init_forward_metadata_replay_cuda_graph(
@@ -1095,50 +1178,18 @@ class NativeSparseAttnBackend(
         out_cache_loc: Optional[torch.Tensor] = None,
     ):
         """Initialize forward metadata for replaying CUDA graph."""
-        if not torch.compiler.is_compiling():
-            assert seq_lens_cpu is not None
-            self.set_nsa_prefill_impl(forward_batch=None)
+        assert seq_lens_cpu is not None
 
-        # Normal Decode
-        metadata: NSAMetadata = self.decode_cuda_graph_metadata[bs]
-        self._init_forward_metadata_replay_cuda_graph_impl(
-            metadata,
-            bs,
-            req_pool_indices,
-            seq_lens,
-            seq_lens_sum,
-            encoder_lens,
-            forward_mode,
-            spec_info,
-            seq_lens_cpu,
-            out_cache_loc,
-        )
+        self.set_nsa_prefill_impl(forward_batch=None)
 
-    def _init_forward_metadata_replay_cuda_graph_impl(
-        self,
-        metadata: NSAMetadata,
-        bs: int,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        seq_lens_sum: int,
-        encoder_lens: Optional[torch.Tensor],
-        forward_mode: ForwardMode,
-        spec_info: Optional[SpecInput],
-        seq_lens_cpu: Optional[torch.Tensor],
-        out_cache_loc: Optional[torch.Tensor] = None,
-    ):
         seq_lens = seq_lens[:bs]
         seq_lens_cpu = seq_lens_cpu[:bs]
         req_pool_indices = req_pool_indices[:bs]
 
+        metadata: NSAMetadata = self.decode_cuda_graph_metadata[bs]
         if forward_mode.is_decode_or_idle():
             # Normal Decode
-            max_len = seq_lens_cpu.max().item()
-            # torch._check needed to avoid GuardOnDataDependentSymNode
-            # when setting capture_scalar_outputs=True in Dynamo
-            if torch.compiler.is_compiling():
-                torch._check(max_len >= 0)
-                torch._check(max_len <= self.max_context_len)
+            max_len = int(seq_lens_cpu.max().item())
 
             cache_seqlens = seq_lens.to(torch.int32)
             metadata.cache_seqlens_int32.copy_(cache_seqlens)
@@ -1151,9 +1202,6 @@ class NativeSparseAttnBackend(
                 cache_seqlens, nsa_index_topk=self.nsa_index_topk
             )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
-            # nsa_seqlens_expanded == cache_seqlens in decode; copy explicitly
-            # since they use separate pre-allocated buffers (no aliasing)
-            metadata.nsa_seqlens_expanded.copy_(cache_seqlens)
             seqlens_expanded = cache_seqlens
         elif forward_mode.is_target_verify():
             max_seqlen_k = int(
@@ -1223,44 +1271,123 @@ class NativeSparseAttnBackend(
             )
 
         # Update DeepGEMM paged MQA schedule metadata outside the captured graph.
-        if self._deep_gemm_num_sms is not None and (
+        if is_cuda() and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
             or forward_mode.is_draft_extend()
         ):
-            seqlens_32 = (
-                seqlens_expanded
-                if (
-                    forward_mode.is_target_verify()
-                    or forward_mode.is_draft_extend()
+            try:
+                import deep_gemm
+
+                seqlens_32 = (
+                    seqlens_expanded
+                    if (
+                        forward_mode.is_target_verify()
+                        or forward_mode.is_draft_extend()
+                    )
+                    else metadata.cache_seqlens_int32
                 )
-                else metadata.cache_seqlens_int32
-            )
-            new_schedule = self._deep_gemm_get_paged_mqa_logits_metadata(
-                seqlens_32, 64, self._deep_gemm_num_sms
-            )
-            if metadata.paged_mqa_schedule_metadata is None:
-                metadata.paged_mqa_schedule_metadata = new_schedule
-            else:
-                metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+                new_schedule = deep_gemm.get_paged_mqa_logits_metadata(
+                    seqlens_32, 64, deep_gemm.get_num_sms()
+                )
+                if metadata.paged_mqa_schedule_metadata is None:
+                    metadata.paged_mqa_schedule_metadata = new_schedule
+                else:
+                    metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+            except (ImportError, ModuleNotFoundError):
+                metadata.paged_mqa_schedule_metadata = None
         seqlens_expanded_size = seqlens_expanded.shape[0]
+        assert (
+            metadata.nsa_cache_seqlens_int32 is not None
+            and metadata.nsa_cu_seqlens_k is not None
+            and self.nsa_index_topk is not None
+        )
 
         metadata.nsa_cu_seqlens_k[1 : 1 + seqlens_expanded_size].copy_(
             torch.cumsum(nsa_cache_seqlens, dim=0, dtype=torch.int32)
         )
         # NOTE(dark): (nsa-) cu_seqlens_q is always arange, no need to copy
 
+        assert self.real_page_size == metadata.page_size
         if self.real_page_size > 1:
             real_table = self._transform_table_1_to_real(page_indices)
             new_rows = real_table.shape[0]
             new_cols = real_table.shape[1]
             metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
         else:
-            # real_page_table uses a separate pre-allocated buffer (no aliasing
-            # with page_table_1), so copy page_indices explicitly
-            metadata.real_page_table[
-                : page_indices.shape[0], : page_indices.shape[1]
-            ].copy_(page_indices)
+            assert metadata.real_page_table is metadata.page_table_1
+
+        if self.nsa_decode_impl == "flashmla_kv":
+            flashmla_metadata = metadata.flashmla_metadata.slice(
+                slice(0, seqlens_expanded_size + 1)
+            )
+            flashmla_metadata.copy_(
+                self._compute_flashmla_metadata(
+                    cache_seqlens=nsa_cache_seqlens,
+                    seq_len_q=1,
+                )
+            )
+
+        self.forward_metadata = metadata
+
+    def _init_forward_metadata_replay_cuda_graph_compiled(
+        self,
+        metadata: NSAMetadata,
+        bs: int,
+        req_pool_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        forward_mode: ForwardMode,
+        seq_lens_cpu: Optional[torch.Tensor],
+    ):
+        assert self.real_page_size > 1
+        assert forward_mode.is_decode_or_idle()
+        assert seq_lens_cpu is not None
+
+        seq_lens = seq_lens[:bs]
+        seq_lens_cpu = seq_lens_cpu[:bs]
+        req_pool_indices = req_pool_indices[:bs]
+
+        max_len = seq_lens_cpu.max().item()
+        # torch._check avoids GuardOnDataDependentSymNode when Dynamo captures
+        # scalar outputs from seq_lens_cpu.max().item().
+        if torch.compiler.is_compiling():
+            torch._check(max_len >= 0)
+            torch._check(max_len <= self.max_context_len)
+
+        cache_seqlens = seq_lens.to(torch.int32)
+        metadata.cache_seqlens_int32.copy_(cache_seqlens)
+        metadata.cu_seqlens_k[1:].copy_(
+            torch.cumsum(cache_seqlens, dim=0, dtype=torch.int32)
+        )
+        page_indices = self.req_to_token[req_pool_indices, :max_len]
+        metadata.page_table_1[:, :max_len].copy_(page_indices)
+        nsa_cache_seqlens = compute_nsa_seqlens(
+            cache_seqlens, nsa_index_topk=self.nsa_index_topk
+        )
+        metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
+        metadata.nsa_seqlens_expanded.copy_(cache_seqlens)
+
+        new_schedule = self._get_compiled_paged_mqa_schedule_metadata(
+            metadata.cache_seqlens_int32
+        )
+        if new_schedule is not None:
+            if metadata.paged_mqa_schedule_metadata is None:
+                metadata.paged_mqa_schedule_metadata = new_schedule
+            else:
+                metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+
+        seqlens_expanded_size = cache_seqlens.shape[0]
+
+        metadata.nsa_cu_seqlens_k[1 : 1 + seqlens_expanded_size].copy_(
+            torch.cumsum(nsa_cache_seqlens, dim=0, dtype=torch.int32)
+        )
+        # NOTE(dark): (nsa-) cu_seqlens_q is always arange, no need to copy
+
+        assert self.real_page_size == metadata.page_size
+        real_table = self._transform_table_1_to_real(page_indices)
+        new_rows = real_table.shape[0]
+        new_cols = real_table.shape[1]
+        metadata.real_page_table[:new_rows, :new_cols].copy_(real_table)
 
         if self.nsa_decode_impl == "flashmla_kv":
             flashmla_metadata = metadata.flashmla_metadata.slice(

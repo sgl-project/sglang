@@ -1244,6 +1244,21 @@ class CudaGraphRunner:
             return self.model_runner.decode_attn_backend_group[get_current_stream_idx()]
         return self.attn_backend
 
+    def _get_compiled_replay_metadata(self, attn_backend, bs: int):
+        # Fetch metadata before entering torch.compile. If the compiled region
+        # performs metadata lookup/allocation itself, Dynamo sees changing Python
+        # metadata objects and recompiles frequently.
+        replay_metadata = attn_backend.get_cuda_graph_replay_metadata(bs)
+
+        if replay_metadata is None:
+            raise RuntimeError(
+                "Compiled replay prepare requires attention metadata to be exported "
+                f"before entering the compiled region for capture batch size {bs}. "
+                "Without exporting metadata outside torch.compile, Dynamo observes "
+                "changing metadata objects and recompiles frequently."
+            )
+        return replay_metadata
+
     def _can_compile_replay_prepare(self):
         if self._can_compile_replay_prepare_cache is not None:
             return self._can_compile_replay_prepare_cache
@@ -1509,7 +1524,7 @@ class CudaGraphRunner:
             and self._can_compile_replay_prepare()
         ):
             attn_backend = self._get_replay_attn_backend()
-            replay_metadata = attn_backend.get_cuda_graph_replay_metadata(bs)
+            replay_metadata = self._get_compiled_replay_metadata(attn_backend, bs)
             # Mark dynamic dims for the compiled path to avoid runtime recompilation
             # due to metadata changes.
             self._mark_compiled_replay_prepare_dynamic_dims(
