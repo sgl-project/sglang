@@ -311,6 +311,8 @@ class LoRAManager:
         lora_ranks = [0] * self.max_loras_per_batch
         scalings = [0] * self.max_loras_per_batch
         for i, uid in enumerate(forward_batch.lora_ids):
+            if uid not in self.memory_pool.uid_to_buffer_id:
+                continue
             weight_indices[i] = self.memory_pool.get_buffer_id(uid)
             if uid is not None:
                 lora = self.loras[uid]
@@ -808,6 +810,12 @@ class LoRAManager:
                 x in self.target_modules for x in ["gate_up_proj", "down_proj"]
             ):
                 layer_id = get_layer_id(module_name)
+                if layer_id is None:
+                    # FusedMoE submodules outside the decoder layer hierarchy
+                    # (e.g. nested helpers under non-".layers." prefixes) have
+                    # no resolvable layer id; skip them so we don't index
+                    # `self.lora_modules` with `None`.
+                    continue
                 lora_module = self.set_lora_module(module_name, module)
                 lora_module.experts_shared_outer_loras = self.experts_shared_outer_loras
                 lora_module.lora_use_virtual_experts = self.lora_use_virtual_experts
