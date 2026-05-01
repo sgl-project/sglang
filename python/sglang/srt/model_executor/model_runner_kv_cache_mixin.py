@@ -7,8 +7,8 @@ import torch
 
 from sglang.srt.configs.model_config import (
     get_nsa_index_head_dim,
+    is_deepseek_compressed,
     is_deepseek_nsa,
-    is_deepseek_v4,
 )
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
@@ -283,7 +283,7 @@ class ModelRunnerKVCacheMixin:
 
         # Initialize token_to_kv_pool
         is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
-        is_v4_model = is_deepseek_v4(self.model_config.hf_config)
+        is_v4_model = is_deepseek_compressed(self.model_config.hf_config)
 
         # Out-of-tree platform plugin system — used by elif below
         from sglang.srt.platforms import current_platform
@@ -770,7 +770,7 @@ class ModelRunnerKVCacheMixin:
         # state buffers); set unconditionally so draft workers have it before
         # _init_pools reads it (target path also overwrites this in the
         # configurator's resolve() for parity, harmless here).
-        if is_deepseek_v4(self.model_config.hf_config):
+        if is_deepseek_compressed(self.model_config.hf_config):
             self.state_dtype = torch.float32
 
         self._init_pools()
