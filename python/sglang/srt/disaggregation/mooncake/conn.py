@@ -9,7 +9,7 @@ import struct
 import threading
 import time
 from collections import defaultdict
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -227,6 +227,7 @@ class MooncakeKVManager(CommonKVManager):
             self.enable_custom_mem_pool, self.custom_mem_pool_type = (
                 check_mooncake_custom_mem_pool_enabled()
             )
+            self.room_transfer_elapsed: Dict[int, float] = {}
             self._staging_ctx = PrefillStagingContext() if self.enable_staging else None
             if self.enable_staging:
                 self._init_staging_buffers(len(self.transfer_queues))
@@ -1181,6 +1182,7 @@ class MooncakeKVManager(CommonKVManager):
                 # When staging transfer is not yet ready (watermark/allocation pending),
                 # the chunk is re-enqueued and we break out of the req loop to retry later.
                 staging_deferred = False
+                t_chunk_start = time.monotonic()
                 for req in reqs_to_be_processed:
                     if not req.is_dummy:
                         # Early exit if the request has failed
@@ -1315,6 +1317,11 @@ class MooncakeKVManager(CommonKVManager):
 
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
+                                chunk_elapsed = time.monotonic() - t_chunk_start
+                                self.room_transfer_elapsed[kv_chunk.room] = (
+                                    self.room_transfer_elapsed.get(kv_chunk.room, 0.0)
+                                    + chunk_elapsed
+                                )
                                 status = KVPoll.Success if all(polls) else KVPoll.Failed
                                 self.update_status(req.room, status)
                                 for endpoint, dst_port, room in dst_ranks_infos:
@@ -1330,6 +1337,13 @@ class MooncakeKVManager(CommonKVManager):
                         # Dummy request does not need to sync status to decode endpoint
                         if kv_chunk.is_last_chunk and req.room in self.request_status:
                             self.update_status(req.room, KVPoll.Success)
+
+                if not kv_chunk.is_last_chunk:
+                    chunk_elapsed = time.monotonic() - t_chunk_start
+                    self.room_transfer_elapsed[kv_chunk.room] = (
+                        self.room_transfer_elapsed.get(kv_chunk.room, 0.0)
+                        + chunk_elapsed
+                    )
 
                 if staging_deferred:
                     continue
@@ -1649,6 +1663,7 @@ class MooncakeKVSender(CommonKVSender):
         super().__init__(mgr, bootstrap_addr, bootstrap_room, dest_tp_ranks, pp_rank)
         self.conclude_state = None
         self.init_time = time.time()
+        self.transfer_elapsed_s: float = 0.0
 
     def send(
         self,
@@ -1694,6 +1709,11 @@ class MooncakeKVSender(CommonKVSender):
         if self.conclude_state is None:
             status = self.kv_mgr.check_status(self.bootstrap_room)
             if status in (KVPoll.Success, KVPoll.Failed):
+                popped = self.kv_mgr.room_transfer_elapsed.pop(
+                    self.bootstrap_room, 0.0
+                )
+                if status == KVPoll.Success:
+                    self.transfer_elapsed_s = popped
                 self.conclude_state = status
             elif status == KVPoll.Bootstrapping:
                 if self.init_time is not None:
@@ -1719,6 +1739,7 @@ class MooncakeKVSender(CommonKVSender):
     def clear(self) -> None:
         if self.bootstrap_room in self.kv_mgr.request_status:
             self.kv_mgr.request_status.pop(self.bootstrap_room)
+        self.kv_mgr.room_transfer_elapsed.pop(self.bootstrap_room, None)
 
     def failure_exception(self):
         # Explicitly set the status to failure since this request has failed in another rank

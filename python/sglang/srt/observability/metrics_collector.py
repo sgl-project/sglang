@@ -113,6 +113,8 @@ class SchedulerStats:
     num_decode_transfer_queue_reqs: QueueCount = field(default_factory=QueueCount)
     kv_transfer_speed_gb_s: float = 0.0
     kv_transfer_latency_ms: float = 0.0
+    kv_transfer_rdma_speed_gb_s: float = 0.0
+    kv_transfer_rdma_latency_ms: float = 0.0
 
     # Utilization
     utilization: float = 0.0
@@ -413,6 +415,18 @@ class SchedulerMetricsCollector:
             documentation="Histogram of KV cache transfer size in MB.",
             labelnames=labels.keys(),
             buckets=(1, 5, 10, 50, 100, 500, 1000, 5000, 10000),
+        )
+        self.kv_transfer_rdma_speed_gb_s = Gauge(
+            name="sglang:kv_transfer_rdma_speed_gb_s",
+            documentation="The RDMA transfer speed of the KV cache in GB/s.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+        self.kv_transfer_rdma_latency_ms = Gauge(
+            name="sglang:kv_transfer_rdma_latency_ms",
+            documentation="The RDMA transfer latency of the KV cache in ms.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
         )
 
         # Utilization
@@ -1056,6 +1070,12 @@ class SchedulerMetricsCollector:
         )
         self._log_gauge_queue_count(
             self.num_decode_transfer_queue_reqs, stats.num_decode_transfer_queue_reqs
+        )
+        self._log_gauge(
+            self.kv_transfer_rdma_speed_gb_s, stats.kv_transfer_rdma_speed_gb_s
+        )
+        self._log_gauge(
+            self.kv_transfer_rdma_latency_ms, stats.kv_transfer_rdma_latency_ms
         )
         # Retract
         self._log_gauge(self.num_retracted_reqs, stats.num_retracted_reqs)
