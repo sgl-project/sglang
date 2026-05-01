@@ -58,6 +58,7 @@ from sglang.srt.layers.dp_attention import (
     moe_cp_all_gather_into_tensor,
 )
 from sglang.srt.layers.flashinfer_comm_fusion import is_flashinfer_allreduce_unavailable
+from sglang.srt.layers.moe.dwdp import enable_dwdp
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     should_use_dp_reduce_scatterv,
@@ -372,6 +373,7 @@ class LayerScatterModes:
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 not get_moe_a2a_backend().is_none()
                 or should_use_flashinfer_cutlass_moe_fp4_allgather()
+                or enable_dwdp()  # DWDP: each rank computes locally, no token movement
             ):
                 return ScatterMode.SCATTERED
             # NSA CP doesn't support MOE_FULL yet; fall back to FULL

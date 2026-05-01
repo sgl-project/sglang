@@ -491,6 +491,24 @@ class QuarkFusedMoEMethod(FusedMoEMethodBase):
             raise ValueError("A scheme must be defined for each layer")
         return scheme.apply_weights(layer, dispatch_output)
 
+    def apply_dwdp(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: "StandardDispatchOutput",
+        w13_list,
+        w2_list,
+        w13_scale_list,
+        w2_scale_list,
+    ):
+        """Multi-B DWDP forward: pass weight lists to FlyDSL kernels."""
+        scheme = layer.scheme
+        if scheme is None:
+            raise ValueError("A scheme must be defined for each layer")
+        return scheme.apply_dwdp_weights(
+            layer, dispatch_output,
+            w13_list, w2_list, w13_scale_list, w2_scale_list,
+        )
+
 
 class QuarkKVCacheMethod(BaseKVCacheMethod):
     """

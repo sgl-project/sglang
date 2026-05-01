@@ -97,6 +97,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.layers.moe.dwdp import enable_dwdp
 from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.attention_registry import (
@@ -1507,6 +1508,117 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 raise ValueError(
                     f"TP rank {self.tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
                 ) from None
+
+        # DWDP initialization after model loading
+        if self.server_args.dwdp_size > 1:
+            self._init_dwdp()
+
+    def _init_dwdp(self):
+        """Initialize DWDP after model weights are loaded."""
+        from sglang.srt.distributed.parallel_state import (
+            _init_dwdp_group,
+            get_tp_group,
+        )
+        from sglang.srt.layers.moe.dwdp.dwdp_manager import (
+            DwdpExpertLayout,
+            DwdpManager,
+            set_global_dwdp_manager,
+        )
+
+        tp_group = get_tp_group()
+        _init_dwdp_group(tp_group, self.server_args)
+
+        # Get model config for expert count
+        num_routed_experts = getattr(self.model_config.hf_config, "n_routed_experts", None)
+        if num_routed_experts is None:
+            num_routed_experts = getattr(self.model_config.hf_config, "num_experts", 256)
+
+        # Determine experts per worker
+        dwdp_size = self.server_args.dwdp_size
+        num_experts_per_worker = self.server_args.dwdp_num_experts_per_worker
+        if num_experts_per_worker is None:
+            num_experts_per_worker = num_routed_experts // dwdp_size  # default: EP partition
+
+        layout = DwdpExpertLayout(
+            num_routed_experts=num_routed_experts,
+            dwdp_size=dwdp_size,
+            dwdp_rank=tp_group.rank_in_group,
+            num_experts_per_worker=num_experts_per_worker,
+        )
+
+        # Count MoE layers and find first MoE layer ID
+        first_moe_layer_id = None
+        num_moe_layers = 0
+        if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
+            for layer in self.model.model.layers:
+                if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                    num_moe_layers += 1
+                    layer_id = layer.mlp.layer_id
+                    if first_moe_layer_id is None or layer_id < first_moe_layer_id:
+                        first_moe_layer_id = layer_id
+
+        if first_moe_layer_id is None:
+            logger.warning("[DWDP] No MoE layers found, skipping DWDP init")
+            return
+
+        # Detect fused shared experts from the first MoE layer
+        num_fused_shared_experts = 0
+        for layer in self.model.model.layers:
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                experts = layer.mlp.experts
+                if hasattr(experts, "_has_fused_shared") and experts._has_fused_shared:
+                    num_fused_shared_experts = experts.num_local_experts - experts._num_local_routed
+                break
+
+        dwdp_mgr = DwdpManager(
+            layout=layout,
+            num_moe_layers=num_moe_layers,
+            first_moe_layer_id=first_moe_layer_id,
+            process_group=tp_group,
+            num_fused_shared_experts=num_fused_shared_experts,
+        )
+
+        # Register weights from each MoE layer
+        for layer in self.model.model.layers:
+            if hasattr(layer, "mlp") and hasattr(layer.mlp, "experts"):
+                mlp = layer.mlp
+                experts = mlp.experts
+                layer_id = mlp.layer_id
+                # Collect weight tensors (routed experts only, exclude fused shared)
+                num_local_routed = experts._num_local_routed
+                weights = {}
+                for name, param in experts.named_parameters():
+                    if name not in ["correction_bias"] and param.dim() >= 2:
+                        # If tensor has fused shared expert appended, take only routed portion
+                        if param.shape[0] > num_local_routed:
+                            weights[name] = param.data[:num_local_routed]
+                        else:
+                            weights[name] = param.data
+                if weights:
+                    dwdp_mgr.register_layer_weights(layer_id, weights)
+
+                # Register shared expert weight slices separately
+                if num_fused_shared_experts > 0:
+                    shared_weights = {}
+                    for name, param in experts.named_parameters():
+                        if name not in ["correction_bias"] and param.dim() >= 2:
+                            if param.shape[0] > num_local_routed:
+                                shared_weights[name] = param.data[num_local_routed:]
+                    if shared_weights:
+                        dwdp_mgr.register_shared_expert_weights(layer_id, shared_weights)
+
+        # Exchange IPC handles and initialize buffers
+        dwdp_mgr.exchange_ipc_handles()
+        dwdp_mgr.init_prefetch_buffers()
+        dwdp_mgr.initialize_compute_events()
+
+        set_global_dwdp_manager(dwdp_mgr)
+        logger.info(
+            f"[DWDP] Initialization complete: "
+            f"{num_moe_layers} MoE layers, "
+            f"{num_routed_experts} routed experts, "
+            f"{num_experts_per_worker} experts per worker"
+        )
 
     def update_expert_location(
         self,
@@ -2962,6 +3074,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # DWDP: trigger async prefetch for first MoE layers (decode path)
+        if enable_dwdp():
+            from sglang.srt.layers.moe.dwdp.dwdp_manager import get_global_dwdp_manager
+            dwdp_mgr = get_global_dwdp_manager()
+            if dwdp_mgr is not None:
+                dwdp_mgr.prefetch_first_layers()
+
         if not skip_attn_backend_init:
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
@@ -2991,6 +3110,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Tuple[
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
     ]:
+        # DWDP: trigger async prefetch for first MoE layers
+        if enable_dwdp():
+            from sglang.srt.layers.moe.dwdp.dwdp_manager import get_global_dwdp_manager
+            dwdp_mgr = get_global_dwdp_manager()
+            if dwdp_mgr is not None:
+                dwdp_mgr.prefetch_first_layers()
+
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors

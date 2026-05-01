@@ -572,6 +572,10 @@ class ServerArgs:
     mooncake_ib_device: Optional[str] = None
     elastic_ep_rejoin: bool = False
 
+    # DWDP (Distributed Weight Data Parallelism)
+    dwdp_size: int = 1
+    dwdp_num_experts_per_worker: Optional[int] = None
+
     # Mamba cache
     max_mamba_cache_size: Optional[int] = None
     mamba_ssm_dtype: Optional[str] = None
@@ -850,6 +854,9 @@ class ServerArgs:
 
         # Handle Hicache settings.
         self._handle_hicache()
+
+        # Handle DWDP parallelism (must run before data parallelism).
+        self._handle_dwdp()
 
         # Handle data parallelism.
         self._handle_data_parallelism()
@@ -2916,6 +2923,48 @@ class ServerArgs:
             assert (
                 self.moe_dp_size == 1
             ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+
+    def _handle_dwdp(self):
+        """Configure DWDP parallelism settings.
+
+        Must run BEFORE _handle_data_parallelism(), which resets
+        enable_dp_attention=False when dp_size==1.
+        """
+        if self.dwdp_size <= 1:
+            return
+
+        assert self.dwdp_size >= 2, (
+            f"dwdp_size ({self.dwdp_size}) must be >= 2"
+        )
+        assert self.dwdp_size == self.tp_size, (
+            f"dwdp_size ({self.dwdp_size}) must equal tp_size ({self.tp_size})"
+        )
+        assert self.disaggregation_mode != "decode", (
+            "DWDP is not supported for decode-only instances"
+        )
+        assert not self.enable_eplb, (
+            "EPLB is incompatible with DWDP (static partitioning)"
+        )
+
+        # Force DP attention, dense MLP independence, EP partition
+        self.dp_size = self.dwdp_size
+        self.enable_dp_attention = True
+        self.moe_dense_tp_size = 1
+        self.ep_size = self.dwdp_size
+        self.moe_dp_size = 1
+
+        # DWDP always uses "none" — each rank computes independently
+        self.moe_a2a_backend = "none"
+        if self.disaggregation_mode != "prefill":
+            self.enable_mixed_chunk = False
+
+        logger.info(
+            f"[DWDP] Auto-configured: dp_size={self.dp_size}, "
+            f"enable_dp_attention={self.enable_dp_attention}, "
+            f"moe_dense_tp_size={self.moe_dense_tp_size}, "
+            f"ep_size={self.ep_size}, moe_dp_size={self.moe_dp_size}, "
+            f"moe_a2a_backend={self.moe_a2a_backend}"
+        )
 
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
@@ -5682,6 +5731,24 @@ class ServerArgs:
             action="store_true",
             default=ServerArgs.elastic_ep_rejoin,
             help="Indicates that this process is a relaunched elastic EP rank that should rejoin an existing process group.",
+        )
+
+        # DWDP (Distributed Weight Data Parallelism)
+        parser.add_argument(
+            "--dwdp-size",
+            type=int,
+            default=ServerArgs.dwdp_size,
+            help="DWDP group size. When > 1, enables Distributed Weight Data Parallelism "
+            "where each GPU handles a partition of MoE experts and uses DP attention. "
+            "Must equal tp_size. Set to 0 to disable.",
+        )
+        parser.add_argument(
+            "--dwdp-num-experts-per-worker",
+            type=int,
+            default=ServerArgs.dwdp_num_experts_per_worker,
+            help="Number of experts stored on each DWDP worker. Defaults to total "
+            "routed experts (each rank has all experts via IPC). Lower values "
+            "reduce memory by using overlapping expert allocation.",
         )
 
         # Mamba Cache

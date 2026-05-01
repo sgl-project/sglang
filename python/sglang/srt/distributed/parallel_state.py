@@ -1487,6 +1487,9 @@ _MOE_DP: Optional[GroupCoordinator] = None
 _MOE_EP: Optional[GroupCoordinator] = None
 _MOE_TP: Optional[GroupCoordinator] = None
 
+# DWDP group (same as TP group when dwdp_size == tp_size)
+_DWDP: Optional[GroupCoordinator] = None
+
 
 def get_moe_dp_group() -> GroupCoordinator:
     assert _MOE_DP is not None, "moe data parallel group is not initialized"
@@ -1501,6 +1504,22 @@ def get_moe_ep_group() -> GroupCoordinator:
 def get_moe_tp_group() -> GroupCoordinator:
     assert _MOE_TP is not None, "expert model parallel group is not initialized"
     return _MOE_TP
+
+
+def get_dwdp_group() -> Optional[GroupCoordinator]:
+    return _DWDP
+
+
+def get_dwdp_rank() -> int:
+    if _DWDP is None:
+        return 0
+    return _DWDP.rank_in_group
+
+
+def get_dwdp_world_size() -> int:
+    if _DWDP is None:
+        return 1
+    return _DWDP.world_size
 
 
 # kept for backward compatibility
@@ -2223,6 +2242,19 @@ def get_moe_tensor_parallel_rank():
     return get_moe_tp_group().rank_in_group
 
 
+def _init_dwdp_group(tp_group: GroupCoordinator, server_args):
+    """Initialize DWDP group. Called from model_runner after model parallel init."""
+    global _DWDP
+    if server_args.dwdp_size > 1:
+        # DWDP group is the same as TP group since dwdp_size == tp_size
+        _DWDP = tp_group
+        import logging
+        logging.getLogger(__name__).info(
+            f"[DWDP] Initialized DWDP group: rank={_DWDP.rank_in_group}, "
+            f"size={_DWDP.world_size}"
+        )
+
+
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""
     global _TP
@@ -2244,6 +2276,10 @@ def destroy_model_parallel():
     if _MOE_TP:
         _MOE_TP.destroy()
     _MOE_TP = None
+
+    global _DWDP
+    # DWDP group is same as TP group, just set to None (don't destroy twice)
+    _DWDP = None
 
     global _ATTN_CP
     global _MOE_DP

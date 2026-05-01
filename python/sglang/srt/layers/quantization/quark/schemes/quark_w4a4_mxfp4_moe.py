@@ -226,3 +226,50 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             expert_mask=layer.dispatcher.expert_mask_gpu,
         )
         return self.runner.run(dispatch_output, quant_info)
+
+    def apply_dwdp_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+        w13_list,
+        w2_list,
+        w13_scale_list,
+        w2_scale_list,
+    ) -> CombineInput:
+        """Multi-B DWDP path: pass weight lists directly to FlyDSL kernels."""
+        from aiter import ActivationType, QuantType
+        from aiter.fused_moe import fused_moe
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        topk_output = dispatch_output.topk_output
+        topk_weights, topk_ids, _ = topk_output
+        if _is_hip:
+            topk_weights = topk_weights.to(torch.float32)
+
+        # View as fp4x2 + propagate is_shuffled
+        is_shuffled = getattr(layer.w13_weight, "is_shuffled", False)
+        if hasattr(torch, "float4_e2m1fn_x2"):
+            w13_list = [w.view(torch.float4_e2m1fn_x2) for w in w13_list]
+            w2_list = [w.view(torch.float4_e2m1fn_x2) for w in w2_list]
+        for w in w13_list + w2_list:
+            w.is_shuffled = is_shuffled
+
+        output = fused_moe(
+            x,
+            w13_list,  # List[Tensor] — multi-B!
+            w2_list,   # List[Tensor]
+            topk_weights,
+            topk_ids,
+            expert_mask=None,  # All experts local in DWDP
+            quant_type=QuantType.per_1x32,
+            w1_scale=w13_scale_list,  # List[Tensor] or None
+            w2_scale=w2_scale_list,   # List[Tensor] or None
+            activation=(
+                ActivationType.Silu
+                if self.moe_runner_config.activation == "silu"
+                else ActivationType.Gelu
+            ),
+            doweight_stage1=False,
+        )
+        return StandardCombineInput(hidden_states=output)

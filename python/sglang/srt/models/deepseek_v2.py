@@ -48,6 +48,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
+from sglang.srt.layers.moe.dwdp import enable_dwdp, get_global_dwdp_manager
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
@@ -574,6 +575,7 @@ class DeepseekV2MoE(nn.Module):
             or get_moe_a2a_backend().is_ascend_fuseep()
             or get_moe_a2a_backend().is_flashinfer()
         )
+        # NOTE: enable_dwdp() is False at init time; call dynamically in forward()
         self._fuse_shared_experts_inside_sbo = SboFlags.fuse_shared_experts_inside_sbo()
 
     def get_moe_weights(self):
@@ -594,6 +596,11 @@ class DeepseekV2MoE(nn.Module):
         use_reduce_scatter: bool = False,
         gemm_output_zero_allocator: BumpAllocator = None,
     ) -> torch.Tensor:
+        if enable_dwdp():
+            return self.forward_dwdp(
+                hidden_states,
+                gemm_output_zero_allocator,
+            )
         if not self._enable_a2a_moe:
             if (
                 self.alt_stream is not None
@@ -616,6 +623,68 @@ class DeepseekV2MoE(nn.Module):
                 )
         else:
             return self.forward_deepep(hidden_states, forward_batch)
+
+    def forward_dwdp(
+        self,
+        hidden_states: torch.Tensor,
+        gemm_output_zero_allocator: BumpAllocator = None,
+    ) -> torch.Tensor:
+        """DWDP forward: local routing with all experts visible via prefetch."""
+        dwdp_mgr = get_global_dwdp_manager()
+
+        # 1. Wait for prefetched weights for this layer
+        dwdp_mgr.wait_prefetch(self.layer_id)
+
+        # 2. Shared experts (no TP reduction needed since moe_dense_tp_size=1)
+        if hasattr(self, "shared_experts"):
+            shared_output = self._forward_shared_experts(
+                hidden_states, gemm_output_zero_allocator
+            )
+        else:
+            shared_output = None
+
+        # 3. Gate routing (full expert vocabulary)
+        if hidden_states.shape[0] > 0:
+            router_logits = self.gate(hidden_states, gemm_output_zero_allocator)
+            topk_output = self.topk(
+                hidden_states,
+                router_logits,
+            )
+        else:
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
+
+        # 4. Get assembled weight view from DWDP manager
+        weight_view = dwdp_mgr.get_weight_view(self.layer_id)
+
+        # 5. MoE compute with full expert weights (local + prefetched)
+        if hidden_states.shape[0] == 0:
+            final_hidden_states = hidden_states
+        else:
+            final_hidden_states = self.experts.forward_dwdp(
+                hidden_states, topk_output, weight_view
+            )
+
+        # No scaling needed: forward_dwdp sets moe_ep_size=1 so the kernel
+        # outputs the raw MoE result without EP-level reduction.
+
+        # Apply routed scaling if needed
+        if (
+            not _is_cuda
+            and not _is_musa
+            and not _is_xpu
+            and not _use_aiter
+            or isinstance(self.experts.quant_method, KTEPWrapperMethod)
+        ):
+            final_hidden_states *= self.routed_scaling_factor
+
+        if shared_output is not None:
+            final_hidden_states += shared_output
+
+        # 6. Record compute done and trigger prefetch for layer+2
+        dwdp_mgr.record_compute_and_prefetch_next(self.layer_id)
+
+        # No all-reduce needed: DWDP is fully local per rank
+        return final_hidden_states
 
     def forward_normal_dual_stream(
         self,

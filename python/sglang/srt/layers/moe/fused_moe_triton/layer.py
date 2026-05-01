@@ -1081,6 +1081,59 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
+    def forward_dwdp(
+        self,
+        hidden_states: torch.Tensor,
+        topk_output,
+        weight_view,
+    ) -> torch.Tensor:
+        """DWDP forward using multi-B FlyDSL kernels (no weight copy/concat).
+
+        Passes per-rank weight lists directly to FlyDSL stage1/stage2 kernels
+        which read from multiple buffer resources (up to 4) via compile-time
+        arith.select.
+        """
+        from sglang.srt.layers.moe.dwdp.dwdp_manager import DwdpWeightView
+
+        assert isinstance(weight_view, DwdpWeightView)
+
+        # Extract weight lists from view (shared expert already pre-fused by DwdpManager)
+        w13_list = weight_view.weights["w13_weight"]
+        w2_list = weight_view.weights["w2_weight"]
+        w13_scale_list = weight_view.weights.get("w13_weight_scale")
+        w2_scale_list = weight_view.weights.get("w2_weight_scale")
+
+        # Build dispatch output (bypass dispatcher since no EP remapping needed)
+        from sglang.srt.layers.moe.token_dispatcher.standard import (
+            StandardDispatchOutput,
+        )
+
+        dispatch_output = StandardDispatchOutput(
+            hidden_states=hidden_states,
+            hidden_states_scale=None,
+            topk_output=topk_output,
+        )
+
+        # Call multi-B apply
+        combine_input = self.quant_method.apply_dwdp(
+            layer=self,
+            dispatch_output=dispatch_output,
+            w13_list=w13_list,
+            w2_list=w2_list,
+            w13_scale_list=w13_scale_list,
+            w2_scale_list=w2_scale_list,
+        )
+
+        # Combine (weighted sum of expert outputs)
+        with use_symmetric_memory(
+            get_tp_group(), disabled=not is_allocation_symmetric()
+        ):
+            final_hidden_states = self.dispatcher.combine(combine_input=combine_input)
+            origin_dim = hidden_states.shape[-1]
+            final_hidden_states = final_hidden_states[..., :origin_dim].contiguous()
+
+        return final_hidden_states
+
     def run_moe_core(self, dispatch_output: DispatchOutput) -> CombineInput:
         # TODO: consider using symmetric memory
         return self.quant_method.apply(
