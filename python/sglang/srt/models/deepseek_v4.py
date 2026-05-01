@@ -60,7 +60,6 @@ from sglang.srt.models.dbrx import ReplicatedLinear
 from sglang.srt.models.deepseek_v2 import ParallelLMHead, _is_cuda, _is_hip, _is_npu
 from sglang.srt.server_args import get_global_server_args
 from sglang.srt.utils import (
-    BumpAllocator,
     LazyValue,
     add_prefix,
     log_info_on_rank0,
@@ -1092,26 +1091,6 @@ class DeepseekV4Model(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor],
     ) -> torch.Tensor:
-        total_num_layers = self.end_layer - self.start_layer
-        device = input_embeds.device if input_embeds is not None else input_ids.device
-        zero_allocator = BumpAllocator(
-            buffer_size=total_num_layers * 2 * (2 if forward_batch.can_run_tbo else 1),
-            dtype=torch.float32,
-            device=device,
-        )
-        has_gemm_output_zero_allocator = hasattr(
-            self, "gemm_output_zero_allocator_size"
-        )
-        gemm_output_zero_allocator = (
-            BumpAllocator(
-                buffer_size=self.gemm_output_zero_allocator_size,
-                dtype=torch.float32,
-                device=device,
-            )
-            if has_gemm_output_zero_allocator
-            and self.gemm_output_zero_allocator_size > 0
-            else None
-        )
         hidden_states = self.embed_tokens(input_ids)
         hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
