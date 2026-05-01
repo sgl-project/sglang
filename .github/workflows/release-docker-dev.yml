@@ -59,9 +59,9 @@ jobs:
           # Build tag config
           if [ -z "${SUFFIX}" ]; then
             # Nightly: include dated tags
-            TAG_CONFIG='[{"cuda":"cu129","tags":["dev","nightly-dev-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev-cu13","nightly-dev-cu13-{date}-{short_sha}"]}]'
+            TAG_CONFIG='[{"cuda":"cu129","tags":["dev-cu12","nightly-dev-cu12-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev","nightly-dev-{date}-{short_sha}"]}]'
           else
-            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev-cu13${SUFFIX}\"]}]"
+            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev-cu12${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\"]}]"
           fi
           echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
 
@@ -81,6 +81,6 @@ jobs:
     if: ${{ !inputs.tag && !inputs.pr_number }}
     uses: ./.github/workflows/_docker-cleanup-nightly.yml
     with:
-      tag_prefixes: '["nightly-dev", "nightly-dev-cu13"]'
+      tag_prefixes: '["nightly-dev", "nightly-dev-cu12"]'
       image_repo: ${{ inputs.image_repo || 'lmsysorg/sglang' }}
     secrets: inherit
