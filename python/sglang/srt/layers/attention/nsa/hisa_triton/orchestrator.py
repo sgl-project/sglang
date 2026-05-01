@@ -64,7 +64,7 @@ _FAST_TOPK_DISABLE = os.environ.get("SGLANG_HISA_FAST_TOPK_DISABLE", "0") == "1"
 
 
 def _stage3_topk_prefill(
-    score_2d: torch.Tensor, block_topk: int, k_block_size: int,
+    score_2d: torch.Tensor, block_topk: int,
 ) -> torch.Tensor:
     """Prefill stage 3: [seq, L] f32 → [seq, topk] (i32 fast / i64 torch).
 
@@ -74,7 +74,7 @@ def _stage3_topk_prefill(
     without per-row lengths.
     """
     topk = min(block_topk, score_2d.shape[-1])
-    if _FAST_TOPK_DISABLE or k_block_size not in (16, 32) or topk > _FAST_TOPK_MAX:
+    if _FAST_TOPK_DISABLE or topk > _FAST_TOPK_MAX:
         # bf16 path: ~40% faster than f32 torch.topk on long rows.
         return torch.topk(
             score_2d.bfloat16(), k=topk, dim=-1, sorted=False,
@@ -340,7 +340,7 @@ def fp8_native_hierarchy_mqa_logits(
     # torch.topk(bf16) at K∈{64,128} (fast_topk's setup tax > sort savings
     # at small topk). Helper above hides the dispatch and the L>=topk clamp.
     topk_block_indices = _stage3_topk_prefill(
-        block_k_indexer_score, block_topk, k_block_size,
+        block_k_indexer_score, block_topk
     )  # [seq, min(block_topk, L)] int32 (fast_topk) or int64 (torch.topk)
 
     # 4) Sparse-MQA on raw K — split dispatch by K (sweep at sq=8192,
