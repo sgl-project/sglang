@@ -546,66 +546,87 @@ class Envs:
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
 
     SGLANG_ENABLE_THINKING = EnvBool(False)
+
+    # ====================================================================
+    # DeepSeek V4
+    # ====================================================================
+
+    # Identity / chat encoder
+    SGLANG_DSV4_ISOLATE = EnvInt(False)
+    # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
+    SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
-    # Accepts "", "max", "high" (empty string means unset). Other values filtered to None.
+    # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_REASONING_EFFORT = EnvStr("")
 
-    SGLANG_DSV4_ISOLATE = EnvInt(False)
-    SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)  # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint
+    # HiSparse / compressor (HC = HiSparse compressor, MHC = HiSparse hash kernel)
     SGLANG_OPT_HISPARSE_C4_SHRINK = EnvInt(1)
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
-    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
-
-
-    SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
-    SGLANG_OPT_USE_TILELANG_SWA_PREPARE = EnvBool(True)
-    SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
-
+    SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
+    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
+    SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+    SGLANG_HANDLE_C128_PREFILL_KERNEL = EnvBool(False)
+    SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE = EnvInt(-1)
+    SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
+    SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_FIX_MTP_HC_HIDDEN = EnvBool(True)
-    SGLANG_FIX_ATTN_BACKEND_IDLE = EnvBool(True)
-    SGLANG_FIX_PD_IDLE = EnvBool(True)
-    SGLANG_OPT_V4_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)  # usually not useful
-    SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
-    SGLANG_OPT_USE_OVERLAP_STORE_CACHE = EnvBool(True)
-    SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
-    SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
-    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
+
+    # SWA radix cache
+    SGLANG_OPT_USE_TILELANG_SWA_PREPARE = EnvBool(True)
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
     # TODO(DSV4): @ispobock this has bug on main branch when retract
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
     SGLANG_OPT_SWA_SPLIT_LEAF_ON_INSERT = EnvBool(False)
     SGLANG_OPT_SWA_RELEASE_LEAF_LOCK_AFTER_WINDOW = EnvBool(False)
+
+    # Mxfp4 experts
     SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD = EnvBool(True)
     SGLANG_OPT_MXFP4_STATIC_SCALE_ONES = EnvBool(True)
     SGLANG_OPT_MXFP4_SKIP_DISPATCHER_MAPPING = EnvBool(True)
-    SGLANG_OPT_USE_JIT_INDEXER_METADATA = EnvBool(False)
-    SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
-    SGLANG_OPT_DG_PAGED_MQA_LOGITS_CHUNK_SIZE = EnvInt(-1)
-    SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
-    SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)
+
+    # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
     SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH = EnvBool(True)
-    SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
-    SGLANG_OPT_USE_JIT_NORM = EnvBool(False)
     SGLANG_OPT_FIX_HASH_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_FIX_NEXTN_MEGA_MOE = EnvBool(False)
-    SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(False)
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
-    SGLANG_HANDLE_C128_PREFILL_KERNEL = EnvBool(False)
-    SGLANG_OPT_USE_ONLINE_COMPRESS = EnvBool(False)
+
+    # TopK
+    SGLANG_OPT_USE_FUSED_HASH_TOPK = EnvBool(True)
+    SGLANG_OPT_USE_JIT_KERNEL_FUSED_TOPK = EnvBool(True)
+    SGLANG_OPT_USE_TOPK_V2 = EnvBool(False)
+
+    # GEMM / kernel fusion
+    SGLANG_OPT_FP8_WO_A_GEMM = EnvBool(False)
+    SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
+    SGLANG_OPT_USE_JIT_EP_ACTIVATION = EnvBool(True)
+    SGLANG_OPT_USE_JIT_NORM = EnvBool(False)
+    SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
+    SGLANG_OPT_SWIGLU_CLAMP_FUSION = EnvBool(True)
+
+    # Cache / overlap
+    SGLANG_OPT_USE_FUSED_STORE_CACHE = EnvBool(True)
+    SGLANG_OPT_USE_OVERLAP_STORE_CACHE = EnvBool(True)
+    SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
+
+    # CUDA graph
+    SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
+    SGLANG_OPT_V4_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)  # usually not useful
+
+    # Distributed
+    SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(False)
+    SGLANG_DSV4_FIX_TP_ATTN_A2A_SCATTER = EnvBool(True)
+
+    # Misc fix
+    SGLANG_FIX_ATTN_BACKEND_IDLE = EnvBool(True)
+    SGLANG_FIX_PD_IDLE = EnvBool(True)
 
     # Dangerous untested flags
     SGLANG_OPT_USE_FAST_MASK_EP = EnvBool(False)
     SGLANG_OPT_USE_FLASHINFER_NORM = EnvBool(False)
-
-    SGLANG_PREP_IN_CUDA_GRAPH = EnvBool(True)
-
-    SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
-    SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
-    SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
 
     # Symmetric Memory
     SGLANG_SYMM_MEM_PREALLOC_GB_SIZE = EnvInt(-1)
