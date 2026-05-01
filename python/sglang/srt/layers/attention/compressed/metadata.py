@@ -185,17 +185,6 @@ class PagedIndexerMetadata(IndexerMetadata):
         )
 
 
-@dataclass
-class DeepseekV4Metadata:
-    core_metadata: CoreMetadata
-    indexer_metadata: IndexerMetadata
-    debug_seq_lens_expanded: torch.Tensor
-
-    def copy_(self, other: "DeepseekV4Metadata"):
-        self.core_metadata.copy_(other.core_metadata)
-        self.indexer_metadata.copy_(other.indexer_metadata)
-
-
 def maybe_copy_inplace(dst, *, src) -> None:
     assert type(src) == type(dst)
     if dst is not None:

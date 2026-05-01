@@ -18,7 +18,6 @@ from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.compressed.compressor import CompressorBackend
-    from sglang.srt.layers.attention.compressed.metadata import DeepseekV4Metadata
     from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v4 import C4Indexer
@@ -223,7 +222,6 @@ def fused_scale(
 class C4IndexerBackend:
     def __init__(self):
         super().__init__()
-        self.forward_metadata: DeepseekV4Metadata
         self.debug_use_external_c4_sparse_indices: bool = False
 
     def _forward_prepare_multi_stream(
