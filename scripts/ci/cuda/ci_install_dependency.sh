@@ -395,6 +395,9 @@ install_extra_deps() {
     fi
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
+    # Best-effort NIXL install for decode-radix disaggregation coverage.
+    $PIP_CMD install nixl $PIP_INSTALL_SUFFIX || echo "Warning: nixl install failed; continuing without nixl"
+
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
         $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
