@@ -339,8 +339,8 @@ class LightningAttentionBackend(MambaAttnBackendBase):
             and forward_batch.mamba_track_mask is not None
         ):
             # save mamba cache for extra buffer
-            mamba_track_mask = forward_batch.mamba_track_mask.cpu()
-            mamba_track_indices = forward_batch.mamba_track_indices.cpu()
+            mamba_track_mask = forward_batch.mamba_track_mask
+            mamba_track_indices = forward_batch.mamba_track_indices
             dst_masked = mamba_track_indices[mamba_track_mask]
             src_masked = metadata.mamba_cache_indices[mamba_track_mask]
             ssm_states[dst_masked] = ssm_states[src_masked]
