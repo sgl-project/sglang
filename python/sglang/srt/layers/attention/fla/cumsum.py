@@ -70,9 +70,10 @@ def chunk_local_cumsum_scalar_kernel(
 
 @triton.autotune(
     configs=[
-        triton.Config({"BS": BS}, num_warps=num_warps)
+        triton.Config({"BS": BS}, num_warps=num_warps, num_stages=num_stages)
         for BS in BS_LIST
         for num_warps in [2, 4, 8]
+        for num_stages in [2, 3, 4]
     ],
     key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
 )
@@ -225,9 +226,6 @@ def chunk_local_cumsum_vector(
     def grid(meta):
         return (triton.cdiv(meta["S"], meta["BS"]), NT, B * H)
 
-    # keep cumulative normalizer in fp32
-    # this kernel is equivalent to
-    # g = g.view(B, H, NT, BT, -1).cumsum(-2).view(B, H, T, -1)
     chunk_local_cumsum_vector_kernel[grid](
         s=g_org,
         o=g,
