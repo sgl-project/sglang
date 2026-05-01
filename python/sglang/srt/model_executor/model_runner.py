@@ -3446,35 +3446,12 @@ def _unwrap_tensor(tensor, tp_rank, device):
 
 
 def _build_step_span_name(forward_batch: ForwardBatch) -> str:
-    """Build a profile-trace span name for one forward step.
-
-    Format:
-      step[decode bs=N]                   — decode-only batch
-      step[prefill bs=N toks=T]           — extend-only (prefill) batch
-      step[mixed bs=N ext=T dec=D]        — extend+decode mixed batch
-      step[idle]                          — idle/padding step
-      step[<MODE> bs=N]                   — other modes (target-verify, etc.)
-
-    Used by ModelRunner.forward to wrap each step in a torch.profile
-    record_function so Chrome traces show labeled step boundaries.
-    """
+    """Build a profile-trace span name for one forward step."""
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
-    if mode.is_idle():
-        return "step[idle]"
-    if mode.is_decode():
-        return f"step[decode bs={bs}]"
-    if mode.is_extend():
+    if mode == ForwardMode.EXTEND:
         ext_toks = forward_batch.extend_num_tokens or 0
-        ext_seqs = (
-            forward_batch.extend_seq_lens.shape[0]
-            if forward_batch.extend_seq_lens is not None
-            else bs
-        )
-        dec_seqs = bs - ext_seqs
-        if dec_seqs > 0:
-            return f"step[mixed bs={bs} ext={ext_toks} dec={dec_seqs}]"
-        return f"step[prefill bs={bs} toks={ext_toks}]"
+        return f"step[extend bs={bs} toks={ext_toks}]"
     return f"step[{mode.name} bs={bs}]"
 
 
