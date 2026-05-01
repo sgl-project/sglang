@@ -13,7 +13,10 @@ from sglang.srt.layers.attention.fla.index import (
     prepare_chunk_offsets,
 )
 from sglang.srt.layers.attention.fla.op import exp, safe_exp
-from sglang.srt.layers.attention.fla.utils import is_nvidia_hopper, autotune_cache_kwargs
+from sglang.srt.layers.attention.fla.utils import (
+    autotune_cache_kwargs,
+    is_nvidia_hopper,
+)
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
@@ -22,11 +25,11 @@ CHUNK_SIZE = 64
 @triton.autotune(
     configs=[
         triton.Config({"BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BV in [32, 64]
-        for num_warps in [2, 4]
-        for num_stages in [2, 3, 4]
+        for BV in [32]
+        for num_warps in [4]
+        for num_stages in [2]
     ],
-    key=["H", "K", "V", "BT", "USE_GK"],
+    key=["H", "K", "V", "BT", "USE_GK", "NT_BUCKET"],
     **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
@@ -55,6 +58,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     INPLACE_UPDATE: tl.constexpr,
     SAVE_NEW_VALUE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    NT_BUCKET: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -331,5 +335,6 @@ def chunk_gated_delta_rule_fwd_h(
         INPLACE_UPDATE=True,
         SAVE_NEW_VALUE=v_new is not None,
         IS_VARLEN=cu_seqlens is not None,
+        NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
     )
     return h, v_new
