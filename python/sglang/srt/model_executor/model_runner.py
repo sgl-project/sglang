@@ -348,6 +348,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.is_draft_worker = is_draft_worker
         self.memory_pool_config = memory_pool_config
         self.is_generation = model_config.is_generation
+        self.device_timer = None
         self.is_multimodal = model_config.is_multimodal
         self.is_multimodal_chunked_prefill_supported = (
             model_config.is_multimodal_chunked_prefill_supported
@@ -362,6 +363,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.is_hybrid_swa_compress = model_config.is_hybrid_swa_compress
         self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
         self.attention_chunk_size = model_config.attention_chunk_size
+        rope_scaling = getattr(
+            model_config.hf_text_config, "rope_parameters", None
+        ) or getattr(model_config.hf_text_config, "rope_scaling", {})
+        self.model_is_mrope = (
+            rope_scaling is not None and "mrope_section" in rope_scaling
+        )
+        self.enable_elastic_ep = server_args.elastic_ep_backend is not None
         self.forward_pass_id = 0
         self.init_new_workspace = False
         self.draft_model_idx = draft_model_idx
@@ -2962,6 +2970,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         skip_attn_backend_init: bool = False,
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
+        # Set extra arguments
         if not skip_attn_backend_init:
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
@@ -2976,12 +2985,20 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
+
+        # Launch forward
+        ctx = (
+            self.device_timer.wrap(metadata={"category": "decode"})
+            if self.device_timer
+            else contextlib.nullcontext()
         )
+        with ctx:
+            return self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
 
     def forward_extend(
         self,
@@ -2991,6 +3008,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> Tuple[
         Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput], bool
     ]:
+        # Setup extra arguments
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
@@ -3010,17 +3028,25 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.is_generation:
             kwargs["get_embedding"] = True
 
+        # Check piecewies cuda graph
         can_run_graph = (
             self.piecewise_cuda_graph_runner is not None
             and self.piecewise_cuda_graph_runner.can_run(forward_batch)
         )
-
         if can_run_graph:
-            return (
-                self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs),
-                can_run_graph,
+            # TODO: device_timer.wrap is too broad here — it also includes
+            # replay_prepare time. Move timing into the piecewise cuda graph
+            # runner to capture only the model.forward part.
+            ctx = (
+                self.device_timer.wrap(metadata={"category": "extend"})
+                if self.device_timer
+                else contextlib.nullcontext()
             )
+            with ctx:
+                ret = self.piecewise_cuda_graph_runner.replay(forward_batch, **kwargs)
+            return (ret, can_run_graph)
 
+        # Launch model forward
         if not skip_attn_backend_init:
             if hasattr(self.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
@@ -3028,15 +3054,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 self.model.prepare_forward_batch(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
 
-        return (
-            self.model.forward(
+        ctx = (
+            self.device_timer.wrap(metadata={"category": "extend"})
+            if self.device_timer
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            ret = self.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
                 forward_batch,
                 **kwargs,
-            ),
-            can_run_graph,
-        )
+            )
+        return (ret, can_run_graph)
 
     def forward_idle(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None
@@ -3050,12 +3080,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         kwargs = {}
         if self.support_pp:
             kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-        return self.model.forward(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            **kwargs,
+        ctx = (
+            self.device_timer.wrap(metadata={"category": "idle"})
+            if self.device_timer
+            else contextlib.nullcontext()
         )
+        with ctx:
+            return self.model.forward(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                **kwargs,
+            )
 
     def forward_split_prefill(
         self,
@@ -3069,12 +3105,18 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.split_index + forward_count,
             self.model_config.num_hidden_layers,
         )
-        ret = self.model.forward_split_prefill(
-            forward_batch.input_ids,
-            forward_batch.positions,
-            forward_batch,
-            (forward_batch.split_index, next_split_index),
+        ctx = (
+            self.device_timer.wrap(metadata={"category": "split_prefill"})
+            if self.device_timer
+            else contextlib.nullcontext()
         )
+        with ctx:
+            ret = self.model.forward_split_prefill(
+                forward_batch.input_ids,
+                forward_batch.positions,
+                forward_batch,
+                (forward_batch.split_index, next_split_index),
+            )
         forward_batch.split_index = next_split_index
         return ret
 
@@ -3088,12 +3130,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
 
+        # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = (
                 self.gpu_id if self.dp_size is not None and self.dp_size > 1 else None
             )
             self.msprobe_debugger.start(model=self.model, rank_id=rank_id)
 
+        # Step span
         step_span_ctx = (
             torch.profiler.record_function(_build_step_span_name(forward_batch))
             if torch.autograd._profiler_enabled()
@@ -3113,21 +3157,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 reinit_attn_backend,
                 split_forward_count,
             )
-            elastic_ep_state = ElasticEPStateManager.instance()
-            if (
-                elastic_ep_state is not None
-                and not elastic_ep_state.is_active_equal_last()
-            ):
-                elastic_ep_state.snapshot_active_to_last()
-                elastic_ep_state.sync_active_to_cpu()
-                logging.info("EPLB due to rank faults")
-                gen = self.eplb_manager.rebalance()
-                while True:
-                    try:
-                        next(gen)
-                    except StopIteration:
-                        break
-                output = self._forward_raw(
+            if self.enable_elastic_ep:
+                output = self._maybe_rebalance_after_rank_fault(
+                    output,
                     forward_batch,
                     skip_attn_backend_init,
                     pp_proxy_tensors,
@@ -3167,6 +3199,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         reinit_attn_backend: bool = False,
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
+        # Check whether can run cuda graph
         mode_check = (
             forward_batch.forward_mode.is_cpu_graph
             if self.device == "cpu"
@@ -3178,12 +3211,14 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             and self.graph_runner.can_run(forward_batch)
         )
 
+        # Hisparse coordinator
         if (
             self.hisparse_coordinator is not None
             and forward_batch.forward_mode.is_decode()
         ):
             self.hisparse_coordinator.wait_for_pending_backup()
 
+        # Replay cuda graph if applicable
         if can_run_graph:
             ret = self.graph_runner.replay(
                 forward_batch,
@@ -3213,10 +3248,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if forward_batch.out_cache_loc_swa is not None:
             self.token_to_kv_pool.set_swa_loc(forward_batch.out_cache_loc_swa)
 
+        # Hisparse coordinator
         forward_batch.hisparse_coordinator = self.hisparse_coordinator
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
 
+        # Forward without cuda graph
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(
                 forward_batch,
@@ -3279,14 +3316,8 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         Returns:
             A list of next_token_ids
         """
-        # For duplex models with multiple output streams.
-        if isinstance(logits_output, tuple):
-            return torch.stack(
-                [self.sample(values, forward_batch) for values in logits_output],
-                axis=-1,
-            )
-
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
+
         # Sample the next tokens
         next_token_ids = self.sampler(
             logits_output,
@@ -3335,18 +3366,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             forward_batch.top_logprobs_nums,
             forward_batch.token_ids_logprobs,
         )
-
-    @property
-    def model_is_mrope(self) -> bool:
-        """Detect if the model has "mrope" rope_scaling type.
-        mrope requires keep "rope_deltas" between prompt and decoding phases."""
-        rope_scaling = getattr(
-            self.model_config.hf_text_config, "rope_parameters", None
-        ) or getattr(self.model_config.hf_text_config, "rope_scaling", {})
-        if rope_scaling is None:
-            return False
-        is_mrope_enabled = "mrope_section" in rope_scaling
-        return is_mrope_enabled
 
     def save_remote_model(self, url: str):
         from sglang.srt.model_loader.loader import RemoteModelLoader
@@ -3405,6 +3424,35 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                     device=self.device,
                 )
 
+    def _maybe_rebalance_after_rank_fault(
+        self,
+        output: ModelRunnerOutput,
+        forward_batch: ForwardBatch,
+        skip_attn_backend_init: bool,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+        reinit_attn_backend: bool,
+        split_forward_count: int,
+    ) -> ModelRunnerOutput:
+        elastic_ep_state = ElasticEPStateManager.instance()
+        if elastic_ep_state is not None and not elastic_ep_state.is_active_equal_last():
+            elastic_ep_state.snapshot_active_to_last()
+            elastic_ep_state.sync_active_to_cpu()
+            logging.info("EPLB due to rank faults")
+            gen = self.eplb_manager.rebalance()
+            while True:
+                try:
+                    next(gen)
+                except StopIteration:
+                    break
+            output = self._forward_raw(
+                forward_batch,
+                skip_attn_backend_init,
+                pp_proxy_tensors,
+                reinit_attn_backend,
+                split_forward_count,
+            )
+        return output
+
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
     params_dict = dict(model.named_parameters())
@@ -3419,35 +3467,12 @@ def _unwrap_tensor(tensor, tp_rank, device):
 
 
 def _build_step_span_name(forward_batch: ForwardBatch) -> str:
-    """Build a profile-trace span name for one forward step.
-
-    Format:
-      step[decode bs=N]                   — decode-only batch
-      step[prefill bs=N toks=T]           — extend-only (prefill) batch
-      step[mixed bs=N ext=T dec=D]        — extend+decode mixed batch
-      step[idle]                          — idle/padding step
-      step[<MODE> bs=N]                   — other modes (target-verify, etc.)
-
-    Used by ModelRunner.forward to wrap each step in a torch.profile
-    record_function so Chrome traces show labeled step boundaries.
-    """
+    """Build a profile-trace span name for one forward step."""
     mode = forward_batch.forward_mode
     bs = forward_batch.batch_size
-    if mode.is_idle():
-        return "step[idle]"
-    if mode.is_decode():
-        return f"step[decode bs={bs}]"
-    if mode.is_extend():
+    if mode == ForwardMode.EXTEND:
         ext_toks = forward_batch.extend_num_tokens or 0
-        ext_seqs = (
-            forward_batch.extend_seq_lens.shape[0]
-            if forward_batch.extend_seq_lens is not None
-            else bs
-        )
-        dec_seqs = bs - ext_seqs
-        if dec_seqs > 0:
-            return f"step[mixed bs={bs} ext={ext_toks} dec={dec_seqs}]"
-        return f"step[prefill bs={bs} toks={ext_toks}]"
+        return f"step[EXTEND bs={bs} toks={ext_toks}]"
     return f"step[{mode.name} bs={bs}]"
 
 
