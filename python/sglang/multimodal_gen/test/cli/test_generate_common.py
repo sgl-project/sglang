@@ -7,6 +7,7 @@ Common generate cli test, one test for image and video each
 import dataclasses
 import os
 import shlex
+import shutil
 import unittest
 
 from PIL import Image
@@ -84,6 +85,21 @@ class CLIBase(unittest.TestCase):
         name, status = self._run_command(name, args=args, model_path=model_path)
         self.verify(status, name)
 
+    def _save_diffusion_artifact(self, path: str):
+        artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
+        if not artifact_dir or not os.path.isfile(path):
+            return
+
+        dst_dir = os.path.join(artifact_dir, "cli")
+        os.makedirs(dst_dir, exist_ok=True)
+        dst_name = "".join(
+            c if c.isalnum() or c in "._-" else "_"
+            for c in os.path.basename(path)
+        )
+        dst = os.path.join(dst_dir, dst_name)
+        shutil.copy2(path, dst)
+        logger.info("Saved CLI output artifact: %s", dst)
+
     def verify(self, status, name):
         print("-" * 80)
         print("\n" * 3)
@@ -99,6 +115,7 @@ class CLIBase(unittest.TestCase):
         if self.data_type == DataType.IMAGE:
             with Image.open(path) as image:
                 check_image_size(self, image, self.width, self.height)
+        self._save_diffusion_artifact(path)
 
     def model_name(self):
         return self.model_path.split("/")[-1]

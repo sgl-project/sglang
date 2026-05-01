@@ -712,15 +712,16 @@ Repository: https://github.com/sgl-project/ci-data (path: diffusion-ci/consisten
         case: DiffusionTestCase,
         content: bytes,
     ) -> None:
-        """Preserve selected generated outputs for CI artifact upload."""
+        """Preserve generated outputs for CI artifact upload."""
         artifact_dir = os.environ.get("SGLANG_DIFFUSION_ARTIFACT_DIR")
-        if not artifact_dir or not content or "modelopt" not in case.id.lower():
+        if not artifact_dir or not content:
             return
 
         safe_case_id = "".join(c if c.isalnum() or c in "._-" else "_" for c in case.id)
         is_video = case.server_args.modality == "video"
         if is_video:
-            filename = f"{safe_case_id}_5s.mp4"
+            suffix = case.sampling_params.output_format or "mp4"
+            filename = f"{safe_case_id}.{suffix}"
         else:
             from sglang.multimodal_gen.test.test_utils import detect_image_format
 
