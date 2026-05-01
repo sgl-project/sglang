@@ -306,18 +306,6 @@ jobs:
 
       - name: Run E2E tests
         run: |
-          # llm-tokenizer 1.0.0 (pinned by sgl-model-gateway/Cargo.toml)
-          # uses hf_hub::ApiBuilder::from_env(), which only reads the
-          # token file — not the HF_TOKEN env var. Bridge by writing
-          # the runner's HF_TOKEN to the canonical token-file location
-          # so gated-model tokenizer downloads (e.g. Llama-3.1-8B) get
-          # authenticated. Removable once the crate is bumped to ≥1.1.0
-          # (which reads HF_TOKEN directly, added in upstream PR #192).
-          if [ -n "$HF_TOKEN" ]; then
-            mkdir -p "$HOME/.cache/huggingface"
-            printf '%s' "$HF_TOKEN" > "$HOME/.cache/huggingface/token"
-            chmod 600 "$HOME/.cache/huggingface/token"
-          fi
           python3 python/sglang/cli/killall.py
           cd sgl-model-gateway
           ${{ matrix.env_vars }} pytest ${{ matrix.reruns }} ${{ matrix.parallel_opts }} ${{ matrix.test_dirs }} -s -vv -o log_cli=true --log-cli-level=INFO
