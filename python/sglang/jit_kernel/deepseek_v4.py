@@ -345,12 +345,6 @@ def fused_norm_rope_inplace(
     freq_cis: torch.Tensor,
     positions: torch.Tensor,
 ) -> None:
-    if is_hip_runtime():
-        from sglang.srt.layers.deepseek_v4_rope import fused_norm_rope_inplace_triton
-
-        fused_norm_rope_inplace_triton(kv, weight, eps, freq_cis, positions)
-        return
-
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
     module.forward(
