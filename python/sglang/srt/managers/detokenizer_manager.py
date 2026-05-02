@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import psutil
 import pybase64
 import setproctitle
+import torch
 import zmq
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -321,32 +322,24 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         return output_strs
 
-    def _extract_topk_base64(self, data_list) -> List[List[int]]:
+    @staticmethod
+    def _b64_encode_per_request(
+        data_list: Optional[List[Optional[torch.Tensor]]],
+    ) -> Optional[List[Optional[str]]]:
+        """Encode a per-request list of tensors as base64 strings, off the
+        tokenizer hot path. Returns None when the input is None; per-item None
+        stays None.
+        """
         if data_list is None:
             return None
         return [
             (
                 pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
                 if item is not None
-                else []
+                else None
             )
             for item in data_list
         ]
-
-    def _extract_routed_experts(
-        self, recv_obj: BatchTokenIDOutput
-    ) -> list[str | None] | None:
-        routed_experts = None
-        if recv_obj.routed_experts is not None:
-            routed_experts = [
-                (
-                    pybase64.b64encode(routed_experts.numpy().tobytes()).decode("utf-8")
-                    if routed_experts is not None
-                    else None
-                )
-                for routed_experts in recv_obj.routed_experts
-            ]
-        return routed_experts
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
@@ -355,9 +348,8 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
-        routed_experts = self._extract_topk_base64(recv_obj.routed_experts)
-        indexer_topk = self._extract_topk_base64(recv_obj.indexer_topk)
-
+        routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
+        indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
