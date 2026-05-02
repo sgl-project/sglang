@@ -87,21 +87,6 @@ class FluxPipelineConfig(ImagePipelineConfig):
         ]
     )
 
-    def _get_or_create_rotary_emb(self, rotary_emb):
-        if rotary_emb is not None:
-            return rotary_emb
-
-        fallback_rotary_emb = getattr(self, "_fallback_rotary_emb", None)
-        if fallback_rotary_emb is None:
-            from sglang.multimodal_gen.runtime.models.dits.flux import FluxPosEmbed
-
-            fallback_rotary_emb = FluxPosEmbed(
-                theta=10000,
-                axes_dim=self.dit_config.arch_config.axes_dims_rope,
-            )
-            self._fallback_rotary_emb = fallback_rotary_emb
-        return fallback_rotary_emb
-
     def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
         # Flux v1 does not use attention masks for text encoders.
         return None
@@ -159,7 +144,6 @@ class FluxPipelineConfig(ImagePipelineConfig):
         return latent_image_ids
 
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
-        rotary_emb = self._get_or_create_rotary_emb(rotary_emb)
         txt_ids = torch.zeros(prompt_embeds.shape[1], 3, device=device)
         img_ids = self._prepare_latent_image_ids(
             original_height=height,
@@ -420,22 +404,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         ]
     )
 
-    def _get_or_create_rotary_emb(self, rotary_emb):
-        if rotary_emb is not None:
-            return rotary_emb
-
-        fallback_rotary_emb = getattr(self, "_fallback_rotary_emb", None)
-        if fallback_rotary_emb is None:
-            from sglang.multimodal_gen.runtime.models.dits.flux_2 import Flux2PosEmbed
-
-            arch_config = self.dit_config.arch_config
-            fallback_rotary_emb = Flux2PosEmbed(
-                theta=getattr(arch_config, "rope_theta", 10000),
-                axes_dim=arch_config.axes_dims_rope,
-            )
-            self._fallback_rotary_emb = fallback_rotary_emb
-        return fallback_rotary_emb
-
     def get_text_encoder_attention_mask(self, text_inputs, encoder_index):
         # Flux2 uses standard attention masks (unlike Flux v1).
         return text_inputs.get("attention_mask")
@@ -546,7 +514,6 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         batch.condition_image_latent_ids = image_latent_ids.to(get_local_torch_device())
 
     def get_freqs_cis(self, prompt_embeds, width, height, device, rotary_emb, batch):
-        rotary_emb = self._get_or_create_rotary_emb(rotary_emb)
         txt_ids = _prepare_text_ids(prompt_embeds).to(device=device)
 
         img_ids = batch.latent_ids

@@ -8,7 +8,6 @@ If the actual run is significantly better than the baseline, the improved cases 
 from __future__ import annotations
 
 import os
-import shlex
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -55,35 +54,6 @@ logger = init_logger(__name__)
 # Track test cases missing estimated_full_test_time_s for time measurement output
 _MISSING_ESTIMATED_TIME_CASES: set[str] = set()
 _PENDING_BASELINE_DUMPS: dict[str, tuple["PerformanceSummary", bool]] = {}
-
-
-def _serve_arg_present(extra_args: str, flag: str) -> bool:
-    return any(
-        arg == flag or arg.startswith(f"{flag}=") for arg in shlex.split(extra_args)
-    )
-
-
-def _append_amd_internal_ports(extra_args: str, http_port: int) -> str:
-    """Assign ROCm CI internal ports from the same per-device test port block.
-
-    Diffusion server tests run with --strict-ports so the client cannot attach
-    to a stale server.  On AMD CI, several ROCm partitions can share a runner,
-    so leaving internal ports at their global defaults (scheduler=5555,
-    master=30005) makes otherwise independent jobs contend for the same ports.
-    Derive them from the already per-device HTTP port unless a test explicitly
-    overrides them.
-    """
-    if not current_platform.is_hip():
-        return extra_args
-
-    internal_ports = {
-        "--scheduler-port": http_port + 100,
-        "--master-port": http_port + 200,
-    }
-    for flag, value in internal_ports.items():
-        if not _serve_arg_present(extra_args, flag):
-            extra_args += f" {flag} {value}"
-    return extra_args
 
 
 @pytest.fixture
@@ -148,8 +118,6 @@ def diffusion_server(case: DiffusionTestCase) -> ServerContext:
 
     for arg in server_args.extras:
         extra_args += f" {arg}"
-
-    extra_args = _append_amd_internal_ports(extra_args, port)
 
     # Build custom environment variables
     env_vars = {}
