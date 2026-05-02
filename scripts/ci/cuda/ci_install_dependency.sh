@@ -234,6 +234,16 @@ install_sglang() {
     echo "Installing python extras: [${EXTRAS}]"
     $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
 
+    # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
+    # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
+    # If the file is missing, force-reinstall the wheel before downstream steps.
+    SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
+    if [ ! -f "$SITE_PACKAGES/nvidia/cusparselt/lib/libcusparseLt.so.0" ] \
+       && pip show nvidia-cusparselt-cu13 >/dev/null 2>&1; then
+        echo "WARNING: nvidia-cusparselt-cu13 metadata present but libcusparseLt.so.0 missing — reinstalling"
+        $PIP_CMD install --reinstall nvidia-cusparselt-cu13 $PIP_INSTALL_SUFFIX
+    fi
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
@@ -384,6 +394,9 @@ install_extra_deps() {
         $PIP_CMD install ${MOONCAKE_PKG} --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
+
+    # Best-effort NIXL install for decode-radix disaggregation coverage.
+    $PIP_CMD install nixl $PIP_INSTALL_SUFFIX || echo "Warning: nixl install failed; continuing without nixl"
 
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git

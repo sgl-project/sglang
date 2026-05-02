@@ -54,10 +54,7 @@ logger = logging.getLogger(__name__)
 
 WEIGHT_LOADER_V2_SUPPORTED = [
     "CompressedTensorsLinearMethod",
-    "AWQMarlinLinearMethod",
     "AWQLinearMethod",
-    "AWQLinearAscendMethod",
-    "AWQLinearIntelAMXMethod",
     "GPTQMarlinLinearMethod",
     "Fp8LinearMethod",
     "BlockInt8LinearMethod",
@@ -1050,7 +1047,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         block_n, _ = self.quant_method.quant_config.weight_block_size
         q_size = self.total_num_heads * self.head_size // block_n
         k_size = self.total_num_kv_heads * self.head_size // block_n
-        v_size = self.total_num_kv_heads * self.head_size // block_n
+        v_size = self.total_num_kv_heads * self.v_head_size // block_n
         shard_offsets = [
             # (shard_id, shard_offset, shard_size)
             ("q", 0, q_size),
