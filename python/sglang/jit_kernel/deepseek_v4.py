@@ -586,10 +586,16 @@ def _decode_prefill_plan(plan_bytes: torch.Tensor) -> torch.Tensor:
     Each plan slot is 4 little-endian uint32:
     (ragged_id, batch_id, position, window_len). Invalid entries use
     ``0xFFFFFFFF`` for every field.
+
+    On-device bitcast: avoids a D->H sync that drains the L0 queue every
+    layer on XPU. uint8 [N, 16] is reinterpreted as int32 [N, 4] (LE on
+    XPU/x86), promoted to int64, then masked to keep the unsigned value
+    so that the kInvalid sentinel 0xFFFFFFFF (which would bitcast to -1
+    in int32) compares correctly against ``_INVALID_PLAN``.
     """
-    cpu = plan_bytes.detach().to("cpu", copy=False).contiguous()
-    arr = cpu.numpy().reshape(-1).view("<u4").reshape(-1, 4).astype("int64")
-    return torch.from_numpy(arr)
+    t = plan_bytes.detach().contiguous()
+    as_i32 = t.view(torch.int32).reshape(-1, 4)
+    return as_i32.to(torch.int64) & 0xFFFFFFFF
 
 
 _INVALID_PLAN = 0xFFFFFFFF
@@ -730,26 +736,23 @@ def _torch_c4_decode(
     kv_score_buffer[indices_i64, write_pos] = kv_score_input.to(kv_score_buffer.dtype)
 
     # 2) forward only when seq_len % 4 == 0
-    do_fwd = (seq_lens_i64 % 4) == 0
-    if not bool(do_fwd.any()):
-        return
+    # NOTE: avoid host syncs on the per-step hot path -- compute over all
+    # B batches and mask the writeback. On XPU/L0, ``bool(t.any())`` and
+    # ``t.nonzero()`` drain the command queue every layer.
+    do_fwd = (seq_lens_i64 % 4) == 0  # [B]
 
-    fwd_idx = do_fwd.nonzero(as_tuple=True)[0]
-    fwd_indices = indices_i64[fwd_idx]  # [F]
-    fwd_seq_lens = seq_lens_i64[fwd_idx]  # [F]
-
-    # Gather 8 slots from buffer for each forward batch.
+    # Gather 8 slots from buffer for every batch.
     buf4 = _c4_split_chunks(kv_score_buffer, HD)  # [N_idx, page, 4, HD]
 
     if paged:
         assert extra is not None, "Page4Align mode requires extra tensor"
-        index_prev = extra.view(-1)[fwd_idx].to(torch.int64)  # [F]
+        index_prev = extra.view(-1).to(torch.int64)  # [B]
         # i in [0,8): first 4 use index_prev (overlap), last 4 use index
         kv_chunks = []
         score_chunks = []
         for i in range(8):
             k = i % 4
-            page_idx = index_prev if i < 4 else fwd_indices
+            page_idx = index_prev if i < 4 else indices_i64
             chunk_kv = 0 if i < 4 else 1
             chunk_score = 2 if i < 4 else 3
             kv_chunks.append(buf4[page_idx, k, chunk_kv])
@@ -759,30 +762,31 @@ def _torch_c4_decode(
         kv_chunks = []
         score_chunks = []
         for i in range(8):
-            k = (fwd_seq_lens + i) % 8
+            k = (seq_lens_i64 + i) % 8
             chunk_kv = 0 if i < 4 else 1
             chunk_score = 2 if i < 4 else 3
-            kv_chunks.append(buf4[fwd_indices, k, chunk_kv])
-            score_chunks.append(buf4[fwd_indices, k, chunk_score])
+            kv_chunks.append(buf4[indices_i64, k, chunk_kv])
+            score_chunks.append(buf4[indices_i64, k, chunk_score])
 
-    kv_stack = torch.stack(kv_chunks, dim=1)  # [F, 8, HD]
+    kv_stack = torch.stack(kv_chunks, dim=1)  # [B, 8, HD]
     score_stack = torch.stack(score_chunks, dim=1)
-    bias = ape.unsqueeze(0).expand(kv_stack.shape[0], -1, -1)  # [F, 8, HD]
+    bias = ape.unsqueeze(0).expand(kv_stack.shape[0], -1, -1)  # [B, 8, HD]
 
     # seq_len == 4 special case: zero overlap kv, -inf overlap score.
-    sl4 = (fwd_seq_lens == 4)
-    if bool(sl4.any()):
-        sl4_b = sl4.view(-1, 1, 1)
-        zero = torch.zeros((), dtype=kv_stack.dtype, device=device)
-        ninf = torch.full((), -1e9, dtype=score_stack.dtype, device=device)
-        head_mask = torch.zeros(8, dtype=torch.bool, device=device)
-        head_mask[:4] = True
-        full_mask = sl4_b & head_mask.view(1, 8, 1)
-        kv_stack = torch.where(full_mask, zero, kv_stack)
-        score_stack = torch.where(full_mask, ninf, score_stack)
+    # Apply unconditionally via torch.where to avoid a host sync.
+    sl4 = (seq_lens_i64 == 4)
+    sl4_b = sl4.view(-1, 1, 1)
+    zero = torch.zeros((), dtype=kv_stack.dtype, device=device)
+    ninf = torch.full((), -1e9, dtype=score_stack.dtype, device=device)
+    head_mask = torch.zeros(8, dtype=torch.bool, device=device)
+    head_mask[:4] = True
+    full_mask = sl4_b & head_mask.view(1, 8, 1)
+    kv_stack = torch.where(full_mask, zero, kv_stack)
+    score_stack = torch.where(full_mask, ninf, score_stack)
 
     result = _softmax_weighted_sum(kv_stack, score_stack, bias, out_dtype)
-    out[fwd_idx] = result
+    mask = do_fwd.view(-1, *([1] * (out.ndim - 1)))
+    out.copy_(torch.where(mask, result.to(out.dtype), out))
 
 
 def _torch_c4_prefill(
@@ -804,9 +808,14 @@ def _torch_c4_prefill(
     device = kv_score_input.device
     indices_i64 = indices.to(torch.int64)
 
-    # Decode plans on CPU then move valid entries to device.
-    cplan_cpu = _decode_prefill_plan(compress_plan)  # [Nc, 4] int64
-    wplan_cpu = _decode_prefill_plan(write_plan)  # [Nw, 4] int64
+    # On-device, fully-valid plans. ``_torch_plan_compress_prefill`` already
+    # slices the plan tensors to their exact valid length on the host before
+    # the H->D copy (see ``CompressorPrefillPlan.generate``), and prefill
+    # plans never use cuda-graph padding. So we can skip the per-layer
+    # ``bool((plan != INVALID).any())`` host sync and the data-dependent
+    # boolean-mask gather entirely; both are intrinsic L0-queue drains.
+    cplan = _decode_prefill_plan(compress_plan)  # [Nc, 4] int64
+    wplan = _decode_prefill_plan(write_plan)  # [Nw, 4] int64
 
     extra_i64: Optional[torch.Tensor] = None
     if paged:
@@ -818,13 +827,11 @@ def _torch_c4_prefill(
     # would feed write-modified slots into compress and corrupt the output.
 
     # ---- compress plan ----------------------------------------------------
-    valid_c = (cplan_cpu[:, 0] != _INVALID_PLAN)
-    if bool(valid_c.any()):
-        cp = cplan_cpu[valid_c].to(device)
-        ragged_ids = cp[:, 0]
-        batch_ids = cp[:, 1]
-        positions = cp[:, 2]
-        window_lens = cp[:, 3]
+    if cplan.shape[0] > 0:
+        ragged_ids = cplan[:, 0]
+        batch_ids = cplan[:, 1]
+        positions = cplan[:, 2]
+        window_lens = cplan[:, 3]
         seq_lens = positions + 1  # [N]
         N = ragged_ids.shape[0]
 
@@ -877,16 +884,17 @@ def _torch_c4_prefill(
         score_stack = torch.stack(score_chunks, dim=1)
         bias = ape.unsqueeze(0).expand(N, -1, -1)
 
+        # Apply the seq_len==4 special case unconditionally via torch.where
+        # to keep this sync-free; rows where seq_len != 4 see no change.
         sl4 = (seq_lens == 4)
-        if bool(sl4.any()):
-            sl4_b = sl4.view(-1, 1, 1)
-            zero = torch.zeros((), dtype=kv_stack.dtype, device=device)
-            ninf = torch.full((), -1e9, dtype=score_stack.dtype, device=device)
-            head_mask = torch.zeros(8, dtype=torch.bool, device=device)
-            head_mask[:4] = True
-            full_mask = sl4_b & head_mask.view(1, 8, 1)
-            kv_stack = torch.where(full_mask, zero, kv_stack)
-            score_stack = torch.where(full_mask, ninf, score_stack)
+        sl4_b = sl4.view(-1, 1, 1)
+        zero = torch.zeros((), dtype=kv_stack.dtype, device=device)
+        ninf = torch.full((), -1e9, dtype=score_stack.dtype, device=device)
+        head_mask = torch.zeros(8, dtype=torch.bool, device=device)
+        head_mask[:4] = True
+        full_mask = sl4_b & head_mask.view(1, 8, 1)
+        kv_stack = torch.where(full_mask, zero, kv_stack)
+        score_stack = torch.where(full_mask, ninf, score_stack)
 
         result = _softmax_weighted_sum(kv_stack, score_stack, bias, out.dtype)
         out[ragged_ids] = result
@@ -897,7 +905,7 @@ def _torch_c4_prefill(
         kv_score_input,
         indices_i64,
         extra_i64,
-        wplan_cpu,
+        wplan,
         paged,
         device,
     )
@@ -908,17 +916,18 @@ def _torch_c4_prefill_write(
     kv_score_input: torch.Tensor,
     indices_i64: torch.Tensor,
     extra_i64: Optional[torch.Tensor],
-    wplan_cpu: torch.Tensor,
+    wplan: torch.Tensor,
     paged: bool,
     device: torch.device,
 ) -> None:
-    valid_w = (wplan_cpu[:, 0] != _INVALID_PLAN)
-    if not bool(valid_w.any()):
+    # See ``_torch_c4_prefill`` for why no validity check / boolean-mask
+    # gather is needed: prefill plans are already pre-sliced to valid
+    # length on the host before the H->D copy.
+    if wplan.shape[0] == 0:
         return
-    wp = wplan_cpu[valid_w].to(device)
-    ragged_ids = wp[:, 0]
-    batch_ids = wp[:, 1]
-    positions = wp[:, 2]
+    ragged_ids = wplan[:, 0]
+    batch_ids = wplan[:, 1]
+    positions = wplan[:, 2]
     if paged:
         assert extra_i64 is not None
         last_pos = extra_i64[batch_ids, 3]
@@ -969,18 +978,20 @@ def _torch_c128_decode(
     kv_score_buffer[indices_i64, write_pos] = kv_score_input.to(kv_score_buffer.dtype)
 
     # 2) forward only when seq_len % 128 == 0; window_len = 128 (all from buf).
-    do_fwd = (seq_lens_i64 % 128) == 0
-    if not bool(do_fwd.any()):
-        return
-    fwd_idx = do_fwd.nonzero(as_tuple=True)[0]
-    fwd_indices = indices_i64[fwd_idx]
+    # NOTE: avoid host syncs (e.g. ``bool(do_fwd.any())`` /
+    # ``do_fwd.nonzero()``) on the per-step hot path -- on XPU/L0 those
+    # force-drain the queue every layer and turn one decode step into
+    # minutes. Compute over all B batches, then mask the writeback.
+    do_fwd = (seq_lens_i64 % 128) == 0  # [B]
 
     buf2 = _c128_split_chunks(kv_score_buffer, HD)  # [N_idx, 128, 2, HD]
-    gathered = buf2[fwd_indices]  # [F, 128, 2, HD]
-    kv = gathered[..., 0, :]  # [F, 128, HD]
+    gathered = buf2[indices_i64]  # [B, 128, 2, HD]
+    kv = gathered[..., 0, :]  # [B, 128, HD]
     score = gathered[..., 1, :]
     bias = ape.unsqueeze(0).expand(kv.shape[0], -1, -1)
-    out[fwd_idx] = _softmax_weighted_sum(kv, score, bias, out.dtype)
+    result = _softmax_weighted_sum(kv, score, bias, out.dtype)  # [B, ...]
+    mask = do_fwd.view(-1, *([1] * (out.ndim - 1)))
+    out.copy_(torch.where(mask, result.to(out.dtype), out))
 
 
 def _torch_c128_prefill(
@@ -1003,20 +1014,19 @@ def _torch_c128_prefill(
         extra.to(torch.int64) if extra is not None else indices_i64
     )
 
-    cplan_cpu = _decode_prefill_plan(compress_plan)
-    wplan_cpu = _decode_prefill_plan(write_plan)
+    # On-device, fully-valid plans (see ``_torch_c4_prefill``).
+    cplan = _decode_prefill_plan(compress_plan)
+    wplan = _decode_prefill_plan(write_plan)
 
     # NOTE: order matches the CUDA kernel launches in c128.cuh: compress
     # (reads buffer) runs BEFORE write (mutates buffer). Reversing the order
     # would feed write-modified slots into compress and corrupt the output.
 
     # ---- compress plan (uses `load_indices`) -----------------------------
-    valid_c = (cplan_cpu[:, 0] != _INVALID_PLAN)
-    if bool(valid_c.any()):
-        cp = cplan_cpu[valid_c].to(device)
-        ragged_ids = cp[:, 0]
-        batch_ids = cp[:, 1]
-        window_lens = cp[:, 3]
+    if cplan.shape[0] > 0:
+        ragged_ids = cplan[:, 0]
+        batch_ids = cplan[:, 1]
+        window_lens = cplan[:, 3]
         N = ragged_ids.shape[0]
 
         buf2 = _c128_split_chunks(kv_score_buffer, HD)  # [N_idx, 128, 2, HD]
@@ -1044,12 +1054,10 @@ def _torch_c128_prefill(
         out[ragged_ids] = _softmax_weighted_sum(kv, score, bias, out.dtype)
 
     # ---- write plan (uses `indices`, must run AFTER compress) ------------
-    valid_w = (wplan_cpu[:, 0] != _INVALID_PLAN)
-    if bool(valid_w.any()):
-        wp = wplan_cpu[valid_w].to(device)
-        ragged_ids = wp[:, 0]
-        batch_ids = wp[:, 1]
-        positions = wp[:, 2]
+    if wplan.shape[0] > 0:
+        ragged_ids = wplan[:, 0]
+        batch_ids = wplan[:, 1]
+        positions = wplan[:, 2]
         tgt_index = indices_i64[batch_ids]
         tgt_pos = positions % 128
         kv_score_buffer[tgt_index, tgt_pos] = kv_score_input[ragged_ids].to(
@@ -1912,23 +1920,34 @@ def _torch_fused_norm_rope(
     in_dtype = input_tensor.dtype
 
     if mode == 0:
-        plan = _decode_prefill_plan(handle).to(device)
-        valid = plan[:, 0] != _INVALID_PLAN
-        if not bool(valid.any()):
+        # Prefill plan is already pre-sliced to its exact valid length on
+        # the host (no cuda-graph padding on the prefill path), so all rows
+        # are valid. Avoid the per-layer ``bool((plan != INVALID).any())``
+        # / boolean-mask gather host-syncs that drain the L0 queue.
+        plan = _decode_prefill_plan(handle)
+        if plan.shape[0] == 0:
             return
-        rows = plan[valid, 0]
-        positions = plan[valid, 2] + 1 - compress_ratio
+        rows = plan[:, 0]
+        positions = plan[:, 2] + 1 - compress_ratio
+        row_mask = None  # writeback unconditional via index
     elif mode == 1:
+        # Decode: avoid host syncs (``bool(valid.any())`` /
+        # ``valid.nonzero()``) that drain the L0 queue every layer.
+        # Compute over all rows and mask the writeback with torch.where.
         seq_lens = handle.to(torch.int64)
-        valid = (seq_lens % compress_ratio) == 0
-        if not bool(valid.any()):
-            return
-        rows = valid.nonzero(as_tuple=True)[0]
-        positions = seq_lens[valid] - compress_ratio
+        valid = (seq_lens % compress_ratio) == 0  # [B] bool
+        num_works = seq_lens.shape[0]
+        rows = torch.arange(num_works, device=device, dtype=torch.int64)
+        # For invalid rows, ``positions`` would be negative; clamp to 0
+        # so freqs_cis[positions] is always in-bounds. Result is masked
+        # out below before writeback.
+        positions = (seq_lens - compress_ratio).clamp_min(0)
+        row_mask = valid
     elif mode == 2:
         num_works = handle.shape[0]
         positions = handle.to(torch.int64)
         rows = torch.arange(num_works, device=device, dtype=torch.int64)
+        row_mask = None
     else:
         raise ValueError(f"unsupported fused_norm_rope mode: {mode}")
 
@@ -1947,7 +1966,14 @@ def _torch_fused_norm_rope(
     out_i = xr * fi + xi * fr
     rope_out = torch.stack([out_r, out_i], dim=-1).reshape(n, rope_dim)
     x[..., -rope_dim:] = rope_out
-    input_tensor[rows] = x.to(in_dtype)
+    if row_mask is None:
+        input_tensor[rows] = x.to(in_dtype)
+    else:
+        # Only update rows where ``valid`` is true; preserve others.
+        mask = row_mask.view(-1, *([1] * (x.ndim - 1)))
+        input_tensor[rows] = torch.where(
+            mask, x.to(in_dtype), input_tensor[rows]
+        )
 
 
 def fused_rope(
