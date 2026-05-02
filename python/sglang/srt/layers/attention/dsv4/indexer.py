@@ -144,6 +144,30 @@ def fp8_paged_mqa_logits_torch(
     return logits
 
 
+_NEG_INF_I32_CACHE: dict = {}
+_NEG_ONE_I32_CACHE: dict = {}
+
+
+def _neg_inf_scalar(device: torch.device) -> torch.Tensor:
+    """Cached scalar -inf fp32 tensor per device."""
+    key = str(device)
+    t = _NEG_INF_I32_CACHE.get(key)
+    if t is None:
+        t = torch.tensor(float("-inf"), device=device, dtype=torch.float32)
+        _NEG_INF_I32_CACHE[key] = t
+    return t
+
+
+def _neg_one_i32_scalar(device: torch.device) -> torch.Tensor:
+    """Cached scalar -1 int32 tensor per device."""
+    key = str(device)
+    t = _NEG_ONE_I32_CACHE.get(key)
+    if t is None:
+        t = torch.tensor(-1, device=device, dtype=torch.int32)
+        _NEG_ONE_I32_CACHE[key] = t
+    return t
+
+
 def topk_transform_512_pytorch_vectorized(
     scores: torch.Tensor,
     seq_lens: torch.Tensor,
@@ -161,13 +185,18 @@ def topk_transform_512_pytorch_vectorized(
     page_bits = (page_size - 1).bit_length() if page_size > 1 else 0
     page_mask = page_size - 1
 
-    positions = (
-        torch.arange(max_seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
-    )
-    valid_mask = positions < seq_lens.unsqueeze(1)
+    # Per-device cached scalar constants — constructing torch.tensor(...) on
+    # the device path here would otherwise force an H2D copy + sync per call
+    # (this function runs per-layer per prefill chunk).
+    neg_inf = _neg_inf_scalar(device)
+    neg_one_i32 = _neg_one_i32_scalar(device)
 
-    masked_scores = scores.clone()
-    masked_scores[~valid_mask] = float("-inf")
+    positions = torch.arange(max_seq_len, device=device).unsqueeze(0)  # (1, S)
+    valid_mask = positions < seq_lens.unsqueeze(1)                     # (B, S)
+
+    # NOTE: avoid `masked_scores[~valid_mask] = float("-inf")` — boolean-
+    # indexed scatter writes are a known L0 sync hot spot on Intel XPU.
+    masked_scores = torch.where(valid_mask, scores, neg_inf)
 
     actual_k = min(TOPK, max_seq_len)
     _, raw_indices = torch.topk(
@@ -181,39 +210,35 @@ def topk_transform_512_pytorch_vectorized(
         )
         raw_indices = torch.cat([raw_indices, padding], dim=1)
 
-    batch_indices = (
-        torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, TOPK)
-    )
-    gathered_scores = scores[
-        batch_indices.flatten(), raw_indices.clamp(min=0).flatten()
-    ].view(batch_size, TOPK)
+    # Gather along dim=1 with a single int64 gather kernel — significantly
+    # cheaper than the 2-D advanced index `scores[batch_idx.flatten(),
+    # raw.flatten()].view(...)` pattern, which materializes a flat int64
+    # index tensor of size B*TOPK for every call.
+    gather_idx = raw_indices.clamp(min=0).to(torch.long)
+    gathered_scores = torch.gather(scores, dim=1, index=gather_idx)
 
     valid_topk = gathered_scores != float("-inf")
     if actual_k < TOPK:
         pad_mask = torch.arange(TOPK, device=device).unsqueeze(0) >= actual_k
         valid_topk = valid_topk & ~pad_mask
 
-    needs_sequential = seq_lens <= TOPK
-    if needs_sequential.any():
-        sequential_indices = (
-            torch.arange(TOPK, device=device, dtype=torch.int32)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
+    # Always run the sequential override (cheap when no row hits it).
+    # Previously this was guarded by `if needs_sequential.any():` which
+    # forced a D2H sync per call on XPU.
+    needs_sequential = (seq_lens <= TOPK).unsqueeze(1)  # (B, 1) bool
+    sequential_indices = torch.arange(
+        TOPK, device=device, dtype=torch.int32
+    ).unsqueeze(0)                                       # (1, TOPK)
+    sequential_valid = sequential_indices < seq_lens.unsqueeze(1).to(
+        sequential_indices.dtype
+    )                                                    # (B, TOPK)
 
-        raw_indices = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK),
-            torch.where(
-                sequential_valid,
-                sequential_indices,
-                torch.tensor(-1, device=device, dtype=torch.int32),
-            ),
-            raw_indices,
-        )
-        valid_topk = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK), sequential_valid, valid_topk
-        )
+    raw_indices = torch.where(
+        needs_sequential,
+        torch.where(sequential_valid, sequential_indices, neg_one_i32),
+        raw_indices,
+    )
+    valid_topk = torch.where(needs_sequential, sequential_valid, valid_topk)
 
     page_idx = raw_indices >> page_bits
     offset_in_page = raw_indices & page_mask
@@ -224,16 +249,12 @@ def topk_transform_512_pytorch_vectorized(
     page_indices = (physical_pages << page_bits) | offset_in_page
     page_indices = page_indices.to(torch.int32)
 
-    page_indices = torch.where(
-        valid_topk, page_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-    )
+    page_indices = torch.where(valid_topk, page_indices, neg_one_i32)
 
     out_page_indices.copy_(page_indices)
 
     if out_raw_indices is not None:
-        raw_indices = torch.where(
-            valid_topk, raw_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-        )
+        raw_indices = torch.where(valid_topk, raw_indices, neg_one_i32)
         out_raw_indices.copy_(raw_indices)
 
 
