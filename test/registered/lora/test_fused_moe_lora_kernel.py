@@ -1,6 +1,7 @@
 # Temporarily adapted from https://github.com/vllm-project/vllm/blob/main/tests/lora/test_fused_moe_lora_kernel.py, will optimize in future refactor
 import random
 import sys
+import unittest
 
 import pytest
 import torch
@@ -267,6 +268,7 @@ DEVICES = [f"cuda:{0}"]
 SEED = [42]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @pytest.mark.parametrize("mul_routed_weight", [False, True])
 @pytest.mark.parametrize("num_tokens", [100])
 @pytest.mark.parametrize("top_k_num", [6, 12])

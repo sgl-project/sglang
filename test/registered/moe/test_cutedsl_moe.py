@@ -2,24 +2,34 @@
 import unittest
 
 import torch
-from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
 from torch.nn import functional as F
 
-from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.moe.flashinfer_cutedsl_moe import flashinfer_cutedsl_moe_masked
 from sglang.test.ci.ci_register import register_cuda_ci
 
-try:
-    from flashinfer import CuteDslMoEWrapper
-    from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
-except ImportError:
+if torch.cuda.is_available():
+    from flashinfer import fp4_quantize, scaled_fp4_grouped_quantize
+
+    from sglang.srt.layers.activation import SiluAndMul
+    from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
+        flashinfer_cutedsl_moe_masked,
+    )
+
+    try:
+        from flashinfer import CuteDslMoEWrapper
+        from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+    except ImportError:
+        CuteDslMoEWrapper = None
+        convert_sf_to_mma_layout = None
+    SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
+    SKIP_REASON = "Nvfp4 Requires compute capability of 10 or above."
+else:
     CuteDslMoEWrapper = None
     convert_sf_to_mma_layout = None
+    SKIP_TEST = True
+    SKIP_REASON = "CUDA not available"
 
 register_cuda_ci(est_time=24, stage="extra-b", runner_config="4-gpu-b200")
 
-SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
-SKIP_REASON = "Nvfp4 Requires compute capability of 10 or above."
 
 kE2M1ToFloat = torch.tensor(
     [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=torch.float32
@@ -473,6 +483,7 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids):
     ).sum(dim=1)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestCuteDslV2(unittest.TestCase):
     """Correctness tests for the CuteDSL v2 (standard) path.
 
@@ -777,6 +788,7 @@ class TestCuteDslV2(unittest.TestCase):
                 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestCuteDslV1(unittest.TestCase):
     """Correctness tests for the CuteDSL v1 (deepep) path.
 

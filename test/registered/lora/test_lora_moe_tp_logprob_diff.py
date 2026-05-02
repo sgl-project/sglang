@@ -71,6 +71,7 @@ def _run_sglang_moe_lora(
     }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMoELoRATP2Logprobs(CustomTestCase):
     """Compare TP=1 vs TP=2 MoE LoRA: output strings must match and logprobs
     must stay within threshold."""

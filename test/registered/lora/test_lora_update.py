@@ -861,6 +861,7 @@ class LoRAUpdateTestSessionMode(Enum):
     SERVER = "server"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class LoRAUpdateTestSessionBase:
     """
     Base context manager for testing LoRA adapters.
@@ -945,6 +946,7 @@ class LoRAUpdateTestSessionBase:
         raise NotImplementedError("Subclasses must implement forward")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
     """
     Context manager for testing LoRA adapters with in-process engine.
@@ -1094,6 +1096,7 @@ class LoRAUpdateEngineTestSession(LoRAUpdateTestSessionBase):
         return output
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class LoRAUpdateServerTestSession(LoRAUpdateTestSessionBase):
     """
     Context manager for testing LoRA adapters with standalone server.
@@ -1289,6 +1292,7 @@ def LoRAUpdateTestSession(
         raise ValueError(f"Unrecognized mode: {mode!r}")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRADynamicUpdate(CustomTestCase):
     """
     This test case verifies that the SRT runner can dynamically load and unload LoRA adapters
