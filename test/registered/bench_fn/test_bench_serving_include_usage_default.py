@@ -17,7 +17,6 @@ override via ``--extra-request-body``.
 
 import asyncio
 import json
-import socket
 import threading
 import time
 import unittest
@@ -34,12 +33,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="stage-a-test-cpu")
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 class _PayloadCaptureHandler(BaseHTTPRequestHandler):
@@ -108,14 +101,16 @@ class TestBenchServingIncludeUsageDefault(CustomTestCase):
         )
 
     def _serve(self, mode: str):
-        port = _free_port()
-
         class Handler(_PayloadCaptureHandler):
             pass
 
         Handler.captured_bodies = []
         Handler.mode = mode
-        server = HTTPServer(("127.0.0.1", port), Handler)
+        # Bind to port 0 so the kernel picks an available port atomically;
+        # avoids a probe-then-bind race where another process could grab it
+        # between _free_port() and HTTPServer().
+        server = HTTPServer(("127.0.0.1", 0), Handler)
+        port = server.server_address[1]
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         return server, thread, port, Handler
@@ -138,9 +133,7 @@ class TestBenchServingIncludeUsageDefault(CustomTestCase):
         server, _, port, Handler = self._serve("completions")
         try:
             asyncio.run(
-                async_request_openai_completions(
-                    self._req(port, "/v1/completions", {})
-                )
+                async_request_openai_completions(self._req(port, "/v1/completions", {}))
             )
         finally:
             server.shutdown()
