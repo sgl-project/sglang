@@ -39,6 +39,36 @@ from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
+MIMO_V2_MODEL_ARCHS = (
+    "MiMoV2ForCausalLM",
+    "MiMoV2FlashForCausalLM",
+)
+MIMO_V2_MULTIMODAL_ARCHS = ("MiMoV2ForCausalLM",)
+
+
+def get_mimo_v2_fused_qkv_expected_tp_size(hf_config):
+    layout = getattr(hf_config, "attention_projection_layout", None)
+    if layout is None:
+        return None
+    if layout != "fused_qkv":
+        raise ValueError(
+            "MiMoV2 hf_config has unsupported "
+            f"attention_projection_layout={layout!r}; expected 'fused_qkv' "
+            "or unset."
+        )
+
+    num_key_value_heads = getattr(hf_config, "num_key_value_heads", None)
+    text_config = getattr(hf_config, "text_config", None)
+    if num_key_value_heads is None and text_config is not None:
+        num_key_value_heads = getattr(text_config, "num_key_value_heads", None)
+    if num_key_value_heads is None:
+        raise ValueError(
+            "MiMoV2 hf_config has attention_projection_layout='fused_qkv' "
+            "but num_key_value_heads is missing; this value is required to "
+            "derive the fused qkv_proj TP size."
+        )
+    return num_key_value_heads
+
 
 class AttentionArch(IntEnum):
     MLA = auto()
@@ -337,10 +367,7 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] == "MiMoForCausalLM":
             self.hf_config.architectures[0] = "MiMoMTP"
-        if is_draft_model and self.hf_config.architectures[0] in (
-            "MiMoV2ForCausalLM",
-            "MiMoV2FlashForCausalLM",
-        ):
+        if is_draft_model and self.hf_config.architectures[0] in MIMO_V2_MODEL_ARCHS:
             self.hf_config.architectures[0] = "MiMoV2MTP"
         if is_draft_model and self.hf_config.architectures[0] == "Step3p5ForCausalLM":
             self.hf_config.architectures[0] = "Step3p5MTP"
@@ -397,8 +424,7 @@ class ModelConfig:
         self.has_attention_sinks = self._detect_attention_sinks()
 
         self.is_hybrid_swa_compress = self.hf_config.architectures[0] in [
-            "MiMoV2ForCausalLM",
-            "MiMoV2FlashForCausalLM",
+            *MIMO_V2_MODEL_ARCHS,
             "MiMoV2MTP",
             "Gemma4ForCausalLM",
             "Gemma4ForConditionalGeneration",
@@ -417,14 +443,7 @@ class ModelConfig:
             return True
 
         # MiMoV2 creates sinks only when the config flags are set.
-        if any(
-            a in archs
-            for a in (
-                "MiMoV2FlashForCausalLM",
-                "MiMoV2ForCausalLM",
-                "MiMoV2MTP",
-            )
-        ):
+        if any(a in archs for a in (*MIMO_V2_MODEL_ARCHS, "MiMoV2MTP")):
             return getattr(
                 self.hf_text_config, "add_swa_attention_sink_bias", False
             ) or getattr(self.hf_text_config, "add_full_attention_sink_bias", False)
@@ -1383,6 +1402,7 @@ multimodal_model_archs = [
     "LlavaVidForCausalLM",
     "Lfm2VlForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
+    *MIMO_V2_MULTIMODAL_ARCHS,
     "MiniCPMO",
     "MiniCPMV",
     "Mistral3ForConditionalGeneration",
@@ -1528,8 +1548,7 @@ def is_hybrid_swa_model(model_architectures: List[str]):
     hybrid_swa_archs = {
         "Llama4ForConditionalGeneration",
         "GptOssForCausalLM",
-        "MiMoV2ForCausalLM",
-        "MiMoV2FlashForCausalLM",
+        *MIMO_V2_MODEL_ARCHS,
         "MiMoV2MTP",
         "Step3p5ForCausalLM",
         "Step3p5MTP",
@@ -1559,13 +1578,7 @@ def get_hybrid_layer_ids(
         full_attention_layer_ids = [
             i for i, x in enumerate(layer_types) if x == "full_attention"
         ]
-    elif any(
-        x in model_architectures
-        for x in (
-            "MiMoV2ForCausalLM",
-            "MiMoV2FlashForCausalLM",
-        )
-    ):
+    elif any(arch in MIMO_V2_MODEL_ARCHS for arch in model_architectures):
         hybrid_layer_pattern = getattr(hf_text_config, "hybrid_layer_pattern", None)
         swa_attention_layer_ids = [
             i for i in range(num_hidden_layers) if hybrid_layer_pattern[i] == 1
