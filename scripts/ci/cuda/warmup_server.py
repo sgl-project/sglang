@@ -192,15 +192,6 @@ def warmup_one_model(model, tp, port):
         ok, err = wait_for_server(base_url, proc, SERVER_STARTUP_TIMEOUT)
         if not ok:
             print(f"  Warning: server not ready: {err}")
-            # Dump last lines of server log for debugging
-            try:
-                log_file.flush()
-                with open(log_path) as f:
-                    lines = f.readlines()
-                for line in lines[-20:]:
-                    print(f"    | {line.rstrip()}")
-            except Exception:
-                pass
             return False
 
         print("  Server ready, sending generate request...")
@@ -208,6 +199,20 @@ def warmup_one_model(model, tp, port):
         return True
 
     finally:
+        # Surface the tail of the server log so CI captures validation
+        # messages, exceptions, and warmup progress (the launch_server
+        # subprocess writes stdout/stderr to the tempfile, not our stdout).
+        try:
+            log_file.flush()
+            with open(log_path) as f:
+                lines = f.readlines()
+            print(f"  --- server log tail ({len(lines)} lines, last 30) ---")
+            for line in lines[-30:]:
+                print(f"    | {line.rstrip()}")
+            print("  --- end server log ---")
+        except Exception:
+            pass
+
         print("  Killing server...")
         kill_server(proc)
         log_file.close()
