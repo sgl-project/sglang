@@ -984,6 +984,76 @@ class DeepseekV4DecoderLayer(nn.Module):
             and layer_id % moe_layer_freq == 0
         )
 
+    def _hc_pre_decode_pure_torch(
+        self,
+        x: torch.Tensor,
+        hc_fn: torch.Tensor,
+        hc_scale: torch.Tensor,
+        hc_base: torch.Tensor,
+    ):
+        """Decode-optimized hc_pre: pure PyTorch, GPU-only (CUDA graph compatible).
+
+        For decode (small batch), replaces tilelang 32-way split-K (~34 kernel
+        launches) with ~4 PyTorch kernel launches. All ops stay on GPU to
+        support CUDA graph capture.
+        """
+        shape, dtype = x.size(), x.dtype
+        hc_mult = self.hc_mult
+        hidden_size = shape[-1]
+        hc_mult3 = (2 + hc_mult) * hc_mult  # 24
+
+        # Flatten: (tokens, hc_mult, hidden_size) → (tokens, hc_mult * hidden_size)
+        x_flat = x.flatten(1)  # bf16
+
+        # GEMV + sqrsum (2 kernel launches vs 34 for tilelang split-K)
+        x_fp32 = x_flat.float()
+        sqrsum = x_fp32.square().sum(-1, keepdim=True)  # (tokens, 1)
+        linear_out = F.linear(x_fp32, hc_fn)  # (tokens, 24) fp32
+
+        # RMS normalize
+        rsqrt = torch.rsqrt(sqrsum / (hc_mult * hidden_size) + self.rms_norm_eps)
+        mixes_sq = linear_out * rsqrt  # (tokens, 24) fp32, stays on GPU
+
+        # All subsequent ops on GPU (CUDA graph compatible)
+
+        # Extract pre (sigmoid + eps)
+        pre_raw = mixes_sq[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult]
+        pre_out = torch.sigmoid(pre_raw) + self.hc_eps  # (tokens, hc_mult)
+
+        # Extract post (2 * sigmoid)
+        post_raw = (
+            mixes_sq[:, hc_mult : 2 * hc_mult] * hc_scale[1]
+            + hc_base[hc_mult : 2 * hc_mult]
+        )
+        post_out = 2.0 * torch.sigmoid(post_raw)  # (tokens, hc_mult)
+
+        # Extract comb + Sinkhorn normalize (on GPU, tiny 4x4 matrix)
+        comb_base_mat = hc_base[2 * hc_mult :].view(hc_mult, hc_mult)
+        comb_raw = (
+            mixes_sq[:, 2 * hc_mult :].view(-1, hc_mult, hc_mult) * hc_scale[2]
+            + comb_base_mat
+        )
+        comb_frag = torch.exp(comb_raw - comb_raw.max(dim=-1, keepdim=True).values)
+        row_sum = comb_frag.sum(dim=-1, keepdim=True)
+        comb_frag = comb_frag / row_sum + self.hc_eps
+        col_sum = comb_frag.sum(dim=-2, keepdim=True)
+        comb_frag = comb_frag / (col_sum + self.hc_eps)
+
+        for _ in range(self.hc_sinkhorn_iters - 1):
+            row_sum = comb_frag.sum(dim=-1, keepdim=True)
+            comb_frag = comb_frag / (row_sum + self.hc_eps)
+            col_sum = comb_frag.sum(dim=-2, keepdim=True)
+            comb_frag = comb_frag / (col_sum + self.hc_eps)
+
+        # Convert to bf16 directly on GPU
+        pre = pre_out.to(torch.bfloat16)
+        post = post_out.to(torch.bfloat16)
+        comb = comb_frag.to(torch.bfloat16)
+
+        # Output: weighted sum of residual heads (bf16 multiply)
+        y = (pre.unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
+        return y, post, comb
+
     def hc_pre(
         self,
         x: torch.Tensor,
@@ -991,15 +1061,6 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        @maybe_torch_compile
-        def hc_pre_torch_impl(x, hc_fn):
-            x_flat = x.flatten(1).float()
-            rsqrt = torch.rsqrt(
-                x_flat.square().mean(-1, keepdim=True) + self.rms_norm_eps
-            )
-            mixes = (F.linear(x_flat, hc_fn) * rsqrt).unsqueeze(1)
-            return x_flat, mixes
-
         shape, dtype = x.size(), x.dtype
 
         if x.shape[0] == 0:
@@ -1009,6 +1070,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 (0, self.hc_mult, self.hc_mult), dtype=dtype, device=x.device
             )
             return y, post, comb
+
+        # Decode optimization: bypass tilelang split-K for small batches.
+        # Tilelang 32-way split-K produces ~34 kernel launches per hc_pre call;
+        # pure PyTorch + CPU Sinkhorn uses ~4 GPU kernels + fast CPU compute.
+        if x.shape[0] <= 8:
+            return self._hc_pre_decode_pure_torch(x, hc_fn, hc_scale, hc_base)
 
         if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.srt.layers.mhc import mhc_pre
@@ -1041,7 +1108,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             rsqrt = torch.rsqrt(s_out / k + self.rms_norm_eps)
             mixes = (d_out * rsqrt.unsqueeze(1)).unsqueeze(1)
         else:
-            x_flat, mixes = hc_pre_torch_impl(x, hc_fn)
+            x_flat = x.flatten(1).float()
+            sq = x_flat.square()
+            mean = sq.mean(-1, keepdim=True)
+            rsqrt = torch.rsqrt(mean + self.rms_norm_eps)
+            linear_out = F.linear(x_flat, hc_fn)
+            mixes = (linear_out * rsqrt).unsqueeze(1)
 
         from sglang.srt.layers.mhc import hc_split_sinkhorn
 
@@ -1053,6 +1125,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             self.hc_sinkhorn_iters,
             self.hc_eps,
         )
+
         y = (pre.squeeze(1).unsqueeze(-1) * x_flat.view(shape)).sum(dim=1)
         return y.to(dtype), post.squeeze(1), comb.squeeze(1)
 
@@ -1080,10 +1153,12 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         @maybe_torch_compile
         def hc_post_torch_impl(x, residual, post, comb):
-            return (
-                post.unsqueeze(-1) * x.unsqueeze(1)
-                + (comb.unsqueeze(-1) * residual.unsqueeze(2)).sum(dim=1)
-            ).type_as(x)
+            # Ensure type consistency: einsum requires uniform dtypes
+            p = post.type_as(x)
+            c = comb.type_as(residual)
+            return torch.einsum("bi,bd->bid", p, x) + torch.einsum(
+                "bij,bjd->bid", c, residual
+            )
 
         return hc_post_torch_impl(x, residual, post, comb)
 
@@ -1638,7 +1713,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                 if envs.SGLANG_DSV4_FP4_EXPERTS.get():
                     weights = _dequant_fp8_wo_a(weights)
                 else:
-                    weights = ((n, t) for n, t in weights if not n.endswith(".wo_a.scale"))
+                    weights = (
+                        (n, t) for n, t in weights if not n.endswith(".wo_a.scale")
+                    )
                 # ------------------------------------------------------------------------
 
         stacked_params_mapping = [

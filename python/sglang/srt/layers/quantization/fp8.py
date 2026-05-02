@@ -747,7 +747,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         # WEIGHT_SCALES
         if self.is_fp4_expert:
-            if envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get() and not is_large_dummy_model():
+            if (
+                envs.SGLANG_DEBUG_SANITY_CHECK_CONFIG.get()
+                and not is_large_dummy_model()
+            ):
                 assert hidden_size == 4096
                 assert intermediate_size_per_partition == 2048
             fp4_block_k = 32
@@ -872,6 +875,227 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         else:
             layer.w13_input_scale = None
             layer.w2_input_scale = None
+
+    @staticmethod
+    def _dequant_fp4_to_bf16(
+        w_fp4: torch.Tensor,
+        scale_fp32: torch.Tensor,
+        fp4_block_k: int = 32,
+    ) -> torch.Tensor:
+        """Dequantize a single expert's FP4 weights to BF16."""
+        N, K_half = w_fp4.shape
+        K = K_half * 2
+
+        low_nib = w_fp4 & 0x0F
+        high_nib = (w_fp4 >> 4) & 0x0F
+        unpacked = torch.stack([low_nib, high_nib], dim=-1).reshape(N, K)
+
+        # Inline E2M1: avoid index lookup, use arithmetic
+        # E2M1 values for magnitude 0-7: [0, 0.5, 1, 1.5, 2, 3, 4, 6]
+        # Decompose: bit2=0 -> [0,0.5,1,1.5], bit2=1 -> [2,3,4,6]
+        # This avoids the gather operation that causes kernel launch overhead
+        mag = unpacked & 0x07
+        sign = 1 - 2 * ((unpacked >> 3) & 1).float()
+        is_high = ((mag >> 2) & 1).float()  # 1 if magnitude >= 4
+        low2 = (mag & 0x03).float()
+        # low range: [0, 0.5, 1, 1.5], high range: [2, 3, 4, 6]
+        # low: 0.5 * low2, high: 2 + low2 if low2<2 else 2*(low2+0)
+        # Actually: low=[0,0.5,1,1.5] = 0.5*[0,1,2,3], high=[2,3,4,6]
+        # Better: use conditional arithmetic
+        low_val = 0.5 * low2  # [0, 0.5, 1.0, 1.5]
+        high_val = low2 + (low2 >= 2).float() * (4.0 - low2 - 2.0)  # not clean
+        # Simpler: just compute directly
+        # mag 0->0, 1->0.5, 2->1, 3->1.5, 4->2, 5->3, 6->4, 7->6
+        # = (1 + 0.5*bit1) * 2^bit2 for mag<6, 6 for mag=7
+        # Use a small constant lookup (faster than large tensor gather)
+        e2m1_lut = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+            dtype=torch.float32,
+            device=w_fp4.device,
+        )
+        fp4_float = sign * e2m1_lut[mag.long()]
+
+        fp4_float = fp4_float.reshape(N, K // fp4_block_k, fp4_block_k)
+        dequant = (fp4_float * scale_fp32.unsqueeze(-1)).reshape(N, K)
+        return dequant.to(torch.bfloat16)
+
+    @staticmethod
+    def _dequant_fp4_batch(
+        w_fp4_batch: torch.Tensor,
+        scale_fp32_batch: torch.Tensor,
+        fp4_block_k: int = 32,
+    ) -> torch.Tensor:
+        """Batch dequantize multiple experts' FP4 weights to BF16.
+
+        Args:
+            w_fp4_batch: (E, N, K//2) int8
+            scale_fp32_batch: (E, N, K//fp4_block_k) float32
+
+        Returns:
+            (E, N, K) bf16
+        """
+        E, N, K_half = w_fp4_batch.shape
+        K = K_half * 2
+
+        low_nib = w_fp4_batch & 0x0F
+        high_nib = (w_fp4_batch >> 4) & 0x0F
+        unpacked = torch.stack([low_nib, high_nib], dim=-1).reshape(E, N, K)
+
+        e2m1_lut = torch.tensor(
+            [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0],
+            dtype=torch.float32,
+            device=w_fp4_batch.device,
+        )
+        mag = unpacked & 0x07
+        sign = 1 - 2 * ((unpacked >> 3) & 1).float()
+        fp4_float = sign * e2m1_lut[mag.long()]
+
+        fp4_float = fp4_float.reshape(E, N, K // fp4_block_k, fp4_block_k)
+        dequant = (fp4_float * scale_fp32_batch.unsqueeze(-1)).reshape(E, N, K)
+        return dequant.to(torch.bfloat16)
+
+    @staticmethod
+    def _apply_fp4_moe_torch(
+        hidden_states: torch.Tensor,
+        w13_weight: torch.Tensor,
+        w2_weight: torch.Tensor,
+        w13_weight_scale_inv: torch.Tensor,
+        w2_weight_scale_inv: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """PyTorch/Triton MoE for FP4 experts (SM120 fallback).
+
+        Uses fused FP4 GEMV Triton kernel for decode (n_tokens <= 8),
+        falls back to full dequant + matmul for larger batches.
+        Path A is fully batched: eliminates Python for-loop by processing
+        all (token, expert) pairs in 2 kernel launches instead of 16.
+        """
+        from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
+            deepseek_v4_moe_code_path_checker,
+        )
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        deepseek_v4_moe_code_path_checker.observed += 1
+
+        num_tokens, hidden_size = hidden_states.shape
+        intermediate_half = w13_weight.shape[1] // 2
+
+        # Try to import fused FP4 GEMV kernels (Triton-based)
+        use_fused_gemv = False
+        try:
+            from sglang.srt.layers.quantization.fp4_gemv_triton import (
+                fp4_gemv_batched_multi_input,
+            )
+
+            use_fused_gemv = True
+        except Exception:
+            pass
+
+        # Path A: Batched FP4 GEMV for decode (small batch, CUDA-graph compatible)
+        # Processes ALL (token, expert) pairs in 2 kernel launches instead of
+        # num_tokens * 2, eliminating Python for-loop overhead.
+        # Threshold 8: covers CUDA graph capture batch sizes up to 8.
+        if use_fused_gemv and num_tokens <= 8:
+            topk = topk_ids.shape[1]  # (num_tokens, topk)
+            total_pairs = num_tokens * topk
+
+            # Flatten all (token, expert) pairs
+            all_expert_ids = topk_ids.reshape(total_pairs)  # (total_pairs,)
+
+            # Expand hidden_states for all (token, expert) pairs
+            # (num_tokens, hidden_size) → (num_tokens, topk, hidden_size) → (total_pairs, hidden_size)
+            x_all = (
+                hidden_states.unsqueeze(1)
+                .expand(-1, topk, -1)
+                .reshape(total_pairs, hidden_size)
+                .contiguous()
+            )
+
+            # Gather all expert weights at once (4 index_select calls instead of num_tokens * 4)
+            w13_all = torch.index_select(w13_weight, 0, all_expert_ids)
+            s13_all = torch.index_select(w13_weight_scale_inv, 0, all_expert_ids)
+            w2_all = torch.index_select(w2_weight, 0, all_expert_ids)
+            s2_all = torch.index_select(w2_weight_scale_inv, 0, all_expert_ids)
+
+            # Batched w13 GEMV: all (token, expert) pairs at once
+            gate_up_all = fp4_gemv_batched_multi_input(x_all, w13_all, s13_all)
+
+            # SwiGLU
+            gate = gate_up_all[:, :intermediate_half]
+            up = gate_up_all[:, intermediate_half:]
+            hidden_all = torch.nn.functional.silu(gate) * up
+
+            # Batched w2 GEMV
+            expert_outputs = fp4_gemv_batched_multi_input(
+                hidden_all.contiguous(), w2_all, s2_all
+            )
+
+            # Weighted sum: reshape and vectorized reduction
+            expert_outputs = expert_outputs.view(num_tokens, topk, hidden_size)
+            weights = topk_weights.unsqueeze(-1).to(
+                expert_outputs.dtype
+            )  # (num_tokens, topk, 1)
+            output = (expert_outputs * weights).sum(dim=1)  # (num_tokens, hidden_size)
+
+            return StandardCombineInput(hidden_states=output)
+
+        # Path B: Dequant + BF16 matmul for prefill (large batch, no CUDA graph)
+        # This is faster for large batches but NOT CUDA-graph compatible.
+        output = torch.zeros(
+            num_tokens,
+            hidden_size,
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
+
+        for t in range(num_tokens):
+            expert_ids_t = topk_ids[t]  # (topk,) — CPU sync OK (not in CUDA graph)
+            topk = expert_ids_t.shape[0]
+            x = hidden_states[t]  # (hidden_size,) bf16
+            weights = topk_weights[t]  # (topk,)
+
+            # Gather and dequantize selected experts' FP4 weights to BF16
+            w13_bf16 = Fp8MoEMethod._dequant_fp4_batch(
+                w13_weight[expert_ids_t],
+                w13_weight_scale_inv[expert_ids_t],
+            )  # (topk, N, hidden_size)
+            w2_bf16 = Fp8MoEMethod._dequant_fp4_batch(
+                w2_weight[expert_ids_t],
+                w2_weight_scale_inv[expert_ids_t],
+            )  # (topk, hidden_size, intermediate_half)
+
+            # Batched matrix-vector: gate_up = x @ w13.T per expert
+            # einsum('k,enk->en') computes sum_k x[k]*w[e,n,k] = (w @ x)[n] per expert
+            gate_up_all = torch.einsum(
+                "k,enk->en",
+                x.to(torch.float32),
+                w13_bf16.to(torch.float32),
+            ).to(torch.bfloat16)
+
+            # SwiGLU
+            gate = gate_up_all[:, :intermediate_half]
+            up = gate_up_all[:, intermediate_half:]
+            hidden_all = (
+                torch.nn.functional.silu(gate) * up
+            )  # (topk, intermediate_half)
+
+            # Batched matrix-vector: out = hidden_all @ w2.T per expert
+            expert_outputs = torch.einsum(
+                "ek,emk->em",
+                hidden_all.to(torch.float32),
+                w2_bf16.to(torch.float32),
+            ).to(
+                torch.bfloat16
+            )  # (topk, hidden_size)
+
+            # Weighted sum across topk
+            for k in range(topk):
+                output[t] = output[t] + expert_outputs[k] * weights[k].to(
+                    expert_outputs.dtype
+                )
+
+        return StandardCombineInput(hidden_states=output)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         # If ROCm, normalize the weights and scales to e4m3fnuz
@@ -1305,6 +1529,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 output=symm_output,
             )
             return StandardCombineInput(hidden_states=output)
+
+        # SM120 fallback: FP4 experts with Triton runner (DeepGEMM not available)
+        # Use pure PyTorch MoE with on-the-fly FP4 dequantization to avoid
+        # the memory cost of converting all FP4 weights to FP8 (~65 GB extra).
+        if self.is_fp4_expert and self.runner.runner_backend.is_triton():
+            topk_weights, topk_ids, _ = dispatch_output.topk_output
+            return self._apply_fp4_moe_torch(
+                hidden_states=x,
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale_inv=layer.w13_weight_scale_inv,
+                w2_weight_scale_inv=layer.w2_weight_scale_inv,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+            )
 
         if self.runner.runner_backend.is_deep_gemm():
 

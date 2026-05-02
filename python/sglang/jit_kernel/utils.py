@@ -172,4 +172,4 @@ def is_arch_support_pdl() -> bool:
     import torch
 
     device = torch.cuda.current_device()
-    return torch.cuda.get_device_capability(device)[0] >= 9
+    return torch.cuda.get_device_capability(device)[0] == 9
