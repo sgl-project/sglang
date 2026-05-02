@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+import json
+import logging
+from collections import Counter
 from collections.abc import Sequence
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def _readonly_sequence(value: Any, *, field_name: str) -> Sequence[Any]:
@@ -65,3 +70,66 @@ def build_runtime_observation_payloads(
                 }
             )
     return payloads
+
+
+def summarize_runtime_observation_payloads(
+    payloads: Sequence[dict[str, Any]],
+) -> dict[str, Any]:
+    """Summarize read-only runtime observation payloads.
+
+    This reads payload dictionaries only. It does not touch KV pools, create
+    snapshots, copy host backup tensors, mutate scheduler state, or write back
+    runtime state.
+    """
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_batch: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "source_mutated_true_count": 0,
+            "attention_override_true_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+        }
+    )
+
+    for payload in payloads:
+        per_request[str(payload.get("request_id"))] += 1
+        layer_value = payload.get("layer_id")
+        if layer_value is None:
+            layer_value = payload.get("layer_idx")
+        per_layer[str(layer_value)] += 1
+        per_batch[str(payload.get("batch_id"))] += 1
+
+        if payload.get("source_mutated") is True:
+            safety_counts["source_mutated_true_count"] += 1
+        if payload.get("attention_override") is True:
+            safety_counts["attention_override_true_count"] += 1
+        if payload.get("kv_cache_mutation") is True:
+            safety_counts["kv_cache_mutation_true_count"] += 1
+        if payload.get("runtime_writeback") is True:
+            safety_counts["runtime_writeback_true_count"] += 1
+        if payload.get("scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+
+    return {
+        "total_payloads": len(payloads),
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_batch_counts": dict(sorted(per_batch.items())),
+        **dict(safety_counts),
+    }
+
+
+def log_runtime_observation_summary(
+    summary: dict[str, Any],
+    *,
+    logger_: logging.Logger | None = None,
+    prefix: str = "relaykv_runtime_observation_summary",
+) -> None:
+    """Log a precomputed read-only runtime observation summary."""
+
+    target_logger = logger_ if logger_ is not None else logger
+    target_logger.info("%s=%s", prefix, json.dumps(summary, sort_keys=True))
