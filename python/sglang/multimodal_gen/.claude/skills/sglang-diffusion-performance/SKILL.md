@@ -201,7 +201,8 @@ Use these as first commands to benchmark, not as universal winners.
 | Wan2.2 A14B T2V/I2V | 720p, 81 frames | Nightly: `--num-gpus 4 --enable-cfg-parallel --ulysses-degree 2 --text-encoder-cpu-offload --pin-cpu-memory` | For lowest latency, also benchmark pure Ulysses on the same GPUs. |
 | Wan2.2 TI2V 5B | 720p, 81 frames, 1 GPU | `--enable-torch-compile --warmup` | Keep the input image and motion prompt fixed when comparing sparse attention or Cache-DiT. |
 | LTX-2 / LTX-2.3 | 768x512, 121 frames, 2 GPUs | `--pipeline-class-name LTX2TwoStagePipeline --enable-torch-compile --warmup`; LTX-2 nightly also uses `--enable-cfg-parallel` | Use the benchmark/profile skill presets for exact nightly alignment. PRs #22441, #24025, and #23736 track additional LTX2 perf/parallel work. |
-| HunyuanVideo | 848x480 or 720p class video | `--text-encoder-cpu-offload --pin-cpu-memory --enable-torch-compile --warmup` | Check VAE decode separately. GroupNorm+SiLU is a mainline toggle, with default/tuning changes in open PRs #23148 and #23938. |
+| HunyuanVideo | 848x480 or 720p class video | `--text-encoder-cpu-offload --pin-cpu-memory --enable-torch-compile --warmup` | Check VAE decode separately. GroupNorm+SiLU is default-eligible in mainline when wrapper guards pass; use `bench_group_norm_silu.py` when VAE residual blocks are hot. |
+| JoyAI-Image-Edit | 1024-class TI2I, 40 steps, guidance 4.0 | Start from the CI/default TI2I path for `jdopensource/JoyAI-Image-Edit-Diffusers`; add `--warmup` and benchmark `--enable-torch-compile` separately | Newly supported image-edit path. Keep the input image, prompt, seed, and output size fixed; sequence shard is auto-enabled for Joy pipelines. |
 | MOVA / Helios | Use the benchmark/profile presets first | `--enable-torch-compile --warmup`; pin offload flags explicitly | PR #20530 tracks MOVA fused RMSNorm+RoPE; PR #24059 tracks Helios fused norm modulation. |
 
 ## Open PR Watchlist
@@ -210,7 +211,7 @@ As of 2026-05-02, these performance PRs were open. Treat them as direction and
 prior art until merged:
 
 - Fusion/kernel: #24025 LTX2 QK norm, #24059 Helios norm modulation, #24117 Z-Image packed QKV, #19488 Wan elementwise cross-block fusion, #19249 Z-Image gate/norm fusion, #20429 Qwen-Image layernorm/modulation, #20530 MOVA RMSNorm+RoPE.
-- VAE/decode: #23148 and #23938 HunyuanVideo GroupNorm+SiLU, #22531 LTX2 parallel VAE, #20927 batched tiled VAE decode.
+- VAE/decode: #22531 LTX2 parallel VAE, #20927 batched tiled VAE decode.
 - Runtime/parallel/cache: #22805 FLUX.2 packed QKV for A2A, #21742 hybrid attention schedule, #24053 USP replicated-prefix fix, #21613 TeaCache refactor, #24227 WanVideo TeaCache fix, #18764 dynamic batching, #24200 disaggregated diffusion.
 
 ## Tips
