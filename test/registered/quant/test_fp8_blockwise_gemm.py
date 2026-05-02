@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+import torch
+
 from sglang.srt.utils import get_device_sm, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -104,10 +106,12 @@ class MXFP8GemmBase:
         self.assertGreaterEqual(metrics["score"], 0.8)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFP8BlockwiseGemmTriton(FP8BlockwiseGemmBase, unittest.TestCase):
     backend = "triton"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFP8BlockwiseGemmDeepGemm(FP8BlockwiseGemmBase, unittest.TestCase):
     backend = "deep_gemm"
 
