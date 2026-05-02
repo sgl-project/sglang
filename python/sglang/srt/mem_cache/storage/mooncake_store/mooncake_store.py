@@ -235,18 +235,16 @@ class MooncakeStore(HiCacheStorage):
                     )
                     device_name = ""
 
-            base_args = (
-                self.config.local_hostname,
-                self.config.metadata_server,
-                per_tp_global_segment_size,
-                DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
-                self.config.protocol,
-                device_name,
-                self.config.master_server_address,
-            )
             try:
                 ret_code = self.store.setup(
-                    *base_args, enable_ssd_offload=self.config.enable_ssd_offload
+                    self.config.local_hostname,
+                    self.config.metadata_server,
+                    per_tp_global_segment_size,
+                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                    self.config.protocol,
+                    device_name,
+                    self.config.master_server_address,
+                    enable_ssd_offload=self.config.enable_ssd_offload,
                 )
             except TypeError as e:
                 if "enable_ssd_offload" not in str(e):
@@ -257,7 +255,15 @@ class MooncakeStore(HiCacheStorage):
                     "Falling back to setup without enable_ssd_offload. "
                     "Please upgrade Mooncake to enable SSD offload support."
                 )
-                ret_code = self.store.setup(*base_args)
+                ret_code = self.store.setup(
+                    self.config.local_hostname,
+                    self.config.metadata_server,
+                    per_tp_global_segment_size,
+                    DEFAULT_LOCAL_BUFFER_SIZE,  # Zero copy interface does not need local buffer
+                    self.config.protocol,
+                    device_name,
+                    self.config.master_server_address,
+                )
             if ret_code:
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"
