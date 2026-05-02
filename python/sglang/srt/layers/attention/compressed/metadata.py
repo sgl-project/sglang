@@ -91,25 +91,7 @@ def create_flashmla_metadata():
 
 
 @dataclass
-class CoreMetadata:
-    positions: torch.Tensor
-    swa_slice: Optional[torch.Tensor]
-    swa_out_loc_sliced: torch.Tensor
-    c4_out_loc: torch.Tensor
-    c128_out_loc: torch.Tensor
-
-    def copy_(self, other):
-        raise NotImplementedError
-
-
-@dataclass
-class IndexerMetadata:
-    def copy_(self, other):
-        raise NotImplementedError
-
-
-@dataclass
-class PagedIndexerMetadata(IndexerMetadata):
+class PagedIndexerMetadata:
     page_size: int
     page_table: torch.Tensor
     c4_seq_lens: torch.Tensor
