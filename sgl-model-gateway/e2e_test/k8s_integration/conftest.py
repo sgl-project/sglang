@@ -46,6 +46,14 @@ _TRANSIENT_ERRORS = (
 )
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "slow: marks tests that wait for multiple reconciliation cycles "
+        "(deselect with '-m \"not slow\"')",
+    )
+
+
 def _kubectl(
     *args: str, check: bool = True, capture: bool = True
 ) -> subprocess.CompletedProcess:
