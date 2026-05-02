@@ -99,7 +99,9 @@ def _resolve_platform() -> SRTPlatform:
 
     if len(activated) == 0:
         if _is_cuda_available():
-            logger.debug("No platform plugin detected. Using CUDA SRTPlatform defaults.")
+            logger.debug(
+                "No platform plugin detected. Using CUDA SRTPlatform defaults."
+            )
             return CudaSRTPlatform()
         logger.debug("No platform detected. Using base SRTPlatform.")
         return SRTPlatform()

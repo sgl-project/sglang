@@ -246,14 +246,18 @@ class TestCudaDeviceMixin(CustomTestCase):
         self.assertIsInstance(base, CudaDeviceMixin)
 
     @patch("torch.cuda.get_device_properties")
-    def test_default_get_device_total_memory_uses_cuda(self, mock_get_device_properties):
+    def test_default_get_device_total_memory_uses_cuda(
+        self, mock_get_device_properties
+    ):
         mock_get_device_properties.return_value.total_memory = 123
         base = CudaSRTPlatform()
         self.assertEqual(base.get_device_total_memory(1), 123)
         mock_get_device_properties.assert_called_once_with(1)
 
     @patch("torch.cuda.max_memory_allocated", return_value=456)
-    def test_default_get_current_memory_usage_uses_cuda(self, mock_max_memory_allocated):
+    def test_default_get_current_memory_usage_uses_cuda(
+        self, mock_max_memory_allocated
+    ):
         base = CudaSRTPlatform()
         device = torch.device("cuda", 1)
         self.assertEqual(base.get_current_memory_usage(device), 456.0)
