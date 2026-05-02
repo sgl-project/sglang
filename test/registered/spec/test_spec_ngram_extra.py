@@ -1,6 +1,7 @@
 import unittest
 
 import requests
+import torch
 
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -33,6 +34,7 @@ class TestNgramSpeculativeDecodingNoOverlap(NgramServerBase, GSM8KMixin):
     extra_args = ["--disable-overlap-schedule"]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_hip(), _AMD_SKIP_BACKEND)
 class TestNgramSpeculativeDecodingFlashinfer(NgramServerBase, GSM8KMixin):
     attention_backend = "flashinfer"
