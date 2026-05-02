@@ -1,16 +1,11 @@
 """Pytest configuration for E2E tests.
 
-Parallel Execution
-------------------
-Tests can run in parallel using pytest-parallel with shared worker processes.
-Use --workers 1 --tests-per-worker N for N concurrent test threads:
-
-    pytest --workers 1 --tests-per-worker 4 e2e_test/router/
-
-This leverages the thread-safe ModelPool and GPUAllocator classes to enable
-true shared-worker parallelism where all threads share the same session-scoped
-model_pool fixture. Tests marked with @pytest.mark.thread_unsafe will be
-automatically skipped in parallel mode.
+Tests run serially under plain pytest. ModelPool / GPUAllocator stay
+thread-safe so re-introducing parallelism (e.g. via pytest-xdist) is
+still a tractable option; pytest-parallel was previously used but its
+thread dispatch leaked fixture references and caused model_pool
+deadlocks. Tests marked ``@pytest.mark.thread_unsafe`` would be
+auto-skipped in any future parallel mode.
 
 Markers
 -------

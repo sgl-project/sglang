@@ -165,6 +165,67 @@ class TestMMMUEvalUtils(CustomTestCase):
 
         self.assertEqual(pred_ans, "B")
 
+    def test_parse_multi_choice_extracts_boxed_answer(self):
+        response = "After computing the integral the result lines up with \\boxed{C}."
+
+        pred_ans = self.eval_utils.parse_multi_choice_response(
+            response, ["A", "B", "C", "D"], self._index_to_answer()
+        )
+
+        self.assertEqual(pred_ans, "C")
+
+    def test_parse_multi_choice_extracts_the_answer_is(self):
+        response = "Reasoning about the diagram, the answer is D."
+
+        pred_ans = self.eval_utils.parse_multi_choice_response(
+            response, ["A", "B", "C", "D"], self._index_to_answer()
+        )
+
+        self.assertEqual(pred_ans, "D")
+
+    def test_parse_multi_choice_extracts_final_answer(self):
+        response = "Working through the steps...\nFinal answer: A"
+
+        pred_ans = self.eval_utils.parse_multi_choice_response(
+            response, ["A", "B", "C", "D"], self._index_to_answer()
+        )
+
+        self.assertEqual(pred_ans, "A")
+
+    def test_parse_multi_choice_extracts_correct_answer_phrase(self):
+        response = (
+            "(A) is wrong because the proportions do not match.\n"
+            "The correct answer is B."
+        )
+
+        pred_ans = self.eval_utils.parse_multi_choice_response(
+            response, ["A", "B", "C", "D"], self._index_to_answer()
+        )
+
+        self.assertEqual(pred_ans, "B")
+
+    def test_parse_multi_choice_ignores_parenthetical_option_mentions(self):
+        # Thinking-style outputs discuss/reject several options inside
+        # ``<think>...</think>`` using parenthetical mentions like ``(A)``,
+        # ``(B)``.  Those mentions must NOT match any explicit-commit
+        # pattern, otherwise the latest-match heuristic would pick up a
+        # rejected option from the thinking text.  Only the explicit
+        # ``Answer: D`` after ``</think>`` should win.
+        response = (
+            "<think>\n"
+            "Option (A) seems plausible but the diagram shows otherwise.\n"
+            "Maybe (B) given the labels — actually no, (B) is contradicted "
+            "by the second figure. Let me reconsider; the data points to D.\n"
+            "</think>\n"
+            "Answer: D"
+        )
+
+        pred_ans = self.eval_utils.parse_multi_choice_response(
+            response, ["A", "B", "C", "D"], self._index_to_answer()
+        )
+
+        self.assertEqual(pred_ans, "D")
+
     def _multiple_choice_sample(self, response):
         return {
             "id": "sample-1",
