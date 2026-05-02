@@ -25,8 +25,8 @@ def make_name(name: str) -> str:
 @cache_once
 def _jit_common_module() -> Module:
     return load_jit(
-        make_name(f"common"),
-        cuda_files=[f"deepseek_v4/common.cuh"],
+        make_name("common"),
+        cuda_files=["deepseek_v4/common.cuh"],
         cuda_wrappers=[("plan_compress_prefill", "plan_compress_prefill")],
     )
 
@@ -187,9 +187,9 @@ def _jit_norm_rope_module(
 ) -> Module:
     args = make_cpp_args(dtype, head_dim, rope_dim, is_arch_support_pdl())
     return load_jit(
-        make_name(f"fused_norm_rope"),
+        make_name("fused_norm_rope"),
         *args,
-        cuda_files=[f"deepseek_v4/fused_norm_rope.cuh"],
+        cuda_files=["deepseek_v4/fused_norm_rope.cuh"],
         cuda_wrappers=[
             ("forward", f"FusedNormRopeKernel<{args}>::forward"),
         ],
