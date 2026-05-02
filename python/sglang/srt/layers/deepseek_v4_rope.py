@@ -239,3 +239,171 @@ def apply_rotary_emb_triton(
         )
 
     return x
+
+
+@triton.jit
+def _fused_norm_rope_kernel(
+    x_ptr,
+    weight_ptr,
+    freqs_real_ptr,
+    positions_ptr,
+    eps,
+    stride_x_row,
+    stride_freq_row,
+    HEAD_DIM: tl.constexpr,
+    ROPE_DIM: tl.constexpr,
+    HEAD_BLOCK: tl.constexpr,
+    ROPE_PAIR_BLOCK: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    USE_POS: tl.constexpr,
+):
+    # NOTE: avoids store-then-reload on the same kernel: rope-segment values
+    # are loaded a 2nd time as (real, imag) pairs straight from the input,
+    # rms_inv/weight applied in register, and all stores happen at the end.
+    pid = tl.program_id(0)
+    base = pid.to(tl.int64) * stride_x_row
+
+    offs = tl.arange(0, HEAD_BLOCK)
+    mask = offs < HEAD_DIM
+    x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+
+    sum_sq = tl.sum(x * x, axis=0)
+    rms_inv = tl.rsqrt(sum_sq / HEAD_DIM + eps)
+
+    if HAS_WEIGHT:
+        w = tl.load(weight_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        x_normed = x * rms_inv * w
+    else:
+        x_normed = x * rms_inv
+
+    rope_start = HEAD_DIM - ROPE_DIM
+
+    pair_offs = tl.arange(0, ROPE_PAIR_BLOCK)
+    pair_mask = pair_offs < (ROPE_DIM // 2)
+
+    x_real = tl.load(
+        x_ptr + base + rope_start + 2 * pair_offs,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+    x_imag = tl.load(
+        x_ptr + base + rope_start + 2 * pair_offs + 1,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    if HAS_WEIGHT:
+        w_real = tl.load(
+            weight_ptr + rope_start + 2 * pair_offs,
+            mask=pair_mask,
+            other=1.0,
+        ).to(tl.float32)
+        w_imag = tl.load(
+            weight_ptr + rope_start + 2 * pair_offs + 1,
+            mask=pair_mask,
+            other=1.0,
+        ).to(tl.float32)
+        x_real = x_real * rms_inv * w_real
+        x_imag = x_imag * rms_inv * w_imag
+    else:
+        x_real = x_real * rms_inv
+        x_imag = x_imag * rms_inv
+
+    if USE_POS:
+        position = tl.load(positions_ptr + pid).to(tl.int64)
+    else:
+        position = pid.to(tl.int64)
+
+    freq_base = position * stride_freq_row
+    f_real = tl.load(
+        freqs_real_ptr + freq_base + 2 * pair_offs,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+    f_imag = tl.load(
+        freqs_real_ptr + freq_base + 2 * pair_offs + 1,
+        mask=pair_mask,
+        other=0.0,
+    ).to(tl.float32)
+
+    out_real = x_real * f_real - x_imag * f_imag
+    out_imag = x_real * f_imag + x_imag * f_real
+
+    is_non_rope = offs < rope_start
+    tl.store(
+        x_ptr + base + offs,
+        x_normed.to(x_ptr.dtype.element_ty),
+        mask=mask & is_non_rope,
+    )
+    tl.store(
+        x_ptr + base + rope_start + 2 * pair_offs,
+        out_real.to(x_ptr.dtype.element_ty),
+        mask=pair_mask,
+    )
+    tl.store(
+        x_ptr + base + rope_start + 2 * pair_offs + 1,
+        out_imag.to(x_ptr.dtype.element_ty),
+        mask=pair_mask,
+    )
+
+
+def fused_norm_rope_inplace_triton(
+    kv: torch.Tensor,
+    weight: Optional[torch.Tensor],
+    eps: float,
+    freqs_cis: torch.Tensor,
+    positions: Optional[torch.Tensor] = None,
+) -> None:
+    """Fused RMSNorm (over head_dim) + RoPE (on last rope_dim of head_dim), in-place.
+
+    Equivalent to::
+
+        kv = rms_normalize(kv, eps, weight)
+        apply_rotary_emb_triton(kv[..., -rope_dim:], freqs_cis, positions=positions)
+
+    Args:
+        kv: [M, head_dim], any float dtype, contiguous along last dim. Modified in-place.
+        weight: [head_dim] or None.
+        eps: RMSNorm epsilon.
+        freqs_cis: complex tensor.
+            - If ``positions`` is None: shape [M, rope_dim // 2], one freq per token.
+            - Else: shape [max_seq, rope_dim // 2], full table; indexed by ``positions``.
+        positions: optional [M] int tensor, absolute positions to index into ``freqs_cis``.
+    """
+    assert kv.dim() == 2 and kv.stride(-1) == 1
+    M, head_dim = kv.shape
+
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+    rope_dim = freqs_real.shape[-1]
+    assert head_dim >= rope_dim and rope_dim % 2 == 0
+    if weight is not None:
+        assert weight.shape == (head_dim,)
+    if positions is None:
+        assert (
+            freqs_real.shape[0] == M
+        ), f"freqs_cis row count {freqs_real.shape[0]} != M={M}"
+    else:
+        assert positions.shape == (M,) and positions.dim() == 1
+
+    if M == 0:
+        return
+
+    HEAD_BLOCK = triton.next_power_of_2(head_dim)
+    ROPE_PAIR_BLOCK = max(triton.next_power_of_2(rope_dim // 2), 1)
+
+    grid = (M,)
+    _fused_norm_rope_kernel[grid](
+        kv,
+        weight,
+        freqs_real,
+        positions,
+        eps,
+        kv.stride(0),
+        freqs_real.stride(0),
+        HEAD_DIM=head_dim,
+        ROPE_DIM=rope_dim,
+        HEAD_BLOCK=HEAD_BLOCK,
+        ROPE_PAIR_BLOCK=ROPE_PAIR_BLOCK,
+        HAS_WEIGHT=(weight is not None),
+        USE_POS=(positions is not None),
+    )

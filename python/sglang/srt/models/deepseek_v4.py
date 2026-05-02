@@ -33,7 +33,10 @@ from sglang.srt.layers.attention.nsa.utils import (
     prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.communicator import LayerScatterModes, get_attn_tp_context
-from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+from sglang.srt.layers.deepseek_v4_rope import (
+    apply_rotary_emb_triton,
+    fused_norm_rope_inplace_triton,
+)
 from sglang.srt.layers.dp_attention import (
     _DpGatheredBufferWrapper,
     dp_gather_partial,
@@ -240,6 +243,8 @@ class Compressor(nn.Module):
 
     @cached_property
     def use_fused_compress(self) -> bool:
+        if _is_hip:
+            return False
         if (
             envs.SGLANG_OPT_USE_FUSED_PAGED_COMPRESS.get()
             and envs.SGLANG_OPT_DPSK_V4_RADIX.get()
@@ -249,6 +254,10 @@ class Compressor(nn.Module):
             envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
             and not envs.SGLANG_OPT_DPSK_V4_RADIX.get()
         )
+
+    @cached_property
+    def use_hip_fused_compress(self) -> bool:
+        return _is_hip and envs.SGLANG_OPT_USE_FUSED_COMPRESS.get()
 
     def apply_ape_hotfix(self):
         assert not self.ape_converted
@@ -441,7 +450,6 @@ class Compressor(nn.Module):
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
             assert kv_compressed.dtype == torch.float32
-            kv_compressed = self.norm(kv_compressed)
 
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
@@ -449,9 +457,15 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            apply_rotary_emb_triton(
-                kv_compressed[..., -self.rope_head_dim :], freqs_cis
-            )
+            if self.use_hip_fused_compress:
+                fused_norm_rope_inplace_triton(
+                    kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+                )
+            else:
+                kv_compressed = self.norm(kv_compressed)
+                apply_rotary_emb_triton(
+                    kv_compressed[..., -self.rope_head_dim :], freqs_cis
+                )
             del beg_idx, end_idx
 
             if self.rotate:
@@ -545,11 +559,19 @@ class Compressor(nn.Module):
             kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
-        kv_compressed = self.norm(kv_compressed)
-        self.print_tensor(kv_compressed, "kv_after_norm")
-        freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-        self.print_tensor(freqs_cis, "freqs_cis")
-        apply_rotary_emb_triton(kv_compressed[..., -self.rope_head_dim :], freqs_cis)
+        if self.use_hip_fused_compress:
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            fused_norm_rope_inplace_triton(
+                kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+            )
+        else:
+            kv_compressed = self.norm(kv_compressed)
+            self.print_tensor(kv_compressed, "kv_after_norm")
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            self.print_tensor(freqs_cis, "freqs_cis")
+            apply_rotary_emb_triton(
+                kv_compressed[..., -self.rope_head_dim :], freqs_cis
+            )
         self.print_tensor(kv_compressed, "kv_after_rope")
         if self.rotate:
             kv_compressed = rotate_activation(kv_compressed)
@@ -666,7 +688,6 @@ class Compressor(nn.Module):
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
             assert kv_compressed.dtype == torch.float32
-            kv_compressed = self.norm(kv_compressed)
 
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
@@ -674,9 +695,15 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            apply_rotary_emb_triton(
-                kv_compressed[..., -self.rope_head_dim :], freqs_cis
-            )
+            if self.use_hip_fused_compress:
+                fused_norm_rope_inplace_triton(
+                    kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+                )
+            else:
+                kv_compressed = self.norm(kv_compressed)
+                apply_rotary_emb_triton(
+                    kv_compressed[..., -self.rope_head_dim :], freqs_cis
+                )
             del beg_idx, end_idx
 
             if self.rotate:
@@ -758,11 +785,19 @@ class Compressor(nn.Module):
             kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
         ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
-        kv_compressed = self.norm(kv_compressed)
-        self.print_tensor(kv_compressed, "kv_after_norm")
-        freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-        self.print_tensor(freqs_cis, "freqs_cis")
-        apply_rotary_emb_triton(kv_compressed[..., -self.rope_head_dim :], freqs_cis)
+        if self.use_hip_fused_compress:
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            fused_norm_rope_inplace_triton(
+                kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+            )
+        else:
+            kv_compressed = self.norm(kv_compressed)
+            self.print_tensor(kv_compressed, "kv_after_norm")
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            self.print_tensor(freqs_cis, "freqs_cis")
+            apply_rotary_emb_triton(
+                kv_compressed[..., -self.rope_head_dim :], freqs_cis
+            )
         self.print_tensor(kv_compressed, "kv_after_rope")
         if self.rotate:
             kv_compressed = rotate_activation(kv_compressed)
@@ -955,7 +990,6 @@ class Compressor(nn.Module):
             # NOTE: ref code requires dtype as the same as hidden states (float32)
             # the raw output of kv_compressed is float32 already
             assert kv_compressed.dtype == torch.float32
-            kv_compressed = self.norm(kv_compressed)
 
             beg_idx = prefix_lens[i] // self.ratio * self.ratio
             end_idx = (prefix_lens[i] + extend_lens[i]) // self.ratio * self.ratio
@@ -963,9 +997,15 @@ class Compressor(nn.Module):
             assert freqs_cis.size(0) == kv_compressed.size(
                 0
             ), f"{freqs_cis.shape=} {kv_compressed.shape=}"
-            apply_rotary_emb_triton(
-                kv_compressed[..., -self.rope_head_dim :], freqs_cis
-            )
+            if self.use_hip_fused_compress:
+                fused_norm_rope_inplace_triton(
+                    kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+                )
+            else:
+                kv_compressed = self.norm(kv_compressed)
+                apply_rotary_emb_triton(
+                    kv_compressed[..., -self.rope_head_dim :], freqs_cis
+                )
             del beg_idx, end_idx
 
             if self.rotate:
@@ -1000,66 +1040,102 @@ class Compressor(nn.Module):
         req_pool_indices = forward_batch.req_pool_indices
 
         bs = kv_and_scores.kv.size(0)
-        write_pos = (seq_lens - 1) % self.ratio + self.overlap * self.ratio
-        kv_and_score_states_pool[req_pool_indices, write_pos] = kv_and_scores
-
-        # NOTE: need to copy out before modifying overlap states
-        # kv_states: [bs, coff * ratio, coff * head_dim]
-        kv_and_score_to_compress = kv_and_score_states_pool[req_pool_indices]
-
-        if self.overlap:
-            # Shift just compressed kv states left by ratio
-            should_shift = seq_lens % self.ratio == 0
-            kv_and_score_states_pool[req_pool_indices, : self.ratio] = KVAndScore(
-                kv=torch.where(
-                    should_shift[:, None, None],
-                    kv_and_score_to_compress.kv[:, self.ratio :],
-                    kv_and_score_to_compress.kv[:, : self.ratio],
-                ),
-                score=torch.where(
-                    should_shift[:, None, None],
-                    kv_and_score_to_compress.score[:, self.ratio :],
-                    kv_and_score_to_compress.score[:, : self.ratio],
-                ),
+        if self.use_hip_fused_compress and self.ratio == 4 and self.overlap:
+            from sglang.srt.layers.attention.compressed.fused_compress_old_triton import (
+                fused_compress_c4_decode_old_triton,
             )
 
-        # shape: [bs * coff, ratio, coff * head_dim]
-        kv_and_score_to_compress = kv_and_score_to_compress.view(
-            -1, self.ratio, self.coff * self.head_dim
-        )
-        kv_and_score_to_compress.score = (
-            kv_and_score_to_compress.score + self.ape.unsqueeze(0)
-        )
+            kv_compressed = fused_compress_c4_decode_old_triton(
+                pool_kv=kv_and_score_states_pool.kv,
+                kv_score_input_kv=kv_and_scores.kv,
+                ape=self.ape,
+                seq_lens=seq_lens.to(torch.int32),
+                req_pool_indices=req_pool_indices.to(torch.int32),
+                head_dim=self.head_dim,
+            )
+        elif self.use_hip_fused_compress and self.ratio == 128 and not self.overlap:
+            from sglang.srt.layers.attention.compressed.fused_compress_old_triton import (
+                fused_compress_c128_decode_old_triton,
+            )
 
-        if self.overlap:
-            # shape: [bs, coff * ratio, coff * head_dim]
+            kv_compressed = fused_compress_c128_decode_old_triton(
+                pool_kv=kv_and_score_states_pool.kv,
+                kv_score_input_kv=kv_and_scores.kv,
+                ape=self.ape,
+                seq_lens=seq_lens.to(torch.int32),
+                req_pool_indices=req_pool_indices.to(torch.int32),
+                head_dim=self.head_dim,
+            )
+        else:
+            write_pos = (seq_lens - 1) % self.ratio + self.overlap * self.ratio
+            kv_and_score_states_pool[req_pool_indices, write_pos] = kv_and_scores
+
+            # NOTE: need to copy out before modifying overlap states
+            # kv_states: [bs, coff * ratio, coff * head_dim]
+            kv_and_score_to_compress = kv_and_score_states_pool[req_pool_indices]
+
+            if self.overlap:
+                # Shift just compressed kv states left by ratio
+                should_shift = seq_lens % self.ratio == 0
+                kv_and_score_states_pool[req_pool_indices, : self.ratio] = KVAndScore(
+                    kv=torch.where(
+                        should_shift[:, None, None],
+                        kv_and_score_to_compress.kv[:, self.ratio :],
+                        kv_and_score_to_compress.kv[:, : self.ratio],
+                    ),
+                    score=torch.where(
+                        should_shift[:, None, None],
+                        kv_and_score_to_compress.score[:, self.ratio :],
+                        kv_and_score_to_compress.score[:, : self.ratio],
+                    ),
+                )
+
+            # shape: [bs * coff, ratio, coff * head_dim]
             kv_and_score_to_compress = kv_and_score_to_compress.view(
-                bs, self.coff * self.ratio, self.coff * self.head_dim
+                -1, self.ratio, self.coff * self.head_dim
             )
-            kv_and_score_to_compress.kv = self.overlap_transform_decode(
+            kv_and_score_to_compress.score = (
+                kv_and_score_to_compress.score + self.ape.unsqueeze(0)
+            )
+
+            if self.overlap:
+                # shape: [bs, coff * ratio, coff * head_dim]
+                kv_and_score_to_compress = kv_and_score_to_compress.view(
+                    bs, self.coff * self.ratio, self.coff * self.head_dim
+                )
+                kv_and_score_to_compress.kv = self.overlap_transform_decode(
+                    kv_and_score_to_compress.kv
+                )
+                kv_and_score_to_compress.score = self.overlap_transform_decode(
+                    kv_and_score_to_compress.score
+                )
+
+            self.print_tensor(kv_and_score_to_compress.kv, "kv_to_compress")
+            self.print_tensor(kv_and_score_to_compress.score, "score_to_compress")
+
+            # kv_to_compress: [bs, ratio * coff, head_dim]
+            kv_and_score_to_compress = kv_and_score_to_compress.view(
+                bs, self.ratio * self.coff, self.head_dim
+            )
+
+            kv_compressed = (
                 kv_and_score_to_compress.kv
-            )
-            kv_and_score_to_compress.score = self.overlap_transform_decode(
-                kv_and_score_to_compress.score
-            )
-
-        self.print_tensor(kv_and_score_to_compress.kv, "kv_to_compress")
-        self.print_tensor(kv_and_score_to_compress.score, "score_to_compress")
-
-        # kv_to_compress: [bs, ratio * coff, head_dim]
-        kv_and_score_to_compress = kv_and_score_to_compress.view(
-            bs, self.ratio * self.coff, self.head_dim
-        )
-
-        kv_compressed = (
-            kv_and_score_to_compress.kv * kv_and_score_to_compress.score.softmax(dim=1)
-        ).sum(dim=1)
+                * kv_and_score_to_compress.score.softmax(dim=1)
+            ).sum(dim=1)
         self.print_tensor(kv_compressed, "kv_before_norm")
-        kv_compressed = self.norm(kv_compressed)
-        self.print_tensor(kv_compressed, "kv_after_norm")
-        freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
-        self.print_tensor(freqs_cis, "freqs_cis")
-        apply_rotary_emb_triton(kv_compressed[..., -self.rope_head_dim :], freqs_cis)
+        if self.use_hip_fused_compress:
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            fused_norm_rope_inplace_triton(
+                kv_compressed, self.norm.weight, self.norm.eps, freqs_cis
+            )
+        else:
+            kv_compressed = self.norm(kv_compressed)
+            self.print_tensor(kv_compressed, "kv_after_norm")
+            freqs_cis = self.freqs_cis[(seq_lens - 1) // self.ratio * self.ratio]
+            self.print_tensor(freqs_cis, "freqs_cis")
+            apply_rotary_emb_triton(
+                kv_compressed[..., -self.rope_head_dim :], freqs_cis
+            )
         self.print_tensor(kv_compressed, "kv_after_rope")
         if self.rotate:
             kv_compressed = rotate_activation(kv_compressed)
