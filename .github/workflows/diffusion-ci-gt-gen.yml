@@ -19,7 +19,7 @@ on:
         default: ''
         type: string
       publish_target_dir:
-        description: 'Remote target directory in sglang-ci-data. Leave empty to use diffusion-ci/consistency_gt/sglang_generated.'
+        description: 'Remote target directory in sgl-project/ci-data. Leave empty to use diffusion-ci/consistency_gt/sglang_generated.'
         required: false
         default: ''
         type: string
@@ -136,7 +136,7 @@ jobs:
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
-      - name: Publish GT images to sglang-bot/sglang-ci-data
+      - name: Publish GT images to sgl-project/ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -202,7 +202,7 @@ jobs:
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
-      - name: Publish GT images to sglang-bot/sglang-ci-data
+      - name: Publish GT images to sgl-project/ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
@@ -268,7 +268,7 @@ jobs:
           path: python/${{ env.OUTPUT_NAME }}
           retention-days: 7
 
-      - name: Publish GT images to sglang-bot/sglang-ci-data
+      - name: Publish GT images to sgl-project/ci-data
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
         run: |
