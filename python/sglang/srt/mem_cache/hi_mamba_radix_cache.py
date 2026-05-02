@@ -632,6 +632,11 @@ class HiMambaRadixCache(MambaRadixCache):
                 break
             if node.parent.full_lock_ref > 0 or node.parent.mamba_lock_ref > 0:
                 break
+            if (
+                node.parent.host_ref_counter > 0
+                or node.parent.host_mamba_ref_counter > 0
+            ):
+                break
 
             parent = node.parent
 

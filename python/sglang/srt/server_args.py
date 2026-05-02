@@ -81,6 +81,10 @@ MIMO_V2_MODEL_ARCHS = (
     "MiMoV2ForCausalLM",
     "MiMoV2FlashForCausalLM",
 )
+LLAMA4_MODEL_ARCHS = (
+    "Llama4ForConditionalGeneration",
+    "Llama4ForCausalLM",
+)
 
 SAMPLING_BACKEND_CHOICES = {"flashinfer", "pytorch", "ascend"}
 
@@ -721,6 +725,7 @@ class ServerArgs:
     disaggregation_transfer_backend: str = "mooncake"
     disaggregation_bootstrap_port: int = 8998
     disaggregation_ib_device: Optional[str] = None
+    disaggregation_decode_enable_radix_cache: bool = False
     disaggregation_decode_enable_offload_kvcache: bool = False
     num_reserved_decode_tokens: int = 512  # used for decode kv cache offload in PD
     # FIXME: hack to reduce ITL when decode bs is small
@@ -768,6 +773,9 @@ class ServerArgs:
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
+    # For communications compression
+    enable_quant_communications: Optional[bool] = False
+
     # For msProbe
     msprobe_dump_config: Optional[str] = None
 
@@ -785,6 +793,9 @@ class ServerArgs:
         self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+
+        # Validate PD disaggregation flags early (before dummy-model short-circuit).
+        self._handle_pd_disaggregation()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -872,9 +883,6 @@ class ServerArgs:
 
         # Handle model loading format.
         self._handle_load_format()
-
-        # Handle PD disaggregation.
-        self._handle_pd_disaggregation()
 
         # Handle Encoder disaggregation.
         self._handle_encoder_disaggregation()
@@ -2033,7 +2041,7 @@ class ServerArgs:
                 logger.warning(
                     "Disable hybrid SWA memory for Step3p5ForCausalLM model with hierarchical cache"
                 )
-        elif "Llama4" in model_arch and self.device != "cpu":
+        elif model_arch in LLAMA4_MODEL_ARCHS and self.device != "cpu":
             # Auto-select attention backend for Llama4 if not specified
             if self.attention_backend is None:
                 if is_sm100_supported():
@@ -3729,14 +3737,39 @@ class ServerArgs:
 
     def _handle_pd_disaggregation(self):
         if self.disaggregation_mode == "decode":
-            self.disable_radix_cache = True
-            logger.warning("KV cache is forced as chunk cache for decode server")
-            if self.enable_mamba_extra_buffer():
-                logger.warning(
-                    "Mamba extra_buffer is disabled because decode disaggregation "
-                    "currently forces chunk cache. Falling back to no_buffer."
-                )
-                self.mamba_scheduler_strategy = "no_buffer"
+            if self.disaggregation_decode_enable_radix_cache:
+                if self.enable_hisparse:
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache is incompatible "
+                        "with --enable-hisparse"
+                    )
+                if self.disaggregation_transfer_backend != "nixl":
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache currently "
+                        "requires --disaggregation-transfer-backend nixl"
+                    )
+                if self.speculative_algorithm is not None:
+                    raise ValueError(
+                        "--disaggregation-decode-enable-radix-cache is incompatible "
+                        "with speculative decoding "
+                        f"(--speculative-algorithm {self.speculative_algorithm})"
+                    )
+                if self.enable_dp_attention:
+                    logger.warning(
+                        "EXPERIMENTAL: Decode radix cache with DP attention. "
+                        "Requires prefix-aware DP rank routing for optimal cache hits."
+                    )
+                self.disable_radix_cache = False
+                logger.warning("EXPERIMENTAL: Radix cache is enabled for decode server")
+            else:
+                self.disable_radix_cache = True
+                logger.warning("KV cache is forced as chunk cache for decode server")
+                if self.enable_mamba_extra_buffer():
+                    logger.warning(
+                        "Mamba extra_buffer is disabled because decode disaggregation "
+                        "currently forces chunk cache. Falling back to no_buffer."
+                    )
+                    self.mamba_scheduler_strategy = "no_buffer"
 
         elif self.disaggregation_mode == "prefill":
             assert (
@@ -6411,6 +6444,11 @@ class ServerArgs:
             "Default is None, which triggers automatic device detection when mooncake backend is enabled.",
         )
         parser.add_argument(
+            "--disaggregation-decode-enable-radix-cache",
+            action="store_true",
+            help="Enable radix cache on decode server (PD mode). Caches KV prefixes to avoid redundant transfers. Requires --disaggregation-transfer-backend nixl and is incompatible with --enable-hisparse.",
+        )
+        parser.add_argument(
             "--disaggregation-decode-enable-offload-kvcache",
             action="store_true",
             help="Enable async KV cache offloading on decode server (PD mode).",
@@ -6617,6 +6655,13 @@ class ServerArgs:
             type=json_list_type,
             default=ServerArgs.forward_hooks,
             help="JSON-formatted forward hook specifications to attach to the model.",
+        )
+
+        parser.add_argument(
+            "--enable-quant-communications",
+            action="store_true",
+            default=False,
+            help="Enable INT8 quantization of TP communications (limited support).",
         )
 
         # For msProbe
@@ -6892,6 +6937,17 @@ class ServerArgs:
         if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
+            )
+
+        # Check communications compression
+        if self.enable_quant_communications and self.tp_size == 1:
+            raise ValueError(
+                "Communications quantization is only used with tp_size != 1"
+            )
+
+        if self.enable_quant_communications and self.device != "npu":
+            raise ValueError(
+                "Communications quantization is only supported for NPU device"
             )
 
         if (
