@@ -3031,6 +3031,19 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         split_forward_count: int = 1,
     ) -> ModelRunnerOutput:
         self.forward_pass_id += 1
+        if os.getenv("SGLANG_RELAYKV_RUNTIME_OBSERVATION") == "1":
+            try:
+                from sglang.srt.relaykv.observation import (
+                    run_model_runner_forward_observation_hook,
+                )
+
+                run_model_runner_forward_observation_hook(
+                    forward_batch=forward_batch,
+                    forward_pass_id=self.forward_pass_id,
+                    logger_=logger,
+                )
+            except Exception:
+                logger.debug("RelayKV runtime observation hook failed", exc_info=True)
 
         if self.msprobe_debugger is not None:
             rank_id = (

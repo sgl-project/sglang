@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections import Counter
 from collections.abc import Sequence
 from typing import Any
 
 logger = logging.getLogger(__name__)
+RUNTIME_OBSERVATION_ENV = "SGLANG_RELAYKV_RUNTIME_OBSERVATION"
 
 
 def _readonly_sequence(value: Any, *, field_name: str) -> Sequence[Any]:
@@ -133,3 +135,80 @@ def log_runtime_observation_summary(
 
     target_logger = logger_ if logger_ is not None else logger
     target_logger.info("%s=%s", prefix, json.dumps(summary, sort_keys=True))
+
+
+def run_model_runner_forward_observation_hook(
+    *,
+    forward_batch: Any,
+    forward_pass_id: int,
+    env_value: str | None = None,
+    logger_: logging.Logger | None = None,
+) -> dict[str, Any]:
+    """Run the default-off ModelRunner.forward read-only observation hook.
+
+    The hook is payload-only. It never touches KV pools, snapshots, host backup
+    copy, attention state, scheduler decisions, or runtime writeback.
+    """
+
+    target_logger = logger_ if logger_ is not None else logger
+    if env_value is None:
+        env_value = os.getenv(RUNTIME_OBSERVATION_ENV)
+    if env_value != "1":
+        return {
+            "enabled": False,
+            "skipped": True,
+            "skip_reason": "env_disabled",
+            "summary": None,
+        }
+
+    try:
+        payloads = build_runtime_observation_payloads(
+            batch=forward_batch,
+            layer_ids=[0],
+            batch_id=f"forward-{forward_pass_id}",
+            phase="forward",
+            runtime_policy_state="runtime_observation",
+        )
+        summary = summarize_runtime_observation_payloads(payloads)
+        log_runtime_observation_summary(summary, logger_=target_logger)
+        return {
+            "enabled": True,
+            "skipped": False,
+            "skip_reason": "",
+            "summary": summary,
+        }
+    except (TypeError, ValueError) as exc:
+        target_logger.debug(
+            "relaykv_runtime_observation_skipped=%s",
+            json.dumps(
+                {
+                    "forward_pass_id": forward_pass_id,
+                    "reason": type(exc).__name__,
+                },
+                sort_keys=True,
+            ),
+        )
+        return {
+            "enabled": True,
+            "skipped": True,
+            "skip_reason": type(exc).__name__,
+            "summary": None,
+        }
+    except Exception as exc:
+        target_logger.debug(
+            "relaykv_runtime_observation_error=%s",
+            json.dumps(
+                {
+                    "forward_pass_id": forward_pass_id,
+                    "reason": type(exc).__name__,
+                },
+                sort_keys=True,
+            ),
+            exc_info=True,
+        )
+        return {
+            "enabled": True,
+            "skipped": True,
+            "skip_reason": type(exc).__name__,
+            "summary": None,
+        }
