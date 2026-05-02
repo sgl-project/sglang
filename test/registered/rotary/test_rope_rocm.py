@@ -25,6 +25,7 @@ _CASES = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipUnless(_is_hip, "Requires AMD GPU")
 class TestRotaryEmbeddingNative(CustomTestCase):
     # SGLang's fallback remains in use by Llama when AITER is enabled.
@@ -91,6 +92,7 @@ class TestRotaryEmbeddingNative(CustomTestCase):
                 self._run_case(*case)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(not _use_aiter, reason="Requires AMD GPU plus SGLANG_USE_AITER=1")
 class TestRotaryEmbeddingAITer(CustomTestCase):
     # NOTE: Slightly relaxed tolerance (2e-2 vs 1e-2) for AITER RoPE kernel.
