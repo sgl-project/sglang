@@ -474,4 +474,4 @@ class Qwen3CoderDetector(BaseFormatDetector):
         raise NotImplementedError
 
     def get_structural_tag_name(self) -> str:
-        return "qwen_coder"
+        return "qwen_3_coder"

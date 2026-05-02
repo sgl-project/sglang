@@ -2512,10 +2512,12 @@ class TestQwen3CoderDetector(unittest.TestCase):
         self.assertFalse(self.detector.has_tool_call(""))
 
     # ==================== Structural tag (xgrammar builtin) ====================
-    # Qwen3 Coder uses the new builtin structural tag path, not the legacy one.
+    # Qwen3 Coder uses the new builtin structural tag path. supports_structural_tag()
+    # is True so required/named tool_choice routes through FunctionCallParser
+    # instead of JsonArrayParser.
 
     def test_supports_structural_tag(self):
-        self.assertFalse(self.detector.supports_structural_tag())
+        self.assertTrue(self.detector.supports_structural_tag())
 
     def test_get_model_structural_tag(self):
         import xgrammar as xgr
@@ -4620,6 +4622,46 @@ class TestGetStructureConstraint(unittest.TestCase):
 
         return FunctionCallParser(self._make_tools(strict=strict), parser_name)
 
+    @staticmethod
+    def _walk_format(fmt):
+        """Yield every Format node in a xgrammar 0.2 StructuralTag.format tree."""
+        yield fmt
+        # Combinatorial formats: traverse known child fields.
+        for child in getattr(fmt, "elements", []) or []:
+            yield from TestGetStructureConstraint._walk_format(child)
+        for child in getattr(fmt, "tags", []) or []:
+            yield from TestGetStructureConstraint._walk_format(child)
+        content = getattr(fmt, "content", None)
+        if content is not None and not isinstance(content, str):
+            yield from TestGetStructureConstraint._walk_format(content)
+
+    @classmethod
+    def _find_at_least_one(cls, structural_tag):
+        """Return the at_least_one flag from the first Format node that defines one."""
+        for node in cls._walk_format(structural_tag.format):
+            if hasattr(node, "at_least_one"):
+                return node.at_least_one
+        return None
+
+    @classmethod
+    def _find_tag_formats(cls, structural_tag):
+        """Return all leaf TagFormat nodes (the per-tool tag definitions)."""
+        return [
+            node
+            for node in cls._walk_format(structural_tag.format)
+            if getattr(node, "type", None) == "tag"
+            # the outer reasoning <think> tag uses begin="" — skip it
+            and node.begin != ""
+        ]
+
+    @classmethod
+    def _find_first_json_schema(cls, structural_tag):
+        """Return the first JSONSchemaFormat.json_schema in the tag tree."""
+        for node in cls._walk_format(structural_tag.format):
+            if getattr(node, "type", None) == "json_schema":
+                return node.json_schema
+        return None
+
     # --- structural_tag detectors (kimi_k2, deepseekv3, qwen25, etc.) ---
 
     def test_kimi_required_strict_returns_structural_tag(self):
@@ -4627,7 +4669,7 @@ class TestGetStructureConstraint(unittest.TestCase):
         result = parser.get_structure_constraint("required")
         self.assertIsNotNone(result)
         self.assertEqual(result[0], "structural_tag")
-        self.assertTrue(result[1].at_least_one)
+        self.assertTrue(self._find_at_least_one(result[1]))
 
     def test_kimi_required_no_strict_returns_structural_tag(self):
         """required should use structural_tag even without strict, to preserve native format."""
@@ -4635,14 +4677,14 @@ class TestGetStructureConstraint(unittest.TestCase):
         result = parser.get_structure_constraint("required")
         self.assertIsNotNone(result)
         self.assertEqual(result[0], "structural_tag")
-        self.assertTrue(result[1].at_least_one)
+        self.assertTrue(self._find_at_least_one(result[1]))
 
     def test_kimi_auto_strict_returns_structural_tag(self):
         parser = self._make_parser("kimi_k2", strict=True)
         result = parser.get_structure_constraint("auto")
         self.assertIsNotNone(result)
         self.assertEqual(result[0], "structural_tag")
-        self.assertFalse(result[1].at_least_one)
+        self.assertFalse(self._find_at_least_one(result[1]))
 
     def test_kimi_auto_no_strict_returns_none(self):
         """auto without strict should not constrain."""
@@ -4680,26 +4722,27 @@ class TestGetStructureConstraint(unittest.TestCase):
         """Verify structural_tag contains kimi-specific special tokens."""
         parser = self._make_parser("kimi_k2", strict=True)
         result = parser.get_structure_constraint("required")
-        tag = result[1]
-        structures = tag.structures
-        self.assertTrue(len(structures) > 0)
-        self.assertIn("<|tool_calls_section_begin|>", structures[0].begin)
-        self.assertIn("<|tool_call_end|>", structures[0].end)
+        # Serialised form contains every literal string in the tag tree, so it
+        # is the simplest place to assert kimi-specific markers.
+        serialized = result[1].model_dump_json()
+        self.assertIn("<|tool_calls_section_begin|>", serialized)
+        self.assertIn("<|tool_call_begin|>functions.get_weather:", serialized)
+        self.assertIn("<|tool_call_end|>", serialized)
 
     def test_kimi_required_no_strict_uses_empty_schema(self):
-        """Without strict, structural_tag should use empty schema per OpenAI
-        protocol: strict=False means no parameter schema enforcement."""
+        """Without strict, structural_tag should not enforce a parameter schema.
+
+        xgrammar 0.2 represents "any JSON" with ``json_schema=True``."""
         parser = self._make_parser("kimi_k2", strict=False)
         result = parser.get_structure_constraint("required")
-        tag = result[1]
-        self.assertEqual(tag.structures[0].schema_, {})
+        self.assertIs(self._find_first_json_schema(result[1]), True)
 
     def test_kimi_required_strict_uses_tool_schema(self):
         """With strict, structural_tag should include the tool's parameter schema."""
         parser = self._make_parser("kimi_k2", strict=True)
         result = parser.get_structure_constraint("required")
-        tag = result[1]
-        schema = tag.structures[0].schema_
+        schema = self._find_first_json_schema(result[1])
+        self.assertIsInstance(schema, dict)
         self.assertIn("properties", schema)
         self.assertIn("city", schema["properties"])
 
