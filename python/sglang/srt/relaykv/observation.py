@@ -137,6 +137,18 @@ def log_runtime_observation_summary(
     target_logger.info("%s=%s", prefix, json.dumps(summary, sort_keys=True))
 
 
+def log_runtime_observation_skip(
+    skip_event: dict[str, Any],
+    *,
+    logger_: logging.Logger | None = None,
+    prefix: str = "relaykv_runtime_observation_skip",
+) -> None:
+    """Log that the read-only runtime observation hook was reached and skipped."""
+
+    target_logger = logger_ if logger_ is not None else logger
+    target_logger.warning("%s=%s", prefix, json.dumps(skip_event, sort_keys=True))
+
+
 def run_model_runner_forward_observation_hook(
     *,
     forward_batch: Any,
@@ -178,15 +190,12 @@ def run_model_runner_forward_observation_hook(
             "summary": summary,
         }
     except (TypeError, ValueError) as exc:
-        target_logger.debug(
-            "relaykv_runtime_observation_skipped=%s",
-            json.dumps(
-                {
-                    "forward_pass_id": forward_pass_id,
-                    "reason": type(exc).__name__,
-                },
-                sort_keys=True,
-            ),
+        log_runtime_observation_skip(
+            {
+                "forward_pass_id": forward_pass_id,
+                "reason": type(exc).__name__,
+            },
+            logger_=target_logger,
         )
         return {
             "enabled": True,

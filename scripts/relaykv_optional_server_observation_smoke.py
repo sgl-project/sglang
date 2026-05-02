@@ -142,7 +142,7 @@ def _wait_for_health(proc: subprocess.Popen[str], base_url: str, timeout: float)
         if return_code is not None:
             raise RuntimeError(f"server exited before health check: {return_code}")
         try:
-            status, _ = _request_json(f"{base_url}/health_generate", timeout=2.0)
+            status, _ = _request_json(f"{base_url}/v1/models", timeout=2.0)
             if status == 200:
                 return
         except (OSError, urllib.error.URLError, TimeoutError) as exc:
@@ -166,6 +166,16 @@ def _terminate_process(proc: subprocess.Popen[str]) -> str:
 
 def _tail(text: str, max_lines: int = 80) -> str:
     return "\n".join(text.splitlines()[-max_lines:])
+
+
+def _relaykv_observation_log_flags(stdout: str) -> dict[str, bool]:
+    summary_logged = "relaykv_runtime_observation_summary" in stdout
+    skip_logged = "relaykv_runtime_observation_skip" in stdout
+    return {
+        "relaykv_summary_logged": summary_logged,
+        "relaykv_skip_logged": skip_logged,
+        "relaykv_observation_logged": summary_logged or skip_logged,
+    }
 
 
 def _run_server_case(model_path: str, observation_value: str, timeout: float) -> dict[str, Any]:
@@ -197,6 +207,9 @@ def _run_server_case(model_path: str, observation_value: str, timeout: float) ->
         str(port),
         "--nccl-port",
         str(port_info["nccl_port"]),
+        "--disable-cuda-graph",
+        "--disable-piecewise-cuda-graph",
+        "--disable-overlap-schedule",
     ]
 
     proc = subprocess.Popen(
@@ -218,22 +231,32 @@ def _run_server_case(model_path: str, observation_value: str, timeout: float) ->
         if status != 200:
             raise RuntimeError(f"/generate returned HTTP {status}")
         stdout = _terminate_process(proc)
+        relaykv_log_flags = _relaykv_observation_log_flags(stdout)
+        if observation_value == "0" and relaykv_log_flags["relaykv_observation_logged"]:
+            raise RuntimeError("RelayKV observation log was emitted while env was off")
+        if observation_value == "1" and not relaykv_log_flags["relaykv_observation_logged"]:
+            raise RuntimeError("RelayKV observation hook log was not detected while env was on")
         return {
             "observation_env": observation_value,
             "forward_completed": True,
             "http_status": status,
             "has_response": response is not None,
             "ports": port_info,
-            "relaykv_summary_logged": "relaykv_runtime_observation_summary" in stdout,
-            "relaykv_skip_logged": "relaykv_runtime_observation_hook_skip" in stdout,
-            "log_tail": _tail(stdout, max_lines=20),
+            **relaykv_log_flags,
+            "log_tail": _tail(stdout, max_lines=80),
         }
     except Exception as exc:
         stdout = _terminate_process(proc)
-        raise RuntimeError(
-            f"server observation case failed for {OBSERVATION_ENV}={observation_value}: "
-            f"{exc}\nserver_log_tail:\n{_tail(stdout)}"
-        ) from exc
+        return {
+            "observation_env": observation_value,
+            "case_failed": True,
+            "error": (
+                f"server observation case failed for "
+                f"{OBSERVATION_ENV}={observation_value}: {exc}"
+            ),
+            **_relaykv_observation_log_flags(stdout),
+            "log_tail": _tail(stdout, max_lines=80),
+        }
 
 
 def main() -> int:
@@ -265,10 +288,15 @@ def main() -> int:
         )
 
     timeout = float(os.environ.get(TIMEOUT_ENV, "90"))
-    cases = [
-        _run_server_case(str(model_path_obj), observation_value="0", timeout=timeout),
-        _run_server_case(str(model_path_obj), observation_value="1", timeout=timeout),
-    ]
+    cases = []
+    for observation_value in ("0", "1"):
+        cases.append(
+            _run_server_case(
+                str(model_path_obj),
+                observation_value=observation_value,
+                timeout=timeout,
+            )
+        )
     result = {
         "skipped": False,
         "model_path": str(model_path_obj),
@@ -279,7 +307,7 @@ def main() -> int:
         "cases": cases,
     }
     _print_result(result)
-    return 0
+    return 1 if any(case.get("case_failed") for case in cases) else 0
 
 
 if __name__ == "__main__":
