@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -19,6 +21,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=78, stage="extra-a", runner_config="2-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPAttentionDP2TP2(
     CustomTestCase,
