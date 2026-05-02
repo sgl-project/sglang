@@ -1123,23 +1123,27 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Warmup DeepGEMM JIT Compilation
-        timeout-minutes: 25
+        # Bottleneck is the JIT-compile-on-fallback for non-DeepSeek arches
+        # (each unique arch loads a model and compiles all its shapes).
+        # Cold-cache cumulative for ~7 unique archs is up to ~45 min;
+        # subsequent runs hit warm /root/.cache/deep_gemm and finish in <5 min.
+        # See sglang-ops/ci-machines-overview.md "H200 Pre-cached Models" for
+        # the canonical per-commit model list — keep these in sync.
+        timeout-minutes: 60
         run: |
           # Activate venv if available (GITHUB_ENV may have failed to propagate)
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
           [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
           python3 scripts/ci/cuda/warmup_deep_gemm.py \
             deepseek-ai/DeepSeek-V3-0324:8 \
-            deepseek-ai/DeepSeek-V3.2-Exp:8
-
-      - name: Warmup Server CUDA Graphs
-        timeout-minutes: 25
-        run: |
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/bin/activate" ] && source "${SGLANG_CI_VENV_PATH}/bin/activate"
-          [ -f "${SGLANG_CI_VENV_PATH:-/dev/null}/env.sh" ] && source "${SGLANG_CI_VENV_PATH}/env.sh"
-          python3 scripts/ci/cuda/warmup_server.py \
-            deepseek-ai/DeepSeek-V3-0324:8 \
-            inclusionAI/Ring-2.5-1T:8
+            deepseek-ai/DeepSeek-V3.2:8 \
+            zai-org/GLM-5-FP8:8 \
+            XiaomiMiMo/MiMo-V2-Flash:8 \
+            XiaomiMiMo/MiMo-V2.5:8 \
+            MiniMaxAI/MiniMax-M2.5:8 \
+            nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16:8 \
+            stepfun-ai/Step-3.5-Flash:8 \
+            Qwen/Qwen3-Next-80B-A3B-Instruct:2
 
       - name: Run test
         timeout-minutes: 30
