@@ -38,6 +38,16 @@ class WeightChecker:
 
     def _reset_tensors(self):
         for name, param in self._model_state():
+            if any(
+                pattern in name
+                for pattern in [
+                    "cos_sin_cache",
+                    "freqs_cis",
+                    "attn_mqa.k_scale",
+                    "attn_mqa.v_scale",
+                ]
+            ):
+                continue
             param.copy_(_random_like(param))
 
     def _compare(self):
@@ -110,9 +120,6 @@ def _random_like(t: torch.Tensor):
     if dtype == torch.bool:
         return torch.rand(shape, device=device) > 0.5
 
-    if dtype.is_complex:
-        return torch.randn(shape, device=device, dtype=dtype)
-
     info = torch.iinfo(dtype)
     return torch.randint(
         low=int(info.min), high=int(info.max), size=shape, device=device, dtype=dtype
@@ -124,16 +131,7 @@ def _postprocess_tensors(
 ) -> Iterable[Tuple[str, bool, torch.Tensor]]:
     from sglang.srt.debug_utils.dumper import get_tensor_info
 
-    skip_compare_names = [
-        name
-        for name in raw
-        if any(pattern in name for pattern in ["attn_mqa.k_scale", "attn_mqa.v_scale"])
-    ]
-    skip_compare_names += [
-        name
-        for name in raw
-        if any(pattern in name for pattern in ["freqs_cis", "cos_sin_cache"])
-    ]
+    skip_compare_names = []
 
     # dequant fp8
     quant_names = [
