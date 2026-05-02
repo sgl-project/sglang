@@ -27,8 +27,8 @@ dependencies = [
   "datasets",
   "einops",
   "fastapi",
-  "flashinfer_python==0.6.8", # keep it aligned with jit-cache version in Dockerfile
-  "flashinfer_cubin==0.6.8",
+  "flashinfer_python==0.6.8.post1", # keep it aligned with jit-cache version in Dockerfile
+  "flashinfer_cubin==0.6.8.post1",
   "gguf",
   "interegular",
   "llguidance>=0.7.11,<0.8.0",
@@ -53,7 +53,7 @@ dependencies = [
   "pydantic",
   "python-multipart",
   "pyzmq>=25.1.2",
-  # "quack-kernels==0.2.4",  # conflicts with flashinfer 0.6.8 on nvidia-cutlass-dsl (<4.4.0 vs >=4.4.2); not used by current bench flows
+  "quack-kernels>=0.3.0",
   "requests",
   "scipy",
   "sentencepiece",
