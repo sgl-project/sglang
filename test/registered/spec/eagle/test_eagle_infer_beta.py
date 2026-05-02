@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import requests
+import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils import kill_process_tree
@@ -22,6 +23,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=369, stage="base-b", runner_config="1-gpu-small")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
     max_running_requests = 64
     attention_backend = "triton"
@@ -274,6 +276,7 @@ class TestEagle3ServerBase(CustomTestCase, MatchedStopMixin):
         assert self.process.poll() is None
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEagle3ServerPage(TestEagle3ServerBase):
     other_launch_args = ["--page-size", "64"]
 
