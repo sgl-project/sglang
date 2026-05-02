@@ -462,10 +462,10 @@ class TestMTPwithTBOLowLatency(CustomTestCase):
         env["SGLANG_USE_AITER"] = "1"
         env["SGLANG_MORI_DISPATCH_DTYPE"] = "bf16"
         env["SGLANG_MORI_NUM_MAX_DISPATCH_TOKENS_PER_RANK"] = "4096"
+        env["SGLANG_ENABLE_SPEC_V2"] = "false"
         env["MORI_SHMEM_MODE"] = "ISOLATION"  # avoid out of symmetric heap memory
         # FIXME(billishyahao): enable p2p due to no rdma devices on CI machine
         # env["MORI_DISABLE_P2P"] = "1"
-        env["SGLANG_ENABLE_SPEC_V2"] = "false"
         env["MORI_ENABLE_SDMA"] = "true"
 
         cls.process = popen_launch_server(
