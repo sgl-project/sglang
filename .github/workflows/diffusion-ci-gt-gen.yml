@@ -105,6 +105,11 @@ jobs:
 
           requested = os.environ["OFFICIAL_CASE_IDS"].split()
           requested_set = set(requested)
+          h200_cases = {
+              "flux_2_image_t2i",
+              "flux_2_klein_image_t2i",
+              "flux_2_ti2i",
+          }
           include = []
           for group in selected_groups:
               for case_id in groups[group]:
@@ -114,7 +119,7 @@ jobs:
                       {
                           "source_group": group,
                           "case_id": case_id,
-                          "runner": "8-gpu-h200",
+                          "runner": "8-gpu-h200" if case_id in h200_cases else "1-gpu-h100",
                       }
                   )
 
