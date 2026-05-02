@@ -10,7 +10,11 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.jit_kernel.activation import silu_and_mul
+    from sglang.jit_kernel.activation import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+    )
     from sglang.jit_kernel.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
@@ -47,6 +51,7 @@ def fused_marlin_moe(
     is_k_full: bool = True,
     inplace: bool = False,
     routed_scaling_factor: Optional[float] = None,
+    activation: str = "silu",
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -174,7 +179,17 @@ def fused_marlin_moe(
         is_zp_float=False,
     )
 
-    silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+    if activation == "silu":
+        silu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+    elif activation == "gelu":
+        gelu_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+    elif activation in ("gelu_tanh", "gelu_pytorch_tanh"):
+        gelu_tanh_and_mul(intermediate_cache1.view(-1, 2 * N), intermediate_cache2)
+    else:
+        raise ValueError(
+            f"fused_marlin_moe: unsupported activation {activation!r}. "
+            f"Supported: silu, gelu, gelu_tanh, gelu_pytorch_tanh."
+        )
 
     if expert_map is not None:
         intermediate_cache3.zero_()
