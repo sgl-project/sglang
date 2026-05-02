@@ -1,577 +1,427 @@
 # Test-failure report: `test_nvidia_nemotron_3_nano.py`
 
-This is a running report. Each time the test is re-run with a change, a new
-section is appended. The "Fix log" section at the end tracks every change
-applied to the test or codebase, in order.
+Running report. A new Run section is appended each time the smoke test is
+re-executed with a change. The Fix log at the end tracks every applied
+change in order.
 
 ---
 
-## Run 1 (initial) — `AssertionError: Page size must be 1 for MambaRadixCache v1, got 128`
+## Quick status
 
-### Exit path
+| Aspect | Status |
+| --- | --- |
+| MambaRadixCache `page_size` clash | Fixed by Fix 1 |
+| Memory headroom (Mamba SSM + KV + activations) | Fixed by Fix 1 |
+| Server boots, routes, `/model_info` | Working since Run 3 |
+| Mamba prefill import gate (`causal_conv1d_fn_triton`) | Fixed by Fix 2 |
+| Mamba prefill forward pass (SSD ops) | Fixed by Fix 3 |
+| MoE FFN (`relu2` activation) on XPU — host whitelist | Fixed by Fix 4 (Candidate A) |
+| MoE FFN (`relu2` activation) on XPU — sgl-kernel-xpu | Routed through Triton MoE runner by Fix 5 (surgical Candidate C); sgl-kernel-xpu follow-up issue filed separately |
+| Mamba2 `selective_state_update` decode on XPU | Fixed by Fix 6 (`_device_context` helper in `mamba_ssm.py`) |
+| Test end-to-end | ✅ Green since Run 8 — `test_simple_code_qa` passes in 118.982s, decode ~14.2 tok/s |
 
-`popen_launch_server` timed out waiting for the server to come up healthy
-because every TP worker died during `Scheduler.__init__`. The assertion comes
-from `sglang/srt/mem_cache/mamba_radix_cache.py:436-438`:
+Next blocker: None on this test. Smoke test `test_simple_code_qa` is
+green on XPU (TP=4, `intel_xpu` attention backend). Known follow-ups,
+all out of scope for the smoke test:
 
-```
-AssertionError: Page size must be 1 for MambaRadixCache v1, got 128
-```
-
-That assertion is raised during `init_cache_with_memory_pool()`
-(`sglang/srt/managers/scheduler.py:856`).
-
-### The underlying conflict (seen clearly in the server log)
-
-Three log lines make the root cause unambiguous — they happen in this order
-during `ServerArgs` post-processing:
-
-```
-NemotronHForCausalLM with radix cache requires page_size=1 in the current
-Mamba scheduling mode (no_buffer), but got 64. Automatically setting page_size=1.
-
-Disabling overlap schedule since mamba no_buffer is not compatible with overlap
-schedule, try to use --disable-radix-cache if overlap schedule is necessary
-
-Intel XPU attention backend only supports page_size of 32, 64 or 128,
-changing page_size from 1 to 128.
-```
-
-So the code first coerces `page_size = 1` to satisfy the Mamba no-buffer
-radix-cache path (`sglang/srt/server_args.py:2275-2281`), then *later* coerces
-`page_size = 128` to satisfy the `intel_xpu` attention backend
-(`sglang/srt/server_args.py:2531-2536`). The two coercions silently cancel each
-other, and `MambaRadixCache.__init__` rejects the final `page_size=128`
-(`mamba_radix_cache.py:435-438`).
-
-### Why this model and why XPU specifically
-
-- **Model**: `NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` uses the
-  `NemotronHForCausalLM` architecture (hybrid Mamba + attention + MoE).
-  Hybrid-SSM models go down the `self.is_hybrid_ssm → MambaRadixCache` branch
-  (`scheduler.py:853-856`) rather than the normal `RadixCache`. The
-  `MambaRadixCache v1` path requires `page_size == 1` when
-  `enable_mamba_extra_buffer` is false, which is the default outside CUDA
-  (the extra-buffer mode is explicitly CUDA-only, `server_args.py:2257-2259`).
-- **XPU**: The `intel_xpu` attention backend hard-refuses `page_size=1`. So on
-  XPU the registered CUDA config ("just use the defaults") cannot be copied
-  verbatim — the CUDA test works because on CUDA the backend doesn't force
-  page_size≠1.
-
-### Secondary observations (not the cause of the failure)
-
-- `avail mem=1.80 GB` after weights (14.76 GB) + Mamba cache (~2.9 GB) + KV
-  cache (~3.24 GB) on a 24 GB partition. `--mem-fraction-static 0.92` is
-  aggressive for a hybrid-SSM model because the Mamba SSM state
-  (`2.86 GB per rank`) is counted separately from weights. If the radix-cache
-  issue is fixed, the process could still OOM on CUDA-graph capture.
-- XPU auto-disables piecewise CUDA graph (`XPU platform does not support
-  piecewise CUDA graph`) — fine, but the `--cuda-graph-max-bs 8` setting
-  should still be honored.
-- `BaseImageProcessorFast` deprecation + `vllm`/`tvm_ffi` import-error
-  warnings are benign.
-
-### Suggested fixes (pick one; listed in order of preference)
-
-#### Fix A — Disable radix cache (minimal, recommended)
-
-Disabling radix cache takes the scheduler down the `ChunkCache` path
-(`scheduler.py:799-807`), which does not require `page_size=1`. This is also
-the remedy suggested by SGLang's own warning: *"try to use
-`--disable-radix-cache` if overlap schedule is necessary"*.
-
-Proposed diff to `XPU_SERVER_ARGS`:
-
-```python
-XPU_SERVER_ARGS = [
-    "--device", "xpu",
-    "--tp=4",
-    "--trust-remote-code",
-    "--disable-overlap-schedule",
-    "--disable-radix-cache",           # NEW: avoid MambaRadixCache's page_size==1 requirement
-    "--page-size", "64",                # still legal for intel_xpu (32/64/128)
-    "--attention-backend", "intel_xpu",
-    "--model-impl", "sglang",
-    "--tool-call-parser", "qwen3_coder",
-    "--reasoning-parser", "deepseek-r1",
-    "--mem-fraction-static", "0.85",    # NEW: from 0.92 — more headroom for Mamba SSM + KV
-    "--context-length", "8192",
-    "--chunked-prefill-size", "1024",
-    "--max-running-requests", "8",
-    "--cuda-graph-max-bs", "8",
-]
-```
-
-Behavior: `disable_radix_cache=True` + `chunked_prefill_size=1024` routes the
-scheduler to `ChunkCache` (non-hybrid-SWA branch). `intel_xpu` then gets its
-required `page_size=64`. This mirrors the pattern used for the `trtllm_mha`
-fallback already living in `server_args.py:2288-2294`.
-
-#### Fix B — Switch to `triton` attention backend + `page_size=1`
-
-If Option A causes throughput issues, `triton` tolerates `page_size=1`, which
-keeps the `MambaRadixCache` but drops the XMX attention kernel — so this
-defeats the point of smoke-testing on XPU. Fallback only.
-
-#### Fix C — Same as A but pin `--mamba-scheduler-strategy no_buffer` explicitly
-
-Functionally identical to A; just more self-documenting.
-
-### Full log
-
-`/tmp/nemotron_test_output.log`
+- `ops/layernorm_gated.py:122` — orphaned dead code; `Mixer2RMSNormGated`
+  uses `attention/fla/layernorm_gated.py` instead.
+- `mamba_state_scatter_triton.py:120` — `.is_cuda` guard in
+  `fused_mamba_state_scatter_with_mask`, reachable only from EAGLE
+  tree-attention in `hybrid_linear_attn_backend.py`. Will need the same
+  treatment when someone enables speculative decode on the XPU hybrid-SSM
+  path.
+- `sgl-kernel-xpu` `fused_experts` does not accept `relu2`. Fix 5 routes
+  around it via the Triton MoE runner; reverting Fix 5 to the fast path
+  is a one-line deletion once sgl-kernel-xpu lands relu2.
 
 ---
 
-## Run 2 (after applying Fix A on a loaded shared node) — `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` during weight load
+## Run 1 — `AssertionError: Page size must be 1 for MambaRadixCache v1, got 128`
 
-### Changes applied
+**Exit path.** `popen_launch_server` timed out. Every TP worker died during
+`Scheduler.__init__` at
+`python/sglang/srt/mem_cache/mamba_radix_cache.py:436-438`, raised from
+`init_cache_with_memory_pool` (`scheduler.py:856`).
 
-```python
-XPU_SERVER_ARGS = [
-    "--device", "xpu",
-    "--tp=4",
-    "--trust-remote-code",
-    "--disable-overlap-schedule",
-    "--disable-radix-cache",           # NEW
-    "--page-size", "64",
-    "--attention-backend", "intel_xpu",
-    "--model-impl", "sglang",
-    "--tool-call-parser", "qwen3_coder",
-    "--reasoning-parser", "deepseek-r1",
-    "--mem-fraction-static", "0.85",    # CHANGED: 0.92 → 0.85
-    "--context-length", "8192",
-    "--chunked-prefill-size", "1024",
-    "--max-running-requests", "8",
-    "--cuda-graph-max-bs", "8",
-]
-```
+**Root cause.** Two conflicting coercions in `ServerArgs` post-processing:
 
-### Result
+1. `server_args.py:2275-2281` sets `page_size = 1` because
+   `NemotronHForCausalLM` with radix cache requires it in Mamba `no_buffer`
+   scheduling mode.
+2. `server_args.py:2531-2536` then raises `page_size` to 128 because the
+   `intel_xpu` attention backend only accepts 32/64/128.
 
-The MambaRadixCache `page_size` assertion was no longer hit (Fix A confirmed
-effective for the original bug). However, the server now died during weight
-loading at shard 1/13:
+`MambaRadixCache.__init__` rejects the final `page_size=128`.
 
-```
-File "sglang/srt/layers/vocab_parallel_embedding.py", line 468, in weight_loader
-    param[: loaded_weight.shape[0]].data.copy_(loaded_weight)
-RuntimeError: Native API failed. Native API returns: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)
-```
+**Why XPU.** `enable_mamba_extra_buffer` (the mode that tolerates
+`page_size!=1`) is CUDA-only (`server_args.py:2257-2259`). The
+`intel_xpu` backend also hard-refuses `page_size=1`, so the CUDA config
+cannot be copied verbatim.
 
-### Root cause (environment, not the test)
-
-This run happened while another user's `gemma-4-31B` server was already
-running on the same node (PID 349337), holding all 4 XPUs at ~95% utilization
-with `--mem-fraction-static 0.92`. At weight-load time only a small slice of
-per-device HBM was free on each XPU, so even our first embedding shard
-couldn't be copied in. This was confirmed by `ps -ef` — four
-`sglang::scheduler_TP{0..3}` processes from a different PID tree were active
-when our schedulers started.
-
-This is **not** an issue with the test config itself; it is an environmental
-OOM from device contention. No test-level change was necessary after
-confirming the conflicting run was the only consumer.
-
-### Full log
-
-`/tmp/nemotron_test_output_fixA.log`
+**Full log.** `/tmp/nemotron_test_output.log`.
 
 ---
 
-## Run 3 (clean XPUs, Fix A still applied) — `NameError: causal_conv1d_fn_triton is not defined` in the Mamba forward path
+## Run 2 — `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` during weight load
 
-### Result
+**What was applied.** Fix 1 (see Fix log): `--disable-radix-cache`,
+`--mem-fraction-static 0.85`.
 
-With the node free of other workloads, the server fully boots this time:
+**Result.** MambaRadixCache assertion gone. New failure during the first
+embedding shard copy in
+`python/sglang/srt/layers/vocab_parallel_embedding.py:468`.
+
+**Root cause.** Environmental, not the test. Another user's
+`gemma-4-31B` server (PID 349337) was holding all 4 XPUs at ~95%
+utilization when the schedulers started. Confirmed by `ps -ef`. No
+test-level change needed.
+
+**Full log.** `/tmp/nemotron_test_output_fixA.log`.
+
+---
+
+## Run 3 — `NameError: causal_conv1d_fn_triton is not defined`
+
+**Setup.** Clean XPUs this time. Server boots fully:
+
+- Weights loaded in ~37s, `avail mem=7.95 GB`, `mem usage=14.76 GB`.
+- Mamba cache + KV cache (`#tokens=1557504`, K/V ~2.23 GB each) allocated.
+- Uvicorn listening on `127.0.0.1:21000`, `GET /model_info` → 200.
+
+**Failure on warm-up forward pass:**
 
 ```
-[TP0..3] Load weight end. elapsed=36.9 s, type=NemotronHForCausalLM,
-         avail mem=7.95 GB, mem usage=14.76 GB
-[TP0..3] Mamba Cache is allocated. max_mamba_cache_size: 8,
-         conv_state size: 0.00 GB, ssm_state size: 0.10 GB
-[TP0..3] KV Cache is allocated. #tokens: 1557504,
-         K size: 2.23 GB, V size: 2.23 GB
-[TP0..3] Memory pool end. avail mem=3.39 GB
-[TP0]    max_total_num_tokens=1557504, chunked_prefill_size=1024,
-         max_prefill_tokens=16384, max_running_requests=8,
-         context_len=8192, available_gpu_mem=3.39 GB
-[INFO]   Uvicorn running on http://127.0.0.1:21000
-[INFO]   127.0.0.1:44034 - "GET /model_info HTTP/1.1" 200 OK
-```
-
-So Fix A fully resolves the radix-cache conflict, and the Fix-A memory
-tuning is adequate (3.39 GB free per rank post allocation — headroom is
-tight but sufficient). The server then fails during the health-probe warm-up
-forward pass:
-
-```
-File "sglang/srt/model_executor/model_runner.py", line 2809, in forward_extend
-    self.model.forward(...)
-File "sglang/srt/models/nemotron_h.py", line 437, in forward
-    output = self._forward_mamba(hidden_states, forward_batch)
-File "sglang/srt/models/nemotron_h.py", line 410, in _forward_mamba
-    attn_backend.linear_attn_backend.forward(...)
-File "sglang/srt/layers/attention/hybrid_linear_attn_backend.py", line 705, in forward
-    return mixer.forward(...)
 File "sglang/srt/layers/attention/mamba/mamba.py", line 507, in forward
     else causal_conv1d_fn_triton
 NameError: name 'causal_conv1d_fn_triton' is not defined
 ```
 
-### Root cause
+**Root cause.** `mamba.py:34-51` gates imports on `is_cuda()` / `is_npu()`
+with no XPU branch, so on XPU neither `causal_conv1d_fn` nor
+`causal_conv1d_fn_triton` is bound. The pure-Triton module
+`causal_conv1d_triton.py` has no CUDA dependency and is already the
+CUDA-side fallback when the sgl-kernel native binding is absent
+(`causal_conv1d.py:80`) — the right fallback for XPU.
 
-`sglang/srt/layers/attention/mamba/mamba.py:34-51` gates the import of
-`causal_conv1d_fn` and `causal_conv1d_fn_triton` behind device guards:
-
-```python
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, set_weight_attrs
-...
-if is_cuda():
-    from sglang.srt.layers.attention.mamba.causal_conv1d import causal_conv1d_fn, ...
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_fn as causal_conv1d_fn_triton, ...
-    )
-elif is_npu():
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu as causal_conv1d_fn, ...
-    )
-# NB: no `elif is_xpu(): ...` branch
-```
-
-On XPU *neither* branch runs, so `causal_conv1d_fn` and
-`causal_conv1d_fn_triton` are never bound. When the Mamba mixer's first
-prefill hits `mamba.py:503-507`:
-
-```python
-ccfn = (
-    causal_conv1d_fn
-    if not use_triton_causal_conv
-    else causal_conv1d_fn_triton
-)
-```
-
-Python raises `NameError` for whichever branch the runtime selects
-(`causal_conv1d_fn_triton` in this run, because the Mamba backend is the
-Triton implementation).
-
-Checking the two Python modules the CUDA branch imports:
-
-- `sglang/srt/layers/attention/mamba/causal_conv1d_triton.py` is **pure
-  Triton** (the header explicitly says "adapted from vllm/…"). It does not
-  depend on CUDA-only bindings. Triton already runs on XPU in this repo (see
-  `linear_attn_backend: decode=triton, prefill=triton` in the log and the
-  `--mamba-backend triton` default).
-- `sglang/srt/layers/attention/mamba/causal_conv1d.py` is the *native* CUDA
-  kernel wrapper; it gates on `_HAS_SGL_KERNEL` and silently falls back to
-  the triton implementation when the sgl-kernel CUDA binding is missing
-  (see the `_causal_conv1d_fn_triton` fallback at line 80 of that file).
-
-So the fix should be to extend the device gate so XPU imports both names
-from the Triton module (the Triton fallback is the same path that CUDA takes
-when its native kernel is unavailable).
-
-### Suggested fix (code change, *not* a test-config change)
-
-This one needs a small change to the SGLang source, not just the XPU test.
-
-Apply to `sglang/python/sglang/srt/layers/attention/mamba/mamba.py` around
-lines 32-51:
-
-```python
-from sglang.srt.utils import is_cpu, is_cuda, is_npu, is_xpu, set_weight_attrs
-
-if is_cuda():
-    from sglang.srt.layers.attention.mamba.causal_conv1d import (
-        causal_conv1d_fn,
-        causal_conv1d_update,
-    )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_fn as causal_conv1d_fn_triton,
-    )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_update as causal_conv1d_update_triton,
-    )
-elif is_npu():
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_fn_npu as causal_conv1d_fn,
-    )
-    from sgl_kernel_npu.mamba.causal_conv1d import (
-        causal_conv1d_update_npu as causal_conv1d_update,
-    )
-elif is_xpu():
-    # NEW: XPU has no native causal_conv1d kernel yet; use the portable Triton
-    # implementation for both the "native" and the "_triton" entry points so
-    # `causal_conv1d_fn` / `causal_conv1d_fn_triton` are always bound on XPU.
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_fn as causal_conv1d_fn,
-    )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_fn as causal_conv1d_fn_triton,
-    )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_update as causal_conv1d_update,
-    )
-    from sglang.srt.layers.attention.mamba.causal_conv1d_triton import (
-        causal_conv1d_update as causal_conv1d_update_triton,
-    )
-```
-
-Rationale:
-
-- `causal_conv1d_triton.py` is pure Triton/PyTorch and has no CUDA-only
-  dependency, so it is the natural fallback for XPU.
-- Binding both `causal_conv1d_fn` and `causal_conv1d_fn_triton` to the same
-  Triton implementation matches the semantics on CUDA when the native
-  sgl-kernel binding is missing (see `causal_conv1d.py:80`).
-- This keeps the test config exactly as in Fix A — no further
-  test-side changes needed.
-
-A tiny test-side guard could also be added: select
-`--mamba-backend triton` explicitly if it isn't already implied, so the
-Triton path is deterministic on XPU. In the current log the server already
-prints `Linear attention kernel backend: decode=triton, prefill=triton`, so
-the effective default is already Triton. Still, being explicit is cheap:
-
-```python
-    "--mamba-backend", "triton",        # optional but explicit
-```
-
-### Full log
-
-`/tmp/nemotron_test_output_fixA_retry.log`
+**Full log.** `/tmp/nemotron_test_output_fixA_retry.log`.
 
 ---
 
-## Run 4 (Fix 2 applied) — `RuntimeError: PyTorch was compiled without CUDA support` inside `mamba_chunk_scan_combined`
+## Run 4 — `RuntimeError: PyTorch was compiled without CUDA support`
 
-### Result
+**What was applied.** Fix 2 (see Fix log): `elif is_xpu():` branch in
+`mamba.py` binding all four `causal_conv1d_*` symbols to the pure-Triton
+implementation.
 
-With the `elif is_xpu():` branch added to
-`sglang/srt/layers/attention/mamba/mamba.py`, Run 4 *no longer* hits the
-Run 3 `NameError`. The server reaches the same healthy startup state as
-Run 3 (weights loaded, Mamba cache + KV cache allocated, Uvicorn up and
-`GET /model_info → 200 OK`) and progresses further into the warm-up
-forward pass. It then dies inside the Mamba SSD op itself:
+**Result.** `NameError` gone. Mamba mixer forward progresses into
+`mamba_chunk_scan_combined` and then:
 
 ```
-File "sglang/srt/model_executor/model_runner.py", line 2882, in forward_extend
-    self.model.forward(...)
-File "sglang/srt/models/nemotron_h.py", line 758, in forward
-File "sglang/srt/models/nemotron_h.py", line 642, in forward
-File "sglang/srt/models/nemotron_h.py", line 448, in forward
-File "sglang/srt/models/nemotron_h.py", line 416, in _forward_mamba
-    attn_backend.linear_attn_backend.forward(...)
-File "sglang/srt/layers/attention/hybrid_linear_attn_backend.py", line 707, in forward
-    return mixer.forward(...)
-File "sglang/srt/layers/attention/mamba/mamba.py", line 566, in forward
-    varlen_state = mamba_chunk_scan_combined(...)
-File "sglang/srt/layers/attention/mamba/ops/ssd_combined.py", line 230, in mamba_chunk_scan_combined
-    _mamba_chunk_scan_combined_fwd(...)
-File "sglang/srt/layers/attention/mamba/ops/ssd_combined.py", line 98, in _mamba_chunk_scan_combined_fwd
-    dA_cumsum, dt = _chunk_cumsum_fwd(...)
-File "sglang/srt/layers/attention/mamba/ops/ssd_chunk_state.py", line 463, in _chunk_cumsum_fwd
+File "sglang/srt/layers/attention/mamba/ops/ssd_chunk_state.py", line 463,
+     in _chunk_cumsum_fwd
     with torch.cuda.device(dt.device.index):
-File ".../torch/cuda/__init__.py", line 533, in __enter__
-    self.prev_idx = torch.cuda._exchange_device(self.idx)
-File ".../torch/cuda/__init__.py", line 135, in _exchange_device
+  File ".../torch/cuda/__init__.py", line 135, in _exchange_device
     raise RuntimeError("PyTorch was compiled without CUDA support")
-RuntimeError: PyTorch was compiled without CUDA support
 ```
 
-All four TP ranks hit the same exception at `ssd_chunk_state.py:463`,
-the scheduler SIGQUITs its children, and `popen_launch_server` reports
-the server process exited with code `-9`, surfacing as
-`setUpClass` `ERROR` — not a `NameError` anymore.
+All four TP ranks fail identically. Scheduler SIGQUITs; `popen_launch_server`
+reports `exit code -9`.
 
-### Root cause
+**Root cause.** `ssd_chunk_state.py:463` (and sibling `ssd_*` ops) open
+`torch.cuda.device(...)` unconditionally on the tensor's device index, even
+when tensors live on `xpu:*`. Needs a device-aware dispatch via
+`torch.get_device_module(...)` so the CM resolves to `torch.xpu.device(...)`
+on XPU.
 
-`sglang/srt/layers/attention/mamba/ops/ssd_chunk_state.py:463` (and very
-likely sibling call sites in `ssd_combined.py` / `ssd_state.py`) opens a
-`torch.cuda.device(dt.device.index)` context *unconditionally*, even when
-the tensors live on `xpu:*`. On this host the env is
-`sgl-xpu-d` (XPU-only torch build), so `torch.cuda._exchange_device` is
-unavailable and raises immediately. This guard exists so that Triton
-kernels in the SSD ops get launched on the right device context — the
-correct XPU-aware replacement is to dispatch through
-`torch.xpu.device(...)` when the tensor lives on XPU (or use
-`torch.get_device_module(dt).device(dt.device.index)` /
-`torch.device(dt.device)` + a no-op context when neither is needed —
-Triton on XPU already honours the tensor's device).
-
-Fix 2 is confirmed effective (the NameError is gone, `decode=triton,
-prefill=triton` backend is picked, the mixer forward starts). The
-remaining failure is a *different* defect in the Mamba SSD ops and is
-out of scope for Fix 2 — it needs a Fix 3 that replaces the hardcoded
-`torch.cuda.device(...)` with a device-aware context manager in the
-`ssd_*` modules.
-
-### Full log
-
-`/tmp/nemotron_test_output_fix2.log`
+**Full log.** `/tmp/nemotron_test_output_fix2.log`.
 
 ---
 
-## Run 5 (Fix 3 applied) — `AssertionError: activation = relu2 is not supported.` in the XPU fused-MoE FFN
+## Run 5 — `AssertionError: activation = relu2 is not supported.`
 
-### Result
+**What was applied.** Fix 3 (see Fix log): `_device_context` helper
+replacing hard-coded `torch.cuda.device(...)` in
+`ssd_chunk_state.py` / `ssd_state_passing.py` / `ssd_bmm.py`.
 
-With the device-aware `_device_context(...)` helper replacing the
-hard-coded `torch.cuda.device(...)` in `ssd_chunk_state.py`,
-`ssd_state_passing.py`, and `ssd_bmm.py`, Run 5 progresses past the Run 4
-failure site. The Mamba prefill forward pass now runs end-to-end:
-`_chunk_cumsum_fwd`, `_chunk_state_fwd`, `_state_passing_fwd`,
-`_bmm_chunk_fwd`, `_chunk_scan_fwd`, and `chunk_state_varlen` all
-complete — no "PyTorch was compiled without CUDA support" exception
-anywhere in the log. Control leaves `mamba_chunk_scan_combined` and
-re-enters the decoder layer stack, where the next (non-Mamba) layer —
-the MoE feed-forward — raises a new, distinct error:
+**Result.** Mamba prefill forward pass completes end-to-end on all four
+TP ranks — `_chunk_cumsum_fwd`, `_chunk_state_fwd`, `_state_passing_fwd`,
+`_bmm_chunk_fwd`, `_chunk_scan_fwd`, `chunk_state_varlen` all run clean.
+Control leaves the Mamba mixer and enters the MoE feed-forward, which
+raises:
 
 ```
-File "sglang/srt/models/nemotron_h.py", line 379, in forward
-    hidden_states = self.mixer.forward(hidden_states)
-File "sglang/srt/models/nemotron_h.py", line 278, in forward
-    final_hidden_states, shared_output = self._forward_core(hidden_states)
-File "sglang/srt/models/nemotron_h.py", line 234, in _forward_core
-    return self._forward_core_normal(hidden_states)
-File "sglang/srt/models/nemotron_h.py", line 249, in _forward_core_normal
-    final_hidden_states = self.experts(hidden_states, topk_output)
-File "sglang/srt/layers/moe/fused_moe_triton/layer.py", line 1055, in forward
-File "sglang/srt/layers/moe/fused_moe_triton/layer.py", line 1065, in forward_impl
-File "sglang/srt/layers/moe/fused_moe_triton/layer.py", line 1086, in run_moe_core
-File "sglang/srt/layers/quantization/unquant.py", line 393, in apply
-File "sglang/srt/layers/utils/multi_platform.py", line 83, in forward
 File "sglang/srt/layers/quantization/unquant.py", line 576, in forward_xpu
     assert moe_runner_config.activation in [
 AssertionError: activation = relu2 is not supported.
 ```
 
-All four TP ranks SIGQUIT on the same assertion; `popen_launch_server`
-times out with `Server process exited with code -9`.
+All four TP ranks SIGQUIT on the same assertion.
 
-### Root cause
+**Root cause.** `UnquantizedFusedMoEMethod.forward_xpu`
+(`unquant.py:565-579`) hard-whitelists `silu` and `gelu`. The CUDA path
+in the same file at `unquant.py:437-439` already handles `relu2` via a
+cutlass MoE runner. XPU wasn't extended with the Nemotron-H activation.
 
-`UnquantizedFusedMoEMethod.forward_xpu` in
-`sglang/python/sglang/srt/layers/quantization/unquant.py:565-579`
-hard-asserts that the MoE activation is one of `{"silu", "gelu"}`:
+**Fix 3 is confirmed effective.** The Run 4 "CUDA support" RuntimeError
+is gone and the first end-to-end Mamba prefill succeeds. The remaining
+failure is in a different subsystem (fused MoE), not Mamba.
 
-```python
-def forward_xpu(self, layer, dispatch_output):
-    ...
-    assert moe_runner_config.activation in [
-        "silu",
-        "gelu",
-    ], f"activation = {moe_runner_config.activation} is not supported."
+**Full log.** `/tmp/nemotron_test_output_fix3.log`.
+
+---
+
+## Run 6 — kernel-side `AssertionError: Only silu and gelu are supported but got relu2`
+
+**What was applied.** Fix 4 Candidate A — `relu2` added to
+`UnquantizedFusedMoEMethod.forward_xpu` whitelist at
+`python/sglang/srt/layers/quantization/unquant.py:576-580`.
+
+**Precondition check.**
+`python3 -c "from sgl_kernel import fused_experts; import inspect;
+print(inspect.signature(fused_experts))"` returned
+`activation: str = 'silu'` — a plain string kwarg with no type constraint
+at the Python entry point. So the host-side edit forwarded `relu2` into
+the kernel wrapper unchanged, as Candidate A predicted. Whether the
+wrapper itself accepts the value was deferred to this run.
+
+**Result.** The host-side assertion at `forward_xpu` no longer fires.
+Server boots, weights load, Mamba prefill completes, and control reaches
+the MoE FFN for the first time. The failure has moved one frame down
+into sgl-kernel-xpu:
+
+```
+File "sglang/srt/layers/quantization/unquant.py", line 588, in forward_xpu
+    output = fused_experts(
+             ^^^^^^^^^^^^^^
+File "/home/sdp/workspace/sgl-kernel-xpu/python/sgl_kernel/moe.py", line 307, in fused_experts
+    assert activation in (
+           ^^^^^^^^^^^^^^^
+AssertionError: Only silu and gelu are supported but got relu2
 ```
 
-The Nemotron-H MoE uses `relu2` (squared-ReLU). Other platforms do
-support this — the same file, lines 437-439, shows the CUDA path
-branches on `activation == "relu2"` and calls into a cutlass MoE runner
-with `activation_type=relu2`. The XPU `forward_xpu` was written for
-Qwen/DeepSeek-class MoEs that stuck to `silu`/`gelu` and the
-Nemotron-H pattern simply wasn't contemplated.
+All four TP ranks SIGQUIT on the same assertion.
+`popen_launch_server` times out with `Server process exited with code -9`
+after 60s of the 120s launch timeout (the test never reaches
+`test_simple_text_qa`).
 
-Fix 3 is confirmed effective for its intended bug: the Run 4
-`torch.cuda.device(...)` → `CUDA support` RuntimeError is gone, and the
-first end-to-end Mamba prefill completes for all four TP ranks. The
-remaining failure is in a *different* subsystem (fused-MoE on XPU, not
-Mamba SSD) and will need a Fix 4 that either:
+**Subsystem.** Kernel wrapper — `sgl-kernel-xpu/python/sgl_kernel/moe.py`
+lines 307-310:
 
-1. Teaches `UnquantizedFusedMoEMethod.forward_xpu` to accept `relu2` by
-   dispatching it to the sgl-kernel-xpu `fused_experts` entry point (if
-   that kernel exposes a relu2 path), or
-2. Falls back to a Triton / manual relu2 MoE path on XPU, or
-3. Fuses it pre-/post-kernel (apply `x*x*(x>0)` on the activations
-   around a silu-less matmul — adequate for correctness though not
-   throughput-optimal).
+```python
+assert activation in (
+    "silu",
+    "gelu",
+), f"Only silu and gelu are supported but got {activation}"
+```
 
-This is out of scope for Fix 3 and is intentionally deferred.
+This is a second, independent whitelist inside sgl-kernel-xpu. The sglang
+repo cannot reach past it without either (i) extending the kernel wrapper
+upstream in `sgl-kernel-xpu` (Candidate B collapsed into that edit), or
+(ii) routing `relu2` through the device-agnostic Triton MoE runner from
+the `forward_xpu` else-branch (Candidate C).
 
-### Full log
+**Fix 4 Candidate A assessment.** Correctly applied, correctly forwarded
+to the kernel, **but insufficient on its own** because the sgl-kernel-xpu
+wrapper re-asserts the same whitelist. Per user instruction, Candidate A
+is left in place (it's a prerequisite for any further fix — without it,
+`relu2` can't reach the kernel layer at all), and no automatic escalation
+to Candidate B or C is performed. Decision escalated.
 
-`/tmp/nemotron_test_output_fix3.log`
+**Full log.** `/tmp/nemotron_test_output_fix4.log`.
+
+---
+
+## Run 7 — `RuntimeError: PyTorch was compiled without CUDA support` in `selective_state_update` (decode)
+
+**What was applied.** Fix 5 — surgical Candidate C: `relu2` routed to the
+Triton MoE runner in `forward_xpu`.
+
+**Result.** Fix 5 is effective — the MoE subsystem no longer blocks:
+
+- Server boots. Weights load (~6s, `avail mem=7.95 GB`, `mem usage=14.76 GB`
+  per TP rank). Uvicorn on `127.0.0.1:21000`, `GET /model_info` → 200.
+- Triton MoE config emits the expected "Using default MoE kernel
+  config … E=128,N=464,device_name=Intel(R) Arc(TM) Pro B60 Graphics"
+  notices at `23:34:45` on all four TP ranks. This is proof the `relu2`
+  tokens are taking the Triton path added by Fix 5, not the
+  sgl-kernel-xpu path. (Fix 4 Run 6 never reached this stage.)
+- First real prefill batch succeeds at `23:34:49` —
+  `Prefill batch, #new-seq: 1, #new-token: 64, #cached-token: 0,
+  input throughput (token/s): 1.46`. The MoE layers in the prefill pass
+  clear cleanly.
+
+The failure has moved to a **different, known-deferred subsystem**:
+Mamba2 `selective_state_update` on the **decode** path. All four TP
+ranks SIGQUIT on the same assertion at `23:34:52`:
+
+```
+File "sglang/srt/layers/attention/mamba/mamba.py", line 704, in forward
+    selective_state_update(
+File "sglang/srt/layers/attention/mamba/ops/ssu_dispatch.py", line 258,
+     in selective_state_update
+    _mamba_ssu_backend(
+File "sglang/srt/layers/attention/mamba/ops/ssu_dispatch.py", line 80, in __call__
+    self._kernel(
+File "sglang/srt/layers/attention/mamba/ops/mamba_ssm.py", line 430,
+     in selective_state_update
+    with torch.cuda.device(x.device.index):
+  File "/root/miniforge3/envs/sgl-xpu-d/lib/python3.12/site-packages/torch/cuda/__init__.py",
+       line 135, in _exchange_device
+    raise RuntimeError("PyTorch was compiled without CUDA support")
+```
+
+`popen_launch_server` reports
+`Exception: Server process exited with code -9. Check server logs for errors.`
+at the `setUpClass` level after ~70s — the server dies before
+`test_simple_text_qa` runs.
+
+**Subsystem.** Mamba2 SSU (Selective State Update) decode kernel
+dispatch. `ops/mamba_ssm.py:430` holds the same
+`with torch.cuda.device(x.device.index):` pattern that Fix 3 removed
+from the **prefill**-path SSD ops (`ssd_chunk_state.py`,
+`ssd_state_passing.py`, `ssd_bmm.py`). This exact site is flagged in
+the Fix 3 entry as a "Known follow-up (not on the prefill path;
+deliberately deferred)":
+
+> `ops/mamba_ssm.py:430` — `selective_state_update` (decode only).
+
+Fix 3 chose not to widen its scope because Run 5 was in prefill and
+the decode path was unreachable. Fix 5 made decode reachable, and the
+deferred site fires on the very first decode step.
+
+**Why this is progress, not a regression.** The crash signature is
+identical to Run 4 (`RuntimeError: PyTorch was compiled without CUDA
+support`), but at a **different file/line** (`mamba_ssm.py:430` vs.
+`ssd_chunk_state.py:463`) and in a **different phase** (decode vs.
+prefill). The MoE `relu2` story is closed for this test run. The
+remaining blocker is a one-file extension of Fix 3 to the decode path.
+
+**Fix 5 assessment.** ✅ Applied and effective for its stated scope
+(MoE `relu2` on XPU). Orthogonal Mamba2 decode-path defect now
+exposed.
+
+**Candidate Fix 6 (proposal, not applied).** Extend the Fix 3
+`_device_context(tensor)` helper pattern to
+`python/sglang/srt/layers/attention/mamba/ops/mamba_ssm.py`:
+
+- Add the same `_device_context` helper (copy from
+  `ssd_chunk_state.py:11-38`).
+- Replace `with torch.cuda.device(x.device.index):` at
+  `mamba_ssm.py:430` with `with _device_context(x):`.
+- Audit the rest of `mamba_ssm.py` for any other hard-coded
+  `torch.cuda.device(` call sites — especially
+  `selective_scan_fn` and any module-level helpers — and convert them
+  in the same commit to avoid a Run 8 repeat.
+
+This is a direct repeat of Fix 3's pattern applied to the decode
+kernel. Not auto-applied per guardrails.
+
+**Full log.** `/tmp/nemotron_test_output_fix5.log`.
+
+---
+
+## Run 8 — `test_simple_code_qa` ✅ end-to-end green
+
+**What was applied.** Fix 6 — `_device_context` helper in
+`ops/mamba_ssm.py`, replacing the hard-coded
+`torch.cuda.device(x.device.index)` on the Mamba2 SSU decode path.
+
+**Result.** End-to-end pass on XPU (TP=4, `intel_xpu` attention backend,
+`Intel(R) Arc(TM) Pro B60 Graphics` × 4). The Run 7 decode-step
+`RuntimeError` at `mamba_ssm.py:430` is gone.
+
+- `python3 -m unittest -v xpu.test_nvidia_nemotron_3_nano` →
+  `Ran 1 test in 118.982s` / `OK`.
+- Test: `test_simple_code_qa` (the only method on
+  `TestNemotron3Nano30BXPU`). Assertion passed; final
+  `POST /v1/chat/completions HTTP/1.1` → `200 OK` at 00:23:35.
+- Prefill batch (test prompt, 64 new tokens) @ 00:23:18 — input
+  throughput 39.67 tok/s.
+- Decode batches @ 00:23:20-00:23:34 — steady-state gen throughput
+  ~14.2 tok/s (0.46 on the warm-up step, then 14.18, 14.30, 14.29,
+  14.04, 14.16). `mamba num: 1, mamba usage: 0.12` on every decode
+  step — the SSU kernel is exercised and completes without the CUDA
+  RuntimeError.
+- Fix 3's pattern generalizes cleanly: on CUDA the CM is
+  `torch.cuda.device(idx)` (byte-for-byte the original behavior); on
+  XPU it resolves to `torch.xpu.device(idx)` via
+  `torch.get_device_module(...)`.
+
+**Fix 6 assessment.** ✅ Applied and effective. Mamba2 decode path
+fully unblocked on XPU. The Nemotron-H non-speculative decode smoke
+test is green end-to-end.
+
+**Housekeeping notes** (non-blocking, observed in this log):
+
+- Two `/health_generate` 503s during warm-up (00:22:16, 00:22:26) and
+  one "Health check failed. Server couldn't get a response from
+  detokenizer for last 20 seconds" at 00:23:06 — all self-resolved
+  before `test_simple_code_qa` ran at 00:23:17. This appears to be
+  slow-to-warm heartbeat on XPU, not a defect.
+- CCL warnings on launch (`did not find MPI-launcher specific
+  variables`, `topology recognition shows PCIe connection`) — cosmetic
+  on a single-node XPU.
+- First attempted run of this fix timed out during distributed init
+  (stale `/dev/shm/psm_*` / `sem.mp-*` from a previous aborted job).
+  Cleaning `/dev/shm/psm_*` + `/dev/shm/sem.mp-*` resolved it; the log
+  captured below is the clean second run.
+
+**Full log.** `/tmp/nemotron_test_output_fix6.log`.
 
 ---
 
 ## Fix log (chronological)
 
-### Fix 1 — `Run 1 → Run 2`: disable radix cache + loosen memory fraction
-- **When applied**: between Run 1 and Run 2.
-- **What changed**: edited `test/srt/xpu/test_nvidia_nemotron_3_nano.py`
-  `XPU_SERVER_ARGS`:
-  - **Added** `--disable-radix-cache` to route the scheduler to
-    `ChunkCache` instead of `MambaRadixCache`, side-stepping the
-    `page_size==1` assertion that is mutually exclusive with the
-    `intel_xpu` attention backend's required page sizes (32/64/128).
-  - **Lowered** `--mem-fraction-static` from `0.92` → `0.85` to give the
-    Mamba SSM state + KV pool + activation buffers headroom on a 24 GB
-    Arc Pro B60 partition (Run 1 landed with only `1.80 GB` free post
-    allocation — below the watermark needed for a stable prefill).
-- **Outcome**: Fixes the original `MambaRadixCache` assertion
-  (confirmed by the log — `disable_radix_cache=True` and no MambaRadixCache
-  instantiation in Run 2/3). Run 2 then hit a device-OOM because another
-  user's server was holding the XPUs; Run 3 confirmed the config works on
-  clean XPUs up through server startup.
-- **Status**: ✅ Applied and effective for its intended bug.
-- **File**: `test/srt/xpu/test_nvidia_nemotron_3_nano.py`
+### Fix 1 — disable radix cache + loosen memory fraction (applied Run 1 → Run 2)
 
-### Fix 2 — `Run 3 → Run 4`: XPU branch for `causal_conv1d_fn` imports
-- **Motivation**: Run 3 failure — `NameError: causal_conv1d_fn_triton is
-  not defined` at `mamba.py:507` on the first Mamba prefill.
-- **What changed**: edited
-  `sglang/python/sglang/srt/layers/attention/mamba/mamba.py`. Added
-  `is_xpu` to the `sglang.srt.utils` import block (now lines 33-39) and
-  inserted a new `elif is_xpu():` branch (now lines 59-74) after the
-  existing `is_npu()` branch. The new branch binds
-  `causal_conv1d_fn`, `causal_conv1d_fn_triton`, `causal_conv1d_update`,
-  and `causal_conv1d_update_triton` — all four — from
-  `sglang.srt.layers.attention.mamba.causal_conv1d_triton` (pure Triton,
-  device-agnostic). Both the "native" and "_triton" names resolve to the
-  same Triton function, matching what CUDA does when the native sgl-kernel
-  binding is absent (see `causal_conv1d.py:80`).
-- **Why it's the right fix**: the Triton implementation is already the
-  CUDA-side fallback when the sgl-kernel native binding is missing, and
-  Triton is already in use for the rest of the Mamba/linear-attention path
-  on XPU (the log shows `Linear attention kernel backend:
-  decode=triton, prefill=triton`). The absence of an XPU import branch was
-  a pure oversight — no semantic change is required, only the symbol
-  bindings.
-- **When applied**: 2026-05-01 UTC.
-- **File**: `sglang/python/sglang/srt/layers/attention/mamba/mamba.py`,
-  lines 33-39 (imports) and lines 59-74 (new `elif is_xpu()` branch).
-- **Status**: ✅ Applied. The `NameError` is gone — Run 4 progresses past
-  `mamba.py:507` into `mamba_chunk_scan_combined` and fails later on an
-  unrelated hard-coded `torch.cuda.device(...)` guard. See Run 4 below.
-- **Outcome**: see Run 4 below.
+- **File.** `test/srt/xpu/test_nvidia_nemotron_3_nano.py`, `XPU_SERVER_ARGS`.
+- **Added.** `--disable-radix-cache` (routes the scheduler to `ChunkCache`,
+  which does not require `page_size=1`).
+- **Changed.** `--mem-fraction-static 0.92` → `0.85` (headroom for Mamba
+  SSM state + KV pool + activation buffers on a 24 GB Arc Pro B60 partition).
+- **Status.** Applied and effective. Runs 2, 3, 4, 5 confirm
+  `disable_radix_cache=True` and no MambaRadixCache instantiation.
 
-### Fix 3 — `Run 4 → Run 5`: device-aware context manager in the Mamba SSD ops
-- **Motivation**: Run 4 failure — `RuntimeError: PyTorch was compiled without
-  CUDA support` raised by `torch.cuda._exchange_device` at
-  `ssd_chunk_state.py:463` during the first Mamba prefill. On XPU the CUDA
-  module's device-switching context manager cannot be entered, but the
-  SSD-op Triton launchers opened it unconditionally on the tensor's device
-  index.
-- **What changed**: replaced every unconditional
-  `with torch.cuda.device(<tensor>.device.index):` on the Mamba prefill path
-  with a new module-level helper `_device_context(tensor)` that dispatches
-  through `torch.get_device_module(tensor.device).device(tensor.device.index)`
-  and falls back to `contextlib.nullcontext()` when the device has no
-  `.device` context manager (CPU and misc. backends). The helper is defined
-  once per file so each SSD op module stays self-contained (no cross-file
-  import for three identical one-paragraph functions). Files and real line
-  ranges after the edit:
-  - `sglang/python/sglang/srt/layers/attention/mamba/ops/ssd_chunk_state.py`
-    - helper defined at lines 11-38 (imports + `_device_context`)
-    - call sites: line 484 (`_chunk_cumsum_fwd`, was 463), line 544
-      (`_chunk_state_fwd`, was 523), line 620 (`chunk_state_varlen`, was 599)
-  - `sglang/python/sglang/srt/layers/attention/mamba/ops/ssd_state_passing.py`
-    - helper defined at lines 11-29 (`import contextlib` + `_device_context`)
-    - call site: line 237 (`_state_passing_fwd`, was 217)
-  - `sglang/python/sglang/srt/layers/attention/mamba/ops/ssd_bmm.py`
-    - helper defined at lines 11-30 (`import contextlib` + `_device_context`)
-    - call site: line 201 (`_bmm_chunk_fwd`, was 182)
+### Fix 2 — XPU branch for `causal_conv1d_*` imports (applied Run 3 → Run 4)
 
-  Canonical replacement pattern:
+- **When.** 2026-05-01 UTC.
+- **File.** `python/sglang/srt/layers/attention/mamba/mamba.py`
+  - Lines 33-39: added `is_xpu` to the `sglang.srt.utils` import block.
+  - Lines 59-74: new `elif is_xpu():` branch after the `is_npu()` branch,
+    binding `causal_conv1d_fn`, `causal_conv1d_fn_triton`,
+    `causal_conv1d_update`, and `causal_conv1d_update_triton` — all four —
+    from `sglang.srt.layers.attention.mamba.causal_conv1d_triton`. Both
+    "native" and `_triton` names resolve to the same Triton function,
+    matching CUDA's fallback behavior.
+- **Why it's correct.** The Triton implementation is device-agnostic and is
+  already the CUDA fallback when the sgl-kernel native binding is absent
+  (`causal_conv1d.py:80`). Triton already drives the rest of the
+  Mamba/linear-attention path on XPU.
+- **Status.** Applied and effective. Run 4's `NameError` is gone; the failure
+  moved to `ssd_chunk_state.py:463` — a separate defect.
+
+### Fix 3 — device-aware context manager in Mamba SSD ops (applied Run 4 → Run 5)
+
+- **When.** 2026-05-01 UTC.
+- **Problem.** `with torch.cuda.device(tensor.device.index):` was opened
+  unconditionally in multiple SSD op files, raising
+  `RuntimeError: PyTorch was compiled without CUDA support` on XPU.
+- **What changed.** New module-local `_device_context(tensor)` helper per
+  file. It dispatches through
+  `torch.get_device_module(tensor.device).device(tensor.device.index)` and
+  falls back to `contextlib.nullcontext()` on CPU / backends without a
+  `.device` CM.
+
+  Files and real line ranges after the edit:
+
+  | File | Helper | Call sites (was → is) |
+  | --- | --- | --- |
+  | `python/sglang/srt/layers/attention/mamba/ops/ssd_chunk_state.py` | 11-38 | 463→484, 523→544, 599→620 |
+  | `python/sglang/srt/layers/attention/mamba/ops/ssd_state_passing.py` | 11-29 | 217→237 |
+  | `python/sglang/srt/layers/attention/mamba/ops/ssd_bmm.py` | 11-30 | 182→201 |
+
+  Canonical replacement:
 
   ```python
   def _device_context(tensor: torch.Tensor):
@@ -587,82 +437,452 @@ This is out of scope for Fix 3 and is intentionally deferred.
   # before:
   with torch.cuda.device(x.device.index):
       kernel[grid](...)
-
   # after:
   with _device_context(x):
       kernel[grid](...)
   ```
 
-- **Why it's the right fix**: PyTorch already exposes
-  `torch.get_device_module(device)` precisely so generic code can pick the
-  right namespace (`torch.cuda` / `torch.xpu` / etc.). The old code
-  hard-coded the CUDA namespace. On CUDA the new path resolves to
+- **Why it's correct.** PyTorch exposes `torch.get_device_module(device)`
+  precisely so generic code can pick the right namespace
+  (`torch.cuda` / `torch.xpu` / …). On CUDA this resolves to
   `torch.cuda.device(idx)` — byte-for-byte identical behavior. On XPU it
-  resolves to `torch.xpu.device(idx)` — which exists and is exactly the
-  device-switching CM the Triton launcher needs. This is additive: we only
-  change what happens on non-CUDA. It also mirrors the `is_arch_support_pdl`
-  style guard that the DSv4 enablement used to remove the same class of
-  "assume-CUDA" bug in other SGLang kernel wrappers.
-- **Scope decision**: surveyed all `torch.cuda.device(` sites under
-  `python/sglang/srt/layers/attention/mamba/ops/`. The prefill path that
-  the Nemotron test exercises goes through
-  `_mamba_chunk_scan_combined_fwd` (`ssd_combined.py:98-162`) and hits
-  exactly the 5 sites fixed above (`_chunk_cumsum_fwd`, `_chunk_state_fwd`,
-  `chunk_state_varlen`, `_state_passing_fwd`, `_bmm_chunk_fwd`). The
-  Nemotron-H config uses `cu_seqlens` for varlen prefill, so
-  `chunk_state_varlen` is on the first-prefill path (the Run 4 trace shows
-  `varlen_state = mamba_chunk_scan_combined(...)` at `mamba.py:566`). All
-  5 fixed preemptively so Run 5 does not regress on the next sibling.
-- **Known follow-ups** (not on the prefill path, deliberately left for a
-  later fix once decode is exercised):
+  resolves to `torch.xpu.device(idx)`. The edit is additive: CUDA is
+  unchanged.
+- **Scope decision.** Surveyed every `torch.cuda.device(` site under
+  `python/sglang/srt/layers/attention/mamba/ops/`. The Nemotron prefill
+  path exercises all 5 fixed above (via `_mamba_chunk_scan_combined_fwd`
+  in `ssd_combined.py:98-162`). Nemotron-H uses `cu_seqlens` for varlen
+  prefill, so `chunk_state_varlen` is on the first-prefill path.
+- **Known follow-ups** (not on the prefill path; deliberately deferred):
   - `ops/mamba_ssm.py:430` — `selective_state_update` (decode only).
-  - `ops/layernorm_gated.py:122` — orphaned; `Mixer2RMSNormGated` uses
-    `sglang/srt/layers/attention/fla/layernorm_gated.py` instead of this
-    file, so the site is dead code for the current call graph.
-- **When applied**: 2026-05-01 UTC.
-- **Status**: ✅ Applied. Run 5 progresses past the Run 4 failure site —
-  the Mamba prefill forward pass completes for all four TP ranks — and
-  fails in the downstream MoE FFN (`relu2` activation not supported by
-  `UnquantizedFusedMoEMethod.forward_xpu`). See Run 5 above.
-- **Outcome**: see Run 5 above.
+  - `ops/layernorm_gated.py:122` — orphaned; `Mixer2RMSNormGated` actually
+    uses `sglang/srt/layers/attention/fla/layernorm_gated.py`.
+- **Status.** Applied and effective. Run 5 completes the full Mamba
+  prefill forward pass; failure moved to the MoE FFN.
 
-### Summary of current status
+### Fix 4 — XPU `relu2` support in fused MoE (applied Run 5 → Run 6)
 
-| Aspect                            | Status |
-| --------------------------------- | ------ |
-| MambaRadixCache page_size clash   | ✅ Fixed by Fix 1 |
-| Memory headroom                   | ✅ Fixed by Fix 1 (3.39 GB free per rank post-alloc) |
-| Server boots, routes, KV cache    | ✅ Working in Run 3 |
-| Mamba prefill import gate         | ✅ Fixed by Fix 2 (Run 4 no longer hits the `NameError`) |
-| Mamba prefill forward pass        | ✅ Fixed by Fix 3 (device-aware `_device_context` replaces hard-coded `torch.cuda.device(...)`; Run 5 completes `_chunk_cumsum_fwd`, `_chunk_state_fwd`, `_state_passing_fwd`, `_bmm_chunk_fwd`, and `chunk_state_varlen`) |
-| MoE FFN (`relu2` activation) on XPU | ❌ New block: `UnquantizedFusedMoEMethod.forward_xpu` at `unquant.py:576-579` only accepts `silu`/`gelu` — Nemotron-H uses `relu2`. Needs Fix 4. |
-| Test end-to-end                   | ❌ Not yet passing (needs Fix 4 for fused-MoE `relu2`) |
+- **When.** 2026-05-01 UTC.
+- **File.** `python/sglang/srt/layers/quantization/unquant.py`,
+  `UnquantizedFusedMoEMethod.forward_xpu`, whitelist at lines 576-580
+  (post-edit).
+- **Motivation.** Run 5 failure — `UnquantizedFusedMoEMethod.forward_xpu`
+  at `unquant.py:565-579` only accepted `silu`/`gelu`; Nemotron-H uses
+  `relu2`. The CUDA path (`unquant.py:437-439`) already handles `relu2`
+  via a cutlass MoE runner.
+- **What changed.** One-line extension of the activation whitelist
+  (Candidate A):
 
-### Referenced source locations
+  ```diff
+           moe_runner_config = self.moe_runner_config
+           assert moe_runner_config.activation in [
+               "silu",
+               "gelu",
+  +            "relu2",  # Nemotron-H (NemotronHForCausalLM) uses squared-ReLU.
+           ], f"activation = {moe_runner_config.activation} is not supported."
+  ```
 
-- `sglang/test/srt/xpu/test_nvidia_nemotron_3_nano.py` — the failing test
-- `sglang/python/sglang/srt/mem_cache/mamba_radix_cache.py:435-438` — Run 1 assertion
-- `sglang/python/sglang/srt/server_args.py:2274-2287` — first page_size coercion → 1
-- `sglang/python/sglang/srt/server_args.py:2531-2536` — second page_size coercion → 128
-- `sglang/python/sglang/srt/managers/scheduler.py:763-856` — cache-class selection
-- `sglang/python/sglang/srt/layers/attention/mamba/mamba.py:32-51` — **Run 3 import gate (needs XPU branch)**
-- `sglang/python/sglang/srt/layers/attention/mamba/mamba.py:503-507` — Run 3 NameError site
-- `sglang/python/sglang/srt/layers/attention/mamba/causal_conv1d_triton.py` — pure-Triton impl to use on XPU
-- `sglang/python/sglang/srt/layers/attention/mamba/causal_conv1d.py:80` — precedent for Triton fallback on CUDA
-- `sglang/python/sglang/srt/layers/attention/mamba/ops/ssd_chunk_state.py:11-38, 484, 544, 620` — **Fix 3 sites + `_device_context` helper**
-- `sglang/python/sglang/srt/layers/attention/mamba/ops/ssd_state_passing.py:11-29, 237` — **Fix 3 site + helper**
-- `sglang/python/sglang/srt/layers/attention/mamba/ops/ssd_bmm.py:11-30, 201` — **Fix 3 site + helper**
-- `sglang/python/sglang/srt/layers/attention/mamba/ops/ssd_combined.py:98-162` — Mamba prefill call graph (`_chunk_cumsum_fwd` → `_chunk_state_fwd` → `_state_passing_fwd` → `_bmm_chunk_fwd` → `_chunk_scan_fwd` → `chunk_state_varlen`)
-- `sglang/python/sglang/srt/layers/attention/mamba/ops/mamba_ssm.py:430` — deferred `torch.cuda.device(...)` site (decode-only `selective_state_update`; not on Run 5 prefill path)
-- `sglang/python/sglang/srt/layers/attention/mamba/ops/layernorm_gated.py:122` — deferred `torch.cuda.device(...)` site (orphaned; `Mixer2RMSNormGated` uses `fla/layernorm_gated.py` instead)
-- `sglang/python/sglang/srt/layers/quantization/unquant.py:565-579` — **Run 5 failure site: `forward_xpu` rejects `relu2` activation**
-- `sglang/python/sglang/srt/layers/quantization/unquant.py:437-439` — CUDA precedent for `relu2` dispatch in the same method
-- `sglang/test/registered/models/test_nvidia_nemotron_3_nano.py` — CUDA reference config
+- **Why it's correct.** The existing XPU branch in `forward_xpu` already
+  forwards `moe_runner_config.activation` verbatim to
+  `sgl_kernel.fused_experts(..., activation=...)` at `unquant.py:595`
+  (post-edit line 596). The kernel entry point signature is
+  `activation: str = 'silu'` — a pass-through string — so the host-side
+  change is by construction non-lossy for CUDA and adds one more
+  legal value on XPU.
+- **Precondition check.** `python3 -c "from sgl_kernel import fused_experts;
+  import inspect; print(inspect.signature(fused_experts))"` confirmed the
+  kwarg is an untyped string. That meant no host-side type conflict.
+  Runtime validity inside the kernel wrapper was left to surface in
+  Run 6.
+- **Status.** Applied (Candidate A). Host-side whitelist no longer
+  rejects `relu2`.
+- **Outcome.** See Run 6 below. The host assertion at
+  `unquant.py:576-580` is gone, but a second, kernel-side assertion at
+  `sgl-kernel-xpu/python/sgl_kernel/moe.py:307-310` now fires with the
+  same message shape (`Only silu and gelu are supported but got relu2`).
+  Candidate A alone is **not sufficient** to unblock Nemotron-H on XPU.
 
-### Full logs
+#### Deferred alternatives if Candidate A fails at the kernel layer
 
-- Run 1: `/tmp/nemotron_test_output.log`
-- Run 2: `/tmp/nemotron_test_output_fixA.log`
-- Run 3: `/tmp/nemotron_test_output_fixA_retry.log`
-- Run 4: `/tmp/nemotron_test_output_fix2.log`
-- Run 5: `/tmp/nemotron_test_output_fix3.log`
+Run 6 confirmed the kernel layer rejects `relu2`. Candidates B and C
+below are the two deferred paths. **Per user instruction, they are not
+auto-applied** — the choice between them is escalated.
+
+**Superseded by Fix 5 (surgical Candidate C applied 2026-05-01).** See
+the Fix 5 entry below for the actual edit that shipped: a relu2-only
+early-return to the Triton MoE runner, keeping silu/gelu on the fast
+sgl-kernel-xpu path.
+
+#### Current code (what's there today)
+
+`python/sglang/srt/layers/quantization/unquant.py:565-608`:
+
+```python
+def forward_xpu(
+    self,
+    layer: torch.nn.Module,
+    dispatch_output: StandardDispatchOutput,
+) -> CombineInput:
+    from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+    x = dispatch_output.hidden_states
+    topk_output = dispatch_output.topk_output
+
+    moe_runner_config = self.moe_runner_config
+    assert moe_runner_config.activation in [
+        "silu",
+        "gelu",
+    ], f"activation = {moe_runner_config.activation} is not supported."
+
+    backend = self.runner.runner_backend
+    if use_intel_xpu_backend():
+        from sgl_kernel import fused_experts
+
+        topk_weights, topk_ids, _ = topk_output
+        output = fused_experts(
+            x,
+            layer.w13_weight,
+            layer.w2_weight,
+            topk_weights,
+            topk_ids,
+            b1=getattr(layer, "w13_weight_bias", None),
+            b2=getattr(layer, "w2_weight_bias", None),
+            activation=moe_runner_config.activation,   # passed through as string
+            gemm1_alpha=moe_runner_config.gemm1_alpha,
+            gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+        )
+        return StandardCombineInput(hidden_states=output)
+    else:
+        assert backend.is_triton()
+        assert (
+            moe_runner_config.activation == "silu"
+        ), f"... please set ENV SGLANG_USE_SGL_XPU=1."
+        quant_info = self.get_triton_quant_info(layer)
+        return self.runner.run(dispatch_output, quant_info)
+```
+
+CUDA precedent in the same file — `forward_cuda`'s flashinfer-cutlass
+branch at `unquant.py:437-442` already translates the `relu2` string into
+an `ActivationType` enum:
+
+```python
+activation_type=(
+    ActivationType.Relu2
+    if moe_runner_config.activation == "relu2"
+    else ActivationType.Swiglu
+),
+```
+
+#### Candidate A (preferred) — pass `relu2` through to `sgl_kernel.fused_experts`
+
+If sgl-kernel-xpu's `fused_experts` already implements a squared-ReLU
+activation, the fix is literally lengthening the whitelist: the kernel
+entry point takes `activation` as a string and the XPU branch already
+forwards it unchanged.
+
+```python
+# python/sglang/srt/layers/quantization/unquant.py, forward_xpu
+moe_runner_config = self.moe_runner_config
+assert moe_runner_config.activation in [
+    "silu",
+    "gelu",
+    "relu2",     # NEW: Nemotron-H (NemotronHForCausalLM) uses squared-ReLU.
+], f"activation = {moe_runner_config.activation} is not supported."
+```
+
+**Precondition to verify before landing:** run
+`python3 -c "from sgl_kernel import fused_experts; help(fused_experts)"`
+on the XPU build and confirm the `activation` kwarg accepts `"relu2"`. If
+it does, no further changes are needed — the existing passthrough at
+line 595 (`activation=moe_runner_config.activation`) already handles it.
+
+#### Candidate B — apply `relu2` by hand around a plain matmul path
+
+If `sgl_kernel.fused_experts` does not support `relu2` (i.e., Candidate A
+is not viable), the next cheapest option is to do the activation outside
+the fused kernel: call the kernel with a pass-through-or-silu activation
+and then apply `x * x * (x > 0)` on the intermediate activations. This
+trades throughput for correctness, which is the right choice for a
+smoke test.
+
+Sketch:
+
+```python
+# python/sglang/srt/layers/quantization/unquant.py, forward_xpu
+if moe_runner_config.activation == "relu2":
+    # Run the gate+up matmul without a fused activation, then apply
+    # squared-ReLU manually before the down projection.
+    output = fused_experts(
+        x, layer.w13_weight, layer.w2_weight,
+        topk_weights, topk_ids,
+        b1=getattr(layer, "w13_weight_bias", None),
+        b2=getattr(layer, "w2_weight_bias", None),
+        activation="none",                 # or whatever "no activation" knob exists
+        gemm1_alpha=moe_runner_config.gemm1_alpha,
+        gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+        post_activation_hook=lambda y: torch.where(y > 0, y * y, torch.zeros_like(y)),
+    )
+else:
+    assert moe_runner_config.activation in ["silu", "gelu"]
+    output = fused_experts(
+        x, layer.w13_weight, layer.w2_weight,
+        topk_weights, topk_ids,
+        b1=getattr(layer, "w13_weight_bias", None),
+        b2=getattr(layer, "w2_weight_bias", None),
+        activation=moe_runner_config.activation,
+        gemm1_alpha=moe_runner_config.gemm1_alpha,
+        gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+    )
+return StandardCombineInput(hidden_states=output)
+```
+
+Pseudocode: the `post_activation_hook` / `activation="none"` names are
+placeholders — whichever knob `fused_experts` actually exposes for
+splitting the two matmuls. If it doesn't expose that knob at all, the
+fallback is to lower `forward_xpu` to the Triton MoE runner
+(`self.get_triton_quant_info(layer)` + `self.runner.run(...)`) and do the
+activation there.
+
+#### Candidate C (fallback) — route `relu2` to the Triton MoE runner
+
+If neither A nor B is possible from the XPU path, the `else` branch of
+`forward_xpu` already knows how to drive `get_triton_quant_info(layer)` /
+`self.runner.run(dispatch_output, quant_info)`. The Triton MoE runner
+lives in `python/sglang/srt/layers/moe/fused_moe_triton/` and is
+device-agnostic (it's already in use on the non-`SGLANG_USE_SGL_XPU=1`
+XPU config). Extending Triton's activation dispatch to support `relu2`
+and then routing `relu2` through Triton would be a strictly correct but
+slower fallback.
+
+```python
+# python/sglang/srt/layers/quantization/unquant.py, forward_xpu
+if moe_runner_config.activation == "relu2":
+    # XPU sgl-kernel has no relu2; fall back to the Triton MoE runner.
+    quant_info = self.get_triton_quant_info(layer)
+    return self.runner.run(dispatch_output, quant_info)
+# ... existing silu/gelu sgl-kernel path ...
+```
+
+This requires confirming that the Triton `fused_moe` supports `relu2` —
+which in turn may need its own small change in
+`python/sglang/srt/layers/moe/fused_moe_triton/fused_moe.py`. Treat this
+as a last-resort path only if A and B are both unavailable.
+
+#### Recommended order of attack (updated after Run 6)
+
+1. ~~Candidate A — host-side whitelist extension.~~ **Applied.** The host
+   assertion is gone, but the sgl-kernel-xpu wrapper at
+   `sgl-kernel-xpu/python/sgl_kernel/moe.py:307-310` independently
+   rejects `relu2`. So Candidate A is **necessary but not sufficient**.
+2. Candidate B — host-side squared-ReLU around a pass-through /
+   split-matmul call. This is the next step if the kernel wrapper cannot
+   be extended cheaply. The exact "no activation" knob needs to be
+   inspected in the XPU kernel; `sgl_kernel.fused_experts` has no
+   `post_activation_hook` or `activation="none"` today (signature check
+   confirmed only the 20 kwargs shown above). A minimal Candidate B on
+   XPU likely requires either: (a) extending `sgl_kernel.moe.py:307-310`
+   to accept `"relu2"` and either implementing squared-ReLU in the
+   kernel or doing it outside; or (b) calling the fused kernel with
+   `activation="silu"` plus a hacky post-hoc correction, which is
+   mathematically wrong and therefore not acceptable. Practically
+   Candidate B collapses into "extend sgl-kernel-xpu".
+3. Candidate C — route `relu2` through the Triton MoE runner. Requires
+   `get_triton_quant_info(layer)` + `self.runner.run(dispatch_output,
+   quant_info)` on the XPU side, plus verifying the Triton `fused_moe`
+   dispatch supports `relu2`. Slower but strictly additive to the sglang
+   repo (no sgl-kernel-xpu change required). This is the most tractable
+   path if a sgl-kernel-xpu build-and-test loop is unavailable.
+
+### Fix 5 — Route `relu2` MoE through Triton runner on XPU (applied Run 6 → Run 7)
+
+- **When.** 2026-05-01 UTC.
+- **Motivation.** Run 6 — sgl-kernel-xpu `fused_experts` (moe.py:307-310)
+  re-asserts `activation in {silu, gelu}` at the kernel layer, so Fix 4
+  Candidate A (host whitelist) was necessary but not sufficient.
+- **File.** `python/sglang/srt/layers/quantization/unquant.py`, `forward_xpu`.
+  - Added `if moe_runner_config.activation == "relu2": → Triton runner`
+    early-return before the `use_intel_xpu_backend()` gate (post-edit
+    lines 582-589; comment block 582-586, branch 587-589).
+  - Widened the else-branch `silu`-only assertion to accept
+    `{"silu","relu2"}` (post-edit lines 612-616).
+- **Why it's correct (researcher verdict, summarised).**
+  - Triton MoE already implements squared-ReLU for `not is_gated` at
+    `python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py:583-584`
+    (`torch.square(F.relu(...))`); Nemotron-H has `is_gated=False`
+    (`python/sglang/srt/models/nemotron_h.py:192`).
+  - `gemm1_alpha`/`gemm1_limit` are GPT-OSS swiglu clamp params, unset
+    for Nemotron-H, so routing `relu2` to Triton is numerically
+    equivalent to what the sgl-kernel path would have been (no silent
+    divergence).
+  - Bias tensors `b13`/`b2` are threaded through both paths identically
+    (`get_triton_quant_info` at `unquant.py:557-563`).
+- **Scope decision.** Surgical form: silu/gelu still take the fast
+  sgl-kernel-xpu path. Only relu2 tokens incur the Triton MoE cost.
+  Reversal when sgl-kernel-xpu lands relu2 is a one-line branch
+  deletion.
+- **Follow-up (external repo).** File an issue/PR against
+  `sgl-project/sgl-kernel-xpu` requesting `relu2` support in
+  `fused_experts` (`moe.py:300-330`). When it ships, delete the Fix 5
+  branch and let `use_intel_xpu_backend()` handle all three activations.
+- **Status.** ✅ Applied.
+- **Outcome.** See Run 7 below.
+
+### Fix 6 — Device-aware context manager in Mamba SSU decode op (applied Run 7 → Run 8)
+
+- **When.** 2026-05-02 UTC.
+- **Motivation.** Run 7 decode-step failure — `RuntimeError: PyTorch was
+  compiled without CUDA support` at `ops/mamba_ssm.py:430` on the first
+  `selective_state_update` call. This was explicitly flagged in Fix 3's
+  "Known follow-ups" as decode-only; Fix 5 made decode reachable, so the
+  deferred site fired.
+- **File.** `python/sglang/srt/layers/attention/mamba/ops/mamba_ssm.py`,
+  real line ranges after the edit:
+  - `import contextlib` at line 9 (stdlib import block, adjacent to the
+    existing `import torch` / `import triton` lines).
+  - `_device_context` helper defined at lines 21-38 — copied verbatim
+    from `ops/ssd_chunk_state.py:21-38` so every SSD/SSU file now uses
+    the same helper text.
+  - Call site at line 453 (was 430 pre-edit):
+    `with _device_context(x):` wrapping
+    `_selective_scan_update_kernel[grid](...)` in
+    `selective_state_update`.
+- **Why it's correct.** Mechanical repeat of Fix 3's pattern. The CM
+  brackets a single Triton `_selective_scan_update_kernel[grid](...)`
+  launch with no CUDA-specific state reads in the body.
+  `torch.get_device_module(tensor.device)` resolves to `torch.cuda` on
+  CUDA — byte-for-byte identical behavior — and `torch.xpu` on XPU.
+  CPU / backends without a `.device` context manager fall through to
+  `contextlib.nullcontext()`, matching the other three SSD files.
+- **Scope decision.** Fixed the one site hit by the Nemotron-H
+  non-speculative decode path (the only `torch.cuda.device(` call site
+  in `mamba_ssm.py` — grep confirms zero remaining call sites after the
+  edit; the only literal is a mention inside the helper's docstring).
+  Deferred, per researcher verdict:
+  - `ops/layernorm_gated.py:122` — still orphaned dead code;
+    `Mixer2RMSNormGated` uses `attention/fla/layernorm_gated.py`
+    (confirmed via `mamba/mixer2_rms_norm_gated.py:13`).
+  - `mamba_state_scatter_triton.py:120` — `.is_cuda` guard in
+    `fused_mamba_state_scatter_with_mask`, only reachable from EAGLE
+    tree-attention in `hybrid_linear_attn_backend.py`. Not on the
+    Nemotron-H smoke-test path. Follow-up for whoever enables
+    speculative decode on XPU hybrid-SSM.
+- **Status.** ✅ Applied.
+- **Outcome.** See Run 8 above — `test_simple_code_qa` passes end-to-end
+  in 118.982s with decode throughput ~14.2 tok/s.
+
+---
+
+## Referenced source locations
+
+- **Test.** `test/srt/xpu/test_nvidia_nemotron_3_nano.py`
+- **CUDA reference.** `test/registered/models/test_nvidia_nemotron_3_nano.py`
+
+### Run 1 (page_size)
+
+- `python/sglang/srt/mem_cache/mamba_radix_cache.py:435-438` — assertion
+- `python/sglang/srt/server_args.py:2274-2287` — first coercion → 1
+- `python/sglang/srt/server_args.py:2531-2536` — second coercion → 128
+- `python/sglang/srt/managers/scheduler.py:763-856` — cache-class selection
+
+### Run 3 (imports)
+
+- `python/sglang/srt/layers/attention/mamba/mamba.py:32-51` — import gate
+  (Fix 2 target)
+- `python/sglang/srt/layers/attention/mamba/mamba.py:503-507` — NameError site
+- `python/sglang/srt/layers/attention/mamba/causal_conv1d_triton.py` —
+  pure-Triton implementation
+- `python/sglang/srt/layers/attention/mamba/causal_conv1d.py:80` — CUDA
+  precedent for Triton fallback
+
+### Run 4 + Fix 3 (SSD ops)
+
+- `python/sglang/srt/layers/attention/mamba/ops/ssd_chunk_state.py:11-38, 484, 544, 620`
+- `python/sglang/srt/layers/attention/mamba/ops/ssd_state_passing.py:11-29, 237`
+- `python/sglang/srt/layers/attention/mamba/ops/ssd_bmm.py:11-30, 201`
+- `python/sglang/srt/layers/attention/mamba/ops/ssd_combined.py:98-162` —
+  prefill call graph
+- `python/sglang/srt/layers/attention/mamba/ops/mamba_ssm.py:430` —
+  deferred decode-only site
+- `python/sglang/srt/layers/attention/mamba/ops/layernorm_gated.py:122` —
+  deferred orphaned site
+
+### Run 5 (MoE host-side)
+
+- `python/sglang/srt/layers/quantization/unquant.py:565-579` — `forward_xpu`
+  rejects `relu2` (Fix 4 target; post-edit lines 576-580)
+- `python/sglang/srt/layers/quantization/unquant.py:437-439` — CUDA precedent
+  for `relu2` dispatch
+
+### Run 6 (MoE kernel-side)
+
+- `python/sglang/srt/layers/quantization/unquant.py:576-580` — post-Fix-4
+  whitelist, now includes `relu2`
+- `python/sglang/srt/layers/quantization/unquant.py:588-598` — XPU
+  pass-through call to `sgl_kernel.fused_experts` (unchanged)
+- `/home/sdp/workspace/sgl-kernel-xpu/python/sgl_kernel/moe.py:307-310` —
+  kernel-side activation whitelist (new Run 6 blocker; out-of-repo)
+
+### Run 7 + Fix 5 (Triton MoE relu2 routing)
+
+- `python/sglang/srt/layers/quantization/unquant.py:576-580` — activation
+  whitelist (unchanged from Fix 4, still includes `relu2`)
+- `python/sglang/srt/layers/quantization/unquant.py:582-589` — Fix 5
+  early-return routing `relu2` to `self.runner.run(...)` via
+  `get_triton_quant_info(layer)`
+- `python/sglang/srt/layers/quantization/unquant.py:612-616` — widened
+  else-branch assertion now accepting `{"silu","relu2"}`
+- `python/sglang/srt/layers/quantization/unquant.py:557-563` —
+  `get_triton_quant_info` threads `b13`/`b2` into the Triton runner
+- `python/sglang/srt/layers/moe/moe_runner/triton_utils/fused_moe.py:583-584` —
+  Triton squared-ReLU path (`torch.square(F.relu(...))`) on the
+  `not is_gated` branch
+- `python/sglang/srt/models/nemotron_h.py:192` — Nemotron-H sets
+  `is_gated=False`, so the above Triton branch is selected
+
+### Run 7 (Mamba2 SSU decode blocker — Fix 6 candidate)
+
+- `python/sglang/srt/layers/attention/mamba/mamba.py:704` — decode
+  callsite `selective_state_update(...)`
+- `python/sglang/srt/layers/attention/mamba/ops/ssu_dispatch.py:80, 258`
+  — dispatch frames leading to the kernel
+- `python/sglang/srt/layers/attention/mamba/ops/mamba_ssm.py:430` —
+  `with torch.cuda.device(x.device.index):` deferred by Fix 3, now the
+  decode-path blocker (Fix 6 target)
+
+### Run 8 + Fix 6 (Mamba SSU decode — device-aware CM)
+
+- `python/sglang/srt/layers/attention/mamba/ops/mamba_ssm.py:9` —
+  `import contextlib` (new).
+- `python/sglang/srt/layers/attention/mamba/ops/mamba_ssm.py:21-38` —
+  `_device_context` helper (copied verbatim from
+  `ops/ssd_chunk_state.py:21-38`).
+- `python/sglang/srt/layers/attention/mamba/ops/mamba_ssm.py:453` —
+  `with _device_context(x):` (was line 430 pre-edit,
+  `with torch.cuda.device(x.device.index):`).
+- `test/srt/xpu/test_nvidia_nemotron_3_nano.py` — `test_simple_code_qa`,
+  now green. No change to the test file in this fix.
+
+### Deferred / out-of-scope sites (confirmed not on Nemotron-H smoke path)
+
+- `python/sglang/srt/layers/attention/mamba/ops/layernorm_gated.py:122`
+  — orphaned; `Mixer2RMSNormGated` uses
+  `sglang/srt/layers/attention/fla/layernorm_gated.py` (per
+  `mamba/mixer2_rms_norm_gated.py:13`).
+- `python/sglang/srt/layers/attention/mamba/ops/mamba_state_scatter_triton.py:120`
+  — only reached via EAGLE tree-attention in
+  `hybrid_linear_attn_backend.py`; not on this test's path.
+
+---
+
+## Full logs
+
+| Run | Log path |
+| --- | --- |
+| 1 | `/tmp/nemotron_test_output.log` |
+| 2 | `/tmp/nemotron_test_output_fixA.log` |
+| 3 | `/tmp/nemotron_test_output_fixA_retry.log` |
+| 4 | `/tmp/nemotron_test_output_fix2.log` |
+| 5 | `/tmp/nemotron_test_output_fix3.log` |
+| 6 | `/tmp/nemotron_test_output_fix4.log` |
+| 7 | `/tmp/nemotron_test_output_fix5.log` |
+| 8 | `/tmp/nemotron_test_output_fix6.log` |

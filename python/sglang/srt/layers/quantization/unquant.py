@@ -565,7 +565,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
         assert moe_runner_config.activation in [
             "silu",
             "gelu",
+            "relu2",  # Nemotron-H (NemotronHForCausalLM) uses squared-ReLU.
         ], f"activation = {moe_runner_config.activation} is not supported."
+
+        # sgl-kernel-xpu fused_experts (moe.py:307-310) does not accept relu2
+        # today. Until that lands upstream, route relu2 through the
+        # device-agnostic Triton MoE runner which already implements squared-ReLU
+        # at moe_runner/triton_utils/fused_moe.py:583-584 for the non-gated
+        # (NemotronH-style) case. Silu/gelu stay on the fast sgl-kernel-xpu path.
+        if moe_runner_config.activation == "relu2":
+            quant_info = self.get_triton_quant_info(layer)
+            return self.runner.run(dispatch_output, quant_info)
 
         backend = self.runner.runner_backend
         if use_intel_xpu_backend():
@@ -591,10 +601,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, MultiPlatformOp):
             return StandardCombineInput(hidden_states=output)
         else:
             assert backend.is_triton()
-            assert (
-                moe_runner_config.activation == "silu"
-            ), f"activation = {moe_runner_config.activation} is not supported \
-            for Triton PATH, please set ENV SGLANG_USE_SGL_XPU=1."
+            assert moe_runner_config.activation in (
+                "silu",
+                "relu2",
+            ), f"activation = {moe_runner_config.activation} is not supported for Triton PATH; \
+silu requires ENV SGLANG_USE_SGL_XPU=1 for the fast path, relu2 is always routed here."
 
             quant_info = self.get_triton_quant_info(layer)
             return self.runner.run(dispatch_output, quant_info)
