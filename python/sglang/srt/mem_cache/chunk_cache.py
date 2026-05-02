@@ -19,6 +19,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -109,6 +111,11 @@ class SWAChunkCache(ChunkCache):
     """ChunkCache with support for sliding window attention."""
 
     def __init__(self, params: CacheInitParams):
+        # HiSparse wraps a SWATokenToKVPoolAllocator and exposes the same API.
+        assert isinstance(
+            params.token_to_kv_pool_allocator,
+            (SWATokenToKVPoolAllocator, HiSparseTokenToKVPoolAllocator),
+        )
         super().__init__(params)
 
         self.sliding_window_size = params.sliding_window_size
