@@ -58,6 +58,8 @@ DIFFUSERS_FALLBACK_SIGNALS = (
     "using diffusers backend",
     "loaded diffusers pipeline",
 )
+CATALOG_TABLE_WIDTH = 105
+RESULTS_TABLE_WIDTH = 105
 
 # ---------------------------------------------------------------------------
 # Model configs — kept in exact sync with benchmark-and-profile.md
@@ -320,16 +322,16 @@ def model_nightly_case_id(model_key: str) -> str:
 def print_model_catalog():
     """Print preset order, model path, and whether each preset maps to nightly."""
     print()
-    print("=" * 104)
+    print("=" * CATALOG_TABLE_WIDTH)
     print("MODEL PRESETS — Nightly-aligned first, skill-only extras after")
-    print("=" * 104)
+    print("=" * CATALOG_TABLE_WIDTH)
     print(f"{'Preset':<24} {'Nightly':<28} {'Model Path':<46} {'GPUs':>4}")
-    print("-" * 104)
+    print("-" * CATALOG_TABLE_WIDTH)
     for model_key, cfg in MODELS.items():
         print(
             f"{model_key:<24} {model_nightly_case_id(model_key):<28} {cfg['path']:<46} {required_gpus_for_model(model_key):>4}"
         )
-    print("-" * 104)
+    print("-" * CATALOG_TABLE_WIDTH)
     print(
         "Nightly column shows the comparison_configs.json case id; '-' means skill-only."
     )
@@ -521,15 +523,15 @@ def run_benchmark_once(
 def print_results_table(results: list[dict]):
     """Print a compact table for one or more benchmark runs."""
     print()
-    print("=" * 80)
+    print("=" * RESULTS_TABLE_WIDTH)
     print("BENCHMARK RESULTS — Denoise Latency (primary metric ★)")
     print("(Models and params match benchmark-and-profile.md)")
-    print("=" * 80)
+    print("=" * RESULTS_TABLE_WIDTH)
 
     print(
         f"{'Model':<24} {'Nightly':<28} {'Label':<12} {'Denoise(s)':>12} {'E2E(s)':>10} {'Peak Mem(GB)':>14}"
     )
-    print("-" * 110)
+    print("-" * RESULTS_TABLE_WIDTH)
 
     for result in results:
         denoise_s = result.get("denoise_latency_s")
@@ -542,7 +544,7 @@ def print_results_table(results: list[dict]):
             f"{result['model']:<24} {model_nightly_case_id(result['model']):<28} {result['label']:<12} {denoise_text:>12} {e2e_text:>10} {mem_text:>14}"
         )
 
-    print("-" * 110)
+    print("-" * RESULTS_TABLE_WIDTH)
     print()
     print(
         "★ Denoise latency = sum of stages ending with DenoisingStage plus any RefinementStage."
