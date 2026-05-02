@@ -40,14 +40,9 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 fi
 
 # Python setup (combined with apt update to reduce layers)
-# Add the deadsnakes PPA via a direct apt source list instead of `add-apt-repository`,
-# which calls api.launchpad.net through launchpadlib and has been timing out in CI.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
-    apt update && apt install -y --no-install-recommends wget ca-certificates software-properties-common \
-    && install -d -m 0755 /etc/apt/keyrings \
-    && wget -qO /etc/apt/keyrings/deadsnakes-ppa.asc 'https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0xF23C5A6CF475977595C89F51BA6932366A755776' \
-    && echo "deb [signed-by=/etc/apt/keyrings/deadsnakes-ppa.asc] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu noble main" > /etc/apt/sources.list.d/deadsnakes-ppa.list \
-    && apt update \
+    apt update && apt install -y --no-install-recommends wget software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
     && apt install -y --no-install-recommends python3.12-full python3.12-dev python3.10-venv \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
@@ -688,20 +683,15 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
 # Install runtime dependencies (devel base provides gcc/g++/build tools)
-# Add the deadsnakes PPA via a direct apt source list instead of `add-apt-repository`,
-# which calls api.launchpad.net through launchpadlib and has been timing out in CI.
 RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
     apt-get update && apt-get install -y --no-install-recommends \
-    # Tools needed to add the deadsnakes PPA
-    ca-certificates \
-    wget \
-    && install -d -m 0755 /etc/apt/keyrings \
-    && wget -qO /etc/apt/keyrings/deadsnakes-ppa.asc 'https://keyserver.ubuntu.com/pks/lookup?op=get&options=mr&search=0xF23C5A6CF475977595C89F51BA6932366A755776' \
-    && echo "deb [signed-by=/etc/apt/keyrings/deadsnakes-ppa.asc] https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu noble main" > /etc/apt/sources.list.d/deadsnakes-ppa.list \
-    && apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     # Python runtime
+    software-properties-common \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     python3.12-full \
     python3.12-dev \
+    wget \
     # Core system utilities
     ca-certificates \
     netcat-openbsd \
