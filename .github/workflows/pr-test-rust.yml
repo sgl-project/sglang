@@ -385,7 +385,7 @@ jobs:
       - name: Build smg-gateway:test image
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: sgl-model-gateway
           file: sgl-model-gateway/e2e_test/k8s_integration/Dockerfile.gateway
           tags: smg-gateway:test
           load: true
