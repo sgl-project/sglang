@@ -170,17 +170,30 @@ def _tail(text: str, max_lines: int = 80) -> str:
 
 def _relaykv_observation_log_flags(stdout: str) -> dict[str, bool]:
     summary_logged = "relaykv_runtime_observation_summary" in stdout
+    existing_metadata_summary_logged = (
+        "relaykv_runtime_observation_forward_batch_existing_metadata_summary"
+        in stdout
+    )
     skip_logged = "relaykv_runtime_observation_skip" in stdout
     metadata_description_logged = "metadata_description" in stdout
     cpu_metadata_description_logged = (
         "forward_batch_cpu_metadata_description" in stdout
     )
+    req_pool_idx_none_logged = '"req_pool_idx_none": true' in stdout
+    cpu_tensor_value_source_logged = (
+        '"seq_lens_cpu_value_source": "cpu_tensor_observation_only"' in stdout
+    )
     return {
         "relaykv_summary_logged": summary_logged,
+        "relaykv_existing_metadata_summary_logged": existing_metadata_summary_logged,
         "relaykv_skip_logged": skip_logged,
         "relaykv_metadata_description_logged": metadata_description_logged,
         "relaykv_cpu_metadata_description_logged": cpu_metadata_description_logged,
-        "relaykv_observation_logged": summary_logged or skip_logged,
+        "relaykv_req_pool_idx_none_logged": req_pool_idx_none_logged,
+        "relaykv_cpu_tensor_value_source_logged": cpu_tensor_value_source_logged,
+        "relaykv_observation_logged": (
+            summary_logged or existing_metadata_summary_logged or skip_logged
+        ),
     }
 
 

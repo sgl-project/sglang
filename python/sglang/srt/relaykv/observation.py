@@ -251,6 +251,158 @@ def build_runtime_observation_payload_candidates_from_forward_batch_existing_met
     return payloads
 
 
+def _device_type_name(value: Any) -> str:
+    device = getattr(value, "device", None)
+    device_type = getattr(device, "type", None)
+    if isinstance(device_type, str):
+        return device_type
+    if device is None:
+        return ""
+    return str(device).split(":", 1)[0]
+
+
+def _dtype_is_int64_like(value: Any) -> bool:
+    dtype = getattr(value, "dtype", None)
+    return "int64" in str(dtype) or str(dtype).endswith(".long")
+
+
+def _cpu_tensor_1d_to_list_for_runtime_observation(
+    value: Any,
+    *,
+    field_name: str,
+    expected_len: int,
+) -> list[int]:
+    """Read a 1D CPU tensor-like value for observation-only metadata.
+
+    This intentionally refuses GPU tensors before any value conversion. The only
+    value read allowed here is CPU tensor metadata needed to form a read-only
+    observation payload candidate.
+    """
+
+    if _device_type_name(value) != "cpu":
+        raise TypeError(f"{field_name} must be a CPU tensor for runtime observation")
+    if not _dtype_is_int64_like(value):
+        raise TypeError(f"{field_name} must have int64-like dtype")
+
+    shape = getattr(value, "shape", None)
+    if shape is None or len(shape) != 1:
+        raise ValueError(f"{field_name} must be a 1D CPU tensor")
+    if int(shape[0]) != expected_len:
+        raise ValueError(f"{field_name} must match len(forward_batch.rids)")
+
+    tolist = getattr(value, "tolist", None)
+    if not callable(tolist):
+        raise TypeError(f"{field_name} must support CPU tensor tolist()")
+    values = tolist()
+    if not isinstance(values, list) or len(values) != expected_len:
+        raise ValueError(f"{field_name} CPU tensor values must match len(rids)")
+    return [int(item) for item in values]
+
+
+def _runtime_existing_metadata_seq_lens(
+    value: Any,
+    *,
+    expected_len: int,
+) -> tuple[Sequence[Any], str]:
+    if isinstance(value, (list, tuple)):
+        if len(value) != expected_len:
+            raise ValueError(
+                "forward_batch.seq_lens_cpu must match len(forward_batch.rids)"
+            )
+        return value, "list_tuple_observation_only"
+    return (
+        _cpu_tensor_1d_to_list_for_runtime_observation(
+            value,
+            field_name="forward_batch.seq_lens_cpu",
+            expected_len=expected_len,
+        ),
+        "cpu_tensor_observation_only",
+    )
+
+
+def build_runtime_observation_payload_candidates_from_forward_batch_runtime_existing_metadata(
+    *,
+    forward_batch: Any,
+    layer_ids: Sequence[int],
+    batch_id: str,
+    phase: str,
+    runtime_policy_state: str,
+) -> list[dict[str, Any]]:
+    """Build observation-only candidates from existing ForwardBatch metadata.
+
+    This runtime helper is still payload-only. It reads only rids and
+    seq_lens_cpu/extend CPU metadata that already exists on ForwardBatch-like
+    objects. req_pool_idx remains None and no KV pool, attention, scheduler, or
+    writeback state is touched.
+    """
+
+    rid_values = _readonly_sequence(
+        getattr(forward_batch, "rids"),
+        field_name="forward_batch.rids",
+    )
+    request_count = len(rid_values)
+    seq_len_values, seq_lens_cpu_value_source = _runtime_existing_metadata_seq_lens(
+        getattr(forward_batch, "seq_lens_cpu"),
+        expected_len=request_count,
+    )
+    layer_id_values = _readonly_sequence(layer_ids, field_name="layer_ids")
+    extend_seq_len_values = _readonly_optional_sequence(
+        getattr(forward_batch, "extend_seq_lens_cpu", None),
+        field_name="forward_batch.extend_seq_lens_cpu",
+    )
+    extend_prefix_len_values = _readonly_optional_sequence(
+        getattr(forward_batch, "extend_prefix_lens_cpu", None),
+        field_name="forward_batch.extend_prefix_lens_cpu",
+    )
+
+    if (
+        extend_seq_len_values is not None
+        and len(extend_seq_len_values) != request_count
+    ):
+        raise ValueError(
+            "forward_batch.extend_seq_lens_cpu must match len(forward_batch.rids)"
+        )
+    if (
+        extend_prefix_len_values is not None
+        and len(extend_prefix_len_values) != request_count
+    ):
+        raise ValueError(
+            "forward_batch.extend_prefix_lens_cpu must match len(forward_batch.rids)"
+        )
+
+    payloads: list[dict[str, Any]] = []
+    for request_index, request_id in enumerate(rid_values):
+        for layer_id in layer_id_values:
+            payload: dict[str, Any] = {
+                "event_type": (
+                    "runtime_observation_forward_batch_existing_metadata_candidate"
+                ),
+                "batch_id": batch_id,
+                "request_id": request_id,
+                "request_index_in_batch": request_index,
+                "request_index": request_index,
+                "req_pool_idx": None,
+                "req_pool_index": None,
+                "seq_len": seq_len_values[request_index],
+                "seq_lens_cpu_value_source": seq_lens_cpu_value_source,
+                "layer_id": layer_id,
+                "phase": phase,
+                "runtime_policy_state": runtime_policy_state,
+                "source": "forward_batch_existing_cpu_metadata_runtime_observation",
+                "source_mutated": False,
+                "attention_override": False,
+                "kv_cache_mutation": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+            }
+            if extend_seq_len_values is not None:
+                payload["extend_seq_len"] = extend_seq_len_values[request_index]
+            if extend_prefix_len_values is not None:
+                payload["extend_prefix_len"] = extend_prefix_len_values[request_index]
+            payloads.append(payload)
+    return payloads
+
+
 def summarize_runtime_observation_payloads(
     payloads: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -465,10 +617,62 @@ def run_model_runner_forward_observation_hook(
             layer_ids=[0],
         )
         cpu_metadata_description = _describe_forward_batch_cpu_metadata(forward_batch)
+        try:
+            layer_ids = [0]
+            fallback_payloads = (
+                build_runtime_observation_payload_candidates_from_forward_batch_runtime_existing_metadata(
+                    forward_batch=forward_batch,
+                    layer_ids=layer_ids,
+                    batch_id=f"forward-{forward_pass_id}",
+                    phase="forward",
+                    runtime_policy_state="runtime_observation",
+                )
+            )
+            fallback_summary = summarize_runtime_observation_payloads(
+                fallback_payloads
+            )
+            fallback_summary.update(
+                {
+                    "forward_pass_id": forward_pass_id,
+                    "source": (
+                        "forward_batch_existing_cpu_metadata_runtime_observation"
+                    ),
+                    "seq_lens_cpu_value_source": fallback_payloads[0].get(
+                        "seq_lens_cpu_value_source", ""
+                    )
+                    if fallback_payloads
+                    else "",
+                    "req_pool_idx_none": all(
+                        payload.get("req_pool_idx") is None
+                        and payload.get("req_pool_index") is None
+                        for payload in fallback_payloads
+                    ),
+                    "initial_skip_reason": type(exc).__name__,
+                }
+            )
+            log_runtime_observation_summary(
+                fallback_summary,
+                logger_=target_logger,
+                prefix=(
+                    "relaykv_runtime_observation_forward_batch_"
+                    "existing_metadata_summary"
+                ),
+            )
+            return {
+                "enabled": True,
+                "skipped": False,
+                "skip_reason": "",
+                "summary": fallback_summary,
+                "metadata_description": metadata_description,
+                "forward_batch_cpu_metadata_description": cpu_metadata_description,
+            }
+        except Exception as fallback_exc:
+            fallback_skip_reason = type(fallback_exc).__name__
         log_runtime_observation_skip(
             {
                 "forward_pass_id": forward_pass_id,
                 "reason": type(exc).__name__,
+                "runtime_existing_metadata_skip_reason": fallback_skip_reason,
                 "metadata_description": metadata_description,
                 "forward_batch_cpu_metadata_description": cpu_metadata_description,
             },
@@ -478,6 +682,7 @@ def run_model_runner_forward_observation_hook(
             "enabled": True,
             "skipped": True,
             "skip_reason": type(exc).__name__,
+            "runtime_existing_metadata_skip_reason": fallback_skip_reason,
             "metadata_description": metadata_description,
             "forward_batch_cpu_metadata_description": cpu_metadata_description,
             "summary": None,
