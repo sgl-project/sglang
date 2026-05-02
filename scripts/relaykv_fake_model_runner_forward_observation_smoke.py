@@ -41,6 +41,12 @@ class _PoisonTensorLike:
         self.cpu_called = False
         self.item_called = False
         self.tolist_called = False
+        self.iter_called = False
+        self.len_called = False
+        self.getitem_called = False
+        self.shape = (1,)
+        self.device = "cuda:0"
+        self.dtype = "torch.int32"
 
     def cpu(self) -> None:
         self.cpu_called = True
@@ -54,9 +60,28 @@ class _PoisonTensorLike:
         self.tolist_called = True
         raise AssertionError("tolist() must not be called")
 
+    def __iter__(self):
+        self.iter_called = True
+        raise AssertionError("__iter__() must not be called")
+
+    def __len__(self) -> int:
+        self.len_called = True
+        raise AssertionError("__len__() must not be called")
+
+    def __getitem__(self, index: int) -> None:
+        self.getitem_called = True
+        raise AssertionError("__getitem__() must not be called")
+
     @property
     def sync_called(self) -> bool:
-        return self.cpu_called or self.item_called or self.tolist_called
+        return (
+            self.cpu_called
+            or self.item_called
+            or self.tolist_called
+            or self.iter_called
+            or self.len_called
+            or self.getitem_called
+        )
 
 
 class _ExplodingForwardBatch:
@@ -171,6 +196,16 @@ def _assert_tensor_like_skip() -> dict[str, Any]:
     if hook_result["enabled"] is not True or hook_result["skipped"] is not True:
         raise AssertionError(result)
     if hook_result["skip_reason"] != "TypeError":
+        raise AssertionError(result)
+    metadata_description = hook_result.get("metadata_description")
+    if not metadata_description:
+        raise AssertionError(result)
+    req_pool_description = metadata_description["req_pool_indices"]
+    if req_pool_description["shape_repr"] != "(1,)":
+        raise AssertionError(result)
+    if req_pool_description["device_repr"] != "cuda:0":
+        raise AssertionError(result)
+    if req_pool_description["dtype_repr"] != "torch.int32":
         raise AssertionError(result)
     return result
 

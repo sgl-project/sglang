@@ -171,9 +171,11 @@ def _tail(text: str, max_lines: int = 80) -> str:
 def _relaykv_observation_log_flags(stdout: str) -> dict[str, bool]:
     summary_logged = "relaykv_runtime_observation_summary" in stdout
     skip_logged = "relaykv_runtime_observation_skip" in stdout
+    metadata_description_logged = "metadata_description" in stdout
     return {
         "relaykv_summary_logged": summary_logged,
         "relaykv_skip_logged": skip_logged,
+        "relaykv_metadata_description_logged": metadata_description_logged,
         "relaykv_observation_logged": summary_logged or skip_logged,
     }
 

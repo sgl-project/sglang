@@ -149,6 +149,79 @@ def log_runtime_observation_skip(
     target_logger.warning("%s=%s", prefix, json.dumps(skip_event, sort_keys=True))
 
 
+def _safe_metadata_attr_description(value: Any, attr_name: str) -> dict[str, Any]:
+    description: dict[str, Any] = {
+        f"has_{attr_name}": False,
+        f"{attr_name}_repr": "",
+    }
+    try:
+        attr_value = getattr(value, attr_name)
+    except Exception as exc:
+        description[f"{attr_name}_error"] = type(exc).__name__
+        return description
+
+    description[f"has_{attr_name}"] = True
+    description[f"{attr_name}_repr"] = str(attr_value)
+    return description
+
+
+def _describe_runtime_metadata_value(value: Any) -> dict[str, Any]:
+    """Describe metadata without reading tensor values or synchronizing devices."""
+
+    value_type = type(value)
+    description: dict[str, Any] = {
+        "type_name": value_type.__name__,
+        "type_module": value_type.__module__,
+        "type_qualname": value_type.__qualname__,
+        "is_list_or_tuple": isinstance(value, (list, tuple)),
+        "list_or_tuple_len": None,
+    }
+    if isinstance(value, _MetadataAccessError):
+        description["metadata_access_error_field"] = value.field_name
+        description["metadata_access_error_reason"] = value.reason
+    if description["is_list_or_tuple"]:
+        description["list_or_tuple_len"] = len(value)
+
+    description.update(_safe_metadata_attr_description(value, "shape"))
+    description.update(_safe_metadata_attr_description(value, "device"))
+    description.update(_safe_metadata_attr_description(value, "dtype"))
+    return description
+
+
+def _safe_forward_batch_metadata_value(batch: Any, field_name: str) -> Any:
+    try:
+        return getattr(batch, field_name)
+    except Exception as exc:
+        return _MetadataAccessError(field_name=field_name, reason=type(exc).__name__)
+
+
+class _MetadataAccessError:
+    def __init__(self, *, field_name: str, reason: str) -> None:
+        self.field_name = field_name
+        self.reason = reason
+
+
+def _describe_runtime_forward_batch_metadata(
+    *,
+    forward_batch: Any,
+    layer_ids: Sequence[int],
+) -> dict[str, Any]:
+    """Describe ForwardBatch-like metadata without values, iteration, or tensor sync."""
+
+    return {
+        "rids": _describe_runtime_metadata_value(
+            _safe_forward_batch_metadata_value(forward_batch, "rids")
+        ),
+        "req_pool_indices": _describe_runtime_metadata_value(
+            _safe_forward_batch_metadata_value(forward_batch, "req_pool_indices")
+        ),
+        "seq_lens": _describe_runtime_metadata_value(
+            _safe_forward_batch_metadata_value(forward_batch, "seq_lens")
+        ),
+        "layer_ids": _describe_runtime_metadata_value(layer_ids),
+    }
+
+
 def run_model_runner_forward_observation_hook(
     *,
     forward_batch: Any,
@@ -174,9 +247,10 @@ def run_model_runner_forward_observation_hook(
         }
 
     try:
+        layer_ids = [0]
         payloads = build_runtime_observation_payloads(
             batch=forward_batch,
-            layer_ids=[0],
+            layer_ids=layer_ids,
             batch_id=f"forward-{forward_pass_id}",
             phase="forward",
             runtime_policy_state="runtime_observation",
@@ -190,10 +264,15 @@ def run_model_runner_forward_observation_hook(
             "summary": summary,
         }
     except (TypeError, ValueError) as exc:
+        metadata_description = _describe_runtime_forward_batch_metadata(
+            forward_batch=forward_batch,
+            layer_ids=[0],
+        )
         log_runtime_observation_skip(
             {
                 "forward_pass_id": forward_pass_id,
                 "reason": type(exc).__name__,
+                "metadata_description": metadata_description,
             },
             logger_=target_logger,
         )
@@ -201,6 +280,7 @@ def run_model_runner_forward_observation_hook(
             "enabled": True,
             "skipped": True,
             "skip_reason": type(exc).__name__,
+            "metadata_description": metadata_description,
             "summary": None,
         }
     except Exception as exc:
