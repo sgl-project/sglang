@@ -238,6 +238,13 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && echo '__version__ = "0.0.0"' > sglang/version.py \
     && touch README.md \
     && touch LICENSE \
+    # cu12 torch wheels must be seeded from the cu12x index first: torch 2.11's
+    # default PyPI wheel is cu130, and --extra-index-url below isn't strong
+    # enough to force cu12x resolution when both indexes publish version 2.11.0.
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+               torch torchvision torchaudio ; \
+       fi \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
@@ -551,7 +558,6 @@ COPY docker/configs/opt/.gitconfig /opt/sglang/.gitconfig
 
 # Configure development environment
 COPY docker/configs/.zshrc /root/.zshrc
-
 
 # Fix Trivy-reported CVEs
 # pip:             urllib3 (CVE-2025-43859), pillow (CVE-2026-25990)

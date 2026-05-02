@@ -7,7 +7,7 @@ on:
   workflow_call:
     inputs:
       tag_prefixes:
-        description: 'JSON array of tag prefixes to clean up (e.g. ["nightly-dev", "nightly-dev-cu13"])'
+        description: 'JSON array of tag prefixes to clean up (e.g. ["nightly-dev", "nightly-dev-cu12"])'
         required: true
         type: string
       keep_count:
@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_prefixes:
-        description: 'JSON array of tag prefixes to clean up (e.g. ["nightly-dev", "nightly-dev-cu13"])'
+        description: 'JSON array of tag prefixes to clean up (e.g. ["nightly-dev", "nightly-dev-cu12"])'
         required: true
         type: string
       keep_count:
