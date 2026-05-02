@@ -254,5 +254,12 @@ class KimiK2Detector(BaseFormatDetector):
 
         return get_info
 
-    def get_structural_tag_name(self) -> str:
-        return "kimi"
+    # Kimi stays on the SGLang legacy structural tag path. xgrammar 0.2.0's
+    # get_kimi_structural_tag(tool_choice="auto") emits a bare
+    # <|tool_call_begin|>...<|tool_call_end|> grammar without the
+    # <|tool_calls_section_begin|>/<|tool_calls_section_end|> wrapper Kimi's
+    # chat template uses, and KimiK2Detector.has_tool_call() keys off the
+    # section marker — bare tool calls would be silently dropped. Inheriting
+    # the base get_structural_tag_name (returns None) keeps FunctionCallParser
+    # on the legacy path, whose structure_info bakes the section markers in.
+    # TODO: re-enable the builtin once https://github.com/mlc-ai/xgrammar/issues/622 is fixed.
