@@ -1,0 +1,346 @@
+---
+title: Wan2.2
+metatags:
+    description: "Deploy Wan2.2 video generation models with SGLang - MoE architecture, cinematic aesthetics, and efficient 720P@24fps generation."
+---
+
+import { Wan22Deployment } from '/src/snippets/diffusion/wan22-deployment.jsx';
+
+## 1. Model Introduction
+
+[Wan2.2 series](https://github.com/Wan-Video/Wan2.2) are the most popular and open and advanced large-scale video generative models.
+
+This generation delivers comprehensive upgrades across the board:
+
+- **Effective MoE Architecture**: Introduces a Mixture-of-Experts (MoE) architecture into video diffusion models. By separating the denoising process cross timesteps with specialized powerful expert models, this enlarges the overall model capacity while maintaining the same computational cost.
+- **Cinematic-level Aesthetics**: Incorporates meticulously curated aesthetic data, complete with detailed labels for lighting, composition, contrast, color tone, and more. This allows for more precise and controllable cinematic style generation, facilitating the creation of videos with customizable aesthetic preferences.
+- **Complex Motion Generation**: Trained on a significantly larger data, with +65.6% more images and +83.2% more videos. This expansion notably enhances the model's generalization across multiple dimensions such as motions, semantics, and aesthetics, achieving TOP performance among all open-sourced and closed-sourced models.
+- **Efficient High-Definition Hybrid TI2V**: Open-sources a 5B model built with our advanced Wan2.2-VAE that achieves a compression ratio of 16×16×4. This model supports both text-to-video and image-to-video generation at 720P resolution with 24fps and can also run on consumer-grade graphics cards like 4090. It is one of the fastest 720P@24fps models currently available, capable of serving both the industrial and academic sectors simultaneously.
+
+For more details, please refer to the [official Wan2.2 GitHub Repository](https://github.com/Wan-Video/Wan2.2).
+
+## 2. SGLang-diffusion Installation
+
+SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
+
+Please refer to the [official SGLang-diffusion installation guide](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/install.md) for installation instructions.
+
+## 3. Model Deployment
+
+This section provides deployment configurations optimized for different hardware platforms and use cases.
+
+### 3.1 Basic Configuration
+
+The Wan2.2 series offers models in various sizes, architectures and input types, optimized for different hardware platforms. The recommended launch configurations vary by hardware and model size.
+
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model size. SGLang supports serving Wan2.2 on NVIDIA B200, H200 and AMD MI300X, MI325X and MI355X GPUs.
+
+<Wan22Deployment />
+
+### 3.2 Configuration Tips
+
+Current supported optimization all listed [here](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/support_matrix.md).
+
+- `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
+- `--num-gpus {NUM_GPUS}`: Number of GPUs to use
+- `--tp-size {TP_SIZE}`: Tensor parallelism size (only for the encoder; should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
+- `--sp-degree {SP_SIZE}`: Sequence parallelism size (typically should match the number of GPUs)
+- `--ulysses-degree {ULYSSES_DEGREE}`: The degree of DeepSpeed-Ulysses-style SP in USP
+- `--ring-degree {RING_DEGREE}`: The degree of ring attention-style SP in USP
+
+## 4. Model Invocation
+
+### 4.1 Basic Usage
+
+For more API usage and request examples, please refer to:
+[SGLang Diffusion OpenAI API](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/openai_api.md)
+
+#### 4.1.1 Launch a server and then send requests
+
+```shell Command
+sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000
+
+curl http://127.0.0.1:3000/v1/images/generations \
+  -o >(jq -r '.data[0].b64_json' | base64 --decode > example.png) \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d '{
+    "model": "black-forest-labs/FLUX.1-dev",
+    "prompt": "A cute baby sea otter",
+    "n": 1,
+    "size": "1024x1024",
+    "response_format": "b64_json"
+  }'
+```
+
+#### 4.1.2 Generate a video without launching a server
+
+```shell Command
+SERVER_ARGS=(
+  --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
+  --text-encoder-cpu-offload
+  --pin-cpu-memory
+  --num-gpus 4
+  --ulysses-degree=2
+  --enable-cfg-parallel
+)
+
+SAMPLING_ARGS=(
+  --prompt "A curious raccoon"
+  --save-output
+  --output-path outputs
+  --output-file-name "A curious raccoon.mp4"
+)
+
+sglang generate "${SERVER_ARGS[@]}" "${SAMPLING_ARGS[@]}"
+
+```
+
+### 4.2 Advanced Usage
+
+#### 4.2.1 Cache-DiT Acceleration
+
+SGLang integrates [Cache-DiT](https://github.com/vipshop/cache-dit), a caching acceleration engine for Diffusion Transformers (DiT), to achieve up to 7.4x inference speedup with minimal quality loss. You can set `SGLANG_CACHE_DIT_ENABLED=True` to enable it. For more details, please refer to the SGLang Cache-DiT [documentation](https://github.com/sgl-project/sglang/blob/main/python/sglang/multimodal_gen/docs/cache/cache_dit.md).
+
+**Basic Usage**
+
+```shell Command
+SGLANG_CACHE_DIT_ENABLED=true sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
+```
+
+**Advanced Usage**
+
+- DBCache Parameters: DBCache controls block-level caching behavior:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Fn</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_FN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of first blocks to always compute</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Bn</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_BN`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Number of last blocks to always compute</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>W</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_WARMUP`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>4</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Warmup steps before caching starts</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>R</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_RDT`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>0.24</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Residual difference threshold</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>MC</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_MC`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>3</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum continuous cached steps</td>
+    </tr>
+  </tbody>
+</table>
+
+- TaylorSeer Configuration: TaylorSeer improves caching accuracy using Taylor expansion:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+    <col style={{width: "25.0%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Parameter</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Env Variable</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Default</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Description</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Enable</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TAYLORSEER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>false</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable TaylorSeer calibrator</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Order</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`SGLANG_CACHE_DIT_TS_ORDER`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>1</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Taylor expansion order (1 or 2)</td>
+    </tr>
+  </tbody>
+</table>
+
+  Combined Configuration Example:
+
+```shell Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=2 \
+SGLANG_CACHE_DIT_BN=1 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 \
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=2 \
+sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
+```
+
+#### 4.2.2 GPU Optimization
+
+- `--dit-cpu-offload`: Use CPU offload for DiT inference. Enable if run out of memory with FSDP.
+- `--text-encoder-cpu-offload`: Use CPU offload for text encoder inference. Enable if run out of memory with FSDP.
+- `--image-encoder-cpu-offload`: Use CPU offload for image encoder inference. Enable if run out of memory with FSDP.
+- `--vae-cpu-offload`: Use CPU offload for VAE. Enable if run out of memory.
+- `--pin-cpu-memory`: Pin memory for CPU offload. Only added as a temp workaround if it throws "CUDA error: invalid argument".
+
+#### 4.2.3 Supported LoRA Registry
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "50%"}} />
+    <col style={{width: "50%"}} />
+  </colgroup>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>origin model</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>supported LoRA</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[Wan-AI/Wan2.2-I2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-I2V-A14B-Diffusers)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[lightx2v/Wan2.2-Distill-Loras](https://huggingface.co/lightx2v/Wan2.2-Distill-Loras)</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>[Wan-AI/Wan2.2-T2V-A14B-Diffusers](https://huggingface.co/Wan-AI/Wan2.2-T2V-A14B-Diffusers)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Cseti/wan2.2-14B-Arcane_Jinx-lora-v1](https://huggingface.co/Cseti/wan2.2-14B-Arcane_Jinx-lora-v1)</td>
+    </tr>
+  </tbody>
+</table>
+**Example**:
+```shell Command
+sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000 \
+    --lora-path Cseti/wan2.2-14B-Arcane_Jinx-lora-v1
+```
+
+## 5. Benchmark
+
+Test Environment:
+
+- Hardware: NVIDIA B200 GPU (1x)
+- Model: Wan-AI/Wan2.2-T2V-A14B-Diffusers
+- sglang diffusion version: 0.5.6.post2
+
+### 5.1 Speedup Benchmark
+
+#### 5.1.1 Generate a video
+
+**Server Command**:
+
+```shell Command
+sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
+```
+
+**Benchmark Command**:
+
+```shell Command
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-video --dataset vbench --task t2v --num-prompts 1 --max-concurrency 1
+```
+
+**Result**:
+
+```text Output
+================= Serving Benchmark Result =================
+Backend:                                 sglang-video
+Model:                                   Wan-AI/Wan2.2-T2V-A14B-Diffusers
+Dataset:                                 vbench
+Task:                                    t2v
+--------------------------------------------------
+Benchmark duration (s):                  630.43
+Request rate:                            inf
+Max request concurrency:                 1
+Successful requests:                     1/1
+--------------------------------------------------
+Request throughput (req/s):              0.00
+Latency Mean (s):                        630.4277
+Latency Median (s):                      630.4277
+Latency P99 (s):                         630.4277
+--------------------------------------------------
+Peak Memory Max (MB):                    62627.41
+Peak Memory Mean (MB):                   62627.41
+Peak Memory Median (MB):                 62627.41
+
+============================================================
+```
+
+#### 5.1.2 Generate videos with high concurrency
+
+**Server Command**:
+
+```shell Command
+SGLANG_CACHE_DIT_ENABLED=true \
+SGLANG_CACHE_DIT_FN=2 \
+SGLANG_CACHE_DIT_BN=1 \
+SGLANG_CACHE_DIT_WARMUP=4 \
+SGLANG_CACHE_DIT_RDT=0.4 \
+SGLANG_CACHE_DIT_MC=4 \
+SGLANG_CACHE_DIT_TAYLORSEER=true \
+SGLANG_CACHE_DIT_TS_ORDER=2 \
+sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers
+```
+
+**Benchmark Command**:
+
+```shell Command
+python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+    --backend sglang-video --dataset vbench --task t2v --num-prompts 20 --max-concurrency 20
+```
+
+**Result**:
+
+```text Output
+================= Serving Benchmark Result =================
+Backend:                                 sglang-video
+Model:                                   Wan-AI/Wan2.2-T2V-A14B-Diffusers
+Dataset:                                 vbench
+Task:                                    t2v
+--------------------------------------------------
+Benchmark duration (s):                  5163.21
+Request rate:                            inf
+Max request concurrency:                 20
+Successful requests:                     20/20
+--------------------------------------------------
+Request throughput (req/s):              0.00
+Latency Mean (s):                        2739.7695
+Latency Median (s):                      2742.0673
+Latency P99 (s):                         5121.6331
+--------------------------------------------------
+Peak Memory Max (MB):                    72523.56
+Peak Memory Mean (MB):                   70253.34
+Peak Memory Median (MB):                 70824.46
+
+============================================================
+```

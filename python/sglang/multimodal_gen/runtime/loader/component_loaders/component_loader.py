@@ -326,11 +326,29 @@ class TokenizerLoader(ComponentLoader):
         ):
             return AutoProcessor.from_pretrained(component_model_path)
 
-        return AutoTokenizer.from_pretrained(
-            component_model_path,
-            padding_side="right",
-            use_fast=True,
-        )
+        # Qwen-Image's model_index declares Qwen2Tokenizer; using the fast class
+        # changes text preprocessing and shifts official GT comparisons.
+        use_fast = self.component_architecture != "Qwen2Tokenizer"
+        try:
+            return AutoTokenizer.from_pretrained(
+                component_model_path,
+                padding_side="right",
+                use_fast=use_fast,
+            )
+        except TypeError as e:
+            # tokenizers>=0.21 removed the `cls` kwarg from RobertaProcessing,
+            # but some transformers CLIPTokenizer builds still pass it. Fall back
+            # to the pure-Python (slow) tokenizer which avoids the rust path.
+            if "RobertaProcessing" in str(e) and use_fast:
+                logger.warning(
+                    "Fast tokenizer failed (%s), retrying with use_fast=False", e
+                )
+                return AutoTokenizer.from_pretrained(
+                    component_model_path,
+                    padding_side="right",
+                    use_fast=False,
+                )
+            raise
 
 
 class GenericComponentLoader(ComponentLoader):

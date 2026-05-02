@@ -614,6 +614,110 @@ class TestChunkedSGMV(unittest.TestCase):
                     f"QKV missing k_proj batch_size={batch_size}",
                 )
 
+    def test_4_slice_gdn_qkvz(self):
+        """Test 4-slice shrink+expand operations (GDN in_proj_qkvz)."""
+        num_slices = 4
+        # GDN-style: 4 slices with different sizes [2048, 2048, 4096, 4096]
+        slice_offsets = torch.tensor(
+            [0, 2048, 4096, 8192, 12288], dtype=torch.int32, device=self.device
+        )
+        total_out = 12288
+        max_slice_size = 4096
+
+        for batch_size in [1, 2, 16]:
+            with self.subTest(batch_size=batch_size):
+                # Build batch (reuse the 3-slice helper just for x, batch_info, etc.)
+                x, _, batch_info, seq_lengths, lora_assignments = (
+                    self.create_test_batch(BatchComposition.MIXED, batch_size)
+                )
+
+                # Build 4-slice LoRA weights and stack them manually
+                lora_names = [n for n in self.lora_configs if n != "_NO_LORA_"]
+                max_rank = max(self.lora_configs[n][0] for n in lora_names)
+                stacked_a = torch.zeros(
+                    len(lora_names),
+                    num_slices * max_rank,
+                    self.input_dim,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                stacked_b = torch.zeros(
+                    len(lora_names),
+                    total_out,
+                    max_rank,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                for i, name in enumerate(lora_names):
+                    rank = self.lora_configs[name][0]
+                    if rank > 0:
+                        stacked_a[i, : num_slices * rank, :] = torch.randn(
+                            num_slices * rank,
+                            self.input_dim,
+                            dtype=self.dtype,
+                            device=self.device,
+                        )
+                        stacked_b[i, :, :rank] = torch.randn(
+                            total_out, rank, dtype=self.dtype, device=self.device
+                        )
+
+                lora_assignments_tensor = torch.tensor(
+                    lora_assignments, dtype=torch.int32, device="cpu"
+                )
+                seq_lengths_tensor = torch.tensor(
+                    seq_lengths, dtype=torch.int32, device="cpu"
+                )
+                lora_ranks_tensor = batch_info.lora_ranks.detach().cpu()
+                scalings_tensor = batch_info.scalings.detach().cpu()
+
+                # Shrink
+                chunked_shrink = chunked_sgmv_lora_shrink_forward(
+                    x, stacked_a, batch_info, num_slices=num_slices
+                )
+                reference_shrink = reference_sgmv_shrink(
+                    x,
+                    stacked_a,
+                    lora_assignments_tensor,
+                    seq_lengths_tensor,
+                    lora_ranks_tensor,
+                    scalings_tensor,
+                    num_slices=num_slices,
+                )
+                self._compare_shrink_outputs(
+                    chunked_shrink,
+                    reference_shrink,
+                    seq_lengths,
+                    lora_assignments,
+                    batch_info,
+                    num_slices=num_slices,
+                    test_name=f"4-slice shrink bs={batch_size}",
+                )
+
+                # Expand
+                chunked_expand = chunked_sgmv_lora_expand_forward(
+                    reference_shrink,
+                    stacked_b,
+                    batch_info,
+                    slice_offsets,
+                    max_slice_size,
+                    base_output=None,
+                )
+                reference_expand = reference_sgmv_expand(
+                    reference_shrink,
+                    stacked_b,
+                    lora_assignments_tensor,
+                    seq_lengths_tensor,
+                    lora_ranks_tensor,
+                    slice_offsets,
+                )
+                torch.testing.assert_close(
+                    chunked_expand,
+                    reference_expand,
+                    rtol=self.RTOL,
+                    atol=self.ATOL,
+                    msg=f"4-slice expand failed bs={batch_size}",
+                )
+
     # === Batch Composition Tests ===
 
     def test_uniform_lora_batch(self):

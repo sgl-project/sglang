@@ -5,7 +5,7 @@ run-name: ${{ inputs.target_stage && (inputs.pr_head_sha && format('[{0}] {1}', 
 
 on:
   schedule:
-    - cron: '0 */6 * * *'  # Run every 6 hours (UTC)
+    - cron: '0 1,9,17 * * *'  # Run 3x daily: 2am / 10am / 6pm Pacific (PDT)
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -25,6 +25,11 @@ on:
         required: false
         type: string
         default: ""
+      include_wheel_build:
+        description: "When set with target_stage, also run sgl-kernel-build-wheels so the target stage uses the freshly-built kernel (for /rerun-stage on PRs that modify sgl-kernel/)"
+        required: false
+        type: boolean
+        default: false
       test_parallel_dispatch:
         description: "Test parallel dispatch behavior (simulates scheduled run)"
         required: false
@@ -64,7 +69,7 @@ env:
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
-  SGLANG_PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
 
 permissions:
@@ -80,10 +85,14 @@ jobs:
     outputs:
       # Use API-based detection for target_stage mode (filter-api), otherwise use dorny/paths-filter (filter)
       main_package: ${{ steps.filter-api.outputs.main_package || steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }}
-      # sgl_kernel is forced to false when target_stage is set, since sgl-kernel-build-wheels won't run
-      # This prevents CUSTOM_BUILD_SGL_KERNEL=true when the wheel artifacts aren't available
-      # Note: If PR has kernel changes AND target_stage is set, the validate-target-stage step will fail
-      sgl_kernel: ${{ !inputs.target_stage && (steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel) }}
+      # sgl_kernel is forced to false when target_stage is set AND include_wheel_build is NOT set,
+      # since sgl-kernel-build-wheels normally skips in target_stage mode. When include_wheel_build
+      # is true, keep the real value so the wheel build runs and the target stage downloads its
+      # artifact (used by /rerun-stage on PRs that modify sgl-kernel/).
+      # This prevents CUSTOM_BUILD_SGL_KERNEL=true when the wheel artifacts aren't available.
+      # Note: If PR has kernel changes AND target_stage is set AND include_wheel_build is NOT set,
+      # the validate-target-stage step will fail.
+      sgl_kernel: ${{ (!inputs.target_stage || inputs.include_wheel_build) && (steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel) }}
       # Raw sgl_kernel value before target_stage override (used for validation)
       sgl_kernel_raw: ${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel }}
       jit_kernel: ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
@@ -136,7 +145,7 @@ jobs:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - "python/pyproject.toml"
-              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
+              - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
               - "python/sglang/jit_kernel/diffusion/**"
               - "python/sglang/jit_kernel/tests/diffusion/**"
               - "python/sglang/jit_kernel/benchmark/diffusion/**"
@@ -148,7 +157,7 @@ jobs:
               - "python/sglang/jit_kernel/**"
             sgl_kernel:
               - ".github/workflows/pr-test-sgl-kernel.yml"
-              - "sgl-kernel/**/*.!(md|txt)"
+              - "sgl-kernel/**/!(*.md|THIRDPARTYNOTICES.txt|LICENSE)"
 
       # For /rerun-stage (workflow_dispatch with target_stage), dorny/paths-filter doesn't work
       # correctly because it falls back to "last commit" detection which breaks for merge commits.
@@ -188,9 +197,9 @@ jobs:
             echo "sgl_kernel=false" >> $GITHUB_OUTPUT
           fi
 
-          # Check for main_package changes (excluding multimodal_gen)
-          # Note: Need to filter out multimodal_gen before checking, not pipe grep -q output
-          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml|\.github/workflows/pr-gate\.yml|\.github/actions/)" | grep -v "^python/sglang/multimodal_gen/" || true)
+          # Check for main_package changes (excluding multimodal_gen, jit_kernel/diffusion, jit_kernel/tests/diffusion, jit_kernel/benchmark/diffusion, cli)
+          # Note: Need to filter out multimodal_gen and diffusion-related paths before checking, not pipe grep -q output
+          MAIN_PKG_FILES=$(echo "$CHANGED_FILES" | grep -E "^(python/sglang/|python/pyproject\.toml|scripts/ci/cuda/|scripts/ci/utils/|test/|\.github/workflows/pr-test\.yml|\.github/workflows/pr-gate\.yml|\.github/actions/)" | grep -v -E "^(python/sglang/multimodal_gen/|python/sglang/jit_kernel/diffusion/|python/sglang/jit_kernel/tests/diffusion/|python/sglang/jit_kernel/benchmark/diffusion/|python/sglang/cli/)" || true)
           if [ -n "$MAIN_PKG_FILES" ]; then
             echo "main_package=true" >> $GITHUB_OUTPUT
             echo "Detected main_package changes"
@@ -295,20 +304,26 @@ jobs:
           fi
 
       - name: Validate target_stage with kernel changes
-        # Use API-based detection (filter-api) for target_stage mode, otherwise use dorny/paths-filter (filter)
-        if: inputs.target_stage && (steps.filter-api.outputs.sgl_kernel == 'true' || steps.filter.outputs.sgl_kernel == 'true')
+        # Fail only when PR has sgl-kernel changes AND the caller didn't opt into include_wheel_build.
+        # include_wheel_build=true means sgl-kernel-build-wheels will run alongside the target stage
+        # (see the sgl_kernel output and sgl-kernel-build-wheels if-conditions above/below), so it's
+        # safe to proceed.
+        if: inputs.target_stage && !inputs.include_wheel_build && (steps.filter-api.outputs.sgl_kernel == 'true' || steps.filter.outputs.sgl_kernel == 'true')
         run: |
-          echo "::error::Cannot use /rerun-stage when PR has sgl-kernel changes."
-          echo "::error::The sgl-kernel-build-wheels job is skipped in target_stage mode, but this PR modifies sgl-kernel/ files."
-          echo "::error::Please use /tag-and-rerun-ci to run the full workflow including kernel builds."
+          echo "::error::Cannot use /rerun-stage when PR has sgl-kernel changes without include_wheel_build."
+          echo "::error::The sgl-kernel-build-wheels job is skipped in target_stage mode by default, but this PR modifies sgl-kernel/ files."
+          echo "::error::The slash-command handler should have set include_wheel_build=true automatically; falling back to /tag-and-rerun-ci."
           echo ""
-          echo "ERROR: Cannot use /rerun-stage when PR has sgl-kernel changes."
+          echo "ERROR: Cannot use /rerun-stage when PR has sgl-kernel changes without include_wheel_build."
           echo ""
           echo "This PR modifies files in sgl-kernel/, which requires building custom kernel wheels."
-          echo "The /rerun-stage command skips the wheel build job, so the test would run against"
-          echo "the wrong (PyPI) version of sgl-kernel instead of your changes."
+          echo "Running the target stage without rebuilding the kernel would use the wrong (PyPI)"
+          echo "version of sgl-kernel instead of your changes."
           echo ""
-          echo "To properly test your kernel changes, use one of these commands instead:"
+          echo "The /rerun-stage handler sets include_wheel_build=true automatically when it detects"
+          echo "sgl-kernel/ changes on the PR. If you see this error, the handler may be outdated."
+          echo ""
+          echo "Alternatives:"
           echo "  /tag-and-rerun-ci           - Re-run the full workflow including kernel builds"
           echo "  /rerun-ci                   - Re-run the full workflow"
           echo ""
@@ -323,7 +338,7 @@ jobs:
             echo "|-------------------|---------|"
             echo "| main_package      | ${{ steps.filter-api.outputs.main_package || steps.filter.outputs.main_package || steps.run-mode.outputs.run_all_tests }} |"
             echo "| sgl_kernel (raw)  | ${{ steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel }} |"
-            echo "| sgl_kernel (used) | ${{ !inputs.target_stage && (steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel) }} |"
+            echo "| sgl_kernel (used) | ${{ (!inputs.target_stage || inputs.include_wheel_build) && (steps.filter-api.outputs.sgl_kernel || steps.filter.outputs.sgl_kernel) }} |"
             echo "| jit_kernel        | ${{ steps.filter-api.outputs.jit_kernel || steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }} |"
             echo "| multimodal_gen    | ${{ steps.filter-api.outputs.multimodal_gen || steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }} |"
             echo "| target_stage      | ${{ inputs.target_stage || '(none)' }} |"
@@ -361,7 +376,7 @@ jobs:
         id: wait
         with:
           stage-name: stage-a
-          jobs: '["stage-a-test-1-gpu-small", "stage-a-test-cpu"]'
+          jobs: '["stage-a-test-1-gpu-small", {"prefix": "stage-a-test-cpu", "expected_count": 4}]'
           max-wait-minutes: '240'
 
   wait-for-stage-b:
@@ -417,8 +432,22 @@ jobs:
 
   sgl-kernel-build-wheels:
     needs: [check-changes, call-gate]
-    # Skip for scheduled runs (they run stages independently) and when target_stage is set
-    if: github.event_name != 'schedule' && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
+    # Skip for scheduled runs (they run stages independently). Runs in target_stage mode only when
+    # include_wheel_build is true (i.e. /rerun-stage on a PR with sgl-kernel changes), so the
+    # target stage can download the freshly-built wheel.
+    #
+    # `always()` lets us run when call-gate is skipped (which it always is in target_stage mode by
+    # design). The explicit needs.<x>.result checks preserve old gating for the normal PR path.
+    if: |
+      always() &&
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.sgl_kernel == 'true' &&
+      (
+        (!inputs.target_stage && needs.call-gate.result == 'success') ||
+        (inputs.target_stage && inputs.include_wheel_build)
+      )
     runs-on: x64-kernel-build-node
     timeout-minutes: 240
     strategy:
@@ -426,6 +455,8 @@ jobs:
         include:
           - python-version: "3.10"
             cuda-version: "13.0"
+          - python-version: "3.10"
+            cuda-version: "12.9"
     name: Build Wheel
     steps:
       - name: Cleanup
@@ -443,6 +474,26 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Free Docker disk space
+        run: |
+          set -x
+          # build.sh retags sgl-kernel-deps:cuda${CUDA_VERSION}-${PY_TAG}-${ARCH}
+          # on every run, leaving the previous image as a dangling <none>:<none>
+          # entry (~16-23 GB each). Prune them before building so the runner
+          # doesn't fill up. The local buildx cache at ~/.cache/sgl-kernel/buildx
+          # and the tagged sgl-kernel-deps image are not affected.
+          # `until=12h` avoids racing with a sibling matrix cell (cuda 12.9 vs
+          # 13.0) that may have just orphaned an image seconds ago.
+          docker image prune -f --filter "until=12h"
+          # Drop orphaned buildx builder volumes from past `docker buildx create`
+          # invocations. The active `sgl-kernel-builder` volume is held open and
+          # would fail to remove anyway, but skip it explicitly for clarity.
+          for v in $(docker volume ls -q | grep '^buildx_buildkit_' | grep -v '^buildx_buildkit_sgl-kernel-builder' || true); do
+            echo "Removing orphan buildx volume: $v"
+            docker volume rm "$v" || true
+          done
+          df -h /
 
       - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
         run: |
@@ -465,8 +516,20 @@ jobs:
 
   sgl-kernel-build-wheels-arm:
     needs: [check-changes, call-gate]
-    # Skip for scheduled runs (they run stages independently) and when target_stage is set
-    if: github.event_name != 'schedule' && inputs.test_parallel_dispatch != true && !inputs.target_stage && needs.check-changes.outputs.sgl_kernel == 'true'
+    # Skip for scheduled runs (they run stages independently). Runs in target_stage mode only when
+    # include_wheel_build is true (i.e. /rerun-stage on a PR with sgl-kernel changes).
+    #
+    # See sgl-kernel-build-wheels above for the always() + result-check rationale.
+    if: |
+      always() &&
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      needs.check-changes.result == 'success' &&
+      needs.check-changes.outputs.sgl_kernel == 'true' &&
+      (
+        (!inputs.target_stage && needs.call-gate.result == 'success') ||
+        (inputs.target_stage && inputs.include_wheel_build)
+      )
     runs-on: arm-kernel-build-node
     timeout-minutes: 240
     strategy:
@@ -474,6 +537,8 @@ jobs:
         include:
           - python-version: "3.10"
             cuda-version: "13.0"
+          - python-version: "3.10"
+            cuda-version: "12.9"
     name: Build Wheel Arm
     steps:
       - name: Cleanup
@@ -495,6 +560,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+
+      - name: Free Docker disk space
+        run: |
+          set -x
+          # See sgl-kernel-build-wheels above for the rationale.
+          docker image prune -f --filter "until=12h"
+          for v in $(docker volume ls -q | grep '^buildx_buildkit_' | grep -v '^buildx_buildkit_sgl-kernel-builder' || true); do
+            echo "Removing orphan buildx volume: $v"
+            docker volume rm "$v" || true
+          done
+          df -h /
 
       - name: Build wheel for Python ${{ matrix.python-version }} and CUDA ${{ matrix.cuda-version }}
         run: |
@@ -580,7 +656,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -616,6 +692,10 @@ jobs:
       )
     runs-on: ubuntu-latest
     timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [0, 1, 2, 3]
     steps:
       - name: Free disk space
         run: |
@@ -639,6 +719,19 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v5
 
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
+      - name: Install protoc + Rust toolchain
+        timeout-minutes: 10
+        run: bash scripts/ci/utils/install_rust_protoc.sh
+
+      - name: Rust cache (sglang-grpc)
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust/sglang-grpc
+          shared-key: "sglang-grpc-cpu"
+          save-if: ${{ matrix.partition == 0 }}
+
       # uv pip targets a venv by default; setup-python has no venv — install into that interpreter (see UV_SYSTEM_PYTHON in https://docs.astral.sh/uv/guides/integration/github/)
       - name: Install dependencies
         timeout-minutes: 20
@@ -653,7 +746,7 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cpu --suite stage-a-test-cpu $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cpu --suite stage-a-test-cpu --auto-partition-id ${{ matrix.partition }} --auto-partition-size 4 $CONTINUE_ON_ERROR_FLAG
 
   # Runs on 5090 (32GB, SM120)
   stage-b-test-1-gpu-small:
@@ -691,12 +784,11 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          source /etc/profile.d/sglang-ci.sh
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
@@ -704,7 +796,6 @@ jobs:
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
-          source /etc/profile.d/sglang-ci.sh
           cd test/
           python3 run_suite.py --hw cuda --suite stage-b-test-1-gpu-small --auto-partition-id ${{ matrix.partition }} --auto-partition-size 8 $CONTINUE_ON_ERROR_FLAG
 
@@ -730,7 +821,10 @@ jobs:
           ((needs.check-changes.outputs.main_package == 'true') || (needs.check-changes.outputs.sgl_kernel == 'true'))
         )
       )
-    runs-on: 1-gpu-h100
+    # `1-gpu-h100-h200` is a shared label advertised by both the 1-GPU H100 and
+    # 1-GPU H200 runner pools, so this job can land on either. Multimodal_gen
+    # jobs in pr-test-multimodal-gen.yml continue to pin to `1-gpu-h100`.
+    runs-on: 1-gpu-h100-h200
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -753,7 +847,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -812,7 +906,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -869,7 +963,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -930,7 +1024,7 @@ jobs:
     secrets: inherit
 
   stage-c-test-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -963,7 +1057,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -988,7 +1082,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1021,7 +1115,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1065,7 +1159,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-8-gpu-h20:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1101,7 +1195,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1126,7 +1220,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-deepep-4-gpu-h100:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1155,7 +1249,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1195,7 +1289,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-deepep-8-gpu-h200:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1224,7 +1318,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20
@@ -1265,7 +1359,7 @@ jobs:
         run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   stage-c-test-4-gpu-b200:
-    needs: [check-changes, call-gate, wait-for-stage-b]
+    needs: [check-changes, call-gate, wait-for-stage-b, sgl-kernel-build-wheels]
     if: |
       always() &&
       (
@@ -1299,7 +1393,7 @@ jobs:
         with:
           path: sgl-kernel/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.10-cuda*
 
       - name: Install dependencies
         timeout-minutes: 20

@@ -128,7 +128,7 @@ class SamplingParams:
 
     # Batch info
     num_outputs_per_prompt: int = 1
-    seed: int = 42
+    seed: int | list[int] = 42
     generator_device: str | None = None  # None means use the pipeline/model default
 
     # Original dimensions (before VAE scaling)
@@ -193,6 +193,9 @@ class SamplingParams:
     rollout_return_dit_trajectory: bool = (
         False  # per-step noisy latents + final latent + timesteps (RolloutDitTrajectory)
     )
+    # 0-indexed denoising-loop step filters; None = all steps.
+    rollout_sde_step_indices: list[int] | None = None
+    rollout_return_step_indices: list[int] | None = None
     # if True, disallow user params to override subclass-defined protected fields
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)
@@ -308,6 +311,23 @@ class SamplingParams:
         ):
             raise ValueError(
                 f"num_outputs_per_prompt must be a positive int, got {self.num_outputs_per_prompt!r}"
+            )
+
+        if isinstance(self.seed, list):
+            if not self.seed:
+                raise ValueError("seed list must not be empty")
+            for seed in self.seed:
+                if isinstance(seed, bool) or not isinstance(seed, int) or seed < 0:
+                    raise ValueError(
+                        f"seed list must contain non-negative ints, got {self.seed!r}"
+                    )
+        elif (
+            isinstance(self.seed, bool)
+            or not isinstance(self.seed, int)
+            or self.seed < 0
+        ):
+            raise ValueError(
+                "seed must be a non-negative int or list of ints, " f"got {self.seed!r}"
             )
 
         # Used by seconds() and video writer; fps <= 0 is always invalid.
@@ -571,18 +591,28 @@ class SamplingParams:
     def from_user_sampling_params_args(
         model_path: str, server_args: "ServerArgs", *args, **kwargs
     ):
+        pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
         try:
-            sampling_params = SamplingParams.from_pretrained(
-                model_path, backend=server_args.backend, model_id=server_args.model_id
-            )
-        except (AttributeError, ValueError) as e:
+            sampling_params = None
+            if pipeline_class_name:
+                from sglang.multimodal_gen.registry import get_pipeline_config_classes
+
+                config_classes = get_pipeline_config_classes(pipeline_class_name)
+                if config_classes is not None:
+                    _, sampling_params_cls = config_classes
+                    sampling_params = sampling_params_cls()
+
+            if sampling_params is None:
+                sampling_params = SamplingParams.from_pretrained(
+                    model_path,
+                    backend=server_args.backend,
+                    model_id=server_args.model_id,
+                )
+        except (AttributeError, ValueError):
             # Handle safetensors files or other cases where model_index.json is not available
             # Use appropriate SamplingParams based on pipeline_class_name from registry
             if os.path.isfile(model_path) and model_path.endswith(".safetensors"):
                 # Determine which sampling params to use based on pipeline_class_name
-                pipeline_class_name = getattr(server_args, "pipeline_class_name", None)
-
-                # Try to get SamplingParams from registry
                 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 
                 config_classes = (
@@ -616,7 +646,7 @@ class SamplingParams:
         user_kwargs = dict(kwargs)
         user_kwargs.pop("diffusers_kwargs", None)
 
-        user_sampling_params = SamplingParams(*args, **user_kwargs)
+        user_sampling_params = type(sampling_params)(*args, **user_kwargs)
         # TODO: refactor
         sampling_params._merge_with_user_params(
             user_sampling_params, explicit_fields=set(user_kwargs.keys())
@@ -715,6 +745,7 @@ class SamplingParams:
         add_argument(
             "--seed",
             type=int,
+            nargs="+",
             help="Random seed for generation",
         )
         add_argument(
@@ -948,11 +979,14 @@ class SamplingParams:
         sampling_params_fields = {attr.name for attr in dataclasses.fields(cls)}
         args_attrs = set(vars(args).keys())
         attrs = sampling_params_fields & args_attrs
-        return {
+        cli_args = {
             attr: getattr(args, attr)
             for attr in attrs
             if hasattr(args, attr) and getattr(args, attr) is not None
         }
+        if isinstance(cli_args.get("seed"), list) and len(cli_args["seed"]) == 1:
+            cli_args["seed"] = cli_args["seed"][0]
+        return cli_args
 
     def output_file_path(self):
         if self.output_path is None:
@@ -982,7 +1016,14 @@ class SamplingParams:
         for field in dataclasses.fields(user_params):
             field_name = field.name
             user_value = getattr(user_params, field_name)
-            default_class_value = getattr(SamplingParams, field_name)
+            if hasattr(SamplingParams, field_name):
+                default_class_value = getattr(SamplingParams, field_name)
+            elif field.default is not dataclasses.MISSING:
+                default_class_value = field.default
+            elif field.default_factory is not dataclasses.MISSING:
+                default_class_value = field.default_factory()
+            else:
+                default_class_value = dataclasses.MISSING
 
             is_user_modified = user_value != default_class_value or (
                 explicit_fields is not None and field_name in explicit_fields

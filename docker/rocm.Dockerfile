@@ -1,14 +1,18 @@
 # Usage (to build SGLang ROCm docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx942 -t v0.5.9-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.9-rocm720-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx950 -t v0.5.9-rocm700-mi35x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.9-rocm720-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
 # Usage (to build SGLang ROCm + Mori docker image):
-#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.9-rocm700-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.9-rocm720-mi30x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.9-rocm700-mi35x -f rocm.Dockerfile .
-#   docker build --build-arg SGL_BRANCH=v0.5.9 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 --build-arg NIC_BACKEND=ainic -t v0.5.9-rocm720-mi35x -f rocm.Dockerfile .
+# remove --build-arg NIC_BACKEND=ainic since new MoRI JIT will do NIC auto detection on target
+# Keep the build-arg for user to select the desired nic support, current choice: [ainic, bxnt]
+# if no set this arg, it will support nic auto detection. On a target with more than 1 type of
+# RDMA NICs installed (rare), overwrite w. runtime env MORI_DEVICE_NIC = "bnxt"|"ionic"|"mlx5"
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
+#   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
@@ -27,7 +31,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
+ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
 
 # ===============================
 # Base image 942 with rocm720 and args
@@ -37,7 +41,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
+ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
 
 # ===============================
 # Base image 950 and args
@@ -47,7 +51,7 @@ ENV BUILD_TRITON="0"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
+ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
 
 # ===============================
 # Base image 950 with rocm720 and args
@@ -57,7 +61,7 @@ ENV BUILD_TRITON="1"
 ENV BUILD_LLVM="0"
 ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
-ENV AITER_COMMIT_DEFAULT="v0.1.12.post1"
+ENV AITER_COMMIT_DEFAULT="a6bb499375849eec45d68c5ccaebc8865fd422c0"
 
 # ===============================
 # Chosen arch and args
@@ -100,10 +104,10 @@ ARG ENABLE_MORI=0
 ARG NIC_BACKEND=none
 
 ARG MORI_REPO="https://github.com/ROCm/mori.git"
-ARG MORI_COMMIT="v1.1.0"
+ARG MORI_COMMIT="v1.1.1"
 
 # AMD AINIC apt repo settings
-ARG AINIC_VERSION=1.117.5
+ARG AINIC_VERSION=1.117.5-a-38
 ARG UBUNTU_CODENAME=jammy
 USER root
 
@@ -267,6 +271,9 @@ ENV CARGO_BUILD_JOBS=4
 
 # Build and install sgl-model-gateway
 RUN python3 -m pip install --no-cache-dir maturin \
+    && sed -i -E 's|^(smg-[a-zA-Z-]+)\s*=\s*"~1\.0\.0"|\1 = "=1.0.0"|' \
+           /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
+    && grep -E '^smg-' /sgl-workspace/sglang/sgl-model-gateway/Cargo.toml \
     && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
     && ulimit -n 65536 && maturin build --release --features vendored-openssl --out dist \
     && python3 -m pip install --force-reinstall dist/*.whl \
@@ -383,8 +390,25 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   # NIC backend deps — mori auto-detects NIC at runtime (MORI_DEVICE_NIC env var override).
   # Only vendor packages are installed here for dlopen (e.g. libionic.so); no compile-time flags needed.
   case "${NIC_BACKEND}" in \
-    # default: mlx5
+    # default: install ainic and bxnt driver
     none) \
+      apt-get update && apt-get install -y --no-install-recommends ca-certificates curl gnupg apt-transport-https && \
+      rm -rf /var/lib/apt/lists/* && mkdir -p /etc/apt/keyrings; \
+      curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | gpg --dearmor > /etc/apt/keyrings/amdainic.gpg; \
+      echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${UBUNTU_CODENAME} main" \
+        > /etc/apt/sources.list.d/amdainic.list; \
+      apt-get update && apt-get install -y --no-install-recommends \
+          libionic-dev \
+          ionic-common \
+      ; \
+      rm -rf /var/lib/apt/lists/*; \
+      install -m 0755 -d /etc/apt/keyrings \
+      && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
+      && chmod a+r /etc/apt/keyrings/broadcom-nic.asc \
+      && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" > /etc/apt/sources.list.d/broadcom-nic.list \
+      && apt-get update \
+      && apt-get install -y ibverbs-utils bnxt-rocelib=235.2.86.0 \
+      && cp /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/. \
       ;; \
     # AMD NIC
     ainic) \
@@ -399,10 +423,18 @@ RUN /bin/bash -lc 'set -euo pipefail; \
       ; \
       rm -rf /var/lib/apt/lists/*; \
       ;; \
-    # TODO: Add Broadcom bnxt packages/repos here later.
-    # bnxt) \
-    #   echo "[MORI] NIC_BACKEND=bnxt: USE_BNXT=ON. Add Broadcom bnxt packages/repos here later."; \
-    #   ;; \
+     bnxt) \
+       echo "[MORI] Enabling Broadcom BNXT backend"; \
+       apt-get update \
+       && apt-get install -y --no-install-recommends ca-certificates curl \
+       && install -m 0755 -d /etc/apt/keyrings \
+       && curl -fsSL https://packages.broadcom.com/artifactory/api/security/keypair/PackagesKey/public -o /etc/apt/keyrings/broadcom-nic.asc \
+       && chmod a+r /etc/apt/keyrings/broadcom-nic.asc \
+       && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/broadcom-nic.asc] https://packages.broadcom.com/artifactory/ethernet-nic-debian-public jammy main" > /etc/apt/sources.list.d/broadcom-nic.list \
+       && apt-get update \
+       && apt-get install -y ibverbs-utils bnxt-rocelib=235.2.86.0 \
+       && cp /usr/local/lib/x86_64-linux-gnu/libbnxt_re* /usr/local/lib/. \
+       ;; \
     *) \
       echo "ERROR: unknown NIC_BACKEND=${NIC_BACKEND}. Use one of: none, ainic"; \
       exit 2; \
