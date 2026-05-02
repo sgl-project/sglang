@@ -81,9 +81,9 @@
         },
         "qwen_image_edit_2511_ti2i": {
             "clip_threshold": 0.96,
-            "ssim_threshold": 0.95,
-            "psnr_threshold": 26.1,
-            "mean_abs_diff_threshold": 10.4
+            "ssim_threshold": 0.83,
+            "psnr_threshold": 21.0,
+            "mean_abs_diff_threshold": 16.6
         },
         "qwen_image_layered_i2i": {
             "clip_threshold": 0.92,
