@@ -1,6 +1,8 @@
 import random
 import unittest
 
+import torch
+
 import sglang as sgl
 from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -16,6 +18,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=357, stage="extra-a", runner_config="1-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLEEngine(CustomTestCase):
     BASE_CONFIG = {
         "model_path": DEFAULT_TARGET_MODEL_EAGLE,
@@ -160,6 +163,7 @@ class TestEAGLEEngine(CustomTestCase):
         self.assertGreater(acc_length, self.THRESHOLDS["accept_len"])
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLEEngineTokenMap(TestEAGLEEngine):
     BASE_CONFIG = {
         "model_path": "meta-llama/Meta-Llama-3-8B-Instruct",
@@ -180,6 +184,7 @@ class TestEAGLEEngineTokenMap(TestEAGLEEngine):
     }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEAGLE3Engine(TestEAGLEEngine):
     BASE_CONFIG = {
         "model_path": DEFAULT_TARGET_MODEL_EAGLE3,

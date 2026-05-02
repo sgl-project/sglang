@@ -17,6 +17,8 @@ import os
 import unittest
 from typing import List, Optional
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
     ALL_OTHER_LORA_MODELS,
@@ -41,6 +43,7 @@ register_amd_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRATP(CustomTestCase):
 
     def _run_tp_on_model_cases(
