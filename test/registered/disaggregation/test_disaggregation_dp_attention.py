@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+import torch
 
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -17,6 +18,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=140, stage="base-c", runner_config="8-gpu-h20")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationDPAttention(PDDisaggregationServerBase):
     """The dispatch algorithm itself is covered in
     test/registered/unit/managers/test_data_parallel_controller.py.
