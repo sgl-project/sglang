@@ -700,14 +700,6 @@ class SWARadixCache(BasePrefixCache):
             node = node.parent
         return IncLockRefResult(swa_uuid_for_lock=swa_uuid_for_lock)
 
-    # TODO(DSV4) @ispobock: please review the rebase of `97d1a672fe release lock
-    # after window` onto main #20330's unified lock interface. main wraps
-    # (node, swa_uuid_for_lock) into DecLockRefParams, so we kept `skip_swa` as
-    # an extra kwarg on this override (Liskov-compatible default-valued param)
-    # rather than forking `DecLockRefParams` in base_prefix_cache.py. This
-    # localizes the dsv4 SWA leaf-lock release protocol to the SWARadixCache
-    # subclass and the two call sites in cache_finished_req / cache_unfinished_req
-    # below. dec_swa_lock_only stays unchanged as fork-only API.
     def dec_lock_ref(
         self,
         node: TreeNode,
@@ -967,6 +959,9 @@ class SWARadixCache(BasePrefixCache):
         )
 
     def _compact_single_child_chain(self, node: TreeNode) -> None:
+        # FIXME(ispobock): drifts retract pool accounting (commit 6348cb506);
+        # also overwrites active swa_uuid when window > page_size. Off by
+        # default via SGLANG_OPT_SWA_RADIX_CACHE_COMPACT.
         while len(node.children) == 1:
             child = next(iter(node.children.values()))
             if len(child.children) == 0:
@@ -1178,10 +1173,6 @@ class SWARadixCache(BasePrefixCache):
             #    Note: the -page_size fix in _evict_swa prevents this case from
             #    occurring in normal operation. This check is a defensive guard
             #    against unexpected eviction states from other code paths.
-            logger.debug(
-                f"Has Additional Node: len(key)={len(key)}, total_prefix_length={total_prefix_length}, swa_evicted_seqlen={swa_evicted_seqlen}, len(value)={len(value)}"
-            )
-
             if swa_evicted_seqlen == total_prefix_length + len(key):
                 self.token_to_kv_pool_allocator.free(value)
                 return total_prefix_length
