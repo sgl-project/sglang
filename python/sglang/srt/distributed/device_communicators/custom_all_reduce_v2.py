@@ -8,7 +8,9 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 from sglang.jit_kernel.all_reduce import AllReduceAlgo, get_custom_all_reduce_cls
+from sglang.srt.distributed import is_in_piecewise_cuda_graph
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+    can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
 )
 from sglang.srt.utils import is_sm100_supported, log_info_on_rank0
@@ -38,6 +40,15 @@ class CustomAllReduceV2:
     ) -> None:
         _init_config()
         self.disabled = True
+        full_nvlink = can_use_custom_all_reduce_with_nvlink(
+            group=group,
+            device=device,
+            supported_world_size=list(THRESHOLD_2_SHOT_MAP.keys()),
+            cls_name="CustomAllReduceV2",
+        )
+        if full_nvlink != True:
+            return
+
         self.group = group
         self.rank = dist.get_rank(group=self.group)
         self.world_size = dist.get_world_size(group=self.group)
@@ -114,6 +125,12 @@ class CustomAllReduceV2:
         return inp_size <= self.max_size
 
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor:
+        if is_in_piecewise_cuda_graph():  # disable inplace optimization
+            try:
+                self.obj.set_cuda_graph_capture(False)
+                return self._all_reduce(input)
+            finally:
+                self.obj.set_cuda_graph_capture(True)
         return self._all_reduce(input)
 
     def close(self):
