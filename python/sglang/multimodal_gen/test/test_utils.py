@@ -745,7 +745,18 @@ def get_clip_model() -> tuple[Any, Any]:
             ) from exc
 
         logger.info(f"Loading CLIP model: {CLIP_MODEL_NAME}")
-        processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
+        try:
+            processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
+        except TypeError as e:
+            if "RobertaProcessing" not in str(e):
+                raise
+            logger.warning(
+                "Fast CLIP processor failed (%s), retrying with use_fast=False", e
+            )
+            processor = CLIPProcessor.from_pretrained(
+                CLIP_MODEL_NAME,
+                use_fast=False,
+            )
         model = CLIPModel.from_pretrained(CLIP_MODEL_NAME)
 
         device = "cuda" if torch.cuda.is_available() else "cpu"
