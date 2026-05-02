@@ -32,6 +32,7 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
+import pybase64
 import torch
 import uvloop
 import zmq
@@ -1702,8 +1703,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "routed_experts", None):
-                if recv_obj.routed_experts[i] is not None:
-                    meta_info["routed_experts"] = recv_obj.routed_experts[i]
+                val = recv_obj.routed_experts[i]
+                if val is not None:
+                    # BatchStrOutput is pre-encoded by the detokenizer;
+                    # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
+                    if isinstance(val, torch.Tensor):
+                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                    meta_info["routed_experts"] = val
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
