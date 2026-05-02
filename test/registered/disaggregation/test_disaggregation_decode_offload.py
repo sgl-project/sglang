@@ -3,6 +3,8 @@ import shutil
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -24,6 +26,7 @@ register_cuda_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
     """
     Test class for verifying KV cache offloading on the decode side in a
