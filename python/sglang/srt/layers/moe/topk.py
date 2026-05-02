@@ -32,7 +32,50 @@ import torch
 import torch.nn.functional as F
 
 try:
-    from triton_kernels.routing import GatherIndx, RoutingData, ScatterIndx, routing
+    from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
+    from triton_kernels.tensor import make_ragged_tensor_metadata
+    from triton_kernels.topk import topk as triton_kernels_topk
+
+    def routing(
+        logits,
+        n_expts_act,
+        sm_first=False,
+        expt_indx=None,
+        simulated_ep=1,
+        n_rows=None,
+    ):
+        if simulated_ep != 1:
+            raise NotImplementedError(
+                "simulated_ep routing is not supported with triton_kernels 3.6.0"
+            )
+
+        if sm_first:
+            logits = torch.softmax(logits, dim=-1)
+
+        sparse_logits = triton_kernels_topk(
+            logits,
+            n_expts_act,
+            apply_softmax=not sm_first,
+            y_indx=expt_indx,
+            n_rows=n_rows,
+        )
+        dispatch_indx = sparse_logits.mask_metadata.row_sorted_indx
+        combine_indx = sparse_logits.mask_metadata.col_sorted_indx
+        ragged_metadata = make_ragged_tensor_metadata(
+            sparse_logits.mask_metadata.col_sum, dispatch_indx.shape[0]
+        )
+        gate_scal = sparse_logits.vals.flatten()[combine_indx]
+        routing_data = RoutingData(
+            gate_scal,
+            ragged_metadata.slice_sizes,
+            logits.shape[-1],
+            n_expts_act,
+            ragged_metadata,
+        )
+        gather_indx = GatherIndx(combine_indx, dispatch_indx)
+        scatter_indx = ScatterIndx(dispatch_indx, combine_indx)
+        return routing_data, gather_indx, scatter_indx
+
 except ImportError:
     pass
 
