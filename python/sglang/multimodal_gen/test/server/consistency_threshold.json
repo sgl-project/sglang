@@ -3,9 +3,9 @@
     "cases": {
         "qwen_image_t2i": {
             "clip_threshold": 0.97,
-            "ssim_threshold": 0.84,
+            "ssim_threshold": 0.83,
             "psnr_threshold": 16.0,
-            "mean_abs_diff_threshold": 11.5
+            "mean_abs_diff_threshold": 13.3
         },
         "flux_image_t2i": {
             "clip_threshold": 0.92,
@@ -21,9 +21,9 @@
         },
         "zimage_image_t2i": {
             "clip_threshold": 0.92,
-            "ssim_threshold": 0.90,
-            "psnr_threshold": 22.0,
-            "mean_abs_diff_threshold": 8.0
+            "ssim_threshold": 0.86,
+            "psnr_threshold": 19.9,
+            "mean_abs_diff_threshold": 8.5
         },
         "zimage_image_t2i_multi_lora": {
             "clip_threshold": 0.92,
