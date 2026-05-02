@@ -437,6 +437,7 @@ def compare_logprobs(
     return results, overall_stats
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAHFSGLLogprobDifference(CustomTestCase):
     """
     Test case to compare log probabilities between HuggingFace+LoRA and SGLang+LoRA.

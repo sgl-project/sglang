@@ -3,6 +3,7 @@
 import unittest
 
 import openai
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -48,6 +49,7 @@ def setup_class(cls, *, enable_lora):
     cls.client = openai.Client(api_key="EMPTY", base_url=f"{cls.base_url}/v1")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAOpenAICompatible(CustomTestCase):
     """Verify that ``model:adapter`` reaches the LoRA registry."""
 
@@ -74,6 +76,7 @@ class TestLoRAOpenAICompatible(CustomTestCase):
         self.assertIn("nonexistent", error_message)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRADisabledError(CustomTestCase):
     """Verify the disabled-LoRA request contract."""
 
