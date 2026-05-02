@@ -13,20 +13,6 @@
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx942-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi30x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm700-mi35x -f rocm.Dockerfile .
 #   docker build --build-arg SGL_BRANCH=v0.5.10.post1 --build-arg GPU_ARCH=gfx950-rocm720 --build-arg ENABLE_MORI=1 -t v0.5.10.post1-rocm720-mi35x -f rocm.Dockerfile .
-#
-# This Dockerfile uses multi-stage builds to keep build-time toolchains
-# (Rust, Go, full source trees, .o files) out of the final image. Builder
-# stages produce wheels / installed library trees that are COPYed into the
-# final stage. BuildKit (DOCKER_BUILDKIT=1, default in modern docker) is
-# strongly recommended -- builder stages run in parallel and unused stages
-# are skipped automatically.
-#
-# Two install styles are intentionally preserved:
-#   * Editable (`pip install -e .`) for AITER, SGLang and MORI: these are
-#     the components developers iterate on inside the container.
-#   * Non-editable (wheel/install-from-builder) for Triton, TileLang, FHT,
-#     sgl-model-gateway and Mooncake: build artifacts are discarded with
-#     the builder stage so only runtime files land in the final image.
 
 # Default base images
 ARG BASE_IMAGE_942="rocm/sgl-dev:rocm7-vllm-20250904"
@@ -77,9 +63,8 @@ ENV BUILD_AITER_ALL="1"
 ENV BUILD_MOONCAKE="1"
 ENV AITER_COMMIT_DEFAULT="32e1e6d76988e4fbc67cabd9eb72a45a3c6a1bab"
 
-# ================================================================
-# Builder stage: sgl-model-gateway (Rust wheel, ~5.8 GB discarded)
-# ================================================================
+# ===============================
+# Builder stage: sgl-model-gateway
 FROM ${GPU_ARCH} AS builder-gateway
 
 ARG GPU_ARCH=gfx950
@@ -89,9 +74,6 @@ ARG SGL_BRANCH=${SGL_DEFAULT}
 
 ENV PATH="/root/.cargo/bin:${PATH}"
 
-# Clone sglang sources, install Rust + maturin and build the gateway wheel
-# into /tmp/gateway-wheel. Only the wheel is COPYed into the final image,
-# so the Rust toolchain (~1.3 GB) and cargo target dir (~4.5 GB) are dropped.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/* \
@@ -106,9 +88,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && ulimit -n 65536 && CARGO_BUILD_JOBS=4 maturin build \
         --release --features vendored-openssl --out /tmp/gateway-wheel
 
-# ================================================================
-# Builder stage: Mooncake (Go + C++, ~6 GB discarded)
-# ================================================================
+# ===============================
+# Builder stage: Mooncake
 FROM ${GPU_ARCH} AS builder-mooncake
 
 ARG GPU_ARCH=gfx950
@@ -117,11 +98,8 @@ ARG MOONCAKE_COMMIT="b6a841dc78c707ec655a563453277d969fb8f38d"
 
 ENV PATH=$PATH:/usr/local/go/bin
 
-# Build Mooncake with DESTDIR staging so we capture only the install tree
-# (libetcd_wrapper.so, transfer_engine_c.h, mooncake_master, python bindings)
-# and discard the Go toolchain, source, and intermediate build dir.
-# Always create the staging dir so unconditional COPY --from never fails.
-# When BUILD_MOONCAKE!=1 we skip the build but still leave the placeholder.
+# Always create the staging dir so the unconditional COPY --from in the
+# final stage is a safe no-op when BUILD_MOONCAKE != 1.
 RUN mkdir -p /mooncake-install/usr/local \
     && if [ "$BUILD_MOONCAKE" = "1" ]; then \
         apt-get update && apt-get install -y --no-install-recommends \
@@ -145,9 +123,8 @@ RUN mkdir -p /mooncake-install/usr/local \
         && DESTDIR=/mooncake-install make install; \
     fi
 
-# ================================================================
-# Builder stage: fast-hadamard-transform (HIP wheel)
-# ================================================================
+# ===============================
+# Builder stage: fast-hadamard-transform
 FROM ${GPU_ARCH} AS builder-fht
 
 ARG FHT_REPO="https://github.com/jeffdaily/fast-hadamard-transform.git"
@@ -160,9 +137,8 @@ RUN pip install --no-cache-dir wheel \
     && git checkout -f "${FHT_COMMIT}" \
     && FAST_HADAMARD_TRANSFORM_FORCE_BUILD=TRUE python setup.py bdist_wheel -d /tmp/fht-wheel
 
-# ================================================================
-# Builder stage: TileLang (~2.3 GB discarded)
-# ================================================================
+# ===============================
+# Builder stage: TileLang
 FROM ${GPU_ARCH} AS builder-tilelang
 
 ARG GPU_ARCH=gfx950
@@ -171,8 +147,6 @@ ARG TILELANG_COMMIT="a55a82302bf7f3c5af635b5c9146f728185cc900"
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-# Build TileLang as a wheel; only the wheel is COPYed to final image.
-# All build-time apt packages (LLVM, gtest, gflags, etc.) are discarded.
 RUN /bin/bash -lc 'set -euo pipefail; \
   echo "[TileLang] Building TileLang wheel for ${GPU_ARCH}"; \
   apt-get update && apt-get install -y --no-install-recommends \
@@ -234,16 +208,16 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   export CMAKE_ARGS="-DUSE_CUDA=OFF -DUSE_ROCM=ON -DROCM_PATH=/opt/rocm -DLLVM_CONFIG=${LLVM_CONFIG} -DSKBUILD_SABI_VERSION= ${CMAKE_ARGS:-}" && \
   "$VENV_PIP" wheel -w /tmp/tilelang-wheel . -v --no-build-isolation --no-deps'
 
-# ================================================================
-# Builder stage: Triton custom build (~16 GB of .o files discarded)
-# ================================================================
+# ===============================
+# Builder stage: Triton custom build
 FROM ${GPU_ARCH} AS builder-triton
 
 ARG TRITON_REPO="https://github.com/triton-lang/triton.git"
 ARG TRITON_COMMIT="42270451990532c67e69d753fbd026f28fcc4840"
 
 # BUILD_TRITON is inherited as ENV from the selected base stage.
-# Always create output dir so COPY --from never fails when triton is not built.
+# Always create the output dir so the COPY --from in the final stage is a
+# safe no-op when BUILD_TRITON != 1.
 RUN mkdir -p /tmp/triton-wheel \
     && if [ "$BUILD_TRITON" = "1" ]; then \
         pip uninstall -y triton 2>/dev/null || true \
@@ -256,9 +230,8 @@ RUN mkdir -p /tmp/triton-wheel \
      && pip wheel --no-cache-dir --no-deps -w /tmp/triton-wheel .; \
     fi
 
-# ================================================================
+# ===============================
 # Final stage
-# ================================================================
 FROM ${GPU_ARCH}
 
 # This is necessary for scope purpose, again
@@ -380,7 +353,7 @@ RUN if [ "$BUILD_LLVM" = "1" ]; then \
     fi
 
 # -----------------------
-# AITER (editable; source kept for in-container development)
+# AITER
 # Unset setuptools_scm override so AITER gets its own version (AITER_COMMIT), not SGLang's
 # (SETUPTOOLS_SCM_PRETEND_VERSION is set later for SGLang nightly builds and would otherwise
 # leak into AITER's version when AITER uses setuptools_scm)
@@ -409,15 +382,12 @@ RUN pip uninstall -y aiter 2>/dev/null || true \
       sh -c "GPU_ARCHS=$GPU_ARCH_LIST pip install --no-cache-dir --config-settings editable_mode=compat -e ."; \
     fi \
  && echo "export PYTHONPATH=/sgl-workspace/aiter:\${PYTHONPATH}" >> /etc/bash.bashrc \
- # Cleanup: remove .o files (source kept; .git shrunk via gc).
- # Do NOT touch *.so — those are the prebuilt kernels for runtime.
+ # Drop .o files and shrink .git; keep the source tree and .so kernels.
  && find /sgl-workspace/aiter -name '*.o' -delete 2>/dev/null || true \
  && (cd /sgl-workspace/aiter && git reflog expire --expire=now --all && git gc --prune=now --quiet) || true
 
 # -----------------------
-# Mooncake: install runtime deps + copy build artifacts from builder stage
-# Build-time deps (gcc/make/libtool/autoconf, the Go toolchain, etc.) live
-# only in builder-mooncake and are dropped from the final image.
+# Mooncake: install runtime deps; build artifacts come from builder-mooncake.
 RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      apt-get update && apt-get install -y --no-install-recommends \
          librdmacm-dev rdmacm-utils infiniband-diags ibverbs-utils perftest ethtool \
@@ -429,13 +399,10 @@ RUN if [ "$BUILD_MOONCAKE" = "1" ]; then \
      && rm -rf /var/lib/apt/lists/*; \
     fi
 
-# Copy Mooncake DESTDIR install tree (libetcd_wrapper.so, mooncake_master, etc.).
-# When BUILD_MOONCAKE=0 the staging dir contains only an empty `/usr/local`
-# placeholder so this COPY is a no-op.
 COPY --from=builder-mooncake /mooncake-install/ /
 
 # -----------------------
-# Build SGLang (sgl-kernel + editable sglang in a single layer)
+# Build SGLang
 ARG BUILD_TYPE=all
 
 # Set version for setuptools_scm if provided (for nightly builds). Only pass in the SGLang
@@ -473,15 +440,14 @@ RUN find /sgl-workspace/sglang/python/sglang/srt/layers/quantization/configs/ \
          -type f -name '*MI300X*' | xargs -I {} sh -c 'vf_config=$(echo "$1" | sed "s/MI300X/MI300X_VF/"); cp "$1" "$vf_config"' -- {}
 
 # -----------------------
-# sgl-model-gateway: install wheel built in builder stage. The Rust toolchain
-# (~1.3 GB) and cargo target dir (~4.5 GB) never enter the final image.
+# Install sgl-model-gateway from builder-gateway wheel.
 COPY --from=builder-gateway /tmp/gateway-wheel/ /tmp/gateway-wheel/
 RUN pip install --no-cache-dir --force-reinstall /tmp/gateway-wheel/*.whl \
     && rm -rf /tmp/gateway-wheel /root/.cache
 
 # -----------------------
-# TileLang: install wheel built in builder stage. Runtime deps tvm_ffi and
-# z3-solver are required by the bundled TVM.
+# Install TileLang from builder-tilelang wheel; tvm_ffi and z3-solver are
+# runtime deps of the bundled TVM.
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LIBGL_ALWAYS_INDIRECT=1
 RUN echo "LC_ALL=en_US.UTF-8" >> /etc/environment
@@ -500,13 +466,10 @@ RUN /bin/bash -lc 'set -euo pipefail; \
   "$VENV_PY" -c "import tilelang; print(tilelang.__version__)"'
 
 # -----------------------
-# fast-hadamard-transform: install wheel built in builder stage.
-# --no-deps is critical: the wheel declares `torch` as a runtime dep, and
-# without --no-deps pip resolves that to the latest PyPI CUDA torch
-# (currently torch-2.11.0+cu130), which silently replaces the base image's
-# ROCm torch and breaks the whole stack with `operator torchvision::nms
-# does not exist` at server start. The base image already provides a
-# compatible torch, so we only want the FHT package itself.
+# Install fast-hadamard-transform from builder-fht wheel. --no-deps is
+# required because the wheel declares torch as a runtime dep, and pip would
+# otherwise resolve it to PyPI CUDA torch and replace the ROCm torch from
+# the base image.
 COPY --from=builder-fht /tmp/fht-wheel/ /tmp/fht-wheel/
 RUN pip install --no-cache-dir --no-deps --force-reinstall /tmp/fht-wheel/*.whl \
     && rm -rf /tmp/fht-wheel
@@ -518,7 +481,7 @@ RUN python3 -m pip install --no-cache-dir \
     tabulate
 
 # -----------------------
-# MORI (optional, editable; source kept for in-container development)
+# MORI (optional)
 RUN /bin/bash -lc 'set -euo pipefail; \
   if [ "${ENABLE_MORI}" != "1" ]; then \
     echo "[MORI] Skipping (ENABLE_MORI=${ENABLE_MORI})"; \
@@ -609,10 +572,9 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 # -----------------------
 # Hot patch: torch-ROCm
 # The artifact hardcoded the supported triton version to be 3.5.1.
-# Rewrite the restriction directly. The extract+install+cleanup all run in
-# a single RUN so the 3.3 GB extracted wheel tree never lingers as its own
-# layer (creating hack.py is a separate tiny RUN — heredoc + case in one
-# RUN does not parse reliably under /bin/sh).
+# Rewrite the restriction directly. hack.py is written in its own RUN
+# because heredoc + case in a single RUN does not parse reliably under
+# /bin/sh.
 ARG TORCH_ROCM_FILE="torch-2.9.1+rocm7.2.0.lw.git7e1940d4-cp310-cp310-linux_x86_64.whl"
 RUN mkdir -p /tmp/whl && cat > /tmp/whl/hack.py <<"PY"
 import zipfile, csv, os, re
@@ -679,9 +641,8 @@ RUN set -eux; \
 
 
 # -----------------------
-# Triton (non-editable): install wheel built in builder stage.
-# For ROCm 7.2 this custom build replaces the stock triton wheel; if
-# BUILD_TRITON=0 the builder stage produced no wheel and this is a no-op.
+# Install custom Triton from builder-triton wheel (ROCm 7.2 only). When
+# BUILD_TRITON=0 the builder produced no wheel and this is a no-op.
 COPY --from=builder-triton /tmp/triton-wheel/ /tmp/triton-wheel/
 RUN set -eux; \
     if ls /tmp/triton-wheel/*.whl 1>/dev/null 2>&1; then \
