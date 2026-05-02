@@ -7,6 +7,7 @@ import json
 import unittest
 
 import requests
+import torch
 from transformers import AutoProcessor, AutoTokenizer
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
@@ -27,6 +28,7 @@ register_cuda_ci(est_time=79, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=117, suite="stage-b-test-1-gpu-small-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestSkipTokenizerInit(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -203,6 +205,7 @@ class TestSkipTokenizerInit(CustomTestCase):
         }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestSkipTokenizerInitVLM(TestSkipTokenizerInit):
     @classmethod
     def setUpClass(cls):

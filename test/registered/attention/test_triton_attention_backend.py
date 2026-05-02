@@ -6,6 +6,8 @@ python3 -m unittest test_triton_attention_backend.TestTritonAttnBackend.test_mml
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -24,6 +26,7 @@ register_cuda_ci(est_time=177, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=1400, suite="stage-b-test-1-gpu-small-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestTritonAttnBackend(CustomTestCase):
     def test_latency(self):
         output_throughput = run_bench_offline_throughput(
