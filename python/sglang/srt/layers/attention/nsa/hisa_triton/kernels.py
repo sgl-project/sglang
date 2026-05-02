@@ -890,33 +890,18 @@ def block_sparse_mqa_triton(
         (seq_len, topk * kv_block_size), device=q_fp8.device, dtype=torch.float32,
     )
 
-    # Unified persistent dispatch for K∈{8,16,32,64,128}. Per-K config tuned
-    # at production block_topk = 8192//K, sq=8192, skv∈{16K..128K}.
-    # Two regimes by GEMM_TILE:
-    #   GEMM_TILE=256 (K∈{16,32,64}, num_warps=8, num_stages=3): wide
-    #     wgmma tile fills one CTA's compute, 8 warps amortize occupancy.
-    #   GEMM_TILE=128 (K∈{8,128}, num_warps=4): extreme K values prefer
-    #     a narrower tile + fewer warps. K=8 has tiny per-topk K rows; K=128
-    #     fills the tile with one topk index already so doubling regresses.
-    # All entries are full persistent at prod block_topk: K_CHUNKS = num_chunks
-    # per seq → 1 CTA per query, Q[H,D] + W[H] loaded once per CTA.
-    # Speedups vs tilelang baseline (or prior in-tree):
-    #   K=8:   1.21-1.24× (was grouped, no persistent)
-    #   K=16:  1.01-1.02× (was K_CHUNKS=16)
-    #   K=32:  1.01-1.02× (was K_CHUNKS=16)
-    #   K=64:  1.30-1.31× (was grouped, no persistent)
-    #   K=128: 1.35-1.38× (was tilelang)
     K_CONFIG = {
         # (GROUP_SIZE, K_CHUNKS, num_warps, num_stages)
-        8:   (16, 64, 4, 2),
+        # K=8 K_CHUNKS=32 (not 64): KC=64 catastrophically regressed at
+        # block_topk≤256 (constexpr loop runs full 64 iters, half masked).
+        # KC=32 wins universally across block_topk ∈ {256,512,1024,2048}.
+        8:   (8,  32, 4, 2),
         16:  (16, 32, 8, 3),
         32:  (8,  32, 8, 3),
         64:  (4,  32, 8, 3),
         128: (1,  64, 4, 3),
     }
     GROUP_SIZE, K_CHUNKS, num_warps, num_stages = K_CONFIG[kv_block_size]
-    # Non-divisible topk: ceil to num_chunks; tail-pad lanes are handled
-    # in-kernel via masked load (other=-1) + out_cols < topk*K store mask.
     num_chunks = (topk + GROUP_SIZE - 1) // GROUP_SIZE
     outer = (num_chunks + K_CHUNKS - 1) // K_CHUNKS
     grid = (seq_len, outer)
