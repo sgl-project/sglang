@@ -49,9 +49,20 @@ kubectl config use-context "$CONTEXT"
 # Uses a lightweight test Dockerfile that builds just the Rust binary with
 # the "ci" cargo profile (~5 min), instead of the repo's
 # docker/gateway.Dockerfile which builds a full Python wheel via maturin.
-log "Building gateway Docker image (this may take 5-10 minutes on first run)..."
+#
+# CI sets SKIP_DOCKER_BUILD=1 after pre-building smg-gateway:test via
+# docker/build-push-action with GHA cache, so we don't rebuild here.
 cd "$REPO_ROOT"
-docker build -f e2e_test/k8s_integration/Dockerfile.gateway -t smg-gateway:test .
+if [[ "${SKIP_DOCKER_BUILD:-}" == "1" ]]; then
+    log "SKIP_DOCKER_BUILD=1 — skipping docker build, expecting smg-gateway:test to exist"
+    if ! docker image inspect smg-gateway:test >/dev/null 2>&1; then
+        log "ERROR: smg-gateway:test not found locally; cannot continue"
+        exit 1
+    fi
+else
+    log "Building gateway Docker image (this may take 5-10 minutes on first run)..."
+    docker build -f e2e_test/k8s_integration/Dockerfile.gateway -t smg-gateway:test .
+fi
 
 # Step 3: Load the image into kind
 log "Loading smg-gateway:test image into kind..."
