@@ -403,6 +403,68 @@ def build_runtime_observation_payload_candidates_from_forward_batch_runtime_exis
     return payloads
 
 
+def build_runtime_observation_payload_candidates_from_forward_batch_readonly_metadata(
+    *,
+    forward_batch: Any,
+    layer_ids: Sequence[int],
+    batch_id: str,
+    phase: str,
+    runtime_policy_state: str,
+) -> list[dict[str, Any]]:
+    """Build observation candidates from RelayKV ForwardBatch metadata carrier."""
+
+    metadata_values = _readonly_sequence(
+        getattr(forward_batch, "relaykv_runtime_observation_metadata"),
+        field_name="forward_batch.relaykv_runtime_observation_metadata",
+    )
+    layer_id_values = _readonly_sequence(layer_ids, field_name="layer_ids")
+
+    payloads: list[dict[str, Any]] = []
+    for fallback_request_index, metadata in enumerate(metadata_values):
+        if not isinstance(metadata, dict):
+            raise TypeError("relaykv_runtime_observation_metadata entries must be dicts")
+        request_id = metadata.get("request_id", metadata.get("rid"))
+        if request_id is None:
+            raise ValueError("relaykv metadata entry must include request_id or rid")
+        if "req_pool_idx" not in metadata:
+            raise ValueError("relaykv metadata entry must include req_pool_idx")
+        if "seq_len" not in metadata:
+            raise ValueError("relaykv metadata entry must include seq_len")
+
+        request_index = metadata.get(
+            "request_index_in_batch",
+            metadata.get("request_index", fallback_request_index),
+        )
+        req_pool_idx = metadata["req_pool_idx"]
+        seq_len = metadata["seq_len"]
+        for layer_id in layer_id_values:
+            payload: dict[str, Any] = {
+                "event_type": "runtime_observation_readonly_metadata_candidate",
+                "batch_id": batch_id,
+                "request_id": request_id,
+                "request_index_in_batch": request_index,
+                "request_index": request_index,
+                "req_pool_idx": req_pool_idx,
+                "req_pool_index": req_pool_idx,
+                "seq_len": seq_len,
+                "layer_id": layer_id,
+                "phase": metadata.get("phase", phase),
+                "runtime_policy_state": runtime_policy_state,
+                "source": "forward_batch_readonly_runtime_observation_metadata",
+                "source_mutated": False,
+                "attention_override": False,
+                "kv_cache_mutation": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+            }
+            if metadata.get("extend_seq_len") is not None:
+                payload["extend_seq_len"] = metadata["extend_seq_len"]
+            if metadata.get("extend_prefix_len") is not None:
+                payload["extend_prefix_len"] = metadata["extend_prefix_len"]
+            payloads.append(payload)
+    return payloads
+
+
 def summarize_runtime_observation_payloads(
     payloads: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -617,6 +679,49 @@ def run_model_runner_forward_observation_hook(
             layer_ids=[0],
         )
         cpu_metadata_description = _describe_forward_batch_cpu_metadata(forward_batch)
+        readonly_metadata_skip_reason = ""
+        try:
+            layer_ids = [0]
+            readonly_payloads = (
+                build_runtime_observation_payload_candidates_from_forward_batch_readonly_metadata(
+                    forward_batch=forward_batch,
+                    layer_ids=layer_ids,
+                    batch_id=f"forward-{forward_pass_id}",
+                    phase="forward",
+                    runtime_policy_state="runtime_observation",
+                )
+            )
+            readonly_summary = summarize_runtime_observation_payloads(
+                readonly_payloads
+            )
+            readonly_summary.update(
+                {
+                    "forward_pass_id": forward_pass_id,
+                    "source": "forward_batch_readonly_runtime_observation_metadata",
+                    "req_pool_idx_none": all(
+                        payload.get("req_pool_idx") is None
+                        and payload.get("req_pool_index") is None
+                        for payload in readonly_payloads
+                    ),
+                    "initial_skip_reason": type(exc).__name__,
+                }
+            )
+            log_runtime_observation_summary(
+                readonly_summary,
+                logger_=target_logger,
+                prefix="relaykv_runtime_observation_readonly_metadata_summary",
+            )
+            return {
+                "enabled": True,
+                "skipped": False,
+                "skip_reason": "",
+                "summary": readonly_summary,
+                "metadata_description": metadata_description,
+                "forward_batch_cpu_metadata_description": cpu_metadata_description,
+            }
+        except Exception as readonly_exc:
+            readonly_metadata_skip_reason = type(readonly_exc).__name__
+
         try:
             layer_ids = [0]
             fallback_payloads = (
@@ -663,6 +768,7 @@ def run_model_runner_forward_observation_hook(
                 "skipped": False,
                 "skip_reason": "",
                 "summary": fallback_summary,
+                "readonly_metadata_skip_reason": readonly_metadata_skip_reason,
                 "metadata_description": metadata_description,
                 "forward_batch_cpu_metadata_description": cpu_metadata_description,
             }
@@ -672,6 +778,7 @@ def run_model_runner_forward_observation_hook(
             {
                 "forward_pass_id": forward_pass_id,
                 "reason": type(exc).__name__,
+                "readonly_metadata_skip_reason": readonly_metadata_skip_reason,
                 "runtime_existing_metadata_skip_reason": fallback_skip_reason,
                 "metadata_description": metadata_description,
                 "forward_batch_cpu_metadata_description": cpu_metadata_description,
@@ -682,6 +789,7 @@ def run_model_runner_forward_observation_hook(
             "enabled": True,
             "skipped": True,
             "skip_reason": type(exc).__name__,
+            "readonly_metadata_skip_reason": readonly_metadata_skip_reason,
             "runtime_existing_metadata_skip_reason": fallback_skip_reason,
             "metadata_description": metadata_description,
             "forward_batch_cpu_metadata_description": cpu_metadata_description,

@@ -172,6 +172,9 @@ def _tail(text: str, max_lines: int = 80) -> str:
 
 def _relaykv_observation_log_flags(stdout: str) -> dict[str, bool]:
     summary_logged = "relaykv_runtime_observation_summary" in stdout
+    readonly_metadata_summary_logged = (
+        "relaykv_runtime_observation_readonly_metadata_summary" in stdout
+    )
     existing_metadata_summary_logged = (
         "relaykv_runtime_observation_forward_batch_existing_metadata_summary"
         in stdout
@@ -182,19 +185,25 @@ def _relaykv_observation_log_flags(stdout: str) -> dict[str, bool]:
         "forward_batch_cpu_metadata_description" in stdout
     )
     req_pool_idx_none_logged = '"req_pool_idx_none": true' in stdout
+    req_pool_idx_present_logged = '"req_pool_idx_none": false' in stdout
     cpu_tensor_value_source_logged = (
         '"seq_lens_cpu_value_source": "cpu_tensor_observation_only"' in stdout
     )
     return {
         "relaykv_summary_logged": summary_logged,
+        "relaykv_readonly_metadata_summary_logged": readonly_metadata_summary_logged,
         "relaykv_existing_metadata_summary_logged": existing_metadata_summary_logged,
         "relaykv_skip_logged": skip_logged,
         "relaykv_metadata_description_logged": metadata_description_logged,
         "relaykv_cpu_metadata_description_logged": cpu_metadata_description_logged,
         "relaykv_req_pool_idx_none_logged": req_pool_idx_none_logged,
+        "relaykv_req_pool_idx_present_logged": req_pool_idx_present_logged,
         "relaykv_cpu_tensor_value_source_logged": cpu_tensor_value_source_logged,
         "relaykv_observation_logged": (
-            summary_logged or existing_metadata_summary_logged or skip_logged
+            summary_logged
+            or readonly_metadata_summary_logged
+            or existing_metadata_summary_logged
+            or skip_logged
         ),
     }
 
@@ -221,12 +230,21 @@ def _validate_relaykv_observation_flags(
 
     if not relaykv_log_flags["relaykv_observation_logged"]:
         raise RuntimeError("RelayKV observation hook log was not detected while env was on")
-    if not relaykv_log_flags["relaykv_existing_metadata_summary_logged"]:
-        raise RuntimeError("RelayKV existing metadata summary log was not detected")
-    if not relaykv_log_flags["relaykv_cpu_tensor_value_source_logged"]:
-        raise RuntimeError("RelayKV CPU tensor observation source log was not detected")
-    if not relaykv_log_flags["relaykv_req_pool_idx_none_logged"]:
-        raise RuntimeError("RelayKV req_pool_idx None observation log was not detected")
+    if relaykv_log_flags["relaykv_readonly_metadata_summary_logged"]:
+        if not relaykv_log_flags["relaykv_req_pool_idx_present_logged"]:
+            raise RuntimeError("RelayKV req_pool_idx present observation log was not detected")
+        return
+    if relaykv_log_flags["relaykv_existing_metadata_summary_logged"]:
+        if not relaykv_log_flags["relaykv_cpu_tensor_value_source_logged"]:
+            raise RuntimeError(
+                "RelayKV CPU tensor observation source log was not detected"
+            )
+        if not relaykv_log_flags["relaykv_req_pool_idx_none_logged"]:
+            raise RuntimeError(
+                "RelayKV req_pool_idx None observation log was not detected"
+            )
+        return
+    raise RuntimeError("RelayKV observation summary log was not detected")
 
 
 def _run_server_case(

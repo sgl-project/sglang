@@ -29,6 +29,7 @@ ScheduleBatch -> ModelWorkerBatch -> ForwardBatch
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
@@ -440,6 +441,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None
 
+    # RelayKV read-only observation metadata. This is default-off and is only
+    # consumed by the RelayKV runtime observation hook.
+    relaykv_runtime_observation_metadata: Optional[List[dict]] = None
+
     @classmethod
     def init_new(
         cls,
@@ -491,6 +496,39 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return_pooled_hidden_states=batch.return_pooled_hidden_states,
             rids=[req.rid for req in batch.reqs],
         )
+        if os.getenv("SGLANG_RELAYKV_RUNTIME_OBSERVATION") == "1":
+            extend_seq_lens = (
+                batch.extend_seq_lens if isinstance(batch.extend_seq_lens, list) else None
+            )
+            extend_prefix_lens = (
+                batch.extend_prefix_lens
+                if isinstance(batch.extend_prefix_lens, list)
+                else None
+            )
+            ret.relaykv_runtime_observation_metadata = [
+                {
+                    "request_id": req.rid,
+                    "rid": req.rid,
+                    "request_index_in_batch": request_index,
+                    "req_pool_idx": req.req_pool_idx,
+                    "seq_len": req.seqlen,
+                    "extend_seq_len": (
+                        extend_seq_lens[request_index]
+                        if extend_seq_lens is not None
+                        and request_index < len(extend_seq_lens)
+                        else None
+                    ),
+                    "extend_prefix_len": (
+                        extend_prefix_lens[request_index]
+                        if extend_prefix_lens is not None
+                        and request_index < len(extend_prefix_lens)
+                        else None
+                    ),
+                    "phase": batch.forward_mode.name.lower(),
+                    "source": "forward_batch_readonly_runtime_observation_metadata",
+                }
+                for request_index, req in enumerate(batch.reqs)
+            ]
         device = model_runner.device
 
         if batch.extend_input_logprob_token_ids is not None:
