@@ -18,6 +18,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=130, stage="base-b", runner_config="1-gpu-large")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFlashinferMLAMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
