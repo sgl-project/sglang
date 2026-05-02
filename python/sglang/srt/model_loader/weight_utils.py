@@ -72,6 +72,8 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
+
 # Matches routed-expert weight keys in both HF-style layouts
 # (``...mlp.experts.<N>.{gate,up,down}_proj.weight``) and DeepSeek V4
 # layouts (``...ffn.experts.<N>.w{1,2,3}.weight``). ``shared_experts`` is
@@ -1374,7 +1376,9 @@ def runai_safetensors_weights_iterator(
             mininterval=2,
         )
 
-        yield from tensor_iter
+        for name, tensor in tensor_iter:
+            setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+            yield name, tensor
 
 
 def set_runai_streamer_env(load_config: LoadConfig):
