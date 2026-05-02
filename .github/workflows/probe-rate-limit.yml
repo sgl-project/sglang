@@ -1,56 +1,125 @@
 name: Probe API Rate Limit
 
-# Manual probe to inspect the repo's GITHUB_TOKEN rate-limit bucket.
-# GitHub doesn't expose another repo's rate-limit status to outside callers,
-# so the only way to observe the GITHUB_TOKEN bucket is to authenticate as it
-# from inside a workflow run. Trigger this manually before/during peak CI to
-# see how much of the 1000/hr budget is currently consumed.
+# Long-running probe that captures hourly GITHUB_TOKEN snapshots from a
+# single manual dispatch. ubuntu-latest jobs cap at 6h, so we chain 4
+# sequential jobs (5 snapshots each = 20 hourly snapshots over ~20h)
+# and aggregate at the end. 5 iterations × ~1h each fits inside the
+# 6h cap with comfortable margin.
 #
-# Usage: Actions tab → "Probe API Rate Limit" → Run workflow.
+# The composite action used by each job sleeps until ~60s before the
+# /rate_limit bucket's reset (the only time `used` reflects a full hour of
+# traffic) and re-reads the reset timestamp every iteration so it stays
+# self-correcting against bucket drift.
 
 on:
   workflow_dispatch:
-  # Triggers on any push to the probe branch (including empty commits).
-  # Used to drive an external hourly cadence before the workflow lands
-  # on the default branch (where the schedule trigger would take over).
+  # Push trigger kept for ad-hoc smoke tests on this branch (a single push
+  # to ci-probe-rate-limit also runs the chain, useful while iterating on
+  # the workflow itself).
   push:
     branches:
       - ci-probe-rate-limit
-  # Hourly snapshot of the GITHUB_TOKEN bucket. Schedule events only
-  # fire workflows from the default branch, so this only runs once
-  # this file is on `main`. 24 hourly runs is enough to characterize
-  # daily traffic against the 15,000/hr ceiling.
-  schedule:
-    - cron: '45 * * * *'
 
 permissions:
   contents: read
 
 jobs:
-  probe:
+  probe-1:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 360
     steps:
-      - name: Snapshot GITHUB_TOKEN bucket
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/probe-rate-limit-loop
+        with:
+          iterations: 5
+          output-file: snapshots/job1.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-snapshots-job1
+          path: snapshots/job1.jsonl
+          retention-days: 30
+
+  probe-2:
+    needs: probe-1
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/probe-rate-limit-loop
+        with:
+          iterations: 5
+          output-file: snapshots/job2.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-snapshots-job2
+          path: snapshots/job2.jsonl
+          retention-days: 30
+
+  probe-3:
+    needs: probe-2
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/probe-rate-limit-loop
+        with:
+          iterations: 5
+          output-file: snapshots/job3.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-snapshots-job3
+          path: snapshots/job3.jsonl
+          retention-days: 30
+
+  probe-4:
+    needs: probe-3
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/probe-rate-limit-loop
+        with:
+          iterations: 5
+          output-file: snapshots/job4.jsonl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-snapshots-job4
+          path: snapshots/job4.jsonl
+          retention-days: 30
+
+  aggregate:
+    needs: probe-4
+    if: always() && needs.probe-1.result != 'skipped'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: probe-snapshots-job*
+          merge-multiple: true
+          path: snapshots
+      - name: Build aggregate report
         run: |
-          DATA=$(curl -sH "Authorization: Bearer $GH_TOKEN" \
-                       -H "Accept: application/vnd.github+json" \
-                       https://api.github.com/rate_limit)
-          NOW=$(date +%s)
-          echo "$DATA" | jq --argjson now "$NOW" '
-            .resources.core
-            | { limit, used, remaining,
-                reset_at: (.reset | strftime("%Y-%m-%dT%H:%M:%SZ")),
-                reset_in_min: ((.reset - $now) / 60 | floor),
-                pct_used: (.used / .limit * 100 | floor) }
-          '
+          set -euo pipefail
+          ALL=$(cat snapshots/job1.jsonl snapshots/job2.jsonl snapshots/job3.jsonl snapshots/job4.jsonl 2>/dev/null || true)
+          if [ -z "$ALL" ]; then
+            echo "No snapshots found." | tee -a "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
           {
-            echo "## GITHUB_TOKEN rate limit snapshot"
+            echo "## GITHUB_TOKEN rate-limit — 24h time series"
             echo ""
-            echo "\`\`\`json"
-            echo "$DATA" | jq --argjson now "$NOW" '.resources.core | { limit, used, remaining, reset_at: (.reset | strftime("%Y-%m-%dT%H:%M:%SZ")), reset_in_min: ((.reset - $now) / 60 | floor), pct_used: (.used / .limit * 100 | floor) }'
-            echo "\`\`\`"
-          } >> "$GITHUB_STEP_SUMMARY"
+            echo "| captured_at | used | limit | pct_used | reset_at |"
+            echo "|---|---|---|---|---|"
+            echo "$ALL" | jq -r '"| \(.captured_at) | \(.used) | \(.limit) | \(.pct_used)% | \(.reset_at) |"'
+            echo ""
+            echo "Total snapshots: $(echo "$ALL" | wc -l | tr -d ' ')"
+            echo ""
+            echo "Peak \`used\`: $(echo "$ALL" | jq -s 'max_by(.used) | "\(.used) at \(.captured_at)"')"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: probe-snapshots-all
+          path: snapshots/
+          retention-days: 30

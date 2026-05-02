@@ -1,0 +1,86 @@
+name: Probe Rate Limit Loop
+description: |
+  Sleeps until ~60s before the GITHUB_TOKEN bucket's next reset, captures a
+  /rate_limit snapshot, then crosses the boundary into the next bucket. Repeats
+  for `iterations` cycles. Each captured `used` reflects a full hour's worth
+  of API traffic — sampling at any other point would only show a partial count.
+  /rate_limit calls are themselves exempt from rate limiting, so they don't
+  pollute what we're measuring.
+
+inputs:
+  iterations:
+    description: Number of hourly snapshots to capture (typically 6 per 6h job).
+    required: true
+  output-file:
+    description: Path (relative to job workspace) for appending JSONL snapshots.
+    required: true
+  github-token:
+    description: Token to authenticate /rate_limit calls. Must be the same token whose bucket you want to measure.
+    required: false
+    default: ${{ github.token }}
+
+runs:
+  using: composite
+  steps:
+    - name: Capture hourly snapshots
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ITERATIONS: ${{ inputs.iterations }}
+        OUTPUT_FILE: ${{ inputs.output-file }}
+      run: |
+        set -euo pipefail
+
+        mkdir -p "$(dirname "$OUTPUT_FILE")"
+
+        gh_get_rate_limit() {
+          curl --silent --show-error --fail \
+               --max-time 30 \
+               -H "Authorization: Bearer $GH_TOKEN" \
+               -H "Accept: application/vnd.github+json" \
+               -H "X-GitHub-Api-Version: 2022-11-28" \
+               https://api.github.com/rate_limit
+        }
+
+        for i in $(seq 1 "$ITERATIONS"); do
+          # Read current bucket state to learn this hour's reset timestamp.
+          DATA=$(gh_get_rate_limit)
+          RESET=$(echo "$DATA" | jq -r .resources.core.reset)
+          NOW=$(date +%s)
+
+          # Sleep until 60s before reset. `used` at that moment reflects almost
+          # a full hour of traffic — any earlier sample is partial.
+          WAIT=$((RESET - NOW - 60))
+          RESET_HUMAN=$(date -u -d "@$RESET" +%FT%TZ 2>/dev/null || date -u -r "$RESET" +%FT%TZ)
+          if [ "$WAIT" -gt 0 ]; then
+            echo "iter $i/$ITERATIONS: sleeping ${WAIT}s → snapshot at 60s before reset ($RESET_HUMAN)"
+            sleep "$WAIT"
+          else
+            echo "iter $i/$ITERATIONS: reset within 60s ($RESET_HUMAN); sampling now"
+          fi
+
+          # Snapshot.
+          SNAP=$(gh_get_rate_limit)
+          TS=$(date -u +%FT%TZ)
+          FORMATTED=$(echo "$SNAP" | jq --arg ts "$TS" '
+            .resources.core
+            | { captured_at: $ts,
+                limit, used, remaining,
+                reset_at: (.reset | strftime("%Y-%m-%dT%H:%M:%SZ")),
+                pct_used: (.used / .limit * 100 | floor) }
+          ')
+          echo "$FORMATTED"
+          echo "$FORMATTED" | jq -c . >> "$OUTPUT_FILE"
+
+          # Cross the bucket boundary so the next iteration's gh_get_rate_limit
+          # returns a freshly-reset bucket and a new reset timestamp.
+          NOW=$(date +%s)
+          CROSS=$((RESET + 90 - NOW))
+          if [ "$CROSS" -gt 0 ]; then
+            echo "iter $i/$ITERATIONS: sleeping ${CROSS}s past reset boundary"
+            sleep "$CROSS"
+          fi
+        done
+
+        echo "--- snapshots written to $OUTPUT_FILE ---"
+        cat "$OUTPUT_FILE"
