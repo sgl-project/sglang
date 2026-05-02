@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import struct
 import threading
@@ -196,11 +197,30 @@ class NixlKVManager(CommonKVManager):
             ) from e
 
         backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
-        agent_config = nixl_agent_config(
-            backends=[backend],
-            num_threads=(8 if disaggregation_mode == DisaggregationMode.PREFILL else 0),
+        num_threads = 8 if disaggregation_mode == DisaggregationMode.PREFILL else 0
+        backend_params = json.loads(
+            envs.SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS.get()
         )
+        if not isinstance(backend_params, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in backend_params.items()
+        ):
+            raise ValueError(
+                "SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS must be a JSON object "
+                "with string keys and string values"
+            )
+        agent_config = nixl_agent_config(backends=[], num_threads=num_threads)
         self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
+        if num_threads > 0:
+            # TODO: Remove this once NIXL passes thread parameters from
+            # nixl_agent_config to explicitly-created backends.
+            if backend == "UCX" or backend == "OBJ":
+                backend_params.setdefault("num_threads", str(num_threads))
+            elif backend == "GDS_MT":
+                backend_params.setdefault("thread_count", str(num_threads))
+            elif backend == "UCCL":
+                backend_params.setdefault("num_cpus", str(num_threads))
+        self.agent.create_backend(backend, backend_params)
 
         available_plugins = self.agent.get_plugin_list()
         if backend not in available_plugins:
