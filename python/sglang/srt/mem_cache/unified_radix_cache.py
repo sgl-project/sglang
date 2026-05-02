@@ -812,6 +812,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
         return self.session.session_held_req_count(active_pool_idxs)
 
+    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
+        return self.session.session_held_mamba_slots(active_pool_idxs)
+
     def evictable_size(self) -> int:
         return self.component_evictable_size_.get(BASE_COMPONENT_TYPE, 0)
 

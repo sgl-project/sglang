@@ -31,12 +31,16 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
-SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/diffusion-ci/consistency_gt/official_generated"
-SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/diffusion-ci/consistency_gt/sglang_generated"
+SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/ci-data/main/diffusion-ci/consistency_gt/official_generated"
+SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE = "https://raw.githubusercontent.com/sgl-project/ci-data/main/diffusion-ci/consistency_gt/sglang_generated"
 SGL_TEST_FILES_CONSISTENCY_GT_BASE = SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE
 SGL_TEST_FILES_CONSISTENCY_GT_BASES = (
     SGL_TEST_FILES_OFFICIAL_CONSISTENCY_GT_BASE,
     SGL_TEST_FILES_SGLANG_CONSISTENCY_GT_BASE,
+    # Legacy fallback during migration from sglang-bot/sglang-ci-data
+    "https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/diffusion-ci/consistency_gt/official_generated",
+    "https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/diffusion-ci/consistency_gt/sglang_generated",
+    "https://raw.githubusercontent.com/sglang-bot/sglang-ci-data/main/diffusion-ci/consistency_gt",
 )
 CONSISTENCY_THRESHOLD_JSON_PATH = (
     Path(__file__).resolve().parent / "server" / "consistency_threshold.json"
@@ -70,6 +74,9 @@ DEFAULT_QWEN_IMAGE_EDIT_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit"
 DEFAULT_QWEN_IMAGE_EDIT_2509_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit-2509"
 DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Edit-2511"
 DEFAULT_QWEN_IMAGE_LAYERED_MODEL_NAME_FOR_TEST = "Qwen/Qwen-Image-Layered"
+
+# JoyAI image editing models
+DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST = "jdopensource/JoyAI-Image-Edit-Diffusers"
 
 # FLUX image generation models
 DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST = "black-forest-labs/FLUX.1-dev"

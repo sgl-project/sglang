@@ -699,6 +699,18 @@ class Scheduler(
         else:
             self.model_worker = self.draft_worker
 
+        # Install device timer on model runners for fwd occupancy tracking
+        if hasattr(self, "forward_pass_device_timer"):
+            timer = self.forward_pass_device_timer
+            self.tp_worker.model_runner.device_timer = timer
+            if self.draft_worker is not None:
+                dw = getattr(self.draft_worker, "draft_worker", None)
+                if dw is not None:
+                    if hasattr(dw, "draft_runner"):
+                        dw.draft_runner.device_timer = timer
+                    for r in getattr(dw, "draft_runner_list", []):
+                        r.device_timer = timer
+
         # Get token and memory info from the model worker
         (
             self.max_total_num_tokens,
@@ -744,10 +756,10 @@ class Scheduler(
         set_random_seed(self.random_seed)
 
         # Print debug info
+        avail_mem = get_available_gpu_memory(
+            self.device, self.gpu_id, empty_cache=False
+        )
         if self.tp_rank == 0:
-            avail_mem = get_available_gpu_memory(
-                self.device, self.gpu_id, empty_cache=False
-            )
             logger.info(
                 f"max_total_num_tokens={self.max_total_num_tokens}, "
                 f"chunked_prefill_size={self.server_args.chunked_prefill_size}, "
@@ -758,8 +770,17 @@ class Scheduler(
             )
 
         if self.enable_metrics and hasattr(self, "metrics_collector"):
-            self.metrics_collector.emit_cache_config_info(
-                self.page_size, self.max_total_num_tokens // self.page_size
+            self.metrics_collector.emit_constants(
+                max_total_num_tokens=self.max_total_num_tokens,
+                max_running_requests_under_SLO=getattr(
+                    self, "max_running_requests_under_SLO", None
+                ),
+                engine_startup_time=0.0,
+                engine_load_weights_time=0.0,
+                page_size=self.page_size,
+                num_pages=self.max_total_num_tokens // self.page_size,
+                context_len=self.model_config.context_len,
+                startup_available_gpu_memory_gb=avail_mem,
             )
 
     def init_cache_with_memory_pool(self):
@@ -1491,7 +1512,6 @@ class Scheduler(
             recv_reqs = self.recv_requests()
             self.process_input_requests(recv_reqs)
             if self._engine_paused:
-                self.cancel_bubble_timer()
                 continue
 
             # Get the next batch to run
@@ -1546,7 +1566,6 @@ class Scheduler(
                 self.result_queue.append((batch.copy(), batch_result))
             else:
                 batch_result = None
-                self.cancel_bubble_timer()
 
             # Process the last batch
             if self.last_batch:
@@ -2922,14 +2941,13 @@ class Scheduler(
                 bs = len(model_worker_batch.seq_lens)
                 future_indices = self.future_map.alloc_future_indices(bs)
 
-                with self.forward_stream_ctx, self.record_bubble_metrics(batch):
+                with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     self.future_map.resolve_future(model_worker_batch)
-                    with self.record_forward_metrics(batch):
-                        batch_result = self.model_worker.forward_batch_generation(
-                            model_worker_batch
-                            # here pp is not compatible with overlap
-                        )
+                    batch_result = self.model_worker.forward_batch_generation(
+                        model_worker_batch
+                        # here pp is not compatible with overlap
+                    )
                     # FIXME(lsyin): maybe move this to forward_batch_generation
                     batch_result.copy_done = self.device_module.Event()
                     if batch_result.delay_sample_func is None:
@@ -2948,11 +2966,6 @@ class Scheduler(
                     batch.spec_info = batch_result.next_draft_input
                     batch.spec_info.future_indices = future_indices
 
-                    # batch.spec_info = EagleDraftInput(
-                    #     future_indices=future_indices,
-                    #     verify_done=batch_result.next_draft_input.verify_done,
-                    # )
-
                     # The future value, usually for next batch preparation
                     # Current implementation strictly synchronizes the seq_lens
                     batch.seq_lens = batch_result.next_draft_input.new_seq_lens
@@ -2965,10 +2978,9 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                with self.record_forward_metrics(batch):
-                    batch_result = self.model_worker.forward_batch_generation(
-                        worker_batch_or_batch, **kwargs
-                    )
+                batch_result = self.model_worker.forward_batch_generation(
+                    worker_batch_or_batch, **kwargs
+                )
                 future_indices_or_next_token_ids = batch_result.next_token_ids
                 self.update_cache_from_scheduler(batch, batch_result)
 
@@ -2998,7 +3010,7 @@ class Scheduler(
 
             if self.enable_overlap:
                 self.record_batch_in_overlap(model_worker_batch)
-                with self.forward_stream_ctx, self.record_bubble_metrics(batch):
+                with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
                     pooler_output = self.tp_worker.forward_batch_embedding(
                         model_worker_batch
@@ -3083,6 +3095,7 @@ class Scheduler(
         self.log_batch_result_stats(batch, result)
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
+        self.update_device_timer()
 
     def maybe_send_health_check_signal(self):
         if self.return_health_check_ipcs:

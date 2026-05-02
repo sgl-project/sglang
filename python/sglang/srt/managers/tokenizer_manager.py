@@ -1703,11 +1703,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "routed_experts", None):
-                routed_experts_tensor = recv_obj.routed_experts[i]
-                if routed_experts_tensor is not None:
-                    meta_info["routed_experts"] = pybase64.b64encode(
-                        routed_experts_tensor.numpy().tobytes()
-                    ).decode("utf-8")
+                val = recv_obj.routed_experts[i]
+                if val is not None:
+                    # BatchStrOutput is pre-encoded by the detokenizer;
+                    # BatchTokenIDOutput (skip_tokenizer_init) bypasses it.
+                    if isinstance(val, torch.Tensor):
+                        val = pybase64.b64encode(val.numpy().tobytes()).decode("utf-8")
+                    meta_info["routed_experts"] = val
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]
@@ -2161,13 +2163,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
-            retraction_count = (
-                recv_obj.retraction_counts[i]
-                if getattr(recv_obj, "retraction_counts", None)
-                and i < len(recv_obj.retraction_counts)
-                else 0
-            )
-
             # Get detailed cache breakdown if available
             cached_tokens_details = None
             if (
@@ -2183,7 +2178,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj.cached_tokens[i],
                 state.time_stats.get_e2e_latency(),
                 self._request_has_grammar(state.obj),
-                retraction_count,
                 cached_tokens_details,
             )
 
