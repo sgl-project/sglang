@@ -59,6 +59,30 @@ DEFAULT_MEAN_ABS_DIFF_THRESHOLD_VIDEO = 10.0
 _clip_model_cache: dict[str, Any] = {}
 _consistency_gt_cache: dict[str, Any] = {}
 
+
+def _load_clip_processor_with_roberta_processing_compat(
+    clip_processor_cls, *args, **kwargs
+):
+    from tokenizers import processors
+
+    roberta_processing = processors.RobertaProcessing
+
+    def roberta_processing_compat(*processor_args, **processor_kwargs):
+        if "sep" in processor_kwargs and "cls" in processor_kwargs:
+            sep = processor_kwargs.pop("sep")
+            cls_token = processor_kwargs.pop("cls")
+            return roberta_processing(
+                sep, cls_token, *processor_args, **processor_kwargs
+            )
+        return roberta_processing(*processor_args, **processor_kwargs)
+
+    processors.RobertaProcessing = roberta_processing_compat
+    try:
+        return clip_processor_cls.from_pretrained(*args, **kwargs)
+    finally:
+        processors.RobertaProcessing = roberta_processing
+
+
 # ---------------------------------------------------------------------------
 # Common model IDs for diffusion tests
 #
@@ -753,7 +777,8 @@ def get_clip_model() -> tuple[Any, Any]:
             logger.warning(
                 "Fast CLIP processor failed (%s), retrying with use_fast=False", e
             )
-            processor = CLIPProcessor.from_pretrained(
+            processor = _load_clip_processor_with_roberta_processing_compat(
+                CLIPProcessor,
                 CLIP_MODEL_NAME,
                 use_fast=False,
             )
