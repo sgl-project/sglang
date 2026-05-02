@@ -112,7 +112,13 @@ def summarize_candidate_events(
             "kv_cache_mutation_false": 0,
             "attention_override_false": 0,
             "host_backup_copy_false": 0,
+            "host_backup_copy_candidate_true": 0,
+            "host_backup_copy_candidate_false": 0,
             "host_backup_copy_executed_false": 0,
+            "host_backup_copy_executed_true": 0,
+            "snapshot_created_true": 0,
+            "snapshot_created_false": 0,
+            "runtime_writeback_false": 0,
         }
     )
 
@@ -134,8 +140,20 @@ def summarize_candidate_events(
             noop_guard_counts["attention_override_false"] += 1
         if _event_value(event, "host_backup_copy") is False:
             noop_guard_counts["host_backup_copy_false"] += 1
+        if _event_value(event, "host_backup_copy_candidate") is True:
+            noop_guard_counts["host_backup_copy_candidate_true"] += 1
+        if _event_value(event, "host_backup_copy_candidate") is False:
+            noop_guard_counts["host_backup_copy_candidate_false"] += 1
         if _event_value(event, "host_backup_copy_executed") is False:
             noop_guard_counts["host_backup_copy_executed_false"] += 1
+        if _event_value(event, "host_backup_copy_executed") is True:
+            noop_guard_counts["host_backup_copy_executed_true"] += 1
+        if _event_value(event, "snapshot_created") is True:
+            noop_guard_counts["snapshot_created_true"] += 1
+        if _event_value(event, "snapshot_created") is False:
+            noop_guard_counts["snapshot_created_false"] += 1
+        if _event_value(event, "runtime_writeback") is False:
+            noop_guard_counts["runtime_writeback_false"] += 1
 
     return {
         "candidate_event_counts": dict(candidate_counts),
@@ -169,6 +187,7 @@ def policy_event_payload(
     payload["scheduler_policy_noop"] = True
     payload["kv_cache_mutation"] = False
     payload["attention_override"] = False
+    payload["runtime_writeback"] = False
     payload["host_backup_copy"] = False
     payload["host_backup_copy_executed"] = False
     if dry_copy_candidate:

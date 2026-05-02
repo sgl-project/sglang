@@ -7,6 +7,8 @@ import signal
 from dataclasses import dataclass
 from typing import Optional
 
+import torch
+
 from sglang.srt.relaykv import RelayKVConfig, make_shadow_plan
 from sglang.srt.relaykv.metrics import (
     log_policy_event,
@@ -16,6 +18,7 @@ from sglang.srt.relaykv.metrics import (
     summarize_candidate_events,
     summarize_policy_events,
 )
+from sglang.srt.relaykv.memory import run_host_backup_copy_candidate_for_smoke
 
 
 @dataclass(frozen=True)
@@ -25,12 +28,31 @@ class _FakeRuntimeRequest:
     step_idx: int
 
 
+class _FakeMHATokenToKVPool:
+    def __init__(self) -> None:
+        self.start_layer = 0
+        self.dtype = torch.float16
+        self.device = "cpu"
+        self.k_buffer = [
+            torch.arange(8 * 2 * 8, dtype=self.dtype).reshape(8, 2, 8),
+        ]
+        self.v_buffer = [
+            (torch.arange(8 * 2 * 8, dtype=self.dtype) + 1024).reshape(8, 2, 8),
+        ]
+
+
+class _FakeTokenToKVPoolAllocator:
+    def __init__(self) -> None:
+        self._kvcache = _FakeMHATokenToKVPool()
+
+
 def _runtime_policy_pass(
     *,
     requests: list[_FakeRuntimeRequest],
     config: RelayKVConfig,
     phase: str,
     kv_bytes_per_token: Optional[int],
+    token_to_kv_pool_allocator: object,
 ) -> tuple[list[object], list[dict[str, object]]]:
     plans = []
     candidate_events = []
@@ -66,11 +88,18 @@ def _runtime_policy_pass(
                 "host_backup_copy": False,
             }
             event = policy_event_payload(plan, extra=extra)
+            event = run_host_backup_copy_candidate_for_smoke(
+                plan=plan,
+                event_payload=event,
+                token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+                token_indices=[2, 3, 4, 5],
+                layer_idx=0,
+            )
             candidate_events.append(event)
             log_policy_event(
                 plan,
                 prefix=f"relaykv_runtime_policy_event_{phase}",
-                extra=extra,
+                extra=event,
             )
     log_policy_summary(plans, prefix=f"relaykv_runtime_policy_summary_{phase}")
     return plans, candidate_events
@@ -96,6 +125,7 @@ def main() -> None:
     signal.signal(signal.SIGPIPE, signal.SIG_DFL)
     stream, handler = _capture_relaykv_logs()
     try:
+        token_to_kv_pool_allocator = _FakeTokenToKVPoolAllocator()
         pressure_config = RelayKVConfig(
             enabled=True,
             mode="shadow",
@@ -117,6 +147,7 @@ def main() -> None:
             config=pressure_config,
             phase="prefill",
             kv_bytes_per_token=28672,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
 
         shadow_config = RelayKVConfig(
@@ -133,6 +164,7 @@ def main() -> None:
             config=shadow_config,
             phase="decode",
             kv_bytes_per_token=None,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
         plans.extend(shadow_plans)
         candidate_events.extend(shadow_candidate_events)
@@ -170,13 +202,62 @@ def main() -> None:
         "scheduler_policy_noop_true",
         "kv_cache_mutation_false",
         "attention_override_false",
-        "host_backup_copy_false",
-        "host_backup_copy_executed_false",
+        "runtime_writeback_false",
     ):
         if noop_counts[key] != 3:
             raise AssertionError(candidate_summary)
+    if noop_counts["host_backup_copy_false"] != 3:
+        raise AssertionError(candidate_summary)
+    if noop_counts["host_backup_copy_candidate_true"] != 1:
+        raise AssertionError(candidate_summary)
+    if noop_counts["host_backup_copy_candidate_false"] != 2:
+        raise AssertionError(candidate_summary)
+    if noop_counts["host_backup_copy_executed_true"] != 1:
+        raise AssertionError(candidate_summary)
+    if noop_counts["host_backup_copy_executed_false"] != 2:
+        raise AssertionError(candidate_summary)
+    if noop_counts["snapshot_created_true"] != 1:
+        raise AssertionError(candidate_summary)
+    if noop_counts["snapshot_created_false"] != 2:
+        raise AssertionError(candidate_summary)
     if len(runtime_event_logs) != 3:
         raise AssertionError(runtime_event_logs)
+    applied_events = [
+        event
+        for event in candidate_events
+        if event["runtime_policy_state"] == "applied_candidate"
+    ]
+    fallback_events = [
+        event
+        for event in candidate_events
+        if event["runtime_policy_state"] == "fallback_candidate"
+    ]
+    if len(applied_events) != 1 or len(fallback_events) != 2:
+        raise AssertionError(candidate_events)
+    applied_event = applied_events[0]
+    if applied_event["snapshot_created"] is not True:
+        raise AssertionError(applied_event)
+    if applied_event["host_backup_copy_candidate"] is not True:
+        raise AssertionError(applied_event)
+    if applied_event["host_backup_copy_executed"] is not True:
+        raise AssertionError(applied_event)
+    if applied_event["copy_equal"] is not True:
+        raise AssertionError(applied_event)
+    if applied_event["source_mutated"] is not False:
+        raise AssertionError(applied_event)
+    if applied_event["runtime_writeback"] is not False:
+        raise AssertionError(applied_event)
+    for fallback_event in fallback_events:
+        if fallback_event["snapshot_created"] is not False:
+            raise AssertionError(fallback_event)
+        if fallback_event["host_backup_copy_candidate"] is not False:
+            raise AssertionError(fallback_event)
+        if fallback_event["host_backup_copy_executed"] is not False:
+            raise AssertionError(fallback_event)
+        if fallback_event["fallback_candidate_noop_guard"] is not True:
+            raise AssertionError(fallback_event)
+        if fallback_event["runtime_writeback"] is not False:
+            raise AssertionError(fallback_event)
 
     print("relaykv_runtime_policy_smoke: ok")
     print("relaykv_runtime_policy_event_example=" + runtime_event_logs[0])

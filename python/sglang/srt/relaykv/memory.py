@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from .planner import RelayKVPlan
 
@@ -814,6 +814,132 @@ def snapshot_kv_pool_for_host_backup_smoke(
         token_indices=token_indices,
         runtime_policy_state=plan.runtime_policy_state,
     )
+
+
+def _host_backup_copy_candidate_noop_log(
+    *,
+    runtime_policy_state: str,
+    source_shape: Optional[list[int]],
+    source_dtype: Optional[str],
+    source_device: Optional[str],
+    skipped_reason: str,
+) -> dict[str, Any]:
+    fallback_noop = runtime_policy_state == "fallback_candidate"
+    return {
+        "runtime_policy_state": runtime_policy_state,
+        "host_backup_copy_candidate": False,
+        "host_backup_copy_executed": False,
+        "host_backup_copy_skipped_reason": skipped_reason,
+        "source_shape": source_shape,
+        "backup_shape": None,
+        "source_dtype": source_dtype,
+        "backup_dtype": None,
+        "source_device": source_device,
+        "backup_device": None,
+        "copy_numel": 0,
+        "copy_nbytes": 0,
+        "copy_equal": False,
+        "fallback_candidate_noop_guard": fallback_noop,
+        "attention_override": False,
+        "kv_cache_mutation": False,
+        "scheduler_policy_noop": True,
+    }
+
+
+def run_host_backup_copy_candidate_for_smoke(
+    *,
+    plan: RelayKVPlan,
+    event_payload: Mapping[str, Any],
+    token_to_kv_pool_allocator: Any,
+    token_indices: list[int],
+    layer_idx: int,
+) -> dict[str, Any]:
+    """Run the smoke-only RelayKV host-backup candidate copy path.
+
+    This candidate path is intentionally disconnected from attention, KV-cache
+    freeing, KV-pool mutation, and runtime writeback. It only accepts scheduler
+    runtime candidate event metadata, creates a read-only snapshot for
+    ``applied_candidate``, and copies that snapshot to CPU when the snapshot
+    exists. ``fallback_candidate`` always remains a no-op.
+    """
+
+    runtime_policy_state = str(
+        event_payload.get("runtime_policy_state") or plan.runtime_policy_state
+    )
+    fallback_noop = runtime_policy_state == "fallback_candidate"
+
+    kv_object, base_reason = _resolve_kv_layout_object(token_to_kv_pool_allocator)
+    if kv_object is None:
+        snapshot = _snapshot_result(
+            runtime_policy_state=runtime_policy_state,
+            kv_pool=None,
+            observed_layout=None,
+            has_k_buffer=False,
+            has_v_buffer=False,
+            k_layer=None,
+            v_layer=None,
+            layer_idx=layer_idx,
+            snapshot_created=False,
+            snapshot_skipped_reason=base_reason,
+            token_indices=list(token_indices),
+            fallback_candidate_noop_guard=fallback_noop,
+        )
+    else:
+        snapshot = snapshot_mha_kv_pool_readonly_for_smoke(
+            kv_pool=kv_object,
+            layer_idx=layer_idx,
+            token_indices=token_indices,
+            runtime_policy_state=runtime_policy_state,
+        )
+    snapshot_log = snapshot.to_log_dict()
+
+    if runtime_policy_state == "applied_candidate" and snapshot.snapshot_tensor is not None:
+        copy_log = copy_host_backup_candidate_for_smoke(
+            plan=plan,
+            source_tensor=snapshot.snapshot_tensor,
+        ).to_log_dict()
+    else:
+        skipped_reason = snapshot.snapshot_skipped_reason
+        if not skipped_reason:
+            skipped_reason = (
+                "fallback_candidate_noop_guard"
+                if fallback_noop
+                else "snapshot_not_created"
+            )
+        copy_log = _host_backup_copy_candidate_noop_log(
+            runtime_policy_state=runtime_policy_state,
+            source_shape=snapshot.snapshot_shape,
+            source_dtype=snapshot.snapshot_dtype,
+            source_device=snapshot.source_device,
+            skipped_reason=skipped_reason,
+        )
+
+    payload = dict(event_payload)
+    payload.update(snapshot_log)
+    payload.update(
+        {
+            "host_backup_copy_candidate": copy_log["host_backup_copy_candidate"],
+            "host_backup_copy_executed": copy_log["host_backup_copy_executed"],
+            "host_backup_copy_skipped_reason": copy_log[
+                "host_backup_copy_skipped_reason"
+            ],
+            "backup_shape": copy_log["backup_shape"],
+            "backup_dtype": copy_log["backup_dtype"],
+            "backup_device": copy_log["backup_device"],
+            "copy_numel": copy_log["copy_numel"],
+            "copy_nbytes": copy_log["copy_nbytes"],
+            "copy_equal": copy_log["copy_equal"],
+            "fallback_candidate_noop_guard": (
+                fallback_noop or snapshot_log["fallback_candidate_noop_guard"]
+            ),
+            "attention_override": False,
+            "kv_cache_mutation": False,
+            "runtime_writeback": False,
+            "scheduler_policy_noop": True,
+            "host_backup_copy": False,
+        }
+    )
+    return payload
 
 
 def observe_kv_layout_for_host_backup(
