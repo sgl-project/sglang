@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Image tag to scan (e.g., dev, dev-cu12, latest)"
+        description: "Image tag to scan (e.g., dev, dev-cu13, latest)"
         required: false
         default: ""
 

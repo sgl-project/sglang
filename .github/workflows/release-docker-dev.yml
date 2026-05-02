@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       tag:
-        description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-my-test, dev-cu12-my-test, etc."
+        description: "Custom tag suffix (overrides pr_number in tag). E.g. 'my-test' → dev-my-test, dev-cu13-my-test, etc."
         required: false
         default: ""
       image_repo:
@@ -56,12 +56,13 @@ jobs:
             SUFFIX="-pr-${{ inputs.pr_number }}"
           fi
 
-          # Build tag config
+          # Build tag config. dev-cu13 is published as an alias of dev for
+          # backwards compatibility with consumers pinned to the pre-flip name.
           if [ -z "${SUFFIX}" ]; then
             # Nightly: include dated tags
-            TAG_CONFIG='[{"cuda":"cu129","tags":["dev-cu12","nightly-dev-cu12-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev","nightly-dev-{date}-{short_sha}"]}]'
+            TAG_CONFIG='[{"cuda":"cu129","tags":["dev-cu12","nightly-dev-cu12-{date}-{short_sha}"]},{"cuda":"cu130","tags":["dev","dev-cu13","nightly-dev-{date}-{short_sha}"]}]'
           else
-            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev-cu12${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\"]}]"
+            TAG_CONFIG="[{\"cuda\":\"cu129\",\"tags\":[\"dev-cu12${SUFFIX}\"]},{\"cuda\":\"cu130\",\"tags\":[\"dev${SUFFIX}\",\"dev-cu13${SUFFIX}\"]}]"
           fi
           echo "tag_config=${TAG_CONFIG}" >> $GITHUB_OUTPUT
 

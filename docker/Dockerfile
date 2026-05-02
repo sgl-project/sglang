@@ -536,15 +536,15 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
-# Per-CUDA-major package installs. nixl ships as nixl-cu12 / nixl-cu13 binaries;
-# the `nixl` stub package unconditionally pulls nixl-cu12, so we install the
-# matching variant directly to avoid shipping wrong-CUDA binaries on cu13
-# images.
+# Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
+# the `nixl` import path) but unconditionally requires nixl-cu12, so we install
+# it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
+# to avoid shipping wrong-CUDA libs on cu13 images.
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-    python3 -m pip install nixl-cu12 --no-deps ; \
+    python3 -m pip install nixl nixl-cu12 --no-deps ; \
     python3 -m pip install cuda-python==12.9 ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-    python3 -m pip install nixl-cu13 --no-deps ; \
+    python3 -m pip install nixl nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.2.0 ; \
 fi
 

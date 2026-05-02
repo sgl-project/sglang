@@ -236,7 +236,7 @@ jobs:
             echo "Using freshly built image: $BUILT_IMAGE"
             echo "image=$BUILT_IMAGE" >> $GITHUB_OUTPUT
           else
-            IMAGE="${{ inputs.image || 'lmsysorg/sglang:dev' }}"
+            IMAGE="${{ inputs.image || 'lmsysorg/sglang:dev-cu13' }}"
             echo "Using pre-existing image: $IMAGE"
             echo "image=$IMAGE" >> $GITHUB_OUTPUT
           fi
