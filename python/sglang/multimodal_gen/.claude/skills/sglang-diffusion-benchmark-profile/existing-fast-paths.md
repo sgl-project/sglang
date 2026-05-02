@@ -9,10 +9,12 @@ configuration first before handing the problem to a specialized kernel-optimizat
 - `python/sglang/multimodal_gen/runtime/layers/elementwise.py`
 - `python/sglang/multimodal_gen/runtime/layers/rotary_embedding/utils.py`
 - `python/sglang/jit_kernel/diffusion/triton/scale_shift.py`
+- `python/sglang/jit_kernel/diffusion/triton/group_norm_silu.py`
 - `python/sglang/jit_kernel/diffusion/triton/norm.py`
 - `python/sglang/jit_kernel/diffusion/triton/rmsnorm_onepass.py`
 - `python/sglang/jit_kernel/diffusion/triton/rotary.py`
 - `python/sglang/jit_kernel/diffusion/cutedsl/scale_residual_norm_scale_shift.py`
+- `python/sglang/jit_kernel/tests/diffusion/test_group_norm_silu.py`
 - `python/sglang/jit_kernel/norm.py`
 - `python/sglang/multimodal_gen/runtime/platforms/cuda.py`
 - `python/sglang/multimodal_gen/runtime/layers/attention/selector.py`
@@ -68,6 +70,15 @@ configuration first before handing the problem to a specialized kernel-optimizat
 - NPU fallback: `npu_fallback.apply_rotary_embedding_native`.
 - Validation: `python/sglang/jit_kernel/tests/test_rope.py`.
 
+7. HunyuanVideo VAE GroupNorm + SiLU fusion
+- Kernel: `triton_group_norm_silu`
+- Locations: `triton/group_norm_silu.py`, `runtime/models/vaes/hunyuanvae.py`
+- Toggle: `SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU=false` by default on current mainline.
+- Use case: `activation(group_norm(x))` when the activation is `nn.SiLU` and the GroupNorm is affine.
+- Constraints: CUDA path only; unsupported shapes fall back to native `activation(norm(x))`.
+- Validation: `python/sglang/jit_kernel/tests/diffusion/test_group_norm_silu.py`.
+- Watchlist: PRs #23148 and #23938 tune/default-enable this family; verify merge status before assuming the current branch uses it automatically.
+
 **Faster CUDA Kernel Usage Points**
 
 1. sgl-kernel RMSNorm and fused add RMSNorm
@@ -112,6 +123,7 @@ configuration first before handing the problem to a specialized kernel-optimizat
   - Supported head dims: `64, 128, 256`.
 - Behavior: `apply_qk_norm_rope` prefers the fused JIT kernel when all guards pass; otherwise it falls back to `apply_qk_norm(...)` plus `apply_flashinfer_rope_qk_inplace(...)`.
 - Validation: `python/sglang/jit_kernel/tests/diffusion/test_qknorm_rope.py`.
+- Watchlist: PR #24025 adds LTX2-specific QK norm fusion work. Until merged, treat LTX2 traces that miss the generic fused path as an enablement/shape-guard issue first, not proof that the PR path exists locally.
 
 **Nunchaku Fused GELU MLP**
 
@@ -132,6 +144,7 @@ configuration first before handing the problem to a specialized kernel-optimizat
 - AdaLN modulation: `LayerNormScaleShift`, `RMSNormScaleShift`, `ScaleResidual*` in `layernorm.py`.
 - Qwen-Image gating: `fuse_scale_shift_gate_select01_kernel` in `qwen_image.py`.
 - Z-Image residual-form modulation: `fused_norm_tanh_mul_add` and `fused_norm_tanh_mul_add_norm_scale` in `zimage.py`.
+- HunyuanVideo VAE GroupNorm+SiLU: `_apply_hunyuan_group_norm_silu` in `hunyuanvae.py`, gated by `SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU`.
 - QK norm: `apply_qk_norm` used in `flux.py`, `flux_2.py`, `qwen_image.py`, `zimage.py`, `wanvideo.py`, `ltx_2.py`, `hunyuanvideo.py`.
 - QK norm + RoPE: `apply_qk_norm_rope` in `layernorm.py`; use this path when the model wants fused attention prep instead of separate QK norm and RoPE calls.
 - Nunchaku fused GELU MLP: `_fused_gelu_mlp` in `flux.py` for quantized FLUX-family checkpoints.
@@ -145,6 +158,37 @@ configuration first before handing the problem to a specialized kernel-optimizat
 - TorchInductor compute / communication reorder: `torch._inductor.config.reorder_for_compute_comm_overlap = True` can already partially overlap compiled denoise traces.
 - Dual-stream diffusion models: `use_dual_stream = True` in models such as `hunyuan3d.py` is an existing overlap family.
 - Workflow rule: if a hotspot is communication-heavy, rule out these in-repo overlap families before proposing a brand new overlap design.
+
+**Open PR Watchlist**
+
+As of 2026-05-02, these SGLang PRs were still open. Use them as upstream
+direction and prior art, not as current-main behavior. Re-check the PR state
+before relying on any file path or flag.
+
+- Norm, modulation, and packed projection fusions:
+  - #24025 LTX2 QK norm fusion.
+  - #24059 Helios fused norm modulation.
+  - #24117 Z-Image packed QKV.
+  - #19488 Wan cross-block elementwise fusion.
+  - #19249 Z-Image `scale residual norm scale shift` plus `add gate norm` fusion.
+  - #18897 dual norm fusion for FLUX-family paths (draft).
+  - #20429 Qwen-Image layernorm and `fuse_scale_shift_gate_select01` work.
+  - #20530 MOVA fused RMSNorm + interleaved RoPE.
+- VAE and decode-side acceleration:
+  - #23148 and #23938 HunyuanVideo GroupNorm+SiLU enablement/tuning.
+  - #22531 LTX2 parallel VAE support and #20927 batched tiled VAE decode (draft).
+- Attention, communication, and runtime scheduling:
+  - #22805 FLUX.2 packed QKV for all-to-all.
+  - #21742 hybrid attention schedule.
+  - #24053 USP attention with replicated prefixes.
+  - #18764 dynamic batching v0.
+  - #24200 disaggregated diffusion v2.
+- Cache and CUDA graph:
+  - #21613 TeaCache refactor.
+  - #24227 WanVideo TeaCache skipping fix.
+  - #20447 TeaCache support for GLM-Image, Qwen-Image, and related models.
+  - #19516 Qwen-Image CUDA Graph.
+  - #21912 Z-Image Turbo FP8 full quantization and CUDA Graph.
 
 **Constraints and Fallbacks**
 - `scale_shift` Triton requires CUDA + contiguous `x`. NPU swaps to native.
