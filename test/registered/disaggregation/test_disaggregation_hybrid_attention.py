@@ -1,6 +1,8 @@
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -15,6 +17,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=310, stage="extra-b", runner_config="8-gpu-h200")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_ci(), "Temporarily disable the flaky test.")
 class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
     @classmethod
@@ -88,6 +91,7 @@ class TestDisaggregationHybridAttentionGDN(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.93)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -165,6 +169,7 @@ class TestDisaggregationHybridAttentionGDNExtraBuffer(PDDisaggregationServerBase
         self.assertGreater(metrics["score"], 0.90)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationHybridAttentionGDNDPDecode(PDDisaggregationServerBase):
     """Test with prefill tp=2 and decode tp=2/dp=2 with dp-attention enabled."""
 

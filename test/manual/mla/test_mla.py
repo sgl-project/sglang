@@ -1,5 +1,7 @@
 import unittest
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.kits.eval_accuracy_kit import MGSMEnMixin
 from sglang.test.test_utils import (
@@ -12,6 +14,7 @@ from sglang.test.test_utils import (
 
 
 # MLA attention test with MGSM evaluation
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMLA(CustomTestCase, MGSMEnMixin):
     mgsm_en_score_threshold = 0.8
 
