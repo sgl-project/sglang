@@ -149,6 +149,46 @@ class TestPoolsideV1Detector(CustomTestCase):
         self.assertEqual(result.calls[0].name, "now")
         self.assertEqual(json.loads(result.calls[0].parameters), {})
 
+    def test_truncated_pre_value_emits_no_calls(self):
+        """Regression: max-tokens cutoff mid-`<arg_value>` must drop the
+        in-flight call. The closing-tag-anchored regex in detect_and_parse
+        naturally drops these; this test locks in that contract so a future
+        streaming-as-primitive refactor can't silently regress it."""
+        text = "<tool_call>get_weather\n<arg_key>location</arg_key>\n<arg_value>San Fr"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(
+            len(result.calls), 0, "truncated mid-arg_value must yield 0 calls"
+        )
+
+    def test_truncated_post_value_emits_no_calls(self):
+        """Regression: cutoff after `</arg_value>` but before `</tool_call>`
+        must drop the call. Without the closing-tag anchor, a partial
+        emission could surface non-JSON parameters
+        (`{"location": "SF"` with no closing brace)."""
+        text = (
+            "<tool_call>get_weather\n<arg_key>location</arg_key>\n"
+            "<arg_value>SF</arg_value>\n"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(
+            len(result.calls),
+            0,
+            "truncated after arg_value but before </tool_call> must yield 0 calls",
+        )
+
+    def test_truncated_after_complete_call_keeps_complete(self):
+        """A complete tool_call followed by a truncated second one must keep
+        the complete one and drop only the truncated tail."""
+        text = (
+            "<tool_call>get_weather\n<arg_key>location</arg_key>\n"
+            "<arg_value>NYC</arg_value>\n</tool_call>\n"
+            "<tool_call>search\n<arg_key>q"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"location": "NYC"})
+
     def test_streaming_malformed_no_name_does_not_hang(self):
         """Regression: malformed `<tool_call><arg_key>...` (no name, no \\n)
         used to spin in branch 2 with consume=0. Must drain to </tool_call>."""

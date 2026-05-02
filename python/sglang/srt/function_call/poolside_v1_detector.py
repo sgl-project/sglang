@@ -2,6 +2,7 @@ import ast
 import json
 import logging
 import re
+from enum import Enum, auto
 from typing import Any, List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -14,6 +15,18 @@ from sglang.srt.function_call.core_types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _ParseState(Enum):
+    """5 FSM states for the streaming parser. READING_VALUE is reachable only
+    from READING_KEY, so the "stray <arg_value> before <tool_call>" bug class
+    is structurally impossible."""
+
+    OUTSIDE = auto()
+    READING_NAME = auto()
+    READING_KEY = auto()
+    READING_VALUE = auto()
+    DRAINING = auto()
 
 
 class PoolsideV1Detector(BaseFormatDetector):
@@ -33,40 +46,85 @@ class PoolsideV1Detector(BaseFormatDetector):
     `json.loads` and fall back to `ast.literal_eval`, then to the raw string.
     """
 
+    # Wire-format tag tokens — constants, not per-instance.
+    tool_call_start_token = "<tool_call>"
+    tool_call_end_token = "</tool_call>"
+    arg_key_start = "<arg_key>"
+    arg_key_end = "</arg_key>"
+    arg_value_start = "<arg_value>"
+    arg_value_end = "</arg_value>"
+
+    tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+    arg_pair_regex = re.compile(
+        r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+        re.DOTALL,
+    )
+
+    _partial_tag_prefixes = (
+        tool_call_start_token,
+        tool_call_end_token,
+        arg_key_start,
+        arg_key_end,
+        arg_value_start,
+        arg_value_end,
+    )
+
     def __init__(self):
         super().__init__()
 
-        self.tool_call_start_token = "<tool_call>"
-        self.tool_call_end_token = "</tool_call>"
-        self.arg_key_start = "<arg_key>"
-        self.arg_key_end = "</arg_key>"
-        self.arg_value_start = "<arg_value>"
-        self.arg_value_end = "</arg_value>"
-
-        self.tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
-        self.arg_pair_regex = re.compile(
-            r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
-            re.DOTALL,
-        )
-
-        # Streaming FSM state
+        # Streaming FSM. DRAINING (unknown-tool drain) replaces the old
+        # `skip_until_call_end` boolean and kills the "set name_sent=True
+        # unconditionally to avoid spinning" hack.
         self.parsed_pos: int = 0
-        self.is_inside_tool_call: bool = False
-        self.json_started: bool = False
+        self._state: _ParseState = _ParseState.OUTSIDE
         self.current_func_name: Optional[str] = None
         self.current_pending_key: Optional[str] = None
-        self.skip_until_call_end: bool = (
-            False  # set when current call's name is unknown
-        )
+        self.json_started: bool = False
 
     # ---------- Helpers ----------
+
+    def _reset_call_state(self) -> None:
+        """Reset per-call FSM scratch fields. Called when entering a new
+        <tool_call> and on </tool_call> close."""
+        self.current_func_name = None
+        self.current_pending_key = None
+        self.json_started = False
+
+    def _consume_arg_key(self, slice_: str) -> bool:
+        """Consume `<arg_key>K</arg_key>`, set `current_pending_key` to K.
+        Returns True if consumed, False if `</arg_key>` hasn't arrived yet
+        (caller should break to wait for more bytes)."""
+        end = slice_.find(self.arg_key_end)
+        if end == -1:
+            return False
+        self.current_pending_key = slice_[len(self.arg_key_start) : end].strip()
+        self.parsed_pos += end + len(self.arg_key_end)
+        return True
+
+    def _close_current_call(self, calls: List[ToolCallItem]) -> None:
+        """Emit the closing `}` (or `{}` for zero-arg) for the active call,
+        advance past `</tool_call>`, return to OUTSIDE, and reset per-call
+        state."""
+        fragment = "}" if self.json_started else "{}"
+        calls.append(
+            ToolCallItem(
+                tool_index=self.current_tool_id,
+                parameters=fragment,
+            )
+        )
+        self.streamed_args_for_tool[self.current_tool_id] += fragment
+        self.parsed_pos += len(self.tool_call_end_token)
+        self._state = _ParseState.OUTSIDE
+        self._reset_call_state()
 
     def has_tool_call(self, text: str) -> bool:
         return self.tool_call_start_token in text
 
     @staticmethod
-    def _get_param_schema(func_name: str, tools: Optional[List[Tool]]) -> dict:
-        if not tools:
+    def _get_param_schema(
+        func_name: Optional[str], tools: Optional[List[Tool]]
+    ) -> dict:
+        if not tools or not func_name:
             return {}
         for tool in tools:
             try:
@@ -115,9 +173,7 @@ class PoolsideV1Detector(BaseFormatDetector):
         return value
 
     def _find_name_boundary(self, text: str) -> int:
-        """
-        Earliest of `\\n`, `<arg_key>`, `</tool_call>`. -1 if none — caller buffers.
-        """
+        """Earliest of `\\n`, `<arg_key>`, `</tool_call>`. -1 if none."""
         candidates = []
         nl = text.find("\n")
         if nl != -1:
@@ -129,6 +185,14 @@ class PoolsideV1Detector(BaseFormatDetector):
         if te != -1:
             candidates.append(te)
         return min(candidates) if candidates else -1
+
+    def _is_partial_tag(self, slice_: str) -> bool:
+        """True if slice_ is a strict prefix of any known tag — i.e. more
+        bytes might complete it into a real tag."""
+        return any(
+            tag.startswith(slice_) and tag != slice_
+            for tag in self._partial_tag_prefixes
+        )
 
     # ---------- Non-streaming ----------
 
@@ -142,10 +206,11 @@ class PoolsideV1Detector(BaseFormatDetector):
 
         calls: List[ToolCallItem] = []
         for body in self.tool_call_regex.findall(text):
-            # _find_name_boundary searches for `\n` / `<arg_key>` / `</tool_call>`,
-            # but the regex already stripped `</tool_call>`, so a no-arg call
-            # without a trailing newline (`<tool_call>now</tool_call>`) gives
-            # boundary == -1. Treat that case as "name == entire body".
+            # _find_name_boundary searches for `\n` / `<arg_key>` /
+            # `</tool_call>`, but the regex already stripped `</tool_call>`,
+            # so a no-arg call without a trailing newline
+            # (`<tool_call>now</tool_call>`) gives boundary == -1. Treat
+            # that case as "name == entire body".
             boundary = self._find_name_boundary(body)
             name = (body if boundary == -1 else body[:boundary]).strip()
             if not name or name not in tool_indices:
@@ -181,70 +246,42 @@ class PoolsideV1Detector(BaseFormatDetector):
         calls: List[ToolCallItem] = []
         normal_text_chunks: List[str] = []
 
-        partial_tag_prefixes = (
-            self.tool_call_start_token,
-            self.tool_call_end_token,
-            self.arg_key_start,
-            self.arg_key_end,
-            self.arg_value_start,
-            self.arg_value_end,
-        )
-
         try:
             while True:
                 slice_ = self._buffer[self.parsed_pos :]
                 if not slice_:
                     break
+                state = self._state
 
-                # 1. <tool_call>
-                if slice_.startswith(self.tool_call_start_token):
-                    self.parsed_pos += len(self.tool_call_start_token)
-                    self.is_inside_tool_call = True
-                    self.skip_until_call_end = False
-                    self.current_tool_name_sent = False
-                    self.json_started = False
-                    self.current_func_name = None
-                    self.current_pending_key = None
+                if state is _ParseState.OUTSIDE:
+                    if slice_.startswith(self.tool_call_start_token):
+                        self.parsed_pos += len(self.tool_call_start_token)
+                        self._state = _ParseState.READING_NAME
+                        self._reset_call_state()
+                        continue
+                    if slice_.startswith("<"):
+                        if self._is_partial_tag(slice_):
+                            break  # could be a partial <tool_call>
+                        normal_text_chunks.append("<")
+                        self.parsed_pos += 1
+                        continue
+                    next_lt = slice_.find("<")
+                    segment = slice_ if next_lt == -1 else slice_[:next_lt]
+                    normal_text_chunks.append(segment)
+                    self.parsed_pos += len(segment)
                     continue
 
-                # 2. Tool name (inside tool_call, name not yet emitted)
-                if self.is_inside_tool_call and not self.current_tool_name_sent:
+                if state is _ParseState.READING_NAME:
                     boundary = self._find_name_boundary(slice_)
                     if boundary == -1:
-                        break
+                        break  # name still incoming
                     name = slice_[:boundary].strip()
-                    # Mark name as "sent" UNCONDITIONALLY — this is the actual
-                    # liveness guarantee for branch 2. A malformed
-                    # `<tool_call><arg_key>...` gives boundary=0 at `<arg_key>`
-                    # with no consumable newline, so consume=0 below; without
-                    # the flag flip the next iteration re-enters branch 2 with
-                    # an unchanged slice and spins. Setting the flag means
-                    # branch 2 is one-shot per `<tool_call>` regardless of
-                    # whether the name resolved, and subsequent iterations
-                    # fall through to branches 4/5 (drain) or 3 (close).
-                    self.current_tool_name_sent = True
-                    if name in tool_indices:
-                        self.current_tool_id += 1
-                        self.current_func_name = name
-                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                            self.streamed_args_for_tool.append("")
-                        # Streaming uses the per-response sequential index
-                        # (current_tool_id), NOT the tools-list slot index —
-                        # OpenAI clients group chunks by `index`, so all chunks
-                        # for one call must share the same value as later
-                        # parameter emissions in branches 3/5.
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=name,
-                                parameters="",
-                            )
-                        )
-                    else:
-                        # Unknown tool name (or empty) — drain until </tool_call>.
-                        self.skip_until_call_end = True
-                    # Consume only the name (and a single delimiting newline if present);
-                    # leave <arg_key>/</tool_call> for the next iteration.
+                    # Consume the name and a single delimiting newline (if
+                    # present). The other boundary types (<arg_key>,
+                    # </tool_call>) are left for the next state. boundary
+                    # may be 0 for a malformed `<tool_call><arg_key>...`
+                    # (no name); the state transition below is the
+                    # loop-progress guarantee.
                     consume = boundary
                     if (
                         boundary < len(slice_)
@@ -252,69 +289,63 @@ class PoolsideV1Detector(BaseFormatDetector):
                     ):
                         consume += 1
                     self.parsed_pos += consume
-                    continue
 
-                # 3. </tool_call>
-                if slice_.startswith(self.tool_call_end_token):
-                    if not self.skip_until_call_end and self.current_tool_name_sent:
-                        if not self.json_started:
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id, parameters="{}"
-                                )
+                    if name and name in tool_indices:
+                        self.current_tool_id += 1
+                        while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                            self.streamed_args_for_tool.append("")
+                        self.current_func_name = name
+                        # Per-response sequential index — OpenAI clients
+                        # group chunks by tool_index, so the name event
+                        # and later parameter fragments must share this
+                        # value.
+                        calls.append(
+                            ToolCallItem(
+                                tool_index=self.current_tool_id,
+                                name=name,
+                                parameters="",
                             )
-                            self.streamed_args_for_tool[self.current_tool_id] += "{}"
-                        else:
-                            calls.append(
-                                ToolCallItem(
-                                    tool_index=self.current_tool_id, parameters="}"
-                                )
-                            )
-                            self.streamed_args_for_tool[self.current_tool_id] += "}"
-                    self.parsed_pos += len(self.tool_call_end_token)
-                    self.is_inside_tool_call = False
-                    self.skip_until_call_end = False
-                    self.current_tool_name_sent = False
-                    self.json_started = False
-                    self.current_func_name = None
-                    self.current_pending_key = None
+                        )
+                        self._state = _ParseState.READING_KEY
+                    else:
+                        # Unknown / empty name — drain to </tool_call>
+                        # with no client-visible emission.
+                        self._state = _ParseState.DRAINING
                     continue
 
-                # 4. <arg_key>...</arg_key>
-                if slice_.startswith(self.arg_key_start):
-                    end = slice_.find(self.arg_key_end)
-                    if end == -1:
-                        break  # incomplete tag; wait
-                    # Only capture when we're actively assembling a known
-                    # call's params: inside a tool_call AND the name was
-                    # already resolved (current_tool_id is valid). Without
-                    # `is_inside_tool_call`, a stray `<arg_key>` before any
-                    # `<tool_call>` would set pending_key, then branch 5
-                    # would crash writing to streamed_args_for_tool[-1] on
-                    # an empty list (and that crash would be masked by the
-                    # outer except, hiding the FSM-state bug).
-                    if (
-                        not self.skip_until_call_end
-                        and self.is_inside_tool_call
-                        and self.current_tool_name_sent
-                    ):
-                        self.current_pending_key = slice_[
-                            len(self.arg_key_start) : end
-                        ].strip()
-                    self.parsed_pos += end + len(self.arg_key_end)
+                if state is _ParseState.READING_KEY:
+                    if slice_.startswith(self.tool_call_end_token):
+                        self._close_current_call(calls)
+                        continue
+                    if slice_.startswith(self.arg_key_start):
+                        if not self._consume_arg_key(slice_):
+                            break  # incomplete <arg_key>
+                        self._state = _ParseState.READING_VALUE
+                        continue
+                    if slice_.startswith("<"):
+                        if self._is_partial_tag(slice_):
+                            break
+                        # Bare '<' that's not any known tag — discard
+                        # silently (inside a tool call, this is not
+                        # normal_text).
+                        self.parsed_pos += 1
+                        continue
+                    # Inter-tag whitespace / newline — discard.
+                    next_lt = slice_.find("<")
+                    self.parsed_pos += len(slice_) if next_lt == -1 else next_lt
                     continue
 
-                # 5. <arg_value>...</arg_value>
-                if slice_.startswith(self.arg_value_start):
-                    end = slice_.find(self.arg_value_end)
-                    if end == -1:
-                        break  # incomplete tag; wait (no partial value emission)
-                    raw = slice_[len(self.arg_value_start) : end]
-                    raw = self._strip_edge_newlines(raw)
-                    if (
-                        not self.skip_until_call_end
-                        and self.current_pending_key is not None
-                    ):
+                if state is _ParseState.READING_VALUE:
+                    if slice_.startswith(self.arg_value_start):
+                        end = slice_.find(self.arg_value_end)
+                        if end == -1:
+                            break  # incomplete <arg_value> — no partial emission
+                        raw = self._strip_edge_newlines(
+                            slice_[len(self.arg_value_start) : end]
+                        )
+                        # READING_VALUE is reachable only via READING_KEY
+                        # consuming an <arg_key>...</arg_key>, so
+                        # current_pending_key is set by construction.
                         schema = self._get_param_schema(self.current_func_name, tools)
                         converted = self._convert_param_value(
                             raw, schema, self.current_pending_key
@@ -323,44 +354,41 @@ class PoolsideV1Detector(BaseFormatDetector):
                             f"{json.dumps(self.current_pending_key)}: "
                             f"{json.dumps(converted, ensure_ascii=False)}"
                         )
-                        if not self.json_started:
-                            fragment = "{" + kv
-                            self.json_started = True
-                        else:
-                            fragment = ", " + kv
+                        fragment = "{" + kv if not self.json_started else ", " + kv
+                        self.json_started = True
                         calls.append(
                             ToolCallItem(
-                                tool_index=self.current_tool_id, parameters=fragment
+                                tool_index=self.current_tool_id,
+                                parameters=fragment,
                             )
                         )
                         self.streamed_args_for_tool[self.current_tool_id] += fragment
                         self.current_pending_key = None
-                    self.parsed_pos += end + len(self.arg_value_end)
+                        self.parsed_pos += end + len(self.arg_value_end)
+                        self._state = _ParseState.READING_KEY
+                        continue
+                    if slice_.startswith("<"):
+                        if self._is_partial_tag(slice_):
+                            break
+                        self.parsed_pos += 1
+                        continue
+                    next_lt = slice_.find("<")
+                    self.parsed_pos += len(slice_) if next_lt == -1 else next_lt
                     continue
 
-                # 6. Plain '<' that might be a partial known tag → buffer.
-                if slice_.startswith("<"):
-                    if any(
-                        tag.startswith(slice_) and tag != slice_
-                        for tag in partial_tag_prefixes
-                    ):
-                        break
-                    # A bare '<' that cannot be a known tag.
-                    if not self.is_inside_tool_call:
-                        normal_text_chunks.append("<")
-                    self.parsed_pos += 1
-                    continue
-
-                # 7. Free-form text up to the next `<`. Outside a tool call
-                #    → emit; inside → discard (newlines between tags).
-                #    Trailing-prefix holdback isn't needed here: branch 6
-                #    handles any `<…` boundary, and tag prefixes all start
-                #    with `<`, so a slice with no `<` cannot end on one.
-                next_lt = slice_.find("<")
-                segment = slice_ if next_lt == -1 else slice_[:next_lt]
-                if not self.is_inside_tool_call:
-                    normal_text_chunks.append(segment)
-                self.parsed_pos += len(segment)
+                if state is _ParseState.DRAINING:
+                    end_idx = slice_.find(self.tool_call_end_token)
+                    if end_idx != -1:
+                        self.parsed_pos += end_idx + len(self.tool_call_end_token)
+                        self._state = _ParseState.OUTSIDE
+                        continue
+                    # Hold back trailing bytes that could be a prefix of
+                    # </tool_call>; the next chunk extends the tail.
+                    holdback = self._ends_with_partial_token(
+                        slice_, self.tool_call_end_token
+                    )
+                    self.parsed_pos += len(slice_) - holdback
+                    break
 
         except Exception as e:
             logger.error(f"Error in PoolsideV1Detector.parse_streaming_increment: {e}")
