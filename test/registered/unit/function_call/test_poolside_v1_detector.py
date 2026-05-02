@@ -198,33 +198,47 @@ class TestPoolsideV1Detector(CustomTestCase):
         self.assertEqual(len(result.calls), 0)
 
     def test_streaming_arg_tags_without_tool_call_wrapper(self):
-        """Regression: a stray `<arg_key>...</arg_key><arg_value>...</arg_value>`
-        arriving with no preceding `<tool_call>` used to crash branch 5 with
-        IndexError on streamed_args_for_tool[-1] (current_tool_id == -1, list
-        empty). The crash was silently masked by the outer except. The FSM
-        should not enter the emission state without is_inside_tool_call."""
+        """Regression: stray `<arg_key>...</arg_key><arg_value>...</arg_value>`
+        with no preceding `<tool_call>` used to crash with IndexError on
+        `streamed_args_for_tool[-1]` (masked by the old broad except). The
+        FSM's READING_VALUE state is unreachable from OUTSIDE, so this returns
+        0 calls without raising — and now that the broad except is gone, any
+        regression here would propagate as a real test failure."""
         detector = PoolsideV1Detector()
         wire = "<arg_key>k</arg_key><arg_value>v</arg_value>"
-        # Capture log output to catch any masked exceptions.
-        import logging
-
-        with self.assertLogs(
-            "sglang.srt.function_call.poolside_v1_detector", level="ERROR"
-        ) as logs:
-            result = detector.parse_streaming_increment(wire, self.tools)
-            # Ensure the assertLogs context has at least one record (it errors
-            # if not). If the FSM is correctly guarded, there's nothing to log,
-            # so emit a benign one to satisfy the contract.
-            logging.getLogger("sglang.srt.function_call.poolside_v1_detector").error(
-                "sentinel"
-            )
-        # No errors other than our sentinel — i.e., the parser didn't crash.
-        self.assertEqual(
-            [r for r in logs.records if r.message != "sentinel"],
-            [],
-            "parser hit the broad except; FSM let an invalid state through",
-        )
+        result = detector.parse_streaming_increment(wire, self.tools)
         self.assertEqual(len(result.calls), 0)
+
+    def test_set_literal_falls_back_to_raw_string(self):
+        """Regression: ast.literal_eval('{1,2,3}') returns a set, which
+        json.dumps cannot serialize. Without the round-trip guard in
+        _convert_param_value, the parse_streaming_increment loop would
+        TypeError downstream (previously masked by the broad except). The
+        guard rejects sets and falls back to the raw string."""
+        tools_with_obj = [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"options": {"type": "object"}},
+                    },
+                ),
+            )
+        ]
+        detector = PoolsideV1Detector()
+        text = (
+            "<tool_call>get_weather\n<arg_key>options</arg_key>\n"
+            "<arg_value>{1, 2, 3}</arg_value>\n</tool_call>"
+        )
+        result = detector.detect_and_parse(text, tools_with_obj)
+        self.assertEqual(len(result.calls), 1)
+        args = json.loads(result.calls[0].parameters)
+        # set literal couldn't round-trip, so it's preserved as the raw
+        # string (the only sane fallback).
+        self.assertEqual(args["options"], "{1, 2, 3}")
 
     # ==================== structure_info ====================
 
