@@ -45,14 +45,18 @@ _SCALE_STRIDE = _NUM_TILES + 1  # 8 (7 scales + 1 pad)
 _D = _NOPE_DIM + _ROPE_DIM  # 512
 
 
+_GATHER_CHUNK = 16384  # tokens per chunk; ~16k * 1024 B ≈ 16 MiB output per chunk
+
+
 def _gather_and_dequant(k_cache, indices, page_size):
     """Gather KV entries from the paged buffer using correct page-internal addressing.
 
     Args:
         k_cache: (num_pages, page_size, 1, bytes_per_token) float8_e4m3fn
                  Non-contiguous view of the raw page buffer.
-        indices: (...) int32/int64, token-level indices. -1 = invalid.
-        page_size: tokens per page (256)
+        indices: (...) int32/int64, token-level indices. Invalid indices are
+                 expected to already be clamped into [0, num_pages*page_size).
+        page_size: tokens per page (e.g. 256, 64, 2)
 
     Returns:
         kv: (..., _D) bfloat16, dequantized KV vectors
@@ -62,73 +66,63 @@ def _gather_and_dequant(k_cache, indices, page_size):
     N = flat_idx.shape[0]
     device = k_cache.device
 
-    # Page-level addressing
     page_bytes = k_cache.stride(0)  # actual byte stride between pages
-    pages = flat_idx // page_size
-    offsets = flat_idx % page_size
-
-    # Clamp invalid indices
-    safe_pages = pages.clamp(min=0)
-    safe_offsets = offsets.clamp(min=0)
-
-    # Access raw buffer as uint8 — use as_strided to get full page view
     num_pages = k_cache.shape[0]
+
+    # Flatten the raw byte buffer so we can gather with a single int64 index
+    # per byte instead of paying for a full (N, 448) int64 index tensor up
+    # front. flat_buf has nelems = num_pages * page_bytes uint8.
     raw_pages = k_cache.as_strided(
         (num_pages, page_bytes),
         (page_bytes, 1),
-    ).view(
-        torch.uint8
-    )  # (num_pages, page_bytes) uint8
-    # Note: float8_e4m3fn and uint8 are both 1 byte, view is safe
+    ).view(torch.uint8)
+    flat_buf = raw_pages.reshape(-1)
 
-    # Compute byte offsets within each page
-    # NOPE: page[safe_page, safe_offset * 576 + 0:448]
-    # ROPE: page[safe_page, safe_offset * 576 + 448:576]
-    # SCALES: page[safe_page, page_size * 576 + safe_offset * 8 + 0:7]
+    scale_section_offset = page_size * _NOPE_ROPE_STRIDE
 
-    nope_base = safe_offsets * _NOPE_ROPE_STRIDE  # (N,)
-    nope_offsets = nope_base.unsqueeze(-1) + torch.arange(
-        _NOPE_DIM, device=device, dtype=torch.long
-    )  # (N, 448)
+    nope_arange = torch.arange(_NOPE_DIM, device=device, dtype=torch.long)
+    rope_arange = torch.arange(_ROPE_DIM * 2, device=device, dtype=torch.long)
+    scale_arange = torch.arange(_NUM_TILES, device=device, dtype=torch.long)
 
-    rope_base = nope_base + _NOPE_DIM  # (N,)
-    rope_offsets = rope_base.unsqueeze(-1) + torch.arange(
-        _ROPE_DIM * 2, device=device, dtype=torch.long
-    )  # (N, 128)
-
-    scale_section_offset = page_size * _NOPE_ROPE_STRIDE  # 147456
-    scale_base = scale_section_offset + safe_offsets * _SCALE_STRIDE  # (N,)
-    scale_offsets = scale_base.unsqueeze(-1) + torch.arange(
-        _NUM_TILES, device=device, dtype=torch.long
-    )  # (N, 7)
-
-    # Gather bytes per page — use advanced indexing
-    # raw_pages[safe_pages, nope_offsets] → (N, 448)
-    page_idx_nope = safe_pages.unsqueeze(-1).expand_as(nope_offsets)
-    nope_bytes = raw_pages[page_idx_nope, nope_offsets]  # (N, 448) uint8
-
-    page_idx_rope = safe_pages.unsqueeze(-1).expand_as(rope_offsets)
-    rope_bytes = raw_pages[page_idx_rope, rope_offsets]  # (N, 128) uint8
-
-    page_idx_scale = safe_pages.unsqueeze(-1).expand_as(scale_offsets)
-    scale_bytes = raw_pages[page_idx_scale, scale_offsets]  # (N, 7) uint8
-
-    # Reinterpret dtypes
-    nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)  # (N, 448)
-    rope_bf16 = rope_bytes.contiguous().view(torch.bfloat16)  # (N, 64)
-    scale_e8m0 = scale_bytes.view(torch.float8_e8m0fnu)  # (N, 7)
-
-    # Dequantize: nope_tile * scale_tile → bf16 (vectorized)
     result = torch.empty(N, _D, dtype=torch.bfloat16, device=device)
-    result[:, :_NOPE_DIM] = (
-        (
-            nope_fp8.view(N, _NUM_TILES, _TILE_SIZE).float()
-            * scale_e8m0.view(N, _NUM_TILES, 1).float()
-        )
-        .view(N, _NOPE_DIM)
-        .to(torch.bfloat16)
-    )
-    result[:, _NOPE_DIM:] = rope_bf16
+
+    # Process in chunks to bound peak memory of the int64 advanced-index
+    # tensors (which would otherwise be N * 448 * 8 bytes — multiple GB on
+    # long-context prefills with large topk).
+    for start in range(0, N, _GATHER_CHUNK):
+        end = min(start + _GATHER_CHUNK, N)
+        chunk = flat_idx[start:end]
+        n = end - start
+
+        pages = chunk // page_size
+        offsets = chunk % page_size
+
+        # Per-token base byte offset into the flat raw buffer.
+        page_base = pages.to(torch.long) * page_bytes  # (n,)
+        nope_base = page_base + offsets.to(torch.long) * _NOPE_ROPE_STRIDE  # (n,)
+
+        nope_idx = nope_base.unsqueeze(-1) + nope_arange  # (n, 448)
+        rope_idx = nope_base.unsqueeze(-1) + (_NOPE_DIM + rope_arange)  # (n, 128)
+        scale_idx = (
+            page_base.unsqueeze(-1)
+            + scale_section_offset
+            + offsets.to(torch.long).unsqueeze(-1) * _SCALE_STRIDE
+            + scale_arange
+        )  # (n, 7)
+
+        nope_bytes = flat_buf[nope_idx.reshape(-1)].view(n, _NOPE_DIM)
+        rope_bytes = flat_buf[rope_idx.reshape(-1)].view(n, _ROPE_DIM * 2)
+        scale_bytes = flat_buf[scale_idx.reshape(-1)].view(n, _NUM_TILES)
+
+        nope_fp8 = nope_bytes.view(torch.float8_e4m3fn)  # (n, 448)
+        rope_bf16 = rope_bytes.contiguous().view(torch.bfloat16)  # (n, 64)
+        scale_e8m0 = scale_bytes.view(torch.float8_e8m0fnu)  # (n, 7)
+
+        result[start:end, :_NOPE_DIM] = (
+            nope_fp8.view(n, _NUM_TILES, _TILE_SIZE).float()
+            * scale_e8m0.view(n, _NUM_TILES, 1).float()
+        ).view(n, _NOPE_DIM).to(torch.bfloat16)
+        result[start:end, _NOPE_DIM:] = rope_bf16
 
     return result.reshape(*idx_shape, _D)
 
@@ -148,67 +142,114 @@ def _sm120_sparse_decode_fwd(
     B, s_q, H_q, D_qk = q.shape
     num_pages, page_size, H_k, bpt = k_cache.shape
     topk = indices.shape[-1]
+    device = q.device
 
-    invalid_mask = indices < 0
-    safe_indices = indices.clamp(min=0)
-
+    # FlashMLA kernel treats `index == -1` as invalid; we additionally treat
+    # any index outside [0, num_pages*page_size) as invalid because the CUDA
+    # tile scheduler would simply never visit those slots, whereas this
+    # PyTorch fallback gathers them eagerly.
+    max_valid = num_pages * page_size
+    invalid_mask = (indices < 0) | (indices >= max_valid)
+    safe_indices = indices.clamp(min=0, max=max_valid - 1)
     if topk_length is not None:
         topk_range = torch.arange(topk, device=topk_length.device).view(1, 1, topk)
         invalid_mask = invalid_mask | (topk_range >= topk_length.view(B, 1, 1))
 
-    # Gather and dequantize using page-aware addressing
-    gathered_kv = _gather_and_dequant(k_cache, safe_indices, page_size)
-
-    if extra_k_cache is not None and extra_indices is not None:
+    have_extra = extra_k_cache is not None and extra_indices is not None
+    if have_extra:
         extra_topk = extra_indices.shape[-1]
-        extra_page_size = extra_k_cache.shape[1]
-        extra_invalid = extra_indices < 0
-        extra_safe = extra_indices.clamp(min=0)
+        extra_num_pages, extra_page_size = extra_k_cache.shape[0], extra_k_cache.shape[1]
+        extra_max_valid = extra_num_pages * extra_page_size
+        extra_invalid = (extra_indices < 0) | (extra_indices >= extra_max_valid)
+        extra_safe = extra_indices.clamp(min=0, max=extra_max_valid - 1)
         if extra_topk_length is not None:
-            extra_range = torch.arange(
-                extra_topk, device=extra_topk_length.device
-            ).view(1, 1, extra_topk)
-            extra_invalid = extra_invalid | (
-                extra_range >= extra_topk_length.view(B, 1, 1)
-            )
-        extra_kv = _gather_and_dequant(extra_k_cache, extra_safe, extra_page_size)
-        gathered_kv = torch.cat([gathered_kv, extra_kv], dim=2)
-        invalid_mask = torch.cat([invalid_mask, extra_invalid], dim=2)
-
-    gathered_kv[invalid_mask] = 0.0
-
-    q_f = q.float()
-    kv_f = gathered_kv.float()
-    kv_d = kv_f.shape[-1]
-    if D_qk != kv_d:
-        q_f = q_f[..., :kv_d]
-
-    scores = torch.einsum("bshd,bstd->bsht", q_f, kv_f) * softmax_scale
-    scores.masked_fill_(invalid_mask.unsqueeze(2).expand_as(scores), float("-inf"))
-
-    lse = torch.logsumexp(scores, dim=-1)
-
-    if attn_sink is not None:
-        lse_for_out = torch.logsumexp(
-            torch.stack([lse, attn_sink.view(1, 1, H_q).expand_as(lse)], dim=0), dim=0
-        )
+            extra_range = torch.arange(extra_topk, device=extra_topk_length.device).view(1, 1, extra_topk)
+            extra_invalid = extra_invalid | (extra_range >= extra_topk_length.view(B, 1, 1))
     else:
-        lse_for_out = lse.clone()
+        extra_topk = 0
 
-    lonely = lse == float("-inf")
-    lse_for_out[lonely] = float("inf")
-    weights = torch.exp(scores - lse_for_out.unsqueeze(-1))
-    out = torch.einsum("bsht,bstv->bshv", weights, kv_f[..., :head_dim_v])
-    out[lonely.unsqueeze(-1).expand_as(out)] = 0.0
+    total_topk = topk + extra_topk
+    # Flatten the (B, s_q) row dimension so we can chunk easily.
+    R = B * s_q  # number of query rows
+    q_rows = q.reshape(R, H_q, D_qk)
+    safe_indices_rows = safe_indices.reshape(R, topk)
+    invalid_rows = invalid_mask.reshape(R, topk)
+    if have_extra:
+        extra_safe_rows = extra_safe.reshape(R, extra_topk)
+        extra_invalid_rows = extra_invalid.reshape(R, extra_topk)
 
-    return out.to(torch.bfloat16), lse.permute(0, 2, 1)
+    out_rows = torch.empty(R, H_q, head_dim_v, dtype=torch.bfloat16, device=device)
+    lse_rows = torch.empty(R, H_q, dtype=torch.float32, device=device)
+
+    # Bound per-chunk peak memory. Dominant bf16 tensor is gathered KV:
+    # chunk * total_topk * _D * 2 bytes; fp32 working set adds ~3x on top.
+    # On Intel L0, per-launch overhead is high (~hundreds of us), so prefer
+    # fewer/larger chunks. Target 256 MiB peak (override via env).
+    bytes_per_row = total_topk * _D * 2
+    target_mib = int(os.environ.get("SGLANG_SM120_SPARSE_CHUNK_MIB", "256"))
+    chunk_rows = max(1, min(R, (target_mib * 1024 * 1024) // max(1, bytes_per_row)))
+
+    for start in range(0, R, chunk_rows):
+        end = min(start + chunk_rows, R)
+        n = end - start
+
+        # Gather KV for this chunk only.
+        kv_chunk = _gather_and_dequant(
+            k_cache, safe_indices_rows[start:end], page_size
+        )  # (n, topk, _D)
+        inv_chunk = invalid_rows[start:end]  # (n, topk)
+        if have_extra:
+            extra_kv_chunk = _gather_and_dequant(
+                extra_k_cache, extra_safe_rows[start:end], extra_page_size
+            )  # (n, extra_topk, _D)
+            kv_chunk = torch.cat([kv_chunk, extra_kv_chunk], dim=1)
+            inv_chunk = torch.cat([inv_chunk, extra_invalid_rows[start:end]], dim=1)
+            del extra_kv_chunk
+
+        # Zero-out invalid KV rows so they contribute nothing (kernel parity).
+        kv_chunk[inv_chunk] = 0.0
+
+        q_chunk = q_rows[start:end].float()  # (n, H_q, D_qk)
+        kv_f = kv_chunk.float()  # (n, T, _D)
+        kv_d = kv_f.shape[-1]
+        if D_qk != kv_d:
+            q_chunk = q_chunk[..., :kv_d]
+
+        # scores: (n, H_q, T)
+        scores = torch.einsum("nhd,ntd->nht", q_chunk, kv_f) * softmax_scale
+        scores.masked_fill_(inv_chunk.unsqueeze(1).expand_as(scores), float("-inf"))
+
+        lse = torch.logsumexp(scores, dim=-1)  # (n, H_q)
+
+        if attn_sink is not None:
+            lse_for_out = torch.logsumexp(
+                torch.stack([lse, attn_sink.view(1, H_q).expand_as(lse)], dim=0),
+                dim=0,
+            )
+        else:
+            lse_for_out = lse.clone()
+
+        lonely = lse == float("-inf")
+        lse_for_out[lonely] = float("inf")
+        weights = torch.exp(scores - lse_for_out.unsqueeze(-1))
+        out_chunk = torch.einsum("nht,ntv->nhv", weights, kv_f[..., :head_dim_v])
+        out_chunk[lonely.unsqueeze(-1).expand_as(out_chunk)] = 0.0
+
+        out_rows[start:end] = out_chunk.to(torch.bfloat16)
+        lse_rows[start:end] = lse
+
+        del kv_chunk, kv_f, q_chunk, scores, weights, out_chunk, lse, lse_for_out, lonely
+
+    out = out_rows.reshape(B, s_q, H_q, head_dim_v)
+    lse = lse_rows.reshape(B, s_q, H_q).permute(0, 2, 1)
+    return out, lse
 
 
 _use_triton_flashmla = os.environ.get("SGLANG_SM120_TRITON_FLASHMLA", "1") == "1"
 
 
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
-    if _is_sm120:
+    if _is_sm120 or _is_xpu:
         q = kwargs["q"]
         k_cache = kwargs["k_cache"]
         indices = kwargs["indices"]
