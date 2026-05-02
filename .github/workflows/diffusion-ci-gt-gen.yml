@@ -323,7 +323,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.OUTPUT_NAME }}-${{ matrix.source_group }}-${{ matrix.case_id }}
-          path: python/${{ env.OUTPUT_NAME }}
+          path: |
+            python/${{ env.OUTPUT_NAME }}/*.jpg
+            python/${{ env.OUTPUT_NAME }}/*.png
+            python/${{ env.OUTPUT_NAME }}/official_gt_manifest_*.json
+            python/${{ env.OUTPUT_NAME }}/official_ltx23_manifest.json
           retention-days: 7
 
       - name: Publish official GT images to sgl-project/ci-data
