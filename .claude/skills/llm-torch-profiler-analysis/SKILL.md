@@ -127,10 +127,6 @@ The 2026-05-01 two-card validation artifacts for the additional models are:
 - `/data/bbuf/validate/core_skill_validation_20260501/qwen3_8b/profiler`
 - `/data/bbuf/validate/core_skill_validation_20260501/mistral_7b_instruct_v03/profiler`
 
-Checked-in sample outputs:
-
-- `references/validated_outputs/20260422_h100_qwen3_matrix/qwen3_30b_a3b`
-
 To render a validated run into one markdown document:
 
 ```bash
