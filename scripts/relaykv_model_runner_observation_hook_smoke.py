@@ -19,6 +19,9 @@ class _FakeForwardBatchLike:
     rids: list[str] | Any
     req_pool_indices: list[int] | Any
     seq_lens: list[int] | Any
+    seq_lens_cpu: Any = None
+    extend_seq_lens_cpu: Any = None
+    extend_prefix_lens_cpu: Any = None
 
     @property
     def batch_size(self) -> int:
@@ -134,16 +137,25 @@ def _assert_on_payloads() -> dict[str, Any]:
 
 def _assert_tensor_like_skip() -> dict[str, Any]:
     tensor_like = _SyncForbiddenTensorLike()
+    seq_lens_cpu_like = _SyncForbiddenTensorLike()
+    extend_seq_lens_cpu_like = _SyncForbiddenTensorLike()
     result = run_model_runner_forward_observation_hook(
         forward_batch=_FakeForwardBatchLike(
             rids=["rid-a"],
             req_pool_indices=tensor_like,
             seq_lens=[128],
+            seq_lens_cpu=seq_lens_cpu_like,
+            extend_seq_lens_cpu=extend_seq_lens_cpu_like,
+            extend_prefix_lens_cpu=[0],
         ),
         forward_pass_id=3,
         env_value="1",
     )
-    if tensor_like.sync_called:
+    if (
+        tensor_like.sync_called
+        or seq_lens_cpu_like.sync_called
+        or extend_seq_lens_cpu_like.sync_called
+    ):
         raise AssertionError("sync-like method was called")
     if result["enabled"] is not True or result["skipped"] is not True:
         raise AssertionError(result)
@@ -158,6 +170,18 @@ def _assert_tensor_like_skip() -> dict[str, Any]:
     if req_pool_description["device_repr"] != "cuda:0":
         raise AssertionError(result)
     if req_pool_description["dtype_repr"] != "torch.int32":
+        raise AssertionError(result)
+    cpu_metadata_description = result.get("forward_batch_cpu_metadata_description")
+    if not cpu_metadata_description:
+        raise AssertionError(result)
+    seq_lens_cpu_description = cpu_metadata_description["seq_lens_cpu"]
+    if seq_lens_cpu_description["shape_repr"] != "(1,)":
+        raise AssertionError(result)
+    if seq_lens_cpu_description["device_repr"] != "cuda:0":
+        raise AssertionError(result)
+    if seq_lens_cpu_description["dtype_repr"] != "torch.int32":
+        raise AssertionError(result)
+    if cpu_metadata_description["extend_prefix_lens_cpu"]["list_or_tuple_len"] != 1:
         raise AssertionError(result)
     return result
 

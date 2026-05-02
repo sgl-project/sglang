@@ -222,6 +222,25 @@ def _describe_runtime_forward_batch_metadata(
     }
 
 
+def _describe_forward_batch_cpu_metadata(forward_batch: Any) -> dict[str, Any]:
+    """Inventory existing ForwardBatch CPU-side metadata without reading values."""
+
+    return {
+        "rids": _describe_runtime_metadata_value(
+            _safe_forward_batch_metadata_value(forward_batch, "rids")
+        ),
+        "seq_lens_cpu": _describe_runtime_metadata_value(
+            _safe_forward_batch_metadata_value(forward_batch, "seq_lens_cpu")
+        ),
+        "extend_seq_lens_cpu": _describe_runtime_metadata_value(
+            _safe_forward_batch_metadata_value(forward_batch, "extend_seq_lens_cpu")
+        ),
+        "extend_prefix_lens_cpu": _describe_runtime_metadata_value(
+            _safe_forward_batch_metadata_value(forward_batch, "extend_prefix_lens_cpu")
+        ),
+    }
+
+
 def run_model_runner_forward_observation_hook(
     *,
     forward_batch: Any,
@@ -268,11 +287,13 @@ def run_model_runner_forward_observation_hook(
             forward_batch=forward_batch,
             layer_ids=[0],
         )
+        cpu_metadata_description = _describe_forward_batch_cpu_metadata(forward_batch)
         log_runtime_observation_skip(
             {
                 "forward_pass_id": forward_pass_id,
                 "reason": type(exc).__name__,
                 "metadata_description": metadata_description,
+                "forward_batch_cpu_metadata_description": cpu_metadata_description,
             },
             logger_=target_logger,
         )
@@ -281,6 +302,7 @@ def run_model_runner_forward_observation_hook(
             "skipped": True,
             "skip_reason": type(exc).__name__,
             "metadata_description": metadata_description,
+            "forward_batch_cpu_metadata_description": cpu_metadata_description,
             "summary": None,
         }
     except Exception as exc:

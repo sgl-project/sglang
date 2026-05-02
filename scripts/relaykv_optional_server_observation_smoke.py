@@ -172,10 +172,14 @@ def _relaykv_observation_log_flags(stdout: str) -> dict[str, bool]:
     summary_logged = "relaykv_runtime_observation_summary" in stdout
     skip_logged = "relaykv_runtime_observation_skip" in stdout
     metadata_description_logged = "metadata_description" in stdout
+    cpu_metadata_description_logged = (
+        "forward_batch_cpu_metadata_description" in stdout
+    )
     return {
         "relaykv_summary_logged": summary_logged,
         "relaykv_skip_logged": skip_logged,
         "relaykv_metadata_description_logged": metadata_description_logged,
+        "relaykv_cpu_metadata_description_logged": cpu_metadata_description_logged,
         "relaykv_observation_logged": summary_logged or skip_logged,
     }
 
