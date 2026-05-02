@@ -11,11 +11,13 @@ import torch
 
 from sglang.srt.relaykv import RelayKVConfig, make_shadow_plan
 from sglang.srt.relaykv.metrics import (
+    log_host_backup_copy_candidate_summary,
     log_policy_event,
     log_policy_summary,
     log_shadow_plan,
     policy_event_payload,
     summarize_candidate_events,
+    summarize_host_backup_copy_candidates_for_smoke,
     summarize_policy_events,
 )
 from sglang.srt.relaykv.memory import run_host_backup_copy_candidate_for_smoke
@@ -168,14 +170,23 @@ def main() -> None:
         )
         plans.extend(shadow_plans)
         candidate_events.extend(shadow_candidate_events)
+        log_host_backup_copy_candidate_summary(candidate_events)
     finally:
         _release_relaykv_logs(handler)
 
     policy_summary = summarize_policy_events(plans)
     candidate_summary = summarize_candidate_events(candidate_events)
+    copy_candidate_summary = summarize_host_backup_copy_candidates_for_smoke(
+        candidate_events
+    )
     logs = stream.getvalue().splitlines()
     runtime_event_logs = [
         line for line in logs if line.startswith("relaykv_runtime_policy_event_")
+    ]
+    copy_summary_logs = [
+        line
+        for line in logs
+        if line.startswith("relaykv_host_backup_copy_candidate_summary=")
     ]
 
     expected_state_counts = {
@@ -222,6 +233,8 @@ def main() -> None:
         raise AssertionError(candidate_summary)
     if len(runtime_event_logs) != 3:
         raise AssertionError(runtime_event_logs)
+    if len(copy_summary_logs) != 1:
+        raise AssertionError(copy_summary_logs)
     applied_events = [
         event
         for event in candidate_events
@@ -258,13 +271,81 @@ def main() -> None:
             raise AssertionError(fallback_event)
         if fallback_event["runtime_writeback"] is not False:
             raise AssertionError(fallback_event)
+    if copy_candidate_summary["total_candidate_events"] != 3:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["applied_candidate_count"] != 1:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["fallback_candidate_count"] != 2:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["snapshot_created_count"] != 1:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["snapshot_skipped_count"] != 2:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["host_backup_copy_candidate_count"] != 1:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["host_backup_copy_executed_count"] != 1:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["host_backup_copy_skipped_count"] != 2:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["copy_equal_true_count"] != 1:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["copy_equal_false_count"] != 2:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["source_mutated_true_count"] != 0:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["source_mutated_false_count"] != 3:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["fallback_candidate_noop_guard_count"] != 2:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["attention_override_true_count"] != 0:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["attention_override_false_count"] != 3:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["kv_cache_mutation_true_count"] != 0:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["kv_cache_mutation_false_count"] != 3:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["runtime_writeback_true_count"] != 0:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["runtime_writeback_false_count"] != 3:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["scheduler_policy_noop_false_count"] != 0:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["scheduler_policy_noop_true_count"] != 3:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["skipped_reason_counts"] != {
+        "fallback_candidate_noop_guard": 2,
+    }:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["policy_state_counts"] != {
+        "applied_candidate": 1,
+        "fallback_candidate": 2,
+    }:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["per_layer_counts"]["0"][
+        "total_candidate_events"
+    ] != 3:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["per_request_counts"]["rid-applied-a"][
+        "host_backup_copy_executed_count"
+    ] != 1:
+        raise AssertionError(copy_candidate_summary)
+    if copy_candidate_summary["per_request_counts"]["rid-fallback-a"][
+        "fallback_candidate_noop_guard_count"
+    ] != 1:
+        raise AssertionError(copy_candidate_summary)
 
     print("relaykv_runtime_policy_smoke: ok")
     print("relaykv_runtime_policy_event_example=" + runtime_event_logs[0])
+    print("relaykv_host_backup_copy_candidate_summary_log=" + copy_summary_logs[0])
     print("relaykv_policy_summary=" + json.dumps(policy_summary, sort_keys=True))
     print(
         "relaykv_candidate_event_summary="
         + json.dumps(candidate_summary, sort_keys=True)
+    )
+    print(
+        "relaykv_host_backup_copy_candidate_summary="
+        + json.dumps(copy_candidate_summary, sort_keys=True)
     )
 
 

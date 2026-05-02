@@ -161,6 +161,139 @@ def summarize_candidate_events(
     }
 
 
+def _candidate_copy_count_template() -> Counter[str]:
+    return Counter(
+        {
+            "total_candidate_events": 0,
+            "applied_candidate_count": 0,
+            "fallback_candidate_count": 0,
+            "snapshot_created_count": 0,
+            "snapshot_skipped_count": 0,
+            "host_backup_copy_candidate_count": 0,
+            "host_backup_copy_executed_count": 0,
+            "host_backup_copy_skipped_count": 0,
+            "copy_equal_true_count": 0,
+            "copy_equal_false_count": 0,
+            "source_mutated_true_count": 0,
+            "source_mutated_false_count": 0,
+            "fallback_candidate_noop_guard_count": 0,
+            "attention_override_true_count": 0,
+            "attention_override_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "kv_cache_mutation_false_count": 0,
+            "runtime_writeback_true_count": 0,
+            "runtime_writeback_false_count": 0,
+            "scheduler_policy_noop_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+        }
+    )
+
+
+def _increment_candidate_copy_counts(
+    counts: Counter[str],
+    event: RelayKVPlan | Mapping[str, Any],
+) -> None:
+    counts["total_candidate_events"] += 1
+    state = str(_event_value(event, "runtime_policy_state") or "unknown")
+    if state == "applied_candidate":
+        counts["applied_candidate_count"] += 1
+    elif state == "fallback_candidate":
+        counts["fallback_candidate_count"] += 1
+
+    if _event_value(event, "snapshot_created") is True:
+        counts["snapshot_created_count"] += 1
+    else:
+        counts["snapshot_skipped_count"] += 1
+    if _event_value(event, "host_backup_copy_candidate") is True:
+        counts["host_backup_copy_candidate_count"] += 1
+    if _event_value(event, "host_backup_copy_executed") is True:
+        counts["host_backup_copy_executed_count"] += 1
+    else:
+        counts["host_backup_copy_skipped_count"] += 1
+    if _event_value(event, "copy_equal") is True:
+        counts["copy_equal_true_count"] += 1
+    elif _event_value(event, "copy_equal") is False:
+        counts["copy_equal_false_count"] += 1
+    if _event_value(event, "source_mutated") is True:
+        counts["source_mutated_true_count"] += 1
+    elif _event_value(event, "source_mutated") is False:
+        counts["source_mutated_false_count"] += 1
+    if _event_value(event, "fallback_candidate_noop_guard") is True:
+        counts["fallback_candidate_noop_guard_count"] += 1
+
+    for field, prefix in (
+        ("attention_override", "attention_override"),
+        ("kv_cache_mutation", "kv_cache_mutation"),
+        ("runtime_writeback", "runtime_writeback"),
+        ("scheduler_policy_noop", "scheduler_policy_noop"),
+    ):
+        value = _event_value(event, field)
+        if value is True:
+            counts[f"{prefix}_true_count"] += 1
+        elif value is False:
+            counts[f"{prefix}_false_count"] += 1
+
+
+def _counter_payload(counts: Counter[str]) -> dict[str, int]:
+    return dict(counts)
+
+
+def summarize_host_backup_copy_candidates_for_smoke(
+    events: Iterable[RelayKVPlan | Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Summarize smoke-only host-backup copy candidate events.
+
+    This reads event payloads only. It does not connect the candidate path to
+    attention, KV freeing, KV pool mutation, scheduler decisions, or writeback.
+    """
+
+    total_counts = _candidate_copy_count_template()
+    state_counts = Counter({"applied_candidate": 0, "fallback_candidate": 0})
+    skipped_reason_counts: Counter[str] = Counter()
+    per_layer: dict[str, Counter[str]] = {}
+    per_request: dict[str, Counter[str]] = {}
+
+    for event in events:
+        state = str(_event_value(event, "runtime_policy_state") or "unknown")
+        if state in state_counts:
+            state_counts[state] += 1
+        skipped_reason = _event_value(event, "host_backup_copy_skipped_reason")
+        if skipped_reason:
+            skipped_reason_counts[str(skipped_reason)] += 1
+
+        layer_key = str(_event_value(event, "layer_idx"))
+        request_key = str(_event_value(event, "request_id"))
+        if layer_key not in per_layer:
+            per_layer[layer_key] = _candidate_copy_count_template()
+        if request_key not in per_request:
+            per_request[request_key] = _candidate_copy_count_template()
+
+        _increment_candidate_copy_counts(total_counts, event)
+        _increment_candidate_copy_counts(per_layer[layer_key], event)
+        _increment_candidate_copy_counts(per_request[request_key], event)
+
+    return {
+        **_counter_payload(total_counts),
+        "skipped_reason_counts": dict(sorted(skipped_reason_counts.items())),
+        "policy_state_counts": dict(state_counts),
+        "per_layer_counts": {
+            key: _counter_payload(value) for key, value in sorted(per_layer.items())
+        },
+        "per_request_counts": {
+            key: _counter_payload(value) for key, value in sorted(per_request.items())
+        },
+    }
+
+
+def log_host_backup_copy_candidate_summary(
+    events: Iterable[RelayKVPlan | Mapping[str, Any]],
+    *,
+    prefix: str = "relaykv_host_backup_copy_candidate_summary",
+) -> None:
+    payload = summarize_host_backup_copy_candidates_for_smoke(events)
+    logger.info("%s=%s", prefix, json.dumps(payload, sort_keys=True))
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
