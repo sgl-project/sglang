@@ -3238,11 +3238,13 @@ class RunaiModelStreamerLoader(BaseModelLoader):
             self.target_device_str = "cpu"
 
         target_device = torch.device(device_config.device)
+        quant_config = _get_quantization_config(model_config, self.load_config)
         with set_default_torch_dtype(model_config.dtype):
             with target_device:
                 model = _initialize_model(
                     model_config,
                     self.load_config,
+                    quant_config,
                 )
 
             DefaultModelLoader.load_weights_and_postprocess(
@@ -3260,7 +3262,16 @@ def get_model_loader(
     if load_config.load_format == LoadFormat.DUMMY:
         return DummyModelLoader(load_config)
 
-    if model_config and (
+    # ModelOptModelLoader's local-copy quantize-and-export workflow doesn't apply
+    # to RUNAI_STREAMER, which streams weights directly from object storage.
+    # RUNAI_STREAMER loads always fall through to the unconditional branch at
+    # the bottom of this function. This also avoids calling _is_already_quantized()
+    # on RunAI streamer cache paths, where huggingface_hub raises HFValidationError.
+    model_optloader_allowed = (
+        model_config and load_config.load_format != LoadFormat.RUNAI_STREAMER
+    )
+
+    if model_optloader_allowed and (
         (hasattr(model_config, "modelopt_quant") and model_config.modelopt_quant)
         or model_config.quantization
         in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
@@ -3270,7 +3281,7 @@ def get_model_loader(
 
     # Use ModelOptModelLoader for unified quantization flags
     if (
-        model_config
+        model_optloader_allowed
         and hasattr(model_config, "quantization")
         and model_config.quantization
         in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
