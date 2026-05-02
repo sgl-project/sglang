@@ -1480,6 +1480,23 @@ class Scheduler(
                     break
         ElasticEPStateManager.instance().mark_snapshot_handled()
 
+    def _send_active_ranks_to_controller_from_cpu_snapshot(self):
+        elastic_ep_state = ElasticEPStateManager.instance()
+        assert elastic_ep_state is not None
+        assert elastic_ep_state.tp_active_ranks_cpu is not None
+
+        # Keep the original semantics: a TP rank is active only when both the
+        # device-side Mooncake backend snapshot and the CPU backend mask agree.
+        tp_active_ranks = elastic_ep_state.tp_active_ranks_cpu.detach().clone()
+        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach()
+        assert tp_active_ranks.numel() == tp_active_ranks_cpu.numel()
+        tp_active_ranks &= tp_active_ranks_cpu
+
+        dp_active_ranks = tp_active_ranks.reshape(self.dp_size, -1).prod(dim=1)
+        self.send_to_controller.send_output(
+            ActiveRanksOutput(status=dp_active_ranks.tolist())
+        )
+
     def get_init_info(self) -> Dict[str, Any]:
         """Return scheduler initialization info for handshake.
 
@@ -1560,9 +1577,11 @@ class Scheduler(
             if _elastic_state is not None:
                 if tmp_result.copy_done is not None:
                     tmp_result.copy_done.synchronize()
-                if _elastic_state.is_stale_snapshot():
-                    self._retract_all_and_rebalance_on_rank_fault()
-                    return False
+                if _elastic_state.publish_active_snapshot():
+                    self._send_active_ranks_to_controller_from_cpu_snapshot()
+                    if _elastic_state.is_stale_snapshot():
+                        self._retract_all_and_rebalance_on_rank_fault()
+                        return False
             self.process_batch_result(tmp_batch, tmp_result)
             return True
 
@@ -3065,6 +3084,7 @@ class Scheduler(
         if (
             self.server_args.enable_dp_attention
             and self.server_args.elastic_ep_backend is not None
+            and not self.enable_overlap
         ):
             # Get the tensors indicating rank activeness
             tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()

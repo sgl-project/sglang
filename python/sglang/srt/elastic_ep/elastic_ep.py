@@ -20,10 +20,16 @@ class ElasticEPState:
     active_ranks_cpu: Optional[torch.Tensor]
     last_handled_active_ranks_cpu: Optional[torch.Tensor]
     staging_active_ranks_cpu_slots: Optional[tuple[torch.Tensor, torch.Tensor]]
+    tp_active_ranks_cpu: Optional[torch.Tensor] = None
+    staging_tp_active_ranks_cpu_slots: Optional[
+        tuple[torch.Tensor, torch.Tensor]
+    ] = None
     next_staging_slot: int = 0
     pending_staging_slots: list[int] = field(default_factory=list)
 
-    def submit_active_snapshot(self) -> None:
+    def submit_active_snapshot(
+        self, tp_active_ranks: Optional[torch.Tensor] = None
+    ) -> None:
         """Enqueue an async copy of active_ranks into the pinned staging
         buffer. No explicit event is recorded; the scheduler relies on
         copy_done.synchronize() (same forward_stream, recorded strictly
@@ -43,14 +49,26 @@ class ElasticEPState:
             # CPU backend: fully synchronous, no stream involved.
             staging_active_ranks_cpu.copy_(self.active_ranks)
 
-    def is_stale_snapshot(self) -> bool:
-        """Publish the oldest unconsumed staging snapshot into
-        active_ranks_cpu (so downstream readers like EPLB rebalance see
-        the current state), then return True iff a new fault has appeared
-        since the last mark_snapshot_handled. Caller must have already
-        synchronized the stream the submit was enqueued on (e.g. via
-        copy_done.synchronize) so staging_active_ranks_cpu is known to
-        hold the latest snapshot."""
+        if tp_active_ranks is not None:
+            if (
+                self.tp_active_ranks_cpu is None
+                or self.staging_tp_active_ranks_cpu_slots is None
+            ):
+                raise RuntimeError("TP active-rank snapshot buffers are not initialized")
+            assert tp_active_ranks.numel() == self.tp_active_ranks_cpu.numel()
+            staging_tp_active_ranks_cpu = self.staging_tp_active_ranks_cpu_slots[slot]
+            if tp_active_ranks.device.type == "cuda":
+                staging_tp_active_ranks_cpu.copy_(tp_active_ranks, non_blocking=True)
+            else:
+                staging_tp_active_ranks_cpu.copy_(tp_active_ranks)
+
+    def publish_active_snapshot(self) -> bool:
+        """Publish the oldest unconsumed staging snapshot into CPU mirrors.
+
+        Caller must have already synchronized the stream the submit was enqueued
+        on (e.g. via copy_done.synchronize) so staging buffers are ready.
+        Returns True if a snapshot was published.
+        """
         if (
             not self.pending_staging_slots
             or self.staging_active_ranks_cpu_slots is None
@@ -59,6 +77,15 @@ class ElasticEPState:
         slot = self.pending_staging_slots.pop(0)
         snapshot = self.staging_active_ranks_cpu_slots[slot]
         self.active_ranks_cpu.copy_(snapshot)
+        if self.staging_tp_active_ranks_cpu_slots is not None:
+            self.tp_active_ranks_cpu.copy_(
+                self.staging_tp_active_ranks_cpu_slots[slot]
+            )
+        return True
+
+    def is_stale_snapshot(self) -> bool:
+        """Return True iff a new fault has appeared since the last handled
+        snapshot. Call publish_active_snapshot() before this check."""
         return not torch.equal(
             self.active_ranks_cpu, self.last_handled_active_ranks_cpu
         )
@@ -72,11 +99,31 @@ class ElasticEPState:
     def clear_pending_snapshots(self) -> None:
         self.pending_staging_slots.clear()
 
+    def sync_active_to_cpu(self):
+        if self.active_ranks is not None and self.active_ranks_cpu is not None:
+            self.active_ranks_cpu.copy_(self.active_ranks.detach().cpu())
+
+    def snapshot_active_to_last(self):
+        if (
+            self.active_ranks is not None
+            and self.last_handled_active_ranks_cpu is not None
+        ):
+            self.last_handled_active_ranks_cpu.copy_(self.active_ranks.detach().cpu())
+
     def reset(self):
         if self.active_ranks is not None:
             self.active_ranks.fill_(1)
             self.snapshot_active_to_last()
             self.sync_active_to_cpu()
+        self.clear_pending_snapshots()
+        if self.staging_active_ranks_cpu_slots is not None:
+            for staging_active_ranks_cpu in self.staging_active_ranks_cpu_slots:
+                staging_active_ranks_cpu.fill_(1)
+        if self.tp_active_ranks_cpu is not None:
+            self.tp_active_ranks_cpu.fill_(1)
+        if self.staging_tp_active_ranks_cpu_slots is not None:
+            for staging_tp_active_ranks_cpu in self.staging_tp_active_ranks_cpu_slots:
+                staging_tp_active_ranks_cpu.fill_(1)
 
 
 class ElasticEPStateManager:
@@ -92,7 +139,9 @@ class ElasticEPStateManager:
             return cls._instance
 
         if server_args.elastic_ep_backend is not None:
-            cls._instance = cls._build_state(ep_size=None, device=None)
+            cls._instance = cls._build_state(
+                ep_size=None, server_args=server_args, device=None
+            )
             if server_args.elastic_ep_rejoin:
                 # Mask out peer ranks to perform cuda graph capture on its own
                 cls._instance.active_ranks.zero_()
@@ -113,7 +162,11 @@ class ElasticEPStateManager:
 
     @classmethod
     def _build_state(
-        cls, *, ep_size: Optional[int] = None, device: Optional[torch.device] = None
+        cls,
+        *,
+        ep_size: Optional[int] = None,
+        server_args: Optional[ServerArgs] = None,
+        device: Optional[torch.device] = None,
     ) -> ElasticEPState:
         active = cls.healthy_rank_state(ep_size=ep_size, device=device)
         active_cpu = active.detach().cpu().clone()
@@ -127,11 +180,30 @@ class ElasticEPStateManager:
         else:
             staging_active_ranks_cpu_slots = (active_cpu.clone(), active_cpu.clone())
 
+        if server_args is not None:
+            tp_size = server_args.tp_size
+            tp_active_ranks_cpu = torch.ones(tp_size, dtype=torch.int32, device="cpu")
+            if active.device.type == "cuda":
+                staging_tp_active_ranks_cpu_slots = (
+                    tp_active_ranks_cpu.clone().pin_memory(),
+                    tp_active_ranks_cpu.clone().pin_memory(),
+                )
+            else:
+                staging_tp_active_ranks_cpu_slots = (
+                    tp_active_ranks_cpu.clone(),
+                    tp_active_ranks_cpu.clone(),
+                )
+        else:
+            tp_active_ranks_cpu = None
+            staging_tp_active_ranks_cpu_slots = None
+
         return ElasticEPState(
             active_ranks=active,
             active_ranks_cpu=active_cpu.clone(),
             last_handled_active_ranks_cpu=active_cpu,
             staging_active_ranks_cpu_slots=staging_active_ranks_cpu_slots,
+            tp_active_ranks_cpu=tp_active_ranks_cpu,
+            staging_tp_active_ranks_cpu_slots=staging_tp_active_ranks_cpu_slots,
             pending_staging_slots=[],
         )
 

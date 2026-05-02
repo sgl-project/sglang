@@ -3114,7 +3114,9 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 split_forward_count,
             )
         if elastic_ep_state is not None:
-            elastic_ep_state.submit_active_snapshot()
+            elastic_ep_state.submit_active_snapshot(
+                tp_active_ranks=self.tp_group.active_ranks
+            )
         output.expert_distribution_metrics = recorder_outputs.get("metrics")
 
         no_copy_to_cpu = not self.server_args.disable_overlap_schedule
