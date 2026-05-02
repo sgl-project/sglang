@@ -408,6 +408,8 @@ class StreamingSession(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free(kv_indices)
             self.req_to_token_pool.free_slots.append(slot.req_pool_idx)
 
+        self._free_slot_mamba(slot)
+
     def session_held_tokens(self, active_pool_idxs: Optional[set] = None) -> int:
         """Total KV tokens held by session slots, not tracked by the tree.
 
@@ -473,6 +475,18 @@ class StreamingSession(BasePrefixCache):
             if slot.mamba_ping_pong_track_buffer is not None:
                 total += slot.mamba_ping_pong_track_buffer.numel()
         return total
+
+    def _free_slot_mamba(self, slot: SessionSlot) -> None:
+        """Return a session slot's mamba pool state to the allocator."""
+        mamba_pool = getattr(self.req_to_token_pool, "mamba_pool", None)
+        if mamba_pool is None:
+            return
+        if slot.mamba_pool_idx is not None:
+            mamba_pool.free(slot.mamba_pool_idx.unsqueeze(0))
+            slot.mamba_pool_idx = None
+        if slot.mamba_ping_pong_track_buffer is not None:
+            mamba_pool.free(slot.mamba_ping_pong_track_buffer)
+            slot.mamba_ping_pong_track_buffer = None
 
     # -- Internal helpers (streaming body bits) --
 
