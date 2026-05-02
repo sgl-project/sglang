@@ -2161,13 +2161,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.last_completion_tokens = completion_tokens
 
         if state.finished:
-            retraction_count = (
-                recv_obj.retraction_counts[i]
-                if getattr(recv_obj, "retraction_counts", None)
-                and i < len(recv_obj.retraction_counts)
-                else 0
-            )
-
             # Get detailed cache breakdown if available
             cached_tokens_details = None
             if (
@@ -2183,7 +2176,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj.cached_tokens[i],
                 state.time_stats.get_e2e_latency(),
                 self._request_has_grammar(state.obj),
-                retraction_count,
                 cached_tokens_details,
             )
 
