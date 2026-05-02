@@ -25,6 +25,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional, Union
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -179,6 +180,7 @@ DYNAMIC_UPDATE_CASE = TestCase(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class LoRAUpdateServerTestSession:
     """A standalone server with dynamic LoRA loading; tracks what is loaded."""
 
@@ -338,6 +340,7 @@ class LoRAUpdateServerTestSession:
             self.testcase.assertEqual(adapters[name]["parent"], base[0]["id"])
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRADynamicUpdate(CustomTestCase):
     def _run_operation_sequence(
         self,
