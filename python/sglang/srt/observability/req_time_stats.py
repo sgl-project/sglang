@@ -850,7 +850,7 @@ class SchedulerReqTimeStats(ReqTimeStatsBase):
 
         Returns a dict with latency_ms, total_mb, speed_gb_s if computable, else None.
         """
-        from sglang.srt.disaggregation.utils import kv_to_page_num
+        from sglang.srt.mem_cache.common import kv_to_page_num
 
         result = {}
 
