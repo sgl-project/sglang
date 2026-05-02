@@ -84,9 +84,8 @@ box live in the operator-side per-host skills (for example `h100`,
 skill only requires that the caller can reach a shell inside a container with
 `sglang`, `vllm`, or `tensorrt_llm` installed.
 
-Historical validation snapshots in `references/` are evidence of which flag
-names and failure modes were seen in specific images and are not a requirement
-that the next run happens on the same hardware or framework version.
+Reference files are optional and version-sensitive. Treat historical flag notes
+as evidence from one image, not as a compatibility guarantee for the next run.
 
 Additional H100 validation on `2026-05-01` used two 2-card models with a
 bounded search of two SGLang memory-fraction candidates and two vLLM
@@ -408,10 +407,9 @@ Version-sensitive vLLM knob families to verify:
   those features
 
 vLLM should get a normal sweep, not one baseline command. See
-[references/parameter-coverage.md](references/parameter-coverage.md) for the
-validated flag families. The historical audit happens to use an H100 host, but
-the flag-family coverage is not H100-specific; confirm each flag on the target
-image's `--help` before a run.
+[references/framework-reference.md](references/framework-reference.md) for
+native command templates and cross-framework knob families. Confirm each flag on
+the target image's `--help` before a run.
 
 Keep `gpu_memory_utilization` in the baseline for the default pass. Search it
 only when the question is explicitly about fitting the model or trading capacity
@@ -523,9 +521,7 @@ skipped by policy, or completed but missed the SLA. Add caveats for synthetic
 workloads, incomplete fair searches, or framework-specific parameter
 substitutions.
 
-Use [references/framework-matrix.md](references/framework-matrix.md) when you
-need command templates or source links for each framework. Use
+Use [references/framework-reference.md](references/framework-reference.md) when
+you need command templates, source links, or knob-family mappings. Use
 [references/example-plan.yaml](references/example-plan.yaml) as the starting
-point for a full cross-framework run plan. Use
-[references/version-notes.md](references/version-notes.md) to understand which
-source snapshots informed this skill and what has or has not been smoke-tested.
+point for a full cross-framework run plan.

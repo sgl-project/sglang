@@ -114,7 +114,7 @@ kernel.
 
 See:
 
-- [moe-shared-oob-case-study.md](moe-shared-oob-case-study.md)
+- [case-studies.md](case-studies.md)
 
 ## Trace
 
@@ -212,7 +212,7 @@ git bisect run bash ./repro_or_check.sh
 
 See:
 
-- [ttft-prefill-not-queue-case-study.md](ttft-prefill-not-queue-case-study.md)
+- [case-studies.md](case-studies.md)
 
 ### Distributed hang
 
@@ -225,7 +225,7 @@ See:
 
 See:
 
-- [communication-hang-case-study.md](communication-hang-case-study.md)
+- [case-studies.md](case-studies.md)
 
 ### Throughput regression after deploy
 

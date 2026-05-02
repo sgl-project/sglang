@@ -199,7 +199,7 @@ cuda-gdb "$(which python3)" \
 ```
 
 For a replay-first crash example, read
-[references/moe-shared-oob-case-study.md](references/moe-shared-oob-case-study.md).
+[references/case-studies.md](references/case-studies.md).
 
 #### OTel trace
 
@@ -228,7 +228,7 @@ At that point, switch to `llm-torch-profiler-analysis`. Do not duplicate
 its profiling workflow here.
 
 For a low-noise latency example, read
-[references/ttft-prefill-not-queue-case-study.md](references/ttft-prefill-not-queue-case-study.md).
+[references/case-studies.md](references/case-studies.md).
 
 #### Distributed hang
 
@@ -237,7 +237,7 @@ clean target, collect the replay-time bundle and stacks, then switch to
 `debug-distributed-hang`.
 
 For an example of that flow, read
-[references/communication-hang-case-study.md](references/communication-hang-case-study.md).
+[references/case-studies.md](references/case-studies.md).
 
 #### Regression between two commits
 
@@ -274,12 +274,8 @@ Load only what the current step needs:
   - endpoint behavior, auth notes, field reading
 - [references/replay-trace-profile.md](references/replay-trace-profile.md)
   - request dump, crash dump, replay, trace, profiler step, bisect
-- [references/moe-shared-oob-case-study.md](references/moe-shared-oob-case-study.md)
-  - example: upstream top-k corruption, downstream MoE align shared-memory OOB
-- [references/ttft-prefill-not-queue-case-study.md](references/ttft-prefill-not-queue-case-study.md)
-  - example: TTFT spike with low queue time, request replay, and likely prefill-side ownership
-- [references/communication-hang-case-study.md](references/communication-hang-case-study.md)
-  - example: request-shaped TP hang with request replay and distributed-hang debug flow
+- [references/case-studies.md](references/case-studies.md)
+  - compact examples for replay-first CUDA crash, latency, and distributed-hang triage
 
 ## Scripts
 
