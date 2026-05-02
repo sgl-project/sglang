@@ -252,6 +252,7 @@ def summarize_host_backup_copy_candidates_for_smoke(
     skipped_reason_counts: Counter[str] = Counter()
     per_layer: dict[str, Counter[str]] = {}
     per_request: dict[str, Counter[str]] = {}
+    per_batch: dict[str, Counter[str]] = {}
 
     for event in events:
         state = str(_event_value(event, "runtime_policy_state") or "unknown")
@@ -263,14 +264,21 @@ def summarize_host_backup_copy_candidates_for_smoke(
 
         layer_key = str(_event_value(event, "layer_idx"))
         request_key = str(_event_value(event, "request_id"))
+        batch_value = _event_value(event, "batch_id")
+        if batch_value is None:
+            batch_value = _event_value(event, "batch_index")
+        batch_key = str(batch_value)
         if layer_key not in per_layer:
             per_layer[layer_key] = _candidate_copy_count_template()
         if request_key not in per_request:
             per_request[request_key] = _candidate_copy_count_template()
+        if batch_key not in per_batch:
+            per_batch[batch_key] = _candidate_copy_count_template()
 
         _increment_candidate_copy_counts(total_counts, event)
         _increment_candidate_copy_counts(per_layer[layer_key], event)
         _increment_candidate_copy_counts(per_request[request_key], event)
+        _increment_candidate_copy_counts(per_batch[batch_key], event)
 
     return {
         **_counter_payload(total_counts),
@@ -281,6 +289,9 @@ def summarize_host_backup_copy_candidates_for_smoke(
         },
         "per_request_counts": {
             key: _counter_payload(value) for key, value in sorted(per_request.items())
+        },
+        "per_batch_counts": {
+            key: _counter_payload(value) for key, value in sorted(per_batch.items())
         },
     }
 
