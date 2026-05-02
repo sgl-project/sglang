@@ -493,9 +493,11 @@ class SamplingParams:
 
         pipeline_name_lower = server_args.pipeline_config.__class__.__name__.lower()
 
-        if ("wan" in pipeline_name_lower or "helios" in pipeline_name_lower) and (
-            self.enable_sequence_shard is None or self.enable_sequence_shard
-        ):
+        if (
+            "wan" in pipeline_name_lower
+            or "helios" in pipeline_name_lower
+            or "joy" in pipeline_name_lower
+        ) and (self.enable_sequence_shard is None or self.enable_sequence_shard):
             self.enable_sequence_shard = True
             logger.debug("Automatically enabled enable_sequence_shard")
         else:
