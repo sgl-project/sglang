@@ -1,6 +1,7 @@
 import unittest
 
 import requests
+import torch
 
 from sglang.lang.chat_template import get_chat_template_by_model_path
 from sglang.srt.environ import envs
@@ -27,6 +28,7 @@ register_cuda_ci(est_time=420, stage="base-b", runner_config="2-gpu-large")
 register_amd_ci(est_time=500, suite="stage-b-test-2-gpu-large-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPAttentionDP2TP2(
     CustomTestCase,
@@ -65,6 +67,7 @@ class TestDPAttentionDP2TP2(
         cls._env_override.__exit__(None, None, None)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDPAttentionGatherv(
     CustomTestCase,
     GSM8KMixin,
@@ -137,6 +140,7 @@ class TestDPAttentionMixedChunk(
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 @unittest.skipIf(is_in_amd_ci(), "This test case cannot run on ROCm.")
 class TestDPRetract(
     CustomTestCase,
