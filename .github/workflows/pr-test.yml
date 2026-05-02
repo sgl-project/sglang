@@ -68,6 +68,8 @@ env:
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
   SKIP_STAGE_HEALTH_CHECK: ${{ inputs.skip_stage_health_check == true && 'true' || 'false' }}
+  # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
+  FORCE_REBUILD_DEEPEP: '1'
   # Schedule / main-branch dispatch / workflow_call from main use refs/heads/main; PR events use refs/pull/*/merge
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
   USE_VENV: false
@@ -610,11 +612,18 @@ jobs:
   # =============================================== jit-kernel ====================================================
 
   call-jit-kernel-tests:
-    needs: [check-changes, call-gate]
-    if: needs.check-changes.outputs.jit_kernel == 'true'
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels]
+    if: |
+      always() &&
+      !failure() && !cancelled() &&
+      github.event_name != 'schedule' &&
+      inputs.test_parallel_dispatch != true &&
+      !inputs.target_stage &&
+      needs.check-changes.outputs.jit_kernel == 'true'
     uses: ./.github/workflows/pr-test-jit-kernel.yml
     with:
       jit_kernel: ${{ needs.check-changes.outputs.jit_kernel }}
+      sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       b200_runner: ${{ needs.check-changes.outputs.b200_runner }}
       pr_head_sha: ${{ inputs.pr_head_sha || '' }}
       git_ref: ${{ inputs.git_ref || '' }}
@@ -971,7 +980,7 @@ jobs:
           CUSTOM_BUILD_SGL_KERNEL=${{needs.check-changes.outputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 30
+        timeout-minutes: 40
         env:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
@@ -1175,10 +1184,6 @@ jobs:
     env:
       SGLANG_CI_RDMA_ALL_DEVICES: "mlx5_1,mlx5_2,mlx5_3,mlx5_4"
       CU_VERSION: cu129
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -1208,12 +1213,10 @@ jobs:
           CONTINUE_ON_ERROR_FLAG: ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test
-          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 $CONTINUE_ON_ERROR_FLAG
+          python3 run_suite.py --hw cuda --suite stage-c-test-8-gpu-h20 $CONTINUE_ON_ERROR_FLAG
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
-        with:
-          artifact-suffix: ${{ matrix.part }}
 
       - name: Cleanup venv
         if: always()
