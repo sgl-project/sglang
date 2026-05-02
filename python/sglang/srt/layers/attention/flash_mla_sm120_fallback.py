@@ -47,6 +47,11 @@ _D = _NOPE_DIM + _ROPE_DIM  # 512
 
 _GATHER_CHUNK = 16384  # tokens per chunk; ~16k * 1024 B ≈ 16 MiB output per chunk
 
+# Per-chunk peak-memory budget for the sparse decode fallback (MiB).  Read
+# once at import time so the forward path doesn't pay an os.environ lookup
+# per layer per decode step.
+_SM120_SPARSE_CHUNK_MIB = int(os.environ.get("SGLANG_SM120_SPARSE_CHUNK_MIB", "256"))
+
 
 def _gather_and_dequant(k_cache, indices, page_size):
     """Gather KV entries from the paged buffer using correct page-internal addressing.
@@ -184,10 +189,12 @@ def _sm120_sparse_decode_fwd(
     # Bound per-chunk peak memory. Dominant bf16 tensor is gathered KV:
     # chunk * total_topk * _D * 2 bytes; fp32 working set adds ~3x on top.
     # On Intel L0, per-launch overhead is high (~hundreds of us), so prefer
-    # fewer/larger chunks. Target 256 MiB peak (override via env).
+    # fewer/larger chunks. Target 256 MiB peak (override via
+    # SGLANG_SM120_SPARSE_CHUNK_MIB at import time).
     bytes_per_row = total_topk * _D * 2
-    target_mib = int(os.environ.get("SGLANG_SM120_SPARSE_CHUNK_MIB", "256"))
-    chunk_rows = max(1, min(R, (target_mib * 1024 * 1024) // max(1, bytes_per_row)))
+    chunk_rows = max(
+        1, min(R, (_SM120_SPARSE_CHUNK_MIB * 1024 * 1024) // max(1, bytes_per_row))
+    )
 
     for start in range(0, R, chunk_rows):
         end = min(start + chunk_rows, R)
