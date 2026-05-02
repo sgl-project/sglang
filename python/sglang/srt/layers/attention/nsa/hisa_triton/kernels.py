@@ -1048,74 +1048,37 @@ def block_sparse_mqa_triton(
         (seq_len, topk * kv_block_size), device=q_fp8.device, dtype=torch.float32,
     )
 
-    # SK7+SK11: lift GEMM_TILE to 256 for all k<128. Full sweep
-    # {64,128,256,512} × (seq_q, seq_kv) shows 256 is sweet spot across
-    # all prefill sizes (1024-16K seq_q × 4K-65K seq_kv): 256 vs 128 is
-    # neutral on small (seq_q≤1024) and -7~16% on large (seq_q≥4K).
-    # 512 spills registers and regresses everywhere. k=128 still uses
-    # legacy (BLOCK_N=128, no grouping needed).
-    if kv_block_size < 128:
-        GEMM_TILE = 256
-        GROUP_SIZE = GEMM_TILE // kv_block_size  # 32/16/8/4 for k=8/16/32/64
-        assert GEMM_TILE % kv_block_size == 0
-        # Non-divisible topk: ceil to num_chunks; tail-pad lanes are handled
-        # in-kernel via masked load (other=-1) + out_cols < topk*K store mask.
-        num_chunks = (topk + GROUP_SIZE - 1) // GROUP_SIZE
-
-        # Stage 4 persistent: amortize Q[H,D] / W[H] HBM load across K_CHUNKS
-        # chunks per CTA. Sweep on H100 (sq=8192, skv∈{32K…128K}, topk=2048):
-        #   K=16, 32: K_CHUNKS=16 num_stages=2 num_warps=8 → 1.22-1.27×
-        #   K=8     : best persistent only +5%; K_CHUNKS=16/w=8 *regresses* 18%
-        #   K=64    : K_CHUNKS=32 num_warps=4 wins 1.31× (different config; TODO)
-        # Dispatch persistent only where speedup is non-marginal *and* config
-        # is uniform (K=16/32).
-        if kv_block_size in (16, 32):
-            K_CHUNKS = 16
-            outer = (num_chunks + K_CHUNKS - 1) // K_CHUNKS
-            grid = (seq_len, outer)
-            _block_sparse_mqa_persistent_kernel[grid](
-                q_fp8, k_fp8, k_scale, topk_block_index, logits, weights,
-                cu_seqlen_ks, cu_seqlen_ke,
-                q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2),
-                k_fp8.stride(0), k_fp8.stride(1),
-                k_scale.stride(0),
-                topk_block_index.stride(0), topk_block_index.stride(1),
-                logits.stride(0), logits.stride(1),
-                weights.stride(0), weights.stride(1),
-                seq_kv,
-                topk,
-                HEADS=H, DIM=D,
-                KV_BLOCK_SIZE=kv_block_size,
-                GROUP_SIZE=GROUP_SIZE,
-                K_CHUNKS=K_CHUNKS,
-                num_warps=8,
-            )
-            return logits
-
-        grid = (seq_len, num_chunks)
-        _block_sparse_mqa_grouped_kernel[grid](
-            q_fp8, k_fp8, k_scale, topk_block_index, logits, weights,
-            cu_seqlen_ks, cu_seqlen_ke,
-            q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2),
-            k_fp8.stride(0), k_fp8.stride(1),
-            k_scale.stride(0),
-            topk_block_index.stride(0), topk_block_index.stride(1),
-            logits.stride(0), logits.stride(1),
-            weights.stride(0), weights.stride(1),
-            seq_kv,
-            topk,
-            HEADS=H, DIM=D,
-            KV_BLOCK_SIZE=kv_block_size,
-            GROUP_SIZE=GROUP_SIZE,
-        )
-        return logits
-
-    # Legacy: kv_block_size == 128 only.
-    BLOCK_N = 128
-    assert kv_block_size % BLOCK_N == 0
-    subs_per_topk = kv_block_size // BLOCK_N
-    grid = (seq_len, topk * subs_per_topk)
-    _block_sparse_mqa_kernel[grid](
+    # Unified persistent dispatch for K∈{8,16,32,64,128}. Per-K config tuned
+    # at production block_topk = 8192//K, sq=8192, skv∈{16K..128K}.
+    # Two regimes by GEMM_TILE:
+    #   GEMM_TILE=256 (K∈{16,32,64}, num_warps=8, num_stages=3): wide
+    #     wgmma tile fills one CTA's compute, 8 warps amortize occupancy.
+    #   GEMM_TILE=128 (K∈{8,128}, num_warps=4): extreme K values prefer
+    #     a narrower tile + fewer warps. K=8 has tiny per-topk K rows; K=128
+    #     fills the tile with one topk index already so doubling regresses.
+    # All entries are full persistent at prod block_topk: K_CHUNKS = num_chunks
+    # per seq → 1 CTA per query, Q[H,D] + W[H] loaded once per CTA.
+    # Speedups vs tilelang baseline (or prior in-tree):
+    #   K=8:   1.21-1.24× (was grouped, no persistent)
+    #   K=16:  1.01-1.02× (was K_CHUNKS=16)
+    #   K=32:  1.01-1.02× (was K_CHUNKS=16)
+    #   K=64:  1.30-1.31× (was grouped, no persistent)
+    #   K=128: 1.35-1.38× (was tilelang)
+    K_CONFIG = {
+        # (GROUP_SIZE, K_CHUNKS, num_warps, num_stages)
+        8:   (16, 64, 4, 2),
+        16:  (16, 32, 8, 3),
+        32:  (8,  32, 8, 3),
+        64:  (4,  32, 8, 3),
+        128: (1,  64, 4, 3),
+    }
+    GROUP_SIZE, K_CHUNKS, num_warps, num_stages = K_CONFIG[kv_block_size]
+    # Non-divisible topk: ceil to num_chunks; tail-pad lanes are handled
+    # in-kernel via masked load (other=-1) + out_cols < topk*K store mask.
+    num_chunks = (topk + GROUP_SIZE - 1) // GROUP_SIZE
+    outer = (num_chunks + K_CHUNKS - 1) // K_CHUNKS
+    grid = (seq_len, outer)
+    _block_sparse_mqa_persistent_kernel[grid](
         q_fp8, k_fp8, k_scale, topk_block_index, logits, weights,
         cu_seqlen_ks, cu_seqlen_ke,
         q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2),
@@ -1125,10 +1088,13 @@ def block_sparse_mqa_triton(
         logits.stride(0), logits.stride(1),
         weights.stride(0), weights.stride(1),
         seq_kv,
+        topk,
         HEADS=H, DIM=D,
         KV_BLOCK_SIZE=kv_block_size,
-        BLOCK_N=BLOCK_N,
-        SUBS_PER_TOPK=subs_per_topk,
+        GROUP_SIZE=GROUP_SIZE,
+        K_CHUNKS=K_CHUNKS,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     return logits
 

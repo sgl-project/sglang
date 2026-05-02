@@ -25,7 +25,6 @@ import torch
 from sglang.srt.layers.attention.nsa.hisa.custom_ops import (
     fp8_native_block_mean_pooling_grouped_interface,
     fp8_native_block_mean_pooling_interface,
-    fp8_native_block_sparse_mqa_attn_return_logits_interface,
 )
 from sglang.srt.layers.attention.nsa.hisa.fast_topk_runtime import (
     MAX_TOPK as _FAST_TOPK_MAX,
@@ -44,22 +43,10 @@ from sglang.srt.layers.attention.nsa.hisa_triton.kernels import (
 )
 
 
-# Stage-3 fast_topk dispatch.
-#   prefill K∈{16,32}  → -3 to -6% e2e at production block_topk = 8192//K
-#                        (test_e2e_simulated.py, ctx=128K). Stage 4 is huge
-#                        per-call so CPU launch latency overlaps cleanly.
-#   prefill K∈{64,128} → loses kernel-side at small block_topk; stays on
-#                        torch.topk(bf16).
-#   decode all K       → kernel wins ~4× in isolation; eager-pipeline
-#                        bench shows ~3-6 μs/step regression because
-#                        stage-3 GPU (9 μs) is shorter than stage-4
-#                        launch latency (CUDA-graph A/B confirms it: under
-#                        capture+replay, fast_topk wins ~25 μs/step).
-#                        Wired live for production A/B — sglang's
-#                        piecewise-graph behavior may differ from our
-#                        eager bench. Toggle off via env var if it
-#                        regresses real-world.
-# Output i32 — both downstream wrappers accept it (no .to() cast).
+# Stage 3: fast_topk_runtime for all K (prefill + decode); only falls back
+# to torch.topk(bf16) when topk > _FAST_TOPK_MAX (out of fast_topk's range).
+# Production block_topk = 8192//K ∈ {512, 256, 128, 64}, well within
+# fast_topk capacity. Output is i32; downstream wrappers accept i32 / i64.
 _FAST_TOPK_DISABLE = os.environ.get("SGLANG_HISA_FAST_TOPK_DISABLE", "0") == "1"
 
 
@@ -343,37 +330,20 @@ def fp8_native_hierarchy_mqa_logits(
         block_k_indexer_score, block_topk
     )  # [seq, min(block_topk, L)] int32 (fast_topk) or int64 (torch.topk)
 
-    # 4) Sparse-MQA on raw K — split dispatch by K (sweep at sq=8192,
-    # skv∈{8K,16K,32K,64K}, test_stage4_full_ab.py):
-    #   K<128: triton grouped is 1.4-8x faster than tilelang. tilelang's
-    #     per-iter G TMA loads pay setup tax that dominates at small K
-    #     (TMA descriptor overhead ~constant, transfer time ∝ K rows);
-    #     triton's [256, D] gather load + m=256 WGMMA tile wins.
-    #   K=128: tilelang vanilla wins ~15% (skv=8K..64K). At full K
-    #     bandwidth TMA bulk load (16KB/shot) tops out HBM where triton's
-    #     256-row gather can't, and the cdll-thin launcher amortises
-    #     across the whole sq=8192 chunk too.
-    if k_block_size == 128:
-        block_sparse_logits = fp8_native_block_sparse_mqa_attn_return_logits_interface(
-            q=q_fp8,
-            k=k_fp8,
-            k_scale=k_scales,
-            topk_block_index=topk_block_indices,
-            kv_block_size=k_block_size,
-            weights=weights,
-            cu_seqlen_ks=cu_seqlen_ks,
-            cu_seqlen_ke=cu_seqlen_ke,
-        )  # [seq, min(block_topk, L) * k_block_size] f32
-    else:
-        block_sparse_logits = block_sparse_mqa_triton(
-            q_fp8=q_fp8,
-            k_fp8=k_fp8,
-            k_scale=k_scales,
-            topk_block_index=topk_block_indices,
-            kv_block_size=k_block_size,
-            weights=weights,
-            cu_seqlen_ks=cu_seqlen_ks,
-            cu_seqlen_ke=cu_seqlen_ke,
-        )
+    # 4) Sparse-MQA on raw K — all K via triton ``block_sparse_mqa_triton``:
+    #   K∈{16,32}:  persistent (GEMM_TILE=256 GROUP_SIZE=GEMM_TILE/K K_CHUNKS=16 w8)
+    #   K=64:       grouped (GEMM_TILE=256 GROUP_SIZE=4)
+    #   K=128:      persistent (GEMM_TILE=128 GROUP_SIZE=1 K_CHUNKS=64 w4 s3)
+    #               — wins 1.35-1.38× over tilelang at sq=8192 skv∈{16K..128K}.
+    block_sparse_logits = block_sparse_mqa_triton(
+        q_fp8=q_fp8,
+        k_fp8=k_fp8,
+        k_scale=k_scales,
+        topk_block_index=topk_block_indices,
+        kv_block_size=k_block_size,
+        weights=weights,
+        cu_seqlen_ks=cu_seqlen_ks,
+        cu_seqlen_ke=cu_seqlen_ke,
+    )
 
     return block_sparse_logits, topk_block_indices

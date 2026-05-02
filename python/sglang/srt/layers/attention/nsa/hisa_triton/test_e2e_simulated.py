@@ -147,13 +147,20 @@ def bench_prefill(K):
 
 
 def bench_decode_step(K, B, ctx):
+    import deep_gemm
     block_topk = BLOCK_TOPK_FORMULA // K
     inputs = make_decode_inputs(K, B, ctx)
     q, kv, pp, ppt, w, ctxl, bt = inputs
+    max_seq_len = bt.shape[1] * PAGED
+    npbpr = (ctxl + K - 1) // K
+    sched = deep_gemm.get_paged_mqa_logits_metadata(
+        npbpr, POOL_PAGE, deep_gemm.get_num_sms(),
+    )
     t = cuda_bench(lambda: fp8_native_hierarchy_paged_mqa_logits(
         q_fp8=q, kv_cache_fp8=kv, pool_k_pages=pp, pool_page_tables=ppt,
         weights=w, context_lens=ctxl, block_tables=bt,
         k_block_size=K, pool_page_size=POOL_PAGE, block_topk=block_topk,
+        max_seq_len=max_seq_len, schedule_metadata=sched,
     ))
     del q, kv, pp, ppt, w, ctxl, bt
     torch.cuda.empty_cache()
