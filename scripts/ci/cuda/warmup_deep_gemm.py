@@ -16,11 +16,18 @@ Usage:
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
 from math import ceil
 from pathlib import Path
+
+# Per-model fallback timeout. If any single model's compile_deep_gemm hangs
+# (e.g. one TP rank crashes and the rest deadlock on a collective), kill its
+# whole process group and continue to the next model rather than letting it
+# eat the entire step budget.
+FALLBACK_TIMEOUT_SEC = 900
 
 # Configure DeepGEMM cache before importing deep_gemm
 os.environ["DG_JIT_CACHE_DIR"] = os.getenv(
@@ -291,7 +298,12 @@ def compile_shapes_lightweight(shapes, m_list):
 
 
 def fallback_compile_deep_gemm(model, tp):
-    """Fall back to full sglang.compile_deep_gemm (loads model weights)."""
+    """Fall back to full sglang.compile_deep_gemm (loads model weights).
+
+    Runs in its own process group so a hung subprocess (e.g. one TP rank
+    crashes and the rest deadlock on NCCL collectives) can be killed
+    cleanly without leaking children.
+    """
     print(f"Falling back to full compile_deep_gemm for {model} (tp={tp})...")
     cmd = [
         sys.executable,
@@ -305,10 +317,33 @@ def fallback_compile_deep_gemm(model, tp):
         "--model-loader-extra-config",
         '{"enable_multithread_load": true, "num_threads": 64}',
     ]
-    result = subprocess.run(cmd)
-    if result.returncode != 0:
-        print(f"Warning: fallback failed for {model} (exit code {result.returncode})")
-    return result.returncode == 0
+    proc = subprocess.Popen(cmd, preexec_fn=os.setsid)
+    try:
+        rc = proc.wait(timeout=FALLBACK_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        print(
+            f"Warning: fallback timed out after {FALLBACK_TIMEOUT_SEC}s for "
+            f"{model} (tp={tp}); killing process group and continuing."
+        )
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+        try:
+            rc = proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            try:
+                rc = proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                rc = -1
+        return False
+    if rc != 0:
+        print(f"Warning: fallback failed for {model} (exit code {rc})")
+    return rc == 0
 
 
 def main():
