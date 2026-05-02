@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import socket
 import subprocess
 import sys
@@ -25,6 +26,11 @@ MODEL_ENV = "RELAYKV_OPTIONAL_SERVER_SMOKE_MODEL"
 RUN_ENV = "RELAYKV_OPTIONAL_SERVER_SMOKE_RUN"
 TIMEOUT_ENV = "RELAYKV_OPTIONAL_SERVER_SMOKE_TIMEOUT"
 OBSERVATION_ENV = "SGLANG_RELAYKV_RUNTIME_OBSERVATION"
+MIN_PORT = 1
+MAX_PORT = 65535
+OPTIONAL_PORT_BLOCK_SIZE = 3
+OPTIONAL_PORT_MIN = 20000
+OPTIONAL_PORT_MAX_START = 55000
 
 
 def _print_result(result: dict[str, Any]) -> None:
@@ -42,10 +48,70 @@ def _clean_skip(reason: str, **extra: Any) -> int:
     return 0
 
 
-def _reserve_local_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+def _check_port_range(port: int, name: str) -> None:
+    if not (MIN_PORT <= port <= MAX_PORT):
+        raise ValueError(f"{name} ({port}) must be between {MIN_PORT} and {MAX_PORT}")
+
+
+def _try_bind_local_ports(
+    ports: list[int],
+) -> tuple[list[socket.socket] | None, str | None]:
+    sockets = []
+    try:
+        for port in ports:
+            _check_port_range(port, "relaykv_optional_server_smoke_port")
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", port))
+            sockets.append(sock)
+        return sockets, None
+    except OSError as exc:
+        for sock in sockets:
+            sock.close()
+        return None, str(exc)
+
+
+def _reserve_local_port_block(count: int = OPTIONAL_PORT_BLOCK_SIZE) -> list[int]:
+    if count < 1:
+        raise ValueError("port block count must be positive")
+    max_start = min(OPTIONAL_PORT_MAX_START, MAX_PORT - count + 1)
+    candidates = list(range(OPTIONAL_PORT_MIN, max_start + 1))
+    random.shuffle(candidates)
+    last_error = None
+    for start in candidates[:200]:
+        ports = [start + offset for offset in range(count)]
+        sockets, error = _try_bind_local_ports(ports)
+        if sockets is None:
+            last_error = error
+            continue
+        for sock in sockets:
+            sock.close()
+        return ports
+    raise RuntimeError(
+        "failed to reserve a local optional server smoke port block "
+        f"in {OPTIONAL_PORT_MIN}..{max_start}; last_error={last_error}"
+    )
+
+
+def _port_info_from_ports(ports: list[int]) -> dict[str, int]:
+    port_info = {
+        "server_port": ports[0],
+        "grpc_port": ports[1],
+        "nccl_port": ports[2],
+    }
+    for name, port in port_info.items():
+        _check_port_range(port, name)
+    return port_info
+
+
+def _check_port_selection_bounds_for_smoke() -> dict[str, int]:
+    start = min(OPTIONAL_PORT_MAX_START, MAX_PORT - OPTIONAL_PORT_BLOCK_SIZE + 1)
+    ports = [start + offset for offset in range(OPTIONAL_PORT_BLOCK_SIZE)]
+    return _port_info_from_ports(ports)
+
+
+def _reserve_port_selection_for_server() -> dict[str, int]:
+    return _port_info_from_ports(_reserve_local_port_block())
 
 
 def _request_json(
@@ -103,12 +169,14 @@ def _tail(text: str, max_lines: int = 80) -> str:
 
 
 def _run_server_case(model_path: str, observation_value: str, timeout: float) -> dict[str, Any]:
-    port = _reserve_local_port()
+    port_info = _reserve_port_selection_for_server()
+    port = port_info["server_port"]
     base_url = f"http://127.0.0.1:{port}"
     env = os.environ.copy()
     env["HF_HUB_OFFLINE"] = "1"
     env["TRANSFORMERS_OFFLINE"] = "1"
     env[OBSERVATION_ENV] = observation_value
+    env["SGLANG_GRPC_PORT"] = str(port_info["grpc_port"])
     env.setdefault("FLASHINFER_WORKSPACE_BASE", "/tmp/relaykv_flashinfer_cache")
 
     repo_python = str(Path(__file__).resolve().parents[1] / "python")
@@ -127,6 +195,8 @@ def _run_server_case(model_path: str, observation_value: str, timeout: float) ->
         "127.0.0.1",
         "--port",
         str(port),
+        "--nccl-port",
+        str(port_info["nccl_port"]),
     ]
 
     proc = subprocess.Popen(
@@ -153,6 +223,7 @@ def _run_server_case(model_path: str, observation_value: str, timeout: float) ->
             "forward_completed": True,
             "http_status": status,
             "has_response": response is not None,
+            "ports": port_info,
             "relaykv_summary_logged": "relaykv_runtime_observation_summary" in stdout,
             "relaykv_skip_logged": "relaykv_runtime_observation_hook_skip" in stdout,
             "log_tail": _tail(stdout, max_lines=20),
@@ -166,9 +237,14 @@ def _run_server_case(model_path: str, observation_value: str, timeout: float) ->
 
 
 def main() -> int:
+    port_bounds_check = _check_port_selection_bounds_for_smoke()
     model_path = os.environ.get(MODEL_ENV)
     if not model_path:
-        return _clean_skip("model_env_unset", model_env=MODEL_ENV)
+        return _clean_skip(
+            "model_env_unset",
+            model_env=MODEL_ENV,
+            port_selection_bounds_check=port_bounds_check,
+        )
 
     model_path_obj = Path(model_path).expanduser()
     if not model_path_obj.exists():
@@ -176,6 +252,7 @@ def main() -> int:
             "model_path_not_found",
             model_env=MODEL_ENV,
             model_path=model_path,
+            port_selection_bounds_check=port_bounds_check,
         )
 
     if os.environ.get(RUN_ENV) != "1":
@@ -183,6 +260,7 @@ def main() -> int:
             "explicit_run_env_not_enabled",
             model_env=MODEL_ENV,
             model_path=str(model_path_obj),
+            port_selection_bounds_check=port_bounds_check,
             run_env=RUN_ENV,
         )
 
