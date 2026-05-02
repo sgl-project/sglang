@@ -612,14 +612,14 @@ def traverse_tree(
         if accepted:
             if curr != 0:
                 # Accept the current token
-                grammar.accept_token(draft_tokens[curr])
+                grammar.accept_token(int(draft_tokens[curr]))
             if not grammar.is_terminated():
                 # Generate the bitmask for the current token
                 grammar.fill_vocab_mask(allocate_token_bitmask, curr)
                 if retrieve_next_token[curr] != -1:
                     # Visit the child node
                     dfs(
-                        retrieve_next_token[curr],
+                        int(retrieve_next_token[curr]),
                         retrieve_next_token,
                         retrieve_next_sibling,
                         curr,
@@ -632,7 +632,7 @@ def traverse_tree(
         if retrieve_next_sibling[curr] != -1:
             # Visit the sibling node
             dfs(
-                retrieve_next_sibling[curr],
+                int(retrieve_next_sibling[curr]),
                 retrieve_next_token,
                 retrieve_next_sibling,
                 parent_pos,
