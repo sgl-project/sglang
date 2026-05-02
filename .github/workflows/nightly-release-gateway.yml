@@ -109,16 +109,14 @@ jobs:
             if command -v yum &> /dev/null; then
               yum update -y && yum install -y wget unzip gcc gcc-c++ perl-core make
 
-              # FIX 2: Check condition theek ki aur space add kiya
-              if[ "${{ matrix.target }}" = "aarch64" ] ||[ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+              if [ "${{ matrix.target }}" = "aarch64" ] || [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
                 yum install -y gcc-aarch64-linux-gnu gcc-c++-aarch64-linux-gnu || true
               fi
 
             elif command -v apt-get &> /dev/null; then
               apt-get update && apt-get install -y wget unzip gcc g++ perl make
 
-              # FIX 3: 'if[' ko theek karke 'if[' kiya aur dono target names allow kiye
-              if [ "${{ matrix.target }}" = "aarch64" ] ||[ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+              if [ "${{ matrix.target }}" = "aarch64" ] || [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
                 apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu libc6-dev-arm64-cross || true
               fi
             fi
