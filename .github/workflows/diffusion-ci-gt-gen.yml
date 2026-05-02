@@ -181,7 +181,11 @@ jobs:
       - name: Install official LTX-2.3 repro dependencies
         if: matrix.source_group == 'ltx23'
         run: |
-          UV_SYSTEM_PYTHON=1 uv pip install openimageio --index-strategy unsafe-best-match --prerelease allow
+          UV_SYSTEM_PYTHON=1 uv pip install \
+            "transformers==4.52.4" \
+            openimageio \
+            --index-strategy unsafe-best-match \
+            --prerelease allow
 
       - name: Checkout official Wan2.1 repo
         if: matrix.source_group == 'wan21'
