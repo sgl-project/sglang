@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+import torch
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kl_multiturn_utils import (
@@ -38,6 +40,7 @@ FULL_MODEL = "Qwen/Qwen3-32B"
 register_cuda_ci(est_time=760, stage="base-c", runner_config="4-gpu-h100")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class UnifiedRadixTreeTestMixin:
     """Mixin: gsm8k、mmlu and multi-turn KL tests with multi-branch interleaving."""
 
@@ -170,6 +173,7 @@ class UnifiedRadixTreeTestMixin:
         )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Full attention."""
 
@@ -200,6 +204,7 @@ class TestUnifiedFullRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """Mamba hybrid + UnifiedRadixCache."""
 
@@ -240,6 +245,7 @@ class TestUnifiedMambaRadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
         kill_process_tree(cls.process.pid)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """SWA hybrid + UnifiedRadixCache."""
 
