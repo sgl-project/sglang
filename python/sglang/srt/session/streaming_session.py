@@ -454,6 +454,26 @@ class StreamingSession(BasePrefixCache):
 
         return sum(_owned(s) for s in self.slots.values())
 
+    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
+        """Total mamba_pool entries held by session slots (mamba_pool_idx +
+        mamba_ping_pong_track_buffer). Excludes slots whose owning req is
+        currently in the batch -- those slots are counted via the normal
+        alloc/free paths (same convention as the sibling ``session_held_*``
+        accessors).
+        """
+        total = 0
+        for slot in self.slots.values():
+            in_batch = (
+                active_pool_idxs is not None and slot.req_pool_idx in active_pool_idxs
+            )
+            if in_batch:
+                continue
+            if slot.mamba_pool_idx is not None:
+                total += slot.mamba_pool_idx.numel()
+            if slot.mamba_ping_pong_track_buffer is not None:
+                total += slot.mamba_ping_pong_track_buffer.numel()
+        return total
+
     # -- Internal helpers (streaming body bits) --
 
     def _free_tail(self, slot: SessionSlot, req: Req, prefix_len: int) -> None:
