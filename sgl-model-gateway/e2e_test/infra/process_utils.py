@@ -127,26 +127,40 @@ def wait_for_workers_ready(
 
 
 def detect_ib_device() -> str | None:
-    """Detect first active InfiniBand device.
+    """Detect first active InfiniBand device usable for PD KV transfer.
 
     Enumerates `/sys/class/infiniband/` (the canonical device list that
     sglang's `_validate_ib_devices` checks against) and returns the first
-    one in PORT_ACTIVE state. Avoids guessing `mlx5_<N>` aliases — on
-    runners where the real names are `mlx5_ib<N>`/`mlx5_eth<N>`, the
-    legacy `mlx5_<N>` form succeeds at `ibv_devinfo` (alias resolution)
-    but is then rejected by sglang's validation.
+    PORT_ACTIVE port. Prioritizes ``mlx5_ib*`` (native InfiniBand) over
+    ``mlx5_eth*`` (Ethernet/RoCE) — on the production CI runners both
+    families show up under /sys/class/infiniband, but ``mlx5_eth*`` are
+    plain Ethernet ports that don't carry the RDMA traffic mooncake
+    needs for prefill/decode KV transfer. Picking an eth port led to
+    decode-side 500s on every PD MMLU request (worker comes up healthy
+    but KV reads fail at request time).
+
+    Avoids the legacy `mlx5_<N>` alias form: on these runners
+    ``ibv_devinfo mlx5_0`` resolves to ``mlx5_ib0`` and reports active,
+    but sglang's `_validate_ib_devices` walks /sys/class/infiniband and
+    rejects the alias name.
 
     Returns:
-        Device name (e.g., "mlx5_ib0"), or None if nothing is active.
+        Device name (e.g., ``mlx5_ib0``), or None if nothing usable.
     """
     ib_dir = "/sys/class/infiniband"
     try:
-        candidates = sorted(os.listdir(ib_dir))
+        all_devs = os.listdir(ib_dir)
     except FileNotFoundError:
         return None
 
-    if not candidates:
+    if not all_devs:
         return None
+
+    # Prefer native IB ports over Ethernet/RoCE. Within each family keep
+    # /sys ordering stable.
+    ib_first = sorted(d for d in all_devs if "_ib" in d)
+    eth_last = sorted(d for d in all_devs if "_ib" not in d)
+    candidates = ib_first + eth_last
 
     try:
         subprocess.run(
