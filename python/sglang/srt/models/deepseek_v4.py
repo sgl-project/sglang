@@ -53,7 +53,10 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import RadixAttention
-from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+from sglang.srt.model_executor.cuda_graph_runner import (
+    compile_in_capture_mode,
+    get_is_capture_mode,
+)
 from sglang.srt.model_loader.utils import maybe_executor_submit, should_async_load
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
@@ -64,7 +67,6 @@ from sglang.srt.utils import (
     add_prefix,
     log_info_on_rank0,
     make_layers,
-    maybe_torch_compile,
 )
 from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
@@ -846,7 +848,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         hc_scale: torch.Tensor,
         hc_base: torch.Tensor,
     ):
-        @maybe_torch_compile
+        @compile_in_capture_mode
         def hc_pre_torch_impl(x, hc_fn):
             x_flat = x.flatten(1).float()
             rsqrt = torch.rsqrt(
@@ -933,7 +935,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         assert post.shape == (x.shape[0], self.hc_mult)
         assert comb.shape == (x.shape[0], self.hc_mult, self.hc_mult)
 
-        @maybe_torch_compile
+        @compile_in_capture_mode
         def hc_post_torch_impl(x, residual, post, comb):
             return (
                 post.unsqueeze(-1) * x.unsqueeze(1)

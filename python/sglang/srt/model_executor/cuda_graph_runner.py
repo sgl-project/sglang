@@ -394,6 +394,12 @@ def get_is_capture_mode():
     return is_capture_mode
 
 
+def compile_in_capture_mode(func):
+    if get_is_capture_mode():
+        return torch.compile(func)
+    return func
+
+
 def get_capture_lora_variant() -> Optional[str]:
     """Return the lora variant being captured, or None if not in dual capture."""
     return _capture_lora_variant
