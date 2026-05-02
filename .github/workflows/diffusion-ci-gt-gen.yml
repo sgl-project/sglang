@@ -59,13 +59,21 @@ jobs:
       github.repository == 'sgl-project/sglang' &&
       inputs.official_case_ids != '' &&
       (inputs.official_source_group == '' || inputs.official_source_group == 'diffusers')
-    runs-on: 1-gpu-h100
-    timeout-minutes: 150
+    runs-on: 8-gpu-h200
+    timeout-minutes: 240
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Checkout ci-data repro scripts
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/ci-data
+          ref: main
+          path: ci-data
+          token: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
 
       - name: Prepare sgl-kernel/dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
@@ -91,10 +99,14 @@ jobs:
       - name: Generate official Diffusers outputs
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+          CUDA_VISIBLE_DEVICES: 0
         run: |
+          git -C ci-data rev-parse HEAD
           cd python
-          python -m sglang.multimodal_gen.test.scripts.gen_official_diffusion_gt \
+          python ../ci-data/diffusion-ci/repro_scripts/gen_official_diffusion_gt.py \
             --suite 1-gpu \
             --out-dir ./${{ env.OUTPUT_NAME }} \
             --case-ids ${{ inputs.official_case_ids }} \
@@ -119,13 +131,21 @@ jobs:
 
   official-wan21-gt-1gpu:
     if: github.repository == 'sgl-project/sglang' && inputs.official_source_group == 'wan21'
-    runs-on: 1-gpu-h100
-    timeout-minutes: 150
+    runs-on: 8-gpu-h200
+    timeout-minutes: 180
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Checkout ci-data repro scripts
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/ci-data
+          ref: main
+          path: ci-data
+          token: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
 
       - name: Prepare sgl-kernel/dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
@@ -161,11 +181,15 @@ jobs:
       - name: Generate official Wan2.1 outputs
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+          CUDA_VISIBLE_DEVICES: 0
           WAN_CASE_IDS: ${{ inputs.official_case_ids || 'wan2_1_t2v_1.3b' }}
         run: |
+          git -C ci-data rev-parse HEAD
           cd python
-          python -m sglang.multimodal_gen.test.scripts.gen_official_diffusion_gt \
+          python ../ci-data/diffusion-ci/repro_scripts/gen_official_diffusion_gt.py \
             --suite 1-gpu \
             --out-dir ./${{ env.OUTPUT_NAME }} \
             --case-ids $WAN_CASE_IDS \
@@ -191,13 +215,21 @@ jobs:
 
   official-ltx23-gt-1gpu:
     if: github.repository == 'sgl-project/sglang' && inputs.official_source_group == 'ltx23'
-    runs-on: 1-gpu-h100
-    timeout-minutes: 180
+    runs-on: 8-gpu-h200
+    timeout-minutes: 240
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.ref || github.ref }}
+
+      - name: Checkout ci-data repro scripts
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/ci-data
+          ref: main
+          path: ci-data
+          token: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
 
       - name: Prepare sgl-kernel/dist for prebuilt wheel
         if: inputs.kernel_artifact_run_id != ''
@@ -233,7 +265,10 @@ jobs:
       - name: Materialize LTX-2.3 overlay model
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+          CUDA_VISIBLE_DEVICES: 0
         run: |
           cd python
           python - <<'PY'
@@ -246,12 +281,16 @@ jobs:
       - name: Generate official LTX-2.3 outputs
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HUGGING_FACE_HUB_TOKEN: ${{ secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
+          PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+          CUDA_VISIBLE_DEVICES: 0
           LTX_CASE_IDS: ${{ inputs.official_case_ids || 'ltx_2.3_two_stage_t2v_2gpus ltx_2.3_one_stage_ti2v' }}
         run: |
+          git -C ci-data rev-parse HEAD
           cd python
           PYTHONPATH=/tmp/mmgen-official-code/LTX-2/packages/ltx-core/src:/tmp/mmgen-official-code/LTX-2/packages/ltx-pipelines/src:$PWD:$PYTHONPATH \
-            python -m sglang.multimodal_gen.test.scripts.gen_official_ltx23 \
+            python ../ci-data/diffusion-ci/repro_scripts/gen_official_ltx23.py \
               --out-dir ./${{ env.OUTPUT_NAME }} \
               --case-ids $LTX_CASE_IDS
 
