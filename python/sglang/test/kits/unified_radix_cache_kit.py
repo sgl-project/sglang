@@ -1,4 +1,6 @@
 import random
+import torch
+import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
@@ -15,6 +17,7 @@ def _random_suffixes(n, length, seed):
     return [[rng.randint(1, 30000) for _ in range(length)] for _ in range(n)]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class UnifiedRadixTreeTestMixin:
     """Mixin: gsm8k, mmlu and multi-turn KL tests with multi-branch interleaving."""
 
