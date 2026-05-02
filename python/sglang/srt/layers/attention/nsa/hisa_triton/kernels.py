@@ -357,142 +357,16 @@ def ragged_pool_mqa_triton(
 #     KvCache_fp8:  [num_phys_blocks, paged_block_size * (D + 4)]  fp8 bytes
 #     KvCache_fp32: [num_phys_blocks, paged_block_size * (D + 4) // 4] f32
 #                   (same memory, f32 view for the per-token scale slots)
-#     TopK:         [B, seq_len, topk]               i64  (torch.topk output)
+#     TopK:         [B, seq_len, topk]               i32 / i64
 #     Weights:      [B, seq_len, H]                  f32
 #     ContextLens:  [B]                              i32
 #     BlockTables:  [B, max_blocks]                  i32
 #     Logits:       [B, seq_len, topk * kv_block_size] f32  OUT
 #
-#   Each output column c = n_i * kv_block_size + sub_i * paged_block_size +
-#   local_i is a logit for K token position
-#   topk_block_id[b, s, n_i] * kv_block_size + sub_i * paged_block_size + local_i.
-#
-#   Parallelism strategy: one CTA per (b, seq, paged_sub_block). Grid =
-#   (B, seq, topk * subs_per_topk).  Each CTA does one paged_block_size-wide
-#   GEMM and writes paged_block_size contiguous logits.  Q and weights are
-#   reloaded per-CTA — redundant vs tilelang's per-(b, seq) load-once, but
-#   the higher grid count lets many SMs work in parallel.
+#   Single grouped kernel for K∈{8,16,32,64,128}: per-row paged lookup
+#   (logical_page = token_abs // PAGED) handles K<paged, K==paged, K>paged
+#   uniformly. GEMM_TILE = max(paged, K) per CTA.
 # ---------------------------------------------------------------------------
-
-
-@triton.jit
-def _sparse_paged_mqa_kernel(
-    Q_ptr,            # [B, seq, H, D] fp8
-    KvCacheFp8_ptr,   # [num_phys, paged_block_size * (D + 4)] fp8 (view of uint8)
-    KvCacheFp32_ptr,  # same memory, f32 view: [num_phys, paged_block_size * (D + 4) // 4]
-    TopK_ptr,         # [B, seq, topk]               i64
-    Logits_ptr,       # [B, seq, topk * kv_block_size] f32  OUT
-    W_ptr,            # [B, seq, H]                  f32
-    ContextLens_ptr,  # [B]                          i32
-    BlockTables_ptr,  # [B, max_blocks]              i32
-    # strides (in elements of the pointee dtype)
-    stride_q_b, stride_q_s, stride_q_h, stride_q_d,
-    stride_kv8_p, stride_kv8_b,
-    stride_kv32_p, stride_kv32_b,
-    stride_topk_b, stride_topk_s, stride_topk_n,
-    stride_logits_b, stride_logits_s, stride_logits_n,
-    stride_w_b, stride_w_s, stride_w_h,
-    stride_bt_b, stride_bt_mb,
-    # shapes
-    max_blocks,
-    num_phys,                      # kv_cache.shape[0] — for phys bound (defensive)
-    # constexpr
-    PAGED_BLOCK_SIZE: tl.constexpr,
-    KV_BLOCK_SIZE: tl.constexpr,
-    HEADS: tl.constexpr,
-    DIM: tl.constexpr,
-    SUBS_PER_TOPK: tl.constexpr,
-):
-    b = tl.program_id(0)
-    seq_i = tl.program_id(1)
-    subblock_idx = tl.program_id(2)
-
-    n_i = subblock_idx // SUBS_PER_TOPK
-    sub_i = subblock_idx % SUBS_PER_TOPK
-
-    # --- topk_block_id and the absolute paged-block index it maps to ---
-    topk_id_ptr = (
-        TopK_ptr
-        + b * stride_topk_b
-        + seq_i * stride_topk_s
-        + n_i * stride_topk_n
-    )
-    topk_block_id = tl.load(topk_id_ptr).to(tl.int32)
-    block_s_i = topk_block_id * KV_BLOCK_SIZE + sub_i * PAGED_BLOCK_SIZE
-    logical_page = block_s_i // PAGED_BLOCK_SIZE
-    valid_page = (logical_page >= 0) & (logical_page < max_blocks)
-
-    # --- Physical page lookup (clamped on invalid so the K load stays in-bounds). ---
-    phys = tl.load(
-        BlockTables_ptr + b * stride_bt_b + logical_page * stride_bt_mb,
-        mask=valid_page, other=0,
-    ).to(tl.int32)
-    # Defensive: clamp phys to [0, num_phys) before using as offset.
-    valid = valid_page & (phys >= 0) & (phys < num_phys)
-    phys = tl.where(valid, phys, 0)
-
-    # --- Q [H, D] fp8 ---
-    h_offs = tl.arange(0, HEADS)
-    d_offs = tl.arange(0, DIM)
-    q_ptrs = (
-        Q_ptr
-        + b * stride_q_b
-        + seq_i * stride_q_s
-        + h_offs[:, None] * stride_q_h
-        + d_offs[None, :] * stride_q_d
-    )
-    q = tl.load(q_ptrs)  # fp8 [H, D]
-
-    # --- Weights [H] f32 ---
-    w_ptrs = W_ptr + b * stride_w_b + seq_i * stride_w_s + h_offs * stride_w_h
-    w = tl.load(w_ptrs)  # f32 [H]
-
-    # --- K tile [PAGED_BLOCK_SIZE, D] fp8 from paged cache ---
-    # Layout: bytes [0, PAGED_BLOCK_SIZE * D) = fp8 data, token i at bytes
-    # [i * D, (i + 1) * D).
-    bn_offs = tl.arange(0, PAGED_BLOCK_SIZE)
-    k_byte_offs = bn_offs[:, None] * DIM + d_offs[None, :]
-    k_ptrs = (
-        KvCacheFp8_ptr
-        + phys * stride_kv8_p
-        + k_byte_offs * stride_kv8_b
-    )
-    k = tl.load(k_ptrs)  # fp8 [PAGED_BLOCK_SIZE, D]
-
-    # --- K per-token scale [PAGED_BLOCK_SIZE] f32 ---
-    # Scale is the last PAGED_BLOCK_SIZE f32 slots in the row (after the fp8 data).
-    SCALE_OFFSET: tl.constexpr = PAGED_BLOCK_SIZE * DIM // 4
-    ks_ptrs = (
-        KvCacheFp32_ptr
-        + phys * stride_kv32_p
-        + (SCALE_OFFSET + bn_offs) * stride_kv32_b
-    )
-    k_scale = tl.load(ks_ptrs)  # f32 [PAGED_BLOCK_SIZE]
-
-    # --- GEMM: s = k @ q.T  (fp8 × fp8 → f32) ---
-    s = tl.dot(k, q.trans(1, 0), out_dtype=tl.float32)  # [PAGED_BLOCK_SIZE, H]
-
-    # --- Post: max(s * k_scale, 0) * w, reduce over H ---
-    s = s * k_scale[:, None]
-    s = tl.maximum(s, 0.0)
-    s = s * w[None, :]
-    logits = tl.sum(s, axis=1)  # [PAGED_BLOCK_SIZE] f32
-
-    # --- Mask out-of-range positions (-inf) ---
-    context_len = tl.load(ContextLens_ptr + b)
-    k_i = block_s_i + bn_offs
-    pos_valid = (k_i >= 0) & (k_i < context_len) & valid
-    logits = tl.where(pos_valid, logits, float("-inf"))
-
-    # --- Store logits at [b, seq_i, n_i * KV_BLOCK_SIZE + sub_i * PAGED_BLOCK_SIZE + bn_offs] ---
-    out_cols = n_i * KV_BLOCK_SIZE + sub_i * PAGED_BLOCK_SIZE + bn_offs
-    out_ptrs = (
-        Logits_ptr
-        + b * stride_logits_b
-        + seq_i * stride_logits_s
-        + out_cols * stride_logits_n
-    )
-    tl.store(out_ptrs, logits)
 
 
 @triton.jit
@@ -642,12 +516,14 @@ def sparse_paged_mqa_triton(
     """Triton equivalent of ``fp8_native_paged_block_sparse_mqa_attn_return_logits_interface``.
     Returns logits of shape ``[B, seq, topk * kv_block_size]`` f32.
 
-    Dispatch:
-      kv_block_size >= paged_block_size (= 64) → original kernel; CTA per
-        (b, seq, topk_idx, sub_block) with K tile = [paged_block_size, D].
-      kv_block_size <  paged_block_size       → grouped kernel; CTA per
-        (b, seq, group_of_G_topk) with K tile = [64, D] gathered from G
-        consecutive topk indices.
+    Unified grouped dispatch for K∈{8,16,32,64,128}. The grouped kernel's
+    per-row paged lookup (``logical_page = token_abs // PAGED``) handles all
+    K layouts uniformly:
+      K<paged (8/16/32):   GROUP_SIZE=64/K, GEMM_TILE=64 — G consecutive
+                           topk indices share one paged page.
+      K==paged (64):       GROUP_SIZE=1,    GEMM_TILE=64 — one topk = one page.
+      K>paged (128):       GROUP_SIZE=1,    GEMM_TILE=128 — one topk spans
+                           2 pages, per-row gather looks up each.
     """
     assert q_fp8.ndim == 4, f"q_fp8 should be [B, seq, H, D], got {q_fp8.shape}"
     B, seq_len, H, D = q_fp8.shape
@@ -680,58 +556,23 @@ def sparse_paged_mqa_triton(
         device=q_fp8.device, dtype=torch.float32,
     )
 
-    if kv_block_size != paged_block_size:
-        # Grouped path. GEMM_TILE = max(paged, k):
-        #   k<64 (8/16/32): GROUP_SIZE = 64/k, TILE = 64 (one paged page).
-        #   k=128         : GROUP_SIZE = 1,    TILE = 128 (one topk index
-        #                                       spans 2 paged pages via
-        #                                       per-row gather).
-        # k=64 falls into the legacy branch below as it's exactly equivalent
-        # to grouped(G=1, TILE=64) — kept on legacy for code simplicity.
-        # SK8 tried TILE=128 for k<64 grouped path → regressed (per-CTA
-        # work doubles but small decode grid couldn't absorb it). SK12 finds
-        # k=128 path benefits because legacy SUBS_PER_TOPK=2 issues 2× m=64
-        # WGMMA where 1× m=128 wins.
-        if kv_block_size < paged_block_size:
-            GROUP_SIZE = paged_block_size // kv_block_size  # k<64
-            GEMM_TILE = paged_block_size                     # 64
-        else:
-            GROUP_SIZE = 1                                   # k=128
-            GEMM_TILE = kv_block_size                        # 128
-        assert GEMM_TILE % kv_block_size == 0
-        # Non-divisible topk: ceil to num_chunks; tail-pad lanes are handled
-        # in-kernel via masked load (other=0) + g_valid AND in pos_valid +
-        # out_cols < topk*K store mask.
-        num_chunks = (topk + GROUP_SIZE - 1) // GROUP_SIZE
-        grid = (B, seq_len, num_chunks)
-        _sparse_paged_mqa_grouped_kernel[grid](
-            q_fp8, kv_fp8_view, kv_f32_view, topk_block_index,
-            logits, weights, context_lens, block_tables,
-            q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2), q_fp8.stride(3),
-            kv_fp8_view.stride(0), kv_fp8_view.stride(1),
-            kv_f32_view.stride(0), kv_f32_view.stride(1),
-            topk_block_index.stride(0), topk_block_index.stride(1), topk_block_index.stride(2),
-            logits.stride(0), logits.stride(1), logits.stride(2),
-            weights.stride(0), weights.stride(1), weights.stride(2),
-            block_tables.stride(0), block_tables.stride(1),
-            max_blocks,
-            num_phys_blocks,
-            topk,
-            PAGED_BLOCK_SIZE=paged_block_size,
-            KV_BLOCK_SIZE=kv_block_size,
-            HEADS=H,
-            DIM=D,
-            GROUP_SIZE=GROUP_SIZE,
-        )
-        return logits
-
-    # Legacy path (kv_block_size == paged_block_size, i.e. k=64).
-    assert kv_block_size % paged_block_size == 0
-    subs_per_topk = kv_block_size // paged_block_size
-    total_subblocks = topk * subs_per_topk
-
-    grid = (B, seq_len, total_subblocks)
-    _sparse_paged_mqa_kernel[grid](
+    # GEMM_TILE = max(paged, K). GROUP_SIZE picked so GEMM_TILE = G*K is the
+    # natural tile (one paged page for K<=paged, one topk index for K>paged):
+    #   K<paged (8/16/32):  G = paged/K → TILE = paged = 64
+    #   K==paged (64):      G = 1       → TILE = paged = 64
+    #   K>paged (128):      G = 1       → TILE = K = 128
+    if kv_block_size <= paged_block_size:
+        GROUP_SIZE = paged_block_size // kv_block_size
+    else:
+        GROUP_SIZE = 1
+    GEMM_TILE = GROUP_SIZE * kv_block_size
+    assert GEMM_TILE % kv_block_size == 0
+    # Non-divisible topk: ceil to num_chunks; tail-pad lanes are handled
+    # in-kernel via masked load (other=0) + g_valid AND in pos_valid +
+    # out_cols < topk*K store mask.
+    num_chunks = (topk + GROUP_SIZE - 1) // GROUP_SIZE
+    grid = (B, seq_len, num_chunks)
+    _sparse_paged_mqa_grouped_kernel[grid](
         q_fp8, kv_fp8_view, kv_f32_view, topk_block_index,
         logits, weights, context_lens, block_tables,
         q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2), q_fp8.stride(3),
@@ -743,11 +584,12 @@ def sparse_paged_mqa_triton(
         block_tables.stride(0), block_tables.stride(1),
         max_blocks,
         num_phys_blocks,
+        topk,
         PAGED_BLOCK_SIZE=paged_block_size,
         KV_BLOCK_SIZE=kv_block_size,
         HEADS=H,
         DIM=D,
-        SUBS_PER_TOPK=subs_per_topk,
+        GROUP_SIZE=GROUP_SIZE,
     )
     return logits
 
