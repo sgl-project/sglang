@@ -18,7 +18,10 @@ class DeviceConfig:
         else:
             from sglang.srt.platforms import current_platform
 
-            if current_platform.is_out_of_tree() and device == current_platform.device_name:
+            if (
+                current_platform.is_out_of_tree()
+                and device == current_platform.device_name
+            ):
                 self.device_type = current_platform.device_type
             else:
                 raise RuntimeError(f"Not supported device type: {device}")

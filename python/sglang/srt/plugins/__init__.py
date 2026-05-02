@@ -111,9 +111,7 @@ def _log_unimplemented_oot_placeholders() -> None:
 
     for placeholder in get_oot_hook_placeholders():
         hooks = HookRegistry._hooks.get(placeholder.target, [])
-        has_replace = any(
-            hook_type == HookType.REPLACE for hook_type, _, _ in hooks
-        )
+        has_replace = any(hook_type == HookType.REPLACE for hook_type, _, _ in hooks)
         if has_replace:
             continue
 
