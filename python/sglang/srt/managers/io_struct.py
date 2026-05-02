@@ -573,7 +573,7 @@ class GenerateReqInput(BaseReq):
     def _normalize_bootstrap_params(self, num):
         """Normalize bootstrap parameters for batch processing."""
 
-        def expand_bootstrap_list(values, param_name):
+        def expand_bootstrap_list(values):
             if len(values) == self.batch_size:
                 # Some routers only attach one value per original batch item.
                 return values * self.parallel_sample_num
@@ -600,9 +600,7 @@ class GenerateReqInput(BaseReq):
         elif not isinstance(self.bootstrap_host, list):
             self.bootstrap_host = [self.bootstrap_host] * num
         else:
-            self.bootstrap_host = expand_bootstrap_list(
-                self.bootstrap_host, "bootstrap_host"
-            )
+            self.bootstrap_host = expand_bootstrap_list(self.bootstrap_host)
 
         # Normalize bootstrap_port
         if self.bootstrap_port is None:
@@ -610,9 +608,7 @@ class GenerateReqInput(BaseReq):
         elif not isinstance(self.bootstrap_port, list):
             self.bootstrap_port = [self.bootstrap_port] * num
         else:
-            self.bootstrap_port = expand_bootstrap_list(
-                self.bootstrap_port, "bootstrap_port"
-            )
+            self.bootstrap_port = expand_bootstrap_list(self.bootstrap_port)
 
         # Normalize bootstrap_room
         if self.bootstrap_room is None:
@@ -628,9 +624,7 @@ class GenerateReqInput(BaseReq):
         elif not isinstance(self.bootstrap_pair_key, list):
             self.bootstrap_pair_key = [self.bootstrap_pair_key] * num
         else:
-            self.bootstrap_pair_key = expand_bootstrap_list(
-                self.bootstrap_pair_key, "bootstrap_pair_key"
-            )
+            self.bootstrap_pair_key = expand_bootstrap_list(self.bootstrap_pair_key)
 
     def _validate_session_params(self):
         """Validate that session parameters are properly formatted."""
