@@ -10,7 +10,6 @@ from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.observability.metrics_collector import QueueCount
 from sglang.srt.utils.common import ceil_align, raise_error_or_warn
-from sglang.srt.utils.request_logger import disable_request_logging
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
@@ -166,6 +165,9 @@ class SchedulerRuntimeCheckerMixin:
 
     def _session_held_req_count(self: Scheduler) -> int:
         return self.tree_cache.session_held_req_count()
+
+    def _session_held_mamba_slots(self: Scheduler) -> int:
+        return self.tree_cache.session_held_mamba_slots(self._active_pool_idxs())
 
     def get_pool_stats(self: Scheduler) -> PoolStats:
         if self.is_hybrid_swa:
@@ -336,7 +338,7 @@ class SchedulerRuntimeCheckerMixin:
             ps.mamba_available_size,
             ps.mamba_evictable_size,
             self.tree_cache.mamba_protected_size(),
-            0,
+            self._session_held_mamba_slots(),
             self.req_to_token_pool.mamba_pool.size,
         )
         if leak:
@@ -556,6 +558,9 @@ class SchedulerRuntimeCheckerMixin:
         # reset token ratio
         self.new_token_ratio = self.init_new_token_ratio
 
+        # reset device timer window so idle time isn't counted
+        self.reset_device_timer_window()
+
         # sleep until next event
         self.maybe_sleep_on_idle()
 
@@ -564,7 +569,7 @@ def create_scheduler_watchdog(
     scheduler: Scheduler, watchdog_timeout: float, soft: bool = False
 ) -> WatchdogRaw:
     def dump_info() -> str:
-        if scheduler.is_initializing or disable_request_logging():
+        if scheduler.is_initializing:
             return ""
         _, messages = scheduler._check_all_pools(scheduler.get_pool_stats())
         return (

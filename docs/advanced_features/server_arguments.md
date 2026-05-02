@@ -119,6 +119,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
 | `--modelopt-export-path` | Path to export the quantized model in HuggingFace format after ModelOpt quantization. The exported model can then be used directly with SGLang for inference. If not provided, the model will not be exported. | `None` | Type: str |
 | `--quantize-and-serve` | Quantize the model with ModelOpt and immediately serve it without exporting. This is useful for development and prototyping. For production, it's recommended to use separate quantization and deployment steps. | `False` | bool flag (set to enable) |
 | `--rl-quant-profile` | Path to the FlashRL quantization profile. Required when using --load-format flash_rl. | `None` | Type: str |
+| `--enable-quant-communications` | Enable INT8 quantization of TP communications (Supported only for NPU for Qwen3 series). | `False` | bool flag (set to enable) |
 
 ## Memory and scheduling
 | Argument | Description | Defaults | Options |
