@@ -677,7 +677,7 @@ class HiSparseCoordinator:
             raise ValueError(
                 f"top_k_result dtype {top_k_result.dtype} is not int32 as expected"
             )
-        
+
         local_layer_id = self._to_local_layer_id(layer_id)
 
         num_reqs = req_pool_indices.size(0)
