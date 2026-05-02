@@ -601,7 +601,7 @@ class ServerArgs:
 
     # Hierarchical sparse attention
     enable_hisparse: bool = False
-    hierarchical_sparse_attention_extra_config: Optional[str] = None
+    hisparse_config: Optional[str] = None
 
     # LMCache
     enable_lmcache: bool = False
@@ -5937,9 +5937,11 @@ class ServerArgs:
             help="Enable hierarchical sparse attention",
         )
         parser.add_argument(
+            "--hisparse-config",
             "--hierarchical-sparse-attention-extra-config",
+            dest="hisparse_config",
             type=str,
-            default=ServerArgs.hierarchical_sparse_attention_extra_config,
+            default=ServerArgs.hisparse_config,
             help="A dictionary in JSON string format for hierarchical sparse attention configuration. "
             "Required fields: algorithm (str), backend (str). "
             "All other fields are algorithm-specific and passed to the algorithm constructor. "
@@ -6948,35 +6950,34 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
-            from sglang.srt.configs.model_config import is_deepseek_nsa
+            from sglang.srt.configs.model_config import (
+                is_deepseek_nsa,
+                is_deepseek_v4,
+            )
 
             hf_config = self.get_model_config().hf_config
-            assert is_deepseek_nsa(hf_config), (
-                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
-                "(e.g., DeepSeek V3.2, GLM-5). "
+            is_v4_hisparse = is_deepseek_v4(hf_config)
+            assert is_deepseek_nsa(hf_config) or is_v4_hisparse, (
+                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
+                "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
             )
 
             assert (
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-            for attr, label in [
-                ("nsa_prefill_backend", "prefill"),
-                ("nsa_decode_backend", "decode"),
-            ]:
-                backend = getattr(self, attr)
-                if backend is not None and backend != "flashmla_sparse":
-                    raise ValueError(
-                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
-                        f"but got --nsa-{label}-backend={backend}. "
-                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
-                    )
 
-            if self.kv_cache_dtype != "bfloat16":
-                raise ValueError(
-                    f"HiSparse requires bfloat16 KV cache, but got --kv-cache-dtype={self.kv_cache_dtype}. "
-                    f"Please use --kv-cache-dtype=bfloat16."
-                )
-
+            if not is_v4_hisparse:
+                for attr, label in [
+                    ("nsa_prefill_backend", "prefill"),
+                    ("nsa_decode_backend", "decode"),
+                ]:
+                    backend = getattr(self, attr)
+                    if backend is not None and backend != "flashmla_sparse":
+                        raise ValueError(
+                            f"HiSparse requires flashmla_sparse NSA {label} backend, "
+                            f"but got --nsa-{label}-backend={backend}. "
+                            f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
+                        )
         assert (
             self.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"

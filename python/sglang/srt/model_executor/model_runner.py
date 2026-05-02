@@ -733,26 +733,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # Init ngram embedding token table
         self.maybe_init_ngram_embedding()
 
-        # Init hisparse coordinator (must happen before CUDA graph capture)
-        if self.enable_hisparse:
-            from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-            hisparse_cfg = parse_hisparse_config(self.server_args)
-            self.hisparse_coordinator = HiSparseCoordinator(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                top_k=hisparse_cfg.top_k,
-                device_buffer_size=hisparse_cfg.device_buffer_size,
-                device=self.device,
-                tp_group=(
-                    self.attention_tp_group.cpu_group
-                    if self.server_args.enable_dp_attention
-                    else self.tp_group.cpu_group
-                ),
-                host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
-            )
-
         # Init routed experts capturer
         self.init_routed_experts_capturer()
 
@@ -769,21 +749,24 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             self.kernel_warmup()
             if self.enable_hisparse:
                 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
 
-                _hisparse_top_k = getattr(
-                    self.model_config.hf_text_config, "index_topk", 512
+                hisparse_cfg = parse_hisparse_config(self.server_args)
+                hisparse_top_k = getattr(
+                    self.model_config.hf_text_config, "index_topk", hisparse_cfg.top_k
                 )
                 self.hisparse_coordinator = HiSparseCoordinator(
                     req_to_token_pool=self.req_to_token_pool,
                     token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                    top_k=_hisparse_top_k,
-                    device_buffer_size=_hisparse_top_k * 2,
+                    top_k=hisparse_top_k,
+                    device_buffer_size=hisparse_cfg.device_buffer_size,
                     device=self.device,
                     tp_group=(
                         self.attention_tp_group.cpu_group
                         if self.server_args.enable_dp_attention
                         else self.tp_group.cpu_group
                     ),
+                    host_to_device_ratio=hisparse_cfg.host_to_device_ratio,
                 )
             self._pre_initialize_flashinfer_allreduce_workspace()
             self.init_device_graphs()

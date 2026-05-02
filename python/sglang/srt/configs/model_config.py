@@ -215,20 +215,22 @@ class ModelConfig:
         # Config draft model
         self._config_draft_model()
 
-        # DSV4 expert layout: env (default True = mxfp4) gives the value;
-        # detect overrides only when env unset. Carriers (Fp8Config /
-        # DeepGemmMoeQuantInfo / TopK) propagate downstream.
-        self.is_fp4_experts: bool = envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        if is_deepseek_v4(self.hf_config) and not envs.SGLANG_DSV4_FP4_EXPERTS.is_set():
-            from sglang.srt.configs.deepseek_v4 import try_detect_fp4_experts
+        # DSV4 expert layout: env (default True = mxfp4) applies only to V4.
+        # Other FP8 MoE models (for example DeepSeek V3.2) must keep the normal
+        # FP8 expert tensor layout.
+        self.is_fp4_experts: bool = False
+        if is_deepseek_v4(self.hf_config):
+            self.is_fp4_experts = envs.SGLANG_DSV4_FP4_EXPERTS.get()
+            if not envs.SGLANG_DSV4_FP4_EXPERTS.is_set():
+                from sglang.srt.configs.deepseek_v4 import try_detect_fp4_experts
 
-            detected = try_detect_fp4_experts(self.model_path)
-            if detected is not None:
-                self.is_fp4_experts = detected
-                logger.info(
-                    "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
-                    self.is_fp4_experts,
-                )
+                detected = try_detect_fp4_experts(self.model_path)
+                if detected is not None:
+                    self.is_fp4_experts = detected
+                    logger.info(
+                        "Auto-detected DSV4 routed-expert layout: is_fp4_experts=%s",
+                        self.is_fp4_experts,
+                    )
 
         # Check model type
         self.attention_chunk_size = getattr(

@@ -43,7 +43,9 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
-from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.hisparse_memory_pool import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.swa_memory_pool import SWATokenToKVPoolAllocator
 from sglang.srt.server_args import ServerArgs
@@ -445,11 +447,11 @@ class PrefillAdder:
                 ]
             )
 
-        # Hisparse wraps an SWATokenToKVPoolAllocator internally and exposes
-        # the full SWA allocator interface.
+        # DeepSeek V4 HiSparse wraps an SWATokenToKVPoolAllocator internally and
+        # exposes the full SWA allocator interface.
         self.is_hybrid_swa = isinstance(
             self.token_to_kv_pool_allocator,
-            (SWATokenToKVPoolAllocator, HiSparseTokenToKVPoolAllocator),
+            (SWATokenToKVPoolAllocator, DeepSeekV4HiSparseTokenToKVPoolAllocator),
         )
         self.is_hybrid_ssm_cache = self.tree_cache.supports_mamba()
 

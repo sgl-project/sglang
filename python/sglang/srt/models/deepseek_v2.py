@@ -473,7 +473,7 @@ class DeepseekV2MoE(nn.Module):
         self.alt_stream = alt_stream
         self.is_nextn = is_nextn
 
-        n_hash_layers = config.num_hash_layers
+        n_hash_layers = getattr(config, "num_hash_layers", 0)
         self.is_hash = layer_id < n_hash_layers and not (is_deepseek_v4 and is_nextn)
 
         if self.tp_size > config.n_routed_experts:

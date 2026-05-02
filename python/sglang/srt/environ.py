@@ -561,7 +561,6 @@ class Envs:
     SGLANG_REASONING_EFFORT = EnvStr("")
 
     # HiSparse / compressor (HC = HiSparse compressor, MHC = HiSparse hash kernel)
-    SGLANG_OPT_HISPARSE_C4_SHRINK = EnvInt(1)
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)

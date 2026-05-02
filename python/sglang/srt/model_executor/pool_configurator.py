@@ -323,15 +323,17 @@ class DSv4PoolConfigurator(MemoryPoolConfigurator):
         self.swa_page_size = cfg.window_size
         self.swa_ratio = mr.server_args.swa_full_tokens_ratio
         self.is_speculative = mr.server_args.speculative_algorithm is not None
-        self.c4_shrink_factor = (
-            envs.SGLANG_OPT_HISPARSE_C4_SHRINK.get() if mr.enable_hisparse else 1
-        )
+        if mr.enable_hisparse:
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            self.c4_shrink_factor = parse_hisparse_config(
+                mr.server_args
+            ).host_to_device_ratio
+        else:
+            self.c4_shrink_factor = 1
         assert self.c4_shrink_factor >= 1
         if self.c4_shrink_factor > 1:
-            logger.info(
-                f"HiSparse c4 pool shrink factor = {self.c4_shrink_factor} "
-                f"(set via SGLANG_OPT_HISPARSE_C4_SHRINK)"
-            )
+            logger.info(f"HiSparse c4 host-to-device ratio = {self.c4_shrink_factor}")
 
         self.c4_ring_size = get_compress_state_ring_size(4, self.is_speculative)
         self.c128_ring_size = get_compress_state_ring_size(128, self.is_speculative)

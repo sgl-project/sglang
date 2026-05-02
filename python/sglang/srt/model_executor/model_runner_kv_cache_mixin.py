@@ -18,7 +18,11 @@ from sglang.srt.mem_cache.allocator import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
-from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.hisparse_memory_pool import (
+    DeepSeekV4HiSparseTokenToKVPoolAllocator,
+    HiSparseNSATokenToKVPool,
+    HiSparseTokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
@@ -450,7 +454,17 @@ class ModelRunnerKVCacheMixin:
                     end_layer=self.end_layer,
                 )
         elif self.use_mla_backend and is_nsa_model:
-            self.token_to_kv_pool = NSATokenToKVPool(
+            PoolCls = (
+                HiSparseNSATokenToKVPool if self.enable_hisparse else NSATokenToKVPool
+            )
+            pool_kwargs = {}
+            if self.enable_hisparse:
+                from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+                pool_kwargs["host_to_device_ratio"] = parse_hisparse_config(
+                    self.server_args
+                ).host_to_device_ratio
+            self.token_to_kv_pool = PoolCls(
                 self.max_total_num_tokens,
                 page_size=self.page_size,
                 dtype=self.kv_cache_dtype,
@@ -463,6 +477,7 @@ class ModelRunnerKVCacheMixin:
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
                 index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                **pool_kwargs,
             )
         elif self.use_mla_backend and not self.mambaish_config:
             assert not is_nsa_model
@@ -683,15 +698,25 @@ class ModelRunnerKVCacheMixin:
                             need_sort=need_sort,
                         )
 
+            if self.enable_hisparse and is_v4_model:
+                assert self.is_hybrid_swa, "DeepSeek V4 HiSparse requires SWA mode."
+                self.token_to_kv_pool_allocator = (
+                    DeepSeekV4HiSparseTokenToKVPoolAllocator(
+                        self.token_to_kv_pool_allocator
+                    )
+                )
+
         else:
             assert self.is_draft_worker
             if self.is_hybrid_swa:
-                assert (
-                    self.token_to_kv_pool_allocator.__class__
-                    == SWATokenToKVPoolAllocator
+                swa_allocator = getattr(
+                    self.token_to_kv_pool_allocator,
+                    "logical_attn_allocator",
+                    self.token_to_kv_pool_allocator,
                 )
+                assert swa_allocator.__class__ == SWATokenToKVPoolAllocator
                 self.token_to_kv_pool.full_to_swa_index_mapping = (
-                    self.token_to_kv_pool_allocator.full_to_swa_index_mapping
+                    swa_allocator.full_to_swa_index_mapping
                 )
 
     def _apply_token_constraints(self: ModelRunner, token_capacity: int) -> int:
