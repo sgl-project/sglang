@@ -15,9 +15,19 @@ from sglang.srt.function_call.core_types import (
 
 
 class _ParseState(Enum):
-    """5 FSM states for the streaming parser. READING_VALUE is reachable only
-    from READING_KEY, so the "stray <arg_value> before <tool_call>" bug class
-    is structurally impossible."""
+    """5 FSM states for the streaming parser.
+
+    Entry guard: READING_VALUE is reachable only from READING_KEY, so the
+    "stray <arg_value> before <tool_call>" bug class is structurally
+    impossible.
+
+    Exit guard: both READING_KEY and READING_VALUE recover on `</tool_call>`
+    by closing the active call (orphan key dropped if any). READING_VALUE
+    additionally recovers on `<arg_key>` by replacing the orphan pending key
+    with the new one. Both guards match the (regex-tightened) non-streaming
+    path. Without them, malformed inputs would leave the FSM stuck in
+    READING_VALUE and mis-attribute subsequent values to stale state.
+    """
 
     OUTSIDE = auto()
     READING_NAME = auto()
@@ -52,8 +62,16 @@ class PoolsideV1Detector(BaseFormatDetector):
     arg_value_end = "</arg_value>"
 
     tool_call_regex = re.compile(r"<tool_call>(.*?)</tool_call>", re.DOTALL)
+    # Key uses [^<]*? to prevent the non-greedy `.*?` from backtracking
+    # across an `</arg_key>` boundary on malformed inputs like
+    # `<arg_key>K1</arg_key><arg_key>K2</arg_key><arg_value>V</arg_value>`
+    # — without the `[^<]` constraint, the regex matches the entire orphan
+    # span as a single key (`K1</arg_key><arg_key>K2`). Param names never
+    # contain `<` in practice, so this is safe. The value side keeps `.*?`
+    # because legitimate values can contain `<` (HTML, paths, etc.); the
+    # `</arg_value>` boundary is anchored enough.
     arg_pair_regex = re.compile(
-        r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
+        r"<arg_key>([^<]*?)</arg_key>\s*<arg_value>(.*?)</arg_value>",
         re.DOTALL,
     )
 
@@ -90,7 +108,9 @@ class PoolsideV1Detector(BaseFormatDetector):
     def _consume_arg_key(self, slice_: str) -> bool:
         """Consume `<arg_key>K</arg_key>`, set `current_pending_key` to K.
         Returns True if consumed, False if `</arg_key>` hasn't arrived yet
-        (caller should break to wait for more bytes)."""
+        (caller should break to wait for more bytes). Shared by READING_KEY
+        (well-formed: transitions to READING_VALUE) and READING_VALUE
+        (orphan-key-replace: stays in READING_VALUE)."""
         end = slice_.find(self.arg_key_end)
         if end == -1:
             return False
@@ -101,7 +121,11 @@ class PoolsideV1Detector(BaseFormatDetector):
     def _close_current_call(self, calls: List[ToolCallItem]) -> None:
         """Emit the closing `}` (or `{}` for zero-arg) for the active call,
         advance past `</tool_call>`, return to OUTSIDE, and reset per-call
-        state."""
+        state. Called from both READING_KEY (the well-formed close path) and
+        READING_VALUE (malformed close: `<arg_key>...</arg_key></tool_call>`
+        with no value — orphan key is discarded, matching the regex
+        non-streaming path which drops unmatched <arg_key>...</arg_key>
+        pairs)."""
         fragment = "}" if self.json_started else "{}"
         calls.append(
             ToolCallItem(
@@ -342,6 +366,27 @@ class PoolsideV1Detector(BaseFormatDetector):
                 continue
 
             if state is _ParseState.READING_VALUE:
+                # Recover from a malformed `<arg_key>K</arg_key></tool_call>`
+                # (no <arg_value>) by closing the call here. Without this
+                # branch the FSM would stay stuck in READING_VALUE and
+                # mis-attribute the next call's <arg_value> to the orphan
+                # `current_pending_key`, silently swallowing the next call's
+                # name. Matches the regex non-streaming path, which drops
+                # unmatched <arg_key>...</arg_key> pairs.
+                if slice_.startswith(self.tool_call_end_token):
+                    self._close_current_call(calls)
+                    continue
+                # Recover from a malformed `<arg_key>K1</arg_key><arg_key>K2`
+                # (no value for K1, model went straight to a new key) by
+                # replacing the orphan pending_key with the new one. Stays
+                # in READING_VALUE so the next <arg_value> binds to K2.
+                # Without this branch the FSM treats the second <arg_key>
+                # as bare-`<` garbage and the next <arg_value> binds to
+                # the stale K1 — wrong-argument corruption.
+                if slice_.startswith(self.arg_key_start):
+                    if not self._consume_arg_key(slice_):
+                        break  # incomplete <arg_key>
+                    continue  # stay in READING_VALUE: orphan replaced
                 if slice_.startswith(self.arg_value_start):
                     end = slice_.find(self.arg_value_end)
                     if end == -1:

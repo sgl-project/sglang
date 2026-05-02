@@ -151,10 +151,12 @@ class TestPoolsideV1Detector(CustomTestCase):
 
     def test_truncated_pre_value_emits_no_calls(self):
         """Regression: max-tokens cutoff mid-`<arg_value>` must drop the
-        in-flight call. The closing-tag-anchored regex in detect_and_parse
-        naturally drops these; this test locks in that contract so a future
-        streaming-as-primitive refactor can't silently regress it."""
-        text = "<tool_call>get_weather\n<arg_key>location</arg_key>\n<arg_value>San Fr"
+        in-flight call, matching the old closing-tag-anchored regex behavior.
+        Without the truncated-call filter in detect_and_parse, streaming-as-
+        primitive surfaced a tool call with parameters="{}" on this input."""
+        text = (
+            "<tool_call>get_weather\n<arg_key>location</arg_key>\n" "<arg_value>San Fr"
+        )
         result = self.detector.detect_and_parse(text, self.tools)
         self.assertEqual(
             len(result.calls), 0, "truncated mid-arg_value must yield 0 calls"
@@ -162,9 +164,8 @@ class TestPoolsideV1Detector(CustomTestCase):
 
     def test_truncated_post_value_emits_no_calls(self):
         """Regression: cutoff after `</arg_value>` but before `</tool_call>`
-        must drop the call. Without the closing-tag anchor, a partial
-        emission could surface non-JSON parameters
-        (`{"location": "SF"` with no closing brace)."""
+        used to surface a tool call with non-JSON parameters
+        ('{"location": "SF"' with no closing brace). The filter must drop it."""
         text = (
             "<tool_call>get_weather\n<arg_key>location</arg_key>\n"
             "<arg_value>SF</arg_value>\n"
@@ -176,45 +177,13 @@ class TestPoolsideV1Detector(CustomTestCase):
             "truncated after arg_value but before </tool_call> must yield 0 calls",
         )
 
-    def test_truncated_after_complete_call_keeps_complete(self):
-        """A complete tool_call followed by a truncated second one must keep
-        the complete one and drop only the truncated tail."""
-        text = (
-            "<tool_call>get_weather\n<arg_key>location</arg_key>\n"
-            "<arg_value>NYC</arg_value>\n</tool_call>\n"
-            "<tool_call>search\n<arg_key>q"
-        )
-        result = self.detector.detect_and_parse(text, self.tools)
-        self.assertEqual(len(result.calls), 1)
-        self.assertEqual(result.calls[0].name, "get_weather")
-        self.assertEqual(json.loads(result.calls[0].parameters), {"location": "NYC"})
-
-    def test_streaming_malformed_no_name_does_not_hang(self):
-        """Regression: malformed `<tool_call><arg_key>...` (no name, no \\n)
-        used to spin in branch 2 with consume=0. Must drain to </tool_call>."""
-        detector = PoolsideV1Detector()
-        wire = "<tool_call><arg_key>k</arg_key><arg_value>v</arg_value></tool_call>"
-        result = detector.parse_streaming_increment(wire, self.tools)
-        self.assertEqual(len(result.calls), 0)
-
-    def test_streaming_arg_tags_without_tool_call_wrapper(self):
-        """Regression: stray `<arg_key>...</arg_key><arg_value>...</arg_value>`
-        with no preceding `<tool_call>` used to crash with IndexError on
-        `streamed_args_for_tool[-1]` (masked by the old broad except). The
-        FSM's READING_VALUE state is unreachable from OUTSIDE, so this returns
-        0 calls without raising — and now that the broad except is gone, any
-        regression here would propagate as a real test failure."""
-        detector = PoolsideV1Detector()
-        wire = "<arg_key>k</arg_key><arg_value>v</arg_value>"
-        result = detector.parse_streaming_increment(wire, self.tools)
-        self.assertEqual(len(result.calls), 0)
-
     def test_set_literal_falls_back_to_raw_string(self):
         """Regression: ast.literal_eval('{1,2,3}') returns a set, which
         json.dumps cannot serialize. Without the round-trip guard in
         _convert_param_value, the parse_streaming_increment loop would
-        TypeError downstream (previously masked by the broad except). The
-        guard rejects sets and falls back to the raw string."""
+        TypeError downstream. The guard rejects sets and falls back to the
+        raw string (which then matches the underlying schema-string-typed
+        treatment)."""
         tools_with_obj = [
             Tool(
                 type="function",
@@ -239,6 +208,135 @@ class TestPoolsideV1Detector(CustomTestCase):
         # set literal couldn't round-trip, so it's preserved as the raw
         # string (the only sane fallback).
         self.assertEqual(args["options"], "{1, 2, 3}")
+
+    def test_truncated_after_complete_call_keeps_complete(self):
+        """A complete tool_call followed by a truncated second one must keep
+        the complete one and drop only the truncated tail — matching the old
+        regex behavior on the same input."""
+        text = (
+            "<tool_call>get_weather\n<arg_key>location</arg_key>\n"
+            "<arg_value>NYC</arg_value>\n</tool_call>\n"
+            "<tool_call>search\n<arg_key>q"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {"location": "NYC"})
+
+    def test_arg_key_without_value_emits_empty_call(self):
+        """Non-streaming: malformed `<arg_key>K</arg_key></tool_call>` (no
+        `<arg_value>`) yields a tool call with empty params — the orphan
+        `<arg_key>` is dropped because the regex looks for key/value pairs.
+        Locks in the contract the streaming FSM must match."""
+        text = "<tool_call>get_weather\n<arg_key>location</arg_key></tool_call>"
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        self.assertEqual(json.loads(result.calls[0].parameters), {})
+
+    def test_streaming_arg_key_without_value_closes_call(self):
+        """Regression: malformed `<arg_key>K</arg_key></tool_call>` (no
+        `<arg_value>`) used to leave the streaming FSM stuck in READING_VALUE
+        — the bare-`<` discard ate `</tool_call>` byte-by-byte instead of
+        recognizing it as a close. Worse: a *subsequent* tool call's
+        `<arg_value>` would mis-attribute its content to the orphan
+        `current_pending_key`, silently swallowing the second call's name.
+        Both calls must be emitted with the orphan key dropped."""
+        detector = PoolsideV1Detector()
+        wire = (
+            "<tool_call>get_weather\n<arg_key>location</arg_key></tool_call>"
+            "<tool_call>search\n<arg_key>query</arg_key>\n"
+            "<arg_value>tacos</arg_value>\n</tool_call>"
+        )
+        all_calls = []
+        for chunk in [wire[i : i + 8] for i in range(0, len(wire), 8)]:
+            r = detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(r.calls)
+        names = [c.name for c in all_calls if c.name]
+        self.assertEqual(
+            names,
+            ["get_weather", "search"],
+            "second call must not be swallowed when first is malformed",
+        )
+        per_tool: dict = {}
+        for c in all_calls:
+            if c.parameters:
+                per_tool.setdefault(c.tool_index, "")
+                per_tool[c.tool_index] += c.parameters
+        # Orphan `location` key dropped — first call has empty params.
+        self.assertEqual(json.loads(per_tool[0]), {})
+        # Second call's value must NOT leak into first call's stale key.
+        self.assertEqual(json.loads(per_tool[1]), {"query": "tacos"})
+
+    def test_orphan_key_followed_by_new_key_uses_new_key(self):
+        """Non-streaming: malformed `<arg_key>K1</arg_key><arg_key>K2</arg_key>
+        <arg_value>V</arg_value>` (model emitted a key, then re-emitted a new
+        key without a value for the first) yields `{K2: V}` — the orphan K1
+        is dropped. Without the `[^<]` constraint in arg_pair_regex, the
+        non-greedy `.*?` backtracks across the `</arg_key>` boundary and
+        produces a junk key spanning both <arg_key> tags."""
+        text = (
+            "<tool_call>get_weather\n"
+            "<arg_key>location</arg_key>"
+            "<arg_key>count</arg_key><arg_value>3</arg_value>"
+            "\n</tool_call>"
+        )
+        result = self.detector.detect_and_parse(text, self.tools)
+        self.assertEqual(len(result.calls), 1)
+        self.assertEqual(result.calls[0].name, "get_weather")
+        args = json.loads(result.calls[0].parameters)
+        self.assertEqual(
+            args,
+            {"count": 3},
+            f"orphan key 'location' should be dropped, count=3 should win, got {args}",
+        )
+
+    def test_streaming_orphan_key_followed_by_new_key_uses_new_key(self):
+        """Regression: streaming on `<arg_key>K1</arg_key><arg_key>K2</arg_key>
+        <arg_value>V</arg_value>` used to mis-attribute V to K1 — the bare-`<`
+        discard ate the second `<arg_key>` as garbage and the value bound to
+        the stale `current_pending_key`. With the orphan-key-replace branch
+        in READING_VALUE, the new key wins and streaming matches the
+        non-streaming regex path."""
+        detector = PoolsideV1Detector()
+        wire = (
+            "<tool_call>get_weather\n"
+            "<arg_key>location</arg_key>"
+            "<arg_key>count</arg_key><arg_value>3</arg_value>"
+            "\n</tool_call>"
+        )
+        all_calls = []
+        for chunk in [wire[i : i + 8] for i in range(0, len(wire), 8)]:
+            r = detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(r.calls)
+        names = [c.name for c in all_calls if c.name]
+        self.assertEqual(names, ["get_weather"])
+        params = "".join(c.parameters for c in all_calls if c.parameters)
+        self.assertEqual(
+            json.loads(params),
+            {"count": 3},
+            "orphan key 'location' should be dropped; count=3 must win",
+        )
+
+    def test_streaming_malformed_no_name_does_not_hang(self):
+        """Regression: malformed `<tool_call><arg_key>...` (no name, no \\n)
+        used to spin in branch 2 with consume=0. Must drain to </tool_call>."""
+        detector = PoolsideV1Detector()
+        wire = "<tool_call><arg_key>k</arg_key><arg_value>v</arg_value></tool_call>"
+        result = detector.parse_streaming_increment(wire, self.tools)
+        self.assertEqual(len(result.calls), 0)
+
+    def test_streaming_arg_tags_without_tool_call_wrapper(self):
+        """Regression: stray `<arg_key>...</arg_key><arg_value>...</arg_value>`
+        with no preceding `<tool_call>` used to crash with IndexError on
+        `streamed_args_for_tool[-1]` (masked by the old broad except). The
+        FSM's READING_VALUE state is unreachable from OUTSIDE, so this returns
+        0 calls without raising — and now that the broad except is gone, any
+        regression here would propagate as a real test failure."""
+        detector = PoolsideV1Detector()
+        wire = "<arg_key>k</arg_key><arg_value>v</arg_value>"
+        result = detector.parse_streaming_increment(wire, self.tools)
+        self.assertEqual(len(result.calls), 0)
 
     # ==================== structure_info ====================
 
