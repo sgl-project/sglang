@@ -21,7 +21,9 @@ from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Tuple, Union
 
 import psutil
+import pybase64
 import setproctitle
+import torch
 import zmq
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
@@ -320,6 +322,25 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
 
         return output_strs
 
+    @staticmethod
+    def _b64_encode_per_request(
+        data_list: Optional[List[Optional[torch.Tensor]]],
+    ) -> Optional[List[Optional[str]]]:
+        """Encode a per-request list of tensors as base64 strings, off the
+        tokenizer hot path. Returns None when the input is None; per-item None
+        stays None.
+        """
+        if data_list is None:
+            return None
+        return [
+            (
+                pybase64.b64encode(item.numpy().tobytes()).decode("utf-8")
+                if item is not None
+                else None
+            )
+            for item in data_list
+        ]
+
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
         # If handling idle batch, set output_strs to [].
         output_strs = (
@@ -327,6 +348,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             if len(recv_obj.rids) > 0
             else []
         )
+        routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         return BatchStrOutput(
             rids=recv_obj.rids,
             http_worker_ipcs=recv_obj.http_worker_ipcs,
@@ -355,7 +377,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             output_token_ids_logprobs_idx=recv_obj.output_token_ids_logprobs_idx,
             output_token_entropy_val=recv_obj.output_token_entropy_val,
             output_hidden_states=recv_obj.output_hidden_states,
-            routed_experts=recv_obj.routed_experts,
+            routed_experts=routed_experts,
             customized_info=recv_obj.customized_info,
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,

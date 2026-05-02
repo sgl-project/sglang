@@ -773,6 +773,9 @@ class ServerArgs:
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
+    # For communications compression
+    enable_quant_communications: Optional[bool] = False
+
     # For msProbe
     msprobe_dump_config: Optional[str] = None
 
@@ -6654,6 +6657,13 @@ class ServerArgs:
             help="JSON-formatted forward hook specifications to attach to the model.",
         )
 
+        parser.add_argument(
+            "--enable-quant-communications",
+            action="store_true",
+            default=False,
+            help="Enable INT8 quantization of TP communications (limited support).",
+        )
+
         # For msProbe
         parser.add_argument(
             "--msprobe-dump-config",
@@ -6927,6 +6937,17 @@ class ServerArgs:
         if self.enable_two_batch_overlap and self.moe_a2a_backend == "none":
             raise ValueError(
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
+            )
+
+        # Check communications compression
+        if self.enable_quant_communications and self.tp_size == 1:
+            raise ValueError(
+                "Communications quantization is only used with tp_size != 1"
+            )
+
+        if self.enable_quant_communications and self.device != "npu":
+            raise ValueError(
+                "Communications quantization is only supported for NPU device"
             )
 
         if (
