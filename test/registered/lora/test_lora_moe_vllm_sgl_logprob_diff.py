@@ -23,6 +23,7 @@ register_cuda_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMoELoraRegression(unittest.TestCase):
     def test_sglang_moe_parity_flashinfer(self):
         # flashinfer is CUDA-only.
