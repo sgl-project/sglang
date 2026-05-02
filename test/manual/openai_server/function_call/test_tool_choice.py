@@ -11,6 +11,7 @@ import json
 import unittest
 
 import openai
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -22,6 +23,7 @@ from sglang.test.test_utils import (
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestToolChoiceLlama32(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -763,6 +765,7 @@ class TestToolChoiceLlama32(CustomTestCase):
         self.assertIn("not supported", error_msg)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestToolChoiceQwen25(TestToolChoiceLlama32):
     """Test tool_choice functionality with Qwen2.5 model"""
 
@@ -788,6 +791,7 @@ class TestToolChoiceQwen25(TestToolChoiceLlama32):
         cls.tokenizer = get_tokenizer(cls.model)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestToolChoiceMistral(TestToolChoiceLlama32):
     """Test tool_choice functionality with Mistral model"""
 
@@ -861,6 +865,7 @@ class TestToolChoiceMistral(TestToolChoiceLlama32):
 #         cls.tokenizer = get_tokenizer(cls.model)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestToolChoiceLfm2(TestToolChoiceLlama32):
     """Test tool_choice functionality with LiquidAI LFM2 model"""
 
