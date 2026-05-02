@@ -25,6 +25,8 @@ os.environ.setdefault("FLASHINFER_WORKSPACE_BASE", "/tmp/relaykv_flashinfer_cach
 MODEL_ENV = "RELAYKV_OPTIONAL_SERVER_SMOKE_MODEL"
 RUN_ENV = "RELAYKV_OPTIONAL_SERVER_SMOKE_RUN"
 TIMEOUT_ENV = "RELAYKV_OPTIONAL_SERVER_SMOKE_TIMEOUT"
+GENERATE_TIMEOUT_ENV = "RELAYKV_OPTIONAL_SERVER_SMOKE_GENERATE_TIMEOUT"
+GENERATE_TIMEOUT_GRACE_ENV = "RELAYKV_OPTIONAL_SERVER_SMOKE_GENERATE_TIMEOUT_GRACE"
 OBSERVATION_ENV = "SGLANG_RELAYKV_RUNTIME_OBSERVATION"
 MIN_PORT = 1
 MAX_PORT = 65535
@@ -197,7 +199,43 @@ def _relaykv_observation_log_flags(stdout: str) -> dict[str, bool]:
     }
 
 
-def _run_server_case(model_path: str, observation_value: str, timeout: float) -> dict[str, Any]:
+def _server_log_flags(stdout: str) -> dict[str, bool]:
+    return {
+        "generate_200_logged": (
+            '/generate HTTP/1.1" 200 OK' in stdout
+            or "POST /generate" in stdout
+            and " 200 OK" in stdout
+        ),
+    }
+
+
+def _validate_relaykv_observation_flags(
+    *,
+    observation_value: str,
+    relaykv_log_flags: dict[str, bool],
+) -> None:
+    if observation_value == "0":
+        if relaykv_log_flags["relaykv_observation_logged"]:
+            raise RuntimeError("RelayKV observation log was emitted while env was off")
+        return
+
+    if not relaykv_log_flags["relaykv_observation_logged"]:
+        raise RuntimeError("RelayKV observation hook log was not detected while env was on")
+    if not relaykv_log_flags["relaykv_existing_metadata_summary_logged"]:
+        raise RuntimeError("RelayKV existing metadata summary log was not detected")
+    if not relaykv_log_flags["relaykv_cpu_tensor_value_source_logged"]:
+        raise RuntimeError("RelayKV CPU tensor observation source log was not detected")
+    if not relaykv_log_flags["relaykv_req_pool_idx_none_logged"]:
+        raise RuntimeError("RelayKV req_pool_idx None observation log was not detected")
+
+
+def _run_server_case(
+    model_path: str,
+    observation_value: str,
+    timeout: float,
+    generate_timeout: float,
+    generate_timeout_grace: float,
+) -> dict[str, Any]:
     port_info = _reserve_port_selection_for_server()
     port = port_info["server_port"]
     base_url = f"http://127.0.0.1:{port}"
@@ -246,26 +284,63 @@ def _run_server_case(model_path: str, observation_value: str, timeout: float) ->
             "text": "RelayKV observation smoke.",
             "sampling_params": {"max_new_tokens": 1, "temperature": 0},
         }
-        status, response = _request_json(f"{base_url}/generate", payload, timeout=30)
-        if status != 200:
-            raise RuntimeError(f"/generate returned HTTP {status}")
+        generate_timeout_seen = False
+        timeout_classification = ""
+        response = None
+        status = 0
+        try:
+            status, response = _request_json(
+                f"{base_url}/generate",
+                payload,
+                timeout=generate_timeout,
+            )
+        except TimeoutError:
+            generate_timeout_seen = True
+            timeout_classification = "generate_request_timeout"
+            if generate_timeout_grace > 0:
+                time.sleep(generate_timeout_grace)
+        except urllib.error.URLError as exc:
+            if isinstance(exc.reason, TimeoutError):
+                generate_timeout_seen = True
+                timeout_classification = "generate_request_timeout"
+                if generate_timeout_grace > 0:
+                    time.sleep(generate_timeout_grace)
+            else:
+                raise
         stdout = _terminate_process(proc)
         relaykv_log_flags = _relaykv_observation_log_flags(stdout)
-        if observation_value == "0" and relaykv_log_flags["relaykv_observation_logged"]:
-            raise RuntimeError("RelayKV observation log was emitted while env was off")
-        if observation_value == "1" and not relaykv_log_flags["relaykv_observation_logged"]:
-            raise RuntimeError("RelayKV observation hook log was not detected while env was on")
+        server_log_flags = _server_log_flags(stdout)
+        if generate_timeout_seen and server_log_flags["generate_200_logged"]:
+            status = 200
+            timeout_classification = "generate_timeout_but_200_logged"
+        if status != 200:
+            raise RuntimeError(f"/generate returned HTTP {status}")
+        _validate_relaykv_observation_flags(
+            observation_value=observation_value,
+            relaykv_log_flags=relaykv_log_flags,
+        )
         return {
             "observation_env": observation_value,
             "forward_completed": True,
             "http_status": status,
             "has_response": response is not None,
+            "generate_timeout": generate_timeout_seen,
+            "timeout_classification": timeout_classification,
             "ports": port_info,
             **relaykv_log_flags,
+            **server_log_flags,
             "log_tail": _tail(stdout, max_lines=80),
         }
     except Exception as exc:
         stdout = _terminate_process(proc)
+        relaykv_log_flags = _relaykv_observation_log_flags(stdout)
+        server_log_flags = _server_log_flags(stdout)
+        generate_timeout_seen = isinstance(exc, TimeoutError)
+        timeout_classification = "case_failed"
+        if generate_timeout_seen and server_log_flags["generate_200_logged"]:
+            timeout_classification = "generate_timeout_but_200_logged_case_failed"
+        elif generate_timeout_seen:
+            timeout_classification = "generate_request_timeout"
         return {
             "observation_env": observation_value,
             "case_failed": True,
@@ -273,7 +348,10 @@ def _run_server_case(model_path: str, observation_value: str, timeout: float) ->
                 f"server observation case failed for "
                 f"{OBSERVATION_ENV}={observation_value}: {exc}"
             ),
-            **_relaykv_observation_log_flags(stdout),
+            "generate_timeout": generate_timeout_seen,
+            "timeout_classification": timeout_classification,
+            **relaykv_log_flags,
+            **server_log_flags,
             "log_tail": _tail(stdout, max_lines=80),
         }
 
@@ -307,6 +385,8 @@ def main() -> int:
         )
 
     timeout = float(os.environ.get(TIMEOUT_ENV, "90"))
+    generate_timeout = float(os.environ.get(GENERATE_TIMEOUT_ENV, "120"))
+    generate_timeout_grace = float(os.environ.get(GENERATE_TIMEOUT_GRACE_ENV, "20"))
     cases = []
     for observation_value in ("0", "1"):
         cases.append(
@@ -314,6 +394,8 @@ def main() -> int:
                 str(model_path_obj),
                 observation_value=observation_value,
                 timeout=timeout,
+                generate_timeout=generate_timeout,
+                generate_timeout_grace=generate_timeout_grace,
             )
         )
     result = {
@@ -322,6 +404,11 @@ def main() -> int:
         "offline_env": {
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
+        },
+        "timeouts": {
+            "server_health_timeout": timeout,
+            "generate_timeout": generate_timeout,
+            "generate_timeout_grace": generate_timeout_grace,
         },
         "cases": cases,
     }
