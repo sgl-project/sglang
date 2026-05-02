@@ -3,6 +3,7 @@ import shutil
 import unittest
 from types import SimpleNamespace
 
+import torch
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
@@ -23,6 +24,7 @@ register_cuda_ci(
 )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationDecodeOffload(PDDisaggregationServerBase):
     """Decode-side KV cache offloading in a PD disaggregation setup."""
 

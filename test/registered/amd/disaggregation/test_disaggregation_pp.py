@@ -1,3 +1,4 @@
+import torch
 import os
 import time
 import unittest
@@ -38,6 +39,7 @@ def tearDownModule():
 MAX_REQUEST_ERRORS = 5
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -132,6 +134,7 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
 
 
 # register_amd_ci(est_time=200, suite="base-c-test-large-8-gpu-amd")
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -227,6 +230,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
 
 
 # register_amd_ci(est_time=200, suite="base-c-test-large-8-gpu-amd")
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
