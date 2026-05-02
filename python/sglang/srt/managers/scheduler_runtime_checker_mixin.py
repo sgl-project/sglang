@@ -173,11 +173,12 @@ class SchedulerRuntimeCheckerMixin:
         if self.is_hybrid_swa:
             pool_stats = self._get_swa_token_info()
         elif self.is_hybrid_ssm:
-            return self._get_mamba_token_info()
-        elif self.enable_hisparse:
-            return self._get_hisparse_token_info()
+            pool_stats = self._get_mamba_token_info()
         else:
-            return self._get_token_info()
+            pool_stats = self._get_token_info()
+
+        if self.enable_hisparse:
+            pool_stats = self._get_hisparse_token_info(pool_stats)
 
         # swa + ssm can coexist: overlay mamba fields onto swa stats
         if self.is_hybrid_ssm:
@@ -202,8 +203,7 @@ class SchedulerRuntimeCheckerMixin:
             full_evictable_size=evictable_size,
         )
 
-    def _get_hisparse_token_info(self: Scheduler) -> PoolStats:
-        pool_stats = self._get_token_info()
+    def _get_hisparse_token_info(self: Scheduler, pool_stats: PoolStats) -> PoolStats:
         if self.enable_hisparse and self.hisparse_coordinator is not None:
             h = self.hisparse_coordinator.get_token_stats()
             return dataclasses.replace(

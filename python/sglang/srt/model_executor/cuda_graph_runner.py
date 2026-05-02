@@ -1106,12 +1106,6 @@ class CudaGraphRunner:
 
         self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
 
-        if (
-            getattr(self.model_runner, "hisparse_coordinator", None) is not None
-            and self.capture_forward_mode.is_decode()
-        ):
-            forward_batch.hisparse_coordinator = self.model_runner.hisparse_coordinator
-
         if lora_ids is not None:
             self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
 
