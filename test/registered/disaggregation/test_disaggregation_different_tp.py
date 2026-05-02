@@ -2,6 +2,8 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
@@ -20,6 +22,7 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=1171, stage="base-c", runner_config="8-gpu-h20")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -99,6 +102,7 @@ class TestDisaggregationMooncakePrefillLargerTP(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.60)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -178,6 +182,7 @@ class TestDisaggregationMooncakeDecodeLargerTP(PDDisaggregationServerBase):
         self.assertGreater(metrics["score"], 0.60)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationMooncakeMHAPrefillLargerTP(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -265,6 +270,7 @@ STAGING_ENV = {
 }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationStagingDecodeLargerTP(PDDisaggregationServerBase):
     """Prefill TP=2 -> Decode TP=4 with staging buffer enabled (MHA model)."""
 
