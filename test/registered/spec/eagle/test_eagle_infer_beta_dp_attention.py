@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -42,6 +43,7 @@ def test_gsm8k(base_url: str, model: str):
     return metrics, avg_spec_accept_length
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestEagleDPAttnServerSmall(CustomTestCase):
     @classmethod
     def setUpClass(cls):

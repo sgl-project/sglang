@@ -2,6 +2,8 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -17,6 +19,7 @@ QWEN3_8B_MODEL_PATH = "Qwen/Qwen3-8B"
 register_cuda_ci(est_time=300, stage="base-c", runner_config="4-gpu-gb300")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDisaggregationMooncakeAARCH64Accuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
