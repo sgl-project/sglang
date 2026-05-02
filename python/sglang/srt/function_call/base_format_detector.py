@@ -376,7 +376,7 @@ class BaseFormatDetector(ABC):
         self,
         tools: Union[List[Tool], None] = None,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]] = "auto",
-        thinking_mode: bool = True,
+        thinking_mode: bool = False,
     ) -> Optional[StructuralTag]:
         """
         Return a model-native XGrammar structural tag when supported.
@@ -384,7 +384,11 @@ class BaseFormatDetector(ABC):
         Args:
             tools: List of available tools
             tool_choice: The tool choice setting from the request
-            thinking_mode: Whether thinking mode is enabled
+            thinking_mode: Whether to include the model's reasoning prefix in
+                the returned structural tag. Pass False when SGLang's
+                ReasonerGrammarBackend will own the <think>...</think> prefix
+                (the typical case when --reasoning-parser is configured) so
+                only one layer constrains the reasoning section.
 
         Returns:
             StructuralTag if this detector supports model-native tags, otherwise None

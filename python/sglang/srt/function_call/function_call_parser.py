@@ -208,7 +208,7 @@ class FunctionCallParser:
         self,
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
         parallel_tool_calls: bool = True,
-        thinking_mode: bool = True,
+        thinking_mode: bool = False,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.

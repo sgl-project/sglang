@@ -40,37 +40,14 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
         grammar.rollback.return_value = None
         return grammar, accept_calls, fill_calls
 
-    def test_linear_chain_passes_ints(self):
-        # 3-node linear chain: 0 -> 1 -> 2
-        retrieve_next_token = torch.tensor([1, 2, -1], dtype=torch.int32)
-        retrieve_next_sibling = torch.tensor([-1, -1, -1], dtype=torch.int32)
-        draft_tokens = torch.tensor([10, 20, 30], dtype=torch.int64)
-        # all bits set: every draft token passes the parent's bitmask check
-        bitmask = torch.full((3, 4), -1, dtype=torch.int32)
-
-        grammar, accept_calls, fill_calls = self._record_grammar()
-        traverse_tree(
-            retrieve_next_token,
-            retrieve_next_sibling,
-            draft_tokens,
-            grammar,
-            bitmask,
-        )
-
-        self.assertEqual(accept_calls, [20, 30])
-        self.assertEqual(fill_calls, [0, 1, 2])
-        for token in accept_calls:
-            self.assertIsInstance(token, int)
-        for idx in fill_calls:
-            self.assertIsInstance(idx, int)
-
     def test_branching_tree_passes_ints(self):
-        # Binary tree:
+        # Binary tree exercises both child recursion and sibling recursion:
         #   0 ─┬─ 1
         #      └─ 2 ─── 3
         retrieve_next_token = torch.tensor([1, -1, 3, -1], dtype=torch.int32)
         retrieve_next_sibling = torch.tensor([-1, 2, -1, -1], dtype=torch.int32)
         draft_tokens = torch.tensor([100, 11, 22, 33], dtype=torch.int64)
+        # all bits set: every draft token passes the parent's bitmask check
         bitmask = torch.full((4, 4), -1, dtype=torch.int32)
 
         grammar, accept_calls, fill_calls = self._record_grammar()

@@ -4746,6 +4746,19 @@ class TestGetStructureConstraint(unittest.TestCase):
         self.assertIn("properties", schema)
         self.assertIn("city", schema["properties"])
 
+    # --- reasoning-prefix ownership ---
+
+    def test_kimi_structural_tag_defaults_to_post_reasoning_suffix(self):
+        parser = self._make_parser("kimi_k2", strict=True)
+
+        default_result = parser.get_structure_constraint("required")
+        explicit_true = parser.get_structure_constraint("required", thinking_mode=True)
+
+        default_serialized = default_result[1].model_dump_json()
+        self.assertNotIn("</think>", default_serialized)
+        self.assertIn("<|tool_call_begin|>functions.get_weather:", default_serialized)
+        self.assertIn("</think>", explicit_true[1].model_dump_json())
+
 
 class TestQwen25Detector(unittest.TestCase):
     """Test Qwen25Detector streaming and non-streaming multi-tool-call parsing."""
