@@ -74,13 +74,17 @@ class RouterArgs:
     request_timeout_secs: int = 1800
     # Grace period in seconds to wait for in-flight requests during shutdown
     shutdown_grace_period_secs: int = 180
-    # Max concurrent requests for rate limiting (-1 to disable)
+    # Max concurrent requests (-1 to disable). When rate_limit_tokens_per_second is not set,
+    # this acts as a pure concurrency limiter (semaphore): tokens are only returned when
+    # requests complete, strictly limiting in-flight requests to this value.
     max_concurrent_requests: int = -1
     # Queue size for pending requests when max concurrent limit reached
     queue_size: int = 100
     # Maximum time (in seconds) a request can wait in queue before timing out
     queue_timeout_secs: int = 60
-    # Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests
+    # Token bucket refill rate (tokens per second). When not set, pure concurrency limiting
+    # is used (tokens only returned when requests complete). Set this to enable rate limiting
+    # with automatic token refill, where max_concurrent_requests becomes the burst capacity.
     rate_limit_tokens_per_second: Optional[int] = None
     # CORS allowed origins
     cors_allowed_origins: List[str] = dataclasses.field(default_factory=list)
@@ -519,7 +523,7 @@ class RouterArgs:
             f"--{prefix}max-concurrent-requests",
             type=int,
             default=RouterArgs.max_concurrent_requests,
-            help="Maximum number of concurrent requests allowed (for rate limiting). Set to -1 to disable rate limiting.",
+            help="Maximum number of concurrent in-flight requests allowed. When rate-limit-tokens-per-second is not set, acts as a strict concurrency limiter (semaphore). Set to -1 to disable.",
         )
         rate_limit_group.add_argument(
             f"--{prefix}queue-size",
@@ -537,7 +541,7 @@ class RouterArgs:
             f"--{prefix}rate-limit-tokens-per-second",
             type=int,
             default=RouterArgs.rate_limit_tokens_per_second,
-            help="Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests",
+            help="Token bucket refill rate (tokens per second). When not set, pure concurrency limiting is used. Set to enable rate limiting with max-concurrent-requests as burst capacity.",
         )
 
         # Retry configuration

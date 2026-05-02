@@ -940,12 +940,12 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
     }
 
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
-        app_context.rate_limiter.clone(),
+        app_context.concurrency_limiter.clone(),
         config.router_config.queue_size,
         Duration::from_secs(config.router_config.queue_timeout_secs),
     );
 
-    if app_context.rate_limiter.is_none() {
+    if app_context.concurrency_limiter.is_none() && app_context.rate_limiter.is_none() {
         info!("Rate limiting is disabled (max_concurrent_requests = -1)");
     }
 

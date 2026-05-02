@@ -32,7 +32,7 @@ mod circuit_breaker_tests {
 
         let ctx = AppTestContext::new_with_config(
             config,
-            vec![TestWorkerConfig::flaky(19100, 1.0)], // Always fail
+            vec![TestWorkerConfig::flaky(9100, 1.0)], // Always fail
         )
         .await;
 
@@ -92,7 +92,7 @@ mod circuit_breaker_tests {
 
         let ctx = AppTestContext::new_with_config(
             config,
-            vec![TestWorkerConfig::flaky(19101, 1.0)], // Always fail
+            vec![TestWorkerConfig::flaky(9101, 1.0)], // Always fail
         )
         .await;
 
@@ -139,8 +139,8 @@ mod circuit_breaker_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::flaky(19102, 1.0), // Always fail
-                TestWorkerConfig::healthy(19103),    // Always succeed
+                TestWorkerConfig::flaky(9102, 1.0), // Always fail
+                TestWorkerConfig::healthy(9103),    // Always succeed
             ],
         )
         .await;
@@ -210,8 +210,8 @@ mod circuit_breaker_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::flaky(19104, 1.0), // Always fail
-                TestWorkerConfig::healthy(19105),    // Always succeed
+                TestWorkerConfig::flaky(9104, 1.0), // Always fail
+                TestWorkerConfig::healthy(9105),    // Always succeed
             ],
         )
         .await;

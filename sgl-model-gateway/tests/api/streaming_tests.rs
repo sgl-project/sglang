@@ -12,7 +12,7 @@ mod tests {
     #[tokio::test]
     async fn test_generate_streaming() {
         let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
-            port: 20001,
+            port: 7001,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 10,
@@ -42,7 +42,7 @@ mod tests {
     #[tokio::test]
     async fn test_v1_chat_completions_streaming() {
         let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
-            port: 20002,
+            port: 7002,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 10,
@@ -86,7 +86,7 @@ mod tests {
     #[tokio::test]
     async fn test_v1_completions_streaming() {
         let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
-            port: 20003,
+            port: 7003,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 10,
@@ -113,7 +113,7 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_with_error() {
         let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
-            port: 20004,
+            port: 7004,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 0,
@@ -135,7 +135,7 @@ mod tests {
     #[tokio::test]
     async fn test_streaming_timeouts() {
         let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
-            port: 20005,
+            port: 7005,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 100,
@@ -166,7 +166,7 @@ mod tests {
     #[tokio::test]
     async fn test_batch_streaming() {
         let ctx = WorkerTestContext::new(vec![MockWorkerConfig {
-            port: 20006,
+            port: 7006,
             worker_type: WorkerType::Regular,
             health_status: HealthStatus::Healthy,
             response_delay_ms: 10,

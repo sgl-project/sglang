@@ -22,7 +22,7 @@ mod round_robin_tests {
     async fn test_round_robin_distribution() {
         let config = TestRouterConfig::round_robin(3100);
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19001, 3))
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(9001, 3))
                 .await;
 
         let app = ctx.create_app().await;
@@ -72,8 +72,8 @@ mod round_robin_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::flaky(19004, 1.0), // Always fail
-                TestWorkerConfig::healthy(19005),    // Always succeed
+                TestWorkerConfig::flaky(9004, 1.0), // Always fail
+                TestWorkerConfig::healthy(9005),    // Always succeed
             ],
         )
         .await;
@@ -114,7 +114,7 @@ mod random_tests {
     async fn test_random_distribution() {
         let config = TestRouterConfig::random(3102);
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19010, 2))
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(9010, 2))
                 .await;
 
         let app = ctx.create_app().await;
@@ -159,7 +159,7 @@ mod cache_aware_tests {
     async fn test_cache_aware_consistent_routing() {
         let config = TestRouterConfig::cache_aware(3103);
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19020, 2))
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(9020, 2))
                 .await;
 
         let app = ctx.create_app().await;
@@ -203,7 +203,7 @@ mod cache_aware_tests {
     async fn test_cache_aware_different_prompts() {
         let config = TestRouterConfig::cache_aware(3104);
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19022, 2))
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(9022, 2))
                 .await;
 
         let app = ctx.create_app().await;
@@ -266,8 +266,8 @@ mod worker_health_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::flaky(19030, 1.0), // Always fails
-                TestWorkerConfig::healthy(19031),    // Always succeeds
+                TestWorkerConfig::flaky(9030, 1.0), // Always fails
+                TestWorkerConfig::healthy(9031),    // Always succeeds
             ],
         )
         .await;
@@ -338,7 +338,7 @@ mod worker_response_delay_tests {
         let config = TestRouterConfig::random(3106);
         let ctx = AppTestContext::new_with_config(
             config,
-            vec![TestWorkerConfig::slow(19040, 100)], // 100ms delay
+            vec![TestWorkerConfig::slow(9040, 100)], // 100ms delay
         )
         .await;
 

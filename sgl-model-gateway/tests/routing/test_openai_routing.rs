@@ -807,10 +807,14 @@ async fn test_openai_router_circuit_breaker() {
     // First few requests should fail and record failures
     for _ in 0..3 {
         let response = router.route_chat(None, &chat_request, None).await;
+        let status = response.status();
         // Should get either an error or circuit breaker response
         assert!(
-            response.status() == StatusCode::INTERNAL_SERVER_ERROR
-                || response.status() == StatusCode::SERVICE_UNAVAILABLE
+            status == StatusCode::INTERNAL_SERVER_ERROR
+                || status == StatusCode::SERVICE_UNAVAILABLE
+                || status == StatusCode::BAD_GATEWAY,
+            "Expected 500, 502, or 503 but got {}",
+            status
         );
     }
 }

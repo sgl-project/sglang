@@ -17,7 +17,7 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn test_multiple_concurrent_requests_tracking() {
     let ctx = AppTestContext::new(vec![MockWorkerConfig {
-        port: 19002,
+        port: 9002,
         worker_type: WorkerType::Regular,
         health_status: HealthStatus::Healthy,
         response_delay_ms: 50,
@@ -60,7 +60,7 @@ async fn test_multiple_concurrent_requests_tracking() {
 #[tokio::test]
 async fn test_inflight_request_appears_in_bucket() {
     let ctx = AppTestContext::new(vec![MockWorkerConfig {
-        port: 19004,
+        port: 9004,
         worker_type: WorkerType::Regular,
         health_status: HealthStatus::Healthy,
         response_delay_ms: 2000,
@@ -114,7 +114,7 @@ async fn test_inflight_request_appears_in_bucket() {
 #[tokio::test]
 async fn test_failed_request_still_deregisters() {
     let ctx = AppTestContext::new(vec![MockWorkerConfig {
-        port: 19003,
+        port: 9003,
         worker_type: WorkerType::Regular,
         health_status: HealthStatus::Healthy,
         response_delay_ms: 0,

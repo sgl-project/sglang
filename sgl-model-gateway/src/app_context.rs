@@ -40,6 +40,7 @@ impl std::error::Error for AppContextBuildError {}
 pub struct AppContext {
     pub client: Client,
     pub router_config: RouterConfig,
+    pub concurrency_limiter: Option<Arc<TokenBucket>>,
     pub rate_limiter: Option<Arc<TokenBucket>>,
     pub tokenizer_registry: Arc<TokenizerRegistry>,
     pub reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -72,6 +73,7 @@ impl std::fmt::Debug for AppContext {
 pub struct AppContextBuilder {
     client: Option<Client>,
     router_config: Option<RouterConfig>,
+    concurrency_limiter: Option<Arc<TokenBucket>>,
     rate_limiter: Option<Arc<TokenBucket>>,
     tokenizer_registry: Option<Arc<TokenizerRegistry>>,
     reasoning_parser_factory: Option<ReasoningParserFactory>,
@@ -112,6 +114,7 @@ impl AppContextBuilder {
         Self {
             client: None,
             router_config: None,
+            concurrency_limiter: None,
             rate_limiter: None,
             tokenizer_registry: None,
             reasoning_parser_factory: None,
@@ -137,6 +140,11 @@ impl AppContextBuilder {
 
     pub fn router_config(mut self, router_config: RouterConfig) -> Self {
         self.router_config = Some(router_config);
+        self
+    }
+
+    pub fn concurrency_limiter(mut self, limiter: Option<Arc<TokenBucket>>) -> Self {
+        self.concurrency_limiter = limiter;
         self
     }
 
@@ -248,6 +256,7 @@ impl AppContextBuilder {
         Ok(AppContext {
             client: self.client.ok_or(AppContextBuildError("client"))?,
             router_config,
+            concurrency_limiter: self.concurrency_limiter,
             rate_limiter: self.rate_limiter,
             tokenizer_registry: self
                 .tokenizer_registry
@@ -371,21 +380,35 @@ impl AppContextBuilder {
         Ok(self)
     }
 
-    /// Create rate limiter based on config
+    /// Create rate limiter and concurrency limiter based on config.
+    ///
+    /// Two independent mechanisms:
+    /// - **Concurrency limiter** (`refill_rate=0`, semaphore): tokens returned only when
+    ///   requests complete. Created when `max_concurrent_requests > 0`.
+    /// - **Rate limiter** (`refill_rate>0`, token bucket): tokens auto-refill over time,
+    ///   NOT returned on request completion. Created only when
+    ///   `rate_limit_tokens_per_second` is explicitly set.
+    ///
+    /// Both are enforced independently in middleware: rate limiter checked first (hard
+    /// reject), then concurrency limiter (with queue fallback).
     fn maybe_rate_limiter(mut self, config: &RouterConfig) -> Self {
-        self.rate_limiter = match config.max_concurrent_requests {
+        // Concurrency limiter: pure semaphore (refill_rate=0)
+        self.concurrency_limiter = match config.max_concurrent_requests {
             n if n <= 0 => None,
-            n => {
-                let rate_limit_tokens = config
-                    .rate_limit_tokens_per_second
-                    .filter(|&t| t > 0)
-                    .unwrap_or(n);
-                Some(Arc::new(TokenBucket::new(
-                    n as usize,
-                    rate_limit_tokens as usize,
-                )))
-            }
+            n => Some(Arc::new(TokenBucket::new(n as usize, 0))),
         };
+
+        // Rate limiter: token bucket with time-based refill
+        self.rate_limiter = match (
+            config.max_concurrent_requests,
+            config.rate_limit_tokens_per_second,
+        ) {
+            (n, Some(rate)) if n > 0 && rate > 0 => {
+                Some(Arc::new(TokenBucket::new(n as usize, rate as usize)))
+            }
+            _ => None,
+        };
+
         self
     }
 

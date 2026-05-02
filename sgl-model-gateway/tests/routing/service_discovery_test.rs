@@ -39,7 +39,7 @@ mod service_discovery_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![MockWorkerConfig {
-                port: 20000,
+                port: 7000,
                 worker_type: WorkerType::Regular,
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
@@ -87,7 +87,7 @@ mod service_discovery_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![MockWorkerConfig {
-                port: 20001,
+                port: 7001,
                 worker_type: WorkerType::Regular,
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,
@@ -100,7 +100,7 @@ mod service_discovery_tests {
 
         // Register a new worker via discovery endpoint
         let register_payload = json!({
-            "url": "http://127.0.0.1:20002",
+            "url": "http://127.0.0.1:7002",
             "weight": 1.0
         });
 
@@ -146,14 +146,14 @@ mod service_discovery_tests {
             config,
             vec![
                 MockWorkerConfig {
-                    port: 20003,
+                    port: 7003,
                     worker_type: WorkerType::Regular,
                     health_status: HealthStatus::Healthy,
                     response_delay_ms: 0,
                     fail_rate: 0.0,
                 },
                 MockWorkerConfig {
-                    port: 20004,
+                    port: 7004,
                     worker_type: WorkerType::Regular,
                     health_status: HealthStatus::Healthy,
                     response_delay_ms: 0,
@@ -167,7 +167,7 @@ mod service_discovery_tests {
 
         // Deregister a worker via discovery endpoint
         let deregister_payload = json!({
-            "url": "http://127.0.0.1:20003"
+            "url": "http://127.0.0.1:7003"
         });
 
         let req = Request::builder()
@@ -230,7 +230,7 @@ mod service_discovery_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![MockWorkerConfig {
-                port: 20005,
+                port: 7005,
                 worker_type: WorkerType::Regular,
                 health_status: HealthStatus::Healthy,
                 response_delay_ms: 0,

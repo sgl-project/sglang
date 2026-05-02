@@ -516,10 +516,26 @@ pub async fn concurrency_limit_middleware(
         }
     }
 
-    let token_bucket = match &app_state.context.rate_limiter {
+    // --- Layer 1: Rate limiter (token bucket with time-based refill) ---
+    // Checked first as a hard gate: if rate limit is exceeded, reject immediately.
+    // Tokens are NOT returned when requests complete (they refill over time).
+    if let Some(rate_limiter) = &app_state.context.rate_limiter {
+        if rate_limiter.try_acquire(1.0).await.is_err() {
+            warn!("Rate limit exceeded, returning 429");
+            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+        // Rate limit token acquired — not returned on completion (time-refilled)
+    }
+
+    // --- Layer 2: Concurrency limiter (semaphore with refill_rate=0) ---
+    // Tokens are returned when request response stream ends (via TokenGuardBody drop).
+    let concurrency_bucket = match &app_state.context.concurrency_limiter {
         Some(bucket) => bucket.clone(),
         None => {
-            // Rate limiting disabled, pass through immediately
+            // No concurrency limiting, pass through
+            // (rate limiting may have been checked above)
+            Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
             return next.run(request).await;
         }
     };
@@ -530,9 +546,9 @@ pub async fn concurrency_limit_middleware(
     // Identify if this is an embeddings request based on path
     let is_embeddings = request.uri().path().contains("/v1/embeddings");
 
-    // Try to acquire token immediately
-    if token_bucket.try_acquire(1.0).await.is_ok() {
-        debug!("Acquired token immediately");
+    // Try to acquire concurrency token immediately
+    if concurrency_bucket.try_acquire(1.0).await.is_ok() {
+        debug!("Acquired concurrency token immediately");
         Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
         let response = next.run(request).await;
 
@@ -540,12 +556,12 @@ pub async fn concurrency_limit_middleware(
         // This ensures that for streaming responses, the token is only returned
         // after the entire stream has been sent to the client.
         let (parts, body) = response.into_parts();
-        let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+        let guarded_body = TokenGuardBody::new(body, concurrency_bucket, 1.0);
         Response::from_parts(parts, Body::new(guarded_body))
     } else {
-        // No tokens available, try to queue if enabled
+        // No concurrency tokens available, try to queue if enabled
         if let Some(queue_tx) = &app_state.concurrency_queue_tx {
-            debug!("No tokens available, attempting to queue request");
+            debug!("No concurrency tokens available, attempting to queue request");
 
             // Create a channel for the token response
             let (permit_tx, permit_rx) = oneshot::channel();
@@ -566,7 +582,7 @@ pub async fn concurrency_limit_middleware(
                     // Wait for token from queue processor
                     match permit_rx.await {
                         Ok(Ok(())) => {
-                            debug!("Acquired token from queue");
+                            debug!("Acquired concurrency token from queue");
                             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_ALLOWED);
                             // Dequeue for embeddings
                             if is_embeddings {
@@ -577,7 +593,8 @@ pub async fn concurrency_limit_middleware(
 
                             // Wrap the response body with TokenGuardBody to return token when stream ends
                             let (parts, body) = response.into_parts();
-                            let guarded_body = TokenGuardBody::new(body, token_bucket, 1.0);
+                            let guarded_body =
+                                TokenGuardBody::new(body, concurrency_bucket, 1.0);
                             Response::from_parts(parts, Body::new(guarded_body))
                         }
                         Ok(Err(status)) => {
@@ -607,7 +624,7 @@ pub async fn concurrency_limit_middleware(
                 }
             }
         } else {
-            warn!("No tokens available and queuing is disabled, returning 429");
+            warn!("No concurrency tokens available and queuing is disabled, returning 429");
             Metrics::record_http_rate_limit(metrics_labels::RATE_LIMIT_REJECTED);
             StatusCode::TOO_MANY_REQUESTS.into_response()
         }

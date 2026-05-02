@@ -28,7 +28,7 @@ mod power_of_two_tests {
         let config = TestRouterConfig::power_of_two(3600);
 
         let ctx =
-            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(19600, 2))
+            AppTestContext::new_with_config(config, TestWorkerConfig::healthy_workers(9600, 2))
                 .await;
 
         let app = ctx.create_app().await;
@@ -71,8 +71,8 @@ mod power_of_two_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::slow(19602, 200), // Slow worker
-                TestWorkerConfig::healthy(19603),   // Fast worker
+                TestWorkerConfig::slow(9602, 200), // Slow worker
+                TestWorkerConfig::healthy(9603),   // Fast worker
             ],
         )
         .await;
@@ -158,8 +158,8 @@ mod power_of_two_tests {
         let ctx = AppTestContext::new_with_config(
             config,
             vec![
-                TestWorkerConfig::flaky(19604, 1.0), // Always fails
-                TestWorkerConfig::healthy(19605),    // Always succeeds
+                TestWorkerConfig::flaky(9604, 1.0), // Always fails
+                TestWorkerConfig::healthy(9605),    // Always succeeds
             ],
         )
         .await;

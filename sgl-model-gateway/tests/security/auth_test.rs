@@ -24,7 +24,7 @@ mod auth_tests {
         let config = TestRouterConfig::round_robin(4300);
 
         let ctx =
-            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(20300)]).await;
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(7300)]).await;
 
         let app = ctx.create_app().await;
 
@@ -57,7 +57,7 @@ mod auth_tests {
         let config = TestRouterConfig::round_robin(4301);
 
         let ctx =
-            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(20301)]).await;
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(7301)]).await;
 
         let app = ctx.create_app().await;
 
@@ -92,7 +92,7 @@ mod auth_tests {
         let config = TestRouterConfig::round_robin(4302);
 
         let ctx =
-            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(20302)]).await;
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(7302)]).await;
 
         let app = ctx.create_app().await;
 
@@ -119,7 +119,7 @@ mod auth_tests {
         let config = TestRouterConfig::round_robin(4303);
 
         let ctx =
-            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(20303)]).await;
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(7303)]).await;
 
         let app = ctx.create_app().await;
 
@@ -158,7 +158,7 @@ mod auth_tests {
         let config = TestRouterConfig::round_robin(4304);
 
         let ctx =
-            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(20304)]).await;
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(7304)]).await;
 
         let app = ctx.create_app().await;
         let success_count = Arc::new(AtomicUsize::new(0));
@@ -218,7 +218,7 @@ mod mtls_tests {
         let config = TestRouterConfig::round_robin(4305);
 
         let ctx =
-            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(20305)]).await;
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::healthy(7305)]).await;
 
         let app = ctx.create_app().await;
 

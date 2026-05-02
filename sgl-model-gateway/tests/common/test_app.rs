@@ -26,19 +26,21 @@ pub fn create_test_app(
     client: Client,
     router_config: &RouterConfig,
 ) -> Router {
-    // Initialize rate limiter
-    let rate_limiter = match router_config.max_concurrent_requests {
+    // Initialize concurrency limiter (semaphore: refill_rate=0)
+    let concurrency_limiter = match router_config.max_concurrent_requests {
         n if n <= 0 => None,
-        n => {
-            let rate_limit_tokens = router_config
-                .rate_limit_tokens_per_second
-                .filter(|&t| t > 0)
-                .unwrap_or(n);
-            Some(Arc::new(TokenBucket::new(
-                n as usize,
-                rate_limit_tokens as usize,
-            )))
+        n => Some(Arc::new(TokenBucket::new(n as usize, 0))),
+    };
+
+    // Initialize rate limiter (token bucket: time-based refill)
+    let rate_limiter = match (
+        router_config.max_concurrent_requests,
+        router_config.rate_limit_tokens_per_second,
+    ) {
+        (n, Some(rate)) if n > 0 && rate > 0 => {
+            Some(Arc::new(TokenBucket::new(n as usize, rate as usize)))
         }
+        _ => None,
     };
 
     // Initialize registries
@@ -67,6 +69,7 @@ pub fn create_test_app(
         AppContext::builder()
             .router_config(router_config.clone())
             .client(client)
+            .concurrency_limiter(concurrency_limiter)
             .rate_limiter(rate_limiter)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new())) // tokenizer
             .reasoning_parser_factory(None) // reasoning_parser_factory
@@ -201,6 +204,7 @@ pub async fn create_test_app_context() -> Arc<AppContext> {
         AppContext::builder()
             .router_config(router_config)
             .client(client)
+            .concurrency_limiter(None)
             .rate_limiter(None)
             .tokenizer_registry(Arc::new(TokenizerRegistry::new()))
             .reasoning_parser_factory(None)
