@@ -257,12 +257,14 @@ def _jit_metadata_module():
 def _jit_silu_mul_quant_varlen_module(
     quant_group_size: int,
     scale_ue8m0: bool,
+    transposed: bool,
     swizzle: bool,
     apply_swiglu_limit: bool,
 ) -> Module:
     args = make_cpp_args(
         quant_group_size,
         scale_ue8m0,
+        transposed,
         swizzle,
         is_arch_support_pdl(),
         apply_swiglu_limit,
@@ -280,12 +282,14 @@ def _jit_silu_mul_quant_varlen_module(
 def _jit_silu_mul_quant_contig_module(
     quant_group_size: int,
     scale_ue8m0: bool,
+    transposed: bool,
     swizzle: bool,
     apply_swiglu_limit: bool,
 ) -> Module:
     args = make_cpp_args(
         quant_group_size,
         scale_ue8m0,
+        transposed,
         swizzle,
         is_arch_support_pdl(),
         apply_swiglu_limit,
@@ -308,40 +312,6 @@ def _jit_silu_and_mul_clamp_module(dtype: torch.dtype) -> Module:
         cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant.cuh"],
         cuda_wrappers=[("run", f"SiluAndMulClampKernel<{args}>::run")],
         extra_cuda_cflags=["-use_fast_math"],
-    )
-
-
-# ---------------------------------------------------------------------------
-# Byte-equal fallbacks: when SGLANG_OPT_FIX_MEGA_MOE_MEMORY is off, route
-# silu_and_mul_masked_post_quant / silu_and_mul_clamp through these _tmp
-# modules, which load a copy of the optimize-branch kernel (different
-# precision behavior ??? bf16 silu roundtrip, expf, fp32 clamp).
-# ---------------------------------------------------------------------------
-
-
-@cache_once
-def _jit_silu_mul_quant_tmp_module(
-    quant_group_size: int, scale_ue8m0: bool, apply_swiglu_limit: bool
-) -> Module:
-    args = make_cpp_args(
-        quant_group_size, scale_ue8m0, is_arch_support_pdl(), apply_swiglu_limit
-    )
-    return load_jit(
-        make_name("silu_mul_quant_tmp"),
-        *args,
-        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant_tmp.cuh"],
-        cuda_wrappers=[("run", f"SiluAndMulMaskedPostQuantKernel<{args}>::run")],
-    )
-
-
-@cache_once
-def _jit_silu_and_mul_clamp_tmp_module(dtype: torch.dtype) -> Module:
-    args = make_cpp_args(dtype, is_arch_support_pdl())
-    return load_jit(
-        make_name("silu_and_mul_clamp_tmp"),
-        *args,
-        cuda_files=["deepseek_v4/silu_and_mul_masked_post_quant_tmp.cuh"],
-        cuda_wrappers=[("run", f"SiluAndMulClampKernel<{args}>::run")],
     )
 
 
@@ -964,16 +934,8 @@ def silu_and_mul_clamp(
     output: torch.Tensor,
     swiglu_limit: float,
 ) -> None:
-    # Fallback path is hacky on purpose: when the mega-moe-memory flag is off
-    # we must be bitwise-identical to the optimize branch, which used the
-    # pre-refactor kernel.
-    from sglang.srt.environ import envs
-
     deepseek_v4_moe_code_path_checker.observed += 1
-    if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
-        module = _jit_silu_and_mul_clamp_module(input.dtype)
-    else:
-        module = _jit_silu_and_mul_clamp_tmp_module(input.dtype)
+    module = _jit_silu_and_mul_clamp_module(input.dtype)
     module.run(input, output, float(swiglu_limit))
 
 
@@ -992,21 +954,15 @@ def silu_and_mul_masked_post_quant(
     apply_swiglu_limit = swiglu_limit is not None
     if apply_swiglu_limit:
         deepseek_v4_moe_code_path_checker.observed += 1
-    if swizzle:
-        module = _jit_silu_mul_quant_varlen_module(
-            quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
-        )
-    else:
-        module = _jit_silu_mul_quant_tmp_module(
-            quant_group_size, scale_ue8m0, apply_swiglu_limit
-        )
+    module = _jit_silu_mul_quant_varlen_module(
+        quant_group_size, scale_ue8m0, transposed, swizzle, apply_swiglu_limit
+    )
     module.run(
         input,
         output,
         output_scale,
         masked_m,
         topk,
-        transposed,
         float(swiglu_limit) if apply_swiglu_limit else 0.0,
     )
 
@@ -1026,13 +982,12 @@ def silu_and_mul_contig_post_quant(
     if observe and apply_swiglu_limit:
         deepseek_v4_moe_code_path_checker.observed += 1
     module = _jit_silu_mul_quant_contig_module(
-        quant_group_size, scale_ue8m0, swizzle, apply_swiglu_limit
+        quant_group_size, scale_ue8m0, transposed, swizzle, apply_swiglu_limit
     )
     module.run(
         input,
         output,
         output_scale,
-        transposed,
         float(swiglu_limit) if apply_swiglu_limit else 0.0,
     )
 
