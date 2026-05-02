@@ -104,7 +104,7 @@ def _random_like(t: torch.Tensor):
     shape = t.shape
     dtype = t.dtype
 
-    if dtype.is_floating_point or "float" in str(dtype):
+    if dtype.is_floating_point:
         return torch.rand(shape, device=device, dtype=torch.float32).to(dtype)
 
     if dtype == torch.bool:
