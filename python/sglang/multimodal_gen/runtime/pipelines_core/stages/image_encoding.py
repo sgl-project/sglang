@@ -18,9 +18,6 @@ import torch
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
-from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
-    qwen_image_postprocess_text,
-)
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
@@ -149,10 +146,15 @@ class ImageEncodingStage(PipelineStage):
             uses.append(ComponentUse(stage_name, "text_encoder"))
         return uses
 
-    def encoding_qwen_image_edit(self, outputs, image_inputs):
-        # encoder hidden state
-        prompt_embeds = qwen_image_postprocess_text(outputs, image_inputs, 64)
-        return prompt_embeds
+    def encoding_image_edit(self, outputs, image_inputs, pipeline_config):
+        """Encode image-edit text features via pipeline-configured postprocess hook."""
+        postprocess_funcs = getattr(pipeline_config, "postprocess_text_funcs", ())
+        if not postprocess_funcs or not callable(postprocess_funcs[0]):
+            raise ValueError(
+                "Image-edit pipeline requires a callable postprocess_text_funcs[0]."
+            )
+
+        return postprocess_funcs[0](outputs, image_inputs)
 
     @torch.no_grad()
     def forward(
@@ -262,11 +264,15 @@ class ImageEncodingStage(PipelineStage):
                             )
 
                 all_prompt_embeds.append(
-                    self.encoding_qwen_image_edit(outputs, image_inputs)
+                    self.encoding_image_edit(
+                        outputs, image_inputs, server_args.pipeline_config
+                    )
                 )
                 if batch.do_classifier_free_guidance:
                     all_neg_prompt_embeds.append(
-                        self.encoding_qwen_image_edit(neg_outputs, neg_image_inputs)
+                        self.encoding_image_edit(
+                            neg_outputs, neg_image_inputs, server_args.pipeline_config
+                        )
                     )
 
         if all_prompt_embeds:

@@ -876,6 +876,8 @@ class ImagePipelineConfig(PipelineConfig):
     def shard_latents_for_sp(self, batch, latents):
         # latents: [B, H * W, C]
         sp_world_size, rank_in_sp_group = get_sp_world_size(), get_sp_parallel_rank()
+        if batch.enable_sequence_shard:
+            return latents, False
         seq_len = latents.shape[1]
 
         # TODO: reuse code in PipelineConfig::shard_latents_for_sp

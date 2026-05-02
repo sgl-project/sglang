@@ -280,6 +280,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def session_held_req_count(self, active_pool_idxs: Optional[set] = None) -> int:
         return 0
 
+    def session_held_mamba_slots(self, active_pool_idxs: Optional[set] = None) -> int:
+        return 0
+
     def is_chunk_cache(self) -> bool:
         return False
 
