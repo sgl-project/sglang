@@ -769,12 +769,11 @@ def _block_sparse_mqa_persistent_kernel(
     Q_ptr, K_ptr, KS_ptr,
     TopK_ptr, Logits_ptr, W_ptr,
     CuKS_ptr, CuKE_ptr,
-    stride_q_s, stride_q_h, stride_q_d,
-    stride_k_s, stride_k_d,
-    stride_ks_s,
-    stride_topk_s, stride_topk_n,
-    stride_logits_s, stride_logits_n,
-    stride_w_s, stride_w_h,
+    stride_q_s, stride_q_h,
+    stride_k_s,
+    stride_topk_s,
+    stride_logits_s,
+    stride_w_s,
     seq_kv,
     topk,                               # runtime int, may not divide GROUP_SIZE
     HEADS: tl.constexpr,
@@ -804,15 +803,20 @@ def _block_sparse_mqa_persistent_kernel(
     outer = tl.program_id(1)
 
     # Loaded ONCE — reused across K_CHUNKS inner iters.
+    # Innermost strides (q_d, k_d, ks_s, topk_n, logits_n, w_h) are always 1
+    # by torch contiguous-tensor convention — folded as compile-time 1 here
+    # to drop the per-element runtime multiply (saves ~GEMM_TILE*D ALU ops).
     h_offs = tl.arange(0, HEADS)
     d_offs = tl.arange(0, DIM)
     q = tl.load(
         Q_ptr + seq_i * stride_q_s
-        + h_offs[:, None] * stride_q_h + d_offs[None, :] * stride_q_d
+        + h_offs[:, None] * stride_q_h + d_offs[None, :]
     )  # fp8 [H, D]
-    w = tl.load(W_ptr + seq_i * stride_w_s + h_offs * stride_w_h)  # f32 [H]
+    q_T = q.trans(1, 0)  # [D, H] hoisted out of inner loop
+    w = tl.load(W_ptr + seq_i * stride_w_s + h_offs)  # f32 [H]
     ks_min = tl.load(CuKS_ptr + seq_i)
     ke_max = tl.load(CuKE_ptr + seq_i)
+    topk_K = topk * KV_BLOCK_SIZE  # hoist multiply out of inner loop
 
     g_offs = tl.arange(0, GROUP_SIZE)
     b_offs = tl.arange(0, KV_BLOCK_SIZE)
@@ -825,35 +829,34 @@ def _block_sparse_mqa_persistent_kernel(
         g_idx = n_i_start + g_offs                                # [G]
         g_mask = g_idx < topk                                     # [G]
         topk_block_ids = tl.load(
-            TopK_ptr + seq_i * stride_topk_s + g_idx * stride_topk_n,
+            TopK_ptr + seq_i * stride_topk_s + g_idx,
             mask=g_mask, other=-1,
         ).to(tl.int32)
         k_rows_2d = topk_block_ids[:, None] * KV_BLOCK_SIZE + b_offs[None, :]
         k_rows = tl.reshape(k_rows_2d, (GEMM_TILE,))
 
-        k_mask = (k_rows >= 0) & (k_rows < seq_kv)
-        safe_rows = tl.where(k_mask, k_rows, 0)
+        # Drop separate k_mask; pos_valid (>= ks_min, < ke_max) implies
+        # >= 0 AND < seq_kv since 0 <= ks_min, ke_max <= seq_kv. Use clamped
+        # safe_rows for in-bounds load — invalid lanes read garbage K but
+        # logits are masked to -inf below.
+        safe_rows = tl.maximum(k_rows, 0)
 
         k = tl.load(
-            K_ptr + safe_rows[:, None] * stride_k_s + d_offs[None, :] * stride_k_d
+            K_ptr + safe_rows[:, None] * stride_k_s + d_offs[None, :]
         )                                                          # fp8 [GEMM_TILE, D]
-        ks = tl.load(
-            KS_ptr + safe_rows * stride_ks_s, mask=k_mask, other=0.0,
-        )                                                          # f32 [GEMM_TILE]
+        ks = tl.load(KS_ptr + safe_rows)                           # f32 [GEMM_TILE]
 
-        s = tl.dot(k, q.trans(1, 0), out_dtype=tl.float32)
-        s = s * ks[:, None]
-        s = tl.maximum(s, 0.0)
-        s = s * w[None, :]
+        s = tl.dot(k, q_T, out_dtype=tl.float32)
+        s = tl.maximum(s * ks[:, None], 0.0) * w[None, :]
         logits = tl.sum(s, axis=1)
 
-        pos_valid = (k_rows >= ks_min) & (k_rows < ke_max) & k_mask
+        pos_valid = (k_rows >= ks_min) & (k_rows < ke_max)
         logits = tl.where(pos_valid, logits, float("-inf"))
 
         out_cols = n_i_start * KV_BLOCK_SIZE + bn_offs
-        out_mask = out_cols < topk * KV_BLOCK_SIZE
+        out_mask = out_cols < topk_K
         tl.store(
-            Logits_ptr + seq_i * stride_logits_s + out_cols * stride_logits_n,
+            Logits_ptr + seq_i * stride_logits_s + out_cols,
             logits,
             mask=out_mask,
         )
@@ -905,15 +908,19 @@ def block_sparse_mqa_triton(
     num_chunks = (topk + GROUP_SIZE - 1) // GROUP_SIZE
     outer = (num_chunks + K_CHUNKS - 1) // K_CHUNKS
     grid = (seq_len, outer)
+    # Innermost strides (q.stride(2), k.stride(1), k_scale.stride(0),
+    # topk.stride(1), logits.stride(1), weights.stride(1)) are baked as 1
+    # in the kernel — assert here.
+    assert q_fp8.stride(2) == 1 and k_fp8.stride(1) == 1 and k_scale.stride(0) == 1
+    assert topk_block_index.stride(1) == 1 and logits.stride(1) == 1 and weights.stride(1) == 1
     _block_sparse_mqa_persistent_kernel[grid](
         q_fp8, k_fp8, k_scale, topk_block_index, logits, weights,
         cu_seqlen_ks, cu_seqlen_ke,
-        q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2),
-        k_fp8.stride(0), k_fp8.stride(1),
-        k_scale.stride(0),
-        topk_block_index.stride(0), topk_block_index.stride(1),
-        logits.stride(0), logits.stride(1),
-        weights.stride(0), weights.stride(1),
+        q_fp8.stride(0), q_fp8.stride(1),
+        k_fp8.stride(0),
+        topk_block_index.stride(0),
+        logits.stride(0),
+        weights.stride(0),
         seq_kv,
         topk,
         HEADS=H, DIM=D,
