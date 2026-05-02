@@ -252,6 +252,17 @@ async def async_request_openai_completions(
         if "ignore_eos" not in request_func_input.extra_request_body:
             payload["ignore_eos"] = not args.disable_ignore_eos
 
+        # Request a trailing usage chunk so we can record the real
+        # completion_tokens reported by the server. Without this, sglang
+        # (and other OpenAI-compatible servers such as vLLM) never emits a
+        # usage block on the completions stream, leaving output_len stuck
+        # at the requested max_tokens and making TPOT / throughput /
+        # retokenized-length metrics incorrect whenever generation stops
+        # before max_tokens (EOS, length stop, abort). Streaming-only.
+        # Users can still override via extra_request_body.
+        if not args.disable_stream and "stream_options" not in request_func_input.extra_request_body:
+            payload["stream_options"] = {"include_usage": True}
+
         if args.return_logprob and args.top_logprobs_num > 0:
             payload["logprobs"] = args.top_logprobs_num
 
@@ -408,6 +419,17 @@ async def async_request_openai_chat_completions(
         # Default to False for more realistic behavior (respect EOS tokens)
         if "ignore_eos" not in request_func_input.extra_request_body:
             payload["ignore_eos"] = not args.disable_ignore_eos
+
+        # Request a trailing usage chunk so we can record the real
+        # completion_tokens reported by the server. Without this, sglang
+        # (and other OpenAI-compatible servers) never emits usage on the
+        # chat-completions stream, leaving output_len stuck at the
+        # requested max_completion_tokens and making TPOT / throughput /
+        # retokenized-length metrics incorrect whenever generation stops
+        # before max_completion_tokens. Streaming-only. Users can still
+        # override via extra_request_body.
+        if not args.disable_stream and "stream_options" not in request_func_input.extra_request_body:
+            payload["stream_options"] = {"include_usage": True}
 
         # Merge in extra parameters (tools, temperature, top_p, etc.)
         # These will override defaults if present
