@@ -176,7 +176,7 @@ setup_pip_toolchain() {
 
     export UV_LINK_MODE=copy
     PIP_CMD="uv pip"
-    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match --prerelease allow"
+    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
     PIP_UNINSTALL_CMD="uv pip uninstall"
     PIP_UNINSTALL_SUFFIX=""
 
