@@ -74,6 +74,98 @@ def build_runtime_observation_payloads(
     return payloads
 
 
+def _readonly_optional_sequence(
+    value: Any,
+    *,
+    field_name: str,
+) -> Sequence[Any] | None:
+    if value is None:
+        return None
+    return _readonly_sequence(value, field_name=field_name)
+
+
+def build_runtime_observation_cpu_metadata_payloads(
+    *,
+    rids: Sequence[str],
+    req_pool_indices_cpu: Sequence[int],
+    seq_lens_cpu: Sequence[int],
+    layer_ids: Sequence[int],
+    batch_id: str,
+    phase: str,
+    runtime_policy_state: str,
+    extend_seq_lens_cpu: Sequence[int] | None = None,
+    extend_prefix_lens_cpu: Sequence[int] | None = None,
+) -> list[dict[str, Any]]:
+    """Build RelayKV runtime observation payload candidates from CPU metadata.
+
+    This pure helper fixes the future CPU metadata schema only. It accepts plain
+    Python list/tuple metadata and rejects tensor-like inputs without converting
+    or reading tensor values. It does not touch ForwardBatch, KV pools, snapshots,
+    host backup copy, attention state, scheduler decisions, or writeback.
+    """
+
+    rid_values = _readonly_sequence(rids, field_name="rids")
+    req_pool_idx_values = _readonly_sequence(
+        req_pool_indices_cpu,
+        field_name="req_pool_indices_cpu",
+    )
+    seq_len_values = _readonly_sequence(seq_lens_cpu, field_name="seq_lens_cpu")
+    layer_id_values = _readonly_sequence(layer_ids, field_name="layer_ids")
+    extend_seq_len_values = _readonly_optional_sequence(
+        extend_seq_lens_cpu,
+        field_name="extend_seq_lens_cpu",
+    )
+    extend_prefix_len_values = _readonly_optional_sequence(
+        extend_prefix_lens_cpu,
+        field_name="extend_prefix_lens_cpu",
+    )
+
+    request_count = len(rid_values)
+    if len(req_pool_idx_values) != request_count:
+        raise ValueError("req_pool_indices_cpu must match len(rids)")
+    if len(seq_len_values) != request_count:
+        raise ValueError("seq_lens_cpu must match len(rids)")
+    if (
+        extend_seq_len_values is not None
+        and len(extend_seq_len_values) != request_count
+    ):
+        raise ValueError("extend_seq_lens_cpu must match len(rids)")
+    if (
+        extend_prefix_len_values is not None
+        and len(extend_prefix_len_values) != request_count
+    ):
+        raise ValueError("extend_prefix_lens_cpu must match len(rids)")
+
+    payloads: list[dict[str, Any]] = []
+    for request_index, request_id in enumerate(rid_values):
+        for layer_id in layer_id_values:
+            payload: dict[str, Any] = {
+                "event_type": "runtime_observation_cpu_metadata_candidate",
+                "batch_id": batch_id,
+                "request_id": request_id,
+                "request_index_in_batch": request_index,
+                "request_index": request_index,
+                "req_pool_idx": req_pool_idx_values[request_index],
+                "req_pool_index": req_pool_idx_values[request_index],
+                "seq_len": seq_len_values[request_index],
+                "layer_id": layer_id,
+                "phase": phase,
+                "runtime_policy_state": runtime_policy_state,
+                "source": "cpu_metadata",
+                "source_mutated": False,
+                "attention_override": False,
+                "kv_cache_mutation": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+            }
+            if extend_seq_len_values is not None:
+                payload["extend_seq_len"] = extend_seq_len_values[request_index]
+            if extend_prefix_len_values is not None:
+                payload["extend_prefix_len"] = extend_prefix_len_values[request_index]
+            payloads.append(payload)
+    return payloads
+
+
 def summarize_runtime_observation_payloads(
     payloads: Sequence[dict[str, Any]],
 ) -> dict[str, Any]:
