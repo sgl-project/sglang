@@ -292,10 +292,17 @@ jobs:
               --generator-device cuda
           elif [ "$SOURCE_GROUP" = "ltx23" ]; then
             cd python
+            set +e
             PYTHONPATH=/tmp/mmgen-official-code/LTX-2/packages/ltx-core/src:/tmp/mmgen-official-code/LTX-2/packages/ltx-pipelines/src:$PWD:$PYTHONPATH \
               python ../ci-data/diffusion-ci/repro_scripts/gen_official_ltx23.py \
                 --out-dir ./${{ env.OUTPUT_NAME }} \
                 --case-ids "$CASE_ID"
+            status=$?
+            set -e
+            if [ "$status" -ne 0 ]; then
+              find ./${{ env.OUTPUT_NAME }} -name 'official_ltx23_manifest.json' -print -exec cat {} \;
+              exit "$status"
+            fi
           else
             echo "Unknown SOURCE_GROUP=$SOURCE_GROUP"
             exit 1
@@ -601,10 +608,17 @@ jobs:
         run: |
           git -C ci-data rev-parse HEAD
           cd python
+          set +e
           PYTHONPATH=/tmp/mmgen-official-code/LTX-2/packages/ltx-core/src:/tmp/mmgen-official-code/LTX-2/packages/ltx-pipelines/src:$PWD:$PYTHONPATH \
             python ../ci-data/diffusion-ci/repro_scripts/gen_official_ltx23.py \
               --out-dir ./${{ env.OUTPUT_NAME }} \
               --case-ids $LTX_CASE_IDS
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            find ./${{ env.OUTPUT_NAME }} -name 'official_ltx23_manifest.json' -print -exec cat {} \;
+            exit "$status"
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
