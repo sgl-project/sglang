@@ -501,8 +501,14 @@ RUN /bin/bash -lc 'set -euo pipefail; \
 
 # -----------------------
 # fast-hadamard-transform: install wheel built in builder stage.
+# --no-deps is critical: the wheel declares `torch` as a runtime dep, and
+# without --no-deps pip resolves that to the latest PyPI CUDA torch
+# (currently torch-2.11.0+cu130), which silently replaces the base image's
+# ROCm torch and breaks the whole stack with `operator torchvision::nms
+# does not exist` at server start. The base image already provides a
+# compatible torch, so we only want the FHT package itself.
 COPY --from=builder-fht /tmp/fht-wheel/ /tmp/fht-wheel/
-RUN pip install --no-cache-dir --force-reinstall /tmp/fht-wheel/*.whl \
+RUN pip install --no-cache-dir --no-deps --force-reinstall /tmp/fht-wheel/*.whl \
     && rm -rf /tmp/fht-wheel
 
 # -----------------------
