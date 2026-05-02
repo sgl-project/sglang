@@ -54,6 +54,7 @@ PROMPTS = [
 ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAHFSGLLogprobDifference(CustomTestCase):
     def test_lora_logprob_comparison_chunked(self):
         lora_paths = [LORA_PATH] * len(PROMPTS)

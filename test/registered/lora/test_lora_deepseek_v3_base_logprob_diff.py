@@ -49,6 +49,7 @@ DECODE_ATTENTION_BACKEND = "flashinfer"
 KL_THRESHOLD = 6e-3
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRADeepSeekV3BaseLogprobDiff(CustomTestCase):
     def test_lora_deepseek_v3_base_logprob_accuracy(self):
         adapter_path = snapshot_download(
