@@ -49,6 +49,7 @@ class MooncakeStoreConfig:
     master_server_address: str
     master_metrics_port: int
     check_server: bool
+    enable_ssd_offload: bool = False
 
     @staticmethod
     def from_file() -> "MooncakeStoreConfig":
@@ -86,6 +87,9 @@ class MooncakeStoreConfig:
                 "master_metrics_port", envs.MOONCAKE_MASTER_METRICS_PORT.default
             ),
             check_server=config.get("check_server", envs.MOONCAKE_CHECK_SERVER.default),
+            enable_ssd_offload=config.get(
+                "enable_ssd_offload", envs.MOONCAKE_ENABLE_SSD_OFFLOAD.default
+            ),
         )
 
     @staticmethod
@@ -121,6 +125,7 @@ class MooncakeStoreConfig:
             master_server_address=envs.MOONCAKE_MASTER.value,
             master_metrics_port=envs.MOONCAKE_MASTER_METRICS_PORT.value,
             check_server=envs.MOONCAKE_CHECK_SERVER.value,
+            enable_ssd_offload=envs.MOONCAKE_ENABLE_SSD_OFFLOAD.value,
         )
 
     @staticmethod
@@ -149,6 +154,9 @@ class MooncakeStoreConfig:
             ),
             check_server=extra_config.get(
                 "check_server", envs.MOONCAKE_CHECK_SERVER.default
+            ),
+            enable_ssd_offload=extra_config.get(
+                "enable_ssd_offload", envs.MOONCAKE_ENABLE_SSD_OFFLOAD.default
             ),
         )
 
@@ -227,7 +235,7 @@ class MooncakeStore(HiCacheStorage):
                     )
                     device_name = ""
 
-            ret_code = self.store.setup(
+            base_args = (
                 self.config.local_hostname,
                 self.config.metadata_server,
                 per_tp_global_segment_size,
@@ -236,6 +244,20 @@ class MooncakeStore(HiCacheStorage):
                 device_name,
                 self.config.master_server_address,
             )
+            try:
+                ret_code = self.store.setup(
+                    *base_args, enable_ssd_offload=self.config.enable_ssd_offload
+                )
+            except TypeError as e:
+                if "enable_ssd_offload" not in str(e):
+                    raise
+                logger.warning(
+                    "The installed Mooncake version does not support the "
+                    "enable_ssd_offload parameter in setup(). "
+                    "Falling back to setup without enable_ssd_offload. "
+                    "Please upgrade Mooncake to enable SSD offload support."
+                )
+                ret_code = self.store.setup(*base_args)
             if ret_code:
                 raise RuntimeError(
                     f"Failed to setup Mooncake store, error code: {ret_code}"
