@@ -251,11 +251,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_bool(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "true"
     ),
-    # CUDA: enable the Triton GroupNorm+SiLU fast path in HunyuanVideo VAE
-    # residual blocks.
-    "SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU": _lazy_bool(
-        "SGLANG_USE_CUDA_HUNYUANVIDEO_GROUP_NORM_SILU", "false"
-    ),
     # ================== cache-dit Env Vars ==================
     # Enable cache-dit acceleration for DiT inference
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
