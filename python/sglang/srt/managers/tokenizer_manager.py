@@ -32,7 +32,6 @@ from http import HTTPStatus
 from typing import Any, Awaitable, Dict, List, Optional, Tuple, Union
 
 import fastapi
-import pybase64
 import torch
 import uvloop
 import zmq
@@ -1703,11 +1702,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if getattr(recv_obj, "output_hidden_states", None):
                 meta_info["hidden_states"] = recv_obj.output_hidden_states[i]
             if getattr(recv_obj, "routed_experts", None):
-                routed_experts_tensor = recv_obj.routed_experts[i]
-                if routed_experts_tensor is not None:
-                    meta_info["routed_experts"] = pybase64.b64encode(
-                        routed_experts_tensor.numpy().tobytes()
-                    ).decode("utf-8")
+                if recv_obj.routed_experts[i] is not None:
+                    meta_info["routed_experts"] = recv_obj.routed_experts[i]
             if getattr(recv_obj, "customized_info", None):
                 for k, v in recv_obj.customized_info.items():
                     meta_info[k] = v[i]

@@ -1163,9 +1163,11 @@ class BatchStrOutput(BaseBatchReq, SpeculativeDecodingMetricsMixin):
     # Hidden states
     output_hidden_states: List[List[float]]
 
-    # The routed experts for each token, including both input and output tokens
-    # routed_experts[i] is a tensor of shape (token, layer, top_k) for request i
-    routed_experts: List[Optional[torch.Tensor]]
+    # The routed experts for each token, including both input and output tokens.
+    # Encoded by the detokenizer as a base64 string per request (the underlying
+    # tensor has shape (token, layer, top_k)) so the tokenizer hot path doesn't
+    # do the encode itself.
+    routed_experts: List[Optional[str]]
 
     # The information of placeholder tokens (e.g., image token)
     # idx is the index of the token in the prompt after expansion.
