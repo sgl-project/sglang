@@ -1661,6 +1661,7 @@ class PreshardedModelLoader(DefaultModelLoader):
         self._hash_num_threads = int(
             extra.pop("hash_num_threads", self.DEFAULT_HASH_NUM_THREADS)
         )
+        self._verify_on_load = bool(extra.pop("verify_on_load", True))
         load_config.model_loader_extra_config = extra
         # Switch to AUTO so DefaultModelLoader's source-ckpt discovery
         # accepts the format; PRESHARDED is consumed by get_model_loader's
@@ -2114,32 +2115,32 @@ class PreshardedModelLoader(DefaultModelLoader):
                         if r["stored_key"] not in cached:
                             cached[r["stored_key"]] = fh.get_tensor(r["stored_key"])
 
-                    expected: Dict[str, str] = {}
-                    for r in items:
-                        expected[r["stored_key"]] = r["checksum"]
+                    if self._verify_on_load:
+                        expected: Dict[str, str] = {}
+                        for r in items:
+                            expected[r["stored_key"]] = r["checksum"]
 
-                    def _verify(key: str) -> None:
-                        actual = self._hash_tensor(cached[key])
-                        if actual != expected[key]:
-                            raise ValueError(
-                                f"Checksum mismatch for stored_key "
-                                f"'{key}' in {filename}: expected "
-                                f"{expected[key]}, got {actual}."
-                            )
+                        def _verify(key: str) -> None:
+                            actual = self._hash_tensor(cached[key])
+                            if actual != expected[key]:
+                                raise ValueError(
+                                    f"Checksum mismatch for stored_key "
+                                    f"'{key}' in {filename}: expected "
+                                    f"{expected[key]}, got {actual}."
+                                )
 
-                    keys = list(cached.keys())
-                    n_workers = min(max(1, len(keys)), self._hash_num_threads)
-                    if n_workers <= 1:
-                        for k in keys:
-                            _verify(k)
-                    else:
-                        with concurrent.futures.ThreadPoolExecutor(
-                            max_workers=n_workers,
-                            thread_name_prefix="presharded-verify",
-                        ) as ex:
-                            # Drain all futures so any verify-error propagates.
-                            for _ in ex.map(_verify, keys):
-                                pass
+                        keys = list(cached.keys())
+                        n_workers = min(max(1, len(keys)), self._hash_num_threads)
+                        if n_workers <= 1:
+                            for k in keys:
+                                _verify(k)
+                        else:
+                            with concurrent.futures.ThreadPoolExecutor(
+                                max_workers=n_workers,
+                                thread_name_prefix="presharded-verify",
+                            ) as ex:
+                                for _ in ex.map(_verify, keys):
+                                    pass
 
                     for r in items:
                         tensor = cached[r["stored_key"]]
