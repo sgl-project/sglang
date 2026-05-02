@@ -20,7 +20,7 @@ class QwenImageVAEArchConfig(VAEArchConfig):
     dropout: float = 0.0
 
     is_residual: bool = False
-    in_channels: int = 3
+    input_channels: int = 3
     out_channels: int = 3
     patch_size: int | None = None
     scale_factor_temporal: int = 4
@@ -37,6 +37,8 @@ class QwenImageVAEConfig(VAEConfig):
     use_tiling: bool = False
     use_temporal_tiling: bool = False
     use_parallel_tiling: bool = False
+
+    use_parallel_decode: bool = False
 
     def get_vae_scale_factor(self):
         return 2 ** len(self.arch_config.temperal_downsample)

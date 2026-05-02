@@ -1,7 +1,5 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-from types import SimpleNamespace
-
 from transformers import (
     Cache,
     DynamicCache,
@@ -66,6 +64,7 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
+    Qwen2_5_VisionRotaryEmbedding,
     Qwen2_5_VisionTransformerPretrainedModel,
     Qwen2_5_VLAttention,
     Qwen2_5_VLCausalLMOutputWithPast,
@@ -432,10 +431,9 @@ class Qwen2_5_VLTextModel(nn.Module):
 
         # It may already have been prepared by e.g. `generate`
         if not isinstance(causal_mask_mapping := attention_mask, dict):
-            # Prepare mask arguments
             mask_kwargs = {
                 "config": self.config,
-                "input_embeds": inputs_embeds,
+                "inputs_embeds": inputs_embeds,
                 "attention_mask": attention_mask,
                 "cache_position": cache_position,
                 "past_key_values": past_key_values,
@@ -508,13 +506,26 @@ class Qwen2_5_VLModel(nn.Module):
     accepts_loss_kwargs = False
     _no_split_modules = ["Qwen2_5_VLDecoderLayer", "Qwen2_5_VLVisionBlock"]
 
-    def __init__(self, config):
+    def __init__(self, config, enable_image_understanding: bool = False):
         super().__init__()
-        self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(
-            config.vision_config
-        )
         self.language_model = Qwen2_5_VLTextModel(config.text_config)
-        self.visual.to(torch.get_default_dtype())
+
+        if enable_image_understanding:
+            self.visual = Qwen2_5_VisionTransformerPretrainedModel._from_config(
+                config.vision_config
+            )
+            self.visual.to(torch.get_default_dtype())
+            # keeps the vision rotary frequencies in fp32 even when weights are bf16 (as HF does)
+            head_dim = (
+                config.vision_config.hidden_size // config.vision_config.num_heads
+            )
+            rotary_dim = head_dim // 2
+            inv_freq = Qwen2_5_VisionRotaryEmbedding(rotary_dim).inv_freq
+            self.visual.rotary_pos_emb.register_buffer(
+                "inv_freq",
+                inv_freq,
+                persistent=False,
+            )
         self.rope_deltas = None  # cache rope_deltas here
         self.config = config
         # Initialize weights and apply final processing
@@ -798,6 +809,11 @@ class Qwen2_5_VLModel(nn.Module):
         """
         pixel_values = pixel_values.type(self.visual.dtype)
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
+        if not isinstance(image_embeds, torch.Tensor):
+            # In transformers v5, the visual encoder returns BaseModelOutputWithPooling.
+            # pooler_output contains the spatially merged embeddings (what we need),
+            # while last_hidden_state contains the raw unmerged output.
+            image_embeds = image_embeds.pooler_output
         split_sizes = (
             image_grid_thw.prod(-1) // self.visual.spatial_merge_size**2
         ).tolist()
@@ -997,41 +1013,6 @@ class Qwen2_5_VLModel(nn.Module):
         return output if return_dict else output.to_tuple()
 
 
-class DotDict(dict):
-    def __init__(self, mapping):
-        super().__init__()
-        for key, value in mapping.items():
-            if isinstance(value, dict):
-                value = DotDict(value)  # 递归转换
-            elif isinstance(value, list):
-                # 如果是 list，且元素是 dict 也递归转换
-                value = [
-                    DotDict(item) if isinstance(item, dict) else item for item in value
-                ]
-            self[key] = value
-
-    def __getattr__(self, item):
-        try:
-            return self[item]
-        except KeyError:
-            raise AttributeError(f"No attribute '{item}'")
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def __delattr__(self, key):
-        del self[key]
-
-
-def dict_to_namespace(d):
-    for k, v in d.items():
-        if isinstance(v, dict):
-            d[k] = dict_to_namespace(v)
-        elif isinstance(v, list):
-            d[k] = [dict_to_namespace(i) if isinstance(i, dict) else i for i in v]
-    return SimpleNamespace(**d)
-
-
 class Qwen2_5_VLForConditionalGeneration(TextEncoder):
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
@@ -1058,11 +1039,16 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
         prefix: str = "",
     ) -> None:
         super().__init__(config)
+        enable_image_understanding = config.enable_image_understanding
         config = config.arch_config
-        self.model = Qwen2_5_VLModel(config)
+        self.model = Qwen2_5_VLModel(
+            config, enable_image_understanding=enable_image_understanding
+        )
         self.lm_head = nn.Linear(
             config.text_config.hidden_size, config.text_config.vocab_size, bias=False
         )
+
+        self.enable_image_understanding = enable_image_understanding
 
         self.config = config
 
@@ -1157,6 +1143,8 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
 
             name = name.replace("model.", "model.language_model.")
             if "visual." in name:
+                if not self.enable_image_understanding:
+                    continue
                 name = name.replace("visual.", "model.visual.")
             try:
                 # Skip loading extra bias for GPTQ models.
@@ -1164,7 +1152,6 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
                     continue
                 param = params_dict[name]
             except KeyError:
-                print(params_dict.keys())
                 raise
 
             weight_loader = getattr(param, "weight_loader", default_weight_loader)

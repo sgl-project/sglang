@@ -8,11 +8,11 @@ python3 test_forward_split_prefill.py
 """
 
 import unittest
-from types import SimpleNamespace
 
 import numpy as np
 import torch
 
+from sglang.bench_one_batch import TreeCacheNamespace
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -20,6 +20,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import get_device
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.test_utils import DEFAULT_SMALL_MODEL_NAME_FOR_TEST, CustomTestCase
 
@@ -32,7 +33,7 @@ class TestForwardSplitPrefill(CustomTestCase):
         """Set up the test environment once for all tests."""
         cls.model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.tp_size = 1
-        cls.device = "cuda"
+        cls.device = get_device()
 
         # Initialize server args
         cls.server_args = ServerArgs(
@@ -61,6 +62,8 @@ class TestForwardSplitPrefill(CustomTestCase):
             pp_size=1,
             nccl_port=cls.port_args.nccl_port,
             server_args=cls.server_args,
+            moe_ep_rank=0,
+            moe_ep_size=1,
         )
 
         cls.tokenizer = get_tokenizer(
@@ -92,12 +95,12 @@ class TestForwardSplitPrefill(CustomTestCase):
                 sampling_params=sampling_params,
             )
             req.fill_ids = req.origin_input_ids
-            req.extend_input_len = len(req.fill_ids) - len(req.prefix_indices)
-            req.logprob_start_len = len(req.origin_input_ids) - 1
+            req.logprob_start_len = -1
+            req.set_extend_input_len(len(req.fill_ids) - len(req.prefix_indices))
             reqs.append(req)
 
         # Create dummy tree_cache for tests (no prefix caching, just allocation)
-        dummy_tree_cache = SimpleNamespace(
+        dummy_tree_cache = TreeCacheNamespace(
             page_size=1,
             device=self.model_runner.device,
             token_to_kv_pool_allocator=self.model_runner.token_to_kv_pool_allocator,
@@ -111,7 +114,6 @@ class TestForwardSplitPrefill(CustomTestCase):
             model_config=self.model_config,
             enable_overlap=False,
             spec_algorithm=SpeculativeAlgorithm.NONE,
-            enable_custom_logit_processor=False,
         )
         if is_split_prefill:
             batch.prepare_for_split_prefill()

@@ -24,15 +24,15 @@ class KVArgs:
     state_data_lens: List[int]
     state_item_lens: List[int]
     state_type: str  # "none", "mamba", "swa"
+    # for mamba state different tp slice transfer
+    state_dim_per_tensor: List[int]  # dimension to slice for each state tensor
     ib_device: str
     ib_traffic_class: str
     gpu_id: int
-    # for different tp
-    decode_tp_size: int
     kv_head_num: int
+    total_kv_head_num: int
     page_size: int
     # for pp prefill
-    prefill_pp_size: int
     pp_rank: int
     prefill_start_layer: int
     # for system dp
@@ -58,6 +58,11 @@ class BaseKVManager(ABC):
         server_args: ServerArgs,
         is_mla_backend: Optional[bool] = False,
     ): ...
+
+    @abstractmethod
+    def register_to_bootstrap(self):
+        """Register prefill server info to the bootstrap server."""
+        ...
 
 
 class BaseKVSender(ABC):
@@ -90,6 +95,12 @@ class BaseKVSender(ABC):
         """
         ...
 
+    def pop_decode_prefix_len(self) -> int:
+        return 0
+
+    def should_send_kv_chunk(self, num_pages: int, last_chunk: bool) -> bool:
+        return num_pages > 0
+
     @abstractmethod
     def poll(self) -> KVPoll:
         """
@@ -118,12 +129,23 @@ class BaseKVReceiver(ABC):
     @abstractmethod
     def init(
         self,
+        prefill_dp_rank: int,
+    ):
+        """
+        Resolve bootstrap metadata and mark the receiver ready for transfer metadata.
+        """
+        ...
+
+    @abstractmethod
+    def send_metadata(
+        self,
         kv_indices: npt.NDArray[np.int32],
         aux_index: Optional[int] = None,
         state_indices: Optional[List[int]] = None,
+        decode_prefix_len: Optional[int] = None,
     ):
         """
-        Set req's index metadata locally or notify the prefill server about the kv indices, aux index, and state_indices.
+        Notify the prefill server about the kv indices, aux index, and state_indices.
         """
         ...
 

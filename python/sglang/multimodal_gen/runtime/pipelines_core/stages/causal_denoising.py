@@ -5,6 +5,9 @@ import torch  # type: ignore
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.utils import pred_noise_to_pred_video
+from sglang.multimodal_gen.runtime.pipelines_core.diffusion_scheduler_utils import (
+    get_or_create_request_scheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -13,28 +16,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.sliding_tile_attn import (
-        SlidingTileAttentionBackend,
-    )
-
-    st_attn_available = True
-except ImportError:
-    st_attn_available = False
-    SlidingTileAttentionBackend = None  # type: ignore
-
-try:
-    from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn import (
-        VideoSparseAttentionBackend,
-    )
-
-    vsa_available = True
-except ImportError:
-    vsa_available = False
-    VideoSparseAttentionBackend = None  # type: ignore
 
 logger = init_logger(__name__)
 
@@ -74,6 +61,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         autocast_enabled = (
             target_dtype != torch.float32
         ) and not server_args.disable_autocast
+        scheduler = get_or_create_request_scheduler(batch, self.scheduler)
 
         latent_seq_length = batch.latents.shape[-1] * batch.latents.shape[-2]
         patch_ratio = (
@@ -92,7 +80,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         if server_args.pipeline_config.warp_denoising_step:
             logger.info("Warping timesteps...")
             scheduler_timesteps = torch.cat(
-                (self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))
+                (scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))
             )
             timesteps = scheduler_timesteps[1000 - timesteps]
         timesteps = timesteps.to(get_local_torch_device())
@@ -110,7 +98,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
         )
 
         # STA
-        if st_attn_available and self.attn_backend == SlidingTileAttentionBackend:
+        if self.attn_backend.get_enum() == AttentionBackendEnum.SLIDING_TILE_ATTN:
             self.prepare_sta_param(batch, server_args)
 
         # Latents and prompts
@@ -167,7 +155,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     image_latent[:, :, :1, :, :].to(target_dtype).permute(0, 2, 1, 3, 4)
                 )
                 with torch.autocast(
-                    device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                    device_type=current_platform.device_type,
+                    dtype=target_dtype,
+                    enabled=autocast_enabled,
                 ):
                     _ = self.transformer(
                         image_first_btchw,
@@ -195,7 +185,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                     .permute(0, 2, 1, 3, 4)
                 )
                 with torch.autocast(
-                    device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                    device_type=current_platform.device_type,
+                    dtype=target_dtype,
+                    enabled=autocast_enabled,
                 ):
                     _ = self.transformer(
                         ref_btchw,
@@ -263,8 +255,8 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
                     # Attention metadata if needed
                     if (
-                        vsa_available
-                        and self.attn_backend == VideoSparseAttentionBackend
+                        self.attn_backend.get_enum()
+                        == AttentionBackendEnum.VIDEO_SPARSE_ATTN
                     ):
                         self.attn_metadata_builder_cls = (
                             self.attn_backend.get_builder_cls()
@@ -282,7 +274,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                                 ),  # type: ignore
                                 patch_size=server_args.pipeline_config.dit_config.patch_size,  # type: ignore
                                 STA_param=batch.STA_param,  # type: ignore
-                                VSA_sparsity=server_args.VSA_sparsity,  # type: ignore
+                                VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,  # type: ignore
                                 device=get_local_torch_device(),  # type: ignore
                             )  # type: ignore
                             assert (
@@ -295,7 +287,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
 
                     with (
                         torch.autocast(
-                            device_type="cuda",
+                            device_type=current_platform.device_type,
                             dtype=target_dtype,
                             enabled=autocast_enabled,
                         ),
@@ -329,7 +321,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                         pred_noise=pred_noise_btchw.flatten(0, 1),
                         noise_input_latent=noise_latents.flatten(0, 1),
                         timestep=t_expand,
-                        scheduler=self.scheduler,
+                        scheduler=scheduler,
                     ).unflatten(0, pred_noise_btchw.shape[:2])
 
                     if i < len(timesteps) - 1:
@@ -347,7 +339,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
                             device=self.device,
                         )
                         noise_btchw = noise
-                        noise_latents_btchw = self.scheduler.add_noise(
+                        noise_latents_btchw = scheduler.add_noise(
                             pred_video_btchw.flatten(0, 1),
                             noise_btchw.flatten(0, 1),
                             next_timestep,
@@ -372,7 +364,9 @@ class CausalDMDDenoisingStage(DenoisingStage):
                 context_bcthw = current_latents.to(target_dtype)
                 with (
                     torch.autocast(
-                        device_type="cuda", dtype=target_dtype, enabled=autocast_enabled
+                        device_type=current_platform.device_type,
+                        dtype=target_dtype,
+                        enabled=autocast_enabled,
                     ),
                     set_forward_context(
                         current_timestep=0,

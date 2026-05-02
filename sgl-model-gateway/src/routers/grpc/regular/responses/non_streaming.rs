@@ -1,0 +1,431 @@
+//! Non-streaming execution for Regular Responses API
+//!
+//! This module handles non-streaming request execution:
+//! - `route_responses_internal` - Core execution orchestration
+//! - `execute_tool_loop` - MCP tool loop execution
+//! - `execute_without_mcp` - Simple pipeline execution without MCP
+
+use std::{sync::Arc, time::Instant};
+
+use axum::response::Response;
+use serde_json::json;
+use tracing::{debug, error, trace, warn};
+
+use super::{
+    common::{
+        build_mcp_list_tools_item, build_next_request, convert_mcp_tools_to_chat_tools,
+        extract_all_tool_calls_from_chat, load_conversation_history, prepare_chat_tools_and_choice,
+        ExtractedToolCall, ToolLoopState,
+    },
+    conversions,
+};
+use crate::{
+    observability::metrics::{metrics_labels, Metrics},
+    protocols::responses::{ResponseStatus, ResponsesRequest, ResponsesResponse},
+    routers::{
+        error,
+        grpc::common::responses::{
+            ensure_mcp_connection, persist_response_if_needed, ResponsesContext,
+        },
+        mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
+    },
+};
+
+/// Internal implementation for non-streaming responses
+///
+/// This is the core execution path that:
+/// 1. Loads conversation history / response chain
+/// 2. Checks for MCP tools
+/// 3. Executes with or without MCP tool loop
+/// 4. Persists to storage
+pub(super) async fn route_responses_internal(
+    ctx: &ResponsesContext,
+    request: Arc<ResponsesRequest>,
+    headers: Option<http::HeaderMap>,
+    model_id: Option<String>,
+    response_id: Option<String>,
+) -> Result<ResponsesResponse, Response> {
+    // 1. Load conversation history and build modified request
+    let modified_request = load_conversation_history(ctx, &request).await?;
+
+    // 2. Check MCP connection and get whether MCP tools are present
+    let (has_mcp_tools, server_keys) =
+        ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await?;
+
+    // Set the server keys in the context
+    {
+        let mut servers = ctx.requested_servers.write().unwrap();
+        *servers = server_keys;
+    }
+
+    let responses_response = if has_mcp_tools {
+        debug!("MCP tools detected, using tool loop");
+
+        // Execute with MCP tool loop
+        execute_tool_loop(
+            ctx,
+            modified_request,
+            &request,
+            headers,
+            model_id,
+            response_id.clone(),
+        )
+        .await?
+    } else {
+        // No MCP tools - execute without MCP (may have function tools or no tools)
+        execute_without_mcp(
+            ctx,
+            &modified_request,
+            &request,
+            headers,
+            model_id,
+            response_id.clone(),
+        )
+        .await?
+    };
+
+    // 5. Persist response to storage if store=true
+    persist_response_if_needed(
+        ctx.conversation_storage.clone(),
+        ctx.conversation_item_storage.clone(),
+        ctx.response_storage.clone(),
+        &responses_response,
+        &request,
+    )
+    .await;
+
+    Ok(responses_response)
+}
+
+/// Execute request without MCP tool loop (simple pipeline execution)
+pub(super) async fn execute_without_mcp(
+    ctx: &ResponsesContext,
+    modified_request: &ResponsesRequest,
+    original_request: &ResponsesRequest,
+    headers: Option<http::HeaderMap>,
+    model_id: Option<String>,
+    response_id: Option<String>,
+) -> Result<ResponsesResponse, Response> {
+    // Convert ResponsesRequest → ChatCompletionRequest
+    let chat_request = conversions::responses_to_chat(modified_request).map_err(|e| {
+        error!(
+            function = "execute_without_mcp",
+            error = %e,
+            "Failed to convert ResponsesRequest to ChatCompletionRequest"
+        );
+        error::bad_request(
+            "convert_request_failed",
+            format!("Failed to convert request: {}", e),
+        )
+    })?;
+
+    // Execute chat pipeline (errors already have proper HTTP status codes)
+    let chat_response = ctx
+        .pipeline
+        .execute_chat_for_responses(
+            Arc::new(chat_request),
+            headers,
+            model_id,
+            ctx.components.clone(),
+        )
+        .await?; // Preserve the Response error as-is
+
+    // Convert ChatCompletionResponse → ResponsesResponse
+    conversions::chat_to_responses(&chat_response, original_request, response_id).map_err(|e| {
+        error!(
+            function = "execute_without_mcp",
+            error = %e,
+            "Failed to convert ChatCompletionResponse to ResponsesResponse"
+        );
+        error::internal_error(
+            "convert_to_responses_format_failed",
+            format!("Failed to convert to responses format: {}", e),
+        )
+    })
+}
+
+/// Execute the MCP tool calling loop
+///
+/// This wraps pipeline.execute_chat_for_responses() in a loop that:
+/// 1. Executes the chat pipeline
+/// 2. Checks if response has tool calls
+/// 3. If yes, executes MCP tools and builds resume request
+/// 4. Repeats until no more tool calls or limit reached
+pub(super) async fn execute_tool_loop(
+    ctx: &ResponsesContext,
+    mut current_request: ResponsesRequest,
+    original_request: &ResponsesRequest,
+    headers: Option<http::HeaderMap>,
+    model_id: Option<String>,
+    response_id: Option<String>,
+) -> Result<ResponsesResponse, Response> {
+    // Get server label from original request tools
+    let server_label = extract_server_label(original_request.tools.as_deref(), "request-mcp");
+
+    let mut state = ToolLoopState::new(original_request.input.clone(), server_label.clone());
+
+    // Configuration: max iterations as safety limit
+    let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
+
+    trace!(
+        "Starting MCP tool loop: server_label={}, max_tool_calls={:?}, max_iterations={}",
+        server_label,
+        max_tool_calls,
+        DEFAULT_MAX_ITERATIONS
+    );
+
+    // Get MCP tools and convert to chat format (do this once before loop)
+    let mcp_tools = {
+        let servers = ctx.requested_servers.read().unwrap();
+        ctx.mcp_manager.list_tools_for_servers(&servers)
+    };
+    let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
+    trace!(
+        "Converted {} MCP tools to chat format",
+        mcp_chat_tools.len()
+    );
+
+    loop {
+        // Convert to chat request
+        let mut chat_request = conversions::responses_to_chat(&current_request).map_err(|e| {
+            error!(
+                function = "tool_loop",
+                iteration = state.iteration,
+                error = %e,
+                "Failed to convert ResponsesRequest to ChatCompletionRequest in tool loop"
+            );
+            error::bad_request(
+                "convert_request_failed",
+                format!("Failed to convert request: {}", e),
+            )
+        })?;
+
+        // Prepare tools and tool_choice for this iteration
+        prepare_chat_tools_and_choice(&mut chat_request, &mcp_chat_tools, state.iteration);
+
+        // Execute chat pipeline (errors already have proper HTTP status codes)
+        let chat_response = ctx
+            .pipeline
+            .execute_chat_for_responses(
+                Arc::new(chat_request),
+                headers.clone(),
+                model_id.clone(),
+                ctx.components.clone(),
+            )
+            .await?;
+
+        // Check for function calls (extract all for parallel execution)
+        let tool_calls = extract_all_tool_calls_from_chat(&chat_response);
+
+        if !tool_calls.is_empty() {
+            state.iteration += 1;
+
+            // Record tool loop iteration metric
+            Metrics::record_mcp_tool_iteration(&current_request.model);
+
+            trace!(
+                "Tool loop iteration {}: found {} tool call(s)",
+                state.iteration,
+                tool_calls.len()
+            );
+
+            // Separate MCP and function tool calls
+            let mcp_tool_names: std::collections::HashSet<&str> =
+                mcp_tools.iter().map(|t| t.name.as_ref()).collect();
+            let (mcp_tool_calls, function_tool_calls): (Vec<ExtractedToolCall>, Vec<_>) =
+                tool_calls
+                    .into_iter()
+                    .partition(|tc| mcp_tool_names.contains(tc.name.as_str()));
+
+            trace!(
+                "Separated tool calls: {} MCP, {} function",
+                mcp_tool_calls.len(),
+                function_tool_calls.len()
+            );
+
+            // If ANY tool call is a function tool, return to caller immediately
+            if !function_tool_calls.is_empty() {
+                // Convert chat response to responses format (includes all tool calls)
+                let responses_response = conversions::chat_to_responses(
+                    &chat_response,
+                    original_request,
+                    response_id.clone(),
+                )
+                .map_err(|e| {
+                    error!(
+                        function = "tool_loop",
+                        iteration = state.iteration,
+                        error = %e,
+                        context = "function_tool_calls",
+                        "Failed to convert ChatCompletionResponse to ResponsesResponse"
+                    );
+                    error::internal_error(
+                        "convert_to_responses_format_failed",
+                        format!("Failed to convert to responses format: {}", e),
+                    )
+                })?;
+
+                // Return response with function tool calls to caller
+                return Ok(responses_response);
+            }
+
+            // All MCP tools - check combined limit BEFORE executing
+            let effective_limit = match max_tool_calls {
+                Some(user_max) => user_max.min(DEFAULT_MAX_ITERATIONS),
+                None => DEFAULT_MAX_ITERATIONS,
+            };
+
+            if state.total_calls + mcp_tool_calls.len() > effective_limit {
+                warn!(
+                    "Reached tool call limit: {} + {} > {} (max_tool_calls={:?}, safety_limit={})",
+                    state.total_calls,
+                    mcp_tool_calls.len(),
+                    effective_limit,
+                    max_tool_calls,
+                    DEFAULT_MAX_ITERATIONS
+                );
+
+                // Convert chat response to responses format and mark as incomplete
+                let mut responses_response = conversions::chat_to_responses(
+                    &chat_response,
+                    original_request,
+                    response_id.clone(),
+                )
+                .map_err(|e| {
+                    error!(
+                        function = "tool_loop",
+                        iteration = state.iteration,
+                        error = %e,
+                        context = "max_tool_calls_limit",
+                        "Failed to convert ChatCompletionResponse to ResponsesResponse"
+                    );
+                    error::internal_error(
+                        "convert_to_responses_format_failed",
+                        format!("Failed to convert to responses format: {}", e),
+                    )
+                })?;
+
+                // Mark as completed but with incomplete details
+                responses_response.status = ResponseStatus::Completed;
+                responses_response.incomplete_details = Some(json!({ "reason": "max_tool_calls" }));
+
+                return Ok(responses_response);
+            }
+
+            // Execute all MCP tools
+            for tool_call in mcp_tool_calls {
+                trace!(
+                    "Calling MCP tool '{}' (call_id: {}) with args: {}",
+                    tool_call.name,
+                    tool_call.call_id,
+                    tool_call.arguments
+                );
+
+                let tool_start = Instant::now();
+                let (output_str, success, error) = match ctx
+                    .mcp_manager
+                    .call_tool(tool_call.name.as_str(), tool_call.arguments.as_str())
+                    .await
+                {
+                    Ok(result) => match serde_json::to_string(&result) {
+                        Ok(output) => (output, true, None),
+                        Err(e) => {
+                            let err = format!("Failed to serialize tool result: {}", e);
+                            warn!("{}", err);
+                            let error_json = json!({ "error": &err }).to_string();
+                            (error_json, false, Some(err))
+                        }
+                    },
+                    Err(err) => {
+                        let err_str = format!("tool call failed: {}", err);
+                        warn!("Tool execution failed: {}", err_str);
+                        // Return error as output, let model decide how to proceed
+                        let error_json = json!({ "error": &err_str }).to_string();
+                        (error_json, false, Some(err_str))
+                    }
+                };
+                let tool_duration = tool_start.elapsed();
+
+                // Record MCP tool metrics
+                Metrics::record_mcp_tool_duration(
+                    &current_request.model,
+                    &tool_call.name,
+                    tool_duration,
+                );
+                Metrics::record_mcp_tool_call(
+                    &current_request.model,
+                    &tool_call.name,
+                    if success {
+                        metrics_labels::RESULT_SUCCESS
+                    } else {
+                        metrics_labels::RESULT_ERROR
+                    },
+                );
+
+                // Record the call in state
+                state.record_call(
+                    tool_call.call_id,
+                    tool_call.name,
+                    tool_call.arguments,
+                    output_str,
+                    success,
+                    error,
+                );
+
+                // Increment total calls counter
+                state.total_calls += 1;
+            }
+
+            // Build resume request with conversation history
+            current_request = build_next_request(&state, &current_request);
+
+            // Continue to next iteration
+        } else {
+            // No more tool calls, we're done
+            trace!(
+                "Tool loop completed: {} iterations, {} total calls",
+                state.iteration,
+                state.total_calls
+            );
+
+            // Convert final chat response to responses format
+            let mut responses_response = conversions::chat_to_responses(
+                &chat_response,
+                original_request,
+                response_id.clone(),
+            )
+            .map_err(|e| {
+                error!(
+                    function = "tool_loop",
+                    iteration = state.iteration,
+                    error = %e,
+                    context = "final_response",
+                    "Failed to convert ChatCompletionResponse to ResponsesResponse"
+                );
+                error::internal_error(
+                    "convert_to_responses_format_failed",
+                    format!("Failed to convert to responses format: {}", e),
+                )
+            })?;
+
+            // Inject MCP metadata into output
+            if state.total_calls > 0 {
+                // Prepend mcp_list_tools item
+                let servers = ctx.requested_servers.read().unwrap();
+                let mcp_list_tools =
+                    build_mcp_list_tools_item(&ctx.mcp_manager, &server_label, &servers);
+                responses_response.output.insert(0, mcp_list_tools);
+
+                // Append all mcp_call items at the end
+                responses_response.output.extend(state.mcp_call_items);
+
+                trace!(
+                    "Injected MCP metadata: 1 mcp_list_tools + {} mcp_call items",
+                    state.total_calls
+                );
+            }
+
+            return Ok(responses_response);
+        }
+    }
+}

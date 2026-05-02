@@ -3,18 +3,56 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
-from sglang.multimodal_gen.runtime.layers.attention import USPAttention
-from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm
-from sglang.multimodal_gen.runtime.layers.linear import ReplicatedLinear
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import _apply_rotary_emb
+from sglang.multimodal_gen.runtime.distributed import (
+    get_sp_parallel_rank,
+    get_sp_world_size,
+    get_tp_world_size,
+    sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+)
+from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
+from sglang.multimodal_gen.runtime.layers.attention import (
+    UlyssesAttention,
+    USPAttention,
+)
+from sglang.multimodal_gen.runtime.layers.layernorm import (
+    RMSNorm,
+    apply_qk_norm_with_optional_rope,
+    apply_rmsnorm_tanh_mul_add,
+)
+from sglang.multimodal_gen.runtime.layers.linear import (
+    ColumnParallelLinear,
+    MergedColumnParallelLinear,
+    ReplicatedLinear,
+    RowParallelLinear,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
+    QuantizationConfig,
+)
+from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config import (
+    NunchakuConfig,
+    is_nunchaku_available,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    _apply_rotary_emb,
+    apply_flashinfer_rope_qk_inplace,
+)
+from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
+try:
+    from nunchaku.models.attention import NunchakuFeedForward  # type: ignore[import]
+except Exception:
+    NunchakuFeedForward = None
+
 logger = init_logger(__name__)
+_is_cuda = current_platform.is_cuda()
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -36,9 +74,13 @@ class TimestepEmbedder(nn.Module):
 
         self.mlp = nn.ModuleList(
             [
-                ReplicatedLinear(frequency_embedding_size, mid_size, bias=True),
+                ColumnParallelLinear(
+                    frequency_embedding_size, mid_size, bias=True, gather_output=False
+                ),
                 nn.SiLU(),
-                ReplicatedLinear(mid_size, out_size, bias=True),
+                RowParallelLinear(
+                    mid_size, out_size, bias=True, input_is_parallel=True
+                ),
             ]
         )
 
@@ -46,7 +88,7 @@ class TimestepEmbedder(nn.Module):
 
     @staticmethod
     def timestep_embedding(t, dim, max_period=10000):
-        with torch.amp.autocast("cuda", enabled=False):
+        with torch.amp.autocast(current_platform.device_type, enabled=False):
             half = dim // 2
             freqs = torch.exp(
                 -math.log(max_period)
@@ -74,17 +116,17 @@ class TimestepEmbedder(nn.Module):
 class FeedForward(nn.Module):
     def __init__(self, dim: int, hidden_dim: int):
         super().__init__()
-        self.w1 = ReplicatedLinear(dim, hidden_dim, bias=False)
-        self.w2 = ReplicatedLinear(hidden_dim, dim, bias=False)
-        self.w3 = ReplicatedLinear(dim, hidden_dim, bias=False)
-
-    def _forward_silu_gating(self, x1, x3):
-        return F.silu(x1) * x3
+        # Use MergedColumnParallelLinear for gate and up projection (fused)
+        self.w13 = MergedColumnParallelLinear(
+            dim, [hidden_dim, hidden_dim], bias=False, gather_output=False
+        )
+        self.w2 = RowParallelLinear(hidden_dim, dim, bias=False, input_is_parallel=True)
+        self.act = SiluAndMul()
 
     def forward(self, x):
-        x1, _ = self.w1(x)
-        x3, _ = self.w3(x)
-        out, _ = self.w2(self._forward_silu_gating(x1, x3))
+        x13, _ = self.w13(x)
+        x = self.act(x13)
+        out, _ = self.w2(x)
         return out
 
 
@@ -96,17 +138,63 @@ class ZImageAttention(nn.Module):
         num_kv_heads: int,
         qk_norm: bool = True,
         eps: float = 1e-6,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.dim = dim
+        self.head_dim = dim // num_heads
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads
-        self.head_dim = dim // num_heads
         self.qk_norm = qk_norm
 
-        self.to_q = ReplicatedLinear(dim, dim, bias=False)
-        self.to_k = ReplicatedLinear(dim, self.head_dim * num_kv_heads, bias=False)
-        self.to_v = ReplicatedLinear(dim, self.head_dim * num_kv_heads, bias=False)
+        tp_size = get_tp_world_size()
+        assert (
+            num_heads % tp_size == 0
+        ), f"num_heads {num_heads} must be divisible by tp world size {tp_size}"
+        assert (
+            num_kv_heads % tp_size == 0
+        ), f"num_kv_heads {num_kv_heads} must be divisible by tp world size {tp_size}"
+        self.local_num_heads = num_heads // tp_size
+        self.local_num_kv_heads = num_kv_heads // tp_size
+
+        kv_dim = self.head_dim * num_kv_heads
+        self.use_fused_qkv = isinstance(quant_config, NunchakuConfig)
+
+        if self.use_fused_qkv:
+            self.to_qkv = MergedColumnParallelLinear(
+                dim,
+                [dim, kv_dim, kv_dim],
+                bias=False,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_qkv",
+            )
+        else:
+            self.to_q = ColumnParallelLinear(
+                dim,
+                dim,
+                bias=False,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_q",
+            )
+            self.to_k = ColumnParallelLinear(
+                dim,
+                kv_dim,
+                bias=False,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_k",
+            )
+            self.to_v = ColumnParallelLinear(
+                dim,
+                kv_dim,
+                bias=False,
+                gather_output=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.to_v",
+            )
 
         if self.qk_norm:
             self.norm_q = RMSNorm(self.head_dim, eps=eps)
@@ -115,53 +203,146 @@ class ZImageAttention(nn.Module):
             self.norm_q = None
             self.norm_k = None
 
-        self.to_out = nn.ModuleList([ReplicatedLinear(dim, dim, bias=False)])
+        self.to_out = nn.ModuleList(
+            [
+                RowParallelLinear(
+                    dim,
+                    dim,
+                    bias=False,
+                    input_is_parallel=True,
+                    quant_config=quant_config,
+                    prefix=f"{prefix}.to_out.0",
+                )
+            ]
+        )
 
         self.attn = USPAttention(
-            num_heads=num_heads,
+            num_heads=self.local_num_heads,
             head_size=self.head_dim,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=self.local_num_kv_heads,
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
-            supported_attention_backends={
-                AttentionBackendEnum.FA,
-                AttentionBackendEnum.TORCH_SDPA,
-            },
+        )
+        self.ulysses_attn = UlyssesAttention(
+            num_heads=self.local_num_heads,
+            head_size=self.head_dim,
+            num_kv_heads=self.local_num_kv_heads,
+            softmax_scale=None,
+            causal=False,
         )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        num_replicated_prefix: int = 0,
+        num_replicated_suffix: int = 0,
     ):
-        q, _ = self.to_q(hidden_states)
-        k, _ = self.to_k(hidden_states)
-        v, _ = self.to_v(hidden_states)
-
-        q = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
-        k = k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)
-        v = v.view(*v.shape[:-1], self.num_kv_heads, self.head_dim)
-
-        if self.norm_q is not None:
-            q = self.norm_q(q)
-        if self.norm_k is not None:
-            k = self.norm_k(k)
-
-        # Apply RoPE
-        def apply_rotary_emb(
-            x_in: torch.Tensor,
-            freqs_cis: torch.Tensor,
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            cos, sin = freqs_cis
-            x_out = _apply_rotary_emb(x_in, cos, sin, is_neox_style=False)
-            return x_out
+        if self.use_fused_qkv:
+            qkv, _ = self.to_qkv(hidden_states)
+            q, k, v = qkv.split(
+                [
+                    self.local_num_heads * self.head_dim,
+                    self.local_num_kv_heads * self.head_dim,
+                    self.local_num_kv_heads * self.head_dim,
+                ],
+                dim=-1,
+            )
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+        else:
+            q, _ = self.to_q(hidden_states)
+            k, _ = self.to_k(hidden_states)
+            v, _ = self.to_v(hidden_states)
+        q = q.view(*q.shape[:-1], self.local_num_heads, self.head_dim)
+        k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
+        v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
 
         if freqs_cis is not None:
-            q = apply_rotary_emb(q, freqs_cis)
-            k = apply_rotary_emb(k, freqs_cis)
+            cos, sin = freqs_cis
+            if _is_cuda and q.shape == k.shape:
+                cos_sin_cache = torch.cat(
+                    [
+                        cos.to(dtype=torch.float32).contiguous(),
+                        sin.to(dtype=torch.float32).contiguous(),
+                    ],
+                    dim=-1,
+                )
+                if self.qk_norm:
+                    q, k = apply_qk_norm_with_optional_rope(
+                        q=q,
+                        k=k,
+                        q_norm=self.norm_q,
+                        k_norm=self.norm_k,
+                        head_dim=self.head_dim,
+                        cos_sin_cache=cos_sin_cache,
+                        is_neox=False,
+                        allow_inplace=True,
+                    )
+                else:
+                    q, k = apply_flashinfer_rope_qk_inplace(
+                        q, k, cos_sin_cache, is_neox=False
+                    )
+            else:
+                if self.qk_norm:
+                    q, k = apply_qk_norm_with_optional_rope(
+                        q=q,
+                        k=k,
+                        q_norm=self.norm_q,
+                        k_norm=self.norm_k,
+                        head_dim=self.head_dim,
+                        allow_inplace=True,
+                    )
+                q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
+                k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
+        elif self.qk_norm:
+            q, k = apply_qk_norm_with_optional_rope(
+                q=q,
+                k=k,
+                q_norm=self.norm_q,
+                k_norm=self.norm_k,
+                head_dim=self.head_dim,
+                allow_inplace=True,
+            )
 
-        hidden_states = self.attn(q, k, v)
+        if (
+            num_replicated_suffix > 0
+            and get_sp_world_size() > 1
+            and get_ring_parallel_world_size() == 1
+        ):
+            # the cap (last num_replicated_suffix tokens), as condition, should be replicated
+            q_shard, q_rep = (
+                q[:, :-num_replicated_suffix],
+                q[:, -num_replicated_suffix:],
+            )
+            k_shard, k_rep = (
+                k[:, :-num_replicated_suffix],
+                k[:, -num_replicated_suffix:],
+            )
+            v_shard, v_rep = (
+                v[:, :-num_replicated_suffix],
+                v[:, -num_replicated_suffix:],
+            )
+            hidden_states, hidden_states_rep = self.ulysses_attn(
+                q_shard,
+                k_shard,
+                v_shard,
+                replicated_q=q_rep,
+                replicated_k=k_rep,
+                replicated_v=v_rep,
+            )
+            assert hidden_states_rep is not None
+            hidden_states = torch.cat([hidden_states, hidden_states_rep], dim=1)
+        else:
+            hidden_states = self.attn(
+                q,
+                k,
+                v,
+                num_replicated_prefix=num_replicated_prefix,
+                num_replicated_suffix=num_replicated_suffix,
+            )
         hidden_states = hidden_states.flatten(2)
 
         hidden_states, _ = self.to_out[0](hidden_states)
@@ -179,6 +360,8 @@ class ZImageTransformerBlock(nn.Module):
         norm_eps: float,
         qk_norm: bool,
         modulation=True,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.dim = dim
@@ -192,9 +375,41 @@ class ZImageTransformerBlock(nn.Module):
             num_kv_heads=n_kv_heads,
             qk_norm=qk_norm,
             eps=1e-5,
+            quant_config=quant_config,
+            prefix=f"{prefix}.attention",
         )
+        if not modulation:
+            # Context refiner runs on fully replicated caption tokens only.
+            # Bypass Ulysses here to preserve the single-GPU attention semantics.
+            self.attention.attn.skip_sequence_parallel = True
 
-        self.feed_forward = FeedForward(dim=dim, hidden_dim=int(dim / 3 * 8))
+        hidden_dim = int(dim / 3 * 8)
+        nunchaku_enabled = (
+            isinstance(quant_config, NunchakuConfig) and is_nunchaku_available()
+        )
+        if nunchaku_enabled:
+            import diffusers
+
+            ff = diffusers.models.attention.FeedForward(
+                dim=dim,
+                dim_out=dim,
+                activation_fn="swiglu",
+                inner_dim=hidden_dim,
+                bias=False,
+            )
+            nunchaku_kwargs = {
+                "precision": quant_config.precision,
+                "rank": quant_config.rank,
+                "act_unsigned": quant_config.act_unsigned,
+            }
+            self.feed_forward = NunchakuFeedForward(ff, **nunchaku_kwargs)
+            # NunchakuFeedForward overrides net[2].act_unsigned=True for int4 (GELU-specific
+            # optimization for non-negative activations). Z-Image uses SwiGLU whose output
+            # can be negative, so we must restore the original act_unsigned value.
+            if hasattr(self.feed_forward, "net") and len(self.feed_forward.net) > 2:
+                self.feed_forward.net[2].act_unsigned = quant_config.act_unsigned
+        else:
+            self.feed_forward = FeedForward(dim=dim, hidden_dim=hidden_dim)
 
         self.attention_norm1 = RMSNorm(dim, eps=norm_eps)
         self.ffn_norm1 = RMSNorm(dim, eps=norm_eps)
@@ -212,6 +427,8 @@ class ZImageTransformerBlock(nn.Module):
         x: torch.Tensor,
         freqs_cis: Tuple[torch.Tensor, torch.Tensor],
         adaln_input: Optional[torch.Tensor] = None,
+        num_replicated_prefix: int = 0,
+        num_replicated_suffix: int = 0,
     ):
         if self.modulation:
             assert adaln_input is not None
@@ -219,36 +436,65 @@ class ZImageTransformerBlock(nn.Module):
             scale_msa, gate_msa, scale_mlp, gate_mlp = scale_msa_gate.unsqueeze(
                 1
             ).chunk(4, dim=2)
-            gate_msa, gate_mlp = gate_msa.tanh(), gate_mlp.tanh()
-            scale_msa, scale_mlp = 1.0 + scale_msa, 1.0 + scale_mlp
+            scale_msa = 1.0 + scale_msa
 
             # Attention block
             attn_out = self.attention(
                 self.attention_norm1(x) * scale_msa,
                 freqs_cis=freqs_cis,
+                num_replicated_prefix=num_replicated_prefix,
+                num_replicated_suffix=num_replicated_suffix,
             )
-            x = x + gate_msa * self.attention_norm2(attn_out)
+            if (
+                _is_cuda
+                and attn_out.is_cuda
+                and attn_out.shape[-1] % 256 == 0
+                and attn_out.shape[-1] <= 8192
+                and self.attention_norm2.variance_epsilon
+                == self.ffn_norm1.variance_epsilon
+            ):
+                from sglang.jit_kernel.diffusion.cutedsl.norm_tanh_mul_add_norm_scale import (
+                    fused_norm_tanh_mul_add_norm_scale,
+                )
+
+                x, ffn_in = fused_norm_tanh_mul_add_norm_scale(
+                    attn_out.contiguous(),
+                    self.attention_norm2.weight.data.contiguous(),
+                    None,
+                    gate_msa.contiguous(),
+                    x.contiguous(),
+                    self.ffn_norm1.weight.data.contiguous(),
+                    None,
+                    scale_mlp.contiguous(),
+                    "rms",
+                    self.attention_norm2.variance_epsilon,
+                )
+            else:
+                x = apply_rmsnorm_tanh_mul_add(
+                    attn_out, gate_msa, x, self.attention_norm2
+                )
+                ffn_in = self.ffn_norm1(x) * (1.0 + scale_mlp)
 
             # FFN block
-            x = x + gate_mlp * self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x) * scale_mlp,
-                )
-            )
+            ffn_out = self.feed_forward(ffn_in)
+            x = apply_rmsnorm_tanh_mul_add(ffn_out, gate_mlp, x, self.ffn_norm2)
         else:
             # Attention block
+            attn_input = self.attention_norm1(x)
             attn_out = self.attention(
-                self.attention_norm1(x),
+                attn_input,
                 freqs_cis=freqs_cis,
+                num_replicated_prefix=num_replicated_prefix,
+                num_replicated_suffix=num_replicated_suffix,
             )
             x = x + self.attention_norm2(attn_out)
 
             # FFN block
-            x = x + self.ffn_norm2(
-                self.feed_forward(
-                    self.ffn_norm1(x),
-                )
+            ffn_input = self.ffn_norm1(x)
+            ffn_out = self.feed_forward(
+                ffn_input,
             )
+            x = x + self.ffn_norm2(ffn_out)
 
         return x
 
@@ -257,7 +503,9 @@ class FinalLayer(nn.Module):
     def __init__(self, hidden_size, out_channels):
         super().__init__()
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.linear = ReplicatedLinear(hidden_size, out_channels, bias=True)
+        self.linear = ColumnParallelLinear(
+            hidden_size, out_channels, bias=True, gather_output=True
+        )
 
         self.act = nn.SiLU()
         self.adaLN_modulation = nn.Sequential(
@@ -341,14 +589,43 @@ class RopeEmbedder:
         return torch.cat(cos_out, dim=-1), torch.cat(sin_out, dim=-1)
 
 
-class ZImageTransformer2DModel(CachableDiT):
+class ZImageTransformer2DModel(CachableDiT, OffloadableDiTMixin):
     _supports_gradient_checkpointing = True
     _no_split_modules = ["ZImageTransformerBlock"]
+    _fsdp_shard_conditions = ZImageDitConfig().arch_config._fsdp_shard_conditions
+    param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
+
+    param_names_mapping = ZImageDitConfig().arch_config.param_names_mapping
+    reverse_param_names_mapping = (
+        ZImageDitConfig().arch_config.reverse_param_names_mapping
+    )
+
+    @classmethod
+    def get_nunchaku_quant_rules(cls) -> dict[str, list[str]]:
+        return {
+            "skip": [
+                "norm",
+                "embed",
+                "rotary",
+                "pos_embed",
+            ],
+            "svdq_w4a4": [
+                "attention.to_qkv",
+                "attention.to_out",
+                "img_mlp",
+                "txt_mlp",
+            ],
+            "awq_w4a16": [
+                "img_mod",
+                "txt_mod",
+            ],
+        }
 
     def __init__(
         self,
         config: ZImageDitConfig,
         hf_config: dict[str, Any],
+        quant_config: Optional[QuantizationConfig] = None,
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
 
@@ -373,10 +650,11 @@ class ZImageTransformer2DModel(CachableDiT):
         for patch_idx, (patch_size, f_patch_size) in enumerate(
             zip(self.all_patch_size, self.all_f_patch_size)
         ):
-            x_embedder = ReplicatedLinear(
+            x_embedder = ColumnParallelLinear(
                 f_patch_size * patch_size * patch_size * self.in_channels,
                 self.dim,
                 bias=True,
+                gather_output=True,
             )
             all_x_embedder[f"{patch_size}-{f_patch_size}"] = x_embedder
 
@@ -398,6 +676,8 @@ class ZImageTransformer2DModel(CachableDiT):
                     arch_config.norm_eps,
                     arch_config.qk_norm,
                     modulation=True,
+                    quant_config=quant_config,
+                    prefix=f"noise_refiner.{layer_id}",
                 )
                 for layer_id in range(arch_config.n_refiner_layers)
             ]
@@ -412,6 +692,8 @@ class ZImageTransformer2DModel(CachableDiT):
                     arch_config.norm_eps,
                     arch_config.qk_norm,
                     modulation=False,
+                    quant_config=quant_config,
+                    prefix=f"context_refiner.{layer_id}",
                 )
                 for layer_id in range(arch_config.n_refiner_layers)
             ]
@@ -437,6 +719,8 @@ class ZImageTransformer2DModel(CachableDiT):
                     arch_config.n_kv_heads,
                     arch_config.norm_eps,
                     arch_config.qk_norm,
+                    quant_config=quant_config,
+                    prefix=f"layers.{layer_id}",
                 )
                 for layer_id in range(arch_config.num_layers)
             ]
@@ -449,6 +733,7 @@ class ZImageTransformer2DModel(CachableDiT):
         self.rotary_emb = RopeEmbedder(
             theta=self.rope_theta, axes_dims=self.axes_dims, axes_lens=self.axes_lens
         )
+        self.layer_names = ["layers"]
 
     def unpatchify(
         self, x: List[torch.Tensor], size: List[Tuple], patch_size, f_patch_size
@@ -481,12 +766,19 @@ class ZImageTransformer2DModel(CachableDiT):
         grids = torch.meshgrid(axes, indexing="ij")
         return torch.stack(grids, dim=-1)
 
+    @staticmethod
+    def _ceil_to_multiple(value: int, multiple: int) -> int:
+        if multiple <= 0:
+            return value
+        return int(math.ceil(value / multiple) * multiple)
+
     def patchify_and_embed(
         self,
         all_image: List[torch.Tensor],
         all_cap_feats: List[torch.Tensor],
         patch_size: int,
         f_patch_size: int,
+        image_seq_len_target: int | None = None,
     ):
         assert len(all_image) == len(all_cap_feats) == 1
 
@@ -495,10 +787,11 @@ class ZImageTransformer2DModel(CachableDiT):
         pH = pW = patch_size
         pF = f_patch_size
         device = image.device
-
         all_image_out = []
         all_image_size = []
         all_cap_feats_out = []
+        all_image_valid_lens = []
+        all_cap_valid_lens = []
 
         # ------------ Process Caption ------------
         cap_ori_len = cap_feat.size(0)
@@ -510,6 +803,7 @@ class ZImageTransformer2DModel(CachableDiT):
             dim=0,
         )
         all_cap_feats_out.append(cap_padded_feat)
+        all_cap_valid_lens.append(cap_ori_len)
 
         # ------------ Process Image ------------
         C, F, H, W = image.size()
@@ -522,7 +816,12 @@ class ZImageTransformer2DModel(CachableDiT):
             F_tokens * H_tokens * W_tokens, pF * pH * pW * C
         )
         image_ori_len = image.size(0)
-        image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
+        min_image_seq_len = self._ceil_to_multiple(image_ori_len, SEQ_MULTI_OF)
+        if image_seq_len_target is None:
+            image_seq_len_target = min_image_seq_len
+        else:
+            image_seq_len_target = max(min_image_seq_len, image_seq_len_target)
+        image_padding_len = image_seq_len_target - image_ori_len
 
         # padded feature
         image_padded_feat = torch.cat(
@@ -530,11 +829,14 @@ class ZImageTransformer2DModel(CachableDiT):
             dim=0,
         )
         all_image_out.append(image_padded_feat)
+        all_image_valid_lens.append(image_ori_len)
 
         return (
             all_image_out,
             all_cap_feats_out,
             all_image_size,
+            all_image_valid_lens,
+            all_cap_valid_lens,
         )
 
     def forward(
@@ -546,6 +848,7 @@ class ZImageTransformer2DModel(CachableDiT):
         patch_size=2,
         f_patch_size=1,
         freqs_cis=None,
+        image_seq_len_target: int | None = None,
         **kwargs,
     ):
         assert patch_size in self.all_patch_size
@@ -563,43 +866,85 @@ class ZImageTransformer2DModel(CachableDiT):
             x,
             cap_feats,
             x_size,
-        ) = self.patchify_and_embed(x, cap_feats, patch_size, f_patch_size)
+            x_valid_lens,
+            cap_valid_lens,
+        ) = self.patchify_and_embed(
+            x,
+            cap_feats,
+            patch_size,
+            f_patch_size,
+            image_seq_len_target=image_seq_len_target,
+        )
 
         x = torch.cat(x, dim=0)
         x, _ = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](x)
+        if x_valid_lens[0] < x.shape[0]:
+            x[x_valid_lens[0] :] = self.x_pad_token.to(dtype=x.dtype)
         x_freqs_cis = freqs_cis[1]
 
         x = x.unsqueeze(0)
         x_freqs_cis = x_freqs_cis
-        for layer in self.noise_refiner:
+        for layer_id, layer in enumerate(self.noise_refiner):
             x = layer(x, x_freqs_cis, adaln_input)
 
         cap_feats = torch.cat(cap_feats, dim=0)
 
         cap_feats, _ = self.cap_embedder(cap_feats)
+        if cap_valid_lens[0] < cap_feats.shape[0]:
+            cap_feats[cap_valid_lens[0] :] = self.cap_pad_token.to(
+                dtype=cap_feats.dtype
+            )
 
         cap_freqs_cis = freqs_cis[0]
 
         cap_feats = cap_feats.unsqueeze(0)
-        for layer in self.context_refiner:
-            cap_feats = layer(cap_feats, cap_freqs_cis)
+        cap_input_dtype = cap_feats.dtype
+        for layer_id, layer in enumerate(self.context_refiner):
+            cap_feats = layer(
+                cap_feats,
+                cap_freqs_cis,
+            )
 
+        cap_seq_len = cap_feats.shape[1]
+        use_full_unified_sequence = (
+            get_sp_world_size() > 1 and get_ring_parallel_world_size() > 1
+        )
+        x_local_seq_len = x.shape[1]
+        if use_full_unified_sequence:
+            x = sequence_model_parallel_all_gather(x.contiguous(), dim=1)
+            x_freqs_cis = (
+                sequence_model_parallel_all_gather(x_freqs_cis[0].contiguous(), dim=0),
+                sequence_model_parallel_all_gather(x_freqs_cis[1].contiguous(), dim=0),
+            )
         unified = torch.cat([x, cap_feats], dim=1)
         unified_freqs_cis = (
             torch.cat([x_freqs_cis[0], cap_freqs_cis[0]], dim=0),
             torch.cat([x_freqs_cis[1], cap_freqs_cis[1]], dim=0),
         )
+        num_replicated_suffix = cap_seq_len if not use_full_unified_sequence else 0
 
-        for layer in self.layers:
-            unified = layer(unified, unified_freqs_cis, adaln_input)
+        for layer_id, layer in enumerate(self.layers):
+            layer.attention.attn.skip_sequence_parallel = use_full_unified_sequence
+            unified = layer(
+                unified,
+                unified_freqs_cis,
+                adaln_input,
+                num_replicated_suffix=num_replicated_suffix,
+            )
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
             unified, adaln_input
         )
-        unified = list(unified.unbind(dim=0))
-        x = self.unpatchify(unified, x_size, patch_size, f_patch_size)
+        if use_full_unified_sequence:
+            sp_rank = get_sp_parallel_rank()
+            start = sp_rank * x_local_seq_len
+            end = start + x_local_seq_len
+            unified = unified[:, start:end]
+        x = list(unified.unbind(dim=0))
+        x = self.unpatchify(x, x_size, patch_size, f_patch_size)
 
-        return -x[0]
+        # Keep batch dim so output shape matches input (e.g. rollout/scheduler expect same ndim).
+        return -torch.stack(x)
 
 
 EntryClass = ZImageTransformer2DModel

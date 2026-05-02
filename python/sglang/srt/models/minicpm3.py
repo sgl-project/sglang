@@ -40,9 +40,35 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.utils import add_prefix, is_cuda
+from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 if is_cuda():
-    from sgl_kernel import bmm_fp8
+    from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
+
+    from sglang.srt.utils.custom_op import register_custom_op
+
+    # TODO(yuwei): remove this wrapper after sgl-kernel registers its own fake/meta impl
+    # Wrap bmm_fp8 as a custom op so torch.compile does not trace into
+    # torch.cuda.current_blas_handle() (which returns a non-Tensor).
+    @register_custom_op(mutates_args=["out"])
+    def _bmm_fp8_op(
+        A: torch.Tensor,
+        B: torch.Tensor,
+        out: torch.Tensor,
+        A_scale: torch.Tensor,
+        B_scale: torch.Tensor,
+    ) -> None:
+        _raw_bmm_fp8(A, B, A_scale, B_scale, out.dtype, out)
+
+    def bmm_fp8(A, B, A_scale, B_scale, dtype, out=None):
+        if out is None:
+            out = torch.empty(
+                (A.shape[0], A.shape[1], B.shape[2]),
+                device=A.device,
+                dtype=dtype,
+            )
+        _bmm_fp8_op(A, B, out, A_scale, B_scale)
+        return out
 
 
 class MiniCPM3MLP(nn.Module):
@@ -239,7 +265,9 @@ class MiniCPM3AttentionMLA(nn.Module):
 
         original_shapes = [q_pe.shape, k_pe.shape]
         q_pe, k_pe = self.rotary_emb(
-            positions, q_pe.reshape(q_pe.shape[0], -1), k_pe.reshape(k_pe.shape[0], -1)
+            positions,
+            q_pe.reshape(-1, q_pe.shape[1] * q_pe.shape[2]),
+            k_pe.reshape(-1, k_pe.shape[1] * k_pe.shape[2]),
         )
         q_pe, k_pe = q_pe.view(original_shapes[0]), k_pe.view(original_shapes[1])
         q_input[..., self.kv_lora_rank :] = q_pe
@@ -278,8 +306,7 @@ class MiniCPM3DecoderLayer(nn.Module):
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
-        rope_theta = getattr(config, "rope_theta", 10000)
-        rope_scaling = getattr(config, "rope_scaling", None)
+        rope_theta, rope_scaling = get_rope_config(config)
         max_position_embeddings = getattr(config, "max_position_embeddings", 8192)
         self.self_attn = MiniCPM3AttentionMLA(
             config=config,

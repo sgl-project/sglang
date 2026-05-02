@@ -4,14 +4,15 @@ from typing import Any, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_BLACKWELL,
+    DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,7 @@ if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
     from deep_gemm.utils.layout import get_mn_major_tma_aligned_tensor  # noqa: F401
 
-_SANITY_CHECK = get_bool_env_var("SGLANG_DEEPGEMM_SANITY_CHECK")
+_SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
 
 
 # TODO maybe rename these functions
@@ -102,13 +103,27 @@ def gemm_nt_f8f8bf16(
         )
 
 
+def gemm_nt_bf16bf16f32(
+    lhs: torch.Tensor,
+    rhs: torch.Tensor,
+    out: torch.Tensor,
+):
+    m, k = lhs.shape
+    n, _ = rhs.shape
+    num_groups = 1
+    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_BF16BF16F32
+
+    with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
+        deep_gemm.bf16_gemm_nt(lhs, rhs, out)
+
+
 def update_deep_gemm_config(gpu_id: int, server_args: ServerArgs):
     compile_utils.update_deep_gemm_config(gpu_id, server_args)
 
 
 @contextmanager
 def configure_deep_gemm_num_sms(num_sms):
-    if num_sms is None:
+    if num_sms is None or not ENABLE_JIT_DEEPGEMM:
         yield
     else:
         original_num_sms = deep_gemm.get_num_sms()

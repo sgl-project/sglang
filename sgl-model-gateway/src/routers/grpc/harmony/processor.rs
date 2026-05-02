@@ -3,11 +3,13 @@
 use std::sync::Arc;
 
 use axum::response::Response;
+use smg_grpc_client::sglang_proto::generate_complete::MatchedStop::{
+    MatchedStopStr, MatchedTokenId,
+};
 use tracing::error;
 
 use super::HarmonyParserAdapter;
 use crate::{
-    grpc_client::sglang_proto::generate_complete::MatchedStop::{MatchedStopStr, MatchedTokenId},
     protocols::{
         chat::{ChatChoice, ChatCompletionMessage, ChatCompletionRequest, ChatCompletionResponse},
         common::{CompletionTokensDetails, ToolCall, Usage},
@@ -29,7 +31,7 @@ use crate::{
 ///
 /// Collects all output tokens from execution and parses them using
 /// HarmonyParserAdapter to extract the complete response.
-pub struct HarmonyResponseProcessor;
+pub(crate) struct HarmonyResponseProcessor;
 
 impl HarmonyResponseProcessor {
     /// Create a new Harmony response processor
@@ -155,7 +157,7 @@ impl Default for HarmonyResponseProcessor {
 ///
 /// Used by the MCP tool loop to determine whether to continue
 /// executing tools or return the final response.
-pub enum ResponsesIterationResult {
+pub(crate) enum ResponsesIterationResult {
     /// Tool calls found in commentary channel - continue MCP loop
     ToolCallsFound {
         tool_calls: Vec<ToolCall>,

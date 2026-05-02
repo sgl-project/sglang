@@ -11,7 +11,6 @@ import inspect
 import math
 import os
 import signal
-import socket
 import sys
 import threading
 import traceback
@@ -21,13 +20,8 @@ from functools import lru_cache, partial, wraps
 from typing import Any, TypeVar, cast
 
 import cloudpickle
-import imageio
-import numpy as np
 import torch
-import torchvision
 import yaml
-from einops import rearrange
-from remote_pdb import RemotePdb
 from torch.distributed.fsdp import MixedPrecisionPolicy
 
 import sglang.multimodal_gen.envs as envs
@@ -39,6 +33,24 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 logger = init_logger(__name__)
 
 T = TypeVar("T")
+
+
+def expand_path_fields(obj) -> None:
+    """In-place expanduser on all dataclass fields whose name ends with '_path' or '_paths'."""
+    eu = os.path.expanduser
+    for f in fields(obj):
+        v = getattr(obj, f.name)
+        if f.name.endswith("_path") and isinstance(v, str):
+            setattr(obj, f.name, eu(v))
+        elif f.name.endswith("_path") and isinstance(v, list):
+            setattr(obj, f.name, [eu(x) if isinstance(x, str) else x for x in v])
+        elif f.name.endswith("_paths") and isinstance(v, dict):
+            setattr(
+                obj,
+                f.name,
+                {k: eu(p) if isinstance(p, str) else p for k, p in v.items()},
+            )
+
 
 # TODO(will): used to convert server_args.precision to torch.dtype. Find a
 # cleaner way to do this.
@@ -56,8 +68,8 @@ def find_nccl_library() -> str:
     """
     We either use the library file specified by the `VLLM_NCCL_SO_PATH`
     environment variable, or we find the library file brought by PyTorch.
-    After importing `torch`, `libnccl.so.2` or `librccl.so.1` can be
-    found by `ctypes` automatically.
+    After importing `torch`, `libnccl.so.2`, `librccl.so.1` or `libmccl.so.2`
+    can be found by `ctypes` automatically.
     """
     so_file = envs.SGLANG_DIFFUSION_NCCL_SO_PATH
 
@@ -72,8 +84,10 @@ def find_nccl_library() -> str:
             so_file = "libnccl.so.2"
         elif torch.version.hip is not None:
             so_file = "librccl.so.1"
+        elif hasattr(torch.version, "musa") and torch.version.musa is not None:
+            so_file = "libmccl.so.2"
         else:
-            raise ValueError("NCCL only supports CUDA and ROCm backends.")
+            raise ValueError("NCCL only supports CUDA, ROCm and MUSA backends.")
         logger.info("Found nccl from library %s", so_file)
     return str(so_file)
 
@@ -548,15 +562,6 @@ class TypeBasedDispatcher:
         raise ValueError(f"Invalid object: {obj}")
 
 
-# For non-torch.distributed debugging
-def remote_breakpoint() -> None:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        s.bind(("localhost", 0))  # Let the OS pick an ephemeral port.
-        port = s.getsockname()[1]
-        RemotePdb(host="localhost", port=port).set_trace()
-
-
 @dataclass
 class MixedPrecisionState:
     param_dtype: torch.dtype | None = None
@@ -600,11 +605,7 @@ def set_mixed_precision_policy(
 
 
 def get_compute_dtype() -> torch.dtype:
-    """Get the current compute dtype from mixed precision policy.
-
-    Returns:
-        torch.dtype: The compute dtype to use, defaults to get_default_dtype() if no policy set
-    """
+    """Get the current compute dtype from mixed precision policy."""
     if not hasattr(_mixed_precision_state, "state"):
         return torch.get_default_dtype()
     else:
@@ -786,21 +787,6 @@ def best_output_size(w, h, dw, dh, expected_area):
         return ow1, oh1
     else:
         return ow2, oh2
-
-
-def save_decoded_latents_as_video(
-    decoded_latents: list[torch.Tensor], output_path: str, fps: int
-):
-    # Process outputs
-    videos = rearrange(decoded_latents, "b c t h w -> t b c h w")
-    frames = []
-    for x in videos:
-        x = torchvision.utils.make_grid(x, nrow=6)
-        x = x.transpose(0, 1).transpose(1, 2).squeeze(-1)
-        frames.append((x * 255).numpy().astype(np.uint8))
-
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    imageio.mimsave(output_path, frames, fps=fps, format="mp4")
 
 
 def calculate_dimensions(target_area, ratio):

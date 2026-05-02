@@ -179,7 +179,7 @@ def _bmm_chunk_fwd(a, b, chunk_size, seq_idx=None, causal=False, output_dtype=No
         batch,
         nchunks if not has_groups else nchunks * ngroups,
     )
-    with torch.cuda.device(a.device.index):
+    with torch.get_device_module(a.device).device(a.device.index):
         _bmm_chunk_fwd_kernel[grid](
             a,
             b,

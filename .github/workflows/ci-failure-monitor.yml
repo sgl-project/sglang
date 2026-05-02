@@ -2,7 +2,7 @@ name: CI Failure Monitor
 
 on:
   schedule:
-    - cron: '0 */3 * * *' # Every 3 hour
+    - cron: '0 */12 * * *' # Every 12 hour
   workflow_dispatch:
 
 concurrency:
@@ -29,11 +29,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests slack_sdk
+          pip install requests
 
       - name: Run Failure Analysis
         env:
           GITHUB_TOKEN: ${{ secrets.GH_PAT_FOR_NIGHTLY_CI_DATA }}
+          GH_PAT_FOR_RUNNER_ADMIN: ${{ secrets.GH_PAT_FOR_RUNNER_ADMIN }}
           PYTHONUNBUFFERED: 1
           PYTHONIOENCODING: utf-8
         run: |
@@ -50,22 +51,3 @@ jobs:
           path: |
             scripts/ci_monitor/ci_failure_analysis_*.json
           retention-days: 7
-
-      - name: Send Slack Notification
-        if: always()
-        env:
-          SGLANG_DIFFUSION_SLACK_TOKEN: ${{ secrets.SGLANG_DIFFUSION_SLACK_TOKEN }}
-        run: |
-          cd scripts/ci_monitor
-          LATEST_REPORT=$(ls -t ci_failure_analysis_*.json | head -1)
-
-          if [ ! -f "$LATEST_REPORT" ]; then
-            echo "No report found, so skipping Slack notification"
-            exit 0
-          fi
-
-          if [ -n "$SGLANG_DIFFUSION_SLACK_TOKEN" ]; then
-            python3 post_ci_failures_to_slack.py --report-file "$LATEST_REPORT"
-          else
-            echo "SGLANG_DIFFUSION_SLACK_TOKEN not configured, skipping notification"
-          fi

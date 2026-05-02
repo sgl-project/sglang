@@ -11,6 +11,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
     AttentionMetadataBuilder,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 
 
 class AITerBackend(AttentionBackend):
@@ -19,8 +20,8 @@ class AITerBackend(AttentionBackend):
     """
 
     @staticmethod
-    def get_name() -> str:
-        return "AITER"
+    def get_enum() -> AttentionBackendEnum:
+        return AttentionBackendEnum.AITER
 
     @staticmethod
     def get_impl_cls() -> type["AITerImpl"]:
@@ -52,15 +53,6 @@ class AITerImpl(AttentionImpl):
         dropout_p: float = 0.0,
         **extra_impl_args,
     ) -> None:
-        super().__init__(
-            num_heads=num_heads,
-            head_size=head_size,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            num_kv_heads=num_kv_heads,
-            prefix=prefix,
-            **extra_impl_args,
-        )
         if num_kv_heads is not None and num_kv_heads != num_heads:
             raise NotImplementedError(
                 "AITer backend does not support Grouped Query Attention yet."
@@ -79,16 +71,14 @@ class AITerImpl(AttentionImpl):
         Performs attention using aiter.flash_attn_func.
 
         Args:
-            query: Query tensor of shape [batch_size, num_heads, seq_len, head_dim]
-            key: Key tensor of shape [batch_size, num_heads, seq_len, head_dim]
-            value: Value tensor of shape [batch_size, num_heads, seq_len, head_dim]
+            query: Query tensor of shape [batch_size, seq_len, num_heads, head_dim]
+            key: Key tensor of shape [batch_size, seq_len, num_heads, head_dim]
+            value: Value tensor of shape [batch_size, seq_len, num_heads, head_dim]
             attn_metadata: Metadata for the attention operation (unused).
 
         Returns:
-            Output tensor of shape [batch_size, num_heads, seq_len, head_dim]
+            Output tensor of shape [batch_size, seq_len, num_heads, head_dim]
         """
-        # aiter.flash_attn_func expects tensors in [B, H, S, D] layout,
-        # which is what ring_attn provides.
         output, _ = aiter.flash_attn_func(
             query,
             key,

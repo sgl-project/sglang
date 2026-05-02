@@ -1,11 +1,10 @@
 use super::*;
-use crate::core::ConnectionMode;
 
 /// Configuration validator
-pub struct ConfigValidator;
+pub(crate) struct ConfigValidator;
 
 impl ConfigValidator {
-    pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
+    pub(crate) fn validate(config: &RouterConfig) -> ConfigResult<()> {
         Self::validate_mode(&config.mode)?;
         Self::validate_policy(&config.policy)?;
         Self::validate_server_settings(config)?;
@@ -148,7 +147,10 @@ impl ConfigValidator {
 
     fn validate_policy(policy: &PolicyConfig) -> ConfigResult<()> {
         match policy {
-            PolicyConfig::Random | PolicyConfig::RoundRobin => {}
+            PolicyConfig::Random
+            | PolicyConfig::RoundRobin
+            | PolicyConfig::Manual { .. }
+            | PolicyConfig::ConsistentHashing => {}
             PolicyConfig::CacheAware {
                 cache_threshold,
                 balance_abs_threshold: _,
@@ -224,6 +226,26 @@ impl ConfigValidator {
                         field: "bucket_adjust_interval_secs".to_string(),
                         value: bucket_adjust_interval_secs.to_string(),
                         reason: "Must be < 4294967296s".to_string(),
+                    });
+                }
+            }
+            PolicyConfig::PrefixHash {
+                prefix_token_count,
+                load_factor,
+            } => {
+                if *prefix_token_count == 0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "prefix_token_count".to_string(),
+                        value: prefix_token_count.to_string(),
+                        reason: "Must be > 0".to_string(),
+                    });
+                }
+
+                if *load_factor < 1.0 {
+                    return Err(ConfigError::InvalidValue {
+                        field: "load_factor".to_string(),
+                        value: load_factor.to_string(),
+                        reason: "Must be >= 1.0".to_string(),
                     });
                 }
             }
@@ -517,15 +539,6 @@ impl ConfigValidator {
             return Ok(());
         }
 
-        if matches!(config.connection_mode, ConnectionMode::Grpc { .. })
-            && config.tokenizer_path.is_none()
-            && config.model_path.is_none()
-        {
-            return Err(ConfigError::ValidationFailed {
-                reason: "gRPC connection mode requires either --tokenizer-path or --model-path to be specified".to_string(),
-            });
-        }
-
         Self::validate_mtls(config)?;
 
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled);
@@ -624,6 +637,7 @@ impl ConfigValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::ConnectionMode;
 
     #[test]
     fn test_validate_regular_mode() {
@@ -950,27 +964,6 @@ mod tests {
 
         // Should pass validation even with empty URLs
         assert!(ConfigValidator::validate(&config).is_ok());
-    }
-
-    #[test]
-    fn test_validate_grpc_requires_tokenizer() {
-        let mut config = RouterConfig::new(
-            RoutingMode::Regular {
-                worker_urls: vec!["grpc://worker:50051".to_string()],
-            },
-            PolicyConfig::Random,
-        );
-
-        // Set connection mode to gRPC without tokenizer config
-        config.connection_mode = ConnectionMode::Grpc { port: None };
-        config.tokenizer_path = None;
-        config.model_path = None;
-
-        let result = ConfigValidator::validate(&config);
-        assert!(result.is_err());
-        if let Err(e) = result {
-            assert!(e.to_string().contains("gRPC connection mode requires"));
-        }
     }
 
     #[test]

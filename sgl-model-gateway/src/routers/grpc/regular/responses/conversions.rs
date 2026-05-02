@@ -19,6 +19,7 @@ use crate::{
             ResponseReasoningContent::ReasoningText, ResponseStatus, ResponsesRequest,
             ResponsesResponse, ResponsesUsage, StringOrContentParts, TextConfig, TextFormat,
         },
+        UNKNOWN_MODEL_ID,
     },
     routers::grpc::common::responses::utils::extract_tools_from_response_tools,
 };
@@ -32,7 +33,7 @@ use crate::{
 /// - `tools` → function tools extracted from ResponseTools
 /// - `tool_choice` → passed through from request
 /// - Response-specific fields (previous_response_id, conversation) are handled by router
-pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, String> {
+pub(crate) fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest, String> {
     let mut messages = Vec::new();
 
     // 1. Add system message if instructions provided
@@ -171,7 +172,7 @@ pub fn responses_to_chat(req: &ResponsesRequest) -> Result<ChatCompletionRequest
     Ok(ChatCompletionRequest {
         messages,
         model: if req.model.is_empty() {
-            "default".to_string()
+            UNKNOWN_MODEL_ID.to_string()
         } else {
             req.model.clone()
         },
@@ -270,7 +271,7 @@ fn map_text_to_response_format(text: &Option<TextConfig>) -> Option<ResponseForm
 /// - `choices[0].message` → `output` array (convert to ResponseOutputItem::Message)
 /// - `choices[0].finish_reason` → determines `status` (stop/length → Completed)
 /// - `created` timestamp → `created_at`
-pub fn chat_to_responses(
+pub(crate) fn chat_to_responses(
     chat_resp: &ChatCompletionResponse,
     original_req: &ResponsesRequest,
     response_id_override: Option<String>,

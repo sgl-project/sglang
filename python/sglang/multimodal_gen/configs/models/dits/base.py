@@ -28,8 +28,11 @@ class DiTArchConfig(ArchConfig):
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,
             AttentionBackendEnum.FA,
+            AttentionBackendEnum.AITER,
+            AttentionBackendEnum.AITER_SAGE,
             AttentionBackendEnum.TORCH_SDPA,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
+            AttentionBackendEnum.SPARSE_VIDEO_GEN_2_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.SAGE_ATTN_3,
         }

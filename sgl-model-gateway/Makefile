@@ -20,7 +20,7 @@ endif
 
 .PHONY: help build test clean docs check fmt dev-setup pre-commit setup-sccache sccache-stats sccache-clean sccache-stop \
         python-dev python-build python-build-release python-install python-clean python-test python-check \
-        release-notes
+        show-version bump-version release-notes
 
 help: ## Show this help message
 	@echo "Model Gateway Development Commands"
@@ -120,7 +120,7 @@ python-clean: ## Clean Python build artifacts
 
 python-test: ## Run Python tests
 	@echo "Running Python tests..."
-	@pytest py_test/ -v
+	@pytest e2e_test/ -v
 
 python-check: ## Check Python package with twine
 	@echo "Checking Python package..."
@@ -135,6 +135,49 @@ dev: python-dev ## Quick development setup (build Python bindings in dev mode)
 install: python-install ## Build and install everything
 
 # Release management
+VERSION_FILES := Cargo.toml \
+                 bindings/golang/Cargo.toml \
+                 bindings/python/Cargo.toml \
+                 bindings/python/pyproject.toml \
+                 bindings/python/src/sglang_router/version.py
+
+show-version: ## Show current version across all files
+	@echo "Current versions:"
+	@echo "  Cargo.toml:                 $$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+	@echo "  bindings/golang/Cargo.toml: $$(grep -m1 '^version = ' bindings/golang/Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+	@echo "  bindings/python/Cargo.toml: $$(grep -m1 '^version = ' bindings/python/Cargo.toml | sed 's/version = "\(.*\)"/\1/')"
+	@echo "  bindings/python/pyproject.toml: $$(grep -m1 '^version = ' bindings/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')"
+	@echo "  bindings/python/.../version.py: $$(grep '__version__' bindings/python/src/sglang_router/version.py | sed 's/__version__ = "\(.*\)"/\1/')"
+
+bump-version: ## Bump version across all files (usage: make bump-version VERSION=0.3.3)
+	@if [ -z "$(VERSION)" ]; then \
+		echo "Usage: make bump-version VERSION=<new-version>"; \
+		echo "Example: make bump-version VERSION=0.3.3"; \
+		echo ""; \
+		echo "Current version:"; \
+		grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/  \1/'; \
+		exit 1; \
+	fi
+	@echo "Bumping version to $(VERSION)..."
+	@# Update main Cargo.toml (line 3)
+	@sed -i.bak 's/^version = ".*"/version = "$(VERSION)"/' Cargo.toml && rm -f Cargo.toml.bak
+	@# Update golang binding Cargo.toml
+	@sed -i.bak 's/^version = ".*"/version = "$(VERSION)"/' bindings/golang/Cargo.toml && rm -f bindings/golang/Cargo.toml.bak
+	@# Update python binding Cargo.toml
+	@sed -i.bak 's/^version = ".*"/version = "$(VERSION)"/' bindings/python/Cargo.toml && rm -f bindings/python/Cargo.toml.bak
+	@# Update pyproject.toml
+	@sed -i.bak 's/^version = ".*"/version = "$(VERSION)"/' bindings/python/pyproject.toml && rm -f bindings/python/pyproject.toml.bak
+	@# Update version.py
+	@sed -i.bak 's/__version__ = ".*"/__version__ = "$(VERSION)"/' bindings/python/src/sglang_router/version.py && rm -f bindings/python/src/sglang_router/version.py.bak
+	@echo "Version updated to $(VERSION) in all files:"
+	@echo "  - Cargo.toml"
+	@echo "  - bindings/golang/Cargo.toml"
+	@echo "  - bindings/python/Cargo.toml"
+	@echo "  - bindings/python/pyproject.toml"
+	@echo "  - bindings/python/src/sglang_router/version.py"
+	@echo ""
+	@echo "Verify with: make show-version"
+
 release-notes: ## Generate release notes for gateway (usage: make release-notes PREV=gateway-v0.2.2 CURR=gateway-v1.0.0)
 	@if [ -z "$(PREV)" ] || [ -z "$(CURR)" ]; then \
 		echo "Usage: make release-notes PREV=<previous-tag> CURR=<current-tag>"; \
