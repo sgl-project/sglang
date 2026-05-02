@@ -505,9 +505,8 @@ struct SiluAndMulContigPostQuantKernel {
           .verify(output_scale);
     } else {
       RuntimeCheck(kScaleUE8M0, "transposed layout only supports scale_ue8m0=true");
-      RuntimeCheck(num_groups % 4 == 0, "transposed layout requires num_groups % 4 == 0");
       auto G_ = SymbolicSize{"G // 4"};
-      G_.set_value(num_groups / 4);
+      G_.set_value(div_ceil(num_groups, 4));
       auto M_pad = SymbolicSize{"M padded"};
       TensorMatcher({M, G_})                  // `.transpose(-1,-2)[:M,:]` view of (G//4_pad, M_pad) int32
           .with_strides({int64_t{1}, M_pad})  // col-major transposed
