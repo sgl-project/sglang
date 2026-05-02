@@ -311,6 +311,7 @@ class DeepseekV2MLP(nn.Module):
                 quant_group_size=scale_block_size,
                 scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
                 transposed=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+                swiglu_limit=float(self.swiglu_limit),
                 observe=False,
             )
             down_output = gate_up.new_empty(
