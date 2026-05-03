@@ -24,7 +24,6 @@ from sglang.srt.ug.interleaved import (
     normalize_ug_generation_mode,
 )
 from sglang.srt.ug.runtime import FakeUGModelRunner, UGSessionRuntime
-from sglang.srt.ug.srt_executor import UGSRTRequestBoundaryExecutor
 
 
 class _UGRuntimeTreeCache:
@@ -39,54 +38,34 @@ def _build_srt_owned_ug_runtime(
     model_runner=None,
     *,
     scheduler=None,
-    srt_request_executor=None,
-    srt_u_decode_max_new_tokens: int = 0,
     srt_image_tokenization: Literal["multimodal", "text_placeholder"] = "multimodal",
 ) -> UGSessionRuntime:
-    if srt_request_executor is None:
-        srt_request_executor = _build_srt_request_executor(scheduler)
-    session_controller = (
-        srt_request_executor.session_controller
-        if scheduler is not None
-        else SessionController(_UGRuntimeTreeCache())
-    )
-    model_config = getattr(scheduler, "model_config", None)
-    return UGSessionRuntime(
-        model_runner=model_runner or FakeUGModelRunner(),
-        session_controller=session_controller,
-        srt_request_executor=srt_request_executor,
-        tokenizer=getattr(scheduler, "tokenizer", None),
-        vocab_size=getattr(model_config, "vocab_size", 32000),
-        srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
-        srt_image_tokenization=srt_image_tokenization,
-    )
-
-
-def _build_srt_request_executor(scheduler=None):
     if scheduler is not None:
         raise ValueError(
             "Native UG scheduler execution is intentionally split out of the lean "
             "interleave contract PR"
         )
-    return UGSRTRequestBoundaryExecutor()
+    session_controller = SessionController(_UGRuntimeTreeCache())
+    model_config = getattr(scheduler, "model_config", None)
+    return UGSessionRuntime(
+        model_runner=model_runner or FakeUGModelRunner(),
+        session_controller=session_controller,
+        tokenizer=getattr(scheduler, "tokenizer", None),
+        vocab_size=getattr(model_config, "vocab_size", 32000),
+        srt_image_tokenization=srt_image_tokenization,
+    )
 
 
 def _load_ug_bridge(
     model_path: str,
     *,
     scheduler=None,
-    srt_u_decode_max_new_tokens: int | None = None,
 ) -> UGDenoiserBridge:
-    if srt_u_decode_max_new_tokens is None:
-        srt_u_decode_max_new_tokens = 1 if scheduler is not None else 0
-    srt_request_executor = _build_srt_request_executor(scheduler)
     model_path_lower = model_path.lower()
     if "fake-ug" in model_path_lower:
         return SRTBackedUGDenoiserBridge(
             _build_srt_owned_ug_runtime(
                 scheduler=scheduler,
-                srt_request_executor=srt_request_executor,
-                srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
             )
         )
     raise ValueError(f"Unsupported UG model path: {model_path}")
@@ -107,11 +86,6 @@ class UGPipeline(ComposedPipelineBase):
             "ug_bridge": _load_ug_bridge(
                 self.model_path,
                 scheduler=getattr(server_args, "ug_srt_scheduler", None),
-                srt_u_decode_max_new_tokens=getattr(
-                    server_args,
-                    "ug_srt_u_decode_max_new_tokens",
-                    None,
-                ),
             )
         }
 

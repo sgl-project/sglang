@@ -209,9 +209,6 @@ class UGRuntimeStats:
     append_image_count: int = 0
     decode_count: int = 0
     srt_request_count: int = 0
-    srt_executed_request_count: int = 0
-    srt_sidecar_request_count: int = 0
-    srt_u_decode_request_count: int = 0
 
     @classmethod
     def from_debug_counters(cls, counters: dict[str, Any]) -> "UGRuntimeStats":
@@ -225,13 +222,6 @@ class UGRuntimeStats:
             append_image_count=int(counters.get("append_image_count", 0)),
             decode_count=int(counters.get("decode_count", 0)),
             srt_request_count=int(counters.get("srt_request_count", 0)),
-            srt_executed_request_count=int(
-                counters.get("srt_executed_request_count", 0)
-            ),
-            srt_sidecar_request_count=int(counters.get("srt_sidecar_request_count", 0)),
-            srt_u_decode_request_count=int(
-                counters.get("srt_u_decode_request_count", 0)
-            ),
         )
 
 

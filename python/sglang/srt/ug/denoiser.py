@@ -300,7 +300,7 @@ class SRTBackedUGDenoiserBridge:
                 "UG think text generation"
             )
         if max_new_tokens is None:
-            max_new_tokens = max(1, int(self.runtime.srt_u_decode_max_new_tokens or 8))
+            max_new_tokens = 8
         max_new_tokens = int(max_new_tokens)
         if max_new_tokens <= 0:
             raise ValueError(
