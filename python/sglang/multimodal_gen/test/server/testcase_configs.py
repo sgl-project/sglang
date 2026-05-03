@@ -257,6 +257,7 @@ class DiffusionTestCase:
     sampling_params: DiffusionSamplingParams
     run_perf_check: bool = True
     run_consistency_check: bool = True
+    run_component_accuracy_check: bool = True
     run_models_api_check: bool = True
     run_t2v_input_reference_check: bool = True
     run_lora_basic_api_check: bool = False
@@ -463,6 +464,7 @@ def _make_modelopt_ci_case(
         sampling_params,
         run_perf_check=False,
         run_consistency_check=False,
+        run_component_accuracy_check=False,
     )
 
 

@@ -161,6 +161,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(model_path=DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST),
         TI2I_sampling_params,
         run_consistency_check=False,
+        run_component_accuracy_check=False,
     ),
     # Upscaling (Real-ESRGAN 4×) for T2I
     DiffusionTestCase(
@@ -344,6 +345,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             },
         ),
         T2I_sampling_params,
+        run_component_accuracy_check=False,
     ),
 ]
 
@@ -538,6 +540,7 @@ TWO_GPU_CASES = [
             ],
         ),
         TI2V_sampling_params,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "wan2_1_i2v_14b_480P_2gpu",
@@ -558,6 +561,7 @@ TWO_GPU_CASES = [
             ],
         ),
         T2V_sampling_params,
+        run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
     DiffusionTestCase(
@@ -630,6 +634,7 @@ TWO_GPU_CASES = [
             ulysses_degree=2,
         ),
         TI2V_sampling_params,
+        run_component_accuracy_check=False,
     ),
 ]
 
