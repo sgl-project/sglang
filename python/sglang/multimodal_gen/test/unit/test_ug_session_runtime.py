@@ -64,7 +64,7 @@ class TestUGSessionRuntime(unittest.TestCase):
             [UGInterleavedMessage(type="text", content="hello")]
         )
 
-        self.assertEqual(runtime.records[handle.session_id].state, UGSegmentState.U_DECODE)
+        self.assertEqual(runtime.get_state(handle), UGSegmentState.U_DECODE)
         with self.assertRaisesRegex(ValueError, "Cannot enter G_DENOISE"):
             runtime.predict_velocity(
                 UGVelocityRequest(
@@ -114,7 +114,7 @@ class TestUGSessionRuntime(unittest.TestCase):
         runtime.close_session(handle)
 
         self.assertEqual(tree_cache.released_sessions, [handle.session_id])
-        self.assertTrue(runtime.records[handle.session_id].closed)
+        self.assertTrue(runtime.get_debug_counters(handle)["closed"])
 
 
 if __name__ == "__main__":
