@@ -21,6 +21,7 @@ on:
           - 4-gpu-a10
           - 4-gpu-b200
           - 8-gpu-h200
+          - 8-gpu-h200-deepep
           - 8-gpu-h20
           - 8-gpu-b200
           - ubuntu-latest
