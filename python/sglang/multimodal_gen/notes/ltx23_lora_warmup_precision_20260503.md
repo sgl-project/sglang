@@ -163,3 +163,16 @@ request warmup 会先跑一次 one-step request，并在 stage2 前把 transform
 - 本地 transformers `5.3.0` 中 `use_gqa_in_sdpa(attention_mask, key)` 只有在 `attention_mask is None` 且 torch 版本满足条件时才返回 true。
 - HF `sdpa_attention_forward` 逻辑是：如果 `not use_gqa_in_sdpa(...)`，先 `repeat_kv(key/value)`；否则才传 `enable_gqa=True`。
 - LTX2 Gemma text encoder 当前有 causal/padding additive mask，因此 official default SDPA 语义是 masked SDPA + explicit repeat KV，不是 masked SDPA + `enable_gqa=True`。
+
+## 2026-05-03 first attention QKV 断点复核
+
+- probe: `/tmp/ltx23_sdpa_qkv_probe_math.py` 抓 negative prompt 第一层 SDPA；当前 SGLang commit `fce2f378c`。
+- 对比 `/tmp/ltx23_qkv_official_neg` vs `/tmp/ltx23_qkv_sglang_neg_current`：
+  - `hidden_00`: exact。
+  - `query`: exact。
+  - `key/value`: SGLang 原始为 8 KV heads；按 GQA repeat 到 16 heads 后与 official exact。
+  - official SDPA meta: `key_shape=[1,16,1024,256]`, `value_shape=[1,16,1024,256]`, `mask_dtype=torch.bool`, `enable_gqa=None`。
+  - 当前 SGLang SDPA meta: `key_shape=[1,8,1024,256]`, `value_shape=[1,8,1024,256]`, `mask_dtype=torch.bfloat16`, `enable_gqa=True`。
+  - `sdpa_output_raw`: not exact, mean_abs `35.7053`, rms `56.4228`。
+  - `hidden_01`: not exact, mean_abs `1.6150`, rms `9.7864`（包含 padding tokens 的全量统计）。
+- 结论：第一处漂移不是 QKV/权重/RoPE，而是 masked SDPA 的调用语义：official default 是 repeated K/V + bool mask；当前 `enable_gqa=True` + additive bf16 mask 路径不等价。
