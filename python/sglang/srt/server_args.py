@@ -492,6 +492,7 @@ class ServerArgs:
     experts_shared_outer_loras: Optional[bool] = None
     lora_use_virtual_experts: bool = False
     lora_strict_loading: bool = False
+    lora_drain_wait_threshold: float = 0.0
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -772,6 +773,9 @@ class ServerArgs:
 
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
+
+    # For communications compression
+    enable_quant_communications: Optional[bool] = False
 
     # For msProbe
     msprobe_dump_config: Optional[str] = None
@@ -5255,6 +5259,12 @@ class ServerArgs:
             help="Enable strict loading for LoRA adapters. "
             "When set, mismatched or missing keys in the adapter weights will raise an error.",
         )
+        parser.add_argument(
+            "--lora-drain-wait-threshold",
+            type=float,
+            default=ServerArgs.lora_drain_wait_threshold,
+            help="When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
+        )
 
         # Kernel backend
         parser.add_argument(
@@ -6654,6 +6664,13 @@ class ServerArgs:
             help="JSON-formatted forward hook specifications to attach to the model.",
         )
 
+        parser.add_argument(
+            "--enable-quant-communications",
+            action="store_true",
+            default=False,
+            help="Enable INT8 quantization of TP communications (limited support).",
+        )
+
         # For msProbe
         parser.add_argument(
             "--msprobe-dump-config",
@@ -6929,6 +6946,17 @@ class ServerArgs:
                 "When enabling two batch overlap, moe_a2a_backend cannot be 'none'."
             )
 
+        # Check communications compression
+        if self.enable_quant_communications and self.tp_size == 1:
+            raise ValueError(
+                "Communications quantization is only used with tp_size != 1"
+            )
+
+        if self.enable_quant_communications and self.device != "npu":
+            raise ValueError(
+                "Communications quantization is only supported for NPU device"
+            )
+
         if (
             self.enable_grpc
             and self.grpc_port is not None
@@ -7064,6 +7092,10 @@ class ServerArgs:
                     f"Got: {self.lora_backend}"
                 )
                 logger.info("Virtual expert computation enabled.")
+
+            assert (
+                self.lora_drain_wait_threshold >= 0.0
+            ), "--lora-drain-wait-threshold must be non-negative."
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:
