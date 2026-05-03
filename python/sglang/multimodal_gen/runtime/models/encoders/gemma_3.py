@@ -316,17 +316,27 @@ class Gemma3Attention(nn.Module):
             min_val,
         )
 
-        attn_kwargs = {
-            "attn_mask": attn_mask,
-            "dropout_p": 0.0,
-            "is_causal": False,
-            "scale": self.scaling,
-        }
         if query.shape[1] != key.shape[1]:
-            attn_kwargs["enable_gqa"] = True
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query, key, value, **attn_kwargs
-        )
+            num_key_value_groups = query.shape[1] // key.shape[1]
+            key = key[:, :, None, :, :].expand(
+                batch_size, key.shape[1], num_key_value_groups, seq_len, self.head_dim
+            )
+            value = value[:, :, None, :, :].expand(
+                batch_size,
+                value.shape[1],
+                num_key_value_groups,
+                seq_len,
+                self.head_dim,
+            )
+            key = key.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
+            value = value.reshape(batch_size, query.shape[1], seq_len, self.head_dim)
+
+        attn_weights = torch.matmul(query, key.transpose(2, 3)) * self.scaling
+        attn_weights = attn_weights + attn_mask
+        attn_weights = torch.nn.functional.softmax(
+            attn_weights, dim=-1, dtype=torch.float32
+        ).to(query.dtype)
+        attn_output = torch.matmul(attn_weights, value)
         attn_output = attn_output.transpose(1, 2)
 
         attn_output = attn_output.reshape(
