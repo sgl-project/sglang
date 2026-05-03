@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, cast
 
 import torch
 import tvm_ffi
+from tvm_ffi import Module
 
 from sglang.jit_kernel.utils import (
     cache_once,
@@ -92,7 +93,7 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_custom_all_reduce_pull_module(dtype: torch.dtype, world_size: int):
+def _jit_custom_all_reduce_pull_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
     return load_jit(
         "custom_all_reduce_pull",
@@ -104,7 +105,7 @@ def _jit_custom_all_reduce_pull_module(dtype: torch.dtype, world_size: int):
 
 
 @cache_once
-def _jit_custom_all_reduce_push_module(dtype: torch.dtype, world_size: int):
+def _jit_custom_all_reduce_push_module(dtype: torch.dtype, world_size: int) -> Module:
     args = make_cpp_args(dtype, world_size, is_arch_support_pdl())
     return load_jit(
         "custom_all_reduce_push",
@@ -112,6 +113,24 @@ def _jit_custom_all_reduce_push_module(dtype: torch.dtype, world_size: int):
         extra_ldflags=["-lcuda"],
         cuda_files=["distributed/custom_all_reduce_push.cuh"],
         cuda_wrappers=[("all_reduce", f"custom_all_reduce<{args}>")],
+    )
+
+
+@cache_once
+def _jit_fused_parallel_qknorm_module(
+    dtype: torch.dtype, world_size: int, q_dim: int, k_dim: int
+) -> Module:
+    args = make_cpp_args(dtype, world_size, q_dim, k_dim, is_arch_support_pdl())
+    cls_name = f"FusedParallelQKNormAcrossHead<{args}>"
+    return load_jit(
+        "tp_qknorm",
+        *args,
+        extra_ldflags=["-lcuda"],
+        cuda_files=["distributed/tp_qknorm.cuh"],
+        cuda_wrappers=[
+            ("fused_parallel_qknorm", f"{cls_name}::run"),
+            ("get_max_occupancy", f"{cls_name}::get_max_occupancy"),
+        ],
     )
 
 
@@ -144,18 +163,21 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
             max_pull_blocks: Optional[int] = None,
             max_push_blocks: Optional[int] = None,
         ) -> None:
+            max_pull_blocks = NUM_CTA if max_pull_blocks is None else max_pull_blocks
+            max_push_blocks = NUM_CTA if max_push_blocks is None else max_push_blocks
             self.__ffi_init__(
                 rank,
                 world_size,
-                NUM_CTA if max_pull_blocks is None else max_pull_blocks,
-                NUM_CTA if max_push_blocks is None else max_push_blocks,
+                max_pull_blocks,
+                max_push_blocks,
                 pull_buffer_bytes,
                 push_buffer_bytes,
                 graph_input_count,
             )
             self._world_size = world_size
-            self._pull_config = ConfigResult(NUM_CTA, MAX_THREADS)
-            self.configure_pull(*self._pull_config)  # type: ignore
+            self._pull_config = ConfigResult(min(NUM_CTA, max_pull_blocks), MAX_THREADS)
+            if max_pull_blocks > 0:  # special case: cannot configure 0 blocks
+                self.configure_pull(*self._pull_config)  # type: ignore
 
         @property
         def world_size(self) -> int:
@@ -194,3 +216,25 @@ def get_custom_all_reduce_cls() -> type[CustomAllReduceObj]:
             self.free_storage()  # type: ignore
 
     return cast(type["CustomAllReduceObj"], CustomAllReduceObjReal)
+
+
+def get_fused_parallel_qknorm_max_occupancy(
+    dtype: torch.dtype, world_size: int, q_dim: int, k_dim: int
+) -> int:
+    module = _jit_fused_parallel_qknorm_module(dtype, world_size, q_dim, k_dim)
+    return module.get_max_occupancy()
+
+
+def fused_parallel_qknorm(
+    custom_ar: CustomAllReduceObj,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> None:
+    world_size = custom_ar.world_size
+    q_dim = q.shape[-1] * world_size
+    k_dim = k.shape[-1] * world_size
+    module = _jit_fused_parallel_qknorm_module(q.dtype, world_size, q_dim, k_dim)
+    module.fused_parallel_qknorm(custom_ar, q, k, q_weight, k_weight, eps)

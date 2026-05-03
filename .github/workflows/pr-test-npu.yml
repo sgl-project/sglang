@@ -60,10 +60,11 @@ jobs:
               - "python/sglang/!(multimodal_gen)/**/!(*.md)"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
-              - "test/srt/ascend/**"
+              - "test/registered/ascend/**"
               - ".github/workflows/pr-test-npu.yml"
             multimodal_gen:
-              - "python/sglang/multimodal_gen/**/*.!(md|ipynb)"
+              - "python/sglang/multimodal_gen/**/!(*.md|*.ipynb)"
+              - "python/sglang/jit_kernel/diffusion/triton/npu_fallback.py"
               - "python/sglang/srt/**"
               - "python/pyproject_npu.toml"
               - "scripts/ci/npu/npu_ci_install_dependency.sh"
@@ -102,6 +103,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -154,6 +157,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -202,6 +207,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -251,6 +258,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -297,6 +306,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -319,10 +330,20 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
-          python3 sglang/multimodal_gen/test/run_suite.py --suite 1-npu
+          python3 sglang/multimodal_gen/test/run_suite_npu.py --suite 1-npu
+
+      - name: Upload diffusion failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-failures-npu-1-${{ github.run_attempt }}
+          path: diffusion-failures/
+          if-no-files-found: ignore
+          retention-days: 7
 
   multimodal-gen-test-2-npu-a3:
     needs: [check-changes, pr-gate]
@@ -344,6 +365,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -366,10 +389,20 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
           export PATH="/usr/local/Ascend/8.3.RC1/compiler/bishengir/bin:${PATH}"
           cd python
-          python3 sglang/multimodal_gen/test/run_suite.py --suite 2-npu
+          python3 sglang/multimodal_gen/test/run_suite_npu.py --suite 2-npu
+
+      - name: Upload diffusion failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-failures-npu-2-${{ github.run_attempt }}
+          path: diffusion-failures/
+          if-no-files-found: ignore
+          retention-days: 7
 
   multimodal-gen-test-8-npu-a3:
     needs: [check-changes, pr-gate]
@@ -391,6 +424,8 @@ jobs:
           PYPI_CACHE_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           UV_INDEX_URL: "http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple"
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
+          RUSTUP_DIST_SERVER: "https://rsproxy.cn"
+          RUSTUP_UPDATE_ROOT: "https://rsproxy.cn/rustup"
         run: |
           # speed up by using infra cache services
           CACHING_URL="cache-service.nginx-pypi-cache.svc.cluster.local"
@@ -413,9 +448,19 @@ jobs:
           TORCH_EXTENSIONS_DIR: /tmp/torch_extensions
           PYTORCH_NPU_ALLOC_CONF: "expandable_segments:True"
           STREAMS_PER_DEVICE: 32
+          SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
           cd python
-          python3 sglang/multimodal_gen/test/run_suite.py --suite 8-npu
+          python3 sglang/multimodal_gen/test/run_suite_npu.py --suite 8-npu
+
+      - name: Upload diffusion failure artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diffusion-failures-npu-8-${{ github.run_attempt }}
+          path: diffusion-failures/
+          if-no-files-found: ignore
+          retention-days: 7
 
   pr-test-npu-finish:
     needs:

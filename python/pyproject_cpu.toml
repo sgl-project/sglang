@@ -31,6 +31,7 @@ dependencies = [
   "llguidance>=0.7.11,<0.8.0",
   "modelscope",
   "msgspec",
+  "easydict",
   "ninja",
   "numpy",
   "openai-harmony==0.0.4",
@@ -60,8 +61,8 @@ dependencies = [
   "torchaudio==2.9.0",
   "torchvision==0.24.0",
   "tqdm",
-  "mistral_common>=1.9.0",
-  "transformers==5.3.0",
+  "mistral_common>=1.11.0",
+  "transformers==5.6.0",
   "triton==3.5.0",
   "uvicorn",
   "uvloop",
@@ -70,6 +71,26 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+diffusion = [
+  "PyYAML==6.0.1",
+  "cloudpickle==3.1.2",
+  "diffusers==0.37.0",
+  "imageio==2.36.0",
+  "imageio-ffmpeg==0.5.1",
+  "moviepy>=2.0.0",
+  "opencv-python-headless==4.10.0.84",
+  "remote-pdb==2.1.0",
+  "st_attn==0.0.7 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
+  "vsa==0.0.4 ; platform_machine != 'aarch64' and platform_machine != 'arm64'",
+  "runai_model_streamer>=0.15.5",
+  "cache-dit==1.3.0",
+  "addict==2.4.0",
+  "av==16.1.0",
+  "scikit-image==0.25.2",
+  "trimesh>=4.0.0",
+  "xatlas",
+]
+
 tracing = [
   "opentelemetry-sdk",
   "opentelemetry-api",
@@ -127,4 +148,6 @@ exclude = [
 [tool.setuptools_scm]
 root = ".."
 version_file = "sglang/_version.py"
-git_describe_command = ["python3", "python/tools/get_version_tag.py", "--tag-only"]
+git_describe_command = ["python3", "python/tools/get_version_tag.py"]
+# Allow editable installs even when .git metadata is not available.
+fallback_version = "0.0.0.dev0"

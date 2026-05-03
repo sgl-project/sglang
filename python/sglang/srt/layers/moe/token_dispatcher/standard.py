@@ -34,7 +34,6 @@ from sglang.srt.utils.common import (
     get_bool_env_var,
     get_device,
     is_hip,
-    is_sm120_supported,
 )
 
 _is_hip = is_hip()
@@ -45,14 +44,13 @@ if TYPE_CHECKING:
 
 
 try:
-    if is_sm120_supported():
-        from flashinfer import fp4_quantize
-    else:
-        from sglang.jit_kernel.nvfp4 import scaled_fp4_quant as fp4_quantize
-
     from flashinfer import fp4_quantize as fp4_quantize_flashinfer
+    from flashinfer import (
+        nvfp4_block_scale_interleave as nvfp4_block_scale_interleave_flashinfer,
+    )
 except ImportError:
-    fp4_quantize = None
+    fp4_quantize_flashinfer = None
+    nvfp4_block_scale_interleave_flashinfer = None
 
 
 class StandardDispatchOutput(NamedTuple):
@@ -101,12 +99,14 @@ class StandardDispatcher(BaseDispatcher):
             get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
         self.num_experts = moe_runner_config.num_experts
+        self.num_local_experts = moe_runner_config.num_local_experts
         self.num_local_shared_experts = moe_runner_config.num_fused_shared_experts
         self.num_local_routed_experts = (
-            moe_runner_config.num_local_experts - self.num_local_shared_experts
+            self.num_local_experts - self.num_local_shared_experts
         )
         self.moe_ep_rank = get_moe_expert_parallel_rank()
         self.local_expert_mapping = None
+        self.expert_mask_gpu = None
 
     def dispatch(
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
@@ -114,8 +114,15 @@ class StandardDispatcher(BaseDispatcher):
 
         if should_use_flashinfer_cutlass_moe_fp4_allgather():
             # all-gather fp4 hidden states
-            from flashinfer import nvfp4_block_scale_interleave
-
+            if (
+                fp4_quantize_flashinfer is None
+                or nvfp4_block_scale_interleave_flashinfer is None
+            ):
+                raise RuntimeError(
+                    "FlashInfer fp4_quantize and nvfp4_block_scale_interleave "
+                    "are required for the flashinfer_cutlass FP4 all-gather "
+                    "path."
+                )
             global_scale = self.quant_config.get("input_global_scale", None)
             assert global_scale is not None, "input_global_scale is not set"
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
@@ -140,7 +147,7 @@ class StandardDispatcher(BaseDispatcher):
                 [topk_weights, topk_ids, x, x_sf], sizes=get_dp_global_num_tokens()
             )
             # TODO: fuse into cutlass moe
-            x_sf = nvfp4_block_scale_interleave(x_sf)
+            x_sf = nvfp4_block_scale_interleave_flashinfer(x_sf)
 
             hidden_states = x
             hidden_states_scale = x_sf
@@ -182,13 +189,23 @@ class StandardDispatcher(BaseDispatcher):
                         )
                     )
 
-        if self.local_expert_mapping is not None and not _use_aiter:
-            if TopKOutputChecker.format_is_standard(topk_output):
-                topk_output = topk_output._replace(
-                    topk_ids=self.local_expert_mapping[topk_output.topk_ids]
+        if self.local_expert_mapping is not None:
+            if _use_aiter:
+                self.expert_mask_gpu = (
+                    (
+                        (self.local_expert_mapping >= 0)
+                        & (self.local_expert_mapping < self.num_local_experts)
+                    )
+                    .to(torch.int32)
+                    .to(device="cuda")
                 )
-            elif TopKOutputChecker.format_is_triton_kernels(topk_output):
-                raise NotImplementedError()
+            else:
+                if TopKOutputChecker.format_is_standard(topk_output):
+                    topk_output = topk_output._replace(
+                        topk_ids=self.local_expert_mapping[topk_output.topk_ids]
+                    )
+                elif TopKOutputChecker.format_is_triton_kernels(topk_output):
+                    raise NotImplementedError()
 
         return StandardDispatchOutput(
             hidden_states=hidden_states,

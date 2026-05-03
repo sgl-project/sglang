@@ -22,6 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.jit_kernel.diffusion.group_norm_silu import apply_group_norm_silu
 from sglang.multimodal_gen.configs.models.vaes import HunyuanVAEConfig
 from sglang.multimodal_gen.runtime.layers.activation import get_act_fn
 from sglang.multimodal_gen.runtime.models.vaes.common import ParallelTiledVAE
@@ -258,12 +259,14 @@ class HunyuanVideoResnetBlockCausal3D(nn.Module):
         hidden_states = hidden_states.contiguous()
         residual = hidden_states
 
-        hidden_states = self.norm1(hidden_states)
-        hidden_states = self.nonlinearity(hidden_states)
+        hidden_states = apply_group_norm_silu(
+            hidden_states, self.norm1, self.nonlinearity
+        )
         hidden_states = self.conv1(hidden_states)
 
-        hidden_states = self.norm2(hidden_states)
-        hidden_states = self.nonlinearity(hidden_states)
+        hidden_states = apply_group_norm_silu(
+            hidden_states, self.norm2, self.nonlinearity
+        )
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.conv2(hidden_states)
 
@@ -631,8 +634,9 @@ class HunyuanVideoEncoder3D(nn.Module):
             assert self.mid_block is not None
             hidden_states = self.mid_block(hidden_states)
 
-        hidden_states = self.conv_norm_out(hidden_states)
-        hidden_states = self.conv_act(hidden_states)
+        hidden_states = apply_group_norm_silu(
+            hidden_states, self.conv_norm_out, self.conv_act
+        )
         hidden_states = self.conv_out(hidden_states)
 
         return hidden_states
@@ -753,8 +757,9 @@ class HunyuanVideoDecoder3D(nn.Module):
                 hidden_states = up_block(hidden_states)
 
         # post-process
-        hidden_states = self.conv_norm_out(hidden_states)
-        hidden_states = self.conv_act(hidden_states)
+        hidden_states = apply_group_norm_silu(
+            hidden_states, self.conv_norm_out, self.conv_act
+        )
         hidden_states = self.conv_out(hidden_states)
 
         return hidden_states

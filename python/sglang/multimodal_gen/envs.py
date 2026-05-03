@@ -55,8 +55,10 @@ if TYPE_CHECKING:
     SGLANG_CACHE_DIT_SECONDARY_TS_ORDER: int = 1
     # model loading
     SGLANG_USE_RUNAI_MODEL_STREAMER: bool = True
+    SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D: bool = False
     SGLANG_USE_ROCM_VAE: bool = False
+    SGLANG_USE_ROCM_CUDNN_BENCHMARK: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -277,12 +279,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_USE_RUNAI_MODEL_STREAMER": _lazy_bool(
         "SGLANG_USE_RUNAI_MODEL_STREAMER", "true"
     ),
-    # FlashInfer FP4 GEMM backend for the generic diffusion NVFP4 fallback.
+    # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
+    # Supported values:
+    # - auto
+    # - flashinfer_cudnn
+    # - flashinfer_cutlass
+    # - flashinfer_trtllm
+    # Legacy aliases `cudnn` and `trtllm` are also accepted.
     "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
     ),
     # ROCm: use AITer GroupNorm in VAE for improved performance
     "SGLANG_USE_ROCM_VAE": _lazy_bool("SGLANG_USE_ROCM_VAE"),
+    # ROCm: enable cudnn.benchmark (MIOpen auto-tuning) for VAE conv layers
+    "SGLANG_USE_ROCM_CUDNN_BENCHMARK": _lazy_bool("SGLANG_USE_ROCM_CUDNN_BENCHMARK"),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication

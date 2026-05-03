@@ -11,19 +11,17 @@ python3 -m unittest test_tokenizer_manager.TestTokenizerResultExtraction
 python3 -m unittest test_tokenizer_manager.TestTokenizerManagerIntegration
 python3 -m unittest test_tokenizer_manager.TestReqStateTextBuffering
 python3 -m unittest test_tokenizer_manager.TestReqStateCrashDump
-python3 -m unittest test_tokenizer_manager.TestMakeReqState
 """
 
 import asyncio
 import unittest
 from unittest.mock import Mock, patch
 
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.managers.tokenizer_manager import (
     InputFormat,
     ReqState,
     TokenizerManager,
-    make_req_state,
 )
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.server_args import PortArgs, ServerArgs
@@ -415,7 +413,7 @@ class TestTokenizerManagerIntegration(unittest.TestCase):
         self.assertIsNone(result_token_type_ids)
 
 
-def _make_state(buffer_text: bool = False) -> ReqState:
+def _make_state() -> ReqState:
     """Create a minimal ReqState for testing."""
     obj = Mock(spec=GenerateReqInput)
     return ReqState(
@@ -424,25 +422,26 @@ def _make_state(buffer_text: bool = False) -> ReqState:
         event=asyncio.Event(),
         obj=obj,
         time_stats=APIServerReqTimeStats(),
-        buffer_text=buffer_text,
     )
 
 
 class TestReqStateTextBuffering(unittest.TestCase):
     """Test ReqState.append_text / get_text in both buffering modes."""
 
-    def test_streaming_mode_concatenates_directly(self):
-        state = _make_state(buffer_text=False)
-        state.append_text("hello ")
-        state.append_text("world")
-        self.assertEqual(state.get_text(), "hello world")
-        self.assertEqual(state.text_chunks, [])
-
-    def test_buffer_mode_collects_chunks(self):
-        state = _make_state(buffer_text=True)
+    def test_collects_chunks_lazily(self):
+        state = _make_state()
         state.append_text("hello ")
         state.append_text("world")
         self.assertEqual(state.text, "")
+        self.assertEqual(state.text_chunks, ["hello ", "world"])
+        self.assertEqual(state.get_text(), "hello world")
+        self.assertEqual(state.text_chunks, [])
+
+    def test_get_text_preserves_materialized_prefix(self):
+        state = _make_state()
+        state.append_text("hello ")
+        self.assertEqual(state.get_text(), "hello ")
+        state.append_text("world")
         self.assertEqual(state.get_text(), "hello world")
 
 
@@ -450,58 +449,27 @@ class TestReqStateCrashDump(unittest.TestCase):
     """Test ReqState.get_crash_dump_output."""
 
     def test_empty_state(self):
-        state = _make_state(buffer_text=False)
+        state = _make_state()
         self.assertEqual(state.get_crash_dump_output(), {})
 
     def test_with_text_only(self):
-        state = _make_state(buffer_text=False)
+        state = _make_state()
         state.append_text("partial output")
         self.assertEqual(state.get_crash_dump_output(), {"text": "partial output"})
 
     def test_with_output_ids_only(self):
-        state = _make_state(buffer_text=False)
+        state = _make_state()
         state.output_ids = [1, 2, 3]
         self.assertEqual(state.get_crash_dump_output(), {"output_ids": [1, 2, 3]})
 
     def test_with_text_and_output_ids(self):
-        state = _make_state(buffer_text=False)
+        state = _make_state()
         state.append_text("hello")
         state.output_ids = [10, 20]
         self.assertEqual(
             state.get_crash_dump_output(),
             {"text": "hello", "output_ids": [10, 20]},
         )
-
-
-class TestMakeReqState(unittest.TestCase):
-    """Test make_req_state factory function."""
-
-    def _call(self, *, obj_stream=None):
-        if obj_stream is not None:
-            obj = Mock(spec=GenerateReqInput)
-            obj.stream = obj_stream
-        else:
-            obj = Mock(spec=EmbeddingReqInput)
-            del obj.stream
-        return make_req_state(
-            out_list=[],
-            finished=False,
-            event=asyncio.Event(),
-            obj=obj,
-            time_stats=APIServerReqTimeStats(),
-        )
-
-    def test_streaming_request_does_not_buffer(self):
-        state = self._call(obj_stream=True)
-        self.assertFalse(state.buffer_text)
-
-    def test_non_streaming_request_buffers(self):
-        state = self._call(obj_stream=False)
-        self.assertTrue(state.buffer_text)
-
-    def test_embedding_request_always_buffers(self):
-        state = self._call()
-        self.assertTrue(state.buffer_text)
 
 
 if __name__ == "__main__":

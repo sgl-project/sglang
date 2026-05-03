@@ -3925,6 +3925,119 @@ function call<|role_sep|>
         self.assertEqual(params["city"], "Rome")
 
 
+class TestGetStructureConstraint(unittest.TestCase):
+    """Tests for FunctionCallParser.get_structure_constraint() logic.
+
+    Verifies that detectors supporting structural_tag use it for required/named
+    tool_choice, and that the generic json_schema fallback is used otherwise.
+    """
+
+    def _make_tools(self, strict=False):
+        return [
+            Tool(
+                type="function",
+                function=Function(
+                    name="get_weather",
+                    description="Get weather",
+                    parameters={
+                        "type": "object",
+                        "properties": {"city": {"type": "string"}},
+                        "required": ["city"],
+                    },
+                    strict=strict,
+                ),
+            ),
+        ]
+
+    def _make_parser(self, parser_name, strict=False):
+        from sglang.srt.function_call.function_call_parser import FunctionCallParser
+
+        return FunctionCallParser(self._make_tools(strict=strict), parser_name)
+
+    # --- structural_tag detectors (kimi_k2, deepseekv3, qwen25, etc.) ---
+
+    def test_kimi_required_strict_returns_structural_tag(self):
+        parser = self._make_parser("kimi_k2", strict=True)
+        result = parser.get_structure_constraint("required")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        self.assertTrue(result[1].at_least_one)
+
+    def test_kimi_required_no_strict_returns_structural_tag(self):
+        """required should use structural_tag even without strict, to preserve native format."""
+        parser = self._make_parser("kimi_k2", strict=False)
+        result = parser.get_structure_constraint("required")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        self.assertTrue(result[1].at_least_one)
+
+    def test_kimi_auto_strict_returns_structural_tag(self):
+        parser = self._make_parser("kimi_k2", strict=True)
+        result = parser.get_structure_constraint("auto")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+        self.assertFalse(result[1].at_least_one)
+
+    def test_kimi_auto_no_strict_returns_none(self):
+        """auto without strict should not constrain."""
+        parser = self._make_parser("kimi_k2", strict=False)
+        result = parser.get_structure_constraint("auto")
+        self.assertIsNone(result)
+
+    def test_kimi_named_tool_choice_returns_structural_tag(self):
+        from sglang.srt.entrypoints.openai.protocol import (
+            ToolChoice,
+            ToolChoiceFuncName,
+        )
+
+        parser = self._make_parser("kimi_k2", strict=False)
+        tool_choice = ToolChoice(function=ToolChoiceFuncName(name="get_weather"))
+        result = parser.get_structure_constraint(tool_choice)
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+
+    def test_deepseekv3_required_no_strict_returns_structural_tag(self):
+        parser = self._make_parser("deepseekv3", strict=False)
+        result = parser.get_structure_constraint("required")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+
+    def test_qwen25_required_no_strict_returns_structural_tag(self):
+        parser = self._make_parser("qwen25", strict=False)
+        result = parser.get_structure_constraint("required")
+        self.assertIsNotNone(result)
+        self.assertEqual(result[0], "structural_tag")
+
+    # --- structural_tag content verification ---
+
+    def test_kimi_structural_tag_has_kimi_tokens(self):
+        """Verify structural_tag contains kimi-specific special tokens."""
+        parser = self._make_parser("kimi_k2", strict=True)
+        result = parser.get_structure_constraint("required")
+        tag = result[1]
+        structures = tag.structures
+        self.assertTrue(len(structures) > 0)
+        self.assertIn("<|tool_calls_section_begin|>", structures[0].begin)
+        self.assertIn("<|tool_call_end|>", structures[0].end)
+
+    def test_kimi_required_no_strict_uses_empty_schema(self):
+        """Without strict, structural_tag should use empty schema per OpenAI
+        protocol: strict=False means no parameter schema enforcement."""
+        parser = self._make_parser("kimi_k2", strict=False)
+        result = parser.get_structure_constraint("required")
+        tag = result[1]
+        self.assertEqual(tag.structures[0].schema_, {})
+
+    def test_kimi_required_strict_uses_tool_schema(self):
+        """With strict, structural_tag should include the tool's parameter schema."""
+        parser = self._make_parser("kimi_k2", strict=True)
+        result = parser.get_structure_constraint("required")
+        tag = result[1]
+        schema = tag.structures[0].schema_
+        self.assertIn("properties", schema)
+        self.assertIn("city", schema["properties"])
+
+
 class TestQwen25Detector(unittest.TestCase):
     """Test Qwen25Detector streaming and non-streaming multi-tool-call parsing."""
 

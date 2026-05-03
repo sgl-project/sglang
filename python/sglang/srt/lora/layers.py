@@ -39,6 +39,8 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_backend: BaseLoRABackend = lora_backend
         if hasattr(self.base_layer, "weight"):
             self.weight = self.base_layer.weight
+        if hasattr(self.base_layer, "bias") and self.base_layer.bias is not None:
+            self.bias = self.base_layer.bias
 
     def forward(self, x: torch.Tensor):
         return self.base_layer.forward(x)
@@ -70,6 +72,7 @@ class VocabParallelEmbeddingWithLoRA(BaseLayerWithLoRA):
         self.weight = base_layer.weight
         self.embed_dim = base_layer.embedding_dim
         self.vocab_size = base_layer.org_vocab_size
+        self.num_embeddings = base_layer.num_embeddings
 
         # Embedding LoRA with TP > 1 keeps weights fully replicated
         # (unsharded) on every rank.  This works correctly because the
@@ -471,6 +474,7 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         lora_backend: BaseLoRABackend,
     ) -> None:
         super().__init__(base_layer, lora_backend)
+        self.n_slices = len(self.base_layer.output_partition_sizes)
 
     def set_lora_info(
         self,
@@ -478,46 +482,89 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
         B_buffer: torch.Tensor,
     ):
         self.set_lora = True
-        self.A_buffer_gate_up = A_buffer
-        self.B_buffer_gate_up = B_buffer
+        self.A_buffer = A_buffer
+        self.B_buffer = B_buffer
 
-        shard_size = self.base_layer.output_partition_sizes[0]
+        # Build cumulative output offsets from the first `lora_n_slices`
+        # base partitions. `lora_n_slices` may be smaller than self.n_slices
+        # when only a subset of partitions are LoRA'd (e.g. Mamba in_proj
+        # has 5 partitions but stacked_multiply=2), so we can't precompute
+        # these in __init__.
+        lora_n_slices = self._get_lora_n_slices()
+        if lora_n_slices <= 0 or lora_n_slices > self.n_slices:
+            raise ValueError(
+                f"Invalid LoRA slice count {lora_n_slices} for "
+                f"{self.n_slices} base output partitions."
+            )
+        partition_sizes = list(self.base_layer.output_partition_sizes[:lora_n_slices])
+        offsets = [0]
+        for ps in partition_sizes:
+            offsets.append(offsets[-1] + ps)
+        if offsets[-1] != B_buffer.shape[-2]:
+            raise ValueError(
+                f"LoRA B output dim {B_buffer.shape[-2]} does not match "
+                f"base partition prefix dim {offsets[-1]} for {lora_n_slices} slices."
+            )
         self.output_offset = torch.tensor(
-            [
-                0,
-                shard_size,
-                2 * shard_size,
-            ],
+            offsets,
             dtype=torch.int32,
             device=next(self.base_layer.parameters()).device,
         )
+        self.output_offset_cpu = self.output_offset.cpu()
+        self.max_out_dim = max(partition_sizes)
+        self.use_gate_up_lora = (
+            lora_n_slices == 2 and partition_sizes[0] == partition_sizes[1]
+        )
+
+    def _get_lora_n_slices(self) -> int:
+        """Actual number of LoRA slices from the buffer shapes.
+
+        May differ from self.n_slices (base layer partitions) when only a
+        subset of partitions are LoRA'd (e.g. Mamba in_proj has 5 partitions
+        but stacked_multiply=2).
+        """
+        lora_rank = self.B_buffer.shape[-1]
+        if lora_rank == 0:
+            return self.n_slices
+        return self.A_buffer.shape[-2] // lora_rank
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        lora_output = self.lora_backend.run_gate_up_lora(
-            x=x,
-            gate_up_lora_a=self.A_buffer_gate_up,
-            gate_up_lora_b=self.B_buffer_gate_up,
-            output_offset=self.output_offset,
-            base_output=base_output,
-        )
+        lora_n_slices = self._get_lora_n_slices()
+        if lora_n_slices == 2 and self.use_gate_up_lora:
+            lora_output = self.lora_backend.run_gate_up_lora(
+                x=x,
+                gate_up_lora_a=self.A_buffer,
+                gate_up_lora_b=self.B_buffer,
+                output_offset=self.output_offset,
+                base_output=base_output,
+            )
+        else:
+            lora_output = self.lora_backend.run_qkv_lora(
+                x=x,
+                qkv_lora_a=self.A_buffer,
+                qkv_lora_b=self.B_buffer,
+                output_offset=self.output_offset,
+                output_offset_cpu=self.output_offset_cpu,
+                max_qkv_out_dim=self.max_out_dim,
+                base_output=base_output,
+                n_slices=lora_n_slices,
+            )
         return lora_output
 
     def slice_lora_a_weights(self, A: torch.Tensor, tp_rank: int):
         return A
 
     def slice_lora_b_weights(self, B: torch.Tensor, tp_rank: int):
-        # Since the outputs for both gate and up are identical, we use a random one.
-        shard_size = self.base_layer.output_partition_sizes[0]
-        gate_size = self.base_layer.output_sizes[0]
-        start_idx = tp_rank * shard_size
-        end_idx = (tp_rank + 1) * shard_size
-        return torch.concat(
-            (
-                B[start_idx:end_idx, :],
-                B[gate_size + start_idx : gate_size + end_idx],
-            ),
-            dim=0,
-        )
+        partition_sizes = self.base_layer.output_partition_sizes
+        output_sizes = self.base_layer.output_sizes
+        slices = []
+        offset = 0
+        for full_size, part_size in zip(output_sizes, partition_sizes):
+            start_idx = tp_rank * part_size
+            end_idx = start_idx + part_size
+            slices.append(B[offset + start_idx : offset + end_idx, :])
+            offset += full_size
+        return torch.concat(slices, dim=0)
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
@@ -629,7 +676,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
         return lora_output
 
-    def forward(self, input_: torch.Tensor, skip_all_reduce=False):
+    def forward(self, input_: torch.Tensor, skip_all_reduce=False, forward_batch=None):
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
@@ -693,8 +740,12 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
 
     Used for DeepSeek MLA's fused_qkv_a_proj_with_mqa, which fuses
     q_a_proj and kv_a_proj_with_mqa into a single replicated linear.
-    The two sub-projections have unequal output dimensions, so LoRA B
-    is applied via two separate sgemm calls, one per partition.
+    The two sub-projections have unequal output dimensions, so we use
+    the N-component fused kernel (run_qkv_lora) with n_slices=2 to
+    handle the split inside the triton kernel rather than in Python.
+
+    ``first_output_dim`` (set by LoRAManager after construction) marks the
+    boundary between the first and second sub-projection in the output.
     """
 
     first_output_dim: int = 0
@@ -711,55 +762,53 @@ class ReplicatedLinearWithLoRA(BaseLayerWithLoRA):
         self.set_lora = True
         self.A_buffer = A_buffer
         self.B_buffer = B_buffer
-        first = self.first_output_dim
-        if first > 0 and first < B_buffer.shape[-2]:
-            self.B_first = B_buffer[:, :first, :].contiguous()
-            self.B_second = B_buffer[:, first:, :].contiguous()
-            output_size = B_buffer.shape[-2]
-            self.first_offset = torch.tensor(
-                [0, first], dtype=torch.int32, device=B_buffer.device
+        first_dim = self.first_output_dim
+        if first_dim > 0:
+            second_dim = B_buffer.shape[-2] - first_dim
+            self._output_offset = torch.tensor(
+                [0, first_dim, first_dim + second_dim],
+                dtype=torch.int32,
+                device=B_buffer.device,
             )
-            self.second_offset = torch.tensor(
-                [0, output_size - first], dtype=torch.int32, device=B_buffer.device
-            )
+            self._output_offset_cpu = self._output_offset.cpu()
+            self._max_out_dim = max(first_dim, second_dim)
         else:
-            self.B_first = None
-            self.B_second = None
-            self.output_offset = torch.tensor(
-                [0, self.output_size],
+            # Single-projection path: csgmv backend requires an explicit
+            # slice_offsets tensor of shape [0, output_dim].
+            self._output_offset = torch.tensor(
+                [0, B_buffer.shape[-2]],
                 dtype=torch.int32,
                 device=B_buffer.device,
             )
 
     def apply_lora(self, base_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        if self.B_first is not None:
-            rank = self.B_buffer.shape[-1]
-            lora_a_output = self.lora_backend.run_lora_a_sgemm(
-                x, self.A_buffer, stack_num=2
-            )
-            first_out = base_output[:, : self.first_output_dim]
-            second_out = base_output[:, self.first_output_dim :]
-            self.lora_backend.run_lora_b_sgemm(
-                x=lora_a_output[:, :rank].contiguous(),
-                weights=self.B_first,
-                output_offset=self.first_offset,
-                base_output=first_out,
-            )
-            self.lora_backend.run_lora_b_sgemm(
-                x=lora_a_output[:, rank:].contiguous(),
-                weights=self.B_second,
-                output_offset=self.second_offset,
-                base_output=second_out,
-            )
-            return base_output
-        else:
+        first_dim = self.first_output_dim
+
+        if first_dim == 0:
+            # Simple single-projection (e.g. fc1_latent_proj, fc2_latent_proj)
             lora_a_output = self.lora_backend.run_lora_a_sgemm(x, self.A_buffer)
-            return self.lora_backend.run_lora_b_sgemm(
+            lora_output = self.lora_backend.run_lora_b_sgemm(
                 x=lora_a_output,
                 weights=self.B_buffer,
-                output_offset=self.output_offset,
+                output_offset=self._output_offset,
                 base_output=base_output,
             )
+            return lora_output
+
+        # Use the fused N-component kernel with n_slices=2 to handle the
+        # split inside the triton kernel, avoiding Python-level splitting
+        # which breaks when adapter rank < max_lora_rank.
+        lora_output = self.lora_backend.run_qkv_lora(
+            x=x,
+            qkv_lora_a=self.A_buffer,
+            qkv_lora_b=self.B_buffer,
+            output_offset=self._output_offset,
+            output_offset_cpu=self._output_offset_cpu,
+            max_qkv_out_dim=self._max_out_dim,
+            base_output=base_output,
+            n_slices=2,
+        )
+        return lora_output
 
     def forward(self, x: torch.Tensor):
         bias = self.base_layer.bias if not self.base_layer.skip_bias_add else None
@@ -797,6 +846,7 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         super().__init__(base_layer, lora_backend)
 
         self.experts_shared_outer_loras: bool = False
+        self.lora_use_virtual_experts: bool = False
         self.quant_method = base_layer.quant_method
 
         self.tp_size = getattr(base_layer, "moe_tp_size", 1)
@@ -808,13 +858,20 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             getattr(base_layer.moe_runner_config, "gemm1_alpha", None) is not None
         )
 
-        # initialize triton_lora moe runner for batches with lora enabled
+        # Initialize triton_lora moe runner for batches with lora enabled
         from sglang.srt.layers.moe import MoeRunnerBackend
         from sglang.srt.layers.moe.moe_runner.runner import MoeRunner
+        from sglang.srt.layers.moe.utils import get_moe_runner_backend
 
-        qm = base_layer.quant_method
-        if hasattr(qm, "runner") and qm.runner is not None:
-            runner_backend = qm.runner.runner_backend
+        # Determine runner backend: prefer server arg, fall back to quant method's runner
+        global_backend = get_moe_runner_backend()
+        if not global_backend.is_auto():
+            runner_backend = global_backend
+        elif (
+            hasattr(base_layer.quant_method, "runner")
+            and base_layer.quant_method.runner is not None
+        ):
+            runner_backend = base_layer.quant_method.runner.runner_backend
         else:
             runner_backend = MoeRunnerBackend.TRITON
 
@@ -824,8 +881,25 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             lora_enabled=True,
         )
 
-        # Pre-compute quant info for efficiency (weights don't change during inference)
-        self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
+        if runner_backend.is_marlin():
+            from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+                CompressedTensorsFusedMoEMethod,
+            )
+
+            assert isinstance(
+                base_layer.quant_method, CompressedTensorsFusedMoEMethod
+            ), (
+                f"Marlin MoE backend requires CompressedTensorsFusedMoEMethod, "
+                f"got {type(base_layer.quant_method).__name__}"
+            )
+            self._quant_info = base_layer.quant_method.get_marlin_quant_info(base_layer)
+        elif runner_backend.is_triton():
+            assert base_layer.quant_method is not None, "Quant method must be set"
+            self._quant_info = base_layer.quant_method.get_triton_quant_info(base_layer)
+        else:
+            raise NotImplementedError(
+                f"LoRA MoE not supported for backend {runner_backend}"
+            )
 
     def set_lora_info(
         self,
@@ -876,10 +950,10 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
             num_experts=self.base_layer.num_experts,
             experts_shared_outer_loras=self.experts_shared_outer_loras,
             cg_buffers=cg_buffers,
-            has_active_lora=batch_info.has_active_lora,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             hidden_size=getattr(self.base_layer, "hidden_size", 0),
+            lora_use_virtual_experts=self.lora_use_virtual_experts,
         )
 
     def forward(self, hidden_states: torch.Tensor, topk_output: TopKOutput, **kwargs):
@@ -1011,6 +1085,17 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         self, B: torch.Tensor, tp_rank: int, target_module: str
     ) -> torch.Tensor:
         if target_module == "gate_up_proj_moe":
+            # Non-gated MoE (e.g. Nemotron-H): only w1, no w3.
+            # B has shape [intermediate_size, rank] — TP-shard directly.
+            is_gated = self.base_layer.moe_runner_config.is_gated
+            if not is_gated:
+                if self.tp_size > 1:
+                    shard_size = self.intermediate_size_per_partition
+                    start = tp_rank * shard_size
+                    end = start + shard_size
+                    return B[start:end, :]
+                return B
+
             shard_size = self.intermediate_size_per_partition
             start = tp_rank * shard_size
             end = start + shard_size
