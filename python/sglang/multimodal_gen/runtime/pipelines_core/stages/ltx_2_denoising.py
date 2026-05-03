@@ -1013,7 +1013,7 @@ class LTX2DenoisingStage(DenoisingStage):
         model_kwargs: dict[str, object],
         pass_spec: LTX2GuidancePassSpec,
     ) -> None:
-        """Apply one guidance pass's skips to one model-forward kwargs dict."""
+        """Copy disable-attention options from pass_spec into model_kwargs."""
         if pass_spec.skip_video_self_attn_blocks:
             model_kwargs["skip_video_self_attn_blocks"] = (
                 pass_spec.skip_video_self_attn_blocks
@@ -1487,12 +1487,17 @@ class LTX2DenoisingStage(DenoisingStage):
                 and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
             )
         )
-        # HQ uses split_sizes = [1] * expanded_batch_size below: each model
-        # forward receives one row from the expanded batch, and that row already
-        # represents a concrete guidance pass (cond/neg/perturbed/modality).
-        # Therefore kwargs-level skips match the native forward. TI2V batched
-        # forwards combine multiple guidance-pass rows, so they must keep
-        # per-row perturbation_configs; whole-forward kwargs would change output.
+        # expanded_batch_size = batch_size_local * len(pass_specs). One expanded
+        # item means one local batch element evaluated as cond, neg, perturbed,
+        # or modality. "Perturbation" means disabling selected attention paths
+        # for that item (self-attention blocks or audio/video cross-attention)
+        # to compute STG/modality guidance.
+        #
+        # HQ splits the expanded batch into one-item model calls. Since each
+        # call has only one perturbation setting, pass the disable options
+        # directly as model arguments. TI2V/non-HQ may keep several expanded
+        # items with different settings in one model call, so it needs
+        # perturbation_configs: one config dict per expanded item.
         use_split_pass_kwargs = (
             server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
         )
