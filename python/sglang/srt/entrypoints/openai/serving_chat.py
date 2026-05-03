@@ -631,8 +631,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
-            if envs.SGLANG_ENABLE_THINKING.get():
-                extra_template_kwargs["thinking"] = True
 
             try:
                 prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
