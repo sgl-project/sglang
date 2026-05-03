@@ -632,8 +632,6 @@ class LTX2Attention(nn.Module):
             return False
         if get_tp_world_size() != 1:
             return False
-        if q.shape != k.shape:
-            return False
         if (
             not q.is_cuda
             or not k.is_cuda
