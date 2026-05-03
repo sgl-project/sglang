@@ -88,7 +88,6 @@ __global__ __launch_bounds__(kBlockSize)  //
 
   // ---- compile-time geometry ------------------------------------------------
   static_assert(sizeof(DType) == 2, "fused_rope_hadamard: only fp16/bf16 supported in this version");
-  static_assert(kIsNeox, "fused_rope_hadamard: only neox-style RoPE supported in this version");
 
   constexpr int kNElts = 16 / sizeof(DType);             // 8 for bf16/fp16
   constexpr int kWorkThreads = kHeadDim / kNElts;        // 16 for head_dim=128
@@ -98,7 +97,7 @@ __global__ __launch_bounds__(kBlockSize)  //
   constexpr int kWorkersPerBlock = kBlockSize / kWorkThreads;
 
   static_assert(kHeadDim > 0 && (kHeadDim & (kHeadDim - 1)) == 0, "kHeadDim must be a power of 2");
-  static_assert(kRopeDim > 0 && kRopeDim <= kHeadDim);
+  static_assert(kRopeDim > 0 && kRopeDim <= kHeadDim, "kRopeDim must be in (0, kHeadDim]");
   static_assert(
       kRopeDim % (2 * kNElts) == 0,
       "kRopeDim must be divisible by 2 * kNElts so the rope/nope split aligns to vector lanes");
@@ -149,44 +148,76 @@ __global__ __launch_bounds__(kBlockSize)  //
       }
     }
 
-    // ---- Step 2: in-register neox RoPE on the rope-half --------------------
+    // ---- Step 2: in-register RoPE on the rope-half -------------------------
     //
-    //   For lane t in [0, kRopeXThreads): holds q_x slice = head[lane_in_rope * kNElts ..]
-    //     pairs with lane (t ^ kRopeXThreads) which holds q_y at the same offset.
-    //   Both lanes load the same (cos[i], sin[i]) since neox couples (i, i+kRopeHalf).
+    //   Two layouts (selected at compile time by kIsNeox):
     //
-    //   `__shfl_xor_sync` is called by all kWorkThreads lanes uniformly (no
-    //   intra-warp divergence); only rope-half lanes use the result.
+    //   Neox (split-half pairing): pair (head[i], head[i + kRopeHalf]) for
+    //     i in [0, kRopeHalf). Lanes [0, kRopeXThreads) hold q_x; lanes
+    //     [kRopeXThreads, kRopeYThreads) hold q_y. Pair partner via
+    //     __shfl_xor_sync(_, _, kRopeXThreads, kWorkThreads). Both x-lane and
+    //     y-lane in a pair load the SAME (cos[i], sin[i]).
+    //
+    //   Non-neox (interleaved pairing): pair (head[2i], head[2i+1]) for
+    //     i in [0, kRopeHalf). Each lane holds kPairsPerThread = kNElts/2
+    //     full pairs in its own 8 elements; no cross-lane shuffle is needed.
+    //     Lanes [0, kRopeYThreads) participate; lane t loads cos[t * kPairs ..]
+    //     and sin[t * kPairs ..] from the cos / sin halves of cos_sin_cache.
     {
       const auto pos = static_cast<const IdType*>(params.positions)[token_id];
       const float* cos_cache = static_cast<const float*>(params.cos_sin_cache_ptr);
       const float* sin_cache = cos_cache + kRopeHalf;
       const int64_t pos_offset = static_cast<int64_t>(pos) * static_cast<int64_t>(kRopeDim);
 
-      float cos_vals[kNElts] = {0};
-      float sin_vals[kNElts] = {0};
-      if (lane_id < kRopeYThreads) {
-        const uint32_t lane_in_rope = lane_id & (kRopeXThreads - 1);  // 0..kRopeXThreads-1
-        const int64_t base = pos_offset + static_cast<int64_t>(lane_in_rope) * kNElts;
+      if constexpr (kIsNeox) {
+        float cos_vals[kNElts] = {0};
+        float sin_vals[kNElts] = {0};
+        if (lane_id < kRopeYThreads) {
+          const uint32_t lane_in_rope = lane_id & (kRopeXThreads - 1);  // 0..kRopeXThreads-1
+          const int64_t base = pos_offset + static_cast<int64_t>(lane_in_rope) * kNElts;
+#pragma unroll
+          for (int i = 0; i < kNElts; ++i) {
+            cos_vals[i] = cos_cache[base + i];
+            sin_vals[i] = sin_cache[base + i];
+          }
+        }
+
+        // Width = kWorkThreads keeps shuffles confined to one worker's lanes
+        // when multiple workers share a warp (kBlockSize / kWorkThreads
+        // workers/warp). All kWorkThreads lanes call shfl uniformly.
 #pragma unroll
         for (int i = 0; i < kNElts; ++i) {
-          cos_vals[i] = cos_cache[base + i];
-          sin_vals[i] = sin_cache[base + i];
+          const float my_val = x_vals[0][i];
+          const float pair_val = __shfl_xor_sync(0xFFFFFFFFu, my_val, kRopeXThreads, kWorkThreads);
+          if (lane_id < kRopeXThreads) {
+            // q_x lane: my=x, pair=y → new_x = x*cos − y*sin
+            x_vals[0][i] = my_val * cos_vals[i] - pair_val * sin_vals[i];
+          } else if (lane_id < kRopeYThreads) {
+            // q_y lane: my=y, pair=x → new_y = x*sin + y*cos = pair*sin + my*cos
+            x_vals[0][i] = pair_val * sin_vals[i] + my_val * cos_vals[i];
+          }
+          // lane_id >= kRopeYThreads: nope, leave x_vals unchanged.
         }
-      }
-
-      // Width = kWorkThreads keeps shuffles confined to one worker's lanes when
-      // multiple workers share a warp (kBlockSize / kWorkThreads workers/warp).
+      } else {
+        // Non-neox: pairs are adjacent inside each lane, all in registers.
+        constexpr int kPairsPerThread = kNElts / 2;  // 4 for kNElts=8
+        static_assert(kNElts % 2 == 0, "non-neox requires kNElts to be even");
+        if (lane_id < kRopeYThreads) {
+          const int64_t base = pos_offset + static_cast<int64_t>(lane_id) * kPairsPerThread;
+          float cos_vals[kPairsPerThread];
+          float sin_vals[kPairsPerThread];
 #pragma unroll
-      for (int i = 0; i < kNElts; ++i) {
-        const float my_val = x_vals[0][i];
-        const float pair_val = __shfl_xor_sync(0xFFFFFFFFu, my_val, kRopeXThreads, kWorkThreads);
-        if (lane_id < kRopeXThreads) {
-          // q_x lane: my=x, pair=y → new_x = x*cos − y*sin
-          x_vals[0][i] = my_val * cos_vals[i] - pair_val * sin_vals[i];
-        } else if (lane_id < kRopeYThreads) {
-          // q_y lane: my=y, pair=x → new_y = x*sin + y*cos = pair*sin + my*cos
-          x_vals[0][i] = pair_val * sin_vals[i] + my_val * cos_vals[i];
+          for (int m = 0; m < kPairsPerThread; ++m) {
+            cos_vals[m] = cos_cache[base + m];
+            sin_vals[m] = sin_cache[base + m];
+          }
+#pragma unroll
+          for (int m = 0; m < kPairsPerThread; ++m) {
+            const float x = x_vals[0][2 * m];
+            const float y = x_vals[0][2 * m + 1];
+            x_vals[0][2 * m] = x * cos_vals[m] - y * sin_vals[m];
+            x_vals[0][2 * m + 1] = x * sin_vals[m] + y * cos_vals[m];
+          }
         }
         // lane_id >= kRopeYThreads: nope, leave x_vals unchanged.
       }

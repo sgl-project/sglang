@@ -256,17 +256,19 @@ class Indexer(MultiPlatformOp):
         #   - kRopeDim divisible by 2 * (16 / sizeof(DType)); for bf16/fp16 that is 16
         #   - neox-style RoPE
         # Runtime checks the dtype is bf16/fp16 and the device is CUDA / non-fnuz FP8.
+        # Both neox and non-neox RoPE are supported; the kernel branches on
+        # `is_neox` at compile time and is templated separately per JIT-cache key.
         self._fused_rope_had_eligible = (
             _is_cuda
             and not _is_fp8_fnuz
             and self.head_dim in (32, 64, 128, 256)
             and 0 < self.rope_head_dim <= self.head_dim
             and self.rope_head_dim % 16 == 0
-            and is_neox_style
         )
         # Log once per process (gate on layer_id==0) so we can confirm at server
         # startup whether the fast path is reachable for this model config.
         if self.layer_id == 0:
+            rope_neox = bool(getattr(self.rotary_emb, "is_neox_style", is_neox_style))
             if self._fused_rope_had_eligible:
                 logger.info(
                     "[NSA] fused_rope_hadamard fast path ELIGIBLE "
@@ -274,7 +276,7 @@ class Indexer(MultiPlatformOp):
                     "JIT compile happens on the first forward.",
                     self.head_dim,
                     self.rope_head_dim,
-                    is_neox_style,
+                    rope_neox,
                 )
             else:
                 reasons = []
@@ -290,8 +292,6 @@ class Indexer(MultiPlatformOp):
                     reasons.append(
                         f"rope_head_dim={self.rope_head_dim} not divisible by 16"
                     )
-                if not is_neox_style:
-                    reasons.append("non-neox RoPE")
                 logger.info(
                     "[NSA] fused_rope_hadamard fast path DISABLED, "
                     "falling back to (rotary_emb + Hadamard×2): %s",
@@ -404,10 +404,12 @@ class Indexer(MultiPlatformOp):
         # kHeadDim-wide Hadamard on the full per-head row, in place on q and k.
         # Replaces the (rotary_emb + 2× _update_rope_guarded + 2× rotate_activation)
         # chain. See sglang/jit_kernel/csrc/elementwise/fused_rope_hadamard.cuh.
-        if self._fused_rope_had_eligible and query.dtype in (
-            torch.bfloat16,
-            torch.float16,
-        ):
+        if self._fused_rope_had_eligible and query.dtype == torch.bfloat16:
+            # `key` comes out of `self.wk(x) → self.k_norm(...)` as 2-D `[L, head_dim]`
+            # (MQA, single kv head). The fused kernel's TensorMatcher requires a
+            # 3-D layout `[L, num_kv_heads, head_dim]`, so reshape to a same-storage
+            # 3-D view here. Mutations through `key_3d` are visible on `key`.
+            key_3d = key.view(key.size(0), 1, self.head_dim)
             global _FUSED_ROPE_HAD_FIRST_HIT_LOGGED
             if not _FUSED_ROPE_HAD_FIRST_HIT_LOGGED:
                 _FUSED_ROPE_HAD_FIRST_HIT_LOGGED = True
@@ -418,14 +420,14 @@ class Indexer(MultiPlatformOp):
                     self.layer_id,
                     query.size(0),
                     query.size(1),
-                    key.size(1),
+                    key_3d.size(1),
                     self.head_dim,
                     self.rope_head_dim,
                     query.dtype,
                 )
             fused_rope_hadamard(
                 q=query,
-                k=key,
+                k=key_3d,
                 cos_sin_cache=self.rotary_emb.cos_sin_cache,
                 positions=positions,
                 is_neox=self.rotary_emb.is_neox_style,
