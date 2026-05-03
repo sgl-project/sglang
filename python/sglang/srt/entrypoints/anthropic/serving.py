@@ -439,6 +439,12 @@ class AnthropicServing:
         first_chunk = True
         content_block_index = 0
         content_block_open = False
+        # Type of the currently-open content block ("text" or "tool_use").
+        # Anthropic deltas are typed (text_delta vs input_json_delta) and
+        # must match the block type at their index. We track this so we
+        # can close + reopen when the underlying OpenAI stream switches
+        # between text content and tool_calls within a single turn.
+        content_block_type: Optional[str] = None
         finish_reason: Optional[str] = None
         usage_info: Optional[dict] = None
         message_id = f"msg_{uuid.uuid4().hex}"
@@ -461,6 +467,8 @@ class AnthropicServing:
                         stop_event.model_dump_json(exclude_none=True),
                         "content_block_stop",
                     )
+                    content_block_open = False
+                    content_block_type = None
 
                 # Emit message_delta with stop_reason and usage
                 stop_reason = STOP_REASON_MAP.get(finish_reason or "stop", "end_turn")
@@ -570,6 +578,7 @@ class AnthropicServing:
                                 "content_block_stop",
                             )
                             content_block_index += 1
+                            content_block_type = None
 
                         # Start tool_use content block
                         start_event = AnthropicStreamEvent(
@@ -587,6 +596,7 @@ class AnthropicServing:
                             "content_block_start",
                         )
                         content_block_open = True
+                        content_block_type = "tool_use"
 
                         # Stream initial arguments if present
                         if tc_func.arguments:
@@ -621,6 +631,25 @@ class AnthropicServing:
 
             # Handle text content deltas
             if delta.content is not None and delta.content != "":
+                # If a non-text block is currently open (e.g. a tool_use
+                # opened by an earlier delta in the same turn), close it
+                # before emitting the text. Otherwise the text_delta
+                # would be stamped with the tool_use's index and crash
+                # any Anthropic-SDK client with "Content block is not a
+                # text block".
+                if content_block_open and content_block_type != "text":
+                    stop_event = AnthropicStreamEvent(
+                        type="content_block_stop",
+                        index=content_block_index,
+                    )
+                    yield _wrap_sse_event(
+                        stop_event.model_dump_json(exclude_none=True),
+                        "content_block_stop",
+                    )
+                    content_block_index += 1
+                    content_block_open = False
+                    content_block_type = None
+
                 # Start a text content block if needed
                 if not content_block_open:
                     start_event = AnthropicStreamEvent(
@@ -633,6 +662,7 @@ class AnthropicServing:
                         "content_block_start",
                     )
                     content_block_open = True
+                    content_block_type = "text"
 
                 # Emit text delta
                 delta_event = AnthropicStreamEvent(
