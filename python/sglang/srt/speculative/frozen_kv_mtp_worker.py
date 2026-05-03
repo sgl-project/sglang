@@ -53,16 +53,10 @@ from sglang.srt.speculative.frozen_kv_mtp_info import (
     FrozenKVMTPVerifyOutput,
 )
 from sglang.srt.speculative.frozen_kv_mtp_utils import (
-    build_and_bind_frozen_kv_mtp_context,
     capture_for_decode,
-    create_frozen_kv_mtp_draft_backend,
     expand_for_topk_draft,
     frozen_kv_target_view,
-    init_frozen_kv_metadata,
-    init_frozen_kv_metadata_capture_cuda_graph,
-    init_frozen_kv_metadata_replay_cuda_graph,
     position_for_batch,
-    recurrent_hidden_size,
     select_last_extend_hidden,
     select_last_verified_seed,
     set_frozen_kv_positions,
@@ -190,18 +184,55 @@ class FrozenKVMTPWorker(TpModelWorker):
     def clear_cache_pool(self):
         pass
 
+    def _resolve_draft_backend_type(self) -> str:
+        return (
+            self.server_args.speculative_draft_attention_backend
+            or self.server_args.decode_attention_backend
+            or self.server_args.attention_backend
+        )
+
     def _init_draft_attn_backend(self):
-        return create_frozen_kv_mtp_draft_backend(self)
+        if self.topk == 1:
+            return self.draft_model_runner.attn_backend
+
+        backend_type = self._resolve_draft_backend_type()
+        if backend_type != "triton":
+            raise ValueError(
+                "Frozen-KV MTP topk > 1 currently supports only the triton "
+                f"attention backend, got {backend_type}."
+            )
+        return self._init_triton_draft_attn_backend()
+
+    def _init_triton_draft_attn_backend(self):
+        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
+
+        max_bs = self.req_to_token_pool.size * self.topk
+        kv_indptr_buf = torch.zeros(
+            (max_bs + 1,), dtype=torch.int32, device=self.draft_model_runner.device
+        )
+        return TritonAttnBackend(
+            self.draft_model_runner,
+            skip_prefill=True,
+            kv_indptr_buf=kv_indptr_buf,
+        )
 
     def _bind_kv_context(self) -> None:
-        ctx = build_and_bind_frozen_kv_mtp_context(self)
-        if ctx is None:
+        draft_model = self.draft_model_runner.model
+        if not hasattr(draft_model, "build_frozen_kv_mtp_context") or not hasattr(
+            draft_model, "bind_frozen_kv_context"
+        ):
             logger.debug(
                 "Draft model %s does not implement Frozen-KV MTP context hooks; "
                 "skipping frozen-kv bind.",
-                type(self.draft_model_runner.model).__name__,
+                type(draft_model).__name__,
             )
             return
+
+        ctx = draft_model.build_frozen_kv_mtp_context(
+            target_model=self.target_worker.model_runner.model,
+            target_token_to_kv_pool=self.target_worker.model_runner.token_to_kv_pool,
+        )
+        draft_model.bind_frozen_kv_context(ctx)
         self.kv_context = ctx
 
     def _frozen_kv_target_view(self, forward_batch: ForwardBatch):
@@ -221,20 +252,53 @@ class FrozenKVMTPWorker(TpModelWorker):
 
     @property
     def _recurrent_hidden_size(self) -> int:
-        return recurrent_hidden_size(self)
+        return int(self.draft_model_runner.model.backbone_hidden_size)
 
     def _init_frozen_kv_metadata(self, forward_batch: ForwardBatch) -> None:
-        init_frozen_kv_metadata(self, forward_batch)
+        if forward_batch.forward_mode.is_idle():
+            return
+        if forward_batch.seq_lens_cpu is not None:
+            forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
+        else:
+            forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
+        with self._frozen_kv_target_view(forward_batch):
+            self.draft_attn_backend.init_forward_metadata(forward_batch)
+        forward_batch.attn_backend = self.draft_attn_backend
 
     def _init_frozen_kv_metadata_capture_cuda_graph(
         self, forward_batch: ForwardBatch
     ) -> None:
-        init_frozen_kv_metadata_capture_cuda_graph(self, forward_batch)
+        with self._frozen_kv_target_view(forward_batch):
+            self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
+                forward_batch.batch_size,
+                forward_batch.positions.numel(),
+                forward_batch.req_pool_indices,
+                forward_batch.seq_lens,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=None,
+            )
+        forward_batch.attn_backend = self.draft_attn_backend
 
     def _init_frozen_kv_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
     ) -> None:
-        init_frozen_kv_metadata_replay_cuda_graph(self, forward_batch, bs, seq_lens_sum)
+        with self._frozen_kv_target_view(forward_batch):
+            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
+                bs,
+                forward_batch.req_pool_indices[:bs],
+                forward_batch.seq_lens[:bs],
+                seq_lens_sum,
+                encoder_lens=None,
+                forward_mode=ForwardMode.DECODE,
+                spec_info=None,
+                seq_lens_cpu=(
+                    forward_batch.seq_lens_cpu[:bs]
+                    if forward_batch.seq_lens_cpu is not None
+                    else None
+                ),
+            )
+        forward_batch.attn_backend = self.draft_attn_backend
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:

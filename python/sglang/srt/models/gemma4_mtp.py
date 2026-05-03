@@ -55,57 +55,6 @@ def _resolve_target_text_model(target_model):
     )
 
 
-def build_frozen_kv_context(
-    assistant_model: "Gemma4AssistantForCausalLM",
-    target_model,
-    target_token_to_kv_pool: KVCache,
-) -> FrozenKVMTPContext:
-    """Map each assistant layer to the target physical layer that owns its K/V.
-
-    HF Gemma 4 ties each typed (sliding/full) assistant layer to the target's
-    last layer of the same type; that layer is itself KV-shared with an
-    earlier non-shared layer (via ``kv_shared_layer_index``). We collapse
-    those two hops once so attention can hand a direct ``layer_id`` to
-    ``RadixAttention`` at bind time.
-    """
-    target_text = _get_text_config(target_model)
-    assistant_text = _get_text_config(assistant_model)
-    layers = _resolve_target_text_model(target_model).layers
-
-    def kv_owner(idx: int) -> int:
-        attn = layers[idx].self_attn
-        owner = (
-            getattr(attn, "kv_shared_layer_index", None)
-            if getattr(attn, "is_kv_shared_layer", False)
-            else idx
-        )
-        if owner is None or getattr(
-            layers[owner].self_attn, "is_kv_shared_layer", False
-        ):
-            raise RuntimeError(
-                f"Frozen-KV MTP: target layer {idx} resolved to physical "
-                f"{owner!r}, which is missing or itself KV-shared (HF invariant changed?)."
-            )
-        return owner
-
-    L = target_text.num_hidden_layers
-    by_type = {target_text.layer_types[i]: kv_owner(i) for i in (L - 2, L - 1)}
-
-    physical: Dict[int, int] = {}
-    for i, t in enumerate(assistant_text.layer_types):
-        if t not in by_type:
-            raise ValueError(
-                f"Frozen-KV MTP assistant layer {i} has type {t!r}, "
-                f"expected one of {sorted(by_type)}."
-            )
-        physical[i] = by_type[t]
-
-    return FrozenKVMTPContext(
-        target_token_to_kv_pool=target_token_to_kv_pool,
-        physical_layer_ids=physical,
-    )
-
-
 class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
     """Gemma 4 MTP assistant: target embed + recurrent hidden through pre/post projection; own ``lm_head``."""
 
@@ -202,10 +151,50 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
         target_model,
         target_token_to_kv_pool: KVCache,
     ) -> FrozenKVMTPContext:
-        return build_frozen_kv_context(
-            assistant_model=self,
-            target_model=target_model,
+        """Map each assistant layer to the target physical layer that owns its K/V.
+
+        HF Gemma 4 ties each typed (sliding/full) assistant layer to the target's
+        last layer of the same type; that layer is itself KV-shared with an
+        earlier non-shared layer (via ``kv_shared_layer_index``). We collapse
+        those two hops once so attention can hand a direct ``layer_id`` to
+        ``RadixAttention`` at bind time.
+        """
+        target_text = _get_text_config(target_model)
+        assistant_text = _get_text_config(self)
+        layers = _resolve_target_text_model(target_model).layers
+
+        def kv_owner(idx: int) -> int:
+            attn = layers[idx].self_attn
+            owner = (
+                getattr(attn, "kv_shared_layer_index", None)
+                if getattr(attn, "is_kv_shared_layer", False)
+                else idx
+            )
+            if owner is None or getattr(
+                layers[owner].self_attn, "is_kv_shared_layer", False
+            ):
+                raise RuntimeError(
+                    f"Frozen-KV MTP: target layer {idx} resolved to physical "
+                    f"{owner!r}, which is missing or itself KV-shared "
+                    "(HF invariant changed?)."
+                )
+            return owner
+
+        L = target_text.num_hidden_layers
+        by_type = {target_text.layer_types[i]: kv_owner(i) for i in (L - 2, L - 1)}
+
+        physical: Dict[int, int] = {}
+        for i, t in enumerate(assistant_text.layer_types):
+            if t not in by_type:
+                raise ValueError(
+                    f"Frozen-KV MTP assistant layer {i} has type {t!r}, "
+                    f"expected one of {sorted(by_type)}."
+                )
+            physical[i] = by_type[t]
+
+        return FrozenKVMTPContext(
             target_token_to_kv_pool=target_token_to_kv_pool,
+            physical_layer_ids=physical,
         )
 
     def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:

@@ -318,6 +318,14 @@ class Gemma4MTPGSM8KMixin:
             num_draft_tokens=6,
         )
 
+    def test_gsm8k_mtp_topk3(self) -> None:
+        """Top-k fan-out: tree-shaped verify with Frozen-KV draft CUDA graph."""
+        self._run_mtp_gsm8k(
+            label="mtp-topk3-cuda-graph",
+            topk=3,
+            num_draft_tokens=12,
+        )
+
     def test_gsm8k_mtp_topk5(self) -> None:
         """Top-k fan-out: tree-shaped verify with Frozen-KV draft CUDA graph."""
         self._run_mtp_gsm8k(
