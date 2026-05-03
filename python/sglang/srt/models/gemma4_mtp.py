@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import copy
 import logging
-from dataclasses import dataclass
 from typing import Dict, Iterable, Optional, Tuple
 
 import torch
@@ -32,25 +31,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.gemma4_causal import Gemma4ForCausalLM, Gemma4TextModel
+from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPContext
 from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class FrozenKVMTPContext:
-    """Target KV pool + assistant-logical → target-physical layer map."""
-
-    target_token_to_kv_pool: KVCache
-    physical_layer_ids: Dict[int, int]
-
-    def get_physical_layer_id(self, idx: int) -> int:
-        if idx not in self.physical_layer_ids:
-            raise KeyError(
-                f"FrozenKVMTPContext has no physical layer id for assistant "
-                f"logical index {idx}; available: {sorted(self.physical_layer_ids)}"
-            )
-        return self.physical_layer_ids[idx]
 
 
 def _get_text_config(model_or_config) -> PretrainedConfig:
@@ -212,6 +196,17 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             layer.self_attn.attn.layer_id = target_phys
             layer.self_attn.layer_id = assistant_logical
         self.kv_context = ctx
+
+    def build_frozen_kv_mtp_context(
+        self,
+        target_model,
+        target_token_to_kv_pool: KVCache,
+    ) -> FrozenKVMTPContext:
+        return build_frozen_kv_context(
+            assistant_model=self,
+            target_model=target_model,
+            target_token_to_kv_pool=target_token_to_kv_pool,
+        )
 
     def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.target_embed_weight is None:

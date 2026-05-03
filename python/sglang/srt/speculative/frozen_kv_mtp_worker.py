@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Gemma 4 frozen-KV MTP draft worker.
+"""Frozen-KV MTP draft worker.
 
 The assistant reads target KV only. It reuses EAGLE's verify input/output
 contract, but owns the seed and recurrent draft loop because there is no
@@ -21,8 +21,7 @@ assistant-side KV extension.
 from __future__ import annotations
 
 import logging
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 
@@ -43,14 +42,31 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.observability.req_time_stats import set_time_batch
 from sglang.srt.observability.trace import get_global_tracing_enabled
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.eagle_info import (
-    EagleDraftInput,
-    EagleVerifyInput,
-    EagleVerifyOutput,
-)
 from sglang.srt.speculative.eagle_utils import (
     build_tree_kernel_efficient,
     organize_draft_results,
+)
+from sglang.srt.speculative.frozen_kv_mtp_info import (
+    FrozenKVMTPContext,
+    FrozenKVMTPDraftInput,
+    FrozenKVMTPVerifyInput,
+    FrozenKVMTPVerifyOutput,
+)
+from sglang.srt.speculative.frozen_kv_mtp_utils import (
+    build_and_bind_frozen_kv_mtp_context,
+    capture_for_decode,
+    create_frozen_kv_mtp_draft_backend,
+    expand_for_topk_draft,
+    frozen_kv_target_view,
+    init_frozen_kv_metadata,
+    init_frozen_kv_metadata_capture_cuda_graph,
+    init_frozen_kv_metadata_replay_cuda_graph,
+    position_for_batch,
+    recurrent_hidden_size,
+    select_last_extend_hidden,
+    select_last_verified_seed,
+    set_frozen_kv_positions,
+    target_kv_pool_view,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
@@ -62,9 +78,6 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
 )
 from sglang.srt.utils import empty_context
-
-if TYPE_CHECKING:
-    from sglang.srt.models.gemma4_mtp import FrozenKVMTPContext
 
 logger = logging.getLogger(__name__)
 
@@ -178,194 +191,50 @@ class FrozenKVMTPWorker(TpModelWorker):
         pass
 
     def _init_draft_attn_backend(self):
-        if self.topk == 1:
-            return self.draft_model_runner.attn_backend
-
-        if type(self.draft_model_runner.attn_backend).__name__ != "TritonAttnBackend":
-            raise ValueError(
-                "Frozen-KV MTP topk > 1 currently requires the triton attention "
-                f"backend, got {type(self.draft_model_runner.attn_backend).__name__}."
-            )
-
-        from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-
-        max_bs = self.req_to_token_pool.size * self.topk
-        kv_indptr_buf = torch.zeros(
-            (max_bs + 1,), dtype=torch.int32, device=self.draft_model_runner.device
-        )
-        return TritonAttnBackend(
-            self.draft_model_runner,
-            skip_prefill=True,
-            kv_indptr_buf=kv_indptr_buf,
-        )
+        return create_frozen_kv_mtp_draft_backend(self)
 
     def _bind_kv_context(self) -> None:
-        try:
-            from sglang.srt.models.gemma4_mtp import build_frozen_kv_context
-        except ImportError:
-            logger.debug("gemma4_mtp model not yet available; skipping frozen-kv bind.")
+        ctx = build_and_bind_frozen_kv_mtp_context(self)
+        if ctx is None:
+            logger.debug(
+                "Draft model %s does not implement Frozen-KV MTP context hooks; "
+                "skipping frozen-kv bind.",
+                type(self.draft_model_runner.model).__name__,
+            )
             return
-
-        ctx = build_frozen_kv_context(
-            assistant_model=self.draft_model_runner.model,
-            target_model=self.target_worker.model_runner.model,
-            target_token_to_kv_pool=self.target_worker.model_runner.token_to_kv_pool,
-        )
         self.kv_context = ctx
-        self.draft_model_runner.model.bind_frozen_kv_context(ctx)
 
-    @contextmanager
     def _frozen_kv_target_view(self, forward_batch: ForwardBatch):
-        """Temporarily clear ``spec_info`` and point ``token_to_kv_pool`` at
-        the target so attention metadata is built for committed-prefix geometry.
-        """
-        if self.kv_context is None:
-            raise RuntimeError(
-                "FrozenKVMTPWorker._frozen_kv_target_view called before "
-                "the model was bound; call _bind_kv_context() first."
-            )
-        saved_spec_info = forward_batch.spec_info
-        saved_kv_pool = forward_batch.token_to_kv_pool
-        forward_batch.spec_info = None
-        forward_batch.token_to_kv_pool = self.kv_context.target_token_to_kv_pool
-        try:
-            yield
-        finally:
-            forward_batch.spec_info = saved_spec_info
-            forward_batch.token_to_kv_pool = saved_kv_pool
+        return frozen_kv_target_view(forward_batch, self.kv_context)
 
-    @contextmanager
     def _target_kv_pool_view(self, forward_batch: ForwardBatch):
-        if self.kv_context is None:
-            raise RuntimeError(
-                "FrozenKVMTPWorker._target_kv_pool_view called before "
-                "the model was bound; call _bind_kv_context() first."
-            )
-        saved_kv_pool = forward_batch.token_to_kv_pool
-        forward_batch.token_to_kv_pool = self.kv_context.target_token_to_kv_pool
-        try:
-            yield
-        finally:
-            forward_batch.token_to_kv_pool = saved_kv_pool
+        return target_kv_pool_view(forward_batch, self.kv_context)
 
     def _set_positions(self, forward_batch: ForwardBatch) -> None:
-        """Rope phase = last written target slot: ``clamp(seq_lens-1)``, not
-        advanced per draft step.
-        """
-        seq_lens = forward_batch.seq_lens
-        positions = torch.clamp(seq_lens - 1, min=0).to(torch.int64)
-        if (
-            self.topk > 1
-            and forward_batch.positions is not None
-            and forward_batch.positions.numel() == positions.numel() * self.topk
-        ):
-            positions = positions.repeat_interleave(self.topk, dim=0)
-        if forward_batch.positions is None:
-            forward_batch.positions = positions
-        else:
-            if forward_batch.positions.shape == positions.shape:
-                forward_batch.positions.copy_(positions)
-            else:
-                forward_batch.positions = positions
+        set_frozen_kv_positions(forward_batch, self.topk)
 
     def _expand_for_topk_draft(self, forward_batch: ForwardBatch) -> None:
-        """Repeat committed-prefix metadata for the active ``B * topk`` frontier.
-
-        The tree helper keeps exactly ``topk`` live branches per request after
-        the first expansion. Each branch probes the same frozen target prefix as
-        its parent request, so attention metadata must be built over repeated
-        request ids and sequence lengths rather than speculative KV slots.
-        """
-        if self.topk == 1 or forward_batch.batch_size == 0:
-            return
-
-        if forward_batch.batch_size != forward_batch.seq_lens.shape[0]:
-            raise RuntimeError(
-                "Frozen-KV MTP topk expansion expects an unexpanded forward "
-                "batch where batch_size == len(seq_lens)."
-            )
-
-        forward_batch.batch_size *= self.topk
-        forward_batch.req_pool_indices = (
-            forward_batch.req_pool_indices.repeat_interleave(self.topk, dim=0)
-        )
-        forward_batch.seq_lens = forward_batch.seq_lens.repeat_interleave(
-            self.topk, dim=0
-        )
-        if forward_batch.seq_lens_cpu is not None:
-            forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu.repeat_interleave(
-                self.topk, dim=0
-            )
-            forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
-        else:
-            forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
-
-        positions = torch.clamp(forward_batch.seq_lens - 1, min=0).to(torch.int64)
-        forward_batch.positions = positions
-        forward_batch.num_token_non_padded_cpu = positions.numel()
-        if forward_batch.num_token_non_padded is not None:
-            forward_batch.num_token_non_padded.fill_(positions.numel())
-        if (
-            forward_batch.mrope_positions is not None
-            and forward_batch.mrope_positions.shape[-1] * self.topk == positions.numel()
-        ):
-            forward_batch.mrope_positions = (
-                forward_batch.mrope_positions.repeat_interleave(self.topk, dim=-1)
-            )
+        expand_for_topk_draft(forward_batch, self.topk)
 
     def _position_for_batch(self, batch: ScheduleBatch) -> torch.Tensor:
-        return torch.clamp(batch.seq_lens - 1, min=0).to(torch.int64)
+        return position_for_batch(batch)
 
     @property
     def _recurrent_hidden_size(self) -> int:
-        return int(self.draft_model_runner.model.backbone_hidden_size)
+        return recurrent_hidden_size(self)
 
     def _init_frozen_kv_metadata(self, forward_batch: ForwardBatch) -> None:
-        """Build decode metadata from target committed-prefix slots only."""
-        if forward_batch.forward_mode.is_idle():
-            return
-        if forward_batch.seq_lens_cpu is not None:
-            forward_batch.seq_lens_sum = forward_batch.seq_lens_cpu.sum().item()
-        else:
-            forward_batch.seq_lens_sum = torch.sum(forward_batch.seq_lens).item()
-        with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_metadata(forward_batch)
-        forward_batch.attn_backend = self.draft_attn_backend
+        init_frozen_kv_metadata(self, forward_batch)
 
     def _init_frozen_kv_metadata_capture_cuda_graph(
         self, forward_batch: ForwardBatch
     ) -> None:
-        with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.positions.numel(),
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=None,
-            )
-        forward_batch.attn_backend = self.draft_attn_backend
+        init_frozen_kv_metadata_capture_cuda_graph(self, forward_batch)
 
     def _init_frozen_kv_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int, seq_lens_sum: int
     ) -> None:
-        with self._frozen_kv_target_view(forward_batch):
-            self.draft_attn_backend.init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices[:bs],
-                forward_batch.seq_lens[:bs],
-                seq_lens_sum,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=None,
-                seq_lens_cpu=(
-                    forward_batch.seq_lens_cpu[:bs]
-                    if forward_batch.seq_lens_cpu is not None
-                    else None
-                ),
-            )
-        forward_batch.attn_backend = self.draft_attn_backend
+        init_frozen_kv_metadata_replay_cuda_graph(self, forward_batch, bs, seq_lens_sum)
 
     def init_cuda_graphs(self) -> None:
         if self.server_args.disable_cuda_graph or self.speculative_num_steps <= 1:
@@ -389,32 +258,17 @@ class FrozenKVMTPWorker(TpModelWorker):
     def _select_last_extend_hidden(
         self, batch: ScheduleBatch, hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        """Pick the final target hidden state for each request in an extend batch."""
-        if hidden_states.shape[0] == batch.batch_size():
-            return hidden_states
-        lens = torch.tensor(batch.extend_lens, device=hidden_states.device)
-        last_indices = torch.cumsum(lens, dim=0) - 1
-        return hidden_states[last_indices.to(torch.long)]
+        return select_last_extend_hidden(batch, hidden_states)
 
     def _select_last_verified_seed(
-        self, draft_input: EagleDraftInput
+        self, draft_input: FrozenKVMTPDraftInput
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        if draft_input.num_accepted_tokens is None:
-            return draft_input.verified_id, draft_input.hidden_states
-
-        counts = draft_input.num_accepted_tokens.to(torch.long)
-        last_indices = torch.cumsum(counts, dim=0) - 1
-        return (
-            draft_input.verified_id[last_indices],
-            draft_input.hidden_states[last_indices],
-        )
+        return select_last_verified_seed(draft_input)
 
     def _capture_for_decode(
-        self, logits_output: LogitsProcessorOutput, draft_input: EagleDraftInput
+        self, logits_output: LogitsProcessorOutput, draft_input: FrozenKVMTPDraftInput
     ) -> None:
-        probs = torch.softmax(logits_output.next_token_logits, dim=-1)
-        draft_input.topk_p, draft_input.topk_index = fast_topk(probs, self.topk, dim=-1)
-        draft_input.hidden_states = logits_output.hidden_states
+        capture_for_decode(logits_output, draft_input, self.topk)
 
     def _run_assistant_seed_step(
         self,
@@ -423,11 +277,11 @@ class FrozenKVMTPWorker(TpModelWorker):
         last_hidden_states: torch.Tensor,
         seq_lens_cpu: Optional[torch.Tensor] = None,
         mm_input_embeds: Optional[torch.Tensor] = None,
-        draft_input: Optional[EagleDraftInput] = None,
+        draft_input: Optional[FrozenKVMTPDraftInput] = None,
     ) -> None:
         """Run the one-token assistant seed step against frozen target KV."""
         if batch.forward_mode.is_idle() or last_token_ids.numel() == 0:
-            batch.spec_info = EagleDraftInput.create_idle_input(
+            batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
                 device=batch.device,
                 hidden_size=self._recurrent_hidden_size,
                 dtype=self.model_config.dtype,
@@ -437,7 +291,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             return
 
         if draft_input is None:
-            draft_input = EagleDraftInput()
+            draft_input = FrozenKVMTPDraftInput()
 
         draft_input.verified_id = last_token_ids.to(torch.int64)
         draft_input.hidden_states = last_hidden_states
@@ -578,12 +432,12 @@ class FrozenKVMTPWorker(TpModelWorker):
         )
 
     def forward_draft_extend_after_decode(self, batch: ScheduleBatch) -> None:
-        assert isinstance(batch.spec_info, EagleDraftInput)
+        assert isinstance(batch.spec_info, FrozenKVMTPDraftInput)
         input_is_idle = batch.forward_mode.is_idle()
         if not input_is_idle and batch.spec_info.verified_id.numel() == 0:
             batch = batch.copy()
             batch.prepare_for_idle()
-            batch.spec_info = EagleDraftInput.create_idle_input(
+            batch.spec_info = FrozenKVMTPDraftInput.create_idle_input(
                 device=self.device,
                 hidden_size=self._recurrent_hidden_size,
                 dtype=self.model_config.dtype,
@@ -622,7 +476,7 @@ class FrozenKVMTPWorker(TpModelWorker):
 
     def draft(self, batch: ScheduleBatch):
         if batch.forward_mode.is_idle():
-            return EagleVerifyInput.create_idle_input(
+            return FrozenKVMTPVerifyInput.create_idle_input(
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
@@ -633,7 +487,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             req.decode_batch_idx += 1
 
         spec_info = batch.spec_info
-        assert isinstance(spec_info, EagleDraftInput)
+        assert isinstance(spec_info, FrozenKVMTPDraftInput)
 
         if batch.sampling_info.penalizer_orchestrator.is_required:
             batch.sampling_info.penalizer_orchestrator.cumulate_output_tokens(
@@ -687,7 +541,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             self.speculative_num_draft_tokens,
         )
 
-        return EagleVerifyInput(
+        return FrozenKVMTPVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
@@ -707,7 +561,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         self, forward_batch: ForwardBatch, skip_attn_backend_init: bool = False
     ):
         spec_info = forward_batch.spec_info
-        assert isinstance(spec_info, EagleDraftInput)
+        assert isinstance(spec_info, FrozenKVMTPDraftInput)
         topk_p, topk_index, hidden_states = (
             spec_info.topk_p,
             spec_info.topk_index,
@@ -760,7 +614,7 @@ class FrozenKVMTPWorker(TpModelWorker):
             score_list, token_list, parents_list, self.speculative_num_draft_tokens
         )
 
-    def verify(self, batch: ScheduleBatch, spec_info: EagleVerifyInput):
+    def verify(self, batch: ScheduleBatch, spec_info: FrozenKVMTPVerifyInput):
         seq_lens_pre_verify = batch.seq_lens.clone()
         spec_info.prepare_for_verify(batch, self.page_size)
         spec_info.num_tokens_per_req = self.speculative_num_steps + 1
@@ -810,7 +664,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         maybe_detect_nan(logits_output.next_token_logits, "frozen_kv_mtp_verify")
 
         spec_info.hidden_states = logits_output.hidden_states
-        res: EagleVerifyOutput = spec_info.verify(
+        res: FrozenKVMTPVerifyOutput = spec_info.verify(
             batch,
             logits_output,
             self.token_to_kv_pool_allocator,
@@ -830,7 +684,7 @@ class FrozenKVMTPWorker(TpModelWorker):
         ):
             logger.warning(
                 "Frozen-KV MTP does not implement mamba state updates; "
-                "Gemma 4 targets should not use this path."
+                "targets with recurrent state should not use this path."
             )
 
         if batch.return_logprob:

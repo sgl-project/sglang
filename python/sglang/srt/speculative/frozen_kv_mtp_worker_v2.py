@@ -36,7 +36,7 @@ class FrozenKVMTPWorkerV2(FrozenKVMTPWorker):
         target_worker: TpModelWorker,
     ):
         raise NotImplementedError(
-            "FrozenKVMTPWorkerV2 (overlap scheduling for Gemma 4 MTP) is "
+            "FrozenKVMTPWorkerV2 (overlap scheduling for Frozen-KV MTP) is "
             "not yet implemented. Pass --disable-overlap-schedule to use "
             "FrozenKVMTPWorker."
         )
