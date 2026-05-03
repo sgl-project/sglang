@@ -68,7 +68,8 @@ class TextEncodingStage(PipelineStage):
         super().__init__()
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
-        self._negative_text_cache = {}
+        self._negative_text_cache_key = None
+        self._negative_text_cache_value = None
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -130,7 +131,11 @@ class TextEncodingStage(PipelineStage):
                 batch.negative_prompt,
                 batch.max_sequence_length,
             )
-            cached_negative = self._negative_text_cache.get(negative_cache_key)
+            cached_negative = (
+                self._negative_text_cache_value
+                if self._negative_text_cache_key == negative_cache_key
+                else None
+            )
             if cached_negative is None:
                 neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = (
                     self.encode_text(
@@ -140,14 +145,13 @@ class TextEncodingStage(PipelineStage):
                         return_attention_mask=True,
                     )
                 )
-                if len(self._negative_text_cache) >= 2:
-                    self._negative_text_cache.clear()
                 # Negative prompts are often a long model default that warmup
                 # and later requests share. For the same pipeline, encoders,
                 # prompt text, and max length, encoding is deterministic, so the
                 # cached tensors are exactly the result of calling encode_text
                 # again.
-                self._negative_text_cache[negative_cache_key] = (
+                self._negative_text_cache_key = negative_cache_key
+                self._negative_text_cache_value = (
                     tuple(neg_embeds_list),
                     tuple(neg_masks_list),
                     tuple(neg_pooler_embeds_list),
