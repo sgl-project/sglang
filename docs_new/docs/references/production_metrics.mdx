@@ -7,6 +7,22 @@ SGLang exposes the following metrics via Prometheus. You can enable it by adding
 
 An example of the monitoring dashboard is available in [examples/monitoring/grafana.json](https://github.com/sgl-project/sglang/blob/main/examples/monitoring/grafana/dashboards/json/sglang-dashboard.json).
 
+SGLang Diffusion also exposes diffusion-specific metrics when launched with `--enable-metrics`.
+
+| Metric | Type | Labels | Description |
+| --- | --- | --- | --- |
+| `sglang:diffusion_num_queue_reqs` | Gauge | none | Number of generation requests in the diffusion scheduler queue. |
+| `sglang:diffusion_num_running_reqs` | Gauge | none | Number of diffusion generation requests dispatched by the scheduler and not yet finished. |
+| `sglang:diffusion_requests_total` | Counter | `status`, `is_warmup` | Completed diffusion generation requests. Dynamic batches are counted per original scheduler request after the merged output is split. |
+| `sglang:diffusion_request_latency_seconds` | Histogram | `status`, `is_warmup` | End-to-end scheduler latency from queue insertion to output handling. |
+| `sglang:diffusion_queue_time_seconds` | Histogram | `is_warmup` | Time spent waiting in the diffusion scheduler queue. |
+| `sglang:diffusion_generation_batch_size` | Histogram | `stop_reason` | Generation batch size selected by the diffusion scheduler at dispatch time. |
+| `sglang:diffusion_stage_latency_seconds` | Histogram | `stage` | Pipeline stage latency. Denoising step labels are normalized to `DenoisingStep` to avoid per-step label cardinality. |
+| `sglang:diffusion_lora_loaded_adapters` | Gauge | none | Number of loaded diffusion LoRA adapters. |
+| `sglang:diffusion_lora_active_modules` | Gauge | none | Number of diffusion modules with active LoRA adapters. |
+| `sglang:diffusion_lora_active_adapters` | Gauge | none | Number of unique active diffusion LoRA adapters. |
+| `sglang:diffusion_lora_module_active` | Gauge | `module` | Whether a diffusion module currently has an active LoRA adapter. |
+
 Here is an example of the metrics:
 
 ```text Output

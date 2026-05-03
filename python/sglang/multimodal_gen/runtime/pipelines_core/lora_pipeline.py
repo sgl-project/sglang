@@ -1019,9 +1019,17 @@ class LoRAPipeline(ComposedPipelineBase):
             if not self._is_lora_effective_for_module(module_name, lora_layers):
                 return None
             else:
+                nicknames, strengths = self.cur_adapter_config.get(
+                    module_name,
+                    (
+                        [self.cur_adapter_name.get(module_name, None)],
+                        [self.cur_adapter_strength.get(module_name, None)],
+                    ),
+                )
                 return [
                     {
                         "nickname": self.cur_adapter_name.get(module_name, None),
+                        "nicknames": nicknames,
                         "path": self.cur_adapter_path.get(module_name, None),
                         "merged": self.is_lora_merged.get(module_name, False),
                         "mode": (
@@ -1030,6 +1038,7 @@ class LoRAPipeline(ComposedPipelineBase):
                             else "unmerged"
                         ),
                         "strength": self.cur_adapter_strength.get(module_name, None),
+                        "strengths": strengths,
                     }
                 ]
 

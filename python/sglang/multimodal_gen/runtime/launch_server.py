@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.disaggregation.orchestrator import (
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.http_server import create_app
 from sglang.multimodal_gen.runtime.managers.gpu_worker import run_scheduler_process
+from sglang.multimodal_gen.runtime.observability import (
+    configure_prometheus_multiproc_dir,
+)
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     prepare_server_args,
@@ -24,7 +27,6 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import is_port_available
 from sglang.multimodal_gen.runtime.utils.logging_utils import configure_logger, logger
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.utils import set_prometheus_multiproc_dir
 
 
 def _find_available_port(
@@ -95,7 +97,7 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     logger.info("Starting server...")
 
     if server_args.enable_metrics:
-        set_prometheus_multiproc_dir()
+        configure_prometheus_multiproc_dir()
 
     num_gpus = server_args.num_gpus
     processes = []
@@ -243,6 +245,9 @@ def launch_pool_disagg_server(
             decoder_gpus=[[0], [2]],
         )
     """
+    if server_args.enable_metrics:
+        configure_prometheus_multiproc_dir()
+
     configure_logger(server_args)
 
     num_encoders = len(encoder_gpus)
@@ -482,6 +487,9 @@ def launch_disagg_server(server_args: ServerArgs):
         denoiser result: scheduler_port + 2
         decoder result: scheduler_port + 3
     """
+    if server_args.enable_metrics:
+        configure_prometheus_multiproc_dir()
+
     configure_logger(server_args)
 
     for name, val in [
@@ -554,6 +562,9 @@ def launch_disagg_role(server_args: ServerArgs):
        (derived from --disagg-server-addr + role offset)
     3. Spawns GPU worker processes for the assigned role.
     """
+    if server_args.enable_metrics:
+        configure_prometheus_multiproc_dir()
+
     configure_logger(server_args)
 
     role_type = server_args.disagg_role

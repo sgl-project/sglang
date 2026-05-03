@@ -45,6 +45,7 @@ from sglang.multimodal_gen.runtime.managers.dynamic_batch_admission import (
     BatchAdmissionController,
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
+from sglang.multimodal_gen.runtime.observability import get_diffusion_observer
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,
@@ -58,7 +59,6 @@ from sglang.multimodal_gen.runtime.server_args import (
 from sglang.multimodal_gen.runtime.utils.common import get_zmq_socket
 from sglang.multimodal_gen.runtime.utils.distributed import broadcast_pyobj
 from sglang.multimodal_gen.runtime.utils.logging_utils import GREEN, RESET, init_logger
-from sglang.multimodal_gen.runtime.utils.metrics import get_diffusion_metrics_collector
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 
 logger = init_logger(__name__)
@@ -74,6 +74,7 @@ DEFAULT_PLACEHOLDER_PROMPT = "warmup"
 
 _MAX_RECV_REQS_PER_POLL = 1024
 _BATCH_METRICS_LOG_INTERVAL = 5
+QueueItem = tuple[bytes | None, Any, float]
 
 
 class Scheduler(SchedulerDisaggMixin):
@@ -142,7 +143,7 @@ class Scheduler(SchedulerDisaggMixin):
         }
 
         # FIFO queue entries: (identity, request, enqueue_ts_s)
-        self.waiting_queue: deque[tuple[bytes | None, Any, float]] = deque()
+        self.waiting_queue: deque[QueueItem] = deque()
         self._batching_max_size = server_args.batching_max_size
         self._batching_delay_s = server_args.batching_delay_ms / 1000.0
         self._batch_metrics_enabled = server_args.enable_batching_metrics
@@ -158,11 +159,11 @@ class Scheduler(SchedulerDisaggMixin):
         self._warmup_total = 0
         self._warmup_processed = 0
 
-        self.metrics_collector = (
-            get_diffusion_metrics_collector(server_args) if gpu_id == 0 else None
+        self.observer = get_diffusion_observer(
+            server_args,
+            enabled=gpu_id == 0,
         )
-        if self.metrics_collector is not None:
-            self.metrics_collector.set_running_reqs(0)
+        self.observer.reset_running_requests()
 
         self.prepare_server_warmup_reqs()
         self._set_generation_queue_depth_metric()
@@ -268,17 +269,22 @@ class Scheduler(SchedulerDisaggMixin):
         )
 
     def _set_generation_queue_depth_metric(self) -> None:
-        if self.metrics_collector is not None:
-            self.metrics_collector.set_queue_depth(self._generation_queue_depth())
+        self.observer.set_queue_depth(self._generation_queue_depth())
 
     def _observe_generation_queue_time(
         self, req_or_group: Any, enqueue_time: float
     ) -> None:
-        if (
-            self.metrics_collector is not None
-            and self._first_generation_req(req_or_group) is not None
-        ):
-            self.metrics_collector.observe_queue_time(time.monotonic() - enqueue_time)
+        req = self._first_generation_req(req_or_group)
+        if req is not None:
+            self.observer.observe_queue_time(req, enqueue_time)
+
+    def _observe_generation_request(
+        self, req_or_group: Any, output_batch: OutputBatch, enqueue_time: float
+    ) -> None:
+        req = self._first_generation_req(req_or_group)
+        if req is None:
+            return
+        self.observer.observe_request_finished(req, output_batch, enqueue_time)
 
     def _dispatch_single_request(self, req_or_group: Any) -> OutputBatch:
         if isinstance(req_or_group, list):
@@ -294,7 +300,7 @@ class Scheduler(SchedulerDisaggMixin):
         return handler([req_or_group])
 
     def _dispatch_items(
-        self, items: list[tuple[bytes | None, Any]]
+        self, items: list[QueueItem]
     ) -> OutputBatch | list[OutputBatch]:
         """Dispatch ready queue items; several plain `Req`s form one dynamic batch."""
         reqs = [item[1] for item in items]
@@ -566,6 +572,13 @@ class Scheduler(SchedulerDisaggMixin):
         reject_reasons: list[str] | None = None,
         stop_reason: str | None = None,
     ) -> None:
+        # Batch-size observer events are emitted whenever metrics are enabled;
+        # --enable-batching-metrics only gates the log summary below.
+        self.observer.observe_batch_dispatch(
+            batch_size=batch_size,
+            stop_reason=stop_reason,
+        )
+
         if not self._batch_metrics_enabled:
             return
 
@@ -829,7 +842,7 @@ class Scheduler(SchedulerDisaggMixin):
             return self._batch_admission.enabled and supports_dynamic_batching()
         return self._batch_admission.enabled
 
-    def get_next_batch_to_run(self) -> list[tuple[bytes | None, Any]] | None:
+    def get_next_batch_to_run(self) -> list[QueueItem] | None:
         """Return the next dispatchable queue item or dynamic batch.
 
         Returns None when the head request is waiting for more compatible
@@ -848,13 +861,13 @@ class Scheduler(SchedulerDisaggMixin):
                     stop_reason="dynamic_disabled",
                 )
             self._observe_generation_queue_time(req, enqueue_time)
-            return [(identity, req)]
+            return [(identity, req, enqueue_time)]
 
         identity, req, enqueue_time = self.waiting_queue[0]
         if not isinstance(req, Req):
             identity, req, enqueue_time = self.waiting_queue.popleft()
             self._observe_generation_queue_time(req, enqueue_time)
-            return [(identity, req)]
+            return [(identity, req, enqueue_time)]
 
         # If the head request itself is not eligible for dynamic batching
         # (e.g., image-conditioned i2i request), dispatch it immediately.
@@ -873,7 +886,7 @@ class Scheduler(SchedulerDisaggMixin):
                 stop_reason=reject_reasons[0] if reject_reasons else "head_ineligible",
             )
             self._observe_generation_queue_time(req, head_enqueue_time)
-            return [(identity, req)]
+            return [(identity, req, head_enqueue_time)]
 
         compatible_indices: list[int] = [0]
         compatible_reqs: list[Req] = [req]
@@ -914,11 +927,12 @@ class Scheduler(SchedulerDisaggMixin):
         if should_wait_for_more:
             return None
 
-        batch_items: list[tuple[bytes | None, Any]] = [None] * batch_len
-        for pos, idx in enumerate(reversed(compatible_indices)):
+        batch_items: list[QueueItem] = []
+        for idx in compatible_indices:
             item_identity, item_req, item_enqueue_time = self.waiting_queue[idx]
-            batch_items[batch_len - 1 - pos] = (item_identity, item_req)
+            batch_items.append((item_identity, item_req, item_enqueue_time))
             self._observe_generation_queue_time(item_req, item_enqueue_time)
+        for idx in reversed(compatible_indices):
             del self.waiting_queue[idx]
         stop_reason = self._batch_admission.limit_reason_for_batch(compatible_reqs)
         if stop_reason is None:
@@ -1192,14 +1206,13 @@ class Scheduler(SchedulerDisaggMixin):
                         time.sleep(remaining_ms / 1000.0)
                 continue
 
-            generation_running_reqs = sum(
-                1
-                for _identity, req_or_group in items
-                if self._first_generation_req(req_or_group) is not None
-            )
-            if self.metrics_collector is not None:
-                self.metrics_collector.set_running_reqs(generation_running_reqs)
-                self._set_generation_queue_depth_metric()
+            running_reqs = [
+                req
+                for _identity, req_or_group, _enqueue_time in items
+                if (req := self._first_generation_req(req_or_group)) is not None
+            ]
+            self.observer.mark_requests_dispatched(running_reqs)
+            self._set_generation_queue_depth_metric()
 
             try:
                 try:
@@ -1232,13 +1245,21 @@ class Scheduler(SchedulerDisaggMixin):
                         for _ in items
                     ]
 
+                for (_identity, processed_req, enqueue_time), output_batch in zip(
+                    items, output_batches, strict=True
+                ):
+                    is_warmup = self._is_warmup_item(processed_req)
+                    self._log_warmup_result(output_batch, is_warmup)
+                    self._observe_generation_request(
+                        processed_req, output_batch, enqueue_time
+                    )
+
                 # 3. return results
                 try:
-                    for (identity, processed_req), output_batch in zip(
+                    for (identity, processed_req, _enqueue_time), output_batch in zip(
                         items, output_batches, strict=True
                     ):
                         is_warmup = self._is_warmup_item(processed_req)
-                        self._log_warmup_result(output_batch, is_warmup)
 
                         self.return_result(output_batch, identity, is_warmup=is_warmup)
                 except zmq.ZMQError as e:
@@ -1246,9 +1267,8 @@ class Scheduler(SchedulerDisaggMixin):
                     logger.error(f"ZMQ error sending reply: {e}")
                     continue
             finally:
-                if self.metrics_collector is not None:
-                    self.metrics_collector.set_running_reqs(0)
-                    self._set_generation_queue_depth_metric()
+                self.observer.mark_requests_finished(running_reqs)
+                self._set_generation_queue_depth_metric()
 
         self._log_batch_metrics_summary()
 

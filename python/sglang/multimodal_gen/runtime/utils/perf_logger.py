@@ -16,6 +16,7 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.observability import get_diffusion_observer
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     CYAN,
@@ -26,6 +27,19 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
 )
 
 logger = init_logger(__name__)
+_STAGE_OBSERVER_UNSET = object()
+_stage_observer = _STAGE_OBSERVER_UNSET
+
+
+def _get_stage_observer():
+    global _stage_observer
+
+    if _stage_observer is _STAGE_OBSERVER_UNSET:
+        observer = get_diffusion_observer()
+        if observer.enabled:
+            _stage_observer = observer
+        return observer
+    return _stage_observer
 
 
 @dataclasses.dataclass
@@ -201,6 +215,7 @@ class StageProfiler:
         self.log_stage_start_end = log_stage_start_end
         self.capture_memory = capture_memory
         self.record_as_step = record_as_step
+        self.observer = _get_stage_observer()
 
     def _should_record_as_step(self) -> bool:
         return self.record_as_step or self.stage_name.startswith("denoising_step_")
@@ -218,7 +233,11 @@ class StageProfiler:
                 msg += f" ({round(available_memory, 2)} GB left)"
             self.logger.info(msg)
 
-        if (self.log_timing and self.metrics) or self.log_stage_start_end:
+        if (
+            (self.log_timing and self.metrics)
+            or self.log_stage_start_end
+            or self.observer.enabled
+        ):
             if (
                 os.environ.get("SGLANG_DIFFUSION_SYNC_STAGE_PROFILING", "0") == "1"
                 and self._should_record_as_step()
@@ -230,7 +249,11 @@ class StageProfiler:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if not ((self.log_timing and self.metrics) or self.log_stage_start_end):
+        if not (
+            (self.log_timing and self.metrics)
+            or self.log_stage_start_end
+            or self.observer.enabled
+        ):
             return False
 
         if (
@@ -268,6 +291,12 @@ class StageProfiler:
                 self.metrics.record_memory_snapshot(
                     f"after_{self.stage_name}", snapshot
                 )
+
+        if self.observer.enabled:
+            self.observer.observe_stage_latency(
+                self.stage_name,
+                latency_s=execution_time_s,
+            )
 
         return False
 
