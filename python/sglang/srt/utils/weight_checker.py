@@ -43,8 +43,6 @@ class WeightChecker:
                 for pattern in [
                     "cos_sin_cache",
                     "freqs_cis",
-                    "attn_mqa.k_scale",
-                    "attn_mqa.v_scale",
                 ]
             ):
                 continue
@@ -131,7 +129,11 @@ def _postprocess_tensors(
 ) -> Iterable[Tuple[str, bool, torch.Tensor]]:
     from sglang.srt.debug_utils.dumper import get_tensor_info
 
-    skip_compare_names = []
+    skip_compare_names = [
+        name
+        for name in raw
+        if any(pattern in name for pattern in ["attn_mqa.k_scale", "attn_mqa.v_scale"])
+    ]
 
     # dequant fp8
     quant_names = [
