@@ -1165,6 +1165,154 @@ def build_relaykv_guarded_noop_materialization_results_for_smoke(
     return results
 
 
+def _candidate_event_materialization_block_ids_from_aliases(
+    event: Mapping[str, Any],
+    keys: tuple[str, ...],
+) -> list[Any] | None:
+    for key in keys:
+        value = _event_value(event, key)
+        if value is None:
+            continue
+        if key in ("block_id", "candidate_block_id"):
+            return [value]
+        if not isinstance(value, (list, tuple)):
+            raise TypeError(
+                "RelayKV candidate-event materialization "
+                f"{key} must be list or tuple"
+            )
+        return list(value)
+    return None
+
+
+def build_relaykv_candidate_event_materialization_results_for_smoke(
+    host_backup_candidate_events: list[Mapping[str, Any]]
+    | tuple[Mapping[str, Any], ...],
+    readiness: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build metadata-only materialization results from candidate events.
+
+    This treats candidate event payloads as materialized candidate metadata
+    without reading KV pools, taking snapshots, executing host backup copy,
+    connecting attention, mutating scheduler state, or writing runtime state.
+    """
+
+    if not isinstance(host_backup_candidate_events, (list, tuple)):
+        raise TypeError("host_backup_candidate_events must be a list or tuple")
+    if readiness is not None and not isinstance(readiness, Mapping):
+        raise TypeError("readiness must be a mapping or None")
+
+    readiness_ready = (
+        True
+        if readiness is None
+        else readiness.get("ready_for_materialization") is True
+    )
+    readiness_blocking_reasons: list[str] = []
+    if readiness is not None:
+        blocking_reasons = readiness.get("blocking_reasons")
+        if isinstance(blocking_reasons, (list, tuple)):
+            readiness_blocking_reasons = [str(reason) for reason in blocking_reasons]
+    if readiness is not None and not readiness_ready and not readiness_blocking_reasons:
+        readiness_blocking_reasons = ["readiness_not_met"]
+
+    results: list[dict[str, Any]] = []
+    for event in host_backup_candidate_events:
+        if not isinstance(event, Mapping):
+            raise TypeError(
+                "RelayKV candidate-event materialization events must be mappings"
+            )
+
+        selected_block_ids = (
+            _candidate_event_materialization_block_ids_from_aliases(
+                event,
+                (
+                    "selected_block_ids",
+                    "materialized_block_ids",
+                    "retrieved_block_ids",
+                    "copied_block_ids",
+                    "block_ids",
+                    "block_id",
+                    "candidate_block_id",
+                    "candidate_block_ids",
+                ),
+            )
+            or []
+        )
+        materialized_block_ids = (
+            _candidate_event_materialization_block_ids_from_aliases(
+                event, ("materialized_block_ids",)
+            )
+            or list(selected_block_ids)
+        )
+        retrieved_block_ids = (
+            _candidate_event_materialization_block_ids_from_aliases(
+                event, ("retrieved_block_ids",)
+            )
+            or list(materialized_block_ids)
+        )
+        candidate_block_ids = (
+            _candidate_event_materialization_block_ids_from_aliases(
+                event, ("candidate_block_ids",)
+            )
+            or list(selected_block_ids)
+        )
+        anchor_block_ids = _fake_materialization_block_ids(event, "anchor_block_ids")
+        recent_block_ids = _fake_materialization_block_ids(event, "recent_block_ids")
+
+        blocking_reasons: list[str] = []
+        warning_reasons: list[str] = ["candidate_event_metadata_only_no_kv_copy"]
+        skipped_block_ids: list[Any] = []
+
+        if not readiness_ready:
+            materialization_state = "blocked"
+            blocking_reasons = list(readiness_blocking_reasons)
+            skipped_block_ids = list(selected_block_ids)
+            materialized_block_ids = []
+            retrieved_block_ids = []
+        elif not selected_block_ids or not materialized_block_ids:
+            materialization_state = "skipped"
+            warning_reasons.append("no_selected_blocks")
+            materialized_block_ids = []
+            retrieved_block_ids = []
+        else:
+            materialization_state = "candidate_event_materialized"
+        if readiness is None:
+            warning_reasons.append("readiness_not_provided")
+
+        results.append(
+            {
+                "event_type": "relaykv_materialization_result",
+                "request_id": _event_value(event, "request_id"),
+                "req_pool_idx": _event_req_pool_idx_value(event),
+                "seq_len": _event_value(event, "seq_len"),
+                "layer_id": _event_layer_value(event),
+                "materialization_state": materialization_state,
+                "materialization_mode": "candidate_event",
+                "selected_block_ids": selected_block_ids,
+                "materialized_block_ids": materialized_block_ids,
+                "skipped_block_ids": skipped_block_ids,
+                "fallback_block_ids": [],
+                "anchor_block_ids": anchor_block_ids,
+                "recent_block_ids": recent_block_ids,
+                "retrieved_block_ids": retrieved_block_ids,
+                "candidate_block_ids": candidate_block_ids,
+                "materialized_kv_count": len(materialized_block_ids),
+                "materialized_token_count": 0,
+                "source": "host_backup_candidate_event_materialization",
+                "blocking_reasons": blocking_reasons,
+                "warning_reasons": warning_reasons,
+                "source_mutated": False,
+                "attention_override": False,
+                "kv_cache_mutation": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "host_backup_copy_executed": False,
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+            }
+        )
+    return results
+
+
 def summarize_relaykv_materialization_results_for_smoke(
     results: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
 ) -> dict[str, Any]:
@@ -1192,6 +1340,7 @@ def summarize_relaykv_materialization_results_for_smoke(
     materialized_kv_count = 0
     materialized_token_count = 0
     guarded_noop_count = 0
+    fake_materialized_count = 0
     candidate_event_materialized_count = 0
     host_backup_copy_materialized_count = 0
     skipped_count = 0
@@ -1209,6 +1358,8 @@ def summarize_relaykv_materialization_results_for_smoke(
         per_request[str(_event_value(result, "request_id"))] += 1
         per_layer[str(_event_layer_value(result))] += 1
         if state == "fake_materialized":
+            fake_materialized_count += 1
+        elif state == "candidate_event_materialized":
             candidate_event_materialized_count += 1
         elif state == "guarded_noop":
             guarded_noop_count += 1
@@ -1251,8 +1402,10 @@ def summarize_relaykv_materialization_results_for_smoke(
     return {
         "summary_type": "relaykv_materialization_summary",
         "total_materialization_results": len(results),
-        "materialized_result_count": candidate_event_materialized_count,
-        "fake_materialized_count": candidate_event_materialized_count,
+        "materialized_result_count": (
+            fake_materialized_count + candidate_event_materialized_count
+        ),
+        "fake_materialized_count": fake_materialized_count,
         "guarded_noop_count": guarded_noop_count,
         "candidate_event_materialized_count": candidate_event_materialized_count,
         "host_backup_copy_materialized_count": host_backup_copy_materialized_count,
