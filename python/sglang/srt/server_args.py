@@ -1673,6 +1673,7 @@ class ServerArgs:
 
         if model_arch in [
             "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
             "KimiK25ForConditionalGeneration",
             "MistralLarge3ForCausalLM",
             "PixtralForConditionalGeneration",
