@@ -200,9 +200,7 @@ class GPUWorker:
             current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
         )
         can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
-        suggested_args_str = self._format_offload_disable_suggestions(
-            can_stay_resident
-        )
+        suggested_args_str = self._format_offload_disable_suggestions(can_stay_resident)
 
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
 

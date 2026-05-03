@@ -385,8 +385,6 @@ class ServerArgs(DisaggArgsMixin):
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
-            if self.vae_cpu_offload is None:
-                self.vae_cpu_offload = False
         elif self.pipeline_config.task_type.is_image_gen():
             logger.info(
                 "Disabling some offloading (except dit, text_encoder) for image generation model"
@@ -397,8 +395,6 @@ class ServerArgs(DisaggArgsMixin):
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = False
-            if self.vae_cpu_offload is None:
-                self.vae_cpu_offload = False
         else:
             if self.dit_cpu_offload is None:
                 self.dit_cpu_offload = True
@@ -406,8 +402,6 @@ class ServerArgs(DisaggArgsMixin):
                 self.text_encoder_cpu_offload = True
             if self.image_encoder_cpu_offload is None:
                 self.image_encoder_cpu_offload = True
-            if self.vae_cpu_offload is None:
-                self.vae_cpu_offload = False
 
     def _adjust_ltx2_two_stage_device_mode(self):
         if not self._is_ltx23_two_stage_pipeline():
