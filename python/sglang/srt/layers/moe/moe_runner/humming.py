@@ -5,6 +5,7 @@ import logging
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional
+from weakref import WeakValueDictionary
 
 import torch
 from sglang.srt.environ import envs
@@ -22,7 +23,6 @@ from sglang.srt.layers.moe.moe_runner.base import (
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils.custom_op import register_custom_op
-
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -129,7 +129,7 @@ def humming_moe_runner_core_run(
 
 
 class HummingRunnerCore(MoeRunnerCore):
-    runner_cores: dict[int, HummingRunnerCore] = {}
+    runner_cores: WeakValueDictionary = WeakValueDictionary()
 
     def __init__(self, config: MoeRunnerConfig):
         super().__init__(config)
