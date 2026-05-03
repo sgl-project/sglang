@@ -157,3 +157,9 @@ request warmup 会先跑一次 one-step request，并在 stage2 前把 transform
   - `neg_hidden_48_valid`: mean_abs `0.03184`, rms `0.04384`。
   - 已用 `ca226882f` revert，不保留该 probe。
 - 结论：SDPA/GQA repeat 路径是当前 official default raw Gemma hidden bit-exact 的必要条件；移除后主要误差源在 text encoder 第 1 层开始，后段 res2s 已修复项无法补偿。当前 SDPA 移除状态下 final video SSIM 对齐约 65.33%，bit-exact 0%。
+
+## 2026-05-03 HF SDPA/GQA 语义复核
+
+- 本地 transformers `5.3.0` 中 `use_gqa_in_sdpa(attention_mask, key)` 只有在 `attention_mask is None` 且 torch 版本满足条件时才返回 true。
+- HF `sdpa_attention_forward` 逻辑是：如果 `not use_gqa_in_sdpa(...)`，先 `repeat_kv(key/value)`；否则才传 `enable_gqa=True`。
+- LTX2 Gemma text encoder 当前有 causal/padding additive mask，因此 official default SDPA 语义是 masked SDPA + explicit repeat KV，不是 masked SDPA + `enable_gqa=True`。
