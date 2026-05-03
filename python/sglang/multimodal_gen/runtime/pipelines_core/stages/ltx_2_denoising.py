@@ -366,6 +366,8 @@ class LTX2DenoisingStage(DenoisingStage):
         eta: float = 0.5,
         terminal: bool = False,
     ) -> torch.Tensor:
+        # Keep terminal checks as host-side booleans; branching on CUDA tensors
+        # here would add a synchronization point to every res2s step.
         if terminal:
             return denoised_sample.to(dtype=sample.dtype)
         alpha_ratio, sigma_down, sigma_up = cls._ltx2_get_sde_coeff(
@@ -1442,6 +1444,8 @@ class LTX2DenoisingStage(DenoisingStage):
                 and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
             )
         )
+        # HQ split chunks are whole guidance passes, so kwargs-level skips match
+        # native forwards. TI2V keeps per-sample masks to preserve accuracy.
         use_split_pass_kwargs = (
             server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
         )
