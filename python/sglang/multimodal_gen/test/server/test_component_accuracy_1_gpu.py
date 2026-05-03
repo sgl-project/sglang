@@ -2,7 +2,6 @@ import pytest
 
 from sglang.multimodal_gen.test.server.accuracy_config import (
     ComponentType,
-    get_skip_reason,
     should_skip_component,
 )
 from sglang.multimodal_gen.test.server.accuracy_testcase_configs import (
@@ -15,13 +14,32 @@ from sglang.multimodal_gen.test.server.accuracy_utils import (
 from sglang.multimodal_gen.test.server.component_accuracy import AccuracyEngine
 
 
-@pytest.mark.parametrize("case", ACCURACY_ONE_GPU_CASES, ids=lambda case: case.id)
+def _case_id(case):
+    return case.id
+
+
+VAE_CASES_1GPU = [
+    case
+    for case in ACCURACY_ONE_GPU_CASES
+    if not should_skip_component(case, ComponentType.VAE)
+]
+TRANSFORMER_CASES_1GPU = [
+    case
+    for case in ACCURACY_ONE_GPU_CASES
+    if not should_skip_component(case, ComponentType.TRANSFORMER)
+]
+TEXT_ENCODER_CASES_1GPU = [
+    case
+    for case in ACCURACY_ONE_GPU_CASES
+    if not should_skip_component(case, ComponentType.TEXT_ENCODER)
+]
+
+
 class TestComponentAccuracy1GPU:
     """1-GPU component accuracy suite."""
 
+    @pytest.mark.parametrize("case", VAE_CASES_1GPU, ids=_case_id)
     def test_vae_accuracy(self, case):
-        if should_skip_component(case, ComponentType.VAE):
-            pytest.skip(get_skip_reason(case, ComponentType.VAE))
         run_native_component_accuracy_case(
             AccuracyEngine,
             case,
@@ -30,9 +48,8 @@ class TestComponentAccuracy1GPU:
             case.server_args.num_gpus,
         )
 
+    @pytest.mark.parametrize("case", TRANSFORMER_CASES_1GPU, ids=_case_id)
     def test_transformer_accuracy(self, case):
-        if should_skip_component(case, ComponentType.TRANSFORMER):
-            pytest.skip(get_skip_reason(case, ComponentType.TRANSFORMER))
         run_native_component_accuracy_case(
             AccuracyEngine,
             case,
@@ -41,9 +58,8 @@ class TestComponentAccuracy1GPU:
             case.server_args.num_gpus,
         )
 
+    @pytest.mark.parametrize("case", TEXT_ENCODER_CASES_1GPU, ids=_case_id)
     def test_encoder_accuracy(self, case):
-        if should_skip_component(case, ComponentType.TEXT_ENCODER):
-            pytest.skip(get_skip_reason(case, ComponentType.TEXT_ENCODER))
         run_text_encoder_accuracy_case(
             AccuracyEngine,
             case,

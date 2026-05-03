@@ -82,10 +82,39 @@ jobs:
         run: |
           python scripts/ci/utils/diffusion/compute_diffusion_partitions.py --min-time 1200 --target-time 1800 --max-time 2400 --max-partitions 10
 
-  multimodal-gen-test-1-gpu:
-    needs: compute-diffusion-partitions
+  wait-for-stage-a:
     if: |
       always() &&
+      !cancelled() &&
+      github.event_name == 'pull_request' &&
+      !inputs.target_stage &&
+      inputs.test_parallel_dispatch != 'true' &&
+      inputs.caller_needs_failure != 'true' &&
+      inputs.multimodal_gen == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      stage_a_result: ${{ steps.wait.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pr_head_sha || inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - uses: ./.github/actions/wait-for-jobs
+        id: wait
+        with:
+          stage-name: stage-a
+          # In reusable workflow runs, job names are prefixed with
+          # "call-multimodal-gen-tests / ".
+          jobs: '["call-multimodal-gen-tests / multimodal-gen-unit-test"]'
+          max-wait-minutes: '180'
+
+  multimodal-gen-test-1-gpu:
+    needs: [compute-diffusion-partitions, wait-for-stage-a]
+    if: |
+      always() &&
+      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
       needs.compute-diffusion-partitions.result == 'success' &&
       needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"include":[]}' &&
       (
@@ -162,9 +191,10 @@ jobs:
           artifact-suffix: ${{ matrix.part }}
 
   multimodal-gen-test-2-gpu:
-    needs: compute-diffusion-partitions
+    needs: [compute-diffusion-partitions, wait-for-stage-a]
     if: |
       always() &&
+      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
       needs.compute-diffusion-partitions.result == 'success' &&
       needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"include":[]}' &&
       (
@@ -242,8 +272,11 @@ jobs:
           artifact-suffix: ${{ matrix.part }}
 
   multimodal-gen-component-accuracy:
+    needs: wait-for-stage-a
     if: |
-      (
+      always() &&
+      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
+      ((
         inputs.target_stage == 'multimodal-gen-component-accuracy' ||
         inputs.target_stage == 'multimodal-gen-component-accuracy-1-gpu' ||
         inputs.target_stage == 'multimodal-gen-component-accuracy-2-gpu'
@@ -252,7 +285,7 @@ jobs:
         !inputs.target_stage &&
         ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
         inputs.multimodal_gen == 'true'
-      )
+      ))
     runs-on: 2-gpu-h100
     timeout-minutes: 240
     steps:
@@ -295,13 +328,16 @@ jobs:
           artifact-suffix: component-accuracy
 
   multimodal-gen-test-1-b200:
+    needs: wait-for-stage-a
     if: |
-      (inputs.target_stage == 'multimodal-gen-test-1-b200') ||
+      always() &&
+      (needs.wait-for-stage-a.result == 'success' || needs.wait-for-stage-a.result == 'skipped') &&
+      ((inputs.target_stage == 'multimodal-gen-test-1-b200') ||
       (
         !inputs.target_stage &&
         ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
         inputs.multimodal_gen == 'true'
-      )
+      ))
     runs-on: ${{ inputs.b200_runner }}
     timeout-minutes: 240
     steps:
