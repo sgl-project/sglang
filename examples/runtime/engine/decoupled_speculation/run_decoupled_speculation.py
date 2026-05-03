@@ -1039,7 +1039,6 @@ def _float_or_none(value: Any) -> float | None:
 def collect_mode_metrics(
     *,
     mode: str,
-    elapsed_s: float,
     outputs: list[dict[str, Any]],
     prompt_samples: list[PromptSample],
     include_output_text: bool = True,
@@ -1074,7 +1073,11 @@ def collect_mode_metrics(
         finish_reason = meta_info.get("finish_reason")
         request_latency_s = _float_or_none(meta_info.get("e2e_latency"))
         if request_latency_s is None:
-            request_latency_s = elapsed_s
+            raise RuntimeError(
+                f"{mode} output for batch_index={index}, row_index={sample.row_index} "
+                "is missing meta_info['e2e_latency']; cannot compute request "
+                "duration without script-side timing."
+            )
 
         request_metrics = {
             "batch_index": index,
@@ -1101,7 +1104,12 @@ def collect_mode_metrics(
             )
         per_request.append(request_metrics)
 
-    throughput = total_generated_tokens / elapsed_s if elapsed_s > 0 else 0.0
+    generation_time_s = (
+        max(item["request_latency_s"] for item in per_request) if per_request else 0.0
+    )
+    throughput = (
+        total_generated_tokens / generation_time_s if generation_time_s > 0 else 0.0
+    )
     avg_accept_length = (
         total_accepted_tokens / total_verify_ct
         if total_verify_ct > 0
@@ -1112,7 +1120,7 @@ def collect_mode_metrics(
     )
     return ModeMetrics(
         mode=mode,
-        generation_time_s=elapsed_s,
+        generation_time_s=generation_time_s,
         total_generated_tokens=total_generated_tokens,
         output_throughput_tok_per_s=throughput,
         per_request=per_request,
@@ -1152,7 +1160,7 @@ def run_mode(
             result_endpoints=result_endpoints,
         )
         result = ray.get(
-            target_actors[0].generate_and_measure.remote(
+            target_actors[0].generate_batch.remote(
                 prompt_input_ids, sampling_params
             )
         )
@@ -1163,7 +1171,6 @@ def run_mode(
 
     return collect_mode_metrics(
         mode=mode,
-        elapsed_s=float(result["elapsed_s"]),
         outputs=result["outputs"],
         prompt_samples=prompt_samples,
         include_output_text=include_output_text,

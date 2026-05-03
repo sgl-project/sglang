@@ -506,24 +506,22 @@ class TargetActor:
             "assigned_gpu_ids": self.assigned_gpu_ids,
         }
 
-    def generate_and_measure(
+    def generate_batch(
         self,
         prompt_input_ids: list[list[int]],
         sampling_params: dict[str, Any],
     ) -> dict[str, Any]:
-        """Run generation on rank 0 and return elapsed time plus raw outputs."""
+        """Run generation on rank 0 and return raw outputs."""
         if self.node_rank != 0:
-            raise RuntimeError("generate_and_measure must be called on node rank 0")
+            raise RuntimeError("generate_batch must be called on node rank 0")
 
-        start_time = time.perf_counter()
         outputs = self.engine.generate(
             input_ids=prompt_input_ids,
             sampling_params=sampling_params,
         )
-        elapsed_s = time.perf_counter() - start_time
         if not isinstance(outputs, list):
             outputs = [outputs]
-        return {"elapsed_s": elapsed_s, "outputs": outputs}
+        return {"outputs": outputs}
 
     def shutdown(self) -> bool:
         """Shutdown the target engine owned by this actor."""
