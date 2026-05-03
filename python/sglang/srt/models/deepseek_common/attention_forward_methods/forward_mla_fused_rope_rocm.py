@@ -83,7 +83,9 @@ class DeepseekMLARocmForwardMixin:
             )
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
-        q_input[..., : self.kv_lora_rank] = q_nope_out.transpose(0, 1)
+        q_nope_out_t = q_nope_out.transpose(0, 1)
+        q_nope_out_t = self._apply_kv_b_lora_q_correction(q_nope, q_nope_out_t)
+        q_input[..., : self.kv_lora_rank] = q_nope_out_t
         v_input = latent_cache[..., : self.kv_lora_rank]
         v_input = self.kv_a_layernorm(v_input.contiguous()).unsqueeze(1)
         k_input = latent_cache.unsqueeze(1)
@@ -221,7 +223,10 @@ class DeepseekMLARocmForwardMixin:
             )
         else:
             attn_bmm_output = torch.bmm(attn_output.transpose(0, 1), self.w_vc)
-        attn_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
-        output, _ = self.o_proj(attn_output)
+        attn_bmm_flat = attn_bmm_output.transpose(0, 1).flatten(1, 2)
+        attn_bmm_flat = self._apply_kv_b_lora_v_correction(
+            attn_output, attn_bmm_flat
+        )
+        output, _ = self.o_proj(attn_bmm_flat)
 
         return output
