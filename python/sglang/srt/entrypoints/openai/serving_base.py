@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 from abc import ABC, abstractmethod
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import orjson
@@ -239,6 +240,71 @@ class OpenAIServingBase(ABC):
             code=status_code,
         )
         return json.dumps({"error": error.model_dump()})
+
+    def maybe_convert_pre_stream_bad_request(
+        self, first_chunk: Any
+    ) -> Optional[ORJSONResponse]:
+        """Convert a pre-stream SSE bad-request chunk into an HTTP 400 response.
+
+        Streaming OpenAI handlers kick-start their generators before returning a
+        StreamingResponse so deterministic validation failures can still surface
+        as request-level HTTP errors. Some validation paths in stream mode yield
+        an SSE error chunk as the first item instead of raising ValueError.
+        Detect that first-chunk bad-request case and convert it back into the
+        same flat HTTP 400 error payload used by non-streaming requests.
+        """
+        if isinstance(first_chunk, bytes):
+            try:
+                first_chunk = first_chunk.decode()
+            except UnicodeDecodeError:
+                return None
+        if not isinstance(first_chunk, str):
+            return None
+
+        first_chunk = first_chunk.strip()
+        if not first_chunk.startswith("data:"):
+            return None
+
+        payload = first_chunk[len("data:") :].strip()
+        if payload == "[DONE]":
+            return None
+
+        try:
+            data = json.loads(payload)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        error = data.get("error")
+        if not isinstance(error, dict):
+            return None
+
+        try:
+            status_code = int(error.get("code"))
+        except (TypeError, ValueError):
+            return None
+
+        if status_code != HTTPStatus.BAD_REQUEST.value:
+            return None
+
+        message = error.get("message")
+        if not isinstance(message, str) or not message:
+            message = "Bad request"
+        param = error.get("param")
+        if not isinstance(param, str):
+            param = None
+        err_type = error.get("type")
+        if not isinstance(err_type, str) or not err_type:
+            err_type = "BadRequest"
+
+        return self.create_error_response(
+            message=message,
+            err_type=err_type,
+            status_code=status_code,
+            param=param,
+        )
 
     def extract_custom_labels(self, raw_request):
         if (
