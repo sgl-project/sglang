@@ -1600,19 +1600,14 @@ class ServerArgs:
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
     def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+        from sglang.srt.arg_groups.hisparse_hook import (
+            apply_hisparse_nsa_backend_defaults,
+        )
+
         user_set_prefill = self.nsa_prefill_backend is not None
         user_set_decode = self.nsa_decode_backend is not None
 
-        # HiSparse requires flashmla_sparse for both prefill and decode
-        if self.enable_hisparse:
-            if not user_set_prefill:
-                self.nsa_prefill_backend = "flashmla_sparse"
-            if not user_set_decode:
-                self.nsa_decode_backend = "flashmla_sparse"
-            logger.warning(
-                f"HiSparse enabled: using flashmla_sparse NSA backends "
-                f"(prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend})."
-            )
+        if apply_hisparse_nsa_backend_defaults(self, user_set_prefill, user_set_decode):
             return
 
         if not user_set_prefill and not user_set_decode and is_hip():
@@ -6882,35 +6877,9 @@ class ServerArgs:
                 )
 
         # Check hisparse
-        if self.enable_hisparse:
-            from sglang.srt.configs.model_config import (
-                is_deepseek_nsa,
-                is_deepseek_v4,
-            )
+        from sglang.srt.arg_groups.hisparse_hook import validate_hisparse
 
-            hf_config = self.get_model_config().hf_config
-            is_v4_hisparse = is_deepseek_v4(hf_config)
-            assert is_deepseek_nsa(hf_config) or is_v4_hisparse, (
-                "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) "
-                "models (e.g., DeepSeek V3.2, GLM-5) and DeepSeek V4 now. "
-            )
-
-            assert (
-                self.disable_radix_cache
-            ), "Hierarchical sparse attention currently requires --disable-radix-cache."
-
-            if not is_v4_hisparse:
-                for attr, label in [
-                    ("nsa_prefill_backend", "prefill"),
-                    ("nsa_decode_backend", "decode"),
-                ]:
-                    backend = getattr(self, attr)
-                    if backend is not None and backend != "flashmla_sparse":
-                        raise ValueError(
-                            f"HiSparse requires flashmla_sparse NSA {label} backend, "
-                            f"but got --nsa-{label}-backend={backend}. "
-                            f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
-                        )
+        validate_hisparse(self)
         assert (
             self.schedule_conservativeness >= 0
         ), "schedule_conservativeness must be non-negative"
