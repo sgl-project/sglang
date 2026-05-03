@@ -25,8 +25,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-
-from .conftest import (
+from conftest import (  # pytest's rootdir adds the test dir to sys.path
     KUBECTL_CONTEXT,
     NAMESPACE,
     RECONCILIATION_WAIT_SECS,

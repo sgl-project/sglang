@@ -407,7 +407,12 @@ jobs:
       - name: Run K8s integration tests
         run: |
           cd sgl-model-gateway
-          pytest e2e_test/k8s_integration/ -v -s -o log_cli=true --log-cli-level=INFO
+          # confcutdir avoids loading the parent e2e_test/conftest.py, which
+          # pulls in heavy infra deps (requests, sglang_router) that this job
+          # intentionally doesn't install.
+          pytest e2e_test/k8s_integration/ \
+            --confcutdir=e2e_test/k8s_integration \
+            -v -s -o log_cli=true --log-cli-level=INFO
 
       - name: Dump cluster state on failure
         if: failure()
