@@ -27,6 +27,21 @@ from sglang.srt.disaggregation.utils import (
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
+try:
+    from nixl._bindings import (
+        nixlBackendError,
+        nixlCancelledError,
+        nixlRemoteDisconnectError,
+    )
+
+    _NIXL_TRANSPORT_ERRORS = (
+        nixlRemoteDisconnectError,
+        nixlBackendError,
+        nixlCancelledError,
+    )
+except ImportError:
+    _NIXL_TRANSPORT_ERRORS = (RuntimeError,)
+
 logger = logging.getLogger(__name__)
 
 GUARD = "NixlMsgGuard".encode("ascii")
@@ -1077,7 +1092,7 @@ class NixlKVSender(CommonKVSender):
                 self.aux_index,
                 state_indices,
             )
-        except RuntimeError as e:
+        except _NIXL_TRANSPORT_ERRORS as e:
             logger.warning(
                 f"KVSender transfer request failed for room {self.bootstrap_room}: {e}"
             )
@@ -1098,7 +1113,7 @@ class NixlKVSender(CommonKVSender):
             return self.kv_mgr.check_status(self.bootstrap_room)
         try:
             states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
-        except RuntimeError as e:
+        except _NIXL_TRANSPORT_ERRORS as e:
             logger.warning(
                 f"KVSender check_xfer_state failed for room {self.bootstrap_room}: {e}"
             )
