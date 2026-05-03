@@ -39,7 +39,7 @@ def moe_fused_mul_sum_kernel(
         b_val = tl.load(b_base + n, mask=m_mask, other=0.0).to(tl.float32)
         if has_expert_map:
             id_val = tl.load(top_ids_ptr + offs_m * top_k + n, mask=m_mask, other=0)
-            expert_mask = tl.load(expert_map_ptr + id_val) >= 0
+            expert_mask = (id_val >= 0) & (tl.load(expert_map_ptr + id_val, mask=id_val >= 0, other=-1) >= 0)
             a_vec = tl.load(
                 a_base + n * size,
                 mask=mask & expert_mask[:, None],
