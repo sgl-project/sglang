@@ -1108,6 +1108,10 @@ class NixlKVSender(CommonKVSender):
         if all(x == "DONE" for x in states):
             return KVPoll.Success  # type: ignore
         if any(x == "ERR" for x in states):
+            self._send_failed = True
+            self._send_error = RuntimeError(
+                f"NIXL transfer error for room {self.bootstrap_room}"
+            )
             return KVPoll.Failed  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
 
