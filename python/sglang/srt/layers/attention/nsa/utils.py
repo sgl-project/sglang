@@ -17,25 +17,25 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
-def compute_nsa_seqlens(original_seq_lens, nsa_index_topk: int):
-    return original_seq_lens.clamp(max=nsa_index_topk)
+def compute_nsa_seqlens(original_seq_lens, dsa_index_topk: int):
+    return original_seq_lens.clamp(max=dsa_index_topk)
 
 
 def is_nsa_enable_prefill_cp():
-    return get_global_server_args().enable_nsa_prefill_context_parallel
+    return get_global_server_args().enable_dsa_prefill_context_parallel
 
 
 def is_nsa_prefill_cp_in_seq_split():
     return (
         is_nsa_enable_prefill_cp()
-        and get_global_server_args().nsa_prefill_cp_mode == "in-seq-split"
+        and get_global_server_args().dsa_prefill_cp_mode == "in-seq-split"
     )
 
 
 def is_nsa_prefill_cp_round_robin_split():
     return (
         is_nsa_enable_prefill_cp()
-        and get_global_server_args().nsa_prefill_cp_mode == "round-robin-split"
+        and get_global_server_args().dsa_prefill_cp_mode == "round-robin-split"
     )
 
 
@@ -125,12 +125,12 @@ def pad_nsa_cache_seqlens(forward_batch: "ForwardBatch", nsa_cache_seqlens):
     return nsa_cache_seqlens
 
 
-def can_nsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
+def can_nsa_cp_split(seq_len: int, cp_size: int, use_dsa: bool, forward_batch):
     if is_nsa_prefill_cp_round_robin_split():
         cur_cp_seq_len = seq_len // cp_size
         assert (
             seq_len % cp_size == 0
-        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when nsa_prefill_cp_mode is round-robin-split"
+        ), f"seq_len {seq_len} is not divisible by cp_size {cp_size} when dsa_prefill_cp_mode is round-robin-split"
     else:
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         # Note: (self.cp_size * 2) To achieve load balancing for seq computation,
@@ -139,7 +139,7 @@ def can_nsa_cp_split(seq_len: int, cp_size: int, use_nsa: bool, forward_batch):
     if (
         cur_cp_seq_len != 0
         and cp_size > 1
-        and use_nsa
+        and use_dsa
         and forward_batch.forward_mode.is_context_parallel_extend()
         and is_nsa_enable_prefill_cp()
         and sum(forward_batch.extend_seq_lens_cpu) >= cp_size

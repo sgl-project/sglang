@@ -34,10 +34,10 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
-    get_nsa_index_head_dim,
-    get_nsa_index_n_heads,
-    get_nsa_index_topk,
-    is_deepseek_nsa,
+    get_dsa_index_head_dim,
+    get_dsa_index_n_heads,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
 )
 from sglang.srt.distributed import (
     divide,
@@ -1181,12 +1181,12 @@ class DeepseekV2AttentionMLA(
         self.quant_config = quant_config
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
-        self.use_nsa = is_deepseek_nsa(config)
+        self.use_dsa = is_deepseek_dsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
-            assert self.use_nsa, "CP currently only supports deepseek v3.2 model"
+            assert self.use_dsa, "CP currently only supports deepseek v3.2 model"
         # cp reuse the attn_tp comm group but need to duplicate the weights
-        if self.nsa_enable_prefill_cp and self.use_nsa:
+        if self.nsa_enable_prefill_cp and self.use_dsa:
             self.cp_size = get_attention_cp_size()
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
@@ -1239,14 +1239,14 @@ class DeepseekV2AttentionMLA(
 
         self.skip_topk = None
         self.next_skip_topk = None
-        if self.use_nsa:
+        if self.use_dsa:
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
             self.indexer = Indexer(
                 hidden_size=hidden_size,
-                index_n_heads=get_nsa_index_n_heads(config),
-                index_head_dim=get_nsa_index_head_dim(config),
+                index_n_heads=get_dsa_index_n_heads(config),
+                index_head_dim=get_dsa_index_head_dim(config),
                 rope_head_dim=qk_rope_head_dim,
-                index_topk=get_nsa_index_topk(config),
+                index_topk=get_dsa_index_topk(config),
                 q_lora_rank=q_lora_rank,
                 max_position_embeddings=max_position_embeddings,
                 rope_theta=rope_theta,
@@ -2185,7 +2185,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
-        self.use_nsa = is_deepseek_nsa(config)
+        self.use_dsa = is_deepseek_dsa(config)
         self.model = DeepseekV2Model(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -2223,7 +2223,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.cp_rank = self.cp_size = None
 
         q_lora_rank = config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-        get_attn_tp_context().init_context(q_lora_rank, is_deepseek_nsa(config))
+        get_attn_tp_context().init_context(q_lora_rank, is_deepseek_dsa(config))
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -2305,7 +2305,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     ) -> torch.Tensor:
         if self.nsa_enable_prefill_cp:
             if can_nsa_cp_split(
-                len(input_ids), self.cp_size, self.use_nsa, forward_batch
+                len(input_ids), self.cp_size, self.use_dsa, forward_batch
             ):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),

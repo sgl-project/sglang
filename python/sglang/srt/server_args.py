@@ -142,7 +142,8 @@ ATTENTION_BACKEND_CHOICES = [
     "triton",
     "torch_native",
     "flex_attention",
-    "nsa",
+    "dsa",
+    "nsa",  # deprecated alias for "dsa"
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -227,13 +228,13 @@ LORA_BACKEND_CHOICES = ["triton", "csgmv", "ascend", "torch_native"]
 
 ENCODER_TRANSFER_BACKEND_CHOICES = ["zmq_to_scheduler", "zmq_to_tokenizer", "mooncake"]
 
-NSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
+DSA_PREFILL_CP_SPLIT_CHOICES = ["in-seq-split", "round-robin-split"]
 
 PREFILL_CP_SPLIT_CHOICES = ["in-seq-split"]
 
 DEFAULT_LORA_EVICTION_POLICY = "lru"
 
-NSA_CHOICES = [
+DSA_CHOICES = [
     "flashmla_sparse",
     "flashmla_kv",
     "flashmla_auto",
@@ -503,10 +504,10 @@ class ServerArgs:
     mm_attention_backend: Optional[str] = None
     fp8_gemm_runner_backend: str = "auto"
     fp4_gemm_runner_backend: str = "auto"
-    nsa_prefill_backend: Optional[str] = (
+    dsa_prefill_backend: Optional[str] = (
         None  # None = auto-detect based on hardware/kv_cache_dtype
     )
-    nsa_decode_backend: Optional[str] = (
+    dsa_decode_backend: Optional[str] = (
         None  # auto-detect based on hardware/kv_cache_dtype
     )
     disable_flashinfer_autotune: bool = False
@@ -698,8 +699,8 @@ class ServerArgs:
     enable_attn_tp_input_scattered: bool = False
     gc_threshold: Optional[List[int]] = None
     # Context parallelism used in the long sequence prefill phase of DeepSeek v3.2
-    enable_nsa_prefill_context_parallel: bool = False
-    nsa_prefill_cp_mode: str = "round-robin-split"
+    enable_dsa_prefill_context_parallel: bool = False
+    dsa_prefill_cp_mode: str = "round-robin-split"
     enable_fused_qk_norm_rope: bool = False
     enable_precise_embedding_interpolation: bool = False
     enable_fused_moe_sum_all_reduce: bool = False
@@ -1568,15 +1569,15 @@ class ServerArgs:
 
         return capture_sizes
 
-    def _set_default_nsa_kv_cache_dtype(self, major: int, quantization: str) -> str:
-        user_set_prefill = self.nsa_prefill_backend is not None
-        user_set_decode = self.nsa_decode_backend is not None
+    def _set_default_dsa_kv_cache_dtype(self, major: int, quantization: str) -> str:
+        user_set_prefill = self.dsa_prefill_backend is not None
+        user_set_decode = self.dsa_decode_backend is not None
 
         # If user specified a backend but didn't explicitly set kv_cache_dtype,
         # suggest them to be explicit about kv_cache_dtype to avoid surprises
         if (user_set_prefill or user_set_decode) and self.kv_cache_dtype == "auto":
             logger.warning(
-                "When specifying --nsa-prefill-backend or --nsa-decode-backend, "
+                "When specifying --dsa-prefill-backend or --dsa-decode-backend, "
                 "you should also explicitly set --kv-cache-dtype (e.g., 'fp8_e4m3' or 'bfloat16'). "
                 "DeepSeek V3.2 defaults to FP8 KV cache which may not be compatible with all backends."
             )
@@ -1596,59 +1597,59 @@ class ServerArgs:
             "fp8_e4m3",
         ], "DeepSeek DSA only supports bf16/bfloat16 or fp8_e4m3 kv_cache_dtype"
 
-    def _set_default_nsa_backends(self, kv_cache_dtype: str, major: int) -> str:
-        user_set_prefill = self.nsa_prefill_backend is not None
-        user_set_decode = self.nsa_decode_backend is not None
+    def _set_default_dsa_backends(self, kv_cache_dtype: str, major: int) -> str:
+        user_set_prefill = self.dsa_prefill_backend is not None
+        user_set_decode = self.dsa_decode_backend is not None
 
         # HiSparse requires flashmla_sparse for both prefill and decode
         if self.enable_hisparse:
             if not user_set_prefill:
-                self.nsa_prefill_backend = "flashmla_sparse"
+                self.dsa_prefill_backend = "flashmla_sparse"
             if not user_set_decode:
-                self.nsa_decode_backend = "flashmla_sparse"
+                self.dsa_decode_backend = "flashmla_sparse"
             logger.warning(
-                f"HiSparse enabled: using flashmla_sparse NSA backends "
-                f"(prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend})."
+                f"HiSparse enabled: using flashmla_sparse DSA backends "
+                f"(prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend})."
             )
             return
 
         if not user_set_prefill and not user_set_decode and is_hip():
-            self.nsa_prefill_backend = "tilelang"
-            self.nsa_decode_backend = "tilelang"
+            self.dsa_prefill_backend = "tilelang"
+            self.dsa_decode_backend = "tilelang"
         elif kv_cache_dtype == "fp8_e4m3":
             if major >= 10:
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "trtllm"
+                    self.dsa_prefill_backend = "trtllm"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "trtllm"
+                    self.dsa_decode_backend = "trtllm"
             else:
                 # Hopper FP8 defaults to flashmla_kv for both prefill and decode.
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "flashmla_kv"
+                    self.dsa_prefill_backend = "flashmla_kv"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "flashmla_kv"
+                    self.dsa_decode_backend = "flashmla_kv"
         else:
             # set prefill/decode backends based on hardware architecture.
             if major >= 10:
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "flashmla_sparse"
+                    self.dsa_prefill_backend = "flashmla_sparse"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "trtllm"
+                    self.dsa_decode_backend = "trtllm"
             else:
                 # Hopper defaults for bfloat16
                 if not user_set_prefill:
-                    self.nsa_prefill_backend = "flashmla_sparse"
+                    self.dsa_prefill_backend = "flashmla_sparse"
                 if not user_set_decode:
-                    self.nsa_decode_backend = "fa3"
+                    self.dsa_decode_backend = "fa3"
 
         logger.warning(
-            f"Set NSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.nsa_prefill_backend}, decode={self.nsa_decode_backend}."
+            f"Set DSA backends for {self.kv_cache_dtype} KV Cache: prefill={self.dsa_prefill_backend}, decode={self.dsa_decode_backend}."
         )
 
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
-            is_deepseek_nsa,
+            is_deepseek_dsa,
         )
 
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -1679,37 +1680,37 @@ class ServerArgs:
             "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
-            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2/GLM 5
+            if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
-                    envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
+                    envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
                     logger.warning(
-                        "Force NSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
+                        "Force DSA prefill to use sparse MLA (i.e. disable MHA_ONE_SHOT) for GlmMoeDsaForCausalLM on Blackwell."
                     )
                 else:
-                    if envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
+                    if envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.is_set():
                         logger.warning(
-                            f"Dense attention kv len threshold is manually set to {envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."
+                            f"Dense attention kv len threshold is manually set to {envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DSA. Caution: This may cause performance regression if the threshold is larger than the index topk of model."
                         )
                     else:
                         # When threshold is not manually set, set it to the index topk of model
-                        from sglang.srt.configs.model_config import get_nsa_index_topk
+                        from sglang.srt.configs.model_config import get_dsa_index_topk
 
-                        envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
-                            get_nsa_index_topk(hf_config)
+                        envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(
+                            get_dsa_index_topk(hf_config)
                         )
                         logger.warning(
-                            f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
+                            f"Set dense attention kv len threshold to model index_topk={envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()} for DeepSeek with DSA."
                         )
                 if self.is_attention_backend_not_set():
-                    self.attention_backend = "nsa"
-                    logger.info("Use nsa attention backend for DeepSeek with DSA.")
+                    self.attention_backend = "dsa"
+                    logger.info("Use dsa attention backend for DeepSeek with DSA.")
 
                 if not is_npu():  # CUDA or ROCm GPU
-                    if self.enable_nsa_prefill_context_parallel:
+                    if self.enable_dsa_prefill_context_parallel:
                         logger.warning(
                             "Context parallel feature is still under experiment. It has only been verified on Hopper platform."
                         )
-                        if self.nsa_prefill_cp_mode == "in-seq-split":
+                        if self.dsa_prefill_cp_mode == "in-seq-split":
                             # TODO Supports moe_dense_tp_size != 1, kv cache dtype = "fp8",moe_a2a_backend non-deepep and cross-machine operation .
                             self.enable_dp_attention = True
                             self.moe_dense_tp_size = 1
@@ -1753,13 +1754,13 @@ class ServerArgs:
                     import torch
 
                     major, _ = torch.cuda.get_device_capability()
-                    self._set_default_nsa_kv_cache_dtype(major, self.quantization)
-                    self._set_default_nsa_backends(self.kv_cache_dtype, major)
+                    self._set_default_dsa_kv_cache_dtype(major, self.quantization)
+                    self._set_default_dsa_backends(self.kv_cache_dtype, major)
 
-                if self.enable_nsa_prefill_context_parallel:
+                if self.enable_dsa_prefill_context_parallel:
                     assert (
                         self.disaggregation_mode != "decode"
-                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
+                    ), "CP is only supported for prefill when PD disaggregation, please remove --enable-dsa-prefill-context-parallel."
 
             else:
                 # DeepSeek V3/R1/V3.1
@@ -5318,18 +5319,20 @@ class ServerArgs:
             help="Set multimodal attention backend.",
         )
         parser.add_argument(
+            "--dsa-prefill-backend",
             "--nsa-prefill-backend",
-            default=ServerArgs.nsa_prefill_backend,
+            default=ServerArgs.dsa_prefill_backend,
             type=str,
-            choices=NSA_CHOICES,
-            help="NSA prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            choices=DSA_CHOICES,
+            help="DSA prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
         )
         parser.add_argument(
+            "--dsa-decode-backend",
             "--nsa-decode-backend",
-            default=ServerArgs.nsa_decode_backend,
+            default=ServerArgs.dsa_decode_backend,
             type=str,
-            choices=NSA_CHOICES,
-            help="NSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            choices=DSA_CHOICES,
+            help="DSA decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
         )
         parser.add_argument(
             "--fp8-gemm-backend",
@@ -6326,15 +6329,17 @@ class ServerArgs:
             help="Allow input of attention to be scattered when only using tensor parallelism, to reduce the computational load of operations such as qkv latent.",
         )
         parser.add_argument(
+            "--enable-dsa-prefill-context-parallel",
             "--enable-nsa-prefill-context-parallel",
             action="store_true",
             help="Enable context parallelism used in the long sequence prefill phase of DeepSeek v3.2.",
         )
         parser.add_argument(
+            "--dsa-prefill-cp-mode",
             "--nsa-prefill-cp-mode",
             type=str,
-            default=ServerArgs.nsa_prefill_cp_mode,
-            choices=NSA_PREFILL_CP_SPLIT_CHOICES,
+            default=ServerArgs.dsa_prefill_cp_mode,
+            choices=DSA_PREFILL_CP_SPLIT_CHOICES,
             help="Token splitting mode for the prefill phase of DeepSeek v3.2 under context parallelism. Optional values: 'round-robin-split'(default), 'in-seq-split'  "
             "'round-robin-split' distributes tokens across ranks based on token_idx %% cp_size. It supports multi-batch prefill, fused MoE, and FP8 KV cache.",
         )
@@ -6889,10 +6894,10 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
-            from sglang.srt.configs.model_config import is_deepseek_nsa
+            from sglang.srt.configs.model_config import is_deepseek_dsa
 
             hf_config = self.get_model_config().hf_config
-            assert is_deepseek_nsa(hf_config), (
+            assert is_deepseek_dsa(hf_config), (
                 "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
                 "(e.g., DeepSeek V3.2, GLM-5). "
             )
@@ -6901,15 +6906,15 @@ class ServerArgs:
                 self.disable_radix_cache
             ), "Hierarchical sparse attention currently requires --disable-radix-cache."
             for attr, label in [
-                ("nsa_prefill_backend", "prefill"),
-                ("nsa_decode_backend", "decode"),
+                ("dsa_prefill_backend", "prefill"),
+                ("dsa_decode_backend", "decode"),
             ]:
                 backend = getattr(self, attr)
                 if backend is not None and backend != "flashmla_sparse":
                     raise ValueError(
-                        f"HiSparse requires flashmla_sparse NSA {label} backend, "
-                        f"but got --nsa-{label}-backend={backend}. "
-                        f"Please use --nsa-{label}-backend=flashmla_sparse or omit it."
+                        f"HiSparse requires flashmla_sparse DSA {label} backend, "
+                        f"but got --dsa-{label}-backend={backend}. "
+                        f"Please use --dsa-{label}-backend=flashmla_sparse or omit it."
                     )
 
             if self.kv_cache_dtype != "bfloat16":

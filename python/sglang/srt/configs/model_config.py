@@ -82,7 +82,7 @@ class ModelImpl(str, Enum):
     MINDSPORE = "mindspore"
 
 
-def is_deepseek_nsa(config) -> bool:
+def is_deepseek_dsa(config) -> bool:
     architectures = (
         config.get("architectures")
         if isinstance(config, dict)
@@ -108,18 +108,18 @@ def is_deepseek_nsa(config) -> bool:
     )
 
 
-def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config)
     return config.index_head_dim
 
 
-def get_nsa_index_topk(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+def get_dsa_index_topk(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config)
     return config.index_topk
 
 
-def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
-    assert is_deepseek_nsa(config)
+def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
+    assert is_deepseek_dsa(config)
     return config.index_n_heads
 
 
@@ -258,7 +258,7 @@ class ModelConfig:
         self.use_ngram_embedding = getattr(self.hf_config, "use_ngram_embedding", False)
         self.is_piecewise_cuda_graph_disabled_model = (
             is_piecewise_cuda_graph_disabled_model(self.hf_config.architectures)
-            or is_deepseek_nsa(self.hf_text_config)
+            or is_deepseek_dsa(self.hf_text_config)
         )
         self.dtype = _get_and_verify_dtype(self.hf_text_config, dtype)
 
@@ -532,8 +532,8 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.index_head_dim = (
-                get_nsa_index_head_dim(self.hf_text_config)
-                if is_deepseek_nsa(self.hf_text_config)
+                get_dsa_index_head_dim(self.hf_text_config)
+                if is_deepseek_dsa(self.hf_text_config)
                 else None
             )
             # Handle rope scaling

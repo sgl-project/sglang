@@ -23,7 +23,7 @@ from safetensors.torch import load_file
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.srt.configs.model_config import is_deepseek_nsa
+from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.distributed import get_pp_group, get_tensor_model_parallel_world_size
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -254,7 +254,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         # if not set, model load will be broken in DeepseekV3ForCausalLM load_weights()
         self.pp_group = get_pp_group()
         self.determine_num_fused_shared_experts("DeepseekV3ForCausalLMNextN")
-        self.use_nsa = is_deepseek_nsa(config)
+        self.use_dsa = is_deepseek_dsa(config)
         self.nsa_enable_prefill_cp = is_nsa_enable_prefill_cp()
         if self.nsa_enable_prefill_cp:
             self.cp_rank = get_attention_cp_rank()
@@ -297,7 +297,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         # TODO current just support prefill batch=1 and len(input_ids) > self.cp_size * 2
         if self.nsa_enable_prefill_cp:
             if can_nsa_cp_split(
-                len(input_ids), self.cp_size, self.use_nsa, forward_batch
+                len(input_ids), self.cp_size, self.use_dsa, forward_batch
             ):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),

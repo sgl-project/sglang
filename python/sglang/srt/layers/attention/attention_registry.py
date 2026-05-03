@@ -85,11 +85,12 @@ def create_ascend_backend(runner):
     return AscendAttnBackend(runner)
 
 
-@register_attention_backend("nsa")
-def create_nsa_backend(runner):
-    from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+@register_attention_backend("dsa")
+@register_attention_backend("nsa")  # deprecated alias
+def create_dsa_backend(runner):
+    from sglang.srt.layers.attention.dsa_backend import DSABackend
 
-    return NativeSparseAttnBackend(runner)
+    return DSABackend(runner)
 
 
 @register_attention_backend("triton")

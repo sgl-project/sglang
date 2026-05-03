@@ -112,14 +112,14 @@ class TestDeepseekV32(unittest.TestCase):
         """
         NSA_FLASHMLA_ARGS = [
             "--attention-backend=nsa",
-            "--nsa-prefill-backend=flashmla_sparse",
-            "--nsa-decode-backend=flashmla_kv",
+            "--dsa-prefill-backend=flashmla_sparse",
+            "--dsa-decode-backend=flashmla_kv",
         ]
 
         NSA_FA3_ARGS = [
             "--attention-backend=nsa",
-            "--nsa-prefill-backend=fa3",
-            "--nsa-decode-backend=fa3",
+            "--dsa-prefill-backend=fa3",
+            "--dsa-decode-backend=fa3",
         ]
 
         NSA_FP8KV_ARGS = [

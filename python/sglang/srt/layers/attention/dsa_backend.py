@@ -6,12 +6,12 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlia
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
+from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
 from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
-    NativeSparseAttnBackendMTPPrecomputeMixin,
+    DSAMTPPrecomputeMixin,
     PrecomputedMetadata,
     compute_cu_seqlens,
 )
@@ -250,7 +250,7 @@ class NSAIndexerMetadata(BaseIndexerMetadata):
         else:
             page_table_size_1 = self.attn_metadata.page_table_1
 
-        if not envs.SGLANG_NSA_FUSE_TOPK.get() or self.force_unfused_topk:
+        if not envs.SGLANG_DSA_FUSE_TOPK.get() or self.force_unfused_topk:
             return fast_topk_v2(logits, seq_lens_topk, topk, row_starts=ks)
         elif self.topk_transform_method == TopkTransformMethod.PAGED:
             # NOTE(dark): if fused, we return a transformed page table directly
@@ -284,9 +284,7 @@ _NSA_IMPL_T: TypeAlias = Literal[
 ]
 
 
-class NativeSparseAttnBackend(
-    NativeSparseAttnBackendMTPPrecomputeMixin, AttentionBackend
-):
+class DSABackend(DSAMTPPrecomputeMixin, AttentionBackend):
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -303,12 +301,12 @@ class NativeSparseAttnBackend(
         self.num_splits = (
             1 if model_runner.server_args.enable_deterministic_inference else 0
         )
-        self.use_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
-        assert self.use_nsa, "NSA backend only supports DeepSeek NSA"
+        self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
+        assert self.use_dsa, "NSA backend only supports DeepSeek NSA"
         self.nsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
-        self.nsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
+        self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -323,9 +321,9 @@ class NativeSparseAttnBackend(
 
         self.use_mha: bool = False
         self.nsa_prefill_impl: _NSA_IMPL_T = (
-            model_runner.server_args.nsa_prefill_backend
+            model_runner.server_args.dsa_prefill_backend
         )
-        self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.nsa_decode_backend
+        self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.dsa_decode_backend
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -345,7 +343,7 @@ class NativeSparseAttnBackend(
             )
 
             self.kv_indices = torch.zeros(
-                max_bs * self.nsa_index_topk,
+                max_bs * self.dsa_index_topk,
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -619,7 +617,7 @@ class NativeSparseAttnBackend(
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
         nsa_cache_seqlens_int32 = compute_nsa_seqlens(
             original_seq_lens=seqlens_expanded,
-            nsa_index_topk=self.nsa_index_topk,
+            dsa_index_topk=self.dsa_index_topk,
         )
         nsa_cache_seqlens_int32 = pad_nsa_cache_seqlens(
             forward_batch, nsa_cache_seqlens_int32
@@ -833,7 +831,7 @@ class NativeSparseAttnBackend(
             # NOTE(dark): this is always arange, since we are decoding
             cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][: bs + 1]
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
-                cache_seqlens_int32, nsa_index_topk=self.nsa_index_topk
+                cache_seqlens_int32, dsa_index_topk=self.dsa_index_topk
             )
 
             seqlens_expanded = cache_seqlens_int32
@@ -893,7 +891,7 @@ class NativeSparseAttnBackend(
                 ]
             )
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
-                seqlens_expanded, nsa_index_topk=self.nsa_index_topk
+                seqlens_expanded, dsa_index_topk=self.dsa_index_topk
             )
             nsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
@@ -993,7 +991,7 @@ class NativeSparseAttnBackend(
             page_indices = self.req_to_token[req_pool_indices, :max_len]
             metadata.page_table_1[:, :max_len].copy_(page_indices)
             nsa_cache_seqlens = compute_nsa_seqlens(
-                cache_seqlens, nsa_index_topk=self.nsa_index_topk
+                cache_seqlens, dsa_index_topk=self.dsa_index_topk
             )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
             seqlens_expanded = cache_seqlens
@@ -1026,7 +1024,7 @@ class NativeSparseAttnBackend(
             )
             metadata.nsa_seqlens_expanded.copy_(seqlens_expanded)
             nsa_cache_seqlens = compute_nsa_seqlens(
-                seqlens_expanded, self.nsa_index_topk
+                seqlens_expanded, self.dsa_index_topk
             )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
         elif forward_mode.is_draft_extend(include_v2=True):
@@ -1058,7 +1056,7 @@ class NativeSparseAttnBackend(
                 seqlens_expanded
             )
             nsa_cache_seqlens = compute_nsa_seqlens(
-                seqlens_expanded, self.nsa_index_topk
+                seqlens_expanded, self.dsa_index_topk
             )
             metadata.nsa_cache_seqlens_int32[: seqlens_expanded.shape[0]].copy_(
                 nsa_cache_seqlens
@@ -1094,7 +1092,7 @@ class NativeSparseAttnBackend(
         assert (
             metadata.nsa_cache_seqlens_int32 is not None
             and metadata.nsa_cu_seqlens_k is not None
-            and self.nsa_index_topk is not None
+            and self.dsa_index_topk is not None
         )
 
         metadata.nsa_cu_seqlens_k[1 : 1 + seqlens_expanded_size].copy_(
@@ -1380,7 +1378,7 @@ class NativeSparseAttnBackend(
         topk_transform_method = self.get_topk_transform_method(
             forward_batch.forward_mode
         )
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if envs.SGLANG_DSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
             if topk_transform_method == TopkTransformMethod.RAGGED:
@@ -1564,7 +1562,7 @@ class NativeSparseAttnBackend(
                 topk_indices,
                 layer.layer_id,
             )
-        elif envs.SGLANG_NSA_FUSE_TOPK.get():
+        elif envs.SGLANG_DSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         else:
             page_table_1 = transform_index_page_table_decode(
@@ -1760,7 +1758,7 @@ class NativeSparseAttnBackend(
 
         indices = page_table_1.unsqueeze(1)
         assert (
-            indices.shape[-1] == self.nsa_index_topk
+            indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
 
         o, _ = flash_mla_with_kvcache(
@@ -2069,7 +2067,7 @@ class NativeSparseAttnBackend(
         if topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        if envs.SGLANG_NSA_FUSE_TOPK.get():
+        if envs.SGLANG_DSA_FUSE_TOPK.get():
             page_table_1 = topk_indices
         elif is_prefill:
             page_table_1 = transform_index_page_table_prefill(
@@ -2111,7 +2109,7 @@ class NativeSparseAttnBackend(
             block_tables=block_tables,
             seq_lens=seq_lens,
             max_seq_len=metadata.max_seq_len_k,
-            sparse_mla_top_k=self.nsa_index_topk,
+            sparse_mla_top_k=self.dsa_index_topk,
             bmm1_scale=bmm1_scale,
             backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
@@ -2164,7 +2162,7 @@ class NativeSparseAttnBackend(
                     device_sm == 90 or (device_sm >= 100 and device_sm < 110)
                 )  # SM90/SM100 only
                 and max_kv_len
-                <= envs.SGLANG_NSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
+                <= envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.get()  # Short enough for MHA
                 and forward_batch.token_to_kv_pool.dtype
                 in [torch.bfloat16, torch.float8_e4m3fn]
                 and sum_seq_lens
@@ -2198,7 +2196,7 @@ class NativeSparseAttnBackend(
         self, forward_mode: Optional[ForwardMode] = None
     ) -> TopkTransformMethod:
         """
-        SGLANG_NSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
+        SGLANG_DSA_FUSE_TOPK controls whether to fuse the topk transform into the topk kernel.
         This method is used to select the topk transform method which can be fused or unfused.
         """
         if (
@@ -2241,7 +2239,7 @@ class NativeSparseAttnBackend(
             num_heads_k=1,
             num_heads_q=num_heads_q,
             is_fp8_kvcache=True,
-            topk=self.nsa_index_topk,
+            topk=self.dsa_index_topk,
         )
 
         return NSAFlashMLAMetadata(
@@ -2250,7 +2248,7 @@ class NativeSparseAttnBackend(
         )
 
 
-class NativeSparseAttnMultiStepBackend:
+class DSAMultiStepBackend:
 
     def __init__(
         self, model_runner: ModelRunner, topk: int, speculative_num_steps: int
@@ -2261,7 +2259,7 @@ class NativeSparseAttnMultiStepBackend:
         self.attn_backends = []
         for i in range(self.speculative_num_steps - 1):
             self.attn_backends.append(
-                NativeSparseAttnBackend(
+                DSABackend(
                     model_runner,
                     speculative_step_id=i,
                     topk=self.topk,
@@ -2292,7 +2290,7 @@ class NativeSparseAttnMultiStepBackend:
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
     ):
-        if envs.SGLANG_NSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
+        if envs.SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
             # Precompute metadata once (shared across all backends)
             precomputed = self.attn_backends[0]._precompute_replay_metadata(
                 bs=bs,

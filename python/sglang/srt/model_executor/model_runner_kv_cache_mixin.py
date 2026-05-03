@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
+from sglang.srt.configs.model_config import get_dsa_index_head_dim, is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -131,14 +131,14 @@ class ModelRunnerKVCacheMixin:
         return total_rest_memory - mamba_state_memory
 
     def calculate_mla_kv_cache_dim(self: ModelRunner) -> int:
-        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
         kv_cache_dtype = self.kv_cache_dtype
         kv_lora_rank = self.model_config.kv_lora_rank
         qk_rope_head_dim = self.model_config.qk_rope_head_dim
         kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
 
         # For non-NSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
-        if not is_nsa_model:
+        if not is_dsa_model:
             return kv_cache_dim
 
         # TRTLLM backend does not override kv_cache_dim for MLA kv cache
@@ -146,16 +146,16 @@ class ModelRunnerKVCacheMixin:
         # since it is not compatible for trtllm and other mla attn backend due to the different
         # kv cache layout.
         if (
-            self.server_args.nsa_prefill_backend == "trtllm"
-            or self.server_args.nsa_decode_backend == "trtllm"
+            self.server_args.dsa_prefill_backend == "trtllm"
+            or self.server_args.dsa_decode_backend == "trtllm"
         ):
             return kv_cache_dim
 
         # On HIP with TileLang backend, keep the default MLA KV cache dimension.
         # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
         if _is_hip and (
-            self.server_args.nsa_prefill_backend == "tilelang"
-            or self.server_args.nsa_decode_backend == "tilelang"
+            self.server_args.dsa_prefill_backend == "tilelang"
+            or self.server_args.dsa_decode_backend == "tilelang"
         ):
             return kv_cache_dim
 
@@ -281,13 +281,13 @@ class ModelRunnerKVCacheMixin:
             assert self.is_draft_worker
 
         # Initialize token_to_kv_pool
-        is_nsa_model = is_deepseek_nsa(self.model_config.hf_config)
+        is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
 
         # Check out-of-tree platform (plugin system) first
         from sglang.srt.platforms import current_platform
 
         if current_platform.is_out_of_tree() and not self.mambaish_config:
-            if self.use_mla_backend and is_nsa_model:
+            if self.use_mla_backend and is_dsa_model:
                 PoolCls = current_platform.get_nsa_kv_pool_cls()
                 self.token_to_kv_pool = PoolCls(
                     self.max_total_num_tokens,
@@ -301,7 +301,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
-                    index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                    index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
                 )
             elif self.use_mla_backend:
                 PoolCls = current_platform.get_mla_kv_pool_cls()
@@ -312,7 +312,7 @@ class ModelRunnerKVCacheMixin:
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     index_head_dim=(
-                        self.model_config.index_head_dim if is_nsa_model else None
+                        self.model_config.index_head_dim if is_dsa_model else None
                     ),
                     layer_num=self.num_effective_layers,
                     device=self.device,
@@ -384,7 +384,7 @@ class ModelRunnerKVCacheMixin:
                     kv_lora_rank=self.model_config.kv_lora_rank,
                     qk_rope_head_dim=self.model_config.qk_rope_head_dim,
                     index_head_dim=(
-                        self.model_config.index_head_dim if is_nsa_model else None
+                        self.model_config.index_head_dim if is_dsa_model else None
                     ),
                     layer_num=self.num_effective_layers,
                     device=self.device,
@@ -411,7 +411,7 @@ class ModelRunnerKVCacheMixin:
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
                 )
-        elif self.use_mla_backend and is_nsa_model:
+        elif self.use_mla_backend and is_dsa_model:
             nsa_pool_kwargs = dict(
                 size=self.max_total_num_tokens,
                 page_size=self.page_size,
@@ -424,7 +424,7 @@ class ModelRunnerKVCacheMixin:
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
-                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
+                index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
             )
             if self.enable_hisparse:
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config
@@ -437,7 +437,7 @@ class ModelRunnerKVCacheMixin:
             else:
                 self.token_to_kv_pool = NSATokenToKVPool(**nsa_pool_kwargs)
         elif self.use_mla_backend and not self.mambaish_config:
-            assert not is_nsa_model
+            assert not is_dsa_model
             if is_float4_e2m1fn_x2(self.kv_cache_dtype):
                 self.token_to_kv_pool = MLATokenToKVPoolFP4(
                     self.max_total_num_tokens,

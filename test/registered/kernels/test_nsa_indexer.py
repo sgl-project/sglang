@@ -11,12 +11,12 @@ from sglang.test.ci.ci_register import register_cuda_ci
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.layers.attention.dsa_backend import DSABackend
 from sglang.srt.layers.attention.nsa.nsa_indexer import (
     BaseIndexerMetadata,
     Indexer,
     rotate_activation,
 )
-from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -248,8 +248,8 @@ class MockModelRunner:
                 "speculative_eagle_topk": None,
                 "speculative_num_draft_tokens": 0,
                 "enable_deterministic_inference": False,
-                "nsa_prefill_backend": "flashmla_sparse",
-                "nsa_decode_backend": "fa3",
+                "dsa_prefill_backend": "flashmla_sparse",
+                "dsa_decode_backend": "fa3",
             },
         )()
 
@@ -261,8 +261,8 @@ class TestNSAIndexer(CustomTestCase):
         """Set up global server args for testing."""
         server_args = ServerArgs(model_path="dummy")
         server_args.enable_dp_attention = False
-        server_args.nsa_prefill_backend = "flashmla_sparse"
-        server_args.nsa_decode_backend = "flashmla_sparse"
+        server_args.dsa_prefill_backend = "flashmla_sparse"
+        server_args.dsa_decode_backend = "flashmla_sparse"
         set_global_server_args_for_scheduler(server_args)
 
         # Check GPU capability for FP8
@@ -289,7 +289,7 @@ class TestNSAIndexer(CustomTestCase):
         if config_override:
             config.update(config_override)
         self.model_runner = MockModelRunner(config)
-        self.backend = NativeSparseAttnBackend(self.model_runner)
+        self.backend = DSABackend(self.model_runner)
 
     def _create_indexer(self, **kwargs):
         """Create an Indexer instance with default parameters."""
