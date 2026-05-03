@@ -1013,6 +1013,7 @@ class LTX2DenoisingStage(DenoisingStage):
         model_kwargs: dict[str, object],
         pass_spec: LTX2GuidancePassSpec,
     ) -> None:
+        """Apply one guidance pass's skips to one model-forward kwargs dict."""
         if pass_spec.skip_video_self_attn_blocks:
             model_kwargs["skip_video_self_attn_blocks"] = (
                 pass_spec.skip_video_self_attn_blocks
@@ -1486,11 +1487,12 @@ class LTX2DenoisingStage(DenoisingStage):
                 and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
             )
         )
-        # In HQ, each split chunk is one guidance pass for one sample, so
-        # pass-level skips as kwargs match native single-pass forwards and avoid
-        # per-sample masks. TI2V still relies on per-sample masks inside the
-        # batched forward; replacing them with whole-forward kwargs changes
-        # output accuracy.
+        # HQ uses split_sizes = [1] * expanded_batch_size below: each model
+        # forward receives one row from the expanded batch, and that row already
+        # represents a concrete guidance pass (cond/neg/perturbed/modality).
+        # Therefore kwargs-level skips match the native forward. TI2V batched
+        # forwards combine multiple guidance-pass rows, so they must keep
+        # per-row perturbation_configs; whole-forward kwargs would change output.
         use_split_pass_kwargs = (
             server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
         )
