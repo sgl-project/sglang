@@ -16,6 +16,11 @@ from transformers import AutoImageProcessor, AutoProcessor, AutoTokenizer
 
 from sglang.multimodal_gen.configs.models import ModelConfig
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
+from sglang.multimodal_gen.runtime.layers.attention.selector import (
+    component_force_attn_backend_context_manager,
+    get_component_attn_backend_name,
+    get_component_forced_attn_backend,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     _normalize_component_type,
     component_name_to_loader_cls,
@@ -114,10 +119,29 @@ class ComponentLoader(ABC):
             component_model_path,
             gpu_mem_before_loading,
         )
-        try:
-            component = self.load_customized(
-                component_model_path, server_args, component_name
+        attn_backend = None
+        component_attn_name = None
+        if (
+            get_component_forced_attn_backend() is None
+            and get_component_attn_backend_name() is None
+        ):
+            attn_backend, matched_backend_key = (
+                server_args.resolve_component_attention_backend(component_name)
             )
+            component_attn_name = matched_backend_key or component_name
+            if attn_backend is not None:
+                logger.info(
+                    "Using component attention_backend=%s for %s",
+                    attn_backend.name.lower(),
+                    matched_backend_key,
+                )
+        try:
+            with component_force_attn_backend_context_manager(
+                attn_backend, component_name=component_attn_name
+            ):
+                component = self.load_customized(
+                    component_model_path, server_args, component_name
+                )
             source = "sgl-diffusion"
         except Exception as e:
             if "Unsupported model architecture" in str(e):
@@ -130,9 +154,12 @@ class ComponentLoader(ABC):
                     f"Error while loading customized {component_name}, falling back to native version"
                 )
             # fallback to native version
-            component = self.load_native(
-                component_model_path, server_args, transformers_or_diffusers
-            )
+            with component_force_attn_backend_context_manager(
+                attn_backend, component_name=component_attn_name
+            ):
+                component = self.load_native(
+                    component_model_path, server_args, transformers_or_diffusers
+                )
             should_offload = self.should_offload(server_args)
             target_device = self.target_device(should_offload)
             component = component.to(device=target_device)
