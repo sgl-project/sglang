@@ -107,7 +107,9 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.mxfp4_deepseek import DeepSeekMxfp4MoEMethod
+from sglang.srt.layers.quantization.mxfp4_deepseek import (
+    maybe_fuse_routed_scale_and_shared_add,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
@@ -718,15 +720,12 @@ class DeepseekV2MoE(nn.Module):
 
         current_stream.wait_stream(self.alt_stream)
 
-        if (
-            isinstance(self.experts.quant_method, DeepSeekMxfp4MoEMethod)
-            and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
-        ):
-            final_hidden_states = shared_output.add_(
-                final_hidden_states, alpha=self.routed_scaling_factor
-            )
-        else:
-            final_hidden_states += shared_output
+        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+            self.experts,
+            final_hidden_states,
+            shared_output,
+            self.routed_scaling_factor,
+        )
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,
@@ -819,19 +818,12 @@ class DeepseekV2MoE(nn.Module):
             # fused in biased_grouped_topk so we can skip here
             final_hidden_states *= self.routed_scaling_factor
 
-        if (
-            isinstance(self.experts.quant_method, DeepSeekMxfp4MoEMethod)
-            and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
-        ):
-            if shared_output is not None:
-                final_hidden_states = shared_output.add_(
-                    final_hidden_states, alpha=self.routed_scaling_factor
-                )
-            else:
-                final_hidden_states.mul_(self.routed_scaling_factor)
-        else:
-            if shared_output is not None:
-                final_hidden_states += shared_output
+        final_hidden_states = maybe_fuse_routed_scale_and_shared_add(
+            self.experts,
+            final_hidden_states,
+            shared_output,
+            self.routed_scaling_factor,
+        )
 
         if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
             is_tp_path=True,

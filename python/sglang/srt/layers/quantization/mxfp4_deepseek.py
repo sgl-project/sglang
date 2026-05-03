@@ -464,3 +464,27 @@ class DeepSeekMxfp4MoEMethod:
                 output.mul_(rsf)
 
         return StandardCombineInput(hidden_states=output)
+
+
+def maybe_fuse_routed_scale_and_shared_add(
+    experts,
+    routed: torch.Tensor,
+    shared: torch.Tensor | None,
+    routed_scaling_factor: float,
+) -> torch.Tensor:
+    # When MxFP4 fusion is on, the upstream `routed *= scale` is skipped and
+    # the scaling is folded into the shared-add via `shared.add_(routed,
+    # alpha=scale)`. With no shared output, the missing scale is applied
+    # in-place. Otherwise `routed` is already scale-final and we just add
+    # `shared` (or pass through if there is none).
+    fused = (
+        isinstance(experts.quant_method, DeepSeekMxfp4MoEMethod)
+        and envs.SGLANG_OPT_MXFP4_FUSE_RSF_SHARED_ADD.get()
+    )
+    if fused:
+        if shared is not None:
+            return shared.add_(routed, alpha=routed_scaling_factor)
+        return routed.mul_(routed_scaling_factor)
+    if shared is not None:
+        routed += shared
+    return routed
