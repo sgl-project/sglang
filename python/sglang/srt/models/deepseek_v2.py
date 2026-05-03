@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -72,7 +72,6 @@ from sglang.srt.layers.dp_attention import (
     get_attention_tp_group,
     get_attention_tp_rank,
     get_attention_tp_size,
-    get_dp_global_num_tokens,
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layernorm import RMSNorm
@@ -163,10 +162,6 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-
-if TYPE_CHECKING:
-    from deep_gemm import SymmBuffer
-
 
 if _use_aiter:
     from sglang.srt.layers.rocm_linear_utils import aiter_dsv3_router_gemm
@@ -384,43 +379,6 @@ class MoEGate(nn.Module):
                     logits = F.linear(hidden_states, self.weight, None)
 
         return logits
-
-
-_MEGA_MOE_SYMM_BUFFER: dict = {}
-
-
-def _get_mega_moe_symm_buffer(
-    group,
-    num_experts: int,
-    num_max_tokens_per_rank: int,
-    num_topk: int,
-    hidden: int,
-    intermediate_hidden: int,
-) -> SymmBuffer:
-    import deep_gemm
-
-    key = (
-        id(group),
-        num_max_tokens_per_rank,
-        num_experts,
-        num_topk,
-        hidden,
-        intermediate_hidden,
-    )
-    buf = _MEGA_MOE_SYMM_BUFFER.get(key)
-    if buf is None:
-        buf = deep_gemm.get_symm_buffer_for_mega_moe(
-            group,
-            num_experts,
-            num_max_tokens_per_rank,
-            num_topk,
-            hidden,
-            intermediate_hidden,
-            use_fp8_dispatch=True,
-            activation="swiglu",
-        )
-        _MEGA_MOE_SYMM_BUFFER[key] = buf
-    return buf
 
 
 class DeepseekV2MoE(nn.Module):
@@ -683,8 +641,11 @@ class DeepseekV2MoE(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         input_ids_global: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self._should_use_mega_moe(hidden_states):
-            return self.forward_mega_moe(
+        from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
+
+        if should_use_mega_moe(self, hidden_states):
+            return forward_mega_moe(
+                self,
                 hidden_states,
                 forward_batch,
                 input_ids_global=input_ids_global,
@@ -1163,188 +1124,6 @@ class DeepseekV2MoE(nn.Module):
                 final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
-
-    def _should_use_mega_moe(self, hidden_states: torch.Tensor) -> bool:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
-        if not envs.SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE.get():
-            return False
-        if not getattr(self.experts, "_mega_moe_weights_built", False):
-            return False
-
-        if not envs.SGLANG_OPT_FIX_NEXTN_MEGA_MOE.get():
-            if self.is_nextn:
-                return False
-
-        if not envs.SGLANG_OPT_FIX_HASH_MEGA_MOE.get():
-            if self.is_hash:
-                return False
-
-        if get_is_capture_mode():
-            return True
-
-        global_num_tokens = get_dp_global_num_tokens()
-        if global_num_tokens:
-            max_tokens_per_rank = max(global_num_tokens)
-        else:
-            max_tokens_per_rank = hidden_states.shape[0]
-        cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-        return max_tokens_per_rank <= cap
-
-    def forward_mega_moe(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: Optional[ForwardBatch] = None,
-        input_ids_global: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
-
-        num_tokens = hidden_states.shape[0]
-
-        sbo_overlap_flag = (
-            self.alt_stream is not None
-            and self.num_fused_shared_experts == 0
-            and num_tokens > 0
-            and get_is_capture_mode()
-        )
-
-        if sbo_overlap_flag:
-            current_stream = torch.cuda.current_stream()
-            self.alt_stream.wait_stream(current_stream)
-            shared_output = self._forward_shared_experts(hidden_states)
-            mega_stream_ctx = torch.cuda.stream(self.alt_stream)
-        else:
-            shared_output = self._forward_shared_experts(hidden_states)
-            mega_stream_ctx = nullcontext()
-
-        with mega_stream_ctx:
-            y = self._run_mega_routed(
-                hidden_states, forward_batch, input_ids_global, num_tokens
-            )
-
-        if sbo_overlap_flag:
-            current_stream.wait_stream(self.alt_stream)
-
-        if shared_output is not None:
-            y.add_(shared_output)
-        return y
-
-    def _run_mega_routed(
-        self,
-        hidden_states: torch.Tensor,
-        forward_batch: Optional[ForwardBatch],
-        input_ids_global: Optional[torch.Tensor],
-        num_tokens: int,
-    ) -> torch.Tensor:
-        import deep_gemm
-
-        from sglang.srt.distributed.parallel_state import get_moe_ep_group
-        from sglang.srt.layers.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8_ue8m0,
-        )
-
-        hidden_size = self.config.hidden_size
-
-        if num_tokens > 0:
-            router_logits = self.gate(hidden_states, forward_batch=forward_batch)
-            topk_kwargs = {"input_ids": input_ids_global} if self.is_hash else {}
-            topk_output = self.topk(
-                hidden_states,
-                router_logits,
-                num_token_non_padded=(
-                    forward_batch.num_token_non_padded
-                    if forward_batch is not None
-                    else None
-                ),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
-                **topk_kwargs,
-            )
-            topk_ids = topk_output.topk_ids
-            topk_weights = topk_output.topk_weights
-        else:
-            topk_ids = None
-            topk_weights = None
-
-        ep_group = get_moe_ep_group().device_group
-        num_experts = self.experts.num_experts
-        top_k = self.config.num_experts_per_tok + self.num_fused_shared_experts
-        intermediate_size = self.config.moe_intermediate_size
-        num_max_tokens_per_rank = (
-            envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-        )
-        assert num_tokens <= num_max_tokens_per_rank, (
-            f"mega MoE: num_tokens={num_tokens} exceeds cap "
-            f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK="
-            f"{num_max_tokens_per_rank}; raise the env var or shrink "
-            f"cuda_graph_max_bs / chunked_prefill_size accordingly"
-        )
-
-        buf = _get_mega_moe_symm_buffer(
-            ep_group,
-            num_experts=num_experts,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            num_topk=top_k,
-            hidden=hidden_size,
-            intermediate_hidden=intermediate_size,
-        )
-
-        padded_max = buf.topk_idx.shape[0]
-        if envs.SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH.get():
-            from sglang.jit_kernel.deepseek_v4 import mega_moe_pre_dispatch
-
-            if num_tokens > 0:
-                topk_ids_in = topk_ids
-                topk_weights_in = topk_weights
-            else:
-                topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
-                topk_weights_in = hidden_states.new_empty(
-                    (0, top_k), dtype=torch.float32
-                )
-            mega_moe_pre_dispatch(
-                hidden_states,
-                topk_ids_in,
-                topk_weights_in,
-                buf.x,
-                buf.x_sf,
-                buf.topk_idx,
-                buf.topk_weights,
-                quant_group_size=32,
-            )
-        else:
-            if num_tokens > 0:
-                x_fp8, x_sf = sglang_per_token_group_quant_fp8_ue8m0(
-                    hidden_states, group_size=32
-                )
-                buf.x[:num_tokens].copy_(x_fp8)
-                buf.x_sf[:num_tokens].copy_(x_sf)
-                buf.topk_idx[:num_tokens].copy_(topk_ids)
-                buf.topk_weights[:num_tokens].copy_(topk_weights)
-            if num_tokens < padded_max:
-                buf.topk_idx[num_tokens:].fill_(-1)
-                buf.topk_weights[num_tokens:].zero_()
-
-        y = torch.empty(
-            (num_tokens, hidden_size),
-            dtype=torch.bfloat16,
-            device=hidden_states.device,
-        )
-        swiglu_limit = getattr(self.config, "swiglu_limit", None)
-        deep_gemm.fp8_fp4_mega_moe(
-            y,
-            self.experts.mega_l1_weights,
-            self.experts.mega_l2_weights,
-            buf,
-            recipe=(1, 1, 32),
-            activation="swiglu",
-            activation_clamp=swiglu_limit,
-            fast_math=True,
-        )
-
-        if not self.experts.should_fuse_routed_scaling_factor_in_topk:
-            y.mul_(self.routed_scaling_factor)
-        return y
 
     def _forward_shared_experts(
         self, hidden_states, gemm_output_zero_allocator: BumpAllocator = None
