@@ -20,6 +20,7 @@ import asyncio
 import builtins
 import ctypes
 import functools
+import gc
 import importlib
 import inspect
 import io
@@ -364,7 +365,7 @@ def get_int_env_var(name: str, default: int = 0) -> int:
 
 
 def support_triton(backend: str) -> bool:
-    return backend not in ["torch_native", "intel_amx", "ascend"]
+    return backend not in ["torch_native", "intel_amx"]
 
 
 _ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
@@ -3195,8 +3196,6 @@ def configure_gc_warning(warn_threshold_secs):
 
 
 def freeze_gc(context: str):
-    import gc
-
     g0_before, g1_before, g2_before = gc_object_counts()
     gc.freeze()
     g0_after, g1_after, g2_after = gc_object_counts()
@@ -3210,8 +3209,6 @@ def freeze_gc(context: str):
 
 def configure_gc_logger():
     logger.info("Enable GC Logger")
-
-    import gc
 
     gc_start_time = {}
 
