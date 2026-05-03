@@ -8,8 +8,11 @@ This module contains implementations of prompt encoding stages for diffusion pip
 """
 
 import inspect
-import torch
 from dataclasses import dataclass
+from typing import Any
+
+import torch
+
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.component_manager import ComponentUse
@@ -24,7 +27,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from typing import Any
 
 logger = init_logger(__name__)
 
@@ -82,9 +84,10 @@ class TextEncodingStage(PipelineStage):
             for i in range(len(self.text_encoders))
         ]
 
-    def get_or_compute_negative_text_embedding(self, batch: Req, server_args: ServerArgs, all_indices: List[int]):
-        """Get or compute the negative text embedding
-        """
+    def get_or_compute_negative_text_embedding(
+        self, batch: Req, server_args: ServerArgs, all_indices: list[int]
+    ):
+        """Get or compute the negative text embedding"""
         negative_cache_key = (
             server_args.pipeline_class_name,
             tuple(all_indices),
@@ -100,13 +103,11 @@ class TextEncodingStage(PipelineStage):
                 else None
             )
         if cached_negative is None:
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = (
-                self.encode_text(
-                    batch.negative_prompt,
-                    server_args,
-                    encoder_index=all_indices,
-                    return_attention_mask=True,
-                )
+            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
+                batch.negative_prompt,
+                server_args,
+                encoder_index=all_indices,
+                return_attention_mask=True,
             )
 
             if use_negative_cache:
@@ -118,9 +119,7 @@ class TextEncodingStage(PipelineStage):
                     tuple(neg_pooler_embeds_list),
                 )
         else:
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = (
-                cached_negative
-            )
+            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = cached_negative
         return neg_embeds_list, neg_masks_list, neg_pooler_embeds_list
 
     @torch.no_grad()
@@ -164,9 +163,11 @@ class TextEncodingStage(PipelineStage):
         # Encode negative prompt if CFG is enabled
         if batch.do_classifier_free_guidance:
             assert isinstance(batch.negative_prompt, str)
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.get_or_compute_negative_text_embedding(batch,
-                                                                                                                  server_args,
-                                                                                                                  all_indices)
+            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = (
+                self.get_or_compute_negative_text_embedding(
+                    batch, server_args, all_indices
+                )
+            )
 
             assert batch.negative_prompt_embeds is not None
 
@@ -485,7 +486,7 @@ class TextEncodingStage(PipelineStage):
             "negative_prompt_embeds",
             batch.negative_prompt_embeds,
             lambda x: not batch.do_classifier_free_guidance
-                      or V.list_of_tensors_with_min_dims(x, 2),
+            or V.list_of_tensors_with_min_dims(x, 2),
         )
         if batch.debug:
             logger.debug(f"{batch.prompt_embeds=}")
