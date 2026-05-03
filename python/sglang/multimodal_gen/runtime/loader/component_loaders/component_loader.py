@@ -32,6 +32,27 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+def _load_auto_tokenizer_with_roberta_processing_compat(*args, **kwargs):
+    from tokenizers import processors
+
+    roberta_processing = processors.RobertaProcessing
+
+    def roberta_processing_compat(*processor_args, **processor_kwargs):
+        if "sep" in processor_kwargs and "cls" in processor_kwargs:
+            sep = processor_kwargs.pop("sep")
+            cls_token = processor_kwargs.pop("cls")
+            return roberta_processing(
+                sep, cls_token, *processor_args, **processor_kwargs
+            )
+        return roberta_processing(*processor_args, **processor_kwargs)
+
+    processors.RobertaProcessing = roberta_processing_compat
+    try:
+        return AutoTokenizer.from_pretrained(*args, **kwargs)
+    finally:
+        processors.RobertaProcessing = roberta_processing
+
+
 class ComponentLoader(ABC):
     """Base class for loading a specific type of model component."""
 
@@ -343,7 +364,7 @@ class TokenizerLoader(ComponentLoader):
                 logger.warning(
                     "Fast tokenizer failed (%s), retrying with use_fast=False", e
                 )
-                return AutoTokenizer.from_pretrained(
+                return _load_auto_tokenizer_with_roberta_processing_compat(
                     component_model_path,
                     padding_side="right",
                     use_fast=False,
