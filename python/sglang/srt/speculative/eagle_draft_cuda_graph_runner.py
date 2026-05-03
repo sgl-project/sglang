@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -25,6 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.spec_utils import maybe_detect_nan, maybe_detect_oob
 from sglang.srt.utils import (
     require_attn_tp_gather,
     require_gathered_buffer,
@@ -216,7 +218,13 @@ class EAGLEDraftCudaGraphRunner:
         return out
 
     def _replay(self, forward_batch: ForwardBatch):
-        self.graphs[self.bs].replay()
+        ctx = (
+            self.model_runner.device_timer.wrap(metadata={"category": "eagle_draft"})
+            if self.model_runner.device_timer
+            else contextlib.nullcontext()
+        )
+        with ctx:
+            self.graphs[self.bs].replay()
 
     def capture(self):
         CudaGraphRunner.capture(self)
@@ -384,6 +392,10 @@ class EAGLEDraftCudaGraphRunner:
             buffers.seq_lens.fill_(self.seq_len_fill_value)
             buffers.out_cache_loc.zero_()
             buffers.positions.zero_()
+            buffers.topk_p.zero_()
+            buffers.topk_index.zero_()
+            buffers.hidden_states.zero_()
+            buffers.req_pool_indices.zero_()
 
         num_tokens = bs * self.num_tokens_per_bs
 
@@ -393,6 +405,17 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.out_cache_loc
         )
         buffers.positions[:raw_num_token].copy_(forward_batch.positions)
+        maybe_detect_nan(
+            forward_batch.spec_info.topk_p,
+            "EagleDraftCudaGraphRunner.replay: topk_p",
+        )
+        maybe_detect_oob(
+            forward_batch.spec_info.topk_index,
+            0,
+            self.model_runner.model_config.vocab_size,
+            "EagleDraftCudaGraphRunner.replay: topk_index vs vocab_size="
+            f"{self.model_runner.model_config.vocab_size}",
+        )
         buffers.topk_p[:raw_bs].copy_(forward_batch.spec_info.topk_p)
         buffers.topk_index[:raw_bs].copy_(forward_batch.spec_info.topk_index)
         buffers.hidden_states[:raw_bs].copy_(forward_batch.spec_info.hidden_states)
