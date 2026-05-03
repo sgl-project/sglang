@@ -131,11 +131,14 @@ class TextEncodingStage(PipelineStage):
                 batch.negative_prompt,
                 batch.max_sequence_length,
             )
-            cached_negative = (
-                self._negative_text_cache_value
-                if self._negative_text_cache_key == negative_cache_key
-                else None
-            )
+            use_negative_cache = not batch.is_warmup
+            cached_negative = None
+            if use_negative_cache:
+                cached_negative = (
+                    self._negative_text_cache_value
+                    if self._negative_text_cache_key == negative_cache_key
+                    else None
+                )
             if cached_negative is None:
                 neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = (
                     self.encode_text(
@@ -145,17 +148,20 @@ class TextEncodingStage(PipelineStage):
                         return_attention_mask=True,
                     )
                 )
-                # Negative prompts are often a long model default that warmup
-                # and later requests share. For the same pipeline, encoders,
-                # prompt text, and max length, encoding is deterministic, so the
-                # cached tensors are exactly the result of calling encode_text
-                # again.
-                self._negative_text_cache_key = negative_cache_key
-                self._negative_text_cache_value = (
-                    tuple(neg_embeds_list),
-                    tuple(neg_masks_list),
-                    tuple(neg_pooler_embeds_list),
-                )
+                # CFG uses the negative prompt as the unconditional text input.
+                # Many real requests reuse the same model default negative
+                # prompt. For the same pipeline, text encoders, negative-prompt
+                # text, and max length, text encoding is deterministic, so one
+                # cached result is numerically identical to re-encoding it.
+                # Warmup does not read or write this cache: warmup is synthetic,
+                # and should not precompute data for a future real request.
+                if use_negative_cache:
+                    self._negative_text_cache_key = negative_cache_key
+                    self._negative_text_cache_value = (
+                        tuple(neg_embeds_list),
+                        tuple(neg_masks_list),
+                        tuple(neg_pooler_embeds_list),
+                    )
             else:
                 neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = (
                     cached_negative
