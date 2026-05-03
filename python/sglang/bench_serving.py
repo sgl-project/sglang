@@ -301,14 +301,15 @@ async def async_request_openai_completions(
                             # final chunk with empty `text` that carries the
                             # usage summary. Both must be tolerated, mirroring
                             # the chat path's handling.
-                            choice = (data.get("choices") or [{}])[0]
+                            choices = data.get("choices") or []
+                            choice = choices[0] if choices else {}
                             text = choice.get("text") or ""
 
                             if text:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
+                                    ttft = timestamp - st
                                     output.ttft = ttft
                                 # Decoding phase
                                 else:
