@@ -1,6 +1,6 @@
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from typing import Mapping, MutableMapping, Protocol, Sequence, TypeVar
 
@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 _T = TypeVar("_T")
+PostResponseTask = tuple[str, Callable[[], None]]
 
 
 @dataclass(slots=True)
@@ -49,6 +50,9 @@ class ComponentUse:
     # Some components are intentionally kept ready between warmup and the first
     # real request to avoid measuring a cold H2D in the user-visible request.
     keep_ready_after_warmup: bool = False
+    # Finish this use after the response is sent. The scheduler waits for pending
+    # post-response tasks before executing the next request, avoiding module races.
+    finish_after_response: bool = False
 
 
 @dataclass(slots=True)
@@ -183,6 +187,7 @@ class ComponentResidencyManager:
             pipeline.component_residency_strategies
         )
         self._uses_seen: dict[str, ComponentUse] = {}
+        self._deferred_finish_uses: dict[str, tuple[ComponentUse, nn.Module]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -196,6 +201,7 @@ class ComponentResidencyManager:
             self._active_use = None
             self._active_use_module = None
             self._uses_seen.clear()
+            self._deferred_finish_uses.clear()
             self._prefetched_use_keys.clear()
         elif custom_strategies != self._custom_strategies:
             self.strategy_for.cache_clear()
@@ -233,6 +239,7 @@ class ComponentResidencyManager:
         self._current_use_index = -1
         self._prefetched_use_keys.clear()
         self._uses_seen.clear()
+        self._deferred_finish_uses.clear()
         if self.enabled:
             self._stage_uses_by_index = [
                 tuple(stage.component_uses(server_args, self.stage_name(stage)))
@@ -451,13 +458,24 @@ class ComponentResidencyManager:
                 module,
             )
             return
+        if use.finish_after_response:
+            self._trace(
+                "defer_finish",
+                use,
+                self.strategy_for(use.component_name, module),
+                module,
+                detail="post_response",
+            )
+            self._deferred_finish_uses[use.component_name] = (use, module)
+            return
         strategy = self.strategy_for(use.component_name, module)
         self._trace("finish", use, strategy, module)
         strategy.finish_use(module, use, self.state)
 
-    def finish_request(self) -> None:
+    def finish_request(self) -> list[PostResponseTask]:
+        post_response_tasks: list[PostResponseTask] = []
         if not self.enabled and not self._uses_seen and self._active_use is None:
-            return
+            return post_response_tasks
         # 1. Close the currently active sequential use.
         self.finish_active_use(prefetch_next=False)
         # 2. Pick components that should be ready for the next request.
@@ -489,11 +507,51 @@ class ComponentResidencyManager:
             if preferred and not self.state.batch_is_warmup:
                 self._trace("request_prefetch", use, strategy, module)
                 strategy.prepare_after_request(module, use, self.state)
+            elif use.finish_after_response and not self.state.batch_is_warmup:
+                deferred = self._deferred_finish_uses.pop(component_name, None)
+                deferred_use, deferred_module = deferred or (use, module)
+                self._trace(
+                    "request_defer_finish",
+                    deferred_use,
+                    strategy,
+                    deferred_module,
+                    detail="post_response",
+                )
+                post_response_tasks.append(
+                    self._make_finish_request_task(
+                        component_name,
+                        deferred_use,
+                        deferred_module,
+                        strategy,
+                        preferred=False,
+                    )
+                )
             else:
                 action = "request_resident" if preferred else "request_finish"
                 self._trace(action, use, strategy, module)
                 strategy.finish_request(module, use, self.state, preferred=preferred)
+        self._deferred_finish_uses.clear()
         self._trace("request_end")
+        return post_response_tasks
+
+    def _make_finish_request_task(
+        self,
+        component_name: str,
+        use: ComponentUse,
+        module: nn.Module,
+        strategy: ComponentResidencyStrategy,
+        *,
+        preferred: bool,
+    ) -> PostResponseTask:
+        state = replace(self.state)
+
+        def finish_component() -> None:
+            strategy.finish_request(module, use, state, preferred=preferred)
+
+        return (
+            f"component_residency.finish_request.{component_name}",
+            finish_component,
+        )
 
     def stage_name(self, stage: ComponentResidencyStage) -> str:
         return self._stage_names_by_id.get(id(stage), stage.__class__.__name__)

@@ -31,9 +31,22 @@ class LTX2AVDecodingStage(DecodingStage):
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
         return [
-            ComponentUse(stage_name, "vae", target_dtype=torch.bfloat16),
-            ComponentUse(stage_name, "audio_vae"),
-            ComponentUse(stage_name, "vocoder"),
+            ComponentUse(
+                stage_name,
+                "vae",
+                target_dtype=torch.bfloat16,
+                finish_after_response=server_args.vae_cpu_offload,
+            ),
+            ComponentUse(
+                stage_name,
+                "audio_vae",
+                finish_after_response=server_args.vae_cpu_offload,
+            ),
+            ComponentUse(
+                stage_name,
+                "vocoder",
+                finish_after_response=server_args.vae_cpu_offload,
+            ),
         ]
 
     @staticmethod

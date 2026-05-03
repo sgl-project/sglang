@@ -520,9 +520,10 @@ class Scheduler(SchedulerDisaggMixin):
             identities = [item[0] for item in items]
             reqs = [item[1] for item in items]
 
+            req_or_group = reqs[0]
+            is_warmup = self._is_warmup_item(req_or_group)
             try:
-                req_or_group = reqs[0]
-                is_warmup = self._is_warmup_item(req_or_group)
+                self.worker.wait_post_response_tasks()
                 output_batch = self._dispatch_request(reqs)
             except Exception as e:
                 logger.error(
@@ -541,9 +542,12 @@ class Scheduler(SchedulerDisaggMixin):
                 # Reply failed; log and keep loop alive to accept future requests
                 logger.error(f"ZMQ error sending reply: {e}")
                 continue
+            finally:
+                self.worker.submit_post_response_tasks()
 
         if self.receiver is not None:
             self.receiver.close()
+        self.worker.shutdown_post_response_tasks()
         self._cleanup_disagg()
         self.context.destroy(linger=0)
 

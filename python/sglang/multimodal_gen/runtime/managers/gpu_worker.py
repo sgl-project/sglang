@@ -41,6 +41,9 @@ from sglang.multimodal_gen.runtime.managers.layerwise_offload import (
     OffloadableDiTMixin,
     iter_materialized_weights,
 )
+from sglang.multimodal_gen.runtime.managers.post_response_tasks import (
+    PostResponseTaskRunner,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import (
     ComposedPipelineBase,
     LoRAPipeline,
@@ -105,6 +108,10 @@ class GPUWorker:
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
+        self.post_response_task_runner = PostResponseTaskRunner(
+            f"sgl_diffusion_post_response_{rank}"
+        )
+        self._post_response_tasks: list[tuple[str, Callable[[], None]]] = []
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()
@@ -329,7 +336,11 @@ class GPUWorker:
                     stack.enter_context(
                         trace_slice(item.trace_ctx, DiffStage.GPU_FORWARD)
                     )
-                result = forward_fn()
+                try:
+                    result = forward_fn()
+                finally:
+                    if not return_req:
+                        self._collect_pipeline_post_response_tasks()
 
             # disagg roles return raw Req so callers can keep and transfer intermediate tensors
             # before converting it to OutputBatch
@@ -397,6 +408,35 @@ class GPUWorker:
                 output_batch = OutputBatch()
             output_batch.error = f"Error executing {error_context}: {e}"
         return output_batch
+
+    def _collect_pipeline_post_response_tasks(self) -> None:
+        executor = getattr(self.pipeline, "executor", None)
+        if executor is None:
+            return
+        self._post_response_tasks.extend(executor.pop_post_response_tasks())
+
+    def submit_post_response_tasks(self) -> None:
+        tasks = self._post_response_tasks
+        self._post_response_tasks = []
+        for name, task in tasks:
+            self.post_response_task_runner.submit(
+                name,
+                self._wrap_post_response_task(task),
+            )
+
+    def wait_post_response_tasks(self) -> None:
+        self.post_response_task_runner.wait_pending()
+
+    def shutdown_post_response_tasks(self) -> None:
+        self.post_response_task_runner.shutdown()
+
+    def _wrap_post_response_task(self, task: Callable[[], None]) -> Callable[[], None]:
+        def run_task() -> None:
+            if current_platform.is_cuda():
+                torch.get_device_module().set_device(self.local_rank)
+            task()
+
+        return run_task
 
     def _forward_group(self, batch: list[Req]) -> OutputBatch:
         assert self.pipeline is not None
