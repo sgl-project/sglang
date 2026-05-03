@@ -1,10 +1,12 @@
 import time
 import unittest
+from types import SimpleNamespace
 
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.cache_hit_kit import run_multiturn_cache_hit_test
+from sglang.test.run_eval import run_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
     PDDisaggregationServerBase,
 )
@@ -77,6 +79,39 @@ class TestDisaggregationDecodeRadixCache(PDDisaggregationServerBase):
         self._assert_process_healthy("load balancer", self.process_lb, self.lb_url)
         self._assert_process_healthy("prefill", self.process_prefill, self.prefill_url)
         self._assert_process_healthy("decode", self.process_decode, self.decode_url)
+
+    def test_gsm8k_accuracy_two_passes(self):
+        """Run GSM8K twice to verify decode radix cache does not degrade accuracy."""
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=500,
+            num_threads=100,
+            num_shots=6,
+        )
+
+        metrics_first = run_eval(args)
+        print(f"First run metrics: {metrics_first}")
+
+        metrics_second = run_eval(args)
+        print(f"Second run metrics: {metrics_second}")
+
+        # Both runs should have reasonable accuracy
+        self.assertGreater(metrics_first["score"], 0.80)
+        self.assertGreater(metrics_second["score"], 0.80)
+
+        # Second run accuracy should not drop more than 3% compared to first run
+        accuracy_drop = metrics_first["score"] - metrics_second["score"]
+        self.assertLessEqual(
+            accuracy_drop,
+            0.03,
+            f"Second run accuracy dropped by {accuracy_drop:.4f} "
+            f"(first={metrics_first['score']:.4f}, second={metrics_second['score']:.4f}), "
+            f"exceeds 3% threshold",
+        )
 
 
 if __name__ == "__main__":
