@@ -25,7 +25,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
-from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.server_args import (
+    ServerArgs,
+    is_ltx2_two_stage_pipeline_name,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -68,6 +71,8 @@ class TextEncodingStage(PipelineStage):
         super().__init__()
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
+        self._negative_text_cache_key = None
+        self._negative_text_cache_value = None
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -123,11 +128,8 @@ class TextEncodingStage(PipelineStage):
         # Encode negative prompt if CFG is enabled
         if batch.do_classifier_free_guidance:
             assert isinstance(batch.negative_prompt, str)
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
-                batch.negative_prompt,
-                server_args,
-                encoder_index=all_indices,
-                return_attention_mask=True,
+            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = (
+                self._encode_negative_text(batch, server_args, all_indices)
             )
 
             assert batch.negative_prompt_embeds is not None
@@ -143,6 +145,43 @@ class TextEncodingStage(PipelineStage):
                     batch.negative_attention_mask.append(nm)
 
         return batch
+
+    def _encode_negative_text(
+        self, batch: Req, server_args: ServerArgs, encoder_indices: list[int]
+    ):
+        cache_key = (
+            server_args.pipeline_class_name,
+            tuple(encoder_indices),
+            self.freeze_for_dedup(batch.negative_prompt),
+            self.freeze_for_dedup(batch.prompt_template),
+            batch.max_sequence_length,
+        )
+        use_cache = (not batch.is_warmup) and is_ltx2_two_stage_pipeline_name(
+            server_args.pipeline_class_name
+        )
+        if use_cache and self._negative_text_cache_key == cache_key:
+            return self._negative_text_cache_value
+
+        result = self.encode_text(
+            batch.negative_prompt,
+            server_args,
+            encoder_index=encoder_indices,
+            return_attention_mask=True,
+        )
+        if use_cache:
+            # LTX2's default negative prompt is long and usually reused. With
+            # the same pipeline, encoder set, text, template, and max length,
+            # text encoding produces the same tensors, so this one-slot cache
+            # skips only that repeated work. Warmup requests stay synthetic and
+            # must not seed the real-request cache.
+            self._negative_text_cache_key = cache_key
+            self._negative_text_cache_value = (
+                tuple(result[0]),
+                tuple(result[1]),
+                tuple(result[2]),
+            )
+            return self._negative_text_cache_value
+        return result
 
     def build_dedup_fingerprint(
         self, batch: Req, server_args: ServerArgs
