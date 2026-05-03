@@ -5,11 +5,14 @@ import json
 from typing import Any
 
 from sglang.srt.relaykv.metrics import (
+    assess_relaykv_readonly_attention_readiness_for_smoke,
     assess_relaykv_readonly_materialization_readiness_for_smoke,
+    build_relaykv_candidate_event_materialization_results_for_smoke,
     build_relaykv_policy_dry_run_events_for_smoke,
     build_relaykv_readonly_runtime_candidate_join_report_for_smoke,
     join_runtime_observation_with_host_backup_candidates_for_smoke,
     summarize_host_backup_copy_candidates_for_smoke,
+    summarize_relaykv_materialization_results_for_smoke,
     summarize_relaykv_policy_dry_run_events_for_smoke,
 )
 from sglang.srt.relaykv.observation import summarize_runtime_observation_payloads
@@ -45,6 +48,7 @@ def _candidate_event(
     req_pool_idx: int,
     layer_idx: int,
 ) -> dict[str, Any]:
+    selected_block_ids = [req_pool_idx, req_pool_idx + 1]
     return {
         "runtime_policy_state": "applied_candidate",
         "batch_id": "readonly-diagnostic-batch-a",
@@ -52,6 +56,8 @@ def _candidate_event(
         "req_pool_idx": req_pool_idx,
         "req_pool_index": req_pool_idx,
         "layer_idx": layer_idx,
+        "selected_block_ids": selected_block_ids,
+        "candidate_block_ids": [*selected_block_ids, req_pool_idx + 2],
         "snapshot_created": True,
         "host_backup_copy_candidate": True,
         "host_backup_copy_executed": True,
@@ -115,8 +121,11 @@ def _assert_safety_zero(summary: dict[str, Any]) -> None:
         "kv_cache_mutation_true_count",
         "runtime_writeback_true_count",
         "scheduler_policy_noop_false_count",
+        "host_backup_copy_executed_count",
+        "kv_pool_read_count",
+        "kv_snapshot_count",
     ):
-        if summary[key] != 0:
+        if summary.get(key, 0) != 0:
             raise AssertionError(summary)
 
 
@@ -172,15 +181,62 @@ def _assert_readonly_flow() -> dict[str, Any]:
         join_summary,
         policy_dry_run_summary=dry_run_summary,
     )
+    materialization_readiness = (
+        assess_relaykv_readonly_materialization_readiness_for_smoke(report)
+    )
+    if materialization_readiness["ready_for_materialization"] is not True:
+        raise AssertionError(materialization_readiness)
+
+    materialization_results = (
+        build_relaykv_candidate_event_materialization_results_for_smoke(
+            candidate_events,
+            materialization_readiness,
+        )
+    )
+    materialization_summary = summarize_relaykv_materialization_results_for_smoke(
+        materialization_results
+    )
+    if materialization_summary["total_materialization_results"] != 4:
+        raise AssertionError(materialization_summary)
+    if materialization_summary["candidate_event_materialized_count"] != 4:
+        raise AssertionError(materialization_summary)
+    if materialization_summary["materialized_kv_count"] <= 0:
+        raise AssertionError(materialization_summary)
+    _assert_safety_zero(materialization_summary)
+
+    report = build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
+        runtime_summary,
+        candidate_summary,
+        join_summary,
+        policy_dry_run_summary=dry_run_summary,
+        materialization_summary=materialization_summary,
+    )
     if report["report_type"] != "relaykv_readonly_runtime_candidate_join_report":
         raise AssertionError(report)
     if report["policy_dry_run_included"] is not True:
         raise AssertionError(report)
     if report["policy_dry_run_total_events"] != 4:
         raise AssertionError(report)
+    if report["materialization_summary_included"] is not True:
+        raise AssertionError(report)
+    if report["materialization_candidate_event_count"] != 4:
+        raise AssertionError(report)
+    if report["materialized_kv_count"] <= 0:
+        raise AssertionError(report)
     if report["overall_safety_status"] != "pass":
         raise AssertionError(report)
     _assert_safety_zero(report)
+
+    attention_readiness = assess_relaykv_readonly_attention_readiness_for_smoke(
+        report
+    )
+    if attention_readiness["ready_for_attention_connection"] is not True:
+        raise AssertionError(attention_readiness)
+    if (
+        attention_readiness["readiness_state"]
+        != "ready_for_attention_connection_metadata_only"
+    ):
+        raise AssertionError(attention_readiness)
 
     if runtime_payloads != runtime_before:
         raise AssertionError("runtime payloads were mutated")
@@ -196,7 +252,10 @@ def _assert_readonly_flow() -> dict[str, Any]:
         "candidate_summary": candidate_summary,
         "join_summary": join_summary,
         "dry_run_summary": dry_run_summary,
+        "materialization_readiness": materialization_readiness,
+        "materialization_summary": materialization_summary,
         "report": report,
+        "attention_readiness": attention_readiness,
     }
 
 
@@ -299,6 +358,102 @@ def _assert_readiness_cases() -> dict[str, Any]:
     }
 
 
+def _assert_attention_readiness_cases() -> dict[str, Any]:
+    flow = _assert_readonly_flow()
+    report = flow["report"]
+    report_before = copy.deepcopy(report)
+    ready = assess_relaykv_readonly_attention_readiness_for_smoke(report)
+    if report != report_before:
+        raise AssertionError("attention readiness helper mutated report")
+    if ready["ready_for_attention_connection"] is not True:
+        raise AssertionError(ready)
+    if ready["readiness_state"] != "ready_for_attention_connection_metadata_only":
+        raise AssertionError(ready)
+
+    missing_materialization_report = copy.deepcopy(report)
+    missing_materialization_report["materialization_summary_included"] = False
+    missing_materialization_report["materialization_total_results"] = 0
+    missing_materialization_report["materialization_result_count"] = 0
+    missing_materialization_report["materialized_kv_count"] = 0
+    missing_materialization = assess_relaykv_readonly_attention_readiness_for_smoke(
+        missing_materialization_report
+    )
+    if missing_materialization["ready_for_attention_connection"] is not False:
+        raise AssertionError(missing_materialization)
+    if (
+        "materialization_summary_missing"
+        not in missing_materialization["blocking_reasons"]
+    ):
+        raise AssertionError(missing_materialization)
+
+    guarded_noop_report = copy.deepcopy(report)
+    guarded_noop_report["materialization_guarded_noop_count"] = 1
+    guarded_noop = assess_relaykv_readonly_attention_readiness_for_smoke(
+        guarded_noop_report
+    )
+    if guarded_noop["ready_for_attention_connection"] is not False:
+        raise AssertionError(guarded_noop)
+    if "guarded_noop_present" not in guarded_noop["blocking_reasons"]:
+        raise AssertionError(guarded_noop)
+
+    blocked_report = copy.deepcopy(report)
+    blocked_report["materialization_blocked_count"] = 1
+    blocked = assess_relaykv_readonly_attention_readiness_for_smoke(blocked_report)
+    if blocked["ready_for_attention_connection"] is not False:
+        raise AssertionError(blocked)
+    if "materialization_blocked" not in blocked["blocking_reasons"]:
+        raise AssertionError(blocked)
+
+    error_report = copy.deepcopy(report)
+    error_report["materialization_error_count"] = 1
+    error = assess_relaykv_readonly_attention_readiness_for_smoke(error_report)
+    if error["ready_for_attention_connection"] is not False:
+        raise AssertionError(error)
+    if "materialization_error" not in error["blocking_reasons"]:
+        raise AssertionError(error)
+
+    host_backup_report = copy.deepcopy(report)
+    host_backup_report["overall_safety_status"] = "fail"
+    host_backup_report["host_backup_copy_executed_count"] = 1
+    host_backup = assess_relaykv_readonly_attention_readiness_for_smoke(
+        host_backup_report
+    )
+    if host_backup["ready_for_attention_connection"] is not False:
+        raise AssertionError(host_backup)
+    if "host_backup_copy_executed" not in host_backup["blocking_reasons"]:
+        raise AssertionError(host_backup)
+    if "overall_safety_not_pass" not in host_backup["blocking_reasons"]:
+        raise AssertionError(host_backup)
+
+    kv_pool_report = copy.deepcopy(report)
+    kv_pool_report["overall_safety_status"] = "fail"
+    kv_pool_report["kv_pool_read_count"] = 1
+    kv_pool = assess_relaykv_readonly_attention_readiness_for_smoke(kv_pool_report)
+    if kv_pool["ready_for_attention_connection"] is not False:
+        raise AssertionError(kv_pool)
+    if "kv_pool_read" not in kv_pool["blocking_reasons"]:
+        raise AssertionError(kv_pool)
+
+    no_kv_report = copy.deepcopy(report)
+    no_kv_report["materialized_kv_count"] = 0
+    no_kv = assess_relaykv_readonly_attention_readiness_for_smoke(no_kv_report)
+    if no_kv["ready_for_attention_connection"] is not False:
+        raise AssertionError(no_kv)
+    if "no_materialized_kv" not in no_kv["blocking_reasons"]:
+        raise AssertionError(no_kv)
+
+    return {
+        "ready": ready,
+        "materialization_summary_missing": missing_materialization,
+        "guarded_noop_present": guarded_noop,
+        "materialization_blocked": blocked,
+        "materialization_error": error,
+        "host_backup_copy_executed": host_backup,
+        "kv_pool_read": kv_pool,
+        "no_materialized_kv": no_kv,
+    }
+
+
 def _assert_summary_only_candidate_flow() -> dict[str, Any]:
     runtime_payloads = _runtime_payloads()
     runtime_summary = summarize_runtime_observation_payloads(runtime_payloads)
@@ -328,6 +483,7 @@ def main() -> None:
         "readonly_flow": _assert_readonly_flow(),
         "fail_propagation": _assert_fail_propagation(),
         "readiness_cases": _assert_readiness_cases(),
+        "attention_readiness_cases": _assert_attention_readiness_cases(),
         "summary_only_candidate_flow": _assert_summary_only_candidate_flow(),
     }
     print("relaykv_readonly_diagnostic_flow_smoke=pass")

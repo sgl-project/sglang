@@ -505,6 +505,12 @@ _REPORT_SAFETY_COUNTER_KEYS = (
     "scheduler_policy_noop_false_count",
 )
 
+_MATERIALIZATION_REPORT_SAFETY_COUNTER_KEYS = (
+    "host_backup_copy_executed_count",
+    "kv_pool_read_count",
+    "kv_snapshot_count",
+)
+
 
 def _readonly_report_value(
     missing_field_counts: Counter[str],
@@ -536,6 +542,7 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
     host_backup_candidate_summary: Mapping[str, Any],
     join_summary: Mapping[str, Any],
     policy_dry_run_summary: Mapping[str, Any] | None = None,
+    materialization_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a read-only runtime/candidate/join report for smoke tests.
 
@@ -554,6 +561,10 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
         policy_dry_run_summary, Mapping
     ):
         raise TypeError("policy_dry_run_summary must be a mapping or None")
+    if materialization_summary is not None and not isinstance(
+        materialization_summary, Mapping
+    ):
+        raise TypeError("materialization_summary must be a mapping or None")
 
     missing_field_counts: Counter[str] = Counter({"missing_field_count": 0})
     total_runtime_payloads = _readonly_report_value(
@@ -598,8 +609,21 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
             host_backup_candidate_summary,
             join_summary,
             policy_dry_run_summary or {},
+            materialization_summary or {},
         )
         for key in _REPORT_SAFETY_COUNTER_KEYS
+    }
+    materialization_safety_counts = {
+        key: (
+            _readonly_report_safety_counter(
+                missing_field_counts,
+                key,
+                materialization_summary,
+            )
+            if materialization_summary is not None
+            else 0
+        )
+        for key in _MATERIALIZATION_REPORT_SAFETY_COUNTER_KEYS
     }
     policy_dry_run_included = policy_dry_run_summary is not None
     policy_dry_run_total_events = 0
@@ -614,11 +638,69 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
             if isinstance(value, int):
                 policy_dry_run_selected_event_count = value
                 break
+    materialization_summary_included = materialization_summary is not None
+    materialization_total_results = 0
+    materialization_result_count = 0
+    materialization_fake_count = 0
+    materialization_guarded_noop_count = 0
+    materialization_candidate_event_count = 0
+    materialization_host_backup_copy_count = 0
+    materialization_blocked_count = 0
+    materialization_skipped_count = 0
+    materialization_error_count = 0
+    materialized_kv_count = 0
+    materialized_token_count = 0
+    if materialization_summary is not None:
+        materialization_total_results = _readonly_report_value(
+            missing_field_counts,
+            (materialization_summary, ("total_materialization_results",)),
+        )
+        materialization_result_count = _readonly_report_value(
+            missing_field_counts,
+            (materialization_summary, ("materialized_result_count",)),
+        )
+        materialization_fake_count = _readonly_report_value(
+            missing_field_counts,
+            (materialization_summary, ("fake_materialized_count",)),
+        )
+        materialization_guarded_noop_count = _readonly_report_value(
+            missing_field_counts,
+            (materialization_summary, ("guarded_noop_count",)),
+        )
+        materialization_candidate_event_count = _readonly_report_value(
+            missing_field_counts,
+            (materialization_summary, ("candidate_event_materialized_count",)),
+        )
+        materialization_host_backup_copy_count = _readonly_report_value(
+            missing_field_counts,
+            (materialization_summary, ("host_backup_copy_materialized_count",)),
+        )
+        materialization_blocked_count = _readonly_report_value(
+            missing_field_counts,
+            (materialization_summary, ("blocked_count",)),
+        )
+        materialization_skipped_count = _readonly_report_value(
+            missing_field_counts,
+            (materialization_summary, ("skipped_count",)),
+        )
+        materialization_error_count = _readonly_report_value(
+            missing_field_counts,
+            (materialization_summary, ("error_count",)),
+        )
+        materialized_kv_count = _readonly_report_value(
+            missing_field_counts,
+            (materialization_summary, ("materialized_kv_count",)),
+        )
+        materialized_token_count = _readonly_report_value(
+            missing_field_counts,
+            (materialization_summary, ("materialized_token_count",)),
+        )
     report_generated_from_readonly_inputs = True
+    all_safety_counts = {**safety_counts, **materialization_safety_counts}
     overall_safety_status = (
         "pass"
         if report_generated_from_readonly_inputs
-        and all(value == 0 for value in safety_counts.values())
+        and all(value == 0 for value in all_safety_counts.values())
         else "fail"
     )
     report_warning_counts = {
@@ -637,6 +719,23 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
         "policy_dry_run_included": policy_dry_run_included,
         "policy_dry_run_total_events": policy_dry_run_total_events,
         "policy_dry_run_selected_event_count": policy_dry_run_selected_event_count,
+        "materialization_summary": (
+            dict(materialization_summary)
+            if materialization_summary is not None
+            else None
+        ),
+        "materialization_summary_included": materialization_summary_included,
+        "materialization_total_results": materialization_total_results,
+        "materialization_result_count": materialization_result_count,
+        "materialization_fake_count": materialization_fake_count,
+        "materialization_guarded_noop_count": materialization_guarded_noop_count,
+        "materialization_candidate_event_count": materialization_candidate_event_count,
+        "materialization_host_backup_copy_count": materialization_host_backup_copy_count,
+        "materialization_blocked_count": materialization_blocked_count,
+        "materialization_skipped_count": materialization_skipped_count,
+        "materialization_error_count": materialization_error_count,
+        "materialized_kv_count": materialized_kv_count,
+        "materialized_token_count": materialized_token_count,
         "overall_safety_status": overall_safety_status,
         "total_runtime_payloads": total_runtime_payloads,
         "total_host_backup_candidate_events": total_host_backup_candidate_events,
@@ -646,7 +745,7 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
         "join_granularity": str(join_summary.get("join_granularity", "unknown")),
         "req_pool_idx_joined_count": req_pool_idx_joined_count,
         "req_pool_idx_missing_count": req_pool_idx_missing_count,
-        **safety_counts,
+        **all_safety_counts,
         "missing_field_counts": dict(missing_field_counts),
         "report_warning_counts": report_warning_counts,
     }
@@ -762,6 +861,217 @@ def assess_relaykv_readonly_materialization_readiness_for_smoke(
         "observed_unmatched_candidate_count": observed_unmatched_candidate_count,
         "observed_req_pool_idx_missing_count": observed_req_pool_idx_missing_count,
         "report_generated_from_readonly_inputs": report_generated_from_readonly_inputs,
+        **safety_counts,
+    }
+
+
+def assess_relaykv_readonly_attention_readiness_for_smoke(
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Assess read-only RelayKV metadata readiness for attention connection.
+
+    This consumes a precomputed report dictionary only. It does not connect
+    attention, materialize KV data, execute host backup copy, read KV pools,
+    snapshot KV, alter scheduler decisions, or write runtime state.
+    """
+
+    if not isinstance(report, Mapping):
+        raise TypeError("RelayKV attention readiness report must be a mapping")
+
+    safety_counter_keys = (
+        *_REPORT_SAFETY_COUNTER_KEYS,
+        *_MATERIALIZATION_REPORT_SAFETY_COUNTER_KEYS,
+    )
+    safety_counts = {
+        key: report.get(key) if isinstance(report.get(key), int) else 0
+        for key in safety_counter_keys
+    }
+
+    report_generated_from_readonly_inputs = (
+        report.get("report_generated_from_readonly_inputs") is True
+    )
+    observed_overall_safety_status = str(
+        report.get("overall_safety_status", "unknown")
+    )
+    observed_policy_dry_run_included = report.get("policy_dry_run_included") is True
+    observed_policy_dry_run_total_events = (
+        report.get("policy_dry_run_total_events")
+        if isinstance(report.get("policy_dry_run_total_events"), int)
+        else 0
+    )
+    observed_materialization_summary_included = (
+        report.get("materialization_summary_included") is True
+    )
+    observed_materialization_total_results = (
+        report.get("materialization_total_results")
+        if isinstance(report.get("materialization_total_results"), int)
+        else 0
+    )
+    observed_materialization_result_count = (
+        report.get("materialization_result_count")
+        if isinstance(report.get("materialization_result_count"), int)
+        else 0
+    )
+    observed_materialized_kv_count = (
+        report.get("materialized_kv_count")
+        if isinstance(report.get("materialized_kv_count"), int)
+        else 0
+    )
+    observed_candidate_event_materialized_count = (
+        report.get("materialization_candidate_event_count")
+        if isinstance(report.get("materialization_candidate_event_count"), int)
+        else 0
+    )
+    observed_fake_materialized_count = (
+        report.get("materialization_fake_count")
+        if isinstance(report.get("materialization_fake_count"), int)
+        else 0
+    )
+    observed_guarded_noop_count = (
+        report.get("materialization_guarded_noop_count")
+        if isinstance(report.get("materialization_guarded_noop_count"), int)
+        else 0
+    )
+    observed_blocked_count = (
+        report.get("materialization_blocked_count")
+        if isinstance(report.get("materialization_blocked_count"), int)
+        else 0
+    )
+    observed_error_count = (
+        report.get("materialization_error_count")
+        if isinstance(report.get("materialization_error_count"), int)
+        else 0
+    )
+    observed_host_backup_copy_materialized_count = (
+        report.get("materialization_host_backup_copy_count")
+        if isinstance(report.get("materialization_host_backup_copy_count"), int)
+        else 0
+    )
+    observed_host_backup_copy_executed_count = safety_counts[
+        "host_backup_copy_executed_count"
+    ]
+    observed_kv_pool_read_count = safety_counts["kv_pool_read_count"]
+    observed_kv_snapshot_count = safety_counts["kv_snapshot_count"]
+
+    blocker_state_by_reason = {
+        "not_readonly_report": "blocked_not_readonly_report",
+        "overall_safety_not_pass": "blocked_overall_safety_not_pass",
+        "policy_dry_run_missing": "blocked_policy_dry_run_missing",
+        "materialization_summary_missing": "blocked_materialization_summary_missing",
+        "no_materialization_results": "blocked_no_materialization_results",
+        "no_materialized_kv": "blocked_no_materialized_kv",
+        "guarded_noop_present": "blocked_guarded_noop_present",
+        "materialization_blocked": "blocked_materialization_blocked",
+        "materialization_error": "blocked_materialization_error",
+        "host_backup_copy_executed": "blocked_host_backup_copy_executed",
+        "kv_pool_read": "blocked_kv_pool_read",
+        "kv_snapshot": "blocked_kv_snapshot",
+        "safety_counter_nonzero": "blocked_safety_counter_nonzero",
+    }
+    blocking_reasons: list[str] = []
+    warning_reasons: list[str] = [
+        "metadata_only_readiness_does_not_connect_attention"
+    ]
+
+    if not report_generated_from_readonly_inputs:
+        blocking_reasons.append("not_readonly_report")
+    if observed_overall_safety_status != "pass":
+        blocking_reasons.append("overall_safety_not_pass")
+    if (
+        not observed_policy_dry_run_included
+        or observed_policy_dry_run_total_events <= 0
+    ):
+        blocking_reasons.append("policy_dry_run_missing")
+    if not observed_materialization_summary_included:
+        blocking_reasons.append("materialization_summary_missing")
+    if (
+        observed_materialization_summary_included
+        and observed_materialization_total_results <= 0
+    ):
+        blocking_reasons.append("no_materialization_results")
+    if (
+        observed_materialization_summary_included
+        and observed_materialization_result_count <= 0
+    ):
+        blocking_reasons.append("no_materialization_results")
+    if observed_materialized_kv_count <= 0:
+        blocking_reasons.append("no_materialized_kv")
+    if (
+        observed_candidate_event_materialized_count <= 0
+        and observed_fake_materialized_count <= 0
+    ):
+        blocking_reasons.append("no_materialized_kv")
+    if observed_guarded_noop_count > 0:
+        blocking_reasons.append("guarded_noop_present")
+    if observed_blocked_count > 0:
+        blocking_reasons.append("materialization_blocked")
+    if observed_error_count > 0:
+        blocking_reasons.append("materialization_error")
+    if observed_host_backup_copy_executed_count > 0:
+        blocking_reasons.append("host_backup_copy_executed")
+    if observed_kv_pool_read_count > 0:
+        blocking_reasons.append("kv_pool_read")
+    if observed_kv_snapshot_count > 0:
+        blocking_reasons.append("kv_snapshot")
+    if any(
+        safety_counts[key] != 0
+        for key in (
+            "source_mutated_true_count",
+            "attention_override_true_count",
+            "kv_cache_mutation_true_count",
+            "runtime_writeback_true_count",
+            "scheduler_policy_noop_false_count",
+        )
+    ):
+        blocking_reasons.append("safety_counter_nonzero")
+
+    # Preserve order while dropping duplicate blockers from overlapping rules.
+    blocking_reasons = list(dict.fromkeys(blocking_reasons))
+    ready_for_attention_connection = not blocking_reasons
+    if ready_for_attention_connection:
+        readiness_state = "ready_for_attention_connection_metadata_only"
+        readiness_reasons = ["readonly_metadata_materialization_report_ready"]
+    elif len(blocking_reasons) == 1:
+        readiness_state = blocker_state_by_reason[blocking_reasons[0]]
+        readiness_reasons = []
+    else:
+        readiness_state = "blocked_multiple_reasons"
+        readiness_reasons = []
+
+    return {
+        "readiness_type": "relaykv_readonly_attention_readiness",
+        "ready_for_attention_connection": ready_for_attention_connection,
+        "readiness_state": readiness_state,
+        "readiness_reasons": readiness_reasons,
+        "blocking_reasons": blocking_reasons,
+        "warning_reasons": warning_reasons,
+        "observed_overall_safety_status": observed_overall_safety_status,
+        "observed_materialization_summary_included": (
+            observed_materialization_summary_included
+        ),
+        "observed_materialization_total_results": (
+            observed_materialization_total_results
+        ),
+        "observed_materialization_result_count": (
+            observed_materialization_result_count
+        ),
+        "observed_materialized_kv_count": observed_materialized_kv_count,
+        "observed_candidate_event_materialized_count": (
+            observed_candidate_event_materialized_count
+        ),
+        "observed_fake_materialized_count": observed_fake_materialized_count,
+        "observed_guarded_noop_count": observed_guarded_noop_count,
+        "observed_host_backup_copy_materialized_count": (
+            observed_host_backup_copy_materialized_count
+        ),
+        "observed_host_backup_copy_executed_count": (
+            observed_host_backup_copy_executed_count
+        ),
+        "observed_kv_pool_read_count": observed_kv_pool_read_count,
+        "observed_kv_snapshot_count": observed_kv_snapshot_count,
+        "report_generated_from_readonly_inputs": (
+            report_generated_from_readonly_inputs
+        ),
         **safety_counts,
     }
 

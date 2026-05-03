@@ -70,6 +70,30 @@ def _policy_dry_run_summary() -> dict[str, Any]:
     }
 
 
+def _materialization_summary() -> dict[str, Any]:
+    return {
+        "total_materialization_results": 2,
+        "materialized_result_count": 2,
+        "fake_materialized_count": 0,
+        "guarded_noop_count": 0,
+        "candidate_event_materialized_count": 2,
+        "host_backup_copy_materialized_count": 0,
+        "blocked_count": 0,
+        "skipped_count": 0,
+        "error_count": 0,
+        "materialized_kv_count": 4,
+        "materialized_token_count": 0,
+        "source_mutated_true_count": 0,
+        "attention_override_true_count": 0,
+        "kv_cache_mutation_true_count": 0,
+        "runtime_writeback_true_count": 0,
+        "scheduler_policy_noop_false_count": 0,
+        "host_backup_copy_executed_count": 0,
+        "kv_pool_read_count": 0,
+        "kv_snapshot_count": 0,
+    }
+
+
 def _assert_safety_zero(report: dict[str, Any]) -> None:
     for key in (
         "source_mutated_true_count",
@@ -77,6 +101,9 @@ def _assert_safety_zero(report: dict[str, Any]) -> None:
         "kv_cache_mutation_true_count",
         "runtime_writeback_true_count",
         "scheduler_policy_noop_false_count",
+        "host_backup_copy_executed_count",
+        "kv_pool_read_count",
+        "kv_snapshot_count",
     ):
         if report[key] != 0:
             raise AssertionError(report)
@@ -127,6 +154,10 @@ def _assert_pass_report() -> dict[str, Any]:
     if report["policy_dry_run_included"] is not False:
         raise AssertionError(report)
     if report["policy_dry_run_summary"] is not None:
+        raise AssertionError(report)
+    if report["materialization_summary_included"] is not False:
+        raise AssertionError(report)
+    if report["materialization_summary"] is not None:
         raise AssertionError(report)
     return report
 
@@ -190,6 +221,55 @@ def _assert_policy_dry_run_fail_report() -> dict[str, Any]:
     return report
 
 
+def _assert_materialization_summary_report() -> dict[str, Any]:
+    materialization_summary = _materialization_summary()
+    materialization_before = copy.deepcopy(materialization_summary)
+    report = build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
+        _runtime_summary(),
+        _host_backup_candidate_summary(),
+        _join_summary(),
+        policy_dry_run_summary=_policy_dry_run_summary(),
+        materialization_summary=materialization_summary,
+    )
+    if materialization_summary != materialization_before:
+        raise AssertionError("materialization summary was mutated")
+    if report["materialization_summary_included"] is not True:
+        raise AssertionError(report)
+    if report["materialization_summary"] != materialization_summary:
+        raise AssertionError(report)
+    if report["materialization_total_results"] != 2:
+        raise AssertionError(report)
+    if report["materialization_result_count"] != 2:
+        raise AssertionError(report)
+    if report["materialization_candidate_event_count"] != 2:
+        raise AssertionError(report)
+    if report["materialized_kv_count"] != 4:
+        raise AssertionError(report)
+    if report["overall_safety_status"] != "pass":
+        raise AssertionError(report)
+    _assert_safety_zero(report)
+    return report
+
+
+def _assert_materialization_summary_fail_report() -> dict[str, Any]:
+    materialization_summary = _materialization_summary()
+    materialization_summary["kv_pool_read_count"] = 1
+    report = build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
+        _runtime_summary(),
+        _host_backup_candidate_summary(),
+        _join_summary(),
+        policy_dry_run_summary=_policy_dry_run_summary(),
+        materialization_summary=materialization_summary,
+    )
+    if report["materialization_summary_included"] is not True:
+        raise AssertionError(report)
+    if report["overall_safety_status"] != "fail":
+        raise AssertionError(report)
+    if report["kv_pool_read_count"] != 1:
+        raise AssertionError(report)
+    return report
+
+
 def _assert_fail_report() -> dict[str, Any]:
     runtime_summary = _runtime_summary()
     candidate_summary = _host_backup_candidate_summary()
@@ -241,6 +321,10 @@ def main() -> None:
         "pass_report": _assert_pass_report(),
         "policy_dry_run_report": _assert_policy_dry_run_report(),
         "policy_dry_run_fail_report": _assert_policy_dry_run_fail_report(),
+        "materialization_summary_report": _assert_materialization_summary_report(),
+        "materialization_summary_fail_report": (
+            _assert_materialization_summary_fail_report()
+        ),
         "fail_report": _assert_fail_report(),
         "summary_only_unjoinable_report": _assert_summary_only_unjoinable_report(),
         "missing_fields_report": _assert_missing_fields_report(),
