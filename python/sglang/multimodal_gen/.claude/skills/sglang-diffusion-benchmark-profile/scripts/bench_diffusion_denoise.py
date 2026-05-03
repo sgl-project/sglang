@@ -42,7 +42,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from diffusion_skill_env import (
+from diffusion_skill_env import (  # noqa: E402
     ensure_dir,
     get_assets_dir,
     get_output_dir,
@@ -312,6 +312,8 @@ MODELS = {
             "false",
             "--dit-cpu-offload",
             "false",
+            "--num-gpus=2",
+            "--ulysses-degree=2",
         ],
     },
     # 17. Skill-only extra preset
@@ -329,6 +331,8 @@ MODELS = {
             "false",
             "--dit-cpu-offload",
             "false",
+            "--num-gpus=2",
+            "--ulysses-degree=2",
         ],
     },
     # 18. Skill-only extra preset
@@ -379,6 +383,8 @@ def required_gpus_for_model(model_key: str) -> int:
         "ltx23-ti2v-two-stage",
         "ltx23-one-stage",
         "ltx23-two-stage",
+        "firered-edit-1.0",
+        "firered-edit-1.1",
     }:
         return 2
     return 1

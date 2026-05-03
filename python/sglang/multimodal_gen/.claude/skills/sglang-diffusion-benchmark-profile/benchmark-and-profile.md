@@ -184,8 +184,8 @@ Nightly-aligned presets come first; skill-only presets stay available after them
 | `mova-720p` | `OpenMOSS-Team/MOVA-720p` | No | Skill-only extra preset |
 | `helios` | `BestWishYsh/Helios-Base` | No | Skill-only extra preset |
 | `joyai-edit` | `jdopensource/JoyAI-Image-Edit-Diffusers` | No | Skill-only JoyAI image-edit preset; uses the cat image, 1024x1024, 40 steps, guidance 4.0 |
-| `firered-edit-1.0` | `FireRedTeam/FireRed-Image-Edit-1.0` | No | Skill-only FireRed 1.0 image-edit preset; QwenImageEditPlus native path |
-| `firered-edit-1.1` | `FireRedTeam/FireRed-Image-Edit-1.1` | No | Skill-only FireRed 1.1 image-edit preset; QwenImageEditPlus native path |
+| `firered-edit-1.0` | `FireRedTeam/FireRed-Image-Edit-1.0` | No | Skill-only FireRed 1.0 image-edit preset; QwenImageEditPlus native path; uses 2-GPU Ulysses |
+| `firered-edit-1.1` | `FireRedTeam/FireRed-Image-Edit-1.1` | No | Skill-only FireRed 1.1 image-edit preset; QwenImageEditPlus native path; uses 2-GPU Ulysses |
 | `hunyuan3d-shape` | `tencent/Hunyuan3D-2` | No | Skill-only Hunyuan3D shape-generation preset; primary metric is `Hunyuan3DShapeDenoisingStage` |
 
 For Wan2.2 video models, remember the difference between **nightly alignment**
@@ -287,13 +287,15 @@ sglang generate \
   --image-path="${ASSET_DIR}/cat.png" \
   --width=1024 --height=1024 \
   --num-inference-steps=40 --guidance-scale=4.0 \
+  --num-gpus=2 --ulysses-degree=2 \
   --dit-layerwise-offload false --dit-cpu-offload false \
   --save-output --enable-torch-compile --warmup
 ```
 
 Use `FireRedTeam/FireRed-Image-Edit-1.0` in the same command when comparing the
 1.0 checkpoint. Both FireRed presets use the native `QwenImageEditPlusPipeline`
-path.
+path. On H100, 2-GPU Ulysses reduced FireRed 1.0 40-step denoise latency from
+22964.51 ms to 15768.81 ms versus the otherwise matching 1-GPU command.
 
 ### Manual command example: Hunyuan3D Shape
 
