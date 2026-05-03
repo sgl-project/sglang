@@ -652,6 +652,120 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
     }
 
 
+def assess_relaykv_readonly_materialization_readiness_for_smoke(
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Assess read-only RelayKV dry-run readiness for safe materialization.
+
+    This consumes a precomputed report dictionary only. It does not materialize
+    KV data, execute host backup copy, read KV pools, snapshot KV, connect
+    attention, alter scheduler decisions, or write runtime state.
+    """
+
+    if not isinstance(report, Mapping):
+        raise TypeError("RelayKV materialization readiness report must be a mapping")
+
+    safety_counts = {
+        key: report.get(key) if isinstance(report.get(key), int) else 0
+        for key in _REPORT_SAFETY_COUNTER_KEYS
+    }
+    report_generated_from_readonly_inputs = (
+        report.get("report_generated_from_readonly_inputs") is True
+    )
+    observed_overall_safety_status = str(
+        report.get("overall_safety_status", "unknown")
+    )
+    observed_policy_dry_run_included = report.get("policy_dry_run_included") is True
+    observed_policy_dry_run_total_events = (
+        report.get("policy_dry_run_total_events")
+        if isinstance(report.get("policy_dry_run_total_events"), int)
+        else 0
+    )
+    observed_joined_count = (
+        report.get("joined_count") if isinstance(report.get("joined_count"), int) else 0
+    )
+    observed_unmatched_runtime_count = (
+        report.get("unmatched_runtime_count")
+        if isinstance(report.get("unmatched_runtime_count"), int)
+        else 0
+    )
+    observed_unmatched_candidate_count = (
+        report.get("unmatched_candidate_count")
+        if isinstance(report.get("unmatched_candidate_count"), int)
+        else 0
+    )
+    observed_req_pool_idx_missing_count = (
+        report.get("req_pool_idx_missing_count")
+        if isinstance(report.get("req_pool_idx_missing_count"), int)
+        else 0
+    )
+    observed_join_granularity = str(report.get("join_granularity", "unknown"))
+
+    blocker_state_by_reason = {
+        "safety_counter_nonzero": "blocked_safety_counter_nonzero",
+        "not_readonly_report": "blocked_not_readonly_report",
+        "overall_safety_not_pass": "blocked_overall_safety_not_pass",
+        "policy_dry_run_missing": "blocked_policy_dry_run_missing",
+        "no_joined_events": "blocked_no_joined_events",
+        "summary_only_unjoinable": "blocked_summary_only_unjoinable",
+        "req_pool_idx_missing": "blocked_req_pool_idx_missing",
+    }
+    blocking_reasons: list[str] = []
+    warning_reasons: list[str] = []
+
+    if any(value != 0 for value in safety_counts.values()):
+        blocking_reasons.append("safety_counter_nonzero")
+    if not report_generated_from_readonly_inputs:
+        blocking_reasons.append("not_readonly_report")
+    if observed_overall_safety_status != "pass":
+        blocking_reasons.append("overall_safety_not_pass")
+    if (
+        not observed_policy_dry_run_included
+        or observed_policy_dry_run_total_events <= 0
+    ):
+        blocking_reasons.append("policy_dry_run_missing")
+    if observed_joined_count <= 0:
+        blocking_reasons.append("no_joined_events")
+    if observed_join_granularity == "summary_only_unjoinable":
+        blocking_reasons.append("summary_only_unjoinable")
+    if observed_req_pool_idx_missing_count > 0:
+        blocking_reasons.append("req_pool_idx_missing")
+    if observed_unmatched_runtime_count > 0:
+        warning_reasons.append("unmatched_runtime_events_present")
+    if observed_unmatched_candidate_count > 0:
+        warning_reasons.append("unmatched_candidate_events_present")
+
+    ready_for_materialization = not blocking_reasons
+    if ready_for_materialization:
+        readiness_state = "ready_for_safe_materialization_dry_run_complete"
+        readiness_reasons = ["readonly_dry_run_report_ready"]
+    elif len(blocking_reasons) == 1:
+        readiness_state = blocker_state_by_reason[blocking_reasons[0]]
+        readiness_reasons = []
+    else:
+        readiness_state = "blocked_multiple_reasons"
+        readiness_reasons = []
+
+    return {
+        "readiness_type": "relaykv_readonly_materialization_readiness",
+        "ready_for_materialization": ready_for_materialization,
+        "readiness_state": readiness_state,
+        "readiness_reasons": readiness_reasons,
+        "blocking_reasons": blocking_reasons,
+        "warning_reasons": warning_reasons,
+        "observed_join_granularity": observed_join_granularity,
+        "observed_overall_safety_status": observed_overall_safety_status,
+        "observed_policy_dry_run_included": observed_policy_dry_run_included,
+        "observed_policy_dry_run_total_events": observed_policy_dry_run_total_events,
+        "observed_joined_count": observed_joined_count,
+        "observed_unmatched_runtime_count": observed_unmatched_runtime_count,
+        "observed_unmatched_candidate_count": observed_unmatched_candidate_count,
+        "observed_req_pool_idx_missing_count": observed_req_pool_idx_missing_count,
+        "report_generated_from_readonly_inputs": report_generated_from_readonly_inputs,
+        **safety_counts,
+    }
+
+
 def _policy_dry_run_int_config(
     policy_config: Mapping[str, Any],
     key: str,

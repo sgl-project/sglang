@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from sglang.srt.relaykv.metrics import (
+    assess_relaykv_readonly_materialization_readiness_for_smoke,
     build_relaykv_policy_dry_run_events_for_smoke,
     build_relaykv_readonly_runtime_candidate_join_report_for_smoke,
     join_runtime_observation_with_host_backup_candidates_for_smoke,
@@ -216,6 +217,88 @@ def _assert_fail_propagation() -> dict[str, Any]:
     return {"report": report}
 
 
+def _assert_readiness_cases() -> dict[str, Any]:
+    flow = _assert_readonly_flow()
+    report = flow["report"]
+    report_before = copy.deepcopy(report)
+    readiness = assess_relaykv_readonly_materialization_readiness_for_smoke(report)
+    if report != report_before:
+        raise AssertionError("readiness helper mutated report")
+    if readiness["ready_for_materialization"] is not True:
+        raise AssertionError(readiness)
+    if (
+        readiness["readiness_state"]
+        != "ready_for_safe_materialization_dry_run_complete"
+    ):
+        raise AssertionError(readiness)
+    if readiness["blocking_reasons"] != []:
+        raise AssertionError(readiness)
+
+    safety_report = copy.deepcopy(report)
+    safety_report["kv_cache_mutation_true_count"] = 1
+    safety_readiness = assess_relaykv_readonly_materialization_readiness_for_smoke(
+        safety_report
+    )
+    if safety_readiness["ready_for_materialization"] is not False:
+        raise AssertionError(safety_readiness)
+    if "safety_counter_nonzero" not in safety_readiness["blocking_reasons"]:
+        raise AssertionError(safety_readiness)
+
+    summary_only_report = copy.deepcopy(report)
+    summary_only_report["join_granularity"] = "summary_only_unjoinable"
+    summary_only_readiness = assess_relaykv_readonly_materialization_readiness_for_smoke(
+        summary_only_report
+    )
+    if summary_only_readiness["ready_for_materialization"] is not False:
+        raise AssertionError(summary_only_readiness)
+    if "summary_only_unjoinable" not in summary_only_readiness["blocking_reasons"]:
+        raise AssertionError(summary_only_readiness)
+
+    missing_policy_report = copy.deepcopy(report)
+    missing_policy_report["policy_dry_run_included"] = False
+    missing_policy_report["policy_dry_run_total_events"] = 0
+    missing_policy_readiness = (
+        assess_relaykv_readonly_materialization_readiness_for_smoke(
+            missing_policy_report
+        )
+    )
+    if missing_policy_readiness["ready_for_materialization"] is not False:
+        raise AssertionError(missing_policy_readiness)
+    if "policy_dry_run_missing" not in missing_policy_readiness["blocking_reasons"]:
+        raise AssertionError(missing_policy_readiness)
+
+    missing_req_pool_report = copy.deepcopy(report)
+    missing_req_pool_report["req_pool_idx_missing_count"] = 1
+    missing_req_pool_readiness = (
+        assess_relaykv_readonly_materialization_readiness_for_smoke(
+            missing_req_pool_report
+        )
+    )
+    if missing_req_pool_readiness["ready_for_materialization"] is not False:
+        raise AssertionError(missing_req_pool_readiness)
+    if "req_pool_idx_missing" not in missing_req_pool_readiness["blocking_reasons"]:
+        raise AssertionError(missing_req_pool_readiness)
+
+    no_join_report = copy.deepcopy(report)
+    no_join_report["joined_count"] = 0
+    no_join_readiness = assess_relaykv_readonly_materialization_readiness_for_smoke(
+        no_join_report
+    )
+    if no_join_readiness["ready_for_materialization"] is not False:
+        raise AssertionError(no_join_readiness)
+    if "no_joined_events" not in no_join_readiness["blocking_reasons"]:
+        raise AssertionError(no_join_readiness)
+
+    return {
+        "ready": readiness,
+        "safety_counter_nonzero": safety_readiness,
+        "summary_only_unjoinable": summary_only_readiness,
+        "policy_dry_run_missing": missing_policy_readiness,
+        "req_pool_idx_missing": missing_req_pool_readiness,
+        "no_joined_events": no_join_readiness,
+    }
+
+
 def _assert_summary_only_candidate_flow() -> dict[str, Any]:
     runtime_payloads = _runtime_payloads()
     runtime_summary = summarize_runtime_observation_payloads(runtime_payloads)
@@ -244,6 +327,7 @@ def main() -> None:
     result = {
         "readonly_flow": _assert_readonly_flow(),
         "fail_propagation": _assert_fail_propagation(),
+        "readiness_cases": _assert_readiness_cases(),
         "summary_only_candidate_flow": _assert_summary_only_candidate_flow(),
     }
     print("relaykv_readonly_diagnostic_flow_smoke=pass")

@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from sglang.srt.relaykv.metrics import (
+    assess_relaykv_readonly_materialization_readiness_for_smoke,
     build_relaykv_readonly_runtime_candidate_join_report_for_smoke,
 )
 
@@ -163,6 +164,9 @@ def _assert_policy_dry_run_report() -> dict[str, Any]:
     ):
         if report[key] != 0:
             raise AssertionError(report)
+    readiness = assess_relaykv_readonly_materialization_readiness_for_smoke(report)
+    if readiness["ready_for_materialization"] is not True:
+        raise AssertionError(readiness)
     return report
 
 
