@@ -627,6 +627,168 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
     }
 
 
+def _policy_dry_run_int_config(
+    policy_config: Mapping[str, Any],
+    key: str,
+) -> int:
+    value = policy_config.get(key)
+    if not isinstance(value, int):
+        raise TypeError(f"RelayKV dry-run policy config {key} must be an int")
+    return value
+
+
+def _policy_dry_run_block_ids(
+    block_metadata: Mapping[str, Any],
+    key: str,
+) -> list[Any]:
+    value = block_metadata.get(key, ())
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"RelayKV dry-run block metadata {key} must be list or tuple")
+    return list(value)
+
+
+def build_relaykv_policy_dry_run_events_for_smoke(
+    runtime_payloads: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    block_metadata_by_request: Mapping[str, Mapping[str, Any]],
+    policy_config: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Build smoke-only RelayKV policy dry-run events from read-only metadata.
+
+    This is a log/report layer only. It does not read KV pools, create
+    snapshots, execute host backup copy, connect attention, change scheduler
+    decisions, or write runtime state.
+    """
+
+    if not isinstance(runtime_payloads, (list, tuple)):
+        raise TypeError("runtime_payloads must be a list or tuple")
+    if not isinstance(block_metadata_by_request, Mapping):
+        raise TypeError("block_metadata_by_request must be a mapping")
+    if not isinstance(policy_config, Mapping):
+        raise TypeError("policy_config must be a mapping")
+
+    kv_budget_tokens = _policy_dry_run_int_config(policy_config, "kv_budget_tokens")
+    recent_tokens = _policy_dry_run_int_config(policy_config, "recent_tokens")
+    anchor_tokens = _policy_dry_run_int_config(policy_config, "anchor_tokens")
+    transient_tokens = _policy_dry_run_int_config(policy_config, "transient_tokens")
+    retrieval_top_k = _policy_dry_run_int_config(policy_config, "retrieval_top_k")
+    if retrieval_top_k < 0:
+        raise ValueError("RelayKV dry-run retrieval_top_k must be non-negative")
+    layer_budget_policy = policy_config.get("layer_budget_policy")
+    if not isinstance(layer_budget_policy, str):
+        raise TypeError("RelayKV dry-run layer_budget_policy must be a string")
+
+    retrieval_budget_tokens = max(
+        kv_budget_tokens - recent_tokens - anchor_tokens - transient_tokens,
+        0,
+    )
+    events: list[dict[str, Any]] = []
+    for payload in runtime_payloads:
+        if not isinstance(payload, Mapping):
+            raise TypeError("RelayKV dry-run runtime payloads must be mappings")
+        request_id = _event_value(payload, "request_id")
+        layer_id = _event_layer_value(payload)
+        if request_id is None or layer_id is None:
+            raise ValueError("RelayKV dry-run payload requires request_id and layer_id")
+
+        block_metadata = block_metadata_by_request.get(str(request_id), {})
+        if not isinstance(block_metadata, Mapping):
+            raise TypeError("RelayKV dry-run block metadata must be mappings")
+        anchor_block_ids = _policy_dry_run_block_ids(
+            block_metadata, "anchor_block_ids"
+        )
+        recent_block_ids = _policy_dry_run_block_ids(
+            block_metadata, "recent_block_ids"
+        )
+        candidate_block_ids = _policy_dry_run_block_ids(
+            block_metadata, "candidate_block_ids"
+        )
+        selected_block_ids = candidate_block_ids[:retrieval_top_k]
+        kv_classes_present: list[str] = []
+        if recent_block_ids:
+            kv_classes_present.append("RECENT")
+        if anchor_block_ids:
+            kv_classes_present.append("ANCHOR")
+        if selected_block_ids:
+            kv_classes_present.append("RETRIEVED")
+        if len(candidate_block_ids) > len(selected_block_ids):
+            kv_classes_present.append("COLD_CANDIDATE")
+
+        events.append(
+            {
+                "event_type": "relaykv_policy_dry_run",
+                "request_id": str(request_id),
+                "req_pool_idx": _event_req_pool_idx_value(payload),
+                "seq_len": _event_value(payload, "seq_len"),
+                "layer_id": layer_id,
+                "policy_state": "dry_run",
+                "kv_budget_tokens": kv_budget_tokens,
+                "recent_tokens": recent_tokens,
+                "anchor_tokens": anchor_tokens,
+                "transient_tokens": transient_tokens,
+                "retrieval_budget_tokens": retrieval_budget_tokens,
+                "candidate_block_ids": candidate_block_ids,
+                "selected_block_ids": selected_block_ids,
+                "anchor_block_ids": anchor_block_ids,
+                "recent_block_ids": recent_block_ids,
+                "kv_classes_present": kv_classes_present,
+                "layer_budget_policy": layer_budget_policy,
+                "retrieval_top_k": retrieval_top_k,
+                "source": "readonly_metadata_policy_dry_run",
+                "source_mutated": False,
+                "attention_override": False,
+                "kv_cache_mutation": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+            }
+        )
+    return events
+
+
+def summarize_relaykv_policy_dry_run_events_for_smoke(
+    events: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize smoke-only RelayKV policy dry-run events."""
+
+    if not isinstance(events, (list, tuple)):
+        raise TypeError("RelayKV dry-run events must be a list or tuple")
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    kv_class_counts: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "source_mutated_true_count": 0,
+            "attention_override_true_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+        }
+    )
+    event_type_counts: Counter[str] = Counter()
+
+    for event in events:
+        if not isinstance(event, Mapping):
+            raise TypeError("RelayKV dry-run event must be a mapping")
+        event_type_counts[str(_event_value(event, "event_type"))] += 1
+        per_request[str(_event_value(event, "request_id"))] += 1
+        per_layer[str(_event_layer_value(event))] += 1
+        kv_classes_present = _event_value(event, "kv_classes_present")
+        if isinstance(kv_classes_present, (list, tuple)):
+            for kv_class in kv_classes_present:
+                kv_class_counts[str(kv_class)] += 1
+        _increment_join_safety_counts(safety_counts, event)
+
+    return {
+        "total_events": len(events),
+        "event_type_counts": dict(sorted(event_type_counts.items())),
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "kv_class_counts": dict(sorted(kv_class_counts.items())),
+        **dict(safety_counts),
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
