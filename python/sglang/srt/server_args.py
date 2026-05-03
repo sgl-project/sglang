@@ -1782,10 +1782,9 @@ class ServerArgs:
                             )
 
                     if is_hip():
-                        self.page_size = 64
+                        self.page_size = 1
                         logger.warning(
-                            "Setting page size to 64 for DeepSeek DSA on torch implementation.\n"
-                            "Need to be changed based on ROCm implementation.\n"
+                            "Setting page size to 1 for DeepSeek DSA on ROCm."
                         )
                     else:
                         # For CUDA GPU
