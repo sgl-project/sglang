@@ -5,6 +5,7 @@ import re
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -258,6 +259,31 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 invoke_content = invoke_match.group(2)
                 # group(3) is either "</｜DSML｜invoke>" (complete) or "" (incomplete, matched with $)
                 is_tool_end = bool(invoke_match.group(3))
+
+                # Build tool indices lazily so we can validate function names.
+                if not hasattr(self, "_tool_indices"):
+                    self._tool_indices = self._get_tool_indices(tools)
+
+                # Validate the function name against the request's tools list.
+                # If the model emitted an undefined function, mirror the base
+                # class's behavior: by default skip the invoke (with a warning),
+                # or forward it as-is when SGLANG_FORWARD_UNKNOWN_TOOLS is set
+                # so the client can surface a recoverable error to the model.
+                if func_name not in self._tool_indices:
+                    if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
+                        logger.warning(
+                            f"Model attempted to call undefined function: {func_name}"
+                        )
+                        if is_tool_end:
+                            # Drop the completed invoke and keep parsing
+                            # whatever comes after it.
+                            self._buffer = current_text[invoke_match.end() :]
+                            current_text = self._buffer
+                            self.current_tool_name_sent = False
+                            continue
+                        # Invoke is still partial; wait for more bytes before
+                        # we can safely advance the buffer past it.
+                        break
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:

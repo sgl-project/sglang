@@ -4,6 +4,7 @@ import re
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -122,6 +123,29 @@ class DeepSeekV31Detector(BaseFormatDetector):
                 func_name = partial_match.group(1).strip()
                 func_args_raw = partial_match.group(2).strip()
                 is_tool_end = partial_match.group(3)
+
+                # Validate the function name against the request's tools list.
+                # If the model emitted an undefined function, mirror the base
+                # class's behavior: by default skip the invoke (with a warning),
+                # or forward it as-is when SGLANG_FORWARD_UNKNOWN_TOOLS is set
+                # so the client can surface a recoverable error to the model.
+                if (
+                    not self.current_tool_name_sent
+                    and func_name not in self._tool_indices
+                    and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                ):
+                    logger.warning(
+                        f"Model attempted to call undefined function: {func_name}"
+                    )
+                    if is_tool_end:
+                        # Drop the completed invoke and keep any trailing
+                        # content (potentially the start of a valid invoke).
+                        self._buffer = current_text[partial_match.end(3) :]
+                    else:
+                        # Invoke is still partial; discard the buffer to
+                        # avoid getting stuck re-matching the same name.
+                        self._buffer = ""
+                    return StreamingParseResult(normal_text="", calls=calls)
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:

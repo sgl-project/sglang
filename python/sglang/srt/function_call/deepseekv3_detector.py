@@ -4,6 +4,7 @@ import re
 from typing import List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import (
     StreamingParseResult,
@@ -119,6 +120,32 @@ class DeepSeekV3Detector(BaseFormatDetector):
             if partial_match:
                 func_name = partial_match.group(2).strip()
                 func_args_raw = partial_match.group(3).strip()
+
+                # Validate the function name against the request's tools list.
+                # If the model emitted an undefined function, mirror the base
+                # class's behavior: by default skip the invoke (with a warning),
+                # or forward it as-is when SGLANG_FORWARD_UNKNOWN_TOOLS is set
+                # so the client can surface a recoverable error to the model.
+                if (
+                    not self.current_tool_name_sent
+                    and func_name not in self._tool_indices
+                    and not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get()
+                ):
+                    logger.warning(
+                        f"Model attempted to call undefined function: {func_name}"
+                    )
+                    # Drop the buffered invoke; if the closing token is
+                    # already present, advance past it so any trailing
+                    # valid invoke has a chance to parse on the next chunk.
+                    tool_call_end_pattern = (
+                        r"<｜tool▁call▁begin｜>.*?<｜tool▁call▁end｜>"
+                    )
+                    match = re.search(tool_call_end_pattern, current_text, re.DOTALL)
+                    if match:
+                        self._buffer = current_text[match.end() :]
+                    else:
+                        self._buffer = ""
+                    return StreamingParseResult(normal_text="", calls=calls)
 
                 # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:

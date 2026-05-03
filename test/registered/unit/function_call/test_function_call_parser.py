@@ -2,6 +2,7 @@ import json
 import unittest
 
 from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
 from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
@@ -1254,6 +1255,74 @@ class TestDeepSeekV3Detector(unittest.TestCase):
         self.assertEqual(params1["city"], "Shanghai")
         self.assertEqual(params2["city"], "Beijing")
 
+    def test_parse_streaming_unknown_function_skipped_by_default(self):
+        """Streaming: undefined function name is skipped by default and does not leak as a tool call."""
+        chunks = [
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>function",
+            "<｜tool▁sep｜>undefined_func\n",
+            "```json\n",
+            '{"city": "Shanghai"}\n```',
+            "<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        ]
+
+        all_calls = []
+        for chunk in chunks:
+            r = self.detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(r.calls)
+
+        self.assertEqual(all_calls, [], "Unknown function should be skipped by default")
+
+    def test_parse_streaming_unknown_function_forwarded_with_env(self):
+        """Streaming: SGLANG_FORWARD_UNKNOWN_TOOLS=1 forwards undefined functions to the client."""
+        chunks = [
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>function",
+            "<｜tool▁sep｜>undefined_func\n",
+            "```json\n",
+            '{"city": "Shanghai"}\n```',
+            "<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        ]
+
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            self.detector = DeepSeekV3Detector()
+            all_calls = []
+            for chunk in chunks:
+                r = self.detector.parse_streaming_increment(chunk, self.tools)
+                all_calls.extend(r.calls)
+
+        names = [c.name for c in all_calls if c.name]
+        self.assertEqual(
+            names, ["undefined_func"], "Unknown function should be forwarded as-is"
+        )
+
+    def test_parse_streaming_unknown_then_known(self):
+        """Streaming: an unknown invoke is dropped, a following known invoke still parses."""
+        chunks = [
+            "<｜tool▁calls▁begin｜>",
+            "<｜tool▁call▁begin｜>function",
+            "<｜tool▁sep｜>undefined_func\n",
+            "```json\n",
+            '{"x": 1}\n```',
+            "<｜tool▁call▁end｜>",
+            "\n<｜tool▁call▁begin｜>function<｜tool▁sep｜>",
+            "get_weather\n```json\n",
+            '{"city": "Beijing"}\n',
+            "```<｜tool▁call▁end｜><｜tool▁calls▁end｜>",
+        ]
+
+        all_calls = []
+        for chunk in chunks:
+            r = self.detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(r.calls)
+
+        names = [c.name for c in all_calls if c.name]
+        self.assertEqual(
+            names,
+            ["get_weather"],
+            "Unknown invoke should be dropped while the following known invoke still parses",
+        )
+
 
 class TestDeepSeekV32Detector(unittest.TestCase):
     def setUp(self):
@@ -1631,6 +1700,86 @@ class TestDeepSeekV32Detector(unittest.TestCase):
         self.assertEqual(tool_calls_by_index[0]["name"], "get_date")
         params = json.loads(tool_calls_by_index[0]["parameters"])
         self.assertEqual(params, {})
+
+    def test_parse_streaming_unknown_function_skipped_by_default(self):
+        """Streaming: undefined function name is skipped by default and does not leak as a tool call."""
+        text = (
+            "<｜DSML｜function_calls>\n"
+            '<｜DSML｜invoke name="undefined_func">\n'
+            '<｜DSML｜parameter name="city" string="true">Shanghai</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜function_calls>"
+        )
+
+        # Feed in 1-char chunks to exercise the streaming path.
+        all_calls = []
+        for ch in text:
+            r = self.detector.parse_streaming_increment(ch, self.tools)
+            all_calls.extend(r.calls)
+
+        self.assertEqual(all_calls, [], "Unknown function should be skipped by default")
+
+    def test_parse_streaming_unknown_function_forwarded_with_env(self):
+        """Streaming: SGLANG_FORWARD_UNKNOWN_TOOLS=1 forwards undefined functions to the client."""
+        text = (
+            "<｜DSML｜function_calls>\n"
+            '<｜DSML｜invoke name="undefined_func">\n'
+            '<｜DSML｜parameter name="city" string="true">Shanghai</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜function_calls>"
+        )
+
+        with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+            self.detector = DeepSeekV32Detector()
+            all_calls = []
+            for ch in text:
+                r = self.detector.parse_streaming_increment(ch, self.tools)
+                all_calls.extend(r.calls)
+
+        names = [c.name for c in all_calls if c.name]
+        self.assertEqual(
+            names, ["undefined_func"], "Unknown function should be forwarded as-is"
+        )
+
+    def test_parse_streaming_unknown_then_known(self):
+        """Streaming: an unknown invoke is dropped, a following known invoke still parses."""
+        text = (
+            "<｜DSML｜function_calls>\n"
+            '<｜DSML｜invoke name="undefined_func">\n'
+            '<｜DSML｜parameter name="city" string="true">Shanghai</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            '<｜DSML｜invoke name="search">\n'
+            '<｜DSML｜parameter name="query" string="true">food</｜DSML｜parameter>\n'
+            "</｜DSML｜invoke>\n"
+            "</｜DSML｜function_calls>"
+        )
+
+        all_calls = []
+        for ch in text:
+            r = self.detector.parse_streaming_increment(ch, self.tools)
+            all_calls.extend(r.calls)
+
+        names = [c.name for c in all_calls if c.name]
+        self.assertEqual(
+            names,
+            ["search"],
+            "Unknown invoke should be dropped while the following known invoke still parses",
+        )
+        # Reassemble streamed args for the surviving call to ensure correctness.
+        params_by_index = {}
+        for c in all_calls:
+            if c.tool_index is None:
+                continue
+            params_by_index.setdefault(c.tool_index, "")
+            if c.parameters:
+                params_by_index[c.tool_index] += c.parameters
+        # Exactly one tool slot was used and its arguments are valid JSON.
+        self.assertEqual(len(params_by_index), 1)
+        only_index = next(iter(params_by_index))
+        self.assertEqual(
+            json.loads(params_by_index[only_index]),
+            {"query": "food"},
+        )
 
 
 class TestQwen3CoderDetector(unittest.TestCase):
