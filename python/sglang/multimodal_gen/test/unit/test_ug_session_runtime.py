@@ -65,7 +65,7 @@ class TestUGSessionRuntime(unittest.TestCase):
         )
 
         self.assertEqual(runtime.get_state(handle), UGSegmentState.U_DECODE)
-        with self.assertRaisesRegex(ValueError, "Cannot enter G_DENOISE"):
+        with self.assertRaisesRegex(ValueError, "Cannot predict UG velocity"):
             runtime.predict_velocity(
                 UGVelocityRequest(
                     session=handle,
