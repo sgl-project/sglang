@@ -71,6 +71,27 @@ Before writing CLI examples, re-read the active branch's `docs/diffusion/quantiz
 
 B200 CI coverage can include loose BF16-vs-quantized quality checks. Inspect the active branch's `run_suite.py` before assuming they are part of the suite; mainline and feature branches may differ. Those checks are intended to catch blank, corrupted, or obviously divergent images, not exact image parity.
 
+Mainline documentation now uses `lmsys/*` for the five converted ModelOpt
+checkpoint repos; the FLUX.2 NVFP4 raw export remains
+`black-forest-labs/FLUX.2-dev-NVFP4`. Do not use older `BBuf/*` examples unless
+you are explicitly testing a historical branch.
+
+## Open PR Watchlist
+
+As of 2026-05-02, these related SGLang PRs were open. Treat them as future
+support or migration work until they merge and the docs/CI matrix is updated.
+
+- #23155 adds Qwen Image ModelOpt FP8 support.
+- #23199 adds HunyuanVideo ModelOpt FP8 support.
+- #23373 adds a runtime quantization flag; keep PTQ/export workflows separate from runtime quant examples until the CLI behavior is merged.
+- #24024 adds transformer FP8-cast compatibility mode.
+- #24186 re-enables B200 multimodal CI with NVFP4 fixes for FLUX.2 and Wan2.2.
+
+Do not expand the validated matrix beyond FLUX.1, FLUX.2, and Wan2.2 solely
+because one of these PRs exists. Add a row only after the exact checkpoint,
+loader path, accuracy check, and benchmark scope are validated on the active
+branch.
+
 ## Documentation Maintenance
 
 - Keep the validated ModelOpt support matrix in `docs/diffusion/quantization.md`.
