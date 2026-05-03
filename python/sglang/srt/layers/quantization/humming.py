@@ -213,7 +213,7 @@ class HummingConfig(QuantizationConfig):
     def is_layer_skipped(self, config: dict[str, Any], prefix: str):
         keys = ["ignored_layers", "ignore", "modules_to_not_convert"]
         ignored_layers = self.get_from_keys_or(config, keys, []) or []
-        if hasattr(self, "hf_to_vllm_mapper"):
+        if hasattr(self, "hf_to_sglang_mapper"):
             ignored_layers = self.hf_to_sglang_mapper.apply_list(ignored_layers)
 
         if any(module_name in prefix for module_name in ignored_layers):
