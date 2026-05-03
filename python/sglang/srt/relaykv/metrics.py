@@ -2155,6 +2155,189 @@ def summarize_relaykv_host_backup_copy_requests_for_smoke(
     }
 
 
+def build_relaykv_host_backup_copy_boundary_results_for_smoke(
+    host_backup_copy_requests: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    execute_copy: bool = False,
+) -> list[dict[str, Any]]:
+    """Build host backup copy boundary result payloads without copying KV."""
+
+    if not isinstance(host_backup_copy_requests, (list, tuple)):
+        raise TypeError("host_backup_copy_requests must be a list or tuple")
+    if not isinstance(execute_copy, bool):
+        raise TypeError("execute_copy must be a bool")
+
+    results: list[dict[str, Any]] = []
+    for request in host_backup_copy_requests:
+        if not isinstance(request, Mapping):
+            raise TypeError(
+                "RelayKV host backup copy boundary result inputs must be mappings"
+            )
+
+        selected_block_ids = _host_backup_copy_request_block_ids(
+            request, "selected_block_ids"
+        )
+        materialized_block_ids = _host_backup_copy_request_block_ids(
+            request, "materialized_block_ids"
+        )
+        retrieved_block_ids = _host_backup_copy_request_block_ids(
+            request, "retrieved_block_ids"
+        )
+        candidate_block_ids = _host_backup_copy_request_block_ids(
+            request, "candidate_block_ids"
+        )
+        anchor_block_ids = _host_backup_copy_request_block_ids(
+            request, "anchor_block_ids"
+        )
+        recent_block_ids = _host_backup_copy_request_block_ids(
+            request, "recent_block_ids"
+        )
+
+        blocking_reasons: list[str] = []
+        warning_reasons: list[str] = []
+        if execute_copy:
+            blocking_reasons.append("execute_copy_not_allowed_in_smoke")
+        else:
+            warning_reasons.append("execute_copy_false_boundary_noop")
+        if _event_value(request, "event_type") != "relaykv_host_backup_copy_request":
+            blocking_reasons.append("not_host_backup_copy_request")
+        if _event_value(request, "copy_state") != "request_ready":
+            blocking_reasons.append("copy_request_not_ready")
+        if not materialized_block_ids:
+            blocking_reasons.append("no_materialized_blocks")
+
+        copy_state = "blocked" if blocking_reasons else "boundary_noop"
+        materialized_kv_count = _event_value(request, "materialized_kv_count")
+        materialized_token_count = _event_value(request, "materialized_token_count")
+
+        results.append(
+            {
+                "event_type": "relaykv_host_backup_copy_boundary_result",
+                "materialization_state": (
+                    "blocked"
+                    if blocking_reasons
+                    else "host_backup_copy_boundary_noop"
+                ),
+                "materialization_mode": "host_backup_copy_boundary",
+                "copy_state": copy_state,
+                "copy_mode": _event_value(request, "copy_mode"),
+                "request_id": _event_value(request, "request_id"),
+                "req_pool_idx": _event_req_pool_idx_value(request),
+                "seq_len": _event_value(request, "seq_len"),
+                "layer_id": _event_layer_value(request),
+                "selected_block_ids": selected_block_ids,
+                "materialized_block_ids": materialized_block_ids,
+                "retrieved_block_ids": retrieved_block_ids,
+                "candidate_block_ids": candidate_block_ids,
+                "anchor_block_ids": anchor_block_ids,
+                "recent_block_ids": recent_block_ids,
+                "materialized_kv_count": (
+                    materialized_kv_count if isinstance(materialized_kv_count, int) else 0
+                ),
+                "materialized_token_count": (
+                    materialized_token_count
+                    if isinstance(materialized_token_count, int)
+                    else 0
+                ),
+                "source": "host_backup_copy_request_to_boundary_result",
+                "blocking_reasons": blocking_reasons,
+                "warning_reasons": warning_reasons,
+                "source_mutated": False,
+                "attention_override": False,
+                "kv_cache_mutation": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "host_backup_copy_executed": False,
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+            }
+        )
+    return results
+
+
+def summarize_relaykv_host_backup_copy_boundary_results_for_smoke(
+    results: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize host backup copy boundary result payloads."""
+
+    if not isinstance(results, (list, tuple)):
+        raise TypeError(
+            "RelayKV host backup copy boundary results must be a list or tuple"
+        )
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_copy_state: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "source_mutated_true_count": 0,
+            "attention_override_true_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "host_backup_copy_executed_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+        }
+    )
+    materialized_kv_count = 0
+    materialized_token_count = 0
+    boundary_noop_count = 0
+    blocked_count = 0
+    error_count = 0
+
+    for result in results:
+        if not isinstance(result, Mapping):
+            raise TypeError("RelayKV host backup copy boundary result must be a mapping")
+        copy_state = str(_event_value(result, "copy_state") or "unknown")
+        per_copy_state[copy_state] += 1
+        per_request[str(_event_value(result, "request_id"))] += 1
+        per_layer[str(_event_layer_value(result))] += 1
+        if copy_state == "boundary_noop":
+            boundary_noop_count += 1
+        elif copy_state == "blocked":
+            blocked_count += 1
+        elif copy_state == "error":
+            error_count += 1
+
+        kv_count = _event_value(result, "materialized_kv_count")
+        if isinstance(kv_count, int):
+            materialized_kv_count += kv_count
+        token_count = _event_value(result, "materialized_token_count")
+        if isinstance(token_count, int):
+            materialized_token_count += token_count
+
+        if _event_value(result, "source_mutated") is True:
+            safety_counts["source_mutated_true_count"] += 1
+        if _event_value(result, "attention_override") is True:
+            safety_counts["attention_override_true_count"] += 1
+        if _event_value(result, "kv_cache_mutation") is True:
+            safety_counts["kv_cache_mutation_true_count"] += 1
+        if _event_value(result, "runtime_writeback") is True:
+            safety_counts["runtime_writeback_true_count"] += 1
+        if _event_value(result, "scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+        if _event_value(result, "host_backup_copy_executed") is True:
+            safety_counts["host_backup_copy_executed_count"] += 1
+        if _event_value(result, "kv_pool_read") is True:
+            safety_counts["kv_pool_read_count"] += 1
+        if _event_value(result, "kv_snapshot") is True:
+            safety_counts["kv_snapshot_count"] += 1
+
+    return {
+        "summary_type": "relaykv_host_backup_copy_boundary_result_summary",
+        "total_boundary_results": len(results),
+        "boundary_noop_count": boundary_noop_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_copy_state_counts": dict(sorted(per_copy_state.items())),
+        "materialized_kv_count": materialized_kv_count,
+        "materialized_token_count": materialized_token_count,
+        **dict(safety_counts),
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
