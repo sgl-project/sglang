@@ -58,6 +58,17 @@ def _join_summary(*, join_granularity: str = "per_event") -> dict[str, Any]:
     }
 
 
+def _policy_dry_run_summary() -> dict[str, Any]:
+    return {
+        "total_events": 3,
+        "source_mutated_true_count": 0,
+        "attention_override_true_count": 0,
+        "kv_cache_mutation_true_count": 0,
+        "runtime_writeback_true_count": 0,
+        "scheduler_policy_noop_false_count": 0,
+    }
+
+
 def _assert_safety_zero(report: dict[str, Any]) -> None:
     for key in (
         "source_mutated_true_count",
@@ -112,6 +123,66 @@ def _assert_pass_report() -> dict[str, Any]:
         raise AssertionError(report)
     if report["report_warning_counts"]["missing_field_warning_count"] != 0:
         raise AssertionError(report)
+    if report["policy_dry_run_included"] is not False:
+        raise AssertionError(report)
+    if report["policy_dry_run_summary"] is not None:
+        raise AssertionError(report)
+    return report
+
+
+def _assert_policy_dry_run_report() -> dict[str, Any]:
+    runtime_summary = _runtime_summary()
+    candidate_summary = _host_backup_candidate_summary()
+    join_summary = _join_summary()
+    policy_summary = _policy_dry_run_summary()
+    policy_before = copy.deepcopy(policy_summary)
+    report = build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
+        runtime_summary,
+        candidate_summary,
+        join_summary,
+        policy_dry_run_summary=policy_summary,
+    )
+    if policy_summary != policy_before:
+        raise AssertionError("policy dry-run summary was mutated")
+    if report["policy_dry_run_included"] is not True:
+        raise AssertionError(report)
+    if report["policy_dry_run_summary"] != policy_summary:
+        raise AssertionError(report)
+    if report["policy_dry_run_total_events"] != 3:
+        raise AssertionError(report)
+    if report["policy_dry_run_selected_event_count"] != 0:
+        raise AssertionError(report)
+    if report["overall_safety_status"] != "pass":
+        raise AssertionError(report)
+    for key in (
+        "source_mutated_true_count",
+        "attention_override_true_count",
+        "kv_cache_mutation_true_count",
+        "runtime_writeback_true_count",
+        "scheduler_policy_noop_false_count",
+    ):
+        if report[key] != 0:
+            raise AssertionError(report)
+    return report
+
+
+def _assert_policy_dry_run_fail_report() -> dict[str, Any]:
+    policy_summary = _policy_dry_run_summary()
+    policy_summary["kv_cache_mutation_true_count"] = 1
+    report = build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
+        _runtime_summary(),
+        _host_backup_candidate_summary(),
+        _join_summary(),
+        policy_dry_run_summary=policy_summary,
+    )
+    if report["policy_dry_run_included"] is not True:
+        raise AssertionError(report)
+    if report["policy_dry_run_total_events"] != 3:
+        raise AssertionError(report)
+    if report["overall_safety_status"] != "fail":
+        raise AssertionError(report)
+    if report["kv_cache_mutation_true_count"] != 1:
+        raise AssertionError(report)
     return report
 
 
@@ -164,6 +235,8 @@ def _assert_missing_fields_report() -> dict[str, Any]:
 def main() -> None:
     result = {
         "pass_report": _assert_pass_report(),
+        "policy_dry_run_report": _assert_policy_dry_run_report(),
+        "policy_dry_run_fail_report": _assert_policy_dry_run_fail_report(),
         "fail_report": _assert_fail_report(),
         "summary_only_unjoinable_report": _assert_summary_only_unjoinable_report(),
         "missing_fields_report": _assert_missing_fields_report(),

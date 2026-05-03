@@ -535,6 +535,7 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
     runtime_observation_summary: Mapping[str, Any],
     host_backup_candidate_summary: Mapping[str, Any],
     join_summary: Mapping[str, Any],
+    policy_dry_run_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a read-only runtime/candidate/join report for smoke tests.
 
@@ -549,6 +550,10 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
         raise TypeError("host_backup_candidate_summary must be a mapping")
     if not isinstance(join_summary, Mapping):
         raise TypeError("join_summary must be a mapping")
+    if policy_dry_run_summary is not None and not isinstance(
+        policy_dry_run_summary, Mapping
+    ):
+        raise TypeError("policy_dry_run_summary must be a mapping or None")
 
     missing_field_counts: Counter[str] = Counter({"missing_field_count": 0})
     total_runtime_payloads = _readonly_report_value(
@@ -592,9 +597,23 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
             runtime_observation_summary,
             host_backup_candidate_summary,
             join_summary,
+            policy_dry_run_summary or {},
         )
         for key in _REPORT_SAFETY_COUNTER_KEYS
     }
+    policy_dry_run_included = policy_dry_run_summary is not None
+    policy_dry_run_total_events = 0
+    policy_dry_run_selected_event_count = 0
+    if policy_dry_run_summary is not None:
+        policy_dry_run_total_events = _readonly_report_value(
+            missing_field_counts,
+            (policy_dry_run_summary, ("total_events", "policy_dry_run_total_events")),
+        )
+        for key in ("selected_event_count", "policy_dry_run_selected_event_count"):
+            value = policy_dry_run_summary.get(key)
+            if isinstance(value, int):
+                policy_dry_run_selected_event_count = value
+                break
     report_generated_from_readonly_inputs = True
     overall_safety_status = (
         "pass"
@@ -612,6 +631,12 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
         "runtime_observation_summary": dict(runtime_observation_summary),
         "host_backup_candidate_summary": dict(host_backup_candidate_summary),
         "join_summary": dict(join_summary),
+        "policy_dry_run_summary": (
+            dict(policy_dry_run_summary) if policy_dry_run_summary is not None else None
+        ),
+        "policy_dry_run_included": policy_dry_run_included,
+        "policy_dry_run_total_events": policy_dry_run_total_events,
+        "policy_dry_run_selected_event_count": policy_dry_run_selected_event_count,
         "overall_safety_status": overall_safety_status,
         "total_runtime_payloads": total_runtime_payloads,
         "total_host_backup_candidate_events": total_host_backup_candidate_events,
