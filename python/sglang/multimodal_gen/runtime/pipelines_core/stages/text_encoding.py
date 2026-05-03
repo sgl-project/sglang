@@ -129,7 +129,6 @@ class TextEncodingStage(PipelineStage):
                 server_args.pipeline_class_name,
                 tuple(all_indices),
                 batch.negative_prompt,
-                batch.max_sequence_length,
             )
             use_negative_cache = not batch.is_warmup
             cached_negative = None
@@ -148,13 +147,13 @@ class TextEncodingStage(PipelineStage):
                         return_attention_mask=True,
                     )
                 )
-                # CFG uses the negative prompt as the unconditional text input.
-                # Many real requests reuse the same model default negative
-                # prompt. For the same pipeline, text encoders, negative-prompt
-                # text, and max length, text encoding is deterministic, so one
-                # cached result is numerically identical to re-encoding it.
-                # Warmup does not read or write this cache: warmup is synthetic,
-                # and should not precompute data for a future real request.
+                # Classifier-free guidance encodes both the user prompt and a
+                # negative prompt. The negative prompt is often one long model
+                # default reused by many requests. For a fixed pipeline, encoder
+                # set, and text, the encoder output is deterministic, so reusing
+                # this one-entry cache is equivalent to encoding the same text
+                # again. Warmup requests are synthetic, so they do not read from
+                # or populate the cache for later real requests.
                 if use_negative_cache:
                     self._negative_text_cache_key = negative_cache_key
                     self._negative_text_cache_value = (
