@@ -1038,12 +1038,17 @@ class NixlKVSender(CommonKVSender):
         self.xfer_handles = []
         self.has_sent = False
         self.chunk_id = 0
+        self._send_failed = False
+        self._send_error: Optional[Exception] = None
 
     def send(
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List[int]] = None,
     ):
+        if self._send_failed:
+            return
+
         index_slice = slice(self.curr_idx, self.curr_idx + len(kv_indices))
         self.curr_idx += len(kv_indices)
         is_last = self.curr_idx == self.num_kv_indices
@@ -1062,15 +1067,24 @@ class NixlKVSender(CommonKVSender):
                 self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Success)
                 return
 
-        new_xfer_handles = self.kv_mgr.add_transfer_request(
-            self.bootstrap_room,
-            kv_indices,
-            index_slice,
-            is_last,
-            self.chunk_id,
-            self.aux_index,
-            state_indices,
-        )
+        try:
+            new_xfer_handles = self.kv_mgr.add_transfer_request(
+                self.bootstrap_room,
+                kv_indices,
+                index_slice,
+                is_last,
+                self.chunk_id,
+                self.aux_index,
+                state_indices,
+            )
+        except Exception as e:
+            logger.warning(
+                f"KVSender transfer request failed for room {self.bootstrap_room}: {e}"
+            )
+            self._send_failed = True
+            self._send_error = e
+            return
+
         self.xfer_handles.extend(new_xfer_handles)
         self.chunk_id += 1
         if is_last:
@@ -1078,16 +1092,26 @@ class NixlKVSender(CommonKVSender):
             del self.kv_mgr.request_status[self.bootstrap_room]
 
     def poll(self) -> KVPoll:
+        if self._send_failed:
+            return KVPoll.Failed  # type: ignore
         if not self.has_sent:
             return self.kv_mgr.check_status(self.bootstrap_room)
-        states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
-        if all([x == "DONE" for x in states]):
+        try:
+            states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
+        except Exception as e:
+            logger.warning(
+                f"KVSender check_xfer_state failed for room {self.bootstrap_room}: {e}"
+            )
+            return KVPoll.Failed  # type: ignore
+        if all(x == "DONE" for x in states):
             return KVPoll.Success  # type: ignore
-        if any([x == "ERR" for x in states]):
-            raise Exception("KVSender transfer encountered an error.")
+        if any(x == "ERR" for x in states):
+            return KVPoll.Failed  # type: ignore
         return KVPoll.WaitingForInput  # type: ignore
 
     def failure_exception(self):
+        if self._send_error is not None:
+            raise self._send_error
         raise RuntimeError("NIXL KVSender Exception")
 
 
