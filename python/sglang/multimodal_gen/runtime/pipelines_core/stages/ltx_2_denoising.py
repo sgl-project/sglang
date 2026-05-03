@@ -391,6 +391,8 @@ class LTX2DenoisingStage(DenoisingStage):
         sigma_next: torch.Tensor,
         model_video_velocity: torch.Tensor,
         model_audio_velocity: torch.Tensor,
+        model_video_timestep: torch.Tensor | None,
+        model_audio_timestep: torch.Tensor | None,
         midpoint_model_call,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """res2s RK2 step for unguided stage-2 refinement (HQ pipeline).
@@ -407,10 +409,24 @@ class LTX2DenoisingStage(DenoisingStage):
             denoised_video = ctx.latents.float()
             denoised_audio = ctx.audio_latents.float()
         else:
-            denoised_video = ctx.latents.float() - sigma * model_video_velocity.float()
-            denoised_audio = (
-                ctx.audio_latents.float() - sigma * model_audio_velocity.float()
+            video_sigma_for_x0 = (
+                model_video_timestep
+                if ctx.use_ltx23_hq_timestep_semantics
+                and model_video_timestep is not None
+                else sigma
             )
+            audio_sigma_for_x0 = (
+                model_audio_timestep
+                if ctx.use_ltx23_hq_timestep_semantics
+                and model_audio_timestep is not None
+                else sigma
+            )
+            denoised_video = self._ltx2_velocity_to_x0(
+                ctx.latents, model_video_velocity, video_sigma_for_x0
+            ).float()
+            denoised_audio = self._ltx2_velocity_to_x0(
+                ctx.audio_latents, model_audio_velocity, audio_sigma_for_x0
+            ).float()
 
         if sigma_val == 0.0 or sigma_next_val == 0.0:
             next_video = denoised_video.to(dtype=ctx.latents.dtype)
@@ -477,12 +493,28 @@ class LTX2DenoisingStage(DenoisingStage):
                 anchor_audio = x_mid_a - h * a21 * eps1_audio
                 eps1_audio = denoised_audio.double() - anchor_audio
 
-        mid_v, mid_a = midpoint_model_call(
+        mid_v, mid_a, mid_video_timestep, mid_audio_timestep = midpoint_model_call(
             midpoint_video_latents, midpoint_audio_latents, sub_sigma
         )
 
-        midpoint_denoised_video = midpoint_video_latents.float() - sub_sigma * mid_v
-        midpoint_denoised_audio = midpoint_audio_latents.float() - sub_sigma * mid_a
+        mid_video_sigma_for_x0 = (
+            mid_video_timestep
+            if ctx.use_ltx23_hq_timestep_semantics
+            and mid_video_timestep is not None
+            else sub_sigma
+        )
+        mid_audio_sigma_for_x0 = (
+            mid_audio_timestep
+            if ctx.use_ltx23_hq_timestep_semantics
+            and mid_audio_timestep is not None
+            else sub_sigma
+        )
+        midpoint_denoised_video = self._ltx2_velocity_to_x0(
+            midpoint_video_latents, mid_v, mid_video_sigma_for_x0
+        ).float()
+        midpoint_denoised_audio = self._ltx2_velocity_to_x0(
+            midpoint_audio_latents, mid_a, mid_audio_sigma_for_x0
+        ).float()
 
         eps2_video = midpoint_denoised_video.double() - anchor_video
         eps2_audio = midpoint_denoised_audio.double() - anchor_audio
@@ -1345,7 +1377,12 @@ class LTX2DenoisingStage(DenoisingStage):
                     video_latents: torch.Tensor,
                     audio_latents: torch.Tensor,
                     sigma_value: torch.Tensor,
-                ) -> tuple[torch.Tensor, torch.Tensor]:
+                ) -> tuple[
+                    torch.Tensor,
+                    torch.Tensor,
+                    torch.Tensor | None,
+                    torch.Tensor | None,
+                ]:
                     original_video_latents = ctx.latents
                     original_audio_latents = ctx.audio_latents
                     ctx.latents = video_latents
@@ -1419,7 +1456,12 @@ class LTX2DenoisingStage(DenoisingStage):
                             mid_a_u, mid_a_t = mid_a.chunk(2)
                             mid_v = mid_v_u + batch.guidance_scale * (mid_v_t - mid_v_u)
                             mid_a = mid_a_u + batch.guidance_scale * (mid_a_t - mid_a_u)
-                        return mid_v, mid_a
+                        return (
+                            mid_v,
+                            mid_a,
+                            model_inputs_local.timestep_video,
+                            model_inputs_local.timestep_audio,
+                        )
                     finally:
                         ctx.latents = original_video_latents
                         ctx.audio_latents = original_audio_latents
@@ -1431,6 +1473,8 @@ class LTX2DenoisingStage(DenoisingStage):
                     sigma_next=sigma_next,
                     model_video_velocity=model_video,
                     model_audio_velocity=model_audio,
+                    model_video_timestep=model_inputs.timestep_video,
+                    model_audio_timestep=model_inputs.timestep_audio,
                     midpoint_model_call=_stage2_midpoint_model_call,
                 )
             else:
@@ -1748,23 +1792,28 @@ class LTX2DenoisingStage(DenoisingStage):
                     v_mod, a_v_mod = pass_outputs.get("modality", (None, None))
 
                 sigma_value_float = float(sigma_value.item())
-                video_sigma_for_x0: float | torch.Tensor = sigma_value_float
-                if ctx.denoise_mask is not None:
+                audio_sigma_for_x0: float | torch.Tensor = sigma_value_float
+                if ctx.use_ltx23_hq_timestep_semantics:
+                    video_sigma_for_x0 = model_inputs_local.timestep_video
+                    audio_sigma_for_x0 = model_inputs_local.timestep_audio
+                elif ctx.denoise_mask is not None:
                     video_sigma_for_x0 = sigma_value.to(
                         device=video_latents.device, dtype=torch.float32
                     ) * ctx.denoise_mask.squeeze(-1)
+                else:
+                    video_sigma_for_x0 = sigma_value_float
 
                 denoised_video_local = self._ltx2_velocity_to_x0(
                     video_latents, v_pos, video_sigma_for_x0
                 )
                 denoised_audio_local = self._ltx2_velocity_to_x0(
-                    audio_latents, a_v_pos, sigma_value_float
+                    audio_latents, a_v_pos, audio_sigma_for_x0
                 )
                 denoised_video_neg = self._ltx2_velocity_to_x0(
                     video_latents, v_neg, video_sigma_for_x0
                 )
                 denoised_audio_neg = self._ltx2_velocity_to_x0(
-                    audio_latents, a_v_neg, sigma_value_float
+                    audio_latents, a_v_neg, audio_sigma_for_x0
                 )
                 denoised_video_perturbed = (
                     None
@@ -1777,7 +1826,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     None
                     if a_v_ptb is None
                     else self._ltx2_velocity_to_x0(
-                        audio_latents, a_v_ptb, sigma_value_float
+                        audio_latents, a_v_ptb, audio_sigma_for_x0
                     )
                 )
                 denoised_video_modality = (
@@ -1791,7 +1840,7 @@ class LTX2DenoisingStage(DenoisingStage):
                     None
                     if a_v_mod is None
                     else self._ltx2_velocity_to_x0(
-                        audio_latents, a_v_mod, sigma_value_float
+                        audio_latents, a_v_mod, audio_sigma_for_x0
                     )
                 )
 

@@ -193,6 +193,7 @@ class LTX2SigmaPreparationStage(PipelineStage):
                     int(batch.num_inference_steps),
                     number_of_tokens=latent_num_frames * latent_height * latent_width,
                 )
+                batch.sigmas.append(0.0011)
             else:
                 batch.sigmas = build_official_ltx2_sigmas(
                     int(batch.num_inference_steps)
@@ -931,6 +932,11 @@ class LTX2TwoStagePipeline(_BaseLTX2Pipeline):
                 # Official LTX-2.3 two-stage builds stage 2 with distilled LoRA fused
                 # into the transformer weights. Legacy LTX-2 should keep the
                 # preexisting unmerged behavior to avoid regressing stage 2 quality.
+                set_lora_kwargs["merge_weights"] = (
+                    self._should_merge_stage2_distilled_lora(self.server_args)
+                )
+            elif phase == "stage1" and self.pipeline_name == "LTX2TwoStageHQPipeline":
+                # Official HQ also builds stage 1 with distilled LoRA fused.
                 set_lora_kwargs["merge_weights"] = (
                     self._should_merge_stage2_distilled_lora(self.server_args)
                 )

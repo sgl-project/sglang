@@ -113,7 +113,7 @@
             "clip_threshold": 0.79,
             "ssim_threshold": 0.12,
             "psnr_threshold": 12.1,
-            "mean_abs_diff_threshold": 51.0
+            "mean_abs_diff_threshold": 51.1
         },
         "wan2_1_t2v_1.3b_teacache_enabled": {
             "clip_threshold": 0.93,

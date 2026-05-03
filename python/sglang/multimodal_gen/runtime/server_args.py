@@ -505,6 +505,21 @@ class ServerArgs(DisaggArgsMixin):
         if self.attention_backend is None and self.backend != Backend.DIFFUSERS:
             if (
                 current_platform.is_cuda()
+                and self.pipeline_class_name == "LTX2TwoStageHQPipeline"
+                and self.num_gpus == 1
+                and self.tp_size == 1
+                and self.sp_degree == 1
+                and self.ulysses_degree == 1
+                and self.ring_degree == 1
+                and self._is_ltx23_model_path(self.model_path)
+            ):
+                self.attention_backend = "torch_sdpa"
+                logger.info(
+                    "Automatically set attention_backend=torch_sdpa for LTX-2.3 HQ two-stage on 1 GPU to preserve precision"
+                )
+                return
+            if (
+                current_platform.is_cuda()
                 and self.pipeline_class_name is None
                 and self.num_gpus == 1
                 and self.tp_size == 1
