@@ -265,8 +265,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
             )
             compile_kwargs["mode"] = mode
-            if envs.SGLANG_TORCH_COMPILE_DYNAMIC_FALSE:
-                compile_kwargs["dynamic"] = False
             logger.info(f"Compiling transformer with mode: {mode}")
 
         if self._needs_nvfp4_jit_prewarm(module):

@@ -247,10 +247,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # If set, sgl_diffusion will enable stage logging, which will print the time
     # taken for each stage
     "SGLANG_DIFFUSION_STAGE_LOGGING": _lazy_bool("SGLANG_DIFFUSION_STAGE_LOGGING"),
-    # Force torch.compile to specialize on static input shapes.
-    "SGLANG_TORCH_COMPILE_DYNAMIC_FALSE": _lazy_bool(
-        "SGLANG_TORCH_COMPILE_DYNAMIC_FALSE"
-    ),
     "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D": _lazy_bool(
         "SGLANG_DIFFUSION_VAE_CHANNELS_LAST_3D", "false"
     ),
