@@ -116,7 +116,7 @@ Published checkpoints keep the serialized quantization config as
 `quant_method=modelopt`; the FP8 vs NVFP4 split below is a documentation label
 derived from `quant_algo`.
 
-Five of the six repos live under `BBuf/*`. The FLUX.2 NVFP4 entry keeps the
+Five of the six repos live under `lmsys/*`. The FLUX.2 NVFP4 entry keeps the
 official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -143,7 +143,7 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
       <td><code>FP8</code></td>
       <td><code>black-forest-labs/FLUX.1-dev</code></td>
       <td><code>--transformer-path</code></td>
-      <td><code>BBuf/flux1-dev-modelopt-fp8-sglang-transformer</code></td>
+      <td><code>lmsys/flux1-dev-modelopt-fp8-sglang-transformer</code></td>
       <td>single-transformer override, deterministic latent/image comparison, H100 benchmark, torch-profiler trace</td>
       <td>SGLang converter keeps a validated BF16 fallback set for modulation and FF projection layers; use <code>--model-id FLUX.1-dev</code> for local mirrors</td>
     </tr>
@@ -151,7 +151,7 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
       <td><code>FP8</code></td>
       <td><code>black-forest-labs/FLUX.2-dev</code></td>
       <td><code>--transformer-path</code></td>
-      <td><code>BBuf/flux2-dev-modelopt-fp8-sglang-transformer</code></td>
+      <td><code>lmsys/flux2-dev-modelopt-fp8-sglang-transformer</code></td>
       <td>single-transformer override load and generation path</td>
       <td>published SGLang-ready transformer override</td>
     </tr>
@@ -159,7 +159,7 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
       <td><code>FP8</code></td>
       <td><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code></td>
       <td><code>--transformer-path</code></td>
-      <td><code>BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer</code></td>
+      <td><code>lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer</code></td>
       <td>primary <code>transformer</code> quantized, <code>transformer_2</code> kept BF16</td>
       <td>primary-transformer-only path; keep <code>transformer_2</code> on the base checkpoint, and do not describe this as dual-transformer full-model FP8 unless that path is validated separately</td>
     </tr>
@@ -167,7 +167,7 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
       <td><code>NVFP4</code></td>
       <td><code>black-forest-labs/FLUX.1-dev</code></td>
       <td><code>--transformer-path</code></td>
-      <td><code>BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer</code></td>
+      <td><code>lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer</code></td>
       <td>mixed BF16+NVFP4 transformer override, correctness validation, 4x RTX 5090 benchmark, torch-profiler trace</td>
       <td>use <code>build_modelopt_nvfp4_transformer.py</code>; validated builder keeps selected FLUX.1 modules in BF16 and sets <code>swap_weight_nibbles=false</code></td>
     </tr>
@@ -183,7 +183,7 @@ official `black-forest-labs/FLUX.2-dev-NVFP4` repo.
       <td><code>NVFP4</code></td>
       <td><code>Wan-AI/Wan2.2-T2V-A14B-Diffusers</code></td>
       <td><code>--transformer-path</code></td>
-      <td><code>BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer</code></td>
+      <td><code>lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer</code></td>
       <td>primary <code>transformer</code> quantized with ModelOpt NVFP4, <code>transformer_2</code> kept BF16</td>
       <td>primary-transformer-only path; keep <code>transformer_2</code> on the base checkpoint, and current B200/Blackwell bring-up uses <code>SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn</code></td>
     </tr>
@@ -204,7 +204,7 @@ overrides. If the repo or local directory already contains `config.json`, use
 ```bash
 sglang generate \
   --model-path black-forest-labs/FLUX.2-dev \
-  --transformer-path BBuf/flux2-dev-modelopt-fp8-sglang-transformer \
+  --transformer-path lmsys/flux2-dev-modelopt-fp8-sglang-transformer \
   --prompt "A Logo With Bold Large Text: SGL Diffusion" \
   --save-output
 ```
@@ -212,7 +212,7 @@ sglang generate \
 ```bash
 sglang generate \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --transformer-path BBuf/wan22-t2v-a14b-modelopt-fp8-sglang-transformer \
+  --transformer-path lmsys/wan22-t2v-a14b-modelopt-fp8-sglang-transformer \
   --prompt "a fox walking through neon rain" \
   --save-output
 ```
@@ -247,7 +247,7 @@ For mixed ModelOpt NVFP4 transformer overrides that already contain
 ```bash
 sglang generate \
   --model-path black-forest-labs/FLUX.1-dev \
-  --transformer-path BBuf/flux1-dev-modelopt-nvfp4-sglang-transformer \
+  --transformer-path lmsys/flux1-dev-modelopt-nvfp4-sglang-transformer \
   --prompt "A Logo With Bold Large Text: SGL Diffusion" \
   --save-output
 ```
@@ -280,7 +280,7 @@ was quantized:
 SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND=cudnn \
 sglang generate \
   --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers \
-  --transformer-path BBuf/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer \
+  --transformer-path lmsys/wan22-t2v-a14b-modelopt-nvfp4-sglang-transformer \
   --prompt "a fox walking through neon rain" \
   --save-output
 ```
