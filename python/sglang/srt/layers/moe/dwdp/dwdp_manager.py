@@ -11,7 +11,6 @@ import ctypes
 import logging
 import math
 import os
-import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -41,99 +40,10 @@ class _HsaDirectCopier:
 
     def __init__(self):
         self.hsa = ctypes.CDLL("/opt/rocm/lib/libhsa-runtime64.so")
-        self.roctx = None
-        self.roctx_enabled = os.environ.get("DWDP_HSA_ROCTX", "0") == "1"
-        if self.roctx_enabled:
-            try:
-                self.roctx = ctypes.CDLL("/opt/rocm/lib/libroctx64.so")
-                self.roctx.roctxMarkA.argtypes = [ctypes.c_char_p]
-                self.roctx.roctxRangePushA.argtypes = [ctypes.c_char_p]
-                self.roctx.roctxRangePushA.restype = ctypes.c_int
-                self.roctx.roctxRangePop.argtypes = []
-                self.roctx.roctxRangePop.restype = ctypes.c_int
-            except Exception:
-                logger.exception("[DWDP] Failed to load ROCTX; markers disabled")
-                self.roctx_enabled = False
-                self.roctx = None
-
-        self.timing_enabled = os.environ.get("DWDP_HSA_TIMING", "1") != "0"
-        self.torch_profiler_enabled = (
-            os.environ.get("DWDP_HSA_TORCH_PROFILER", "0") == "1"
-        )
-        self._torch_profiler_warned = False
-        self._signal_meta: Dict[int, Tuple[int, int, int, str, Any]] = {}
-        self._timing_samples: List[Tuple[int, float, float, int, str]] = []
         self._init_symbols()
         self._check(self.hsa.hsa_init(), "hsa_init")
         self.agents = self._get_gpu_agents()
         self._preferred_cache: Dict[Tuple[int, int], int] = {}
-
-    def _roctx_mark(self, message: str):
-        if self.roctx_enabled and self.roctx is not None:
-            self.roctx.roctxMarkA(message.encode("utf-8", errors="replace"))
-
-    def _roctx_push(self, message: str):
-        if self.roctx_enabled and self.roctx is not None:
-            self.roctx.roctxRangePushA(message.encode("utf-8", errors="replace"))
-
-    def _roctx_pop(self):
-        if self.roctx_enabled and self.roctx is not None:
-            self.roctx.roctxRangePop()
-
-    def _torch_profiler_enter(self, message: str):
-        if not self.torch_profiler_enabled:
-            return None
-        try:
-            return torch.ops.profiler._record_function_enter_new(message, "")
-        except Exception:
-            if not self._torch_profiler_warned:
-                logger.exception("[DWDP] Failed to start PyTorch profiler range")
-                self._torch_profiler_warned = True
-            self.torch_profiler_enabled = False
-            return None
-
-    def _torch_profiler_exit(self, handle):
-        if handle is None:
-            return
-        try:
-            torch.ops.profiler._record_function_exit(handle)
-        except Exception:
-            if not self._torch_profiler_warned:
-                logger.exception("[DWDP] Failed to end PyTorch profiler range")
-                self._torch_profiler_warned = True
-            self.torch_profiler_enabled = False
-
-    @staticmethod
-    def _percentile(values: List[float], pct: float) -> float:
-        if not values:
-            return 0.0
-        idx = min(len(values) - 1, max(0, int(len(values) * pct)))
-        return sorted(values)[idx]
-
-    def timing_summary_and_reset(self) -> Optional[str]:
-        if not self.timing_enabled or not self._timing_samples:
-            return None
-
-        samples = self._timing_samples
-        self._timing_samples = []
-        bytes_total = sum(s[0] for s in samples)
-        latency_us = [s[1] for s in samples]
-        wait_us = [s[2] for s in samples]
-        engine_counts: Dict[int, int] = {}
-        for _, _, _, engine, _ in samples:
-            engine_counts[engine] = engine_counts.get(engine, 0) + 1
-        engine_str = ",".join(
-            f"0x{engine:x}:{count}" for engine, count in sorted(engine_counts.items())
-        )
-        return (
-            f"samples={len(samples)}, bytes={bytes_total / 1024**3:.2f}GB, "
-            f"copy_latency_us[p50={self._percentile(latency_us, 0.50):.1f}, "
-            f"p95={self._percentile(latency_us, 0.95):.1f}, "
-            f"max={max(latency_us):.1f}], "
-            f"host_wait_us[p50={self._percentile(wait_us, 0.50):.1f}, "
-            f"p95={self._percentile(wait_us, 0.95):.1f}, "
-            f"max={max(wait_us):.1f}], engines=[{engine_str}]"
-        )
 
     def _init_symbols(self):
         self.hsa.hsa_init.restype = ctypes.c_int
@@ -233,7 +143,6 @@ class _HsaDirectCopier:
         src: torch.Tensor,
         dst_device: int,
         src_device: int,
-        tag: str = "",
     ) -> _HsaSignal:
         if not dst.is_contiguous() or not src.is_contiguous():
             raise RuntimeError("HSA direct copy requires contiguous tensors")
@@ -249,88 +158,33 @@ class _HsaDirectCopier:
         )
         size_bytes = dst.numel() * dst.element_size()
         engine = self._preferred_engine(dst_device, src_device)
-        submit_ns = time.perf_counter_ns()
-        profile_handle = self._torch_profiler_enter(
-            f"DWDP_HSA_COPY {tag} bytes={size_bytes} engine=0x{engine:x}"
+        status = self.hsa.hsa_amd_memory_async_copy_on_engine(
+            ctypes.c_void_p(dst.data_ptr()),
+            self.agents[dst_device],
+            ctypes.c_void_p(src.data_ptr()),
+            self.agents[src_device],
+            ctypes.c_size_t(size_bytes),
+            ctypes.c_uint32(0),
+            None,
+            signal,
+            ctypes.c_uint32(engine),
+            ctypes.c_bool(True),
         )
-        self._roctx_mark(
-            f"DWDP_HSA_COPY_SUBMIT {tag} bytes={size_bytes} engine=0x{engine:x}"
-        )
-        self._roctx_push(
-            f"DWDP_HSA_COPY_LAUNCH {tag} bytes={size_bytes} engine=0x{engine:x}"
-        )
-        try:
-            status = self.hsa.hsa_amd_memory_async_copy_on_engine(
-                ctypes.c_void_p(dst.data_ptr()),
-                self.agents[dst_device],
-                ctypes.c_void_p(src.data_ptr()),
-                self.agents[src_device],
-                ctypes.c_size_t(size_bytes),
-                ctypes.c_uint32(0),
-                None,
-                signal,
-                ctypes.c_uint32(engine),
-                ctypes.c_bool(True),
-            )
-        finally:
-            self._roctx_pop()
         if status != self.HSA_STATUS_SUCCESS:
-            self._torch_profiler_exit(profile_handle)
             self.hsa.hsa_signal_destroy(signal)
             raise RuntimeError(
                 f"hsa_amd_memory_async_copy_on_engine failed with HSA status {status}"
             )
-        if self.timing_enabled or profile_handle is not None:
-            self._signal_meta[signal.handle] = (
-                submit_ns,
-                size_bytes,
-                engine,
-                tag,
-                profile_handle,
-            )
         return signal
 
     def wait_and_destroy(self, signal: _HsaSignal):
-        meta = self._signal_meta.pop(signal.handle, None)
-        wait_start_ns = time.perf_counter_ns()
-        wait_profile_handle = None
-        if meta is not None:
-            _, size_bytes, engine, tag, _ = meta
-            self._roctx_push(
-                f"DWDP_HSA_WAIT {tag} bytes={size_bytes} engine=0x{engine:x}"
-            )
-            wait_profile_handle = self._torch_profiler_enter(
-                f"DWDP_HSA_WAIT {tag} bytes={size_bytes} engine=0x{engine:x}"
-            )
-        try:
-            self.hsa.hsa_signal_wait_scacquire(
-                signal,
-                self.HSA_SIGNAL_CONDITION_LT,
-                1,
-                self.HSA_WAIT_TIMEOUT,
-                self.HSA_WAIT_STATE_BLOCKED,
-            )
-        finally:
-            if meta is not None:
-                self._roctx_pop()
-                self._torch_profiler_exit(wait_profile_handle)
-        wait_end_ns = time.perf_counter_ns()
-        if meta is not None and self.timing_enabled:
-            submit_ns, size_bytes, engine, tag, profile_handle = meta
-            self._timing_samples.append(
-                (
-                    size_bytes,
-                    (wait_end_ns - submit_ns) / 1000.0,
-                    (wait_end_ns - wait_start_ns) / 1000.0,
-                    engine,
-                    tag,
-                )
-            )
-        elif meta is not None:
-            _, _, _, _, profile_handle = meta
-        else:
-            profile_handle = None
-        self._torch_profiler_exit(profile_handle)
+        self.hsa.hsa_signal_wait_scacquire(
+            signal,
+            self.HSA_SIGNAL_CONDITION_LT,
+            1,
+            self.HSA_WAIT_TIMEOUT,
+            self.HSA_WAIT_STATE_BLOCKED,
+        )
         self.hsa.hsa_signal_destroy(signal)
 
 
@@ -490,11 +344,6 @@ class DwdpManager:
         self._hsa_prefetch_signals: Optional[
             List[List[Dict[int, List[_HsaSignal]]]]
         ] = None
-        self._hsa_wait_group_us: List[float] = []
-        self._hsa_wait_group_count = 0
-        self._hsa_timing_log_interval = int(
-            os.environ.get("DWDP_HSA_TIMING_LOG_INTERVAL", "58")
-        )
 
         self._initialized = False
 
@@ -721,36 +570,10 @@ class DwdpManager:
         if self._hsa_prefetch_signals is None:
             return
 
-        profile_handle = self._hsa_copier._torch_profiler_enter(
-            f"DWDP_HSA_WAIT_GROUP buf={buf_idx} layer_slot={layer_slot}"
-        )
-        wait_start_ns = time.perf_counter_ns()
-        try:
-            for signals in self._hsa_prefetch_signals[buf_idx][layer_slot].values():
-                while signals:
-                    signal = signals.pop(0)
-                    self._hsa_copier.wait_and_destroy(signal)
-        finally:
-            wait_end_ns = time.perf_counter_ns()
-            self._hsa_copier._torch_profiler_exit(profile_handle)
-        self._hsa_wait_group_us.append((wait_end_ns - wait_start_ns) / 1000.0)
-        self._hsa_wait_group_count += 1
-
-        if (
-            self._hsa_timing_log_interval > 0
-            and self._hsa_wait_group_count % self._hsa_timing_log_interval == 0
-        ):
-            wait_groups = self._hsa_wait_group_us
-            self._hsa_wait_group_us = []
-            copy_summary = self._hsa_copier.timing_summary_and_reset()
-            logger.info(
-                f"[DWDP][HSA_TIMING] rank={self.dwdp_rank} "
-                f"wait_groups={len(wait_groups)}, "
-                f"wait_group_us[p50={_HsaDirectCopier._percentile(wait_groups, 0.50):.1f}, "
-                f"p95={_HsaDirectCopier._percentile(wait_groups, 0.95):.1f}, "
-                f"max={max(wait_groups):.1f}], "
-                f"copies=({copy_summary or 'none'})"
-            )
+        for signals in self._hsa_prefetch_signals[buf_idx][layer_slot].values():
+            while signals:
+                signal = signals.pop(0)
+                self._hsa_copier.wait_and_destroy(signal)
 
     def _hsa_copy_or_fallback(
         self,
@@ -783,12 +606,8 @@ class DwdpManager:
             return
 
         try:
-            tag = (
-                f"rank={self.dwdp_rank} peer={peer_rank} "
-                f"layer={layer_id} param={param_name}"
-            )
             signals.append(
-                self._hsa_copier.copy_async(dst, src, dst_device, src_device, tag=tag)
+                self._hsa_copier.copy_async(dst, src, dst_device, src_device)
             )
         except Exception:
             logger.exception(
