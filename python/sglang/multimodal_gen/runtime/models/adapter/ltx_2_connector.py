@@ -661,7 +661,7 @@ class LTX2TextConnectors(nn.Module):
                 audio_hidden_states = audio_hidden_states.to(
                     self.audio_aggregate_embed.weight.dtype
                 )
-            source_dim = int(text_encoder_hidden_states.shape[-1])
+            source_dim = self.caption_channels
             video_hidden_states = self._rescale_v2_features(
                 video_hidden_states,
                 self.video_aggregate_embed.out_features,
