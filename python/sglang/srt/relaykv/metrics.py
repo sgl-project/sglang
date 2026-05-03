@@ -305,6 +305,198 @@ def log_host_backup_copy_candidate_summary(
     logger.info("%s=%s", prefix, json.dumps(payload, sort_keys=True))
 
 
+def _event_sequence_from_input(
+    value: Mapping[str, Any] | list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    *,
+    event_keys: tuple[str, ...],
+) -> list[Mapping[str, Any]] | None:
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if not isinstance(value, Mapping):
+        raise TypeError("RelayKV join inputs must be mapping, list, or tuple objects")
+    for key in event_keys:
+        events = value.get(key)
+        if isinstance(events, (list, tuple)):
+            return list(events)
+    return None
+
+
+def _summary_count_value(summary: Mapping[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = summary.get(key)
+        if isinstance(value, int):
+            return value
+    return 0
+
+
+def _event_layer_value(event: Mapping[str, Any]) -> Any:
+    layer_value = _event_value(event, "layer_id")
+    if layer_value is None:
+        layer_value = _event_value(event, "layer_idx")
+    return layer_value
+
+
+def _event_req_pool_idx_value(event: Mapping[str, Any]) -> Any:
+    req_pool_idx = _event_value(event, "req_pool_idx")
+    if req_pool_idx is None:
+        req_pool_idx = _event_value(event, "req_pool_index")
+    if req_pool_idx is None:
+        req_pool_idx = _event_value(event, "request_pool_idx")
+    return req_pool_idx
+
+
+def _runtime_host_backup_join_key(
+    event: Mapping[str, Any],
+) -> tuple[str, str, str] | None:
+    request_id = _event_value(event, "request_id")
+    req_pool_idx = _event_req_pool_idx_value(event)
+    layer_id = _event_layer_value(event)
+    if request_id is None or req_pool_idx is None or layer_id is None:
+        return None
+    return (str(request_id), str(req_pool_idx), str(layer_id))
+
+
+def _increment_join_safety_counts(
+    counts: Counter[str],
+    event: Mapping[str, Any],
+) -> None:
+    if _event_value(event, "source_mutated") is True:
+        counts["source_mutated_true_count"] += 1
+    if _event_value(event, "attention_override") is True:
+        counts["attention_override_true_count"] += 1
+    if _event_value(event, "kv_cache_mutation") is True:
+        counts["kv_cache_mutation_true_count"] += 1
+    if _event_value(event, "runtime_writeback") is True:
+        counts["runtime_writeback_true_count"] += 1
+    if _event_value(event, "scheduler_policy_noop") is False:
+        counts["scheduler_policy_noop_false_count"] += 1
+
+
+def join_runtime_observation_with_host_backup_candidates_for_smoke(
+    runtime_payloads_or_summary: Mapping[str, Any]
+    | list[Mapping[str, Any]]
+    | tuple[Mapping[str, Any], ...],
+    host_backup_candidate_summary_or_events: Mapping[str, Any]
+    | list[Mapping[str, Any]]
+    | tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Join read-only runtime observation metadata with host-backup candidates.
+
+    The join is summary-only plumbing for smoke tests. It reads dictionaries and
+    lists only, does not touch tensors, KV pools, snapshots, host backup copy,
+    attention state, scheduler decisions, or runtime writeback.
+    """
+
+    runtime_payloads = _event_sequence_from_input(
+        runtime_payloads_or_summary,
+        event_keys=("runtime_payloads", "payloads", "events"),
+    )
+    candidate_events = _event_sequence_from_input(
+        host_backup_candidate_summary_or_events,
+        event_keys=("host_backup_candidate_events", "candidate_events", "events"),
+    )
+
+    safety_counts: Counter[str] = Counter(
+        {
+            "source_mutated_true_count": 0,
+            "attention_override_true_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+        }
+    )
+
+    if runtime_payloads is None or candidate_events is None:
+        if isinstance(runtime_payloads_or_summary, Mapping):
+            for key in safety_counts:
+                safety_counts[key] += _summary_count_value(
+                    runtime_payloads_or_summary, key
+                )
+        if isinstance(host_backup_candidate_summary_or_events, Mapping):
+            for key in safety_counts:
+                safety_counts[key] += _summary_count_value(
+                    host_backup_candidate_summary_or_events, key
+                )
+        return {
+            "join_granularity": "summary_only_unjoinable",
+            "total_runtime_payloads": _summary_count_value(
+                runtime_payloads_or_summary, "total_runtime_payloads", "total_payloads"
+            )
+            if isinstance(runtime_payloads_or_summary, Mapping)
+            else 0,
+            "total_host_backup_candidate_events": _summary_count_value(
+                host_backup_candidate_summary_or_events,
+                "total_host_backup_candidate_events",
+                "total_candidate_events",
+            )
+            if isinstance(host_backup_candidate_summary_or_events, Mapping)
+            else 0,
+            "joined_count": 0,
+            "unmatched_runtime_count": 0,
+            "unmatched_candidate_count": 0,
+            "per_request_join_counts": {},
+            "per_layer_join_counts": {},
+            "req_pool_idx_joined_count": 0,
+            "req_pool_idx_missing_count": 0,
+            **dict(safety_counts),
+        }
+
+    candidate_key_counts: Counter[tuple[str, str, str]] = Counter()
+    candidate_invalid_key_count = 0
+    req_pool_idx_missing_count = 0
+    for event in candidate_events:
+        if not isinstance(event, Mapping):
+            raise TypeError("RelayKV candidate join events must be mappings")
+        _increment_join_safety_counts(safety_counts, event)
+        if _event_req_pool_idx_value(event) is None:
+            req_pool_idx_missing_count += 1
+        key = _runtime_host_backup_join_key(event)
+        if key is None:
+            candidate_invalid_key_count += 1
+        else:
+            candidate_key_counts[key] += 1
+
+    joined_count = 0
+    unmatched_runtime_count = 0
+    req_pool_idx_joined_count = 0
+    per_request_join_counts: Counter[str] = Counter()
+    per_layer_join_counts: Counter[str] = Counter()
+
+    for payload in runtime_payloads:
+        if not isinstance(payload, Mapping):
+            raise TypeError("RelayKV runtime join payloads must be mappings")
+        _increment_join_safety_counts(safety_counts, payload)
+        if _event_req_pool_idx_value(payload) is None:
+            req_pool_idx_missing_count += 1
+        key = _runtime_host_backup_join_key(payload)
+        if key is not None and candidate_key_counts[key] > 0:
+            candidate_key_counts[key] -= 1
+            joined_count += 1
+            req_pool_idx_joined_count += 1
+            request_id, _, layer_id = key
+            per_request_join_counts[request_id] += 1
+            per_layer_join_counts[layer_id] += 1
+        else:
+            unmatched_runtime_count += 1
+
+    unmatched_candidate_count = candidate_invalid_key_count + sum(
+        candidate_key_counts.values()
+    )
+    return {
+        "join_granularity": "event",
+        "total_runtime_payloads": len(runtime_payloads),
+        "total_host_backup_candidate_events": len(candidate_events),
+        "joined_count": joined_count,
+        "unmatched_runtime_count": unmatched_runtime_count,
+        "unmatched_candidate_count": unmatched_candidate_count,
+        "per_request_join_counts": dict(sorted(per_request_join_counts.items())),
+        "per_layer_join_counts": dict(sorted(per_layer_join_counts.items())),
+        "req_pool_idx_joined_count": req_pool_idx_joined_count,
+        "req_pool_idx_missing_count": req_pool_idx_missing_count,
+        **dict(safety_counts),
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
