@@ -279,9 +279,8 @@ class EagleVerifyInputV2Mixin:
                 batch.mamba_track_mask = None
                 batch.mamba_track_seqlens = None
 
-        # Populate seq_lens_cpu/seq_lens_sum on the verify input so that
-        # TBO's split_spec_info can slice the custom_mask correctly.
-        if not batch.forward_mode.is_idle():
+            # Populate seq_lens_cpu/seq_lens_sum on the verify input so that
+            # TBO's split_spec_info can slice the custom_mask correctly.
             self.seq_lens_cpu = batch.seq_lens_cpu
             self.seq_lens_sum = batch.seq_lens_sum
 
