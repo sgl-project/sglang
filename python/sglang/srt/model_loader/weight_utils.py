@@ -69,6 +69,8 @@ except ImportError as e:
 
 logger = logging.getLogger(__name__)
 
+RUNAI_STREAMER_TENSOR_ATTR = "_sglang_runai_streamer_tensor"
+
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
 
@@ -1317,7 +1319,9 @@ def runai_safetensors_weights_iterator(
             mininterval=2,
         )
 
-        yield from tensor_iter
+        for name, tensor in tensor_iter:
+            setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+            yield name, tensor
 
 
 def set_runai_streamer_env(load_config: LoadConfig):
