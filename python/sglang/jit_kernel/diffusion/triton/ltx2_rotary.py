@@ -37,8 +37,14 @@ def _ltx2_split_rotary_kernel(
     cos = tl.load(cos_ptr + cos_base + offsets, mask=mask, other=0.0)
     sin = tl.load(sin_ptr + sin_base + offsets, mask=mask, other=0.0)
 
-    out_first = x_first * cos - x_second * sin
-    out_second = x_second * cos + x_first * sin
+    # Match the original PyTorch order: x * cos is written as BF16 first, then
+    # addcmul_ computes the sine product in FP32 before the final BF16 store.
+    out_first = (x_first * cos).to(tl.bfloat16).to(tl.float32) + (
+        -x_second.to(tl.float32) * sin.to(tl.float32)
+    )
+    out_second = (x_second * cos).to(tl.bfloat16).to(tl.float32) + (
+        x_first.to(tl.float32) * sin.to(tl.float32)
+    )
 
     tl.store(out_ptr + x_base + offsets, out_first, mask=mask)
     tl.store(out_ptr + x_base + half_dim + offsets, out_second, mask=mask)
