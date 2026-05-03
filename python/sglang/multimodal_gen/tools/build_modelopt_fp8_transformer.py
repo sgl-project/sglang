@@ -198,6 +198,15 @@ HUNYUANVIDEO_RUNTIME_NAME_REPLACEMENTS = [
     (r"^norm_out\.linear$", r"final_layer.adaLN_modulation.linear"),
     (r"^proj_out$", r"final_layer.linear"),
 ]
+DEFAULT_QWEN_IMAGE_KEEP_BF16_PATTERNS = [
+    r"^img_in$",
+    r"^txt_in$",
+    r"^time_text_embed\.timestep_embedder\.linear_[12]$",
+    r"^norm_out\.linear$",
+    r"^proj_out$",
+    r"^transformer_blocks\.\d+\.img_mlp\.net\.2$",
+    r"^transformer_blocks\.\d+\.(img_mod|txt_mod)$",
+]
 
 
 def _resolve_transformer_dir(path: str) -> str:
@@ -315,6 +324,7 @@ def _module_name_variants(
         canonicalized.append(
             re.sub(r"(\.audio_ff|\.ff)\.net\.2$", r"\1.proj_out", variant)
         )
+        canonicalized.append(re.sub(r"(\.(img_mod|txt_mod))\.1$", r"\1", variant))
     variants.extend(canonicalized)
     if runtime_name_mapper is not None:
         runtime_variants: list[str] = []
@@ -411,6 +421,8 @@ def get_default_keep_bf16_patterns(
         return list(DEFAULT_FLUX2_KEEP_BF16_PATTERNS)
     if model_type == "hunyuan-video":
         return list(DEFAULT_HUNYUANVIDEO_KEEP_BF16_PATTERNS)
+    if model_type == "qwen-image":
+        return list(DEFAULT_QWEN_IMAGE_KEEP_BF16_PATTERNS)
     if model_type == "none":
         return []
     if class_name == "FluxTransformer2DModel":
@@ -419,6 +431,8 @@ def get_default_keep_bf16_patterns(
         return list(DEFAULT_FLUX2_KEEP_BF16_PATTERNS)
     if class_name == "HunyuanVideoTransformer3DModel":
         return list(DEFAULT_HUNYUANVIDEO_KEEP_BF16_PATTERNS)
+    if class_name == "QwenImageTransformer2DModel":
+        return list(DEFAULT_QWEN_IMAGE_KEEP_BF16_PATTERNS)
     return []
 
 
@@ -815,13 +829,14 @@ def _parse_args() -> argparse.Namespace:
             "flux2",
             "ltx2",
             "hunyuan-video",
+            "qwen-image",
             "none",
         ],
         default="auto",
         help=(
             "Optional model-family BF16 fallback profile. 'none' uses the generic "
             "conversion path. 'auto' enables the validated FLUX.1 / FLUX.2 / LTX-2 / "
-            "HunyuanVideo fallback set when the export config matches "
+            "HunyuanVideo / Qwen Image fallback sets when the export config matches "
             "those transformer classes."
         ),
     )
