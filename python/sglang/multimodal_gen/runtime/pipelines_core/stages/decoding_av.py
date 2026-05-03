@@ -41,17 +41,6 @@ class LTX2AVDecodingStage(DecodingStage):
         arch_config = server_args.pipeline_config.vae_config.arch_config
         return str(getattr(arch_config, "video_decoder_variant", "ltx_2")) != "ltx_2_3"
 
-    @staticmethod
-    def _single_decode_generator(batch: Req) -> torch.Generator | None:
-        generator = getattr(batch, "generator", None)
-        if isinstance(generator, torch.Generator):
-            return generator
-        if isinstance(generator, list) and len(generator) == 1:
-            generator = generator[0]
-            if isinstance(generator, torch.Generator):
-                return generator
-        return None
-
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
 
@@ -84,9 +73,7 @@ class LTX2AVDecodingStage(DecodingStage):
                         self.vae.enable_tiling()
                 except Exception:
                     pass
-                decode_output = self.vae.decode(
-                    latents, generator=self._single_decode_generator(batch)
-                )
+                decode_output = self.vae.decode(latents)
                 if isinstance(decode_output, tuple):
                     video = decode_output[0]
                 elif hasattr(decode_output, "sample"):

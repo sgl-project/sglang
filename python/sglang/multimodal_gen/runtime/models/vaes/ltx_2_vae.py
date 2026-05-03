@@ -1253,10 +1253,7 @@ class LTX23VideoDecoder3d(nn.Module):
         self.patch_size_t = patch_size_t
         self.out_channels = out_channels * patch_size**2
         self.is_causal = is_causal
-        self.timestep_conditioning = timestep_conditioning
         self.per_channel_statistics = LTX23PerChannelStatistics(in_channels)
-        self.decode_noise_scale = 0.025
-        self.decode_timestep = 0.05
 
         feature_channels = base_channels * 8
         self.conv_in = LTX2VideoCausalConv3d(
@@ -1312,29 +1309,9 @@ class LTX23VideoDecoder3d(nn.Module):
         self,
         hidden_states: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
-        generator: Optional[torch.Generator] = None,
         causal: Optional[bool] = None,
     ) -> torch.Tensor:
         causal = self.is_causal if causal is None else causal
-
-        if self.timestep_conditioning:
-            noise = (
-                torch.randn(
-                    hidden_states.size(),
-                    generator=generator,
-                    dtype=hidden_states.dtype,
-                    device=hidden_states.device,
-                )
-                * self.decode_noise_scale
-            )
-            hidden_states = noise + (1.0 - self.decode_noise_scale) * hidden_states
-            if temb is None:
-                temb = torch.full(
-                    (hidden_states.shape[0],),
-                    self.decode_timestep,
-                    device=hidden_states.device,
-                    dtype=hidden_states.dtype,
-                )
 
         hidden_states = self.per_channel_statistics.un_normalize(hidden_states)
         hidden_states = self.conv_in(hidden_states, causal=causal)
@@ -1633,7 +1610,6 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         z: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         causal: Optional[bool] = None,
-        generator: Optional[torch.Generator] = None,
         return_dict: bool = True,
     ) -> Union[DecoderOutput, torch.Tensor]:
         batch_size, num_channels, num_frames, height, width = z.shape
@@ -1649,20 +1625,15 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
 
         if self.use_framewise_decoding and num_frames > tile_latent_min_num_frames:
             return self._temporal_tiled_decode(
-                z, temb, causal=causal, generator=generator, return_dict=return_dict
+                z, temb, causal=causal, return_dict=return_dict
             )
 
         if self.use_tiling and (
             width > tile_latent_min_width or height > tile_latent_min_height
         ):
-            return self.tiled_decode(
-                z, temb, causal=causal, generator=generator, return_dict=return_dict
-            )
+            return self.tiled_decode(z, temb, causal=causal, return_dict=return_dict)
 
-        if isinstance(self.decoder, LTX23VideoDecoder3d):
-            dec = self.decoder(z, temb, generator=generator, causal=causal)
-        else:
-            dec = self.decoder(z, temb, causal=causal)
+        dec = self.decoder(z, temb, causal=causal)
 
         if not return_dict:
             return (dec,)
@@ -1674,7 +1645,6 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         z: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
         causal: Optional[bool] = None,
-        generator: Optional[torch.Generator] = None,
         return_dict: bool = True,
     ) -> Union[DecoderOutput, torch.Tensor]:
         """
@@ -1693,21 +1663,17 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         if self.use_slicing and z.shape[0] > 1:
             if temb is not None:
                 decoded_slices = [
-                    self._decode(
-                        z_slice, t_slice, causal=causal, generator=generator
-                    ).sample
+                    self._decode(z_slice, t_slice, causal=causal).sample
                     for z_slice, t_slice in (z.split(1), temb.split(1))
                 ]
             else:
                 decoded_slices = [
-                    self._decode(z_slice, causal=causal, generator=generator).sample
+                    self._decode(z_slice, causal=causal).sample
                     for z_slice in z.split(1)
                 ]
             decoded = torch.cat(decoded_slices)
         else:
-            decoded = self._decode(
-                z, temb, causal=causal, generator=generator
-            ).sample
+            decoded = self._decode(z, temb, causal=causal).sample
 
         if not return_dict:
             return (decoded,)
@@ -1819,7 +1785,6 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         z: torch.Tensor,
         temb: Optional[torch.Tensor],
         causal: Optional[bool] = None,
-        generator: Optional[torch.Generator] = None,
         return_dict: bool = True,
     ) -> Union[DecoderOutput, torch.Tensor]:
         r"""
@@ -1862,26 +1827,17 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         for i in range(0, height, tile_latent_stride_height):
             row = []
             for j in range(0, width, tile_latent_stride_width):
-                tile = z[
-                    :,
-                    :,
-                    :,
-                    i : i + tile_latent_min_height,
-                    j : j + tile_latent_min_width,
-                ]
-                if isinstance(self.decoder, LTX23VideoDecoder3d):
-                    time = self.decoder(
-                        tile,
-                        temb,
-                        generator=generator,
-                        causal=causal,
-                    )
-                else:
-                    time = self.decoder(
-                        tile,
-                        temb,
-                        causal=causal,
-                    )
+                time = self.decoder(
+                    z[
+                        :,
+                        :,
+                        :,
+                        i : i + tile_latent_min_height,
+                        j : j + tile_latent_min_width,
+                    ],
+                    temb,
+                    causal=causal,
+                )
 
                 row.append(time)
             rows.append(row)
@@ -1958,7 +1914,6 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
         z: torch.Tensor,
         temb: Optional[torch.Tensor],
         causal: Optional[bool] = None,
-        generator: Optional[torch.Generator] = None,
         return_dict: bool = True,
     ) -> Union[DecoderOutput, torch.Tensor]:
         batch_size, num_channels, num_frames, height, width = z.shape
@@ -1988,19 +1943,10 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
                 or tile.shape[-2] > tile_latent_min_height
             ):
                 decoded = self.tiled_decode(
-                    tile,
-                    temb,
-                    causal=causal,
-                    generator=generator,
-                    return_dict=True,
+                    tile, temb, causal=causal, return_dict=True
                 ).sample
             else:
-                if isinstance(self.decoder, LTX23VideoDecoder3d):
-                    decoded = self.decoder(
-                        tile, temb, generator=generator, causal=causal
-                    )
-                else:
-                    decoded = self.decoder(tile, temb, causal=causal)
+                decoded = self.decoder(tile, temb, causal=causal)
             if i > 0:
                 decoded = decoded[:, :, :-1, :, :]
             row.append(decoded)
