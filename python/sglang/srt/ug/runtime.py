@@ -479,6 +479,7 @@ class UGSessionRuntime:
             SessionController.adjust_mm_offsets(recv_req, req, mm_inputs)
             req.extend_image_inputs(mm_inputs)
         self._record_srt_req(record, req, request_id=request_id)
+        self._finish_srt_req(req)
 
     def _create_srt_session_req(
         self,
@@ -547,6 +548,12 @@ class UGSessionRuntime:
         record.srt_mm_offsets = UGSessionRuntime._collect_mm_offsets(
             req.multimodal_inputs
         )
+
+    @staticmethod
+    def _finish_srt_req(req: Any) -> None:
+        from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+
+        req.finished_reason = FINISH_LENGTH(len(req.output_ids))
 
     def _tokenize_interleaved_messages(
         self, messages: list[UGInterleavedMessage]
