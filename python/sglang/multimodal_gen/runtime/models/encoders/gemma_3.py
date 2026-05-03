@@ -290,31 +290,14 @@ class Gemma3Attention(nn.Module):
         key = k.transpose(1, 2)
         value = v.transpose(1, 2)
 
-        min_val = torch.finfo(query.dtype).min
-        attn_mask = torch.zeros(
-            (seq_len, seq_len),
-            device=hidden_states.device,
-            dtype=query.dtype,
-        )
-        causal = torch.triu(
-            torch.ones(
-                (seq_len, seq_len), device=hidden_states.device, dtype=torch.bool
-            ),
-            diagonal=1,
-        )
-        attn_mask = attn_mask.masked_fill(causal, min_val)
+        idx = torch.arange(seq_len, device=hidden_states.device)
+        attn_mask = idx[None, :] <= idx[:, None]
         if self.is_sliding and self.sliding_window is not None:
-            idx = torch.arange(seq_len, device=hidden_states.device)
-            dist = idx[None, :] - idx[:, None]
-            too_far = dist > self.sliding_window
-            attn_mask = attn_mask.masked_fill(too_far, min_val)
+            dist = idx[:, None] - idx[None, :]
+            attn_mask = attn_mask & (dist <= self.sliding_window)
 
-        key_pad = ~attention_mask.to(torch.bool)
         attn_mask = attn_mask[None, None, :, :].expand(batch_size, 1, seq_len, seq_len)
-        attn_mask = attn_mask.masked_fill(
-            key_pad[:, None, None, :].expand(batch_size, 1, seq_len, seq_len),
-            min_val,
-        )
+        attn_mask = attn_mask & attention_mask.to(torch.bool)[:, None, None, :]
 
         attn_kwargs = {
             "attn_mask": attn_mask,
