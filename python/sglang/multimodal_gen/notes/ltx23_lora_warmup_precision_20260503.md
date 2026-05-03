@@ -141,3 +141,19 @@ request warmup 会先跑一次 one-step request，并在 stage2 前把 transform
 - 保留内容：Gemma RoPE device-side inv_freq、LTX2 HQ res2s SDE/noise/scalar/midpoint 修复均未改动。
 - 未复跑 GPU 对齐；这是按“sdpa 的修改移除掉，不考虑”的范围做的代码回退。
 - 当前精度对齐百分比：未重新测，沿用上一轮已知 HQ final video SSIM 94.82%/PSNR 29.92 的结果不再作为本次 SDPA 回退后的证明。
+
+## 2026-05-03 SDPA/GQA 移除后的重新验证
+
+- 当前保留 commit: `ca226882f`（revert 掉 eager probe 后回到 SDPA/GQA 移除状态）；远端容器已同步，`gemma_3.py` sha1=`4697760a02de1661b9befc248648dd037dba134d`。
+- final mp4 复测（SGLang vs official，1024x1024, 24 frames, 15 steps, seed 10，单卡 H200，HQ pipeline）：
+  - `all_avg`: PSNR `14.8183`, SSIM `0.6533`, mean_abs `28.1944`。
+  - `key_avg`: PSNR `14.7550`, SSIM `0.6534`, mean_abs `28.4865`。
+  - 对比 SDPA/GQA repeat 还存在时的 `5b59810f3`：PSNR `29.9201 -> 14.8183`，SSIM `0.9482 -> 0.6533`，mean_abs `3.392 -> 28.1944`。
+- raw text hidden 对拍（official raw text vs `bb1008d90`/`ca226882f`）：attention mask 和 embedding 层仍 exact；从 Gemma layer 1 开始不再 exact。
+  - `pos_hidden_48_valid`: mean_abs `0.03556`, rms `0.05274`。
+  - `neg_hidden_48_valid`: mean_abs `0.02823`, rms `0.03960`。
+- eager attention probe: `ea51d177b` 将 Gemma text attention 改成 HF eager matmul 公式；raw hidden 没恢复，且略差：
+  - `pos_hidden_48_valid`: mean_abs `0.03636`, rms `0.05447`。
+  - `neg_hidden_48_valid`: mean_abs `0.03184`, rms `0.04384`。
+  - 已用 `ca226882f` revert，不保留该 probe。
+- 结论：SDPA/GQA repeat 路径是当前 official default raw Gemma hidden bit-exact 的必要条件；移除后主要误差源在 text encoder 第 1 层开始，后段 res2s 已修复项无法补偿。当前 SDPA 移除状态下 final video SSIM 对齐约 65.33%，bit-exact 0%。
