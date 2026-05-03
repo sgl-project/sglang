@@ -3873,6 +3873,300 @@ def summarize_relaykv_attention_override_noop_results_for_smoke(
     }
 
 
+def _unique_sorted_int_list(values: Iterable[Any]) -> list[int]:
+    unique_values: set[int] = set()
+    for value in values:
+        if isinstance(value, int):
+            unique_values.add(value)
+    return sorted(unique_values)
+
+
+def _resolve_attention_comparison_full_kv_block_ids(
+    result: Mapping[str, Any],
+    full_kv_block_ids_by_request_layer: Mapping[Any, Any] | None,
+) -> list[int]:
+    request_id = _event_value(result, "request_id")
+    layer_id = _event_layer_value(result)
+
+    if full_kv_block_ids_by_request_layer is not None:
+        lookup_keys = (
+            (request_id, layer_id),
+            f"{request_id}:{layer_id}",
+            request_id,
+        )
+        for lookup_key in lookup_keys:
+            if lookup_key in full_kv_block_ids_by_request_layer:
+                lookup_value = full_kv_block_ids_by_request_layer[lookup_key]
+                if isinstance(lookup_value, (list, tuple)):
+                    return _unique_sorted_int_list(lookup_value)
+                return []
+
+    synthesized_values: list[int] = []
+    for field_name in (
+        "recent_block_ids",
+        "anchor_block_ids",
+        "candidate_block_ids",
+        "retrieved_block_ids",
+        "materialized_block_ids",
+        "working_kv_block_ids",
+    ):
+        field_value = _event_value(result, field_name)
+        if isinstance(field_value, (list, tuple)):
+            synthesized_values.extend(field_value)
+    return _unique_sorted_int_list(synthesized_values)
+
+
+def build_relaykv_attention_comparison_plans_for_smoke(
+    attention_override_noop_results: list[Mapping[str, Any]]
+    | tuple[Mapping[str, Any], ...],
+    full_kv_block_ids_by_request_layer: Mapping[Any, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build metadata-only attention comparison plans."""
+
+    if not isinstance(attention_override_noop_results, (list, tuple)):
+        raise TypeError("attention_override_noop_results must be a list or tuple")
+    if full_kv_block_ids_by_request_layer is not None and not isinstance(
+        full_kv_block_ids_by_request_layer, Mapping
+    ):
+        raise TypeError(
+            "full_kv_block_ids_by_request_layer must be a mapping or None"
+        )
+
+    plans: list[dict[str, Any]] = []
+    for noop_result in attention_override_noop_results:
+        if not isinstance(noop_result, Mapping):
+            raise TypeError(
+                "RelayKV attention comparison plan inputs must be mappings"
+            )
+
+        working_kv_block_ids = _host_backup_copy_request_block_ids(
+            noop_result, "working_kv_block_ids"
+        )
+        working_kv_block_count = _event_value(noop_result, "working_kv_block_count")
+        if not isinstance(working_kv_block_count, int):
+            working_kv_block_count = len(working_kv_block_ids)
+        working_kv_token_count = _event_value(noop_result, "working_kv_token_count")
+        if not isinstance(working_kv_token_count, int):
+            working_kv_token_count = 0
+
+        full_kv_block_ids = _resolve_attention_comparison_full_kv_block_ids(
+            noop_result, full_kv_block_ids_by_request_layer
+        )
+        full_kv_block_count = len(full_kv_block_ids)
+        working_kv_block_id_set = set(working_kv_block_ids)
+        full_kv_block_id_set = set(full_kv_block_ids)
+        coverage_block_count = sum(
+            1 for block_id in working_kv_block_ids if block_id in full_kv_block_id_set
+        )
+        missing_from_full_block_ids = [
+            block_id for block_id in working_kv_block_ids if block_id not in full_kv_block_id_set
+        ]
+        full_only_block_ids = [
+            block_id for block_id in full_kv_block_ids if block_id not in working_kv_block_id_set
+        ]
+        reduced_block_count = max(full_kv_block_count - working_kv_block_count, 0)
+        working_to_full_block_ratio = (
+            working_kv_block_count / full_kv_block_count
+            if full_kv_block_count > 0
+            else None
+        )
+        coverage_ratio = (
+            coverage_block_count / full_kv_block_count
+            if full_kv_block_count > 0
+            else None
+        )
+
+        blocking_reasons: list[str] = []
+        warning_reasons: list[str] = ["metadata_only_attention_comparison_plan"]
+
+        if (
+            _event_value(noop_result, "event_type")
+            != "relaykv_attention_override_noop_result"
+        ):
+            blocking_reasons.append("not_attention_override_noop_result")
+        if _event_value(noop_result, "attention_connection_state") != "override_noop":
+            blocking_reasons.append("attention_connection_not_override_noop")
+        if _event_value(noop_result, "attention_connection_mode") != "noop_guarded":
+            blocking_reasons.append("attention_connection_not_noop_guarded")
+        if _event_value(noop_result, "attention_override_noop") is not True:
+            blocking_reasons.append("attention_override_noop_not_true")
+        if _event_value(noop_result, "attention_override") is True:
+            blocking_reasons.append("attention_override_true_not_allowed")
+        if not working_kv_block_ids:
+            blocking_reasons.append("no_working_kv_blocks")
+        if not full_kv_block_ids:
+            blocking_reasons.append("no_full_kv_blocks")
+
+        attention_connection_attempted = not blocking_reasons and (
+            _event_value(noop_result, "attention_connection_attempted") is True
+        )
+        comparison_state = "plan_ready" if not blocking_reasons else "blocked"
+
+        plans.append(
+            {
+                "event_type": "relaykv_attention_comparison_plan",
+                "comparison_state": comparison_state,
+                "comparison_mode": "metadata_only",
+                "source": "attention_override_noop_result_to_comparison_plan",
+                "request_id": _event_value(noop_result, "request_id"),
+                "req_pool_idx": _event_req_pool_idx_value(noop_result),
+                "seq_len": _event_value(noop_result, "seq_len"),
+                "layer_id": _event_layer_value(noop_result),
+                "full_kv_block_ids": full_kv_block_ids,
+                "relaykv_working_kv_block_ids": working_kv_block_ids,
+                "relaykv_working_kv_block_count": working_kv_block_count,
+                "full_kv_block_count": full_kv_block_count,
+                "reduced_block_count": reduced_block_count,
+                "working_to_full_block_ratio": working_to_full_block_ratio,
+                "coverage_block_count": coverage_block_count,
+                "coverage_ratio": coverage_ratio,
+                "missing_from_full_block_ids": missing_from_full_block_ids,
+                "full_only_block_ids": full_only_block_ids,
+                "attention_comparison_executed": False,
+                "attention_connection_attempted": attention_connection_attempted,
+                "attention_override": False,
+                "attention_override_noop": (
+                    True if not blocking_reasons else False
+                ),
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "kv_cache_mutation": False,
+                "source_mutated": False,
+                "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
+                "warning_reasons": warning_reasons,
+            }
+        )
+    return plans
+
+
+def summarize_relaykv_attention_comparison_plans_for_smoke(
+    plans: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize metadata-only attention comparison plans."""
+
+    if not isinstance(plans, (list, tuple)):
+        raise TypeError("RelayKV attention comparison plans must be a list or tuple")
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_comparison_state: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "attention_override_true_count": 0,
+            "attention_override_noop_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    comparison_plan_ready_count = 0
+    blocked_count = 0
+    error_count = 0
+    full_kv_block_count = 0
+    relaykv_working_kv_block_count = 0
+    reduced_block_count = 0
+    working_to_full_ratio_sum = 0.0
+    working_to_full_ratio_count = 0
+    coverage_ratio_sum = 0.0
+    coverage_ratio_count = 0
+    missing_from_full_block_count = 0
+    full_only_block_count = 0
+    attention_comparison_executed_count = 0
+    attention_connection_attempted_count = 0
+
+    for plan in plans:
+        if not isinstance(plan, Mapping):
+            raise TypeError("RelayKV attention comparison plan must be a mapping")
+        state = str(_event_value(plan, "comparison_state") or "unknown")
+        per_comparison_state[state] += 1
+        per_request[str(_event_value(plan, "request_id"))] += 1
+        per_layer[str(_event_layer_value(plan))] += 1
+        if state == "plan_ready":
+            comparison_plan_ready_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+
+        value = _event_value(plan, "full_kv_block_count")
+        if isinstance(value, int):
+            full_kv_block_count += value
+        value = _event_value(plan, "relaykv_working_kv_block_count")
+        if isinstance(value, int):
+            relaykv_working_kv_block_count += value
+        value = _event_value(plan, "reduced_block_count")
+        if isinstance(value, int):
+            reduced_block_count += value
+        value = _event_value(plan, "working_to_full_block_ratio")
+        if isinstance(value, (int, float)):
+            working_to_full_ratio_sum += float(value)
+            working_to_full_ratio_count += 1
+        value = _event_value(plan, "coverage_ratio")
+        if isinstance(value, (int, float)):
+            coverage_ratio_sum += float(value)
+            coverage_ratio_count += 1
+        value = _event_value(plan, "missing_from_full_block_ids")
+        if isinstance(value, (list, tuple)):
+            missing_from_full_block_count += len(value)
+        value = _event_value(plan, "full_only_block_ids")
+        if isinstance(value, (list, tuple)):
+            full_only_block_count += len(value)
+        if _event_value(plan, "attention_comparison_executed") is True:
+            attention_comparison_executed_count += 1
+        if _event_value(plan, "attention_connection_attempted") is True:
+            attention_connection_attempted_count += 1
+        if _event_value(plan, "attention_override") is True:
+            safety_counts["attention_override_true_count"] += 1
+        if _event_value(plan, "attention_override_noop") is True:
+            safety_counts["attention_override_noop_count"] += 1
+        if _event_value(plan, "kv_pool_read") is True:
+            safety_counts["kv_pool_read_count"] += 1
+        if _event_value(plan, "kv_snapshot") is True:
+            safety_counts["kv_snapshot_count"] += 1
+        if _event_value(plan, "runtime_writeback") is True:
+            safety_counts["runtime_writeback_true_count"] += 1
+        if _event_value(plan, "scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+        if _event_value(plan, "kv_cache_mutation") is True:
+            safety_counts["kv_cache_mutation_true_count"] += 1
+        if _event_value(plan, "source_mutated") is True:
+            safety_counts["source_mutated_true_count"] += 1
+
+    return {
+        "summary_type": "relaykv_attention_comparison_plan_summary",
+        "total_attention_comparison_plans": len(plans),
+        "comparison_plan_ready_count": comparison_plan_ready_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "full_kv_block_count": full_kv_block_count,
+        "relaykv_working_kv_block_count": relaykv_working_kv_block_count,
+        "reduced_block_count": reduced_block_count,
+        "mean_working_to_full_block_ratio": (
+            working_to_full_ratio_sum / working_to_full_ratio_count
+            if working_to_full_ratio_count > 0
+            else None
+        ),
+        "mean_coverage_ratio": (
+            coverage_ratio_sum / coverage_ratio_count
+            if coverage_ratio_count > 0
+            else None
+        ),
+        "missing_from_full_block_count": missing_from_full_block_count,
+        "full_only_block_count": full_only_block_count,
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_comparison_state_counts": dict(sorted(per_comparison_state.items())),
+        "attention_comparison_executed_count": attention_comparison_executed_count,
+        "attention_connection_attempted_count": attention_connection_attempted_count,
+        **dict(safety_counts),
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
