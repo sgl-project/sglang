@@ -1077,7 +1077,7 @@ class NixlKVSender(CommonKVSender):
                 self.aux_index,
                 state_indices,
             )
-        except Exception as e:
+        except RuntimeError as e:
             logger.warning(
                 f"KVSender transfer request failed for room {self.bootstrap_room}: {e}"
             )
@@ -1098,7 +1098,7 @@ class NixlKVSender(CommonKVSender):
             return self.kv_mgr.check_status(self.bootstrap_room)
         try:
             states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
-        except Exception as e:
+        except RuntimeError as e:
             logger.warning(
                 f"KVSender check_xfer_state failed for room {self.bootstrap_room}: {e}"
             )
