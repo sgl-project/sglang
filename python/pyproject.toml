@@ -59,15 +59,15 @@ dependencies = [
   "sentencepiece",
   "setproctitle",
   "flash-attn-4>=4.0.0b9",
-  "sglang-kernel==0.4.1.post1",
+  "sglang-kernel==0.4.2",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.16",
   "torch_memory_saver>=0.0.9.post1",
-  "torch==2.9.1",
+  "torch==2.11.0",
   "torchao==0.17.0",
-  "torchaudio==2.9.1",
-  "torchcodec==0.9.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec 0.9.1 for torch 2.9.x. Not available on Linux ARM.
+  "torchaudio==2.11.0",
+  "torchcodec==0.11.1 ; sys_platform != 'linux' or (sys_platform == 'linux' and platform_machine != 'aarch64' and platform_machine != 'arm64' and platform_machine != 'armv7l')", # torchcodec 0.11.1 for torch 2.11.x (0.10 is ABI-incompatible: references the pre-2.11 c10::MessageLogger ctor signature). Not available on Linux ARM.
   "av ; sys_platform == 'linux' and (platform_machine == 'aarch64' or platform_machine == 'arm64' or platform_machine == 'armv7l')",
   "torchvision",
   "tqdm",
@@ -85,23 +85,6 @@ dependencies = [
 name = "pypi"
 url = "https://pypi.org/simple"
 default = true
-
-[[tool.uv.index]]
-name = "torch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
-explicit = true
-
-# To be removed after pypi sglang-kernel uses cu130
-[[tool.uv.index]]
-name = "sglang-kernel-cu130"
-url = "https://docs.sglang.ai/whl/cu130/"
-explicit = true
-
-[tool.uv.sources]
-torch = { index = "torch-cu130" }
-torchvision = { index = "torch-cu130" }
-torchaudio = { index = "torch-cu130" }
-sglang-kernel = { index = "sglang-kernel-cu130" }
 
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
