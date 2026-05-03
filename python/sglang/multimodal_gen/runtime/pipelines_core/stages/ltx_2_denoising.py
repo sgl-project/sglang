@@ -560,19 +560,21 @@ class LTX2DenoisingStage(DenoisingStage):
                 ctx.audio_latents, batch
             ).float()
         )
+        # Official res2s keeps main-step SDE sigmas in scheduler dtype; only
+        # deterministic RK/substep math uses double precision.
         next_video = self._ltx2_res2s_sde_step(
             sample=anchor_video,
             denoised_sample=next_video_det,
-            sigma=sigma_d,
-            sigma_next=sigma_next_d,
+            sigma=sigma,
+            sigma_next=sigma_next,
             noise=step_noise_video,
             terminal=False,
         )
         next_audio = self._ltx2_res2s_sde_step(
             sample=anchor_audio,
             denoised_sample=next_audio_det,
-            sigma=sigma_d,
-            sigma_next=sigma_next_d,
+            sigma=sigma,
+            sigma_next=sigma_next,
             noise=step_noise_audio,
             terminal=False,
         )
@@ -2039,19 +2041,21 @@ class LTX2DenoisingStage(DenoisingStage):
                         ctx.audio_latents, batch
                     ).float()
                 )
+                # Official res2s keeps main-step SDE sigmas in scheduler dtype;
+                # only deterministic RK/substep math uses double precision.
                 next_video_latents = self._ltx2_res2s_sde_step(
                     sample=anchor_video,
                     denoised_sample=next_video_deterministic,
-                    sigma=sigma_d,
-                    sigma_next=sigma_next_d,
+                    sigma=sigma,
+                    sigma_next=sigma_next,
                     noise=step_video_noise,
                     terminal=False,
                 )
                 next_audio_latents = self._ltx2_res2s_sde_step(
                     sample=anchor_audio,
                     denoised_sample=next_audio_deterministic,
-                    sigma=sigma_d,
-                    sigma_next=sigma_next_d,
+                    sigma=sigma,
+                    sigma_next=sigma_next,
                     noise=step_audio_noise,
                     terminal=False,
                 )
