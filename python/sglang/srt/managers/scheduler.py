@@ -80,10 +80,12 @@ from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.elastic_ep_status import (
+    create_elastic_ep_status_publisher,
+)
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    ActiveRanksOutput,
     AddExternalCorpusReqInput,
     AddExternalCorpusReqOutput,
     AttachHiCacheStorageReqInput,
@@ -552,6 +554,10 @@ class Scheduler(
             self.send_to_tokenizer = SenderWrapper(None)
             self.send_to_detokenizer = SenderWrapper(None)
             self.send_to_controller = SenderWrapper(None)
+
+        self.elastic_ep_status_publisher = create_elastic_ep_status_publisher(
+            self.server_args, self.send_to_controller
+        )
 
         if self.current_scheduler_metrics_enabled:
             self.send_metrics_from_scheduler = get_zmq_socket(
@@ -1480,21 +1486,14 @@ class Scheduler(
                     break
         ElasticEPStateManager.instance().mark_snapshot_handled()
 
-    def _send_active_ranks_to_controller_from_cpu_snapshot(self):
+    def _publish_active_ranks_from_cpu_snapshot(self):
         elastic_ep_state = ElasticEPStateManager.instance()
         assert elastic_ep_state is not None
         assert elastic_ep_state.tp_active_ranks_cpu is not None
 
-        # Keep the original semantics: a TP rank is active only when both the
-        # device-side Mooncake backend snapshot and the CPU backend mask agree.
-        tp_active_ranks = elastic_ep_state.tp_active_ranks_cpu.detach().clone()
-        tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach()
-        assert tp_active_ranks.numel() == tp_active_ranks_cpu.numel()
-        tp_active_ranks &= tp_active_ranks_cpu
-
-        dp_active_ranks = tp_active_ranks.reshape(self.dp_size, -1).prod(dim=1)
-        self.send_to_controller.send_output(
-            ActiveRanksOutput(status=dp_active_ranks.tolist())
+        self.elastic_ep_status_publisher.publish_active_ranks(
+            tp_active_ranks=elastic_ep_state.tp_active_ranks_cpu,
+            tp_active_ranks_cpu=self.tp_group.active_ranks_cpu,
         )
 
     def get_init_info(self) -> Dict[str, Any]:
@@ -1578,7 +1577,7 @@ class Scheduler(
                 if tmp_result.copy_done is not None:
                     tmp_result.copy_done.synchronize()
                 if _elastic_state.publish_active_snapshot():
-                    self._send_active_ranks_to_controller_from_cpu_snapshot()
+                    self._publish_active_ranks_from_cpu_snapshot()
                     if _elastic_state.is_stale_snapshot():
                         self._retract_all_and_rebalance_on_rank_fault()
                         return False
@@ -3087,12 +3086,9 @@ class Scheduler(
             and not self.enable_overlap
         ):
             # Get the tensors indicating rank activeness
-            tp_active_ranks = self.tp_group.active_ranks.detach().cpu().numpy()
-            tp_active_ranks_cpu = self.tp_group.active_ranks_cpu.detach().numpy()
-            tp_active_ranks &= tp_active_ranks_cpu
-            dp_active_ranks = tp_active_ranks.reshape(self.dp_size, -1).prod(axis=1)
-            self.send_to_controller.send_output(
-                ActiveRanksOutput(status=dp_active_ranks.tolist())
+            self.elastic_ep_status_publisher.publish_active_ranks(
+                tp_active_ranks=self.tp_group.active_ranks,
+                tp_active_ranks_cpu=self.tp_group.active_ranks_cpu,
             )
 
         return ret

@@ -1256,7 +1256,7 @@ class SchedulerDisaggregationDecodeMixin:
                     if tmp_result.copy_done is not None:
                         tmp_result.copy_done.synchronize()
                     if _elastic_state.publish_active_snapshot():
-                        self._send_active_ranks_to_controller_from_cpu_snapshot()
+                        self._publish_active_ranks_from_cpu_snapshot()
                         if _elastic_state.is_stale_snapshot():
                             self._retract_all_and_rebalance_on_rank_fault()
                             continue
