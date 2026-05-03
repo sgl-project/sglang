@@ -336,13 +336,23 @@ def _add_lora_gate_up_delta(
     )
 
     if get_is_capture_mode():
-        from sglang.srt.model_executor.cuda_graph_runner import get_capture_lora_variant
-
-        # Record LoRA kernels for lora graph; skip for nolora graph.
-        if get_capture_lora_variant() == "nolora":
-            return
-
-    if lora_info is None or lora_info.max_lora_rank == 0:
+        # During CUDA graph capture, always enter the LoRA path so that
+        # the LoRA kernels are recorded in the graph.  adapter_enabled is
+        # all-zeros during capture, so the Triton kernel early-exits per
+        # program (zero overhead).  During replay the tensor is updated
+        # in-place with the real adapter mask before graph.replay().
+        has_active_lora = True
+    else:
+        num_loras = len(lora_info.lora_ranks)
+        has_active_lora = (
+            (
+                lora_info.adapter_enabled[:num_loras]
+                * (lora_info.lora_ranks > 0).to(lora_info.adapter_enabled.dtype)
+            )
+            .any()
+            .item()
+        )
+    if not has_active_lora or lora_info is None or lora_info.max_lora_rank == 0:
         return
 
     M, top_k, gate_up_dim = intermediate_cache.shape
@@ -436,12 +446,6 @@ def _add_lora_down_delta(
     if lora_info.max_lora_rank == 0:
         return
 
-    if get_is_capture_mode():
-        from sglang.srt.model_executor.cuda_graph_runner import get_capture_lora_variant
-
-        if get_capture_lora_variant() == "nolora":
-            return
-
     M, top_k, hidden_dim = intermediate_cache.shape
 
     down_lora_a = lora_info.down_lora_a_weights
@@ -516,12 +520,6 @@ def build_lora_hooks(
     """
     if lora_info is None or lora_info.max_lora_rank == 0:
         return LoRAHooks()
-
-    if get_is_capture_mode():
-        from sglang.srt.model_executor.cuda_graph_runner import get_capture_lora_variant
-
-        if get_capture_lora_variant() == "nolora":
-            return LoRAHooks()
 
     # Compute alignment / mapping (once, shared by both hooks)
     token_lora_mapping: torch.Tensor | None = None
