@@ -883,7 +883,8 @@
             },
             "expected_e2e_ms": 6182.06,
             "expected_avg_denoise_ms": 79.29,
-            "expected_median_denoise_ms": 95.78
+            "expected_median_denoise_ms": 95.78,
+            "estimated_full_test_time_s": 84.6
         },
         "wan2_1_t2v_1.3b": {
             "stages_ms": {
