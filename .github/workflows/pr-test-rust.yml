@@ -5,11 +5,17 @@ on:
     branches: [ main ]
     paths:
       - "sgl-model-gateway/**"
+      - ".github/workflows/pr-test-rust.yml"
+      - "scripts/ci/cuda/ci_install_dependency.sh"
+      - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
   pull_request:
     branches: [ main ]
     types: [opened, synchronize, reopened, labeled]
     paths:
       - "sgl-model-gateway/**"
+      - ".github/workflows/pr-test-rust.yml"
+      - "scripts/ci/cuda/ci_install_dependency.sh"
+      - "scripts/ci/cuda/ci_install_gateway_dependencies.sh"
   workflow_dispatch:
 
 concurrency:
@@ -17,8 +23,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  RUSTC_WRAPPER: sccache
-  SCCACHE_GHA_ENABLED: "true"
   SGLANG_IS_IN_CI: true
 
 jobs:
@@ -27,7 +31,18 @@ jobs:
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
-    runs-on: 4-gpu-a10
+    # Pin to 22.04 so the wheel auditwheel-tags as manylinux_2_35; the
+    # self-hosted GPU runners are Ubuntu 22.04 (glibc 2.35) and reject
+    # manylinux_2_39 wheels produced on ubuntu-latest (Ubuntu 24.04).
+    runs-on: ubuntu-22.04
+    # sccache is only installed on the GitHub-hosted runners that run this
+    # job and `unit-tests`; setting RUSTC_WRAPPER workflow-wide leaks it to
+    # gateway-e2e on the self-hosted GPU runners (which don't have sccache),
+    # so any pip-install that compiles a Rust extension would fail with
+    # `could not execute process \`sccache rustc\``.
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -115,6 +130,9 @@ jobs:
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
     runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -180,11 +198,32 @@ jobs:
       github.event_name != 'pull_request' ||
       (github.event.action != 'labeled' && contains(github.event.pull_request.labels.*.name, 'run-ci')) ||
       (github.event.action == 'labeled' && github.event.label.name == 'run-ci')
+    # The `responses` matrix entry is intentionally omitted. It needs
+    # `docker run gvenzl/oracle-xe` + `docker run shoofio/brave-search-mcp-sse`
+    # on the runner host, but the 2-/4-gpu-h100 runners are themselves
+    # containers without a Docker daemon. Re-enable by adding back:
+    #   - name: responses
+    #     runner: 2-gpu-h100
+    #     timeout: 45
+    #     test_dirs: "e2e_test/responses"
+    #     extra_deps: ""
+    #     env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
+    #     reruns: "--reruns 2 --reruns-delay 5"
+    #     setup_oracle: true
+    #     setup_brave: true
+    #     parallel_opts: ""
+    # plus the Oracle Instant Client / `gvenzl/oracle-xe` /
+    # `shoofio/brave-search-mcp-sse` setup + cleanup steps (see commit
+    # cf346bb15 for the exact step bodies) once a runner with
+    # `docker.sock` (or binary-installed deps) is available.
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: benchmarks
+            # 4 GPUs: test_pd_perf.py uses workers(prefill=2, decode=2) and
+            # test_regular_perf.py uses workers(count=4) — both need tp*workers=4.
+            runner: 4-gpu-h100
             timeout: 32
             test_dirs: "e2e_test/benchmarks"
             extra_deps: "genai-bench==0.0.3"
@@ -192,81 +231,56 @@ jobs:
             reruns: ""
             upload_benchmarks: true
             parallel_opts: ""  # No parallel for benchmarks (performance measurement)
-          - name: responses
+          - name: e2e
+            runner: 2-gpu-h100
             timeout: 45
-            test_dirs: "e2e_test/responses"
+            test_dirs: "e2e_test/router e2e_test/embeddings"
             extra_deps: ""
             env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
             reruns: "--reruns 2 --reruns-delay 5"
-            setup_oracle: true
-            setup_brave: true
-            parallel_opts: ""  # Cloud backend tests not compatible with parallel execution
-          - name: e2e
-            timeout: 45
-            test_dirs: "e2e_test/router e2e_test/embeddings"
-            extra_deps: "pytest-parallel py"  # py is required for pytest-parallel with newer pytest
-            env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
-            reruns: "--reruns 2 --reruns-delay 5"
-            parallel_opts: "--workers 1 --tests-per-worker 4"  # Thread-based parallelism
+            # Run tests serially. pytest-parallel (unmaintained since 2019)
+            # has buggy fixture-finalize handling under thread dispatch:
+            # both class- and function-scoped fixture references leaked
+            # between tests, leaving model_pool instances pinned at
+            # _ref_count > 0 and deadlocking later tests that needed
+            # eviction (50+ min hangs). On a 2-GPU runner with 5 distinct
+            # model:mode combos in router+embeddings, the suite is
+            # eviction-bound anyway, so the parallel speedup was illusory.
+            parallel_opts: ""
           - name: chat-completions
+            runner: 2-gpu-h100
             timeout: 45
             test_dirs: "e2e_test/chat_completions"
             extra_deps: ""
             env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
             reruns: "--reruns 2 --reruns-delay 5"
             parallel_opts: ""
-    runs-on: 4-gpu-a10
+          - name: chat-completions-4gpu
+            runner: 4-gpu-h100
+            timeout: 45
+            # qwen-30b (tp=4) tests can't fit on the 2-gpu-h100 matrix entries —
+            # they get skipped there by hooks.py. Run them here so coverage holds.
+            test_dirs: "e2e_test/chat_completions/test_enable_thinking.py"
+            extra_deps: ""
+            env_vars: "SHOW_WORKER_LOGS=0 SHOW_ROUTER_LOGS=1"
+            reruns: "--reruns 2 --reruns-delay 5"
+            parallel_opts: ""
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: ${{ matrix.timeout }}
+    # Self-hosted GPU runners are scarce; serialize per hardware type so
+    # 2-gpu-h100 and 4-gpu-h100 each run one job at a time across all
+    # in-flight PRs. Queue rather than cancel — different refs shouldn't
+    # interrupt each other.
+    concurrency:
+      group: pr-test-rust-${{ matrix.runner }}
+      cancel-in-progress: false
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Install SGLang dependencies
         run: |
-          sudo --preserve-env=PATH bash scripts/ci/cuda/ci_install_dependency.sh
-
-      - name: Setup Oracle Instant Client
-        if: matrix.setup_oracle
-        run: |
-          sudo apt-get install -y unzip
-          INSTANT_CLIENT_DIR="/home/ubuntu/instant-client"
-          INSTANT_CLIENT_ZIP="instantclient-basic-linux.x64-23.9.0.25.07.zip"
-
-          if [ ! -d "$INSTANT_CLIENT_DIR/instantclient_23_9" ]; then
-            echo "Downloading Oracle Instant Client..."
-            mkdir -p "$INSTANT_CLIENT_DIR"
-            cd "$INSTANT_CLIENT_DIR"
-            wget https://download.oracle.com/otn_software/linux/instantclient/2390000/$INSTANT_CLIENT_ZIP
-            unzip $INSTANT_CLIENT_ZIP
-            rm $INSTANT_CLIENT_ZIP
-          else
-            echo "Oracle Instant Client already exists, skipping download"
-          fi
-
-          echo "LD_LIBRARY_PATH=/home/ubuntu/instant-client/instantclient_23_9:\$LD_LIBRARY_PATH" >> $GITHUB_ENV
-
-      - name: Start Oracle Database
-        if: matrix.setup_oracle
-        run: |
-          docker run -d -p 1521:1521 -e ORACLE_PASSWORD=oracle --name oracle-db gvenzl/oracle-xe:21-slim
-          echo "Starting Oracle DB..."
-
-          # Export Oracle connection environment variables
-          echo "ATP_USER=system" >> $GITHUB_ENV
-          echo "ATP_PASSWORD=oracle" >> $GITHUB_ENV
-          echo "ATP_DSN=localhost:1521/XEPDB1" >> $GITHUB_ENV
-
-      - name: Start Brave MCP Server
-        if: matrix.setup_brave
-        run: |
-          docker run -d --rm \
-            -p 8001:8080 \
-            -e BRAVE_API_KEY \
-            --name brave-search-server \
-            shoofio/brave-search-mcp-sse:1.0.10
-          echo "Starting Brave MCP Server..."
-          sleep 2
-          curl -f --max-time 1 http://localhost:8001/sse > /dev/null 2>&1 && echo "Brave MCP Server is healthy!" || echo "Brave MCP Server responded"
+          bash scripts/ci/cuda/ci_install_dependency.sh
 
       - name: Download wheel artifact
         uses: actions/download-artifact@v4
@@ -283,14 +297,27 @@ jobs:
         run: |
           python3 -m pip install pytest pytest-rerunfailures httpx openai grpcio grpcio-health-checking numpy
           if [ -n "${{ matrix.extra_deps }}" ]; then
-            python3 -m pip --no-cache-dir install --upgrade ${{ matrix.extra_deps }}
+            if echo "${{ matrix.extra_deps }}" | grep -q "genai-bench"; then
+              # genai-bench's transitive deps (oci/locust) pull
+              # transformers<5 which requires huggingface_hub<1.0 — that
+              # downgrades the 1.11.0 ci_install_dependency.sh settled on
+              # and breaks `kernels` (requires huggingface_hub>=1.3.0,<2.0).
+              # Install --no-deps and supply the runtime deps explicitly.
+              python3 -m pip --no-cache-dir install --no-deps ${{ matrix.extra_deps }}
+              python3 -m pip --no-cache-dir install \
+                locust click rich tenacity oci openpyxl gevent matplotlib
+            else
+              # Other extras with well-behaved transitive deps —
+              # normal --upgrade install path.
+              python3 -m pip --no-cache-dir install --upgrade ${{ matrix.extra_deps }}
+            fi
           fi
 
       - name: Run E2E tests
         run: |
           python3 python/sglang/cli/killall.py
           cd sgl-model-gateway
-          ${{ matrix.env_vars }} ROUTER_LOCAL_MODEL_PATH="/home/ubuntu/models" pytest ${{ matrix.reruns }} ${{ matrix.parallel_opts }} ${{ matrix.test_dirs }} -s -vv -o log_cli=true --log-cli-level=INFO
+          ${{ matrix.env_vars }} pytest ${{ matrix.reruns }} ${{ matrix.parallel_opts }} ${{ matrix.test_dirs }} -s -vv -o log_cli=true --log-cli-level=INFO
 
       - name: Upload benchmark results
         if: matrix.upload_benchmarks && success()
@@ -298,18 +325,6 @@ jobs:
         with:
           name: genai-bench-results-all-policies
           path: sgl-model-gateway/benchmark_**/
-
-      - name: Cleanup Brave MCP Server
-        if: always() && matrix.setup_brave
-        run: |
-          docker stop brave-search-server || true
-          docker rm brave-search-server || true
-
-      - name: Cleanup Oracle Database
-        if: always() && matrix.setup_oracle
-        run: |
-          docker stop oracle-db || true
-          docker rm oracle-db || true
 
   docker-build-test:
     if: |

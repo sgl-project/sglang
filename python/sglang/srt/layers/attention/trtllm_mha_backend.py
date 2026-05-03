@@ -183,14 +183,18 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     def _get_layer_cache_loc(
         self,
         layer: RadixAttention,
-        cache_loc: torch.Tensor,
+        forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Return cache locations in the correct index space for the given layer."""
         if self.use_sliding_window_kv_pool:
             _, is_swa = self._swa_kv_pool.layers_mapping[layer.layer_id]
             if is_swa:
-                return self._swa_kv_pool.translate_loc_from_full_to_swa(cache_loc)
-        return cache_loc
+                if forward_batch.out_cache_loc_swa is not None:
+                    return forward_batch.out_cache_loc_swa
+                return self._swa_kv_pool.translate_loc_from_full_to_swa(
+                    forward_batch.out_cache_loc
+                )
+        return forward_batch.out_cache_loc
 
     def _bind_swa_page_table(
         self, metadata: TRTLLMMHAMetadata, source: dict, key: str, bs: int
@@ -524,14 +528,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
-            accept_length = spec_info.accept_length[:bs]
-            if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu) + 1
+            extend_lens = spec_info.num_accepted_tokens[:bs]
+            if spec_info.num_accepted_tokens_cpu:
+                metadata.max_seq_len_q = max(spec_info.num_accepted_tokens_cpu)
             else:
                 metadata.max_seq_len_q = 1
 
             metadata.cu_seqlens_q[1:].copy_(
-                torch.cumsum(accept_length, dim=0, dtype=torch.int32)
+                torch.cumsum(extend_lens, dim=0, dtype=torch.int32)
             )
 
             max_seq_pages = (
@@ -563,7 +567,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ):
         """Fused FP8 quantization and KV cache write."""
-        cache_loc = self._get_layer_cache_loc(layer, forward_batch.out_cache_loc)
+        cache_loc = self._get_layer_cache_loc(layer, forward_batch)
 
         # Get K/V cache buffers from token_to_kv_pool
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)

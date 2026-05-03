@@ -13,7 +13,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
-from sglang.srt.mem_cache.mamba_radix_cache import MambaRadixCache
+from sglang.srt.mem_cache.hi_mamba_radix_cache import HiMambaRadixCache
+from sglang.srt.mem_cache.mamba_radix_cache import LRUList, MambaRadixCache, TreeNode
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -21,7 +22,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=9, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -391,6 +392,176 @@ class TestMamba(unittest.TestCase):
             return req
 
         return tree, allocator, req_to_token_pool, make_dummy_req
+
+    def test_hi_mamba_tombstone_cleanup_respects_host_ref(self):
+        tree = object.__new__(HiMambaRadixCache)
+        root = TreeNode()
+        parent = TreeNode()
+        deleted = TreeNode()
+
+        root.key = RadixKey([])
+        parent.key = RadixKey([1])
+        deleted.key = RadixKey([2])
+        parent.parent = root
+        deleted.parent = parent
+        parent.value = torch.tensor([1], dtype=torch.int64)
+        parent.protect_host()
+        root.children[parent.key.child_key(1)] = parent
+
+        class RecordingCacheController:
+            def __init__(self):
+                self.device_evictions = []
+                self.host_evictions = []
+
+            def evict_device(self, value):
+                self.device_evictions.append(value)
+
+            def evict_host(self, value):
+                self.host_evictions.append(value)
+
+        tree.root_node = root
+        tree.page_size = 1
+        tree.full_lru_list = LRUList(mamba=False)
+        tree.full_lru_list.insert_mru(parent)
+        tree.cache_controller = RecordingCacheController()
+        tree.full_evictable_size_ = len(parent.value)
+        tree.evictable_full_device_leaves = {parent}
+        tree.evictable_full_host_leaves = set()
+
+        result_node, full_evicted, mamba_evicted = (
+            tree._iteratively_delete_tombstone_leaf(deleted)
+        )
+
+        self.assertIs(result_node, deleted)
+        self.assertEqual(full_evicted, 0)
+        self.assertEqual(mamba_evicted, 0)
+        self.assertIs(root.children[parent.key.child_key(1)], parent)
+        self.assertTrue(tree.full_lru_list.in_list(parent))
+        self.assertEqual(tree.cache_controller.device_evictions, [])
+        self.assertEqual(tree.cache_controller.host_evictions, [])
+
+    def test_mamba_pool_cpu_offload(self):
+        """MambaPool.get_cpu_copy / load_cpu_copy round-trips conv and temporal state."""
+        _, _, req_to_token_pool, _ = self._setup_tree_and_allocator()
+        mamba_pool = req_to_token_pool.mamba_pool
+        n = 3
+        indices = mamba_pool.alloc(n)
+        self.assertIsNotNone(indices)
+
+        # Write known sentinel values at the allocated slots.
+        for conv in mamba_pool.mamba_cache.conv:
+            conv[:, indices] = 1.0
+        mamba_pool.mamba_cache.temporal[:, indices] = 2.0
+
+        # Save to CPU.
+        conv_cpu, temporal_cpu = mamba_pool.get_cpu_copy(indices)
+
+        # Verify CPU tensors match what was written.
+        for i, conv in enumerate(mamba_pool.mamba_cache.conv):
+            expected = conv[:, indices].cpu()
+            self.assertTrue(
+                torch.allclose(conv_cpu[i].float(), expected.float()),
+                f"conv[{i}] CPU copy mismatch",
+            )
+        expected_t = mamba_pool.mamba_cache.temporal[:, indices].cpu()
+        self.assertTrue(
+            torch.allclose(temporal_cpu.float(), expected_t.float()),
+            "temporal CPU copy mismatch",
+        )
+
+        # Zero out GPU slots and restore from CPU copy.
+        for conv in mamba_pool.mamba_cache.conv:
+            conv[:, indices] = 0.0
+        mamba_pool.mamba_cache.temporal[:, indices] = 0.0
+
+        mamba_pool.load_cpu_copy((conv_cpu, temporal_cpu), indices)
+
+        # Verify restored values match the sentinels.
+        for conv in mamba_pool.mamba_cache.conv:
+            restored = conv[:, indices]
+            self.assertTrue(
+                torch.all(restored == 1.0),
+                "conv not restored after load_cpu_copy",
+            )
+        self.assertTrue(
+            torch.all(mamba_pool.mamba_cache.temporal[:, indices] == 2.0),
+            "temporal not restored after load_cpu_copy",
+        )
+
+    def test_hybrid_kv_pool_cpu_offload(self):
+        """HybridLinearKVPool.get_cpu_copy / load_cpu_copy saves and restores both
+        the full-attention KV cache and Mamba state in a single round-trip."""
+        _, allocator, req_to_token_pool, _ = self._setup_tree_and_allocator()
+        mamba_pool = req_to_token_pool.mamba_pool
+        hybrid_pool = allocator._kvcache  # HybridLinearKVPool
+
+        self.assertIsInstance(hybrid_pool, HybridLinearKVPool)
+
+        n_tokens = 4
+        kv_indices = allocator.alloc(n_tokens)
+        self.assertIsNotNone(kv_indices)
+        mamba_indices = mamba_pool.alloc(1)
+        self.assertIsNotNone(mamba_indices)
+
+        # Write sentinel values into KV buffers (all full-attention layers).
+        for layer_id in range(hybrid_pool.full_kv_pool.layer_num):
+            hybrid_pool.full_kv_pool.k_buffer[layer_id][kv_indices] = 3.0
+            hybrid_pool.full_kv_pool.v_buffer[layer_id][kv_indices] = 4.0
+
+        # Write sentinel values into Mamba state.
+        for conv in mamba_pool.mamba_cache.conv:
+            conv[:, mamba_indices] = 5.0
+        mamba_pool.mamba_cache.temporal[:, mamba_indices] = 6.0
+
+        # --- Round-trip with Mamba indices provided ---
+        cpu_copy = allocator.get_cpu_copy(kv_indices, mamba_indices=mamba_indices)
+        kv_cpu, mamba_cpu = cpu_copy
+        self.assertIsNotNone(
+            mamba_cpu, "mamba_cpu should be saved when mamba_indices given"
+        )
+
+        # Zero out GPU.
+        for layer_id in range(hybrid_pool.full_kv_pool.layer_num):
+            hybrid_pool.full_kv_pool.k_buffer[layer_id][kv_indices] = 0.0
+            hybrid_pool.full_kv_pool.v_buffer[layer_id][kv_indices] = 0.0
+        for conv in mamba_pool.mamba_cache.conv:
+            conv[:, mamba_indices] = 0.0
+        mamba_pool.mamba_cache.temporal[:, mamba_indices] = 0.0
+
+        allocator.load_cpu_copy(cpu_copy, kv_indices, mamba_indices=mamba_indices)
+
+        # Verify KV restored.
+        for layer_id in range(hybrid_pool.full_kv_pool.layer_num):
+            self.assertTrue(
+                torch.all(
+                    hybrid_pool.full_kv_pool.k_buffer[layer_id][kv_indices] == 3.0
+                ),
+                f"k_buffer layer {layer_id} not restored",
+            )
+            self.assertTrue(
+                torch.all(
+                    hybrid_pool.full_kv_pool.v_buffer[layer_id][kv_indices] == 4.0
+                ),
+                f"v_buffer layer {layer_id} not restored",
+            )
+
+        # Verify Mamba restored.
+        for conv in mamba_pool.mamba_cache.conv:
+            self.assertTrue(
+                torch.all(conv[:, mamba_indices] == 5.0),
+                "conv not restored after load_cpu_copy",
+            )
+        self.assertTrue(
+            torch.all(mamba_pool.mamba_cache.temporal[:, mamba_indices] == 6.0),
+            "temporal not restored after load_cpu_copy",
+        )
+
+        # --- Without mamba_indices: mamba_cpu must be None ---
+        cpu_copy_no_mamba = allocator.get_cpu_copy(kv_indices, mamba_indices=None)
+        _, mamba_cpu_none = cpu_copy_no_mamba
+        self.assertIsNone(
+            mamba_cpu_none, "mamba_cpu should be None when mamba_indices=None"
+        )
 
     def test_insert_prev_prefix_len(self):
         """Test that prev_prefix_len correctly controls which KV indices are freed
