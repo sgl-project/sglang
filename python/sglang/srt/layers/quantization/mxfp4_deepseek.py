@@ -146,7 +146,7 @@ class DeepSeekMxfp4MoEMethod:
         elif self.moe_runner_backend.is_humming():
             from sglang.srt.layers.moe.moe_runner import MoeRunner
 
-            moe_runner_config.layer = layer
+            moe_runner_config = dataclasses.replace(moe_runner_config, layer=layer)
             self.runner = MoeRunner(MoeRunnerBackend.HUMMING, moe_runner_config)
 
         swiglu_limit = moe_runner_config.swiglu_limit
