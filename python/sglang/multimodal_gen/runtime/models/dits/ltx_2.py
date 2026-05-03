@@ -34,6 +34,7 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embed
 from sglang.multimodal_gen.runtime.managers.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -879,6 +880,13 @@ class LTX2TransformerBlock(nn.Module):
             prefix=f"{prefix}.audio_to_video_attn",
             quant_config=quant_config,
         )
+        # LTX-2.3's official config keeps video-to-audio cross-attention on
+        # SDPA. FlashAttention is faster on H100, but it changes the floating
+        # point reduction order, so only enable it during explicit perf/quality
+        # experiments.
+        force_v2a_sdpa = force_sdpa_v2a_cross_attention and not get_bool_env_var(
+            "SGLANG_LTX2_ALLOW_FA_V2A_CROSS_ATTN"
+        )
         self.video_to_audio_attn = LTX2Attention(
             query_dim=audio_dim,
             context_dim=dim,
@@ -890,7 +898,7 @@ class LTX2TransformerBlock(nn.Module):
             apply_gated_attention=apply_gated_attention,
             supported_attention_backends=(
                 {AttentionBackendEnum.TORCH_SDPA}
-                if force_sdpa_v2a_cross_attention
+                if force_v2a_sdpa
                 else supported_attention_backends
             ),
             prefix=f"{prefix}.video_to_audio_attn",
