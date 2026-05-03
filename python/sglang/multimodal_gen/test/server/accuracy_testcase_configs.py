@@ -8,54 +8,20 @@ from sglang.multimodal_gen.test.server.accuracy_config import (
     ComponentType,
     should_skip_component,
 )
+from sglang.multimodal_gen.test.server.accuracy_utils import (
+    extract_component_path_overrides,
+)
+from sglang.multimodal_gen.test.server.component_accuracy import COMPONENT_SPECS
 from sglang.multimodal_gen.test.server.testcase_configs import DiffusionTestCase
-
-
-COMPONENT_KEYS = {
-    ComponentType.VAE: (
-        "vae",
-        "vae_model",
-        "autoencoder",
-        "autoencoder_kl",
-        "video_vae",
-        "audio_vae",
-    ),
-    ComponentType.TRANSFORMER: ("transformer", "unet", "dit", "video_dit", "audio_dit"),
-    ComponentType.TEXT_ENCODER: (
-        "text_encoder",
-        "text_encoder_2",
-        "text_encoder_3",
-        "image_encoder",
-    ),
-}
-
-
-def _extract_component_path_overrides(extra_args: list[str]) -> dict[str, str]:
-    component_paths: dict[str, str] = {}
-    index = 0
-    while index < len(extra_args):
-        arg = extra_args[index]
-        key_part = arg.split("=", 1)[0] if "=" in arg else arg
-        if key_part.startswith("--") and key_part.endswith("-path"):
-            component = key_part[2:-5].replace("-", "_")
-            if "=" in arg:
-                component_paths[component] = arg.split("=", 1)[1]
-            elif index + 1 < len(extra_args) and not extra_args[index + 1].startswith(
-                "-"
-            ):
-                index += 1
-                component_paths[component] = extra_args[index]
-        index += 1
-    return component_paths
 
 
 def _component_accuracy_key(
     case: DiffusionTestCase, component: ComponentType
 ) -> tuple:
     server_args = case.server_args
-    component_paths = _extract_component_path_overrides(server_args.extras)
+    component_paths = extract_component_path_overrides(server_args.extras)
     override_path = None
-    for key in (component.value, *COMPONENT_KEYS[component]):
+    for key in (component.value, *COMPONENT_SPECS[component].model_index_keys):
         if key in component_paths:
             override_path = component_paths[key]
             break
