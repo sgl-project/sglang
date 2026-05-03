@@ -143,6 +143,11 @@ class DeepSeekMxfp4MoEMethod:
             from sglang.srt.layers.moe.moe_runner import MoeRunner
 
             self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+        elif self.moe_runner_backend.is_humming():
+            from sglang.srt.layers.moe.moe_runner import MoeRunner
+
+            moe_runner_config.layer = layer
+            self.runner = MoeRunner(MoeRunnerBackend.HUMMING, moe_runner_config)
 
         swiglu_limit = moe_runner_config.swiglu_limit
         is_2604b = envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B"
@@ -233,7 +238,35 @@ class DeepSeekMxfp4MoEMethod:
         if getattr(layer, "_mega_moe_weights_built", False):
             return
 
-        if self.moe_runner_backend.is_marlin():
+        if self.moe_runner_backend.is_humming():
+            from sglang.srt.layers.quantization.humming_utils import (
+                prepare_humming_moe_layer,
+            )
+
+            log_info_on_rank0(
+                logger,
+                f"Preparing DeepSeekV4 MXFP4 experts for Humming backend (layer: {self.prefix})...",
+            )
+
+            layer.register_parameter(
+                "w13_weight_scale",
+                Parameter(
+                    layer.w13_weight_scale_inv.to(torch.float8_e8m0fnu),
+                    requires_grad=False,
+                ),
+            )
+            layer.register_parameter(
+                "w2_weight_scale",
+                Parameter(
+                    layer.w2_weight_scale_inv.to(torch.float8_e8m0fnu),
+                    requires_grad=False,
+                ),
+            )
+
+            del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
+            prepare_humming_moe_layer(layer, {"quant_method": "mxfp4"})
+            return
+        elif self.moe_runner_backend.is_marlin():
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
             )
@@ -380,7 +413,12 @@ class DeepSeekMxfp4MoEMethod:
         layer: Module,
         dispatch_output: DispatchOutput,
     ) -> CombineInput:
-        if self.moe_runner_backend.is_marlin():
+        if self.moe_runner_backend.is_humming():
+            from sglang.srt.layers.moe.moe_runner.humming import HummingMoeQuantInfo
+
+            quant_info = HummingMoeQuantInfo()
+            return self.runner.run(dispatch_output, quant_info)
+        elif self.moe_runner_backend.is_marlin():
             from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
             from sglang.srt.layers.moe.topk import TopKOutputChecker
 
