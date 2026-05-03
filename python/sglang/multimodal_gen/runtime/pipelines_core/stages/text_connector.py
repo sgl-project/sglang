@@ -63,9 +63,16 @@ class LTX2TextConnectorStage(PipelineStage):
             dtype = prompt_embeds.dtype
             pos_additive_mask = (prompt_attention_mask.to(torch.int64) - 1).to(
                 dtype
+            ).reshape(
+                prompt_attention_mask.shape[0], 1, -1, prompt_attention_mask.shape[-1]
             ) * torch.finfo(dtype).max
             neg_additive_mask = (neg_prompt_attention_mask.to(torch.int64) - 1).to(
                 dtype
+            ).reshape(
+                neg_prompt_attention_mask.shape[0],
+                1,
+                -1,
+                neg_prompt_attention_mask.shape[-1],
             ) * torch.finfo(dtype).max
 
             with set_forward_context(current_timestep=None, attn_metadata=None):
@@ -87,6 +94,8 @@ class LTX2TextConnectorStage(PipelineStage):
             dtype = prompt_embeds.dtype
             additive_attention_mask = (prompt_attention_mask.to(torch.int64) - 1).to(
                 dtype
+            ).reshape(
+                prompt_attention_mask.shape[0], 1, -1, prompt_attention_mask.shape[-1]
             ) * torch.finfo(dtype).max
 
             with set_forward_context(current_timestep=None, attn_metadata=None):
