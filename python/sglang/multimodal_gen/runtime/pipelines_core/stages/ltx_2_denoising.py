@@ -25,6 +25,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     is_ltx2_two_stage_pipeline_name,
 )
+from sglang.multimodal_gen.runtime.utils.common import get_bool_env_var
 
 LTX23_RES2S_STEP_NOISE_SEED = -1
 LTX23_RES2S_SUBSTEP_NOISE_SEED = 9999
@@ -1477,30 +1478,38 @@ class LTX2DenoisingStage(DenoisingStage):
             float(stage1_guider_params["video_modality_scale"]) != 1.0
             or float(stage1_guider_params["audio_modality_scale"]) != 1.0
         )
-        # NOTE: this flag must be identical across all SP ranks so that every
-        # rank executes the same number of model-forward calls (each of which
-        # contains NCCL collectives).
-        use_split_stage1_guided_passes = (
+        num_image_tokens = int(getattr(batch, "ltx2_num_image_tokens", 0))
+        batch_hq_stage1_guidance = (
             server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
+            and num_image_tokens == 0
+            and get_bool_env_var("SGLANG_LTX2_BATCH_HQ_STAGE1_GUIDANCE")
+        )
+        # Stage-1 guidance evaluates several versions of the same latent: the
+        # positive prompt, the negative prompt, and optional STG/modality cases
+        # where selected video/audio attention paths are disabled. The faster
+        # path expands those versions into one transformer call and attaches one
+        # perturbation config to each expanded batch item; a perturbation config
+        # is just that item's list of attention paths to disable. HQ keeps
+        # separate transformer calls by default because the batched path changed
+        # some HQ/TI2V outputs in earlier validation. The env var only opts HQ
+        # text-to-video, which has no image tokens, into the batched path for
+        # benchmarking.
+        #
+        # This choice must be identical across all SP ranks so every rank runs
+        # the same number of model calls, including the NCCL collectives inside.
+        use_split_stage1_guided_passes = (
+            (
+                server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
+                and not batch_hq_stage1_guidance
+            )
             or (
                 is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
-                and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
+                and num_image_tokens > 0
             )
         )
-        # "Perturbation" means disabling selected attention paths
-        # for that item (self-attention blocks or audio/video cross-attention)
-        # to compute STG/modality guidance.
-        #
-
-        # Decide whether to use different pass kwargs for split model calls
-        # 1. HQ splits the expanded batch into one-item model calls. Since each
-        # call has only one perturbation setting, pass the disable options
-        # directly as model arguments.
-        # 2. TI2V/non-HQ may keep several expanded
-        # items with different settings in one model call, so it needs
-        # perturbation_configs: one config dict per expanded item.
         use_split_pass_kwargs = (
             server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
+            and use_split_stage1_guided_passes
         )
         skip_v2a_cross_attn_for_video_gt = bool(
             batch.extra.get("ltx2_skip_v2a_cross_attn_for_video_gt", False)
