@@ -928,6 +928,217 @@ def summarize_relaykv_policy_dry_run_events_for_smoke(
     }
 
 
+def _fake_materialization_block_ids(
+    event: Mapping[str, Any],
+    key: str,
+) -> list[Any]:
+    value = _event_value(event, key)
+    if value is None:
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"RelayKV fake materialization {key} must be list or tuple")
+    return list(value)
+
+
+def build_relaykv_fake_materialization_results_for_smoke(
+    policy_dry_run_events: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    readiness: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build fake materialization result payloads from dry-run events only.
+
+    This validates result schema without reading KV pools, taking snapshots,
+    executing host backup copy, connecting attention, mutating scheduler state,
+    or writing runtime state.
+    """
+
+    if not isinstance(policy_dry_run_events, (list, tuple)):
+        raise TypeError("policy_dry_run_events must be a list or tuple")
+    if readiness is not None and not isinstance(readiness, Mapping):
+        raise TypeError("readiness must be a mapping or None")
+
+    readiness_ready = (
+        True
+        if readiness is None
+        else readiness.get("ready_for_materialization") is True
+    )
+    readiness_blocking_reasons: list[str] = []
+    if readiness is not None:
+        blocking_reasons = readiness.get("blocking_reasons")
+        if isinstance(blocking_reasons, (list, tuple)):
+            readiness_blocking_reasons = [str(reason) for reason in blocking_reasons]
+    if readiness is not None and not readiness_ready and not readiness_blocking_reasons:
+        readiness_blocking_reasons = ["readiness_not_met"]
+
+    results: list[dict[str, Any]] = []
+    for event in policy_dry_run_events:
+        if not isinstance(event, Mapping):
+            raise TypeError("RelayKV fake materialization events must be mappings")
+        selected_block_ids = _fake_materialization_block_ids(
+            event, "selected_block_ids"
+        )
+        anchor_block_ids = _fake_materialization_block_ids(event, "anchor_block_ids")
+        recent_block_ids = _fake_materialization_block_ids(event, "recent_block_ids")
+        candidate_block_ids = _fake_materialization_block_ids(
+            event, "candidate_block_ids"
+        )
+        blocking_reasons: list[str] = []
+        warning_reasons: list[str] = []
+        materialized_block_ids: list[Any] = []
+        skipped_block_ids: list[Any] = []
+        retrieved_block_ids: list[Any] = []
+
+        if not readiness_ready:
+            materialization_state = "blocked"
+            blocking_reasons = list(readiness_blocking_reasons)
+            skipped_block_ids = list(selected_block_ids)
+        elif not selected_block_ids:
+            materialization_state = "skipped"
+            warning_reasons.append("no_selected_blocks")
+        else:
+            materialization_state = "fake_materialized"
+            materialized_block_ids = list(selected_block_ids)
+            retrieved_block_ids = list(selected_block_ids)
+        if readiness is None:
+            warning_reasons.append("readiness_not_provided")
+
+        results.append(
+            {
+                "event_type": "relaykv_materialization_result",
+                "request_id": _event_value(event, "request_id"),
+                "req_pool_idx": _event_req_pool_idx_value(event),
+                "seq_len": _event_value(event, "seq_len"),
+                "layer_id": _event_layer_value(event),
+                "materialization_state": materialization_state,
+                "materialization_mode": "fake",
+                "selected_block_ids": selected_block_ids,
+                "materialized_block_ids": materialized_block_ids,
+                "skipped_block_ids": skipped_block_ids,
+                "fallback_block_ids": [],
+                "anchor_block_ids": anchor_block_ids,
+                "recent_block_ids": recent_block_ids,
+                "retrieved_block_ids": retrieved_block_ids,
+                "candidate_block_ids": candidate_block_ids,
+                "materialized_kv_count": len(materialized_block_ids),
+                "materialized_token_count": 0,
+                "source": "policy_dry_run_fake_materialization",
+                "blocking_reasons": blocking_reasons,
+                "warning_reasons": warning_reasons,
+                "source_mutated": False,
+                "attention_override": False,
+                "kv_cache_mutation": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "host_backup_copy_executed": False,
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+            }
+        )
+    return results
+
+
+def summarize_relaykv_materialization_results_for_smoke(
+    results: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize fake RelayKV materialization result payloads."""
+
+    if not isinstance(results, (list, tuple)):
+        raise TypeError("RelayKV materialization results must be a list or tuple")
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_state: Counter[str] = Counter()
+    per_mode: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "source_mutated_true_count": 0,
+            "attention_override_true_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "host_backup_copy_executed_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+        }
+    )
+    materialized_kv_count = 0
+    materialized_token_count = 0
+    guarded_noop_count = 0
+    candidate_event_materialized_count = 0
+    host_backup_copy_materialized_count = 0
+    skipped_count = 0
+    fallback_count = 0
+    blocked_count = 0
+    error_count = 0
+
+    for result in results:
+        if not isinstance(result, Mapping):
+            raise TypeError("RelayKV materialization result must be a mapping")
+        state = str(_event_value(result, "materialization_state") or "unknown")
+        mode = str(_event_value(result, "materialization_mode") or "unknown")
+        per_state[state] += 1
+        per_mode[mode] += 1
+        per_request[str(_event_value(result, "request_id"))] += 1
+        per_layer[str(_event_layer_value(result))] += 1
+        if state == "fake_materialized":
+            candidate_event_materialized_count += 1
+        elif state == "skipped":
+            skipped_count += 1
+            guarded_noop_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+            guarded_noop_count += 1
+        elif state == "fallback":
+            fallback_count += 1
+        elif state == "error":
+            error_count += 1
+
+        kv_count = _event_value(result, "materialized_kv_count")
+        if isinstance(kv_count, int):
+            materialized_kv_count += kv_count
+        token_count = _event_value(result, "materialized_token_count")
+        if isinstance(token_count, int):
+            materialized_token_count += token_count
+
+        if _event_value(result, "source_mutated") is True:
+            safety_counts["source_mutated_true_count"] += 1
+        if _event_value(result, "attention_override") is True:
+            safety_counts["attention_override_true_count"] += 1
+        if _event_value(result, "kv_cache_mutation") is True:
+            safety_counts["kv_cache_mutation_true_count"] += 1
+        if _event_value(result, "runtime_writeback") is True:
+            safety_counts["runtime_writeback_true_count"] += 1
+        if _event_value(result, "scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+        if _event_value(result, "host_backup_copy_executed") is True:
+            safety_counts["host_backup_copy_executed_count"] += 1
+            host_backup_copy_materialized_count += 1
+        if _event_value(result, "kv_pool_read") is True:
+            safety_counts["kv_pool_read_count"] += 1
+        if _event_value(result, "kv_snapshot") is True:
+            safety_counts["kv_snapshot_count"] += 1
+
+    return {
+        "summary_type": "relaykv_materialization_summary",
+        "total_materialization_results": len(results),
+        "materialized_result_count": candidate_event_materialized_count,
+        "fake_materialized_count": candidate_event_materialized_count,
+        "guarded_noop_count": guarded_noop_count,
+        "candidate_event_materialized_count": candidate_event_materialized_count,
+        "host_backup_copy_materialized_count": host_backup_copy_materialized_count,
+        "skipped_count": skipped_count,
+        "fallback_count": fallback_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_state_counts": dict(sorted(per_state.items())),
+        "per_mode_counts": dict(sorted(per_mode.items())),
+        "materialized_kv_count": materialized_kv_count,
+        "materialized_token_count": materialized_token_count,
+        **dict(safety_counts),
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
