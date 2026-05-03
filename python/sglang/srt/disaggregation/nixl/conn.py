@@ -1102,6 +1102,8 @@ class NixlKVSender(CommonKVSender):
             logger.warning(
                 f"KVSender check_xfer_state failed for room {self.bootstrap_room}: {e}"
             )
+            self._send_failed = True
+            self._send_error = e
             return KVPoll.Failed  # type: ignore
         if all(x == "DONE" for x in states):
             return KVPoll.Success  # type: ignore
