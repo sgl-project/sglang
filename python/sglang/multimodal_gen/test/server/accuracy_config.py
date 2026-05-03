@@ -98,6 +98,9 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
         ComponentType.VAE: ComponentSkip(
             "Representative VAE accuracy is already covered by zimage_image_t2i for the same source component and topology"
         ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "FP8 transformer override cannot be materialized by the Diffusers reference loader"
+        ),
         ComponentType.TEXT_ENCODER: ComponentSkip(
             "Representative text encoder accuracy is already covered by zimage_image_t2i for the same source component and topology"
         ),
