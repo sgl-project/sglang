@@ -1122,32 +1122,6 @@ class LTX2DenoisingStage(DenoisingStage):
         finally:
             setattr(model, attr, previous)
 
-    @staticmethod
-    @contextmanager
-    def _temporary_ltx23_hq_sdpa_flags(enabled: bool):
-        if not enabled or not torch.cuda.is_available():
-            yield
-            return
-
-        previous = (
-            torch.backends.cuda.cudnn_sdp_enabled(),
-            torch.backends.cuda.flash_sdp_enabled(),
-            torch.backends.cuda.mem_efficient_sdp_enabled(),
-            torch.backends.cuda.math_sdp_enabled(),
-        )
-        torch.backends.cuda.enable_cudnn_sdp(True)
-        torch.backends.cuda.enable_flash_sdp(True)
-        torch.backends.cuda.enable_mem_efficient_sdp(True)
-        torch.backends.cuda.enable_math_sdp(False)
-        try:
-            yield
-        finally:
-            cudnn, flash, mem_efficient, math = previous
-            torch.backends.cuda.enable_cudnn_sdp(cudnn)
-            torch.backends.cuda.enable_flash_sdp(flash)
-            torch.backends.cuda.enable_mem_efficient_sdp(mem_efficient)
-            torch.backends.cuda.enable_math_sdp(math)
-
     @contextmanager
     def _ltx2_model_forward_context(
         self,
@@ -1157,13 +1131,10 @@ class LTX2DenoisingStage(DenoisingStage):
         with self._temporary_ltx23_hq_timestep_semantics(
             step.current_model, ctx.use_ltx23_hq_timestep_semantics
         ):
-            with self._temporary_ltx23_hq_sdpa_flags(
-                ctx.use_ltx23_hq_timestep_semantics
+            with set_forward_context(
+                current_timestep=step.step_index, attn_metadata=step.attn_metadata
             ):
-                with set_forward_context(
-                    current_timestep=step.step_index, attn_metadata=step.attn_metadata
-                ):
-                    yield
+                yield
 
     def _prepare_denoising_loop(
         self,
