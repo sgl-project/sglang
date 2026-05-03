@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_head_dim, is_deepseek_dsa
+from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_dsa
 from sglang.srt.distributed.parallel_state import get_world_group
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -146,16 +146,16 @@ class ModelRunnerKVCacheMixin:
         # since it is not compatible for trtllm and other mla attn backend due to the different
         # kv cache layout.
         if (
-            self.server_args.dsa_prefill_backend == "trtllm"
-            or self.server_args.dsa_decode_backend == "trtllm"
+            self.server_args.nsa_prefill_backend == "trtllm"
+            or self.server_args.nsa_decode_backend == "trtllm"
         ):
             return kv_cache_dim
 
         # On HIP with TileLang backend, keep the default MLA KV cache dimension.
         # FP8 attention uses the nope(512 fp8) + rope(64 fp8) layout, without extra per-block scales.
         if _is_hip and (
-            self.server_args.dsa_prefill_backend == "tilelang"
-            or self.server_args.dsa_decode_backend == "tilelang"
+            self.server_args.nsa_prefill_backend == "tilelang"
+            or self.server_args.nsa_decode_backend == "tilelang"
         ):
             return kv_cache_dim
 
@@ -301,7 +301,7 @@ class ModelRunnerKVCacheMixin:
                     enable_memory_saver=self.server_args.enable_memory_saver,
                     start_layer=self.start_layer,
                     end_layer=self.end_layer,
-                    index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
+                    index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
                 )
             elif self.use_mla_backend:
                 PoolCls = current_platform.get_mla_kv_pool_cls()
@@ -424,7 +424,7 @@ class ModelRunnerKVCacheMixin:
                 enable_memory_saver=self.server_args.enable_memory_saver,
                 start_layer=self.start_layer,
                 end_layer=self.end_layer,
-                index_head_dim=get_dsa_index_head_dim(self.model_config.hf_config),
+                index_head_dim=get_nsa_index_head_dim(self.model_config.hf_config),
             )
             if self.enable_hisparse:
                 from sglang.srt.mem_cache.sparsity import parse_hisparse_config

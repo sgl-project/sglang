@@ -60,9 +60,9 @@ class TestDeepseekV32DP(CustomTestCase):
             "--enable-dp-attention",
             "--model-loader-extra-config",
             '{"enable_multithread_load": true}',
-            "--dsa-prefill-backend",
+            "--nsa-prefill-backend",
             "tilelang",
-            "--dsa-decode-backend",
+            "--nsa-decode-backend",
             "tilelang",
         ]
         cls.process = popen_launch_server(

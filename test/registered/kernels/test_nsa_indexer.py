@@ -248,8 +248,8 @@ class MockModelRunner:
                 "speculative_eagle_topk": None,
                 "speculative_num_draft_tokens": 0,
                 "enable_deterministic_inference": False,
-                "dsa_prefill_backend": "flashmla_sparse",
-                "dsa_decode_backend": "fa3",
+                "nsa_prefill_backend": "flashmla_sparse",
+                "nsa_decode_backend": "fa3",
             },
         )()
 
@@ -261,8 +261,8 @@ class TestNSAIndexer(CustomTestCase):
         """Set up global server args for testing."""
         server_args = ServerArgs(model_path="dummy")
         server_args.enable_dp_attention = False
-        server_args.dsa_prefill_backend = "flashmla_sparse"
-        server_args.dsa_decode_backend = "flashmla_sparse"
+        server_args.nsa_prefill_backend = "flashmla_sparse"
+        server_args.nsa_decode_backend = "flashmla_sparse"
         set_global_server_args_for_scheduler(server_args)
 
         # Check GPU capability for FP8

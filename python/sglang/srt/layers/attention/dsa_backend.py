@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlia
 
 import torch
 
-from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_dsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
@@ -306,7 +306,7 @@ class DSABackend(DSAMTPPrecomputeMixin, AttentionBackend):
         self.nsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
-        self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
+        self.dsa_index_topk = get_nsa_index_topk(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_attention_tp_size()
@@ -321,9 +321,9 @@ class DSABackend(DSAMTPPrecomputeMixin, AttentionBackend):
 
         self.use_mha: bool = False
         self.nsa_prefill_impl: _NSA_IMPL_T = (
-            model_runner.server_args.dsa_prefill_backend
+            model_runner.server_args.nsa_prefill_backend
         )
-        self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.dsa_decode_backend
+        self.nsa_decode_impl: _NSA_IMPL_T = model_runner.server_args.nsa_decode_backend
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:

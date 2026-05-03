@@ -108,17 +108,17 @@ def is_deepseek_dsa(config) -> bool:
     )
 
 
-def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
+def get_nsa_index_head_dim(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_head_dim
 
 
-def get_dsa_index_topk(config: PretrainedConfig) -> int:
+def get_nsa_index_topk(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_topk
 
 
-def get_dsa_index_n_heads(config: PretrainedConfig) -> int:
+def get_nsa_index_n_heads(config: PretrainedConfig) -> int:
     assert is_deepseek_dsa(config)
     return config.index_n_heads
 
@@ -532,7 +532,7 @@ class ModelConfig:
             self.qk_rope_head_dim = self.hf_text_config.qk_rope_head_dim
             self.v_head_dim = self.hf_text_config.v_head_dim
             self.index_head_dim = (
-                get_dsa_index_head_dim(self.hf_text_config)
+                get_nsa_index_head_dim(self.hf_text_config)
                 if is_deepseek_dsa(self.hf_text_config)
                 else None
             )

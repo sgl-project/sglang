@@ -34,9 +34,9 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
-    get_dsa_index_head_dim,
-    get_dsa_index_n_heads,
-    get_dsa_index_topk,
+    get_nsa_index_head_dim,
+    get_nsa_index_n_heads,
+    get_nsa_index_topk,
     is_deepseek_dsa,
 )
 from sglang.srt.distributed import (
@@ -1243,10 +1243,10 @@ class DeepseekV2AttentionMLA(
             is_neox_style = not getattr(config, "indexer_rope_interleave", False)
             self.indexer = Indexer(
                 hidden_size=hidden_size,
-                index_n_heads=get_dsa_index_n_heads(config),
-                index_head_dim=get_dsa_index_head_dim(config),
+                index_n_heads=get_nsa_index_n_heads(config),
+                index_head_dim=get_nsa_index_head_dim(config),
                 rope_head_dim=qk_rope_head_dim,
-                index_topk=get_dsa_index_topk(config),
+                index_topk=get_nsa_index_topk(config),
                 q_lora_rank=q_lora_rank,
                 max_position_embeddings=max_position_embeddings,
                 rope_theta=rope_theta,
