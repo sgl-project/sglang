@@ -356,31 +356,29 @@ class LTX2DenoisingStage(DenoisingStage):
         sigma_max: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if sigma_down is not None:
-            alpha_ratio = (1.0 - sigma_next) / (1.0 - sigma_down)
-            sigma_up = torch.sqrt(
-                torch.clamp(
-                    sigma_next.square() - sigma_down.square() * alpha_ratio.square(),
-                    min=0.0,
-                )
-            )
+            alpha_ratio = (1 - sigma_next) / (1 - sigma_down)
+            sigma_up = (
+                sigma_next**2 - sigma_down**2 * alpha_ratio**2
+            ).clamp(min=0) ** 0.5
         elif sigma_up is not None:
-            sigma_up = torch.minimum(sigma_up, sigma_next * 0.9999)
+            sigma_up.clamp_(max=sigma_next * 0.9999)
             sigmax = sigma_max if sigma_max is not None else torch.ones_like(sigma_next)
             sigma_signal = sigmax - sigma_next
-            sigma_residual = torch.sqrt(
-                torch.clamp(sigma_next.square() - sigma_up.square(), min=0.0)
-            )
+            sigma_residual = (sigma_next**2 - sigma_up**2).clamp(min=0) ** 0.5
             alpha_ratio = sigma_signal + sigma_residual
             sigma_down = sigma_residual / alpha_ratio
         else:
             alpha_ratio = torch.ones_like(sigma_next)
             sigma_down = sigma_next
             sigma_up = torch.zeros_like(sigma_next)
-        return (
-            torch.nan_to_num(alpha_ratio),
-            torch.nan_to_num(sigma_down),
-            torch.nan_to_num(sigma_up),
+
+        sigma_up = torch.nan_to_num(
+            sigma_up if sigma_up is not None else torch.zeros_like(sigma_next), 0.0
         )
+        nan_mask = torch.isnan(sigma_down)
+        sigma_down[nan_mask] = sigma_next[nan_mask].to(sigma_down.dtype)
+        alpha_ratio = torch.nan_to_num(alpha_ratio, 1.0)
+        return alpha_ratio, sigma_down, sigma_up
 
     @classmethod
     def _ltx2_res2s_sde_step(
