@@ -1553,11 +1553,8 @@ class LTX2DenoisingStage(DenoisingStage):
         # rank executes the same number of model-forward calls (each of which
         # contains NCCL collectives).
         use_split_stage1_guided_passes = (
-            server_args.pipeline_class_name == "LTX2TwoStageHQPipeline"
-            or (
-                is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
-                and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
-            )
+            is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name)
+            and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
         )
         # "Perturbation" means disabling selected attention paths
         # for that item (self-attention blocks or audio/video cross-attention)
