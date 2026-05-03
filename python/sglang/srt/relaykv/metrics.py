@@ -497,6 +497,136 @@ def join_runtime_observation_with_host_backup_candidates_for_smoke(
     }
 
 
+_REPORT_SAFETY_COUNTER_KEYS = (
+    "source_mutated_true_count",
+    "attention_override_true_count",
+    "kv_cache_mutation_true_count",
+    "runtime_writeback_true_count",
+    "scheduler_policy_noop_false_count",
+)
+
+
+def _readonly_report_value(
+    missing_field_counts: Counter[str],
+    *sources_and_keys: tuple[Mapping[str, Any], tuple[str, ...]],
+) -> int:
+    for source, keys in sources_and_keys:
+        for key in keys:
+            value = source.get(key)
+            if isinstance(value, int):
+                return value
+    missing_field_counts["missing_field_count"] += 1
+    return 0
+
+
+def _readonly_report_safety_counter(
+    missing_field_counts: Counter[str],
+    key: str,
+    *sources: Mapping[str, Any],
+) -> int:
+    values = [source.get(key) for source in sources if isinstance(source.get(key), int)]
+    if not values:
+        missing_field_counts["missing_field_count"] += 1
+        return 0
+    return max(values)
+
+
+def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
+    runtime_observation_summary: Mapping[str, Any],
+    host_backup_candidate_summary: Mapping[str, Any],
+    join_summary: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build a read-only runtime/candidate/join report for smoke tests.
+
+    This combines precomputed summary dictionaries only. It does not execute
+    host backup copy, read KV pools, create KV snapshots, connect attention,
+    change scheduler decisions, or write runtime state.
+    """
+
+    if not isinstance(runtime_observation_summary, Mapping):
+        raise TypeError("runtime_observation_summary must be a mapping")
+    if not isinstance(host_backup_candidate_summary, Mapping):
+        raise TypeError("host_backup_candidate_summary must be a mapping")
+    if not isinstance(join_summary, Mapping):
+        raise TypeError("join_summary must be a mapping")
+
+    missing_field_counts: Counter[str] = Counter({"missing_field_count": 0})
+    total_runtime_payloads = _readonly_report_value(
+        missing_field_counts,
+        (runtime_observation_summary, ("total_runtime_payloads", "total_payloads")),
+        (join_summary, ("total_runtime_payloads", "total_payloads")),
+    )
+    total_host_backup_candidate_events = _readonly_report_value(
+        missing_field_counts,
+        (
+            host_backup_candidate_summary,
+            ("total_host_backup_candidate_events", "total_candidate_events"),
+        ),
+        (join_summary, ("total_host_backup_candidate_events", "total_candidate_events")),
+    )
+    joined_count = _readonly_report_value(
+        missing_field_counts,
+        (join_summary, ("joined_count",)),
+    )
+    unmatched_runtime_count = _readonly_report_value(
+        missing_field_counts,
+        (join_summary, ("unmatched_runtime_count",)),
+    )
+    unmatched_candidate_count = _readonly_report_value(
+        missing_field_counts,
+        (join_summary, ("unmatched_candidate_count",)),
+    )
+    req_pool_idx_joined_count = _readonly_report_value(
+        missing_field_counts,
+        (join_summary, ("req_pool_idx_joined_count",)),
+    )
+    req_pool_idx_missing_count = _readonly_report_value(
+        missing_field_counts,
+        (join_summary, ("req_pool_idx_missing_count",)),
+    )
+
+    safety_counts = {
+        key: _readonly_report_safety_counter(
+            missing_field_counts,
+            key,
+            runtime_observation_summary,
+            host_backup_candidate_summary,
+            join_summary,
+        )
+        for key in _REPORT_SAFETY_COUNTER_KEYS
+    }
+    report_generated_from_readonly_inputs = True
+    overall_safety_status = (
+        "pass"
+        if report_generated_from_readonly_inputs
+        and all(value == 0 for value in safety_counts.values())
+        else "fail"
+    )
+    report_warning_counts = {
+        "missing_field_warning_count": missing_field_counts["missing_field_count"]
+    }
+
+    return {
+        "report_type": "relaykv_readonly_runtime_candidate_join_report",
+        "report_generated_from_readonly_inputs": report_generated_from_readonly_inputs,
+        "runtime_observation_summary": dict(runtime_observation_summary),
+        "host_backup_candidate_summary": dict(host_backup_candidate_summary),
+        "join_summary": dict(join_summary),
+        "overall_safety_status": overall_safety_status,
+        "total_runtime_payloads": total_runtime_payloads,
+        "total_host_backup_candidate_events": total_host_backup_candidate_events,
+        "joined_count": joined_count,
+        "unmatched_runtime_count": unmatched_runtime_count,
+        "unmatched_candidate_count": unmatched_candidate_count,
+        "join_granularity": str(join_summary.get("join_granularity", "unknown")),
+        "req_pool_idx_joined_count": req_pool_idx_joined_count,
+        "req_pool_idx_missing_count": req_pool_idx_missing_count,
+        **safety_counts,
+        "missing_field_counts": dict(missing_field_counts),
+        "report_warning_counts": report_warning_counts,
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
