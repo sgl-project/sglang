@@ -267,31 +267,12 @@ class LTX2DenoisingStage(DenoisingStage):
         )
 
     @classmethod
-    def _ltx2_res2s_new_noise_for_shape(
-        cls,
-        shape: tuple[int, ...],
-        reference_tensor: torch.Tensor,
-        generator: torch.Generator,
-    ) -> torch.Tensor:
-        noise = torch.randn(
-            shape,
-            generator=generator,
-            dtype=torch.float64,
-            device=reference_tensor.device,
-        )
-        noise = (noise - noise.mean()) / noise.std()
-        return cls._ltx2_channelwise_normalize(noise)
-
-    @classmethod
     def _ltx2_res2s_noise_like(
         cls,
         reference_tensor: torch.Tensor,
         ctx: LTX2DenoisingContext,
         *,
         substep: bool,
-        batch: Req | None = None,
-        server_args: ServerArgs | None = None,
-        modality: str = "video",
     ) -> torch.Tensor:
         generator = (
             ctx.res2s_substep_noise_generator
@@ -300,54 +281,6 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         if generator is None:
             raise ValueError("LTX-2 res2s noise generator was not initialized.")
-        if (
-            reference_tensor.ndim == 3
-            and batch is not None
-            and server_args is not None
-            and modality in ("video", "audio")
-        ):
-            pipeline_config = server_args.pipeline_config
-            batch_size = int(reference_tensor.shape[0])
-            if modality == "video":
-                patch_size = int(pipeline_config.patch_size)
-                patch_size_t = int(pipeline_config.patch_size_t)
-                channels = int(reference_tensor.shape[2]) // (
-                    patch_size_t * patch_size * patch_size
-                )
-                noise = cls._ltx2_res2s_new_noise_for_shape(
-                    (
-                        batch_size,
-                        channels,
-                        int(ctx.latent_num_frames_for_model),
-                        int(ctx.latent_height),
-                        int(ctx.latent_width),
-                    ),
-                    reference_tensor,
-                    generator,
-                )
-                noise = pipeline_config.maybe_pack_latents(noise, batch_size, batch)
-            else:
-                num_mel_bins = (
-                    int(pipeline_config.audio_vae_config.arch_config.mel_bins)
-                    // int(
-                        pipeline_config.audio_vae_config.arch_config.mel_compression_ratio
-                    )
-                )
-                channels = int(reference_tensor.shape[2]) // int(num_mel_bins)
-                noise = cls._ltx2_res2s_new_noise_for_shape(
-                    (
-                        batch_size,
-                        channels,
-                        int(reference_tensor.shape[1]),
-                        int(num_mel_bins),
-                    ),
-                    reference_tensor,
-                    generator,
-                )
-                noise = pipeline_config.maybe_pack_audio_latents(
-                    noise, batch_size, batch
-                )
-            return noise.to(dtype=reference_tensor.dtype)
         return cls._ltx2_res2s_new_noise(reference_tensor, generator).to(
             dtype=reference_tensor.dtype
         )
@@ -454,7 +387,6 @@ class LTX2DenoisingStage(DenoisingStage):
         *,
         ctx: "LTX2DenoisingContext",
         batch: Req,
-        server_args: ServerArgs,
         sigma: torch.Tensor,
         sigma_next: torch.Tensor,
         model_video_velocity: torch.Tensor,
@@ -517,26 +449,12 @@ class LTX2DenoisingStage(DenoisingStage):
         midpoint_audio_det = anchor_audio + h * a21 * eps1_audio
 
         sub_noise_video = (
-            self._ltx2_res2s_noise_like(
-                ctx.latents,
-                ctx,
-                substep=True,
-                batch=batch,
-                server_args=server_args,
-                modality="video",
-            ).float()
+            self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=True).float()
             if ctx.use_native_hq_res2s_sde_noise
             else self._randn_like_with_batch_generators(ctx.latents, batch).float()
         )
         sub_noise_audio = (
-            self._ltx2_res2s_noise_like(
-                ctx.audio_latents,
-                ctx,
-                substep=True,
-                batch=batch,
-                server_args=server_args,
-                modality="audio",
-            ).float()
+            self._ltx2_res2s_noise_like(ctx.audio_latents, ctx, substep=True).float()
             if ctx.use_native_hq_res2s_sde_noise
             else self._randn_like_with_batch_generators(
                 ctx.audio_latents, batch
@@ -605,26 +523,12 @@ class LTX2DenoisingStage(DenoisingStage):
         next_audio_det = anchor_audio + h * (b1 * eps1_audio + b2 * eps2_audio)
 
         step_noise_video = (
-            self._ltx2_res2s_noise_like(
-                ctx.latents,
-                ctx,
-                substep=False,
-                batch=batch,
-                server_args=server_args,
-                modality="video",
-            ).float()
+            self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=False).float()
             if ctx.use_native_hq_res2s_sde_noise
             else self._randn_like_with_batch_generators(ctx.latents, batch).float()
         )
         step_noise_audio = (
-            self._ltx2_res2s_noise_like(
-                ctx.audio_latents,
-                ctx,
-                substep=False,
-                batch=batch,
-                server_args=server_args,
-                modality="audio",
-            ).float()
+            self._ltx2_res2s_noise_like(ctx.audio_latents, ctx, substep=False).float()
             if ctx.use_native_hq_res2s_sde_noise
             else self._randn_like_with_batch_generators(
                 ctx.audio_latents, batch
@@ -1565,7 +1469,6 @@ class LTX2DenoisingStage(DenoisingStage):
                 ctx.latents, ctx.audio_latents = self._ltx2_stage2_res2s_step(
                     ctx=ctx,
                     batch=batch,
-                    server_args=server_args,
                     sigma=sigma,
                     sigma_next=sigma_next,
                     model_video_velocity=model_video,
@@ -2026,14 +1929,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 midpoint_audio_deterministic = anchor_audio + h * a21 * eps1_audio
 
                 substep_video_noise = (
-                    self._ltx2_res2s_noise_like(
-                        ctx.latents,
-                        ctx,
-                        substep=True,
-                        batch=batch,
-                        server_args=server_args,
-                        modality="video",
-                    ).float()
+                    self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=True).float()
                     if ctx.use_native_hq_res2s_sde_noise
                     else self._randn_like_with_batch_generators(
                         ctx.latents, batch
@@ -2041,12 +1937,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 )
                 substep_audio_noise = (
                     self._ltx2_res2s_noise_like(
-                        ctx.audio_latents,
-                        ctx,
-                        substep=True,
-                        batch=batch,
-                        server_args=server_args,
-                        modality="audio",
+                        ctx.audio_latents, ctx, substep=True
                     ).float()
                     if ctx.use_native_hq_res2s_sde_noise
                     else self._randn_like_with_batch_generators(
@@ -2107,14 +1998,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 )
 
                 step_video_noise = (
-                    self._ltx2_res2s_noise_like(
-                        ctx.latents,
-                        ctx,
-                        substep=False,
-                        batch=batch,
-                        server_args=server_args,
-                        modality="video",
-                    ).float()
+                    self._ltx2_res2s_noise_like(ctx.latents, ctx, substep=False).float()
                     if ctx.use_native_hq_res2s_sde_noise
                     else self._randn_like_with_batch_generators(
                         ctx.latents, batch
@@ -2122,12 +2006,7 @@ class LTX2DenoisingStage(DenoisingStage):
                 )
                 step_audio_noise = (
                     self._ltx2_res2s_noise_like(
-                        ctx.audio_latents,
-                        ctx,
-                        substep=False,
-                        batch=batch,
-                        server_args=server_args,
-                        modality="audio",
+                        ctx.audio_latents, ctx, substep=False
                     ).float()
                     if ctx.use_native_hq_res2s_sde_noise
                     else self._randn_like_with_batch_generators(
