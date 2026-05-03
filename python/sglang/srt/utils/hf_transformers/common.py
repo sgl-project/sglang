@@ -100,16 +100,21 @@ _CONFIG_REGISTRY: Dict[str, Type[PretrainedConfig]] = {
     ]
 }
 
-# DeepSeek V4 reuses the V3 config schema. Subclass the upstream transformers
-# class with the V4 model_type so AutoConfig.register passes its consistency
-# check (which requires class.model_type == registered key). Default-value
-# divergences (e.g. topk_group) are handled in model_config.py post-load.
+# DeepSeek V3.2 / V4 reuse the V3 config schema. Subclass the upstream
+# transformers class with each model_type so AutoConfig.register passes its
+# consistency check (which requires class.model_type == registered key).
+# Default-value divergences (e.g. V4's topk_group) are handled in
+# model_config.py post-load.
 try:
     from transformers import DeepseekV3Config as _HFDeepseekV3Config
+
+    class _DeepseekV32ConfigAlias(_HFDeepseekV3Config):
+        model_type = "deepseek_v32"
 
     class _DeepseekV4ConfigAlias(_HFDeepseekV3Config):
         model_type = "deepseek_v4"
 
+    _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
 except ImportError:
     pass
@@ -326,42 +331,6 @@ def _override_v_head_dim_if_zero(config: PretrainedConfig, patch: int = 128) -> 
         logger.warning(
             f"Overriding v_head_dim from 0 to {patch} to avoid potential issues."
         )
-
-
-def _load_deepseek_temp_model(
-    model_path: str,
-    architecture: str,
-    name_prefix: str,
-    trust_remote_code: bool = False,
-    revision: Optional[str] = None,
-    **kwargs,
-):
-    """Temporary hack for DeepSeek V3.2 / V4: rewrite config.json with the
-    given ``architecture`` and ``model_type=deepseek_v3`` so AutoConfig can
-    load it via the deepseek_v3 registry."""
-    import tempfile
-
-    local_path = download_from_hf(model_path)
-    config_file = os.path.join(local_path, "config.json")
-    if not os.path.exists(config_file):
-        raise RuntimeError(f"Can't find config file in {local_path}.")
-
-    with open(config_file, "r") as f:
-        config_json = json.load(f)
-
-    config_json["architectures"] = [architecture]
-    config_json["model_type"] = "deepseek_v3"
-
-    tmp_path = os.path.join(tempfile.gettempdir(), "_tmp_config_folder")
-    os.makedirs(tmp_path, exist_ok=True)
-
-    unique_path = os.path.join(tmp_path, f"{name_prefix}_{os.getpid()}")
-    with open(unique_path, "w") as f:
-        json.dump(config_json, f)
-
-    return AutoConfig.from_pretrained(
-        unique_path, trust_remote_code=trust_remote_code, revision=revision, **kwargs
-    )
 
 
 # ---------------------------------------------------------------------------

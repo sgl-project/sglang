@@ -225,6 +225,11 @@ class ServerArgs(DisaggArgsMixin):
     webui_port: int | None = 12312
 
     scheduler_port: int = 5555
+    batching_mode: str = "dynamic"
+    batching_max_size: int = 1
+    batching_delay_ms: float = 0.0
+    batching_config: str | None = None
+    enable_batching_metrics: bool = False
 
     # Strict port mode: fail if requested port is unavailable instead of auto-selecting
     strict_ports: bool = False
@@ -325,6 +330,7 @@ class ServerArgs(DisaggArgsMixin):
         if not current_platform.is_cpu():
             self._validate_parallelism()
         self._validate_cfg_parallel()
+        self._validate_batching()
 
     def _adjust_save_paths(self):
         """Normalize empty-string save paths to None (disabled)."""
@@ -1021,6 +1027,41 @@ class ServerArgs(DisaggArgsMixin):
             help="Port for the scheduler server.",
         )
         parser.add_argument(
+            "--batching-mode",
+            type=str,
+            default=ServerArgs.batching_mode,
+            choices=["dynamic"],
+            help="Request batching scheduler mode. Currently only 'dynamic' is implemented.",
+        )
+        parser.add_argument(
+            "--batching-max-size",
+            type=int,
+            default=ServerArgs.batching_max_size,
+            help="Maximum number of compatible generation requests to merge into one batch.",
+        )
+        parser.add_argument(
+            "--batching-delay-ms",
+            type=float,
+            default=ServerArgs.batching_delay_ms,
+            help="Maximum time (in ms) to wait for forming a larger batch before dispatch.",
+        )
+        parser.add_argument(
+            "--batching-config",
+            type=str,
+            default=ServerArgs.batching_config,
+            help=(
+                "Optional JSON file with {'schema_version': 1, 'rules': [...]} "
+                "batching admission rules that can cap model/resolution shapes "
+                "below --batching-max-size."
+            ),
+        )
+        parser.add_argument(
+            "--enable-batching-metrics",
+            action="store_true",
+            default=ServerArgs.enable_batching_metrics,
+            help="Log periodic batch efficiency metrics such as realized batch size and queue wait time.",
+        )
+        parser.add_argument(
             "--host",
             type=str,
             default=ServerArgs.host,
@@ -1460,6 +1501,14 @@ class ServerArgs(DisaggArgsMixin):
             raise ValueError(
                 "CFG Parallelism is enabled via `--enable-cfg-parallel`, but num_gpus == 1"
             )
+
+    def _validate_batching(self):
+        if self.batching_mode != "dynamic":
+            raise ValueError("batching_mode must be one of: dynamic")
+        if self.batching_max_size < 1:
+            raise ValueError("batching_max_size must be >= 1")
+        if self.batching_delay_ms < 0:
+            raise ValueError("batching_delay_ms must be >= 0")
 
     def _set_default_attention_backend(self) -> None:
         """Configure ROCm defaults when users do not specify an attention backend."""
