@@ -939,6 +939,30 @@ class ServingChatTestCase(unittest.TestCase):
                 req.chat_template_kwargs = kwargs
                 self.assertEqual(chat._get_reasoning_from_request(req), expected)
 
+    def test_poolside_v1_does_not_double_prepend_think(self):
+        """When `enable_thinking=True` for poolside_v1, the HF chat template
+        already emits `<think>` via add_generation_prompt — server must NOT
+        append a second `<think>` (regression for serving_chat.py:679-684)."""
+        tm = _MockTokenizerManager()
+        tm.server_args.reasoning_parser = "poolside_v1"
+        chat = OpenAIServingChat(tm, _MockTemplateManager())
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "hi"}],
+            chat_template_kwargs={"enable_thinking": True},
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "BASE_PROMPT"
+            conv_ins.image_data = conv_ins.audio_data = conv_ins.video_data = None
+            conv_ins.modalities = []
+            conv_ins.stop_str = []
+            conv_mock.return_value = conv_ins
+            result = chat._apply_conversation_template(req, is_multimodal=False)
+        self.assertEqual(result.prompt, "BASE_PROMPT")
+
 
 class TestProcessToolCallsWithRequiredToolChoice(unittest.TestCase):
     """Test _process_tool_calls with tool_choice='required' uses model-specific parser."""

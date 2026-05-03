@@ -117,8 +117,6 @@ class LagunaConfig(PretrainedConfig):
         self.max_position_embeddings = max_position_embeddings
         self.initializer_range = initializer_range
         self.rms_norm_eps = rms_norm_eps
-        # Some shared SGLang utilities read `layernorm_epsilon`; mirror it.
-        self.layernorm_epsilon = rms_norm_eps
         self.use_cache = use_cache
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
@@ -155,23 +153,20 @@ class LagunaConfig(PretrainedConfig):
 
         # SGLang's hybrid-SWA core reads `swa_*` KV/head_dim from hf_text_config.
         # Per-layer Q-head count is read directly from num_attention_heads_per_layer.
-        try:
-            full_idx = self.layer_types.index("full_attention")
-        except ValueError:
-            full_idx = 0
+        # Pure-SWA models would have no full_attention layer, but the synthesized
+        # default above always plants one at index 0; let .index() raise if a
+        # caller passes an all-sliding layer_types — silent fallback would wire
+        # the SWA head count into a "full" attribute and corrupt downstream sizes.
+        full_idx = self.layer_types.index("full_attention")
         self.num_attention_heads = self.num_attention_heads_per_layer[full_idx]
         self.swa_num_key_value_heads = num_key_value_heads
         self.swa_head_dim = head_dim
         self.swa_v_head_dim = head_dim
 
-        # Normalise `full_rp` / `swa_rp` to always-dict; reuse the same dict
-        # for both when the caller passes a non-nested rope_parameters (legacy).
+        # Released checkpoint nests rope_parameters under layer-type keys.
         rp = rope_parameters if isinstance(rope_parameters, dict) else {}
-        if "full_attention" in rp or "sliding_attention" in rp:
-            full_rp = rp.get("full_attention") or {}
-            swa_rp = rp.get("sliding_attention") or {}
-        else:
-            full_rp = swa_rp = rp
+        full_rp = rp.get("full_attention") or {}
+        swa_rp = rp.get("sliding_attention") or {}
 
         # transformers v5 aliases `rope_scaling` ↔ `rope_parameters` on
         # PretrainedConfig — writing one clobbers the other. Keep the nested
@@ -196,7 +191,13 @@ class LagunaConfig(PretrainedConfig):
         )
         self.swa_rope_scaling = _to_sglang_rope_scaling(swa_rp)
 
-        # DeepSeek/GLM-V2-style MoE aliases that shared SGLang utilities expect.
+        # DeepSeek-style aliases consumed by cross-cutting infra outside this
+        # model file: `lora/mem_pool.py` and `lora/utils.py` read
+        # `n_routed_experts` / `n_shared_experts` / `first_k_dense_replace`,
+        # `elastic_ep/expert_backup_*` reads `n_routed_experts`. The
+        # hardcoded `n_shared_experts=1` and `norm_topk_prob=True` reflect
+        # Laguna's fixed architecture (one shared expert, sigmoid-renormalized
+        # top-k routing).
         self.n_routed_experts = num_experts
         self.n_shared_experts = 1
         self.routed_scaling_factor = moe_routed_scaling_factor

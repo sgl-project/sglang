@@ -11,7 +11,6 @@ from sglang.srt.parser.reasoning_parser import (
     KimiDetector,
     KimiK2Detector,
     Nemotron3Detector,
-    PoolsideV1Detector,
     Qwen3Detector,
     ReasoningParser,
     StreamingParseResult,
@@ -1500,79 +1499,13 @@ class TestGptOssDetectorToolCall(CustomTestCase):
         self.assertIn("done", all_normal)
 
 
-class TestPoolsideV1Detector(CustomTestCase):
-    """
-    poolside/Laguna-XS.2 reasoning wire format: `<think>...</think>...`.
+class TestPoolsideV1Registered(CustomTestCase):
+    """poolside_v1 (Laguna-XS.2) reuses the Qwen3 `<think>...</think>` envelope.
+    Request dispatch differs (Mimo-style explicit `enable_thinking=True`,
+    asserted in test_serving_chat.py), but the detector itself is Qwen3."""
 
-    Envelope matches Qwen3 (hence the subclass), but request dispatch is
-    NOT Qwen3-style: Laguna's chat template defaults `enable_thinking=false`,
-    so `serving_chat._get_reasoning_from_request` routes `poolside_v1`
-    through the Mimo-style branch (require explicit `enable_thinking=True`).
-    When the server constructs the detector with `force_reasoning=True`, the
-    model output stream begins inside reasoning and the first `</think>` ends
-    it; otherwise output is plain text unless the model itself emits `<think>`.
-    """
-
-    def setUp(self):
-        self.detector = PoolsideV1Detector()
-
-    def test_init_defaults(self):
-        self.assertEqual(self.detector.think_start_token, "<think>")
-        self.assertEqual(self.detector.think_end_token, "</think>")
-        self.assertFalse(self.detector._in_reasoning)
-        self.assertTrue(self.detector.stream_reasoning)
-
-    def test_init_force_reasoning(self):
-        detector = PoolsideV1Detector(force_reasoning=True)
-        self.assertTrue(detector._in_reasoning)
-
-    def test_detect_thinking_mode(self):
-        text = "let me think</think>The answer is 42."
-        detector = PoolsideV1Detector(force_reasoning=True)
-        result = detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "let me think")
-        self.assertEqual(result.normal_text, "The answer is 42.")
-
-    def test_detect_non_thinking_mode(self):
-        text = "Direct answer."
-        result = self.detector.detect_and_parse(text)
-        self.assertEqual(result.normal_text, text)
-        self.assertEqual(result.reasoning_text, "")
-
-    def test_detect_with_explicit_start_token(self):
-        text = "<think>step</think>final"
-        result = self.detector.detect_and_parse(text)
-        self.assertEqual(result.reasoning_text, "step")
-        self.assertEqual(result.normal_text, "final")
-
-    def test_streaming_chunked_full_block(self):
-        chunks = ["<thi", "nk>r1 r2", "</think>", "nm"]
-        reasoning, normal = "", ""
-        for chunk in chunks:
-            r = self.detector.parse_streaming_increment(chunk)
-            reasoning += r.reasoning_text
-            normal += r.normal_text
-        self.assertEqual(reasoning, "r1 r2")
-        self.assertEqual(normal, "nm")
-
-    def test_streaming_partial_start_token_buffered(self):
-        result = self.detector.parse_streaming_increment("<thi")
-        self.assertEqual(result.reasoning_text, "")
-        self.assertEqual(result.normal_text, "")
-
-    def test_streaming_force_reasoning(self):
-        detector = PoolsideV1Detector(force_reasoning=True)
-        result = detector.parse_streaming_increment("step1 ")
-        self.assertEqual(result.reasoning_text, "step1 ")
-        result = detector.parse_streaming_increment("step2")
-        self.assertEqual(result.reasoning_text, "step2")
-        result = detector.parse_streaming_increment("</think>answer")
-        self.assertEqual(result.reasoning_text, "")
-        self.assertEqual(result.normal_text, "answer")
-
-    def test_registered_in_detector_map(self):
-        self.assertIn("poolside_v1", ReasoningParser.DetectorMap)
-        self.assertIs(ReasoningParser.DetectorMap["poolside_v1"], PoolsideV1Detector)
+    def test_registered_to_qwen3(self):
+        self.assertIs(ReasoningParser.DetectorMap["poolside_v1"], Qwen3Detector)
 
 
 if __name__ == "__main__":

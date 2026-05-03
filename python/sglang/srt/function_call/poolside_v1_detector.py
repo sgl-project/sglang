@@ -86,10 +86,6 @@ class PoolsideV1Detector(BaseFormatDetector):
 
     def __init__(self):
         super().__init__()
-
-        # Streaming FSM. DRAINING (unknown-tool drain) replaces the old
-        # `skip_until_call_end` boolean and kills the "set name_sent=True
-        # unconditionally to avoid spinning" hack.
         self.parsed_pos: int = 0
         self._state: _ParseState = _ParseState.OUTSIDE
         self.current_func_name: Optional[str] = None
@@ -196,27 +192,15 @@ class PoolsideV1Detector(BaseFormatDetector):
                 continue
         return raw
 
-    @staticmethod
-    def _strip_edge_newlines(value: str) -> str:
-        if value.startswith("\n"):
-            value = value[1:]
-        if value.endswith("\n"):
-            value = value[:-1]
-        return value
-
     def _find_name_boundary(self, text: str) -> int:
         """Earliest of `\\n`, `<arg_key>`, `</tool_call>`. -1 if none."""
-        candidates = []
-        nl = text.find("\n")
-        if nl != -1:
-            candidates.append(nl)
-        ak = text.find(self.arg_key_start)
-        if ak != -1:
-            candidates.append(ak)
-        te = text.find(self.tool_call_end_token)
-        if te != -1:
-            candidates.append(te)
-        return min(candidates) if candidates else -1
+        hits = (
+            text.find("\n"),
+            text.find(self.arg_key_start),
+            text.find(self.tool_call_end_token),
+        )
+        positive = [h for h in hits if h != -1]
+        return min(positive) if positive else -1
 
     def _is_partial_tag(self, slice_: str) -> bool:
         """True if slice_ is a strict prefix of any known tag — i.e. more
@@ -252,7 +236,7 @@ class PoolsideV1Detector(BaseFormatDetector):
             args: dict = {}
             for raw_key, raw_val in self.arg_pair_regex.findall(body):
                 key = raw_key.strip()
-                val = self._strip_edge_newlines(raw_val)
+                val = raw_val.strip("\n")
                 args[key] = self._convert_param_value(val, schema, key)
 
             calls.append(
@@ -391,9 +375,7 @@ class PoolsideV1Detector(BaseFormatDetector):
                     end = slice_.find(self.arg_value_end)
                     if end == -1:
                         break  # incomplete <arg_value> — no partial emission
-                    raw = self._strip_edge_newlines(
-                        slice_[len(self.arg_value_start) : end]
-                    )
+                    raw = slice_[len(self.arg_value_start) : end].strip("\n")
                     # READING_VALUE is reachable only via READING_KEY
                     # consuming an <arg_key>...</arg_key>, so
                     # current_pending_key is set by construction.

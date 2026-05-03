@@ -61,11 +61,6 @@ from sglang.srt.utils import LazyValue, add_prefix, make_layers
 logger = logging.getLogger(__name__)
 
 
-def _get_attention_sliding_window_size(config: LagunaConfig) -> int:
-    # SGLang's window is exclusive; HF's `sliding_window` is inclusive.
-    return config.sliding_window - 1
-
-
 class LagunaMLP(nn.Module):
     def __init__(
         self,
@@ -147,8 +142,6 @@ class LagunaMoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        self.config = config
-        self.layer_id = layer_id
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.moe_routed_scaling_factor
         self.router_logit_softcapping = getattr(
@@ -196,11 +189,7 @@ class LagunaMoE(nn.Module):
         )
 
     def get_moe_weights(self):
-        return [
-            x.data
-            for name, x in self.experts.named_parameters()
-            if name not in ("correction_bias",)
-        ]
+        return [x.data for x in self.experts.parameters()]
 
     def forward(
         self,
@@ -409,7 +398,8 @@ class LagunaDecoderLayer(nn.Module):
             partial_rotary_factor=partial_rotary_factor,
             max_position_embeddings=config.max_position_embeddings,
             attention_bias=config.attention_bias,
-            sliding_window_size=_get_attention_sliding_window_size(config),
+            # SGLang's window is exclusive; HF's `sliding_window` is inclusive.
+            sliding_window_size=config.sliding_window - 1,
             layer_type=layer_type,
             quant_config=quant_config,
             prefix=add_prefix("self_attn", prefix),
@@ -547,24 +537,6 @@ class LagunaModel(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
-        # `get_rope` memoises by cache key; if a future config-normaliser
-        # collapsed the full/sliding keys we'd silently apply the wrong rope
-        # to one layer-type. Catch it loud at construction.
-        full_rope = swa_rope = None
-        for i in range(self.start_layer, self.end_layer):
-            attn = self.layers[i].self_attn
-            if config.layer_types[i] == "full_attention" and full_rope is None:
-                full_rope = attn.rotary_emb
-            elif config.layer_types[i] == "sliding_attention" and swa_rope is None:
-                swa_rope = attn.rotary_emb
-            if full_rope is not None and swa_rope is not None:
-                break
-        if full_rope is not None and swa_rope is not None:
-            assert full_rope is not swa_rope, (
-                "Full and sliding rotary embeddings collapsed to one cached "
-                "instance — check rope_scaling / base / partial_rotary_factor."
-            )
-
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
@@ -618,7 +590,6 @@ class LagunaForCausalLM(nn.Module):
         super().__init__()
         self.pp_group = get_pp_group()
         self.config = config
-        self.quant_config = quant_config
         self.model = LagunaModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
