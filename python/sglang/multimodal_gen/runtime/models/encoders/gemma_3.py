@@ -213,18 +213,11 @@ class Gemma3Attention(nn.Module):
             is_neox_style=True,
         )
 
-        # NOTE(gmixiaojin): The shared RotaryEmbedding above computes inv_freq on
-        # GPU and uses the x1*cos - x2*sin formula, which causes slight
-        # numerical differences vs HuggingFace (see the NOTE in
-        # rotary_embedding.py:_compute_inv_freq).  For HF-exact alignment we
-        # precompute inv_freq on CPU and use rotate_half in self.rotary_emb().
-        freq_indices = (
-            torch.arange(0, self.head_dim, 2, dtype=torch.int64).float() / self.head_dim
+        self.rope_scaling_factor = (
+            float(rope_scaling["factor"])
+            if rope_scaling and rope_scaling.get("factor")
+            else None
         )
-        inv_freq = 1.0 / (self.rope_theta**freq_indices)
-        if rope_scaling and rope_scaling.get("factor"):
-            inv_freq = inv_freq / float(rope_scaling["factor"])
-        self.register_buffer("_hf_inv_freq", inv_freq, persistent=False)
 
         # Local Attention not support attention mask, we use global attention instead.
         # self.attn = LocalAttention(
@@ -246,12 +239,19 @@ class Gemma3Attention(nn.Module):
         )
 
     def rotary_emb(self, positions, q, k):
-        """Apply RoPE using HF-exact formula with precomputed inv_freq."""
+        """Apply RoPE using the same device-side inv_freq materialization as LTX."""
         positions_flat = positions.flatten().float()
         num_tokens = positions_flat.shape[0]
 
         with torch.autocast(device_type=q.device.type, enabled=False):
-            freqs = torch.outer(positions_flat, self._hf_inv_freq.float())
+            freq_indices = (
+                torch.arange(0, self.head_dim, 2, dtype=torch.int64, device=q.device).float()
+                / self.head_dim
+            )
+            inv_freq = 1.0 / (self.rope_theta**freq_indices)
+            if self.rope_scaling_factor is not None:
+                inv_freq = inv_freq / self.rope_scaling_factor
+            freqs = torch.outer(positions_flat, inv_freq)
             emb = freqs.repeat(1, 2)
             cos = emb.cos().to(q.dtype).unsqueeze(1)
             sin = emb.sin().to(q.dtype).unsqueeze(1)
