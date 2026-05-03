@@ -1,0 +1,3 @@
+# RULER tokenizer cache — content-addressed; regenerable via run_calib.sh
+# (run_calib.sh's NIAH_CACHE_DIR=data/kv_calib/ruler/niah_cache).
+data/kv_calib/ruler/niah_cache/

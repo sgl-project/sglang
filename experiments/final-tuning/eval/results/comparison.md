@@ -8,14 +8,6 @@ Both servers TP=1 on A100-80GB, **PCG enabled on both**. ShareGPT, 300 prompts, 
 
 | mc | metric | baseline | treatment | Δ |
 |---:|:---|---:|---:|---:|
-| 32 | TPS (req/s) | 7.016 | 7.043 | +0.4% |
-| 32 | output throughput (tok/s) | 1421.6 | 1427.0 | +0.4% |
-| 32 | median TTFT (ms) | 62.0 | 66.3 | +6.9% |
-| 32 | mean TTFT (ms) | 106.4 | 115.9 | +8.9% |
-| 32 | p99 TTFT (ms) | 533.1 | 611.7 | +14.7% |
-| 32 | median ITL (ms) | 15.69 | 15.03 | -4.2% |
-| 32 | mean ITL (ms) | 19.59 | 19.63 | +0.2% |
-| 32 | p99 ITL (ms) | 83.74 | 91.96 | +9.8% |
 | 64 | TPS (req/s) | 7.864 | 8.110 | +3.1% |
 | 64 | output throughput (tok/s) | 1593.4 | 1643.2 | +3.1% |
 | 64 | median TTFT (ms) | 76.4 | 82.9 | +8.5% |

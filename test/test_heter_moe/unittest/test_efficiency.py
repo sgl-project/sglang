@@ -175,20 +175,26 @@ def _make_kernel_inputs(m_per_expert, device):
 def _build_mixed_dispatch(topk_ids, topk_w, device):
     """Split experts into cold (INT4) and hot (BF16) groups.
 
-    First half of experts → cold (INT4, sentinel=E for Marlin).
-    Second half → hot (BF16, sentinel=-1 for Triton).
+    A random subset of n_cold = round(E * KERN_COLD_RATIO) experts is
+    assigned cold (INT4, sentinel=E for Marlin); the rest are hot
+    (BF16, sentinel=-1 for Triton). With a uniform token distribution
+    the choice of which IDs are cold doesn't affect kernel latency,
+    but randomizing avoids the visual implication that low-id experts
+    are special.
     """
     n_cold = int(KERN_E * KERN_COLD_RATIO)
 
-    # Cold group: experts [0, n_cold)
-    cold_in = topk_ids < n_cold
+    perm = torch.randperm(KERN_E, device=device)
+    is_cold = torch.zeros(KERN_E, dtype=torch.bool, device=device)
+    is_cold[perm[:n_cold]] = True
+
+    cold_in = is_cold[topk_ids]
     cold_ids = torch.where(
         cold_in, topk_ids, torch.tensor(KERN_E, device=device)
     )
     cold_w = topk_w * cold_in.to(topk_w.dtype)
 
-    # Hot group: experts [n_cold, E)
-    hot_in = topk_ids >= n_cold
+    hot_in = ~cold_in
     hot_ids = torch.where(hot_in, topk_ids, torch.tensor(-1, device=device))
     hot_w = topk_w * hot_in.to(topk_w.dtype)
 
