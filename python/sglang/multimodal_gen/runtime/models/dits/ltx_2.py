@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any, Optional, Tuple, Union
 
 import torch
@@ -519,6 +520,10 @@ class LTX2Attention(nn.Module):
         self.use_local_attention = bool(use_local_attention)
         self.apply_gated_attention = bool(apply_gated_attention)
         self.prefix = prefix
+        self.use_fused_qknorm_across_heads = (
+            os.getenv("SGLANG_LTX2_FUSED_QKNORM_ACROSS_HEADS", "").lower()
+            in {"1", "true", "yes", "on"}
+        )
 
         tp_size = get_tp_world_size()
         if tp_size <= 0:
@@ -618,6 +623,46 @@ class LTX2Attention(nn.Module):
                 prefix=f"{prefix}.attn",
             )
 
+    def _try_fused_qknorm_across_heads(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+    ) -> bool:
+        if not self.use_fused_qknorm_across_heads:
+            return False
+        if get_tp_world_size() != 1:
+            return False
+        if (
+            not q.is_cuda
+            or not k.is_cuda
+            or q.dtype not in (torch.float16, torch.bfloat16)
+            or k.dtype != q.dtype
+            or not q.is_contiguous()
+            or not k.is_contiguous()
+        ):
+            return False
+        if not isinstance(self.q_norm, torch.nn.RMSNorm) or not isinstance(
+            self.k_norm, torch.nn.RMSNorm
+        ):
+            return False
+        q_weight = self.q_norm.weight
+        k_weight = self.k_norm.weight
+        if q_weight is None or k_weight is None:
+            return False
+        if q_weight.dtype != q.dtype or k_weight.dtype != k.dtype:
+            return False
+
+        from sglang.jit_kernel.norm import fused_inplace_qknorm_across_heads
+
+        fused_inplace_qknorm_across_heads(
+            q.reshape(-1, self.inner_dim),
+            k.reshape(-1, self.inner_dim),
+            q_weight,
+            k_weight,
+            self.norm_eps,
+        )
+        return True
+
     def forward(
         self,
         x: torch.Tensor,
@@ -641,8 +686,9 @@ class LTX2Attention(nn.Module):
 
             if self.qk_norm:
                 assert self.q_norm is not None and self.k_norm is not None
-                q = self.q_norm(q)
-                k = self.k_norm(k)
+                if not self._try_fused_qknorm_across_heads(q, k):
+                    q = self.q_norm(q)
+                    k = self.k_norm(k)
 
             if pe is not None:
                 cos, sin = pe
