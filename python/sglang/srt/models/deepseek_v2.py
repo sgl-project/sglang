@@ -30,6 +30,7 @@ from transformers import PretrainedConfig
 from sglang.jit_kernel.deepseek_v4 import (
     linear_bf16_fp32,
     mega_moe_pre_dispatch,
+    silu_and_mul_clamp,
     silu_and_mul_contig_post_quant,
 )
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
@@ -291,8 +292,18 @@ class DeepseekV2MLP(nn.Module):
             x = (x, None, y)
 
         gate_up, _ = self.gate_up_proj(x)
-        if self.swiglu_limit is not None:
-            # NOTE: deepseek v4 clamp fast path
+        # Fused fp8 fast path (silu + clamp + per-group quant + down_proj gemm
+        # in one go). Only valid when down_proj does NOT need an all-reduce and
+        # its weights are fp8 (uint8 storage with weight_scale_inv); otherwise
+        # we'd silently drop the cross-rank reduction or hit a missing
+        # weight_scale_inv attribute. Fall back to the standard path below
+        # (which still applies the swiglu clamp manually) for those cases.
+        if (
+            self.swiglu_limit is not None
+            and not self.down_proj.reduce_results
+            and self.down_proj.weight.dtype == torch.uint8
+            and hasattr(self.down_proj, "weight_scale_inv")
+        ):
             M, N = gate_up.shape
             down_input_fp8 = gate_up.new_empty((M, N // 2), dtype=torch.float8_e4m3fn)
             scale_block_size = 128
@@ -322,9 +333,13 @@ class DeepseekV2MLP(nn.Module):
                 (self.down_proj.weight, self.down_proj.weight_scale_inv),
                 down_output,
             )
-            assert not self.down_proj.reduce_results
             return down_output
-        x = self.act_fn(gate_up)
+        if self.swiglu_limit is not None:
+            M, N = gate_up.shape
+            x = gate_up.new_empty((M, N // 2))
+            silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit), observe=False)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(
             x,
             skip_all_reduce=should_allreduce_fusion or use_reduce_scatter,

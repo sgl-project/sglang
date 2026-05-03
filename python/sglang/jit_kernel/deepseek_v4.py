@@ -977,13 +977,15 @@ def silu_and_mul_clamp(
     input: torch.Tensor,
     output: torch.Tensor,
     swiglu_limit: float,
+    observe: bool = True,
 ) -> None:
     # Fallback path is hacky on purpose: when the mega-moe-memory flag is off
     # we must be bitwise-identical to the optimize branch, which used the
     # pre-refactor kernel.
     from sglang.srt.environ import envs
 
-    deepseek_v4_moe_code_path_checker.observed += 1
+    if observe:
+        deepseek_v4_moe_code_path_checker.observed += 1
     if envs.SGLANG_OPT_FIX_MEGA_MOE_MEMORY.get():
         module = _jit_silu_and_mul_clamp_module(input.dtype)
     else:
