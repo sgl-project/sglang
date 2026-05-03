@@ -623,6 +623,11 @@ class LTX2SnapshotResidencyStrategy(LTX2TwoStageResidencyStrategy):
                 return True
             if self._snapshot_low_vram_mode and state.current_use is not None:
                 return False
+            if (
+                self._snapshot_low_vram_mode
+                and get_bool_env_var("SGLANG_LTX2_DISABLE_LOW_VRAM_PREFETCH")
+            ):
+                return False
             if self._snapshot_low_vram_mode:
                 self._release_stage1_for_low_vram()
         self._snapshot_strategy.prefetch_component(use.component_name, module)
