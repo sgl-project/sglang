@@ -21,8 +21,7 @@ def apply_interleaved_rotary_emb(
     cos, sin = freqs
     x_real, x_imag = x.unflatten(2, (-1, 2)).unbind(-1)  # [B, S, C // 2]
     x_rotated = torch.stack([-x_imag, x_real], dim=-1).flatten(2)
-    out = (x.float() * cos + x_rotated.float() * sin).to(x.dtype)
-    return out
+    return x * cos + x_rotated * sin
 
 
 def apply_split_rotary_emb(
@@ -49,7 +48,7 @@ def apply_split_rotary_emb(
     r = last // 2
 
     # (..., 2, r)
-    split_x = x.reshape(*x.shape[:-1], 2, r).float()
+    split_x = x.reshape(*x.shape[:-1], 2, r)
     first_x = split_x[..., :1, :]  # (..., 1, r)
     second_x = split_x[..., 1:, :]  # (..., 1, r)
 
@@ -68,8 +67,7 @@ def apply_split_rotary_emb(
     if needs_reshape:
         out = out.transpose(1, 2).reshape(b, t, -1)
 
-    out = out.to(dtype=x_dtype)
-    return out
+    return out.to(dtype=x_dtype)
 
 
 @functools.lru_cache(maxsize=5)
