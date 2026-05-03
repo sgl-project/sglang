@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_dsa
+from sglang.srt.configs.model_config import get_nsa_index_head_dim, is_deepseek_nsa
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 from sglang.srt.utils.common import is_float4_e2m1fn_x2
@@ -138,7 +138,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 )
 
             # Add indexer KV cache overhead for NSA models (DeepSeek V3.2)
-            if is_deepseek_dsa(model_config.hf_config):
+            if is_deepseek_nsa(model_config.hf_config):
                 index_head_dim = get_nsa_index_head_dim(model_config.hf_config)
                 indexer_size_per_token = (
                     index_head_dim

@@ -1649,7 +1649,7 @@ class ServerArgs:
     def _handle_model_specific_adjustments(self):
         from sglang.srt.configs.model_config import (
             get_mimo_v2_fused_qkv_expected_tp_size,
-            is_deepseek_dsa,
+            is_deepseek_nsa,
         )
 
         if parse_connector_type(self.model_path) == ConnectorType.INSTANCE:
@@ -1680,7 +1680,7 @@ class ServerArgs:
             "GlmMoeDsaForCausalLM",
         ]:
             # Set attention backend for DeepSeek
-            if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
+            if is_deepseek_nsa(hf_config):  # DeepSeek 3.2/GLM 5
                 if model_arch == "GlmMoeDsaForCausalLM" and is_blackwell_supported():
                     envs.SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD.set(0)
                     logger.warning(
@@ -6890,10 +6890,10 @@ class ServerArgs:
 
         # Check hisparse
         if self.enable_hisparse:
-            from sglang.srt.configs.model_config import is_deepseek_dsa
+            from sglang.srt.configs.model_config import is_deepseek_nsa
 
             hf_config = self.get_model_config().hf_config
-            assert is_deepseek_dsa(hf_config), (
+            assert is_deepseek_nsa(hf_config), (
                 "--enable-hisparse is only supported for DSA (DeepSeek Sparse Attention) models now"
                 "(e.g., DeepSeek V3.2, GLM-5). "
             )

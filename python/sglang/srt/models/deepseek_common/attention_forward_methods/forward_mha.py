@@ -114,9 +114,9 @@ class DeepseekMHAForwardMixin:
                 )
             )
 
-            # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= dsa_index_topk
+            # NSA Indexer: cache quantized keys, auto-skip topk for sequences <= nsa_index_topk
 
-            if self.use_dsa:
+            if self.use_nsa:
                 # NSA requires unquantized q_lora for the indexer. When q_b_proj is FP8
                 # on gfx95, we can still use fused RMSNorm+FP8 quant, but MUST request
                 # the unquantized output for q_lora; otherwise q_lora becomes the (fp8,scale)
@@ -222,7 +222,7 @@ class DeepseekMHAForwardMixin:
             and sum(forward_batch.extend_prefix_lens_cpu) != 0
         ):
             if (
-                self.use_dsa
+                self.use_nsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
                     not get_global_server_args().nsa_decode_backend == "trtllm"

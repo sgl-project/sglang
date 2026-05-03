@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Dict, List, Literal, Optional, Tuple, TypeAlia
 
 import torch
 
-from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_dsa
+from sglang.srt.configs.model_config import get_nsa_index_topk, is_deepseek_nsa
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.nsa.dequant_k_cache import dequantize_k_cache_paged
@@ -301,8 +301,8 @@ class DSABackend(DSAMTPPrecomputeMixin, AttentionBackend):
         self.num_splits = (
             1 if model_runner.server_args.enable_deterministic_inference else 0
         )
-        self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
-        assert self.use_dsa, "NSA backend only supports DeepSeek NSA"
+        self.use_nsa = is_deepseek_nsa(model_runner.model_config.hf_config)
+        assert self.use_nsa, "NSA backend only supports DeepSeek NSA"
         self.nsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.nsa_kv_cache_store_fp8
         )
@@ -617,7 +617,7 @@ class DSABackend(DSAMTPPrecomputeMixin, AttentionBackend):
         # 1D, expanded seqlens (1D means cheap to compute, so always compute it)
         nsa_cache_seqlens_int32 = compute_nsa_seqlens(
             original_seq_lens=seqlens_expanded,
-            dsa_index_topk=self.dsa_index_topk,
+            nsa_index_topk=self.dsa_index_topk,
         )
         nsa_cache_seqlens_int32 = pad_nsa_cache_seqlens(
             forward_batch, nsa_cache_seqlens_int32
@@ -831,7 +831,7 @@ class DSABackend(DSAMTPPrecomputeMixin, AttentionBackend):
             # NOTE(dark): this is always arange, since we are decoding
             cu_seqlens_q = self.decode_cuda_graph_metadata["cu_seqlens_q"][: bs + 1]
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
-                cache_seqlens_int32, dsa_index_topk=self.dsa_index_topk
+                cache_seqlens_int32, nsa_index_topk=self.dsa_index_topk
             )
 
             seqlens_expanded = cache_seqlens_int32
@@ -891,7 +891,7 @@ class DSABackend(DSAMTPPrecomputeMixin, AttentionBackend):
                 ]
             )
             nsa_cache_seqlens_int32 = compute_nsa_seqlens(
-                seqlens_expanded, dsa_index_topk=self.dsa_index_topk
+                seqlens_expanded, nsa_index_topk=self.dsa_index_topk
             )
             nsa_extend_seq_lens_list = [1] * bs * self.speculative_num_draft_tokens
 
@@ -991,7 +991,7 @@ class DSABackend(DSAMTPPrecomputeMixin, AttentionBackend):
             page_indices = self.req_to_token[req_pool_indices, :max_len]
             metadata.page_table_1[:, :max_len].copy_(page_indices)
             nsa_cache_seqlens = compute_nsa_seqlens(
-                cache_seqlens, dsa_index_topk=self.dsa_index_topk
+                cache_seqlens, nsa_index_topk=self.dsa_index_topk
             )
             metadata.nsa_cache_seqlens_int32.copy_(nsa_cache_seqlens)
             seqlens_expanded = cache_seqlens

@@ -136,7 +136,7 @@ class DeepseekMLAForwardMixin:
                         _use_aiter_gfx95
                         and self.q_b_proj.weight.dtype == torch.float8_e4m3fn
                     ):
-                        if self.use_dsa:
+                        if self.use_nsa:
                             q_quanted, q_lora, k_nope, _ = fused_rms_fp8_group_quant(
                                 q,
                                 self.q_a_layernorm.weight,
@@ -178,7 +178,7 @@ class DeepseekMLAForwardMixin:
                         k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
-            if self.use_dsa:
+            if self.use_nsa:
                 if q_lora is None:
                     q_lora = q
 
@@ -317,7 +317,7 @@ class DeepseekMLAForwardMixin:
             self.rotary_emb is not None
             and (not self._fuse_rope_for_trtllm_mla(forward_batch))
             and (not skip_rope_for_nsa_tilelang_fused)
-            and (not _use_aiter or not _is_gfx95_supported or self.use_dsa)
+            and (not _use_aiter or not _is_gfx95_supported or self.use_nsa)
         ):
             q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
 

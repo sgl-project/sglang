@@ -131,7 +131,7 @@ class DSAMTPPrecomputeMixin:
 
         # Compute NSA seqlens
         nsa_cache_seqlens = compute_nsa_seqlens(
-            cache_seqlens, dsa_index_topk=self.dsa_index_topk
+            cache_seqlens, nsa_index_topk=self.dsa_index_topk
         )
         seqlens_expanded = cache_seqlens
         seqlens_expanded_size = seqlens_expanded.shape[0]
