@@ -237,12 +237,17 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         grammar = MagicMock()
         grammar.finished = False
         grammar.is_terminated.return_value = False
-        grammar.allocate_vocab_mask.return_value = torch.zeros(1, VOCAB_SIZE)
+        grammar.allocate_reusable_vocab_mask.return_value = torch.zeros(1, VOCAB_SIZE)
         grammar.move_vocab_mask.return_value = torch.zeros(1, VOCAB_SIZE)
         info = _make_info(batch_size=1)
         info.grammars = [grammar]
         info.update_regex_vocab_mask()
-        grammar.allocate_vocab_mask.assert_called_once()
+        grammar.allocate_reusable_vocab_mask.assert_called_once_with(
+            vocab_size=VOCAB_SIZE,
+            batch_size=1,
+            device=DEVICE,
+        )
+        grammar.allocate_vocab_mask.assert_not_called()
         grammar.fill_vocab_mask.assert_called_once()
         grammar.move_vocab_mask.assert_called_once()
 
@@ -251,7 +256,7 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         active = MagicMock()
         active.finished = False
         active.is_terminated.return_value = False
-        active.allocate_vocab_mask.return_value = torch.zeros(3, VOCAB_SIZE)
+        active.allocate_reusable_vocab_mask.return_value = torch.zeros(3, VOCAB_SIZE)
         active.move_vocab_mask.return_value = torch.zeros(3, VOCAB_SIZE)
 
         finished = MagicMock()
@@ -265,6 +270,12 @@ class TestUpdateRegexVocabMask(CustomTestCase):
         info.grammars = [active, finished, terminated]
         info.update_regex_vocab_mask()
 
+        active.allocate_reusable_vocab_mask.assert_called_once_with(
+            vocab_size=VOCAB_SIZE,
+            batch_size=3,
+            device=DEVICE,
+        )
+        active.allocate_vocab_mask.assert_not_called()
         active.fill_vocab_mask.assert_called_once()
         finished.fill_vocab_mask.assert_not_called()
         terminated.fill_vocab_mask.assert_not_called()

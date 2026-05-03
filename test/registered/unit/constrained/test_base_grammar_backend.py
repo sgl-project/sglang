@@ -19,6 +19,8 @@ import unittest
 from concurrent.futures import Future
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.constrained.base_grammar_backend import (
     GRAMMAR_BACKEND_REGISTRY,
     BaseGrammarBackend,
@@ -31,6 +33,28 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(2.0, "stage-a-test-cpu")
+
+
+class _FakeReusableGrammar(BaseGrammarObject):
+    def __init__(self, fill_value: int = -1, dtype: torch.dtype = torch.int32):
+        super().__init__()
+        self.fill_value = fill_value
+        self.dtype = dtype
+        self.allocate_calls = []
+        self.reset_calls = []
+
+    def allocate_vocab_mask(self, vocab_size: int, batch_size: int, device):
+        self.allocate_calls.append((vocab_size, batch_size, device))
+        return torch.full(
+            (batch_size, vocab_size),
+            self.fill_value,
+            dtype=self.dtype,
+            device=device,
+        )
+
+    def reset_vocab_mask(self, vocab_mask: torch.Tensor) -> None:
+        self.reset_calls.append(tuple(vocab_mask.shape))
+        vocab_mask.fill_(self.fill_value)
 
 
 class TestGrammarStats(unittest.TestCase):
@@ -95,10 +119,33 @@ class TestBaseGrammarBackend(unittest.TestCase):
         self.assertIn(key, self.backend.cache)
         self.assertIs(self.backend.cache[key], obj)
 
+    def test_set_cache_attaches_reusable_vocab_mask_cache(self):
+        obj = _FakeReusableGrammar()
+        key = ("json", "schema")
+
+        self.backend.set_cache(key, obj)
+
+        self.assertIs(
+            obj._reusable_vocab_mask_cache,
+            self.backend.reusable_vocab_mask_cache,
+        )
+
     def test_reset_clears_cache(self):
         self.backend.set_cache(("json", "schema"), BaseGrammarObject())
         self.backend.reset()
         self.assertEqual(len(self.backend.cache), 0)
+
+    def test_reset_clears_reusable_vocab_mask_cache(self):
+        grammar = _FakeReusableGrammar()
+        grammar.set_reusable_vocab_mask_cache(self.backend.reusable_vocab_mask_cache)
+        grammar.allocate_reusable_vocab_mask(8, 2, "cpu")
+
+        self.assertIsNotNone(self.backend.reusable_vocab_mask_cache.mask)
+
+        self.backend.reset()
+
+        self.assertIsNone(self.backend.reusable_vocab_mask_cache.mask)
+        self.assertEqual(self.backend.reusable_vocab_mask_cache.capacity, 0)
 
     def test_cache_hit_returns_copy(self):
         """Cache hit should return a copy of the cached object."""
@@ -113,6 +160,22 @@ class TestBaseGrammarBackend(unittest.TestCase):
         self.assertTrue(cache_hit)
         obj.copy.assert_called_once()
         self.assertIs(result, mock_copy)
+
+    def test_cache_hit_copy_receives_reusable_vocab_mask_cache(self):
+        obj = _FakeReusableGrammar()
+        copied = _FakeReusableGrammar()
+        obj.copy = MagicMock(return_value=copied)
+
+        key = ("json", "schema")
+        self.backend.set_cache(key, obj)
+        result, cache_hit = self.backend.get_cached_or_future_value(key, False)
+
+        self.assertTrue(cache_hit)
+        self.assertIs(result, copied)
+        self.assertIs(
+            result._reusable_vocab_mask_cache,
+            self.backend.reusable_vocab_mask_cache,
+        )
 
     def test_cache_hit_inits_reasoning(self):
         obj = MagicMock(spec=BaseGrammarObject)
@@ -177,6 +240,20 @@ class TestBaseGrammarBackend(unittest.TestCase):
         self.assertIsNotNone(result.grammar_stats.compilation_time)
         self.assertGreater(result.grammar_stats.compilation_time, 0)
 
+    def test_init_value_dispatch_attaches_reusable_vocab_mask_cache(self):
+        grammar = _FakeReusableGrammar()
+        self.backend.dispatch_json = MagicMock(return_value=grammar)
+
+        result = self.backend._init_value_dispatch(("json", "schema"), False)
+
+        self.assertIs(result, grammar)
+        self.assertIs(
+            result._reusable_vocab_mask_cache,
+            self.backend.reusable_vocab_mask_cache,
+        )
+        result.allocate_reusable_vocab_mask(8, 2, "cpu")
+        self.assertEqual(grammar.allocate_calls, [(8, 2, "cpu")])
+
     def test_init_value_dispatch_no_stats(self):
         """When grammar has no stats, should not crash."""
         mock_grammar = MagicMock(spec=BaseGrammarObject)
@@ -212,6 +289,74 @@ class TestBaseGrammarBackend(unittest.TestCase):
         self.backend.dispatch_json = MagicMock(return_value=None)
         result = self.backend._init_value_dispatch(("json", "schema"), False)
         self.assertIsNone(result)
+
+    def test_reusable_vocab_mask_requires_attached_cache(self):
+        grammar = _FakeReusableGrammar()
+
+        with self.assertRaisesRegex(AssertionError, "cache is not attached"):
+            grammar.allocate_reusable_vocab_mask(8, 2, "cpu")
+
+        self.assertEqual(grammar.allocate_calls, [])
+        self.assertEqual(grammar.reset_calls, [])
+
+    def test_reusable_vocab_mask_cache_is_shared_across_grammars(self):
+        grammar_1 = _FakeReusableGrammar()
+        grammar_2 = _FakeReusableGrammar()
+        device = "cpu"
+        grammar_1.set_reusable_vocab_mask_cache(self.backend.reusable_vocab_mask_cache)
+        grammar_2.set_reusable_vocab_mask_cache(self.backend.reusable_vocab_mask_cache)
+
+        first = grammar_1.allocate_reusable_vocab_mask(8, 4, device)
+        first.fill_(123)
+        second = grammar_2.allocate_reusable_vocab_mask(8, 2, device)
+
+        self.assertEqual(grammar_1.allocate_calls, [(8, 4, device)])
+        self.assertEqual(grammar_2.allocate_calls, [])
+        self.assertEqual(grammar_2.reset_calls, [(2, 8)])
+        self.assertEqual(second.data_ptr(), first.data_ptr())
+        self.assertTrue(torch.all(second == -1))
+
+    def test_reusable_vocab_mask_grows_and_keeps_larger_cache(self):
+        grammar_1 = _FakeReusableGrammar()
+        grammar_2 = _FakeReusableGrammar()
+        device = "cpu"
+        grammar_1.set_reusable_vocab_mask_cache(self.backend.reusable_vocab_mask_cache)
+        grammar_2.set_reusable_vocab_mask_cache(self.backend.reusable_vocab_mask_cache)
+
+        first = grammar_1.allocate_reusable_vocab_mask(8, 2, device)
+        first_ptr = first.data_ptr()
+        second = grammar_2.allocate_reusable_vocab_mask(8, 3, device)
+
+        self.assertEqual(grammar_1.allocate_calls, [(8, 2, device)])
+        self.assertEqual(grammar_2.allocate_calls, [(8, 3, device)])
+        self.assertNotEqual(second.data_ptr(), first_ptr)
+        self.assertEqual(self.backend.reusable_vocab_mask_cache.capacity, 3)
+
+        second.fill_(123)
+        reused = grammar_1.allocate_reusable_vocab_mask(8, 3, device)
+
+        self.assertEqual(grammar_1.allocate_calls, [(8, 2, device)])
+        self.assertEqual(grammar_1.reset_calls, [(3, 8)])
+        self.assertEqual(reused.data_ptr(), second.data_ptr())
+        self.assertTrue(torch.all(reused == -1))
+
+    def test_reusable_vocab_mask_reallocates_when_vocab_size_changes(self):
+        grammar_1 = _FakeReusableGrammar()
+        grammar_2 = _FakeReusableGrammar()
+        device = "cpu"
+        grammar_1.set_reusable_vocab_mask_cache(self.backend.reusable_vocab_mask_cache)
+        grammar_2.set_reusable_vocab_mask_cache(self.backend.reusable_vocab_mask_cache)
+
+        first = grammar_1.allocate_reusable_vocab_mask(8, 3, device)
+        second = grammar_2.allocate_reusable_vocab_mask(16, 2, device)
+
+        self.assertEqual(grammar_1.allocate_calls, [(8, 3, device)])
+        self.assertEqual(grammar_2.allocate_calls, [(16, 2, device)])
+        self.assertEqual(grammar_2.reset_calls, [])
+        self.assertNotEqual(second.data_ptr(), first.data_ptr())
+        self.assertEqual(tuple(second.shape), (2, 16))
+        self.assertEqual(self.backend.reusable_vocab_mask_cache.vocab_size, 16)
+        self.assertEqual(self.backend.reusable_vocab_mask_cache.capacity, 2)
 
     def test_cache_miss_duplicate_key_submits_separate_futures(self):
         """Two cache misses for the same key each get their own Future.
