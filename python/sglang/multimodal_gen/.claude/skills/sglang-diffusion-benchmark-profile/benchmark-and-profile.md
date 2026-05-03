@@ -300,11 +300,17 @@ path. On H100, 2-GPU Ulysses reduced FireRed 1.0 40-step denoise latency from
 ### Manual command example: Hunyuan3D Shape
 
 ```bash
+OUTPUT_DIR=$(python3 "$ENV_PY" print-output-dir --kind benchmarks --mkdir)
+CONFIG_DIR="${OUTPUT_DIR}/generated_configs"
+mkdir -p "${CONFIG_DIR}"
+printf '{"paint_enable": false}\n' > "${CONFIG_DIR}/hunyuan3d-shape.json"
+
 sglang generate \
   --backend=sglang \
   --model-path=tencent/Hunyuan3D-2 \
   --prompt="generate 3d mesh" \
   --image-path="${ASSET_DIR}/cat.png" \
+  --config="${CONFIG_DIR}/hunyuan3d-shape.json" \
   --num-inference-steps=50 --guidance-scale=5.0 \
   --dit-layerwise-offload false --dit-cpu-offload false \
   --save-output --enable-torch-compile --warmup

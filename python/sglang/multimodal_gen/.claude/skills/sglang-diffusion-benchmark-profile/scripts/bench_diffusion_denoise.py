@@ -446,7 +446,7 @@ def build_sglang_cmd(
         cmd.append(f"--image-path={cfg['image_path']}")
 
     if "config_overrides" in cfg:
-        config_dir = ensure_dir(ASSET_DIR / "generated_configs")
+        config_dir = ensure_dir(get_output_dir("benchmarks", REPO_ROOT) / "generated_configs")
         config_path = config_dir / f"{model_key}.json"
         with open(config_path, "w") as f:
             json.dump(cfg["config_overrides"], f, indent=2, sort_keys=True)
