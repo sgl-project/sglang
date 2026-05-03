@@ -374,7 +374,7 @@ def _set_k_and_s_triton(
     assert index_head_dim == 128
     assert scale_dim == 1
     if _is_hip:
-        pass
+        assert page_size == 1
     else:
         assert page_size == 64
 
