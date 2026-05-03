@@ -1673,44 +1673,11 @@ class ServerArgs:
         if model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
-            self.attention_backend = "compressed"
-            self.page_size = 256
-            logger.info(
-                f"Use compressed attention backend for {model_arch}, setting page_size to 256."
+            from sglang.srt.arg_groups.deepseek_v4_hook import (
+                apply_deepseek_v4_defaults,
             )
 
-            if self.max_running_requests is None:
-                self.max_running_requests = 256
-                logger.warning(
-                    f"Setting max_running_requests to {self.max_running_requests} for {model_arch}."
-                )
-
-            if self.kv_cache_dtype == "auto":
-                self.kv_cache_dtype = "fp8_e4m3"
-                logger.warning(
-                    f"Setting KV cache dtype to {self.kv_cache_dtype} for {model_arch}."
-                )
-            assert self.kv_cache_dtype in [
-                "fp8_e4m3"
-            ], f"{self.kv_cache_dtype} is not supported for {model_arch}"
-
-            if self.speculative_algorithm is not None:
-                assert (
-                    self.speculative_algorithm == "EAGLE"
-                ), f"Only EAGLE speculative algorithm is supported for {model_arch}"
-                assert (
-                    self.speculative_eagle_topk == 1
-                ), f"Only EAGLE speculative algorithm with topk == 1 is supported for {model_arch}"
-
-                if not envs.SGLANG_ENABLE_SPEC_V2.get():
-                    envs.SGLANG_ENABLE_SPEC_V2.set(True)
-                    logger.warning("Spec v2 is enabled for EAGLE speculative decoding.")
-
-            if self.swa_full_tokens_ratio == ServerArgs.swa_full_tokens_ratio:
-                self.swa_full_tokens_ratio = 0.1
-                logger.info(
-                    f"Setting swa_full_tokens_ratio to {self.swa_full_tokens_ratio} for {model_arch}."
-                )
+            apply_deepseek_v4_defaults(self, model_arch)
 
         if model_arch in [
             "DeepseekV3ForCausalLM",
@@ -1917,25 +1884,9 @@ class ServerArgs:
         elif model_arch in [
             "DeepseekV4ForCausalLM",
         ]:
-            if self.enable_nsa_prefill_context_parallel:
-                if self.nsa_prefill_cp_mode == "round-robin-split":
-                    self.moe_dense_tp_size = 1
-                    assert (
-                        self.dp_size == 1
-                    ), "For round-robin split mode, dp attention is not supported."
-                    assert (
-                        self.tp_size <= 8
-                    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-                    logger.warning(
-                        f"Enable Context Parallel for DeepSeekV4, "
-                        f"dp_size={self.dp_size}, moe_dense_tp_size={self.moe_dense_tp_size}, "
-                        f"ep_size={self.ep_size}, tp_size={self.tp_size}"
-                    )
-                else:
-                    raise ValueError(
-                        f"DeepSeekV4 only supports round-robin-split CP mode, "
-                        f"got {self.nsa_prefill_cp_mode}"
-                    )
+            from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+
+            validate_deepseek_v4_cp(self)
 
         elif model_arch in ["GptOssForCausalLM"]:
             # Set attention backend for GPT-OSS
