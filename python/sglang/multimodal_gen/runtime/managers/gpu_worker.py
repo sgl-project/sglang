@@ -31,10 +31,7 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ulysses_parallel_rank,
     get_ulysses_parallel_world_size,
 )
-from sglang.multimodal_gen.runtime.entrypoints.utils import (
-    UGInterleavedGenerateReq,
-    save_outputs,
-)
+from sglang.multimodal_gen.runtime.entrypoints.utils import save_outputs
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
 from sglang.multimodal_gen.runtime.loader.weights_updater import (
     WeightsUpdater,
@@ -65,61 +62,9 @@ from sglang.multimodal_gen.runtime.utils.perf_logger import (
 )
 from sglang.multimodal_gen.runtime.utils.trace_wrapper import DiffStage, trace_slice
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
-from sglang.srt.ug.interleaved import normalize_ug_generation_mode
 from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
-
-
-def _is_ug_vlm_request(req: UGInterleavedGenerateReq) -> bool:
-    return (
-        normalize_ug_generation_mode(
-            req.request.metadata.get("mode"), default="interleave"
-        )
-        == "vlm"
-    )
-
-
-def _should_attach_ug_srt_scheduler(server_args: ServerArgs) -> bool:
-    if getattr(server_args, "ug_srt_scheduler", None) is not None:
-        return False
-    if getattr(server_args, "pipeline_class_name", None) not in (None, "UGPipeline"):
-        return False
-
-    from sglang.srt.ug.srt_server import is_real_bagel_ug_model
-
-    return is_real_bagel_ug_model(
-        getattr(server_args, "model_path", None),
-        getattr(server_args, "model_id", None),
-    )
-
-
-def _maybe_attach_ug_srt_scheduler(
-    server_args: ServerArgs,
-    *,
-    local_rank: int,
-):
-    if not _should_attach_ug_srt_scheduler(server_args):
-        return None
-    if server_args.num_gpus != 1 or server_args.enable_cfg_parallel:
-        raise RuntimeError(
-            "BAGEL UGPipeline native SRT entrypoint currently supports only "
-            "single-GPU execution with CFG parallel disabled"
-        )
-
-    from sglang.srt.ug.srt_server import create_bagel_srt_scheduler
-
-    handle = create_bagel_srt_scheduler(
-        checkpoint_dir=server_args.model_path,
-        gpu_id=local_rank,
-        mem_fraction_static=server_args.ug_srt_mem_fraction_static,
-        chunked_prefill_size=server_args.ug_srt_chunked_prefill_size,
-        attention_backend=server_args.ug_srt_attention_backend,
-        log_level=server_args.ug_srt_log_level,
-    )
-    setattr(server_args, "ug_srt_scheduler", handle.scheduler)
-    setattr(server_args, "ug_srt_scheduler_handle", handle)
-    return handle
 
 
 @dataclass
@@ -152,7 +97,6 @@ class GPUWorker:
         # FIXME: should we use tcp as distribute init method?
         self.server_args = server_args
         self.pipeline: ComposedPipelineBase = None
-        self.ug_srt_scheduler_handle = None
 
         self.init_device_and_model()
         self.sp_group = get_sp_group()
@@ -205,16 +149,7 @@ class GPUWorker:
         else:
             setproctitle(f"sgl_diffusion::scheduler_{self.local_rank}")
 
-        self.ug_srt_scheduler_handle = _maybe_attach_ug_srt_scheduler(
-            self.server_args,
-            local_rank=self.local_rank,
-        )
-        try:
-            self.pipeline = build_pipeline(self.server_args)
-        except Exception:
-            if self.ug_srt_scheduler_handle is not None:
-                self.ug_srt_scheduler_handle.close()
-            raise
+        self.pipeline = build_pipeline(self.server_args)
 
         # apply layerwise offload after lora is applied while building LoRAPipeline
         # otherwise empty offloaded weights could fail lora converting
@@ -321,56 +256,6 @@ class GPUWorker:
             ),
             error_context=f"request {req.request_id}",
         )
-
-    def execute_ug_interleaved(
-        self,
-        reqs: list[UGInterleavedGenerateReq],
-    ) -> OutputBatch:
-        """Execute experimental UG interleaved requests with session isolation."""
-        try:
-            assert self.pipeline is not None
-            responses = self._execute_ug_interleaved_requests(reqs)
-            return OutputBatch(
-                output=responses[0] if len(responses) == 1 else responses
-            )
-        except Exception as e:
-            logger.error("Error executing UG interleaved request: %s", e, exc_info=True)
-            return OutputBatch(error=f"Error executing UG interleaved request: {e}")
-
-    def _execute_ug_interleaved_requests(
-        self,
-        reqs: list[UGInterleavedGenerateReq],
-    ) -> list[Any]:
-        assert self.pipeline is not None
-        if all(_is_ug_vlm_request(req) for req in reqs):
-            forward_vlm_batch = getattr(self.pipeline, "forward_vlm_batch", None)
-            if callable(forward_vlm_batch):
-                return forward_vlm_batch(
-                    [req.request for req in reqs],
-                    server_args=self.server_args,
-                )
-        if not any(_is_ug_vlm_request(req) for req in reqs):
-            forward_batch = getattr(self.pipeline, "forward_interleaved_batch", None)
-            if callable(forward_batch):
-                return forward_batch(
-                    [req.request for req in reqs],
-                    server_args=self.server_args,
-                )
-
-        responses = []
-        for req in reqs:
-            if _is_ug_vlm_request(req):
-                forward_one = getattr(self.pipeline, "forward_vlm", None)
-                unsupported = "UG VLM generation"
-            else:
-                forward_one = getattr(self.pipeline, "forward_interleaved", None)
-                unsupported = "UG interleaved generation"
-            if not callable(forward_one):
-                raise RuntimeError(
-                    f"{self.pipeline.__class__.__name__} does not support {unsupported}"
-                )
-            responses.append(forward_one(req.request, server_args=self.server_args))
-        return responses
 
     def _execute_forward_batch(self, batch: list[Req]) -> OutputBatch:
         """Execute expanded multi-output requests as one grouped forward."""
@@ -851,7 +736,7 @@ class GPUWorker:
         return checksums
 
 
-OOM_MSG = """
+OOM_MSG = f"""
 OOM detected. Possible solutions:
   - If the OOM occurs during loading:
     1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT

@@ -47,7 +47,7 @@ class UGModelAppendImageResult:
 
 
 class UGModelAdapterProtocol(Protocol):
-    """Model-side UG entrypoints that BAGEL-like models need to implement."""
+    """Model-side UG entrypoints for interleaved understanding/generation models."""
 
     def prepare_srt_u_message_inputs(
         self,

@@ -2,28 +2,16 @@
 
 import unittest
 from dataclasses import fields
-from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    UG_BATCH_COMPAT_CAUSAL,
-    UG_BATCH_COMPAT_NON_CAUSAL_QUERY,
-    ScheduleBatch,
-    check_ug_non_causal_batch_compat,
-    get_ug_batch_compat_key,
-    get_ug_batch_compat_key_for_reqs,
-    is_ug_batch_compatible,
-)
-from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.ug.context import UGSessionHandle, UGSRTKVTokenBinding, UGSRTRequestView
+from sglang.srt.ug.context import UGSessionHandle
 from sglang.srt.ug.runtime import (
     FakeUGModelRunner,
     UGInterleavedMessage,
     UGSegmentState,
     UGSessionRuntime,
-    UGSRTPreparedInput,
     UGVelocityRequest,
 )
 
@@ -34,166 +22,6 @@ class FakeTreeCache:
 
     def release_session(self, session_id):
         self.released_sessions.append(session_id)
-
-
-class RecordingSRTRequestExecutor:
-    def __init__(self):
-        self.events = []
-
-    def execute_ug_request(self, *, record, req, state):
-        self.events.append(
-            {
-                "session_id": record.session_id,
-                "state": state.value,
-                "rid": req.rid,
-                "origin_input_ids": list(req.origin_input_ids),
-                "mm_offsets": (
-                    [
-                        offset
-                        for item in getattr(req.multimodal_inputs, "mm_items", [])
-                        for offset in getattr(item, "offsets", [])
-                    ]
-                    if req.multimodal_inputs is not None
-                    else []
-                ),
-                "finished_reason": req.finished_reason,
-                "max_new_tokens": req.sampling_params.max_new_tokens,
-                "temperature": req.sampling_params.temperature,
-                "top_k": req.sampling_params.top_k,
-                "output_ids": list(req.output_ids),
-                "ug_position_ids": getattr(req, "ug_position_ids", None),
-                "ug_u_forward_metadata": getattr(req, "ug_u_forward_metadata", None),
-            }
-        )
-
-
-class OutputAppendingSRTExecutor(RecordingSRTRequestExecutor):
-    def __init__(self, token_ids):
-        super().__init__()
-        self.token_ids = list(token_ids)
-
-    def execute_ug_request(self, *, record, req, state):
-        if state == UGSegmentState.U_DECODE:
-            req.output_ids.extend(self.token_ids[: req.sampling_params.max_new_tokens])
-        super().execute_ug_request(record=record, req=req, state=state)
-
-
-class RecordingUGModelRunner(FakeUGModelRunner):
-    def __init__(self):
-        self.srt_u_forward_events = []
-
-    def observe_srt_u_forward(self, *, record, request, messages):
-        self.srt_u_forward_events.append(
-            {
-                "session_id": record.session_id,
-                "state": request.state,
-                "request_id": request.request_id,
-                "messages": list(messages),
-                "has_token_binding": "srt_kv_token_binding" in request.metadata,
-            }
-        )
-
-
-class ModelStateUGModelRunner(FakeUGModelRunner):
-    def __init__(self):
-        self.observed_model_states = []
-
-    def prepare_srt_u_message_inputs(self, *, record, message, state):
-        del record, state
-        return [
-            UGSRTPreparedInput(
-                input_ids=[7, 8, 9],
-                input_text=str(message.content),
-                messages=[message],
-                adapter_metadata={
-                    "ug_model_state_updates": {
-                        "bagel": {
-                            "logical_kv_lens": [3],
-                            "logical_ropes": [11],
-                        }
-                    }
-                },
-            )
-        ]
-
-    def observe_srt_u_forward(self, *, record, request, messages):
-        del record, messages
-        self.observed_model_states.append(request.metadata.get("ug_model_state"))
-
-
-class SidecarUGModelRunner(FakeUGModelRunner):
-    def prepare_srt_u_message_inputs(self, *, record, message, state):
-        del state
-        if message.type != "image":
-            return None
-        return [
-            UGSRTPreparedInput(
-                input_ids=[31],
-                input_text=f"main:{record.session_id}",
-                messages=[message],
-                adapter_metadata={
-                    "ug_model_state_updates": {
-                        "test": {
-                            "owner_session_id": record.session_id,
-                            "main_seen": True,
-                        }
-                    }
-                },
-            ),
-            UGSRTPreparedInput(
-                input_ids=[41],
-                input_text=f"sidecar:{record.session_id}",
-                messages=[message],
-                non_causal_query_attention=True,
-                srt_sidecar_role="cfg_img",
-                srt_sidecar_session_id=f"{record.session_id}:cfg_img",
-                adapter_metadata={
-                    "ug_model_state_updates": {
-                        "test": {
-                            "owner_session_id": record.session_id,
-                            "sidecar_seen": True,
-                        }
-                    }
-                },
-            ),
-        ]
-
-
-class ModelRunnerObserverSRTExecutor(RecordingSRTRequestExecutor):
-    def __init__(self):
-        super().__init__()
-        self.observer = None
-
-    def set_ug_u_forward_observer(self, observer):
-        self.observer = observer
-
-    def execute_ug_request(self, *, record, req, state):
-        super().execute_ug_request(record=record, req=req, state=state)
-        if self.observer is None or state == UGSegmentState.U_DECODE:
-            return
-        metadata = req.ug_u_forward_metadata
-        self.observer(
-            request=UGSRTRequestView(
-                session=metadata["session"],
-                state=metadata["state"],
-                request_id=metadata["request_id"],
-                origin_input_len=metadata["origin_input_len"],
-                origin_input_ids=metadata["origin_input_ids"],
-                output_ids=metadata["output_ids"],
-                max_new_tokens=metadata["max_new_tokens"],
-                input_text=metadata["input_text"],
-                mm_offsets=metadata["mm_offsets"],
-                metadata={
-                    "srt_kv_token_binding": UGSRTKVTokenBinding(
-                        session_id=record.session_id,
-                        request_id=req.rid,
-                        token_count=len(req.origin_input_ids),
-                        token_indices=torch.arange(len(req.origin_input_ids)),
-                    )
-                },
-            ),
-            messages=list(metadata["messages"]),
-        )
 
 
 class TestUGSessionRuntime(unittest.TestCase):
@@ -208,786 +36,85 @@ class TestUGSessionRuntime(unittest.TestCase):
         self.assertFalse(any("slot" in name.lower() for name in names))
         self.assertFalse(any("page" in name.lower() for name in names))
 
-    def test_runtime_uses_existing_srt_session_lifecycle(self):
-        class FakeSessionController:
-            def __init__(self):
-                self.opened = []
-                self.closed = []
-                self.sessions = set()
-
-            def __contains__(self, session_id):
-                return session_id in self.sessions
-
-            def open(self, req):
-                self.opened.append(req.session_id)
-                self.sessions.add(req.session_id)
-                return SimpleNamespace(success=True)
-
-            def close(self, req):
-                self.closed.append(req.session_id)
-                self.sessions.remove(req.session_id)
-
-        controller = FakeSessionController()
+    def test_prefill_reuses_existing_srt_session(self):
         runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(), session_controller=controller
-        )
-
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="hello")],
-            session_id="srt-session",
-        )
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="again")],
-            session_id=handle.session_id,
-        )
-
-        self.assertEqual(handle.session_id, "srt-session")
-        self.assertEqual(controller.opened, ["srt-session"])
-        self.assertEqual(runtime.get_debug_counters(handle)["prefill_count"], 2)
-
-        runtime.close_session(handle)
-        self.assertEqual(controller.closed, ["srt-session"])
-
-    def test_prefill_uses_srt_create_req_and_appends_to_same_session(self):
-        controller = SessionController(FakeTreeCache())
-        runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(), session_controller=controller
+            model_runner=FakeUGModelRunner(),
+            session_controller=SessionController(FakeTreeCache()),
         )
 
         first = runtime.prefill_interleaved(
-            [
-                UGInterleavedMessage(type="image", content=object()),
-                UGInterleavedMessage(type="text", content="hello"),
-            ],
-            session_id="srt-backed-prefill",
+            [UGInterleavedMessage(type="text", content="hello")],
+            session_id="ug-session",
         )
-        first_debug = runtime.get_debug_counters(first)
-
-        self.assertEqual(first_debug["srt_request_count"], 1)
-        self.assertEqual(first_debug["srt_last_request_id"], first.anchor_request_id)
-        self.assertEqual(first_debug["srt_last_origin_input_len"], 4)
-        self.assertEqual(first_debug["srt_mm_offsets"], [(1, 3)])
-
         second = runtime.prefill_interleaved(
             [UGInterleavedMessage(type="text", content="again")],
             session_id=first.session_id,
         )
-        second_debug = runtime.get_debug_counters(second)
 
-        self.assertEqual(second.session_id, first.session_id)
-        self.assertEqual(controller.sessions.keys(), {"srt-backed-prefill"})
-        self.assertEqual(second_debug["prefill_count"], 2)
-        self.assertEqual(second_debug["srt_request_count"], 2)
-        self.assertEqual(second_debug["srt_last_request_id"], second.anchor_request_id)
-        self.assertEqual(second_debug["srt_last_origin_input_len"], 5)
-        self.assertEqual(second_debug["srt_mm_offsets"], [(1, 3)])
-        self.assertEqual(len(controller.get(second.session_id).req_nodes), 2)
+        self.assertEqual(second.session_id, "ug-session")
+        self.assertEqual(runtime.get_debug_counters(second)["prefill_count"], 2)
+        self.assertEqual(runtime.get_debug_counters(second)["session_id"], "ug-session")
 
-    def test_prefill_uses_real_tokenizer_when_available(self):
-        class EncodedTokenizer:
-            bos_token_id = None
-            eos_token_id = 9
-
-            def encode(self, text, add_special_tokens=False):
-                self.last_encode = (text, add_special_tokens)
-                return [11, 12]
-
-        tokenizer = EncodedTokenizer()
-        controller = SessionController(FakeTreeCache())
-        runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(),
-            session_controller=controller,
-            tokenizer=tokenizer,
-            vocab_size=128,
-        )
-
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="hello world")],
-            session_id="encoded-tokenizer",
-        )
-        debug = runtime.get_debug_counters(handle)
-
-        self.assertEqual(tokenizer.last_encode, ("hello world", False))
-        self.assertEqual(debug["srt_last_origin_input_ids"], [9, 11, 12])
-        self.assertEqual(debug["srt_last_origin_input_len"], 3)
-
-    def test_text_placeholder_image_tokenization_avoids_srt_mm_inputs(self):
-        class EncodedTokenizer:
-            bos_token_id = 1
-
-            def __init__(self):
-                self.calls = []
-
-            def encode(self, text, add_special_tokens=False):
-                self.calls.append((text, add_special_tokens))
-                return {"<image>": [41], "hello": [42]}[text]
-
-        tokenizer = EncodedTokenizer()
+    def test_state_machine_rejects_invalid_g_transition(self):
         runtime = UGSessionRuntime(
             model_runner=FakeUGModelRunner(),
             session_controller=SessionController(FakeTreeCache()),
-            tokenizer=tokenizer,
-            vocab_size=128,
-            srt_image_tokenization="text_placeholder",
         )
-
         handle = runtime.prefill_interleaved(
-            [
-                UGInterleavedMessage(type="image", content=object()),
-                UGInterleavedMessage(type="text", content="hello"),
-            ],
-            session_id="placeholder-image",
-        )
-        debug = runtime.get_debug_counters(handle)
-
-        self.assertEqual(
-            tokenizer.calls,
-            [("<image>", False), ("hello", False)],
-        )
-        self.assertEqual(debug["srt_last_origin_input_ids"], [1, 41, 42])
-        self.assertEqual(debug["srt_mm_offsets"], [])
-
-    def test_append_generated_image_uses_srt_session_offset_shift(self):
-        controller = SessionController(FakeTreeCache())
-        runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(), session_controller=controller
+            [UGInterleavedMessage(type="text", content="hello")]
         )
 
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="hello world")],
-            session_id="srt-backed-image-append",
-        )
-        self.assertEqual(runtime.get_debug_counters(handle)["srt_mm_offsets"], [])
-
-        decode = runtime.decode_next_segment(handle)
-        self.assertEqual(decode.type, "image_marker")
-        handle = runtime.append_generated_image(handle, image=object())
-        debug = runtime.get_debug_counters(handle)
-
-        self.assertEqual(debug["srt_request_count"], 2)
-        self.assertEqual(debug["srt_last_request_id"], handle.anchor_request_id)
-        self.assertEqual(debug["srt_last_origin_input_len"], 5)
-        self.assertEqual(debug["srt_mm_offsets"], [(3, 5)])
-        self.assertEqual(debug["append_image_count"], 1)
-        self.assertEqual(debug["state"], "u_decode")
-
-        post_image = runtime.decode_next_segment(handle)
-        self.assertEqual(post_image.type, "text")
-        self.assertEqual(post_image.text, "generated_text_after_image")
-
-    def test_srt_request_executor_receives_materialized_prefill_and_append_reqs(self):
-        executor = RecordingSRTRequestExecutor()
-        runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(),
-            session_controller=SessionController(FakeTreeCache()),
-            srt_request_executor=executor,
-        )
-
-        handle = runtime.prefill_interleaved(
-            [
-                UGInterleavedMessage(type="image", content=object()),
-                UGInterleavedMessage(type="text", content="hello"),
-            ],
-            session_id="srt-executor-session",
-        )
-        runtime.decode_next_segment(handle)
-        handle = runtime.append_generated_image(handle, image=object())
-
-        self.assertEqual(
-            [event["state"] for event in executor.events],
-            ["u_prefill", "append_image"],
-        )
-        self.assertEqual(
-            [event["rid"] for event in executor.events],
-            ["srt-executor-session:u1", "srt-executor-session:u2"],
-        )
-        self.assertEqual(executor.events[0]["mm_offsets"], [(1, 3)])
-        self.assertEqual(executor.events[1]["mm_offsets"], [(1, 3), (4, 6)])
-        self.assertIsNone(executor.events[0]["finished_reason"])
-        self.assertIsNone(executor.events[1]["finished_reason"])
-
-        debug = runtime.get_debug_counters(handle)
-        self.assertEqual(debug["srt_executed_request_count"], 2)
-        self.assertEqual(
-            debug["srt_last_executed_request_id"], handle.anchor_request_id
-        )
-        self.assertEqual(debug["srt_last_executed_state"], "append_image")
-
-    def test_model_runner_observer_can_own_srt_u_forward_notification(self):
-        executor = ModelRunnerObserverSRTExecutor()
-        model_runner = RecordingUGModelRunner()
-        runtime = UGSessionRuntime(
-            model_runner=model_runner,
-            session_controller=SessionController(FakeTreeCache()),
-            srt_request_executor=executor,
-        )
-
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="hello model runner")],
-            session_id="srt-model-runner-observer",
-        )
-
-        self.assertEqual(
-            model_runner.srt_u_forward_events,
-            [
-                {
-                    "session_id": "srt-model-runner-observer",
-                    "state": "u_prefill",
-                    "request_id": "srt-model-runner-observer:u1",
-                    "messages": [
-                        UGInterleavedMessage(type="text", content="hello model runner")
-                    ],
-                    "has_token_binding": True,
-                }
-            ],
-        )
-        self.assertEqual(
-            runtime.get_debug_counters(handle)["srt_model_runner_forward_request_ids"],
-            ["srt-model-runner-observer:u1"],
-        )
-
-    def test_model_runner_builds_ug_request_view_from_forward_batch(self):
-        observed = []
-        runner = object.__new__(ModelRunner)
-        runner.ug_u_forward_observer = lambda *, request, messages: observed.append(
-            (request, messages)
-        )
-        forward_batch = SimpleNamespace(
-            ug_u_forward_metadata=[
-                {
-                    "session": UGSessionHandle(
-                        session_id="forward-batch-session",
-                        anchor_request_id="forward-batch-session:u1",
-                        context_length=0,
-                        context_version=0,
-                    ),
-                    "state": "u_prefill",
-                    "request_id": "forward-batch-session:u1",
-                    "origin_input_len": 3,
-                    "origin_input_ids": (1, 2, 3),
-                    "output_ids": (),
-                    "max_new_tokens": 0,
-                    "input_text": "hello",
-                    "mm_offsets": (),
-                    "messages": (UGInterleavedMessage(type="text", content="hello"),),
-                }
-            ],
-            req_pool_indices=torch.tensor([1], dtype=torch.long),
-            seq_lens=torch.tensor([3], dtype=torch.long),
-            req_to_token_pool=SimpleNamespace(
-                req_to_token=torch.tensor(
-                    [
-                        [0, 0, 0, 0],
-                        [9, 10, 11, 0],
-                    ],
-                    dtype=torch.long,
-                )
-            ),
-        )
-
-        ModelRunner._notify_ug_u_forward_observer(runner, forward_batch)
-
-        request, messages = observed[0]
-        self.assertEqual(request.request_id, "forward-batch-session:u1")
-        self.assertEqual(messages, [UGInterleavedMessage(type="text", content="hello")])
-        binding = request.metadata["srt_kv_token_binding"]
-        self.assertEqual(binding.session_id, "forward-batch-session")
-        self.assertEqual(binding.request_id, "forward-batch-session:u1")
-        self.assertEqual(binding.token_count, 3)
-        self.assertTrue(torch.equal(binding.token_indices, torch.tensor([9, 10, 11])))
-
-    def test_runtime_persists_safe_model_state_metadata(self):
-        runner = ModelStateUGModelRunner()
-        runtime = UGSessionRuntime(
-            model_runner=runner,
-            session_controller=SessionController(FakeTreeCache()),
-            srt_request_executor=OutputAppendingSRTExecutor([42]),
-        )
-
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="stateful")],
-            session_id="ug-model-state-session",
-        )
-        decoded = runtime.decode_text(
-            handle,
-            max_new_tokens=1,
-            start_token_id=42,
-            position_ids=[11],
-            greedy=True,
-            model_state_updates={
-                "bagel": {
-                    "logical_kv_lens": [4],
-                    "logical_ropes": [12],
-                }
-            },
-        )
-        counters = runtime.get_debug_counters(decoded.session)
-
-        self.assertEqual(
-            counters["ug_model_state"],
-            {"bagel": {"logical_kv_lens": [4], "logical_ropes": [12]}},
-        )
-        self.assertEqual(
-            runner.observed_model_states[0],
-            {"bagel": {"logical_kv_lens": [3], "logical_ropes": [11]}},
-        )
-        self.assertEqual(
-            runner.observed_model_states[1],
-            {"bagel": {"logical_kv_lens": [4], "logical_ropes": [12]}},
-        )
-        state_repr = str(counters["ug_model_state"]).lower()
-        self.assertNotIn("allocator", state_repr)
-        self.assertNotIn("slot", state_repr)
-        self.assertNotIn("page", state_repr)
-
-    def test_u_decode_can_materialize_srt_session_decode_request(self):
-        executor = RecordingSRTRequestExecutor()
-        runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(),
-            session_controller=SessionController(FakeTreeCache()),
-            srt_request_executor=executor,
-            srt_u_decode_max_new_tokens=1,
-        )
-
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="draw a cat")],
-            session_id="srt-u-decode-session",
-        )
-        marker = runtime.decode_next_segment(handle)
-        debug = runtime.get_debug_counters(handle)
-
-        self.assertEqual(marker.type, "image_marker")
-        self.assertEqual(
-            [event["state"] for event in executor.events],
-            ["u_prefill", "u_decode"],
-        )
-        self.assertEqual(
-            [event["rid"] for event in executor.events],
-            ["srt-u-decode-session:u1", "srt-u-decode-session:d1"],
-        )
-        self.assertEqual([event["max_new_tokens"] for event in executor.events], [0, 1])
-        self.assertEqual(executor.events[-1]["top_k"], 1)
-        self.assertEqual(debug["srt_request_count"], 2)
-        self.assertEqual(debug["srt_u_decode_request_count"], 1)
-        self.assertEqual(
-            debug["srt_last_u_decode_request_id"], "srt-u-decode-session:d1"
-        )
-        self.assertEqual(debug["srt_last_executed_state"], "u_decode")
-        self.assertEqual(debug["state"], "g_denoise")
-
-    def test_decode_text_materializes_start_token_request(self):
-        executor = OutputAppendingSRTExecutor(token_ids=[201, 202])
-        runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(),
-            session_controller=SessionController(FakeTreeCache()),
-            srt_request_executor=executor,
-        )
-
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="describe")],
-            session_id="srt-u-text-decode-session",
-        )
-        decoded = runtime.decode_text(handle, max_new_tokens=2, start_token_id=101)
-        debug = runtime.get_debug_counters(decoded.session)
-
-        self.assertEqual(decoded.input_ids, (101,))
-        self.assertEqual(decoded.output_ids, (201, 202))
-        self.assertEqual(decoded.text, "201 202")
-        self.assertEqual(debug["state"], "u_decode")
-        self.assertEqual(debug["srt_u_decode_request_count"], 1)
-        self.assertEqual(executor.events[-1]["rid"], "srt-u-text-decode-session:d1")
-        self.assertEqual(executor.events[-1]["origin_input_ids"][-1], 101)
-        self.assertEqual(executor.events[-1]["max_new_tokens"], 2)
-
-    def test_srt_u_decode_records_tokenizer_decoded_text(self):
-        class DecodingTokenizer:
-            bos_token_id = None
-            eos_token_id = None
-
-            def encode(self, text, add_special_tokens=False):
-                del text, add_special_tokens
-                return [11]
-
-            def decode(self, token_ids):
-                self.last_decode = list(token_ids)
-                return "decoded:" + ",".join(str(token_id) for token_id in token_ids)
-
-        tokenizer = DecodingTokenizer()
-        executor = OutputAppendingSRTExecutor(token_ids=[201, 202])
-        runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(),
-            session_controller=SessionController(FakeTreeCache()),
-            srt_request_executor=executor,
-            srt_u_decode_max_new_tokens=1,
-            tokenizer=tokenizer,
-            vocab_size=512,
-        )
-
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="describe")],
-            session_id="srt-u-decoded-text-session",
-        )
-        runtime.decode_next_segment(handle)
-        debug = runtime.get_debug_counters(handle)
-
-        self.assertEqual(tokenizer.last_decode, [201])
-        self.assertEqual(debug["srt_last_u_decode_output_ids"], [201])
-        self.assertEqual(debug["srt_last_u_decode_text"], "decoded:201")
-
-    def test_decode_text_can_use_bagel_logical_position_ids(self):
-        executor = OutputAppendingSRTExecutor(token_ids=[201])
-        runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(),
-            session_controller=SessionController(FakeTreeCache()),
-            srt_request_executor=executor,
-        )
-
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="describe")],
-            session_id="srt-u-text-position-session",
-        )
-        first = runtime.decode_text(
-            handle,
-            max_new_tokens=1,
-            start_token_id=101,
-            position_ids=[7],
-        )
-        second = runtime.decode_text(
-            first.session,
-            max_new_tokens=1,
-            start_token_id=201,
-            position_ids=[8],
-            drop_previous_output=True,
-        )
-
-        self.assertEqual(first.position_ids, (7,))
-        self.assertEqual(second.position_ids, (8,))
-        self.assertEqual(executor.events[-2]["rid"], "srt-u-text-position-session:d1")
-        self.assertEqual(executor.events[-1]["rid"], "srt-u-text-position-session:d2")
-        self.assertEqual(executor.events[-2]["ug_position_ids"][-1], 7)
-        self.assertEqual(executor.events[-1]["ug_position_ids"][-1], 8)
-
-    def test_decode_text_can_force_greedy_sampling(self):
-        executor = OutputAppendingSRTExecutor(token_ids=[201])
-        runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(),
-            session_controller=SessionController(FakeTreeCache()),
-            srt_request_executor=executor,
-        )
-
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="describe")],
-            session_id="srt-u-text-greedy-session",
-        )
-        runtime.decode_text(
-            handle,
-            max_new_tokens=1,
-            start_token_id=101,
-            greedy=True,
-        )
-
-        self.assertEqual(executor.events[-1]["top_k"], 1)
-
-    def test_close_session_releases_srt_multimodal_features(self):
-        tree_cache = FakeTreeCache()
-        controller = SessionController(tree_cache)
-        runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(), session_controller=controller
-        )
-
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="image", content=object())],
-            session_id="srt-backed-close",
-        )
-        self.assertFalse(runtime.get_debug_counters(handle)["srt_mm_features_released"])
-
-        runtime.close_session(handle)
-        debug = runtime.get_debug_counters("srt-backed-close")
-
-        self.assertTrue(debug["closed"])
-        self.assertEqual(debug["state"], "done")
-        self.assertTrue(debug["srt_mm_features_released"])
-        self.assertEqual(tree_cache.released_sessions, ["srt-backed-close"])
-        self.assertNotIn("srt-backed-close", controller.sessions)
-
-    def test_two_ug_sessions_are_isolated_when_interleaved(self):
-        tree_cache = FakeTreeCache()
-        controller = SessionController(tree_cache)
-        runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(),
-            session_controller=controller,
-        )
-
-        handle_a = runtime.prefill_interleaved(
-            [
-                UGInterleavedMessage(type="image", content=object()),
-                UGInterleavedMessage(type="text", content="draw a red kite"),
-            ],
-            session_id="ug-session-a",
-        )
-        marker_a = runtime.decode_next_segment(handle_a)
-        self.assertEqual(marker_a.type, "image_marker")
-
-        handle_b = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="draw a blue boat")],
-            session_id="ug-session-b",
-        )
-        marker_b = runtime.decode_next_segment(handle_b)
-        self.assertEqual(marker_b.type, "image_marker")
-
-        response_a = runtime.predict_velocity(
-            UGVelocityRequest(
-                session=handle_a,
-                latent_tokens=torch.zeros(1, 2, 4),
-                timestep=torch.tensor([0.75]),
-                latent_position_ids=torch.arange(2),
-                sampling_params=None,
-            )
-        )
-        response_b = runtime.predict_velocity(
-            UGVelocityRequest(
-                session=handle_b,
-                latent_tokens=torch.zeros(1, 2, 4),
-                timestep=torch.tensor([0.5]),
-                latent_position_ids=torch.arange(2),
-                sampling_params=None,
-            )
-        )
-        self.assertEqual(response_a.session.session_id, "ug-session-a")
-        self.assertEqual(response_b.session.session_id, "ug-session-b")
-
-        handle_a = runtime.append_generated_image(handle_a, image=object())
-        text_a = runtime.decode_next_segment(handle_a)
-        self.assertEqual(text_a.type, "text")
-
-        debug_a = runtime.get_debug_counters(handle_a)
-        debug_b = runtime.get_debug_counters(handle_b)
-        self.assertEqual(debug_a["session_id"], "ug-session-a")
-        self.assertEqual(debug_b["session_id"], "ug-session-b")
-        self.assertEqual(debug_a["prefill_count"], 1)
-        self.assertEqual(debug_b["prefill_count"], 1)
-        self.assertEqual(debug_a["velocity_count"], 1)
-        self.assertEqual(debug_b["velocity_count"], 1)
-        self.assertEqual(debug_a["append_image_count"], 1)
-        self.assertEqual(debug_b["append_image_count"], 0)
-        self.assertEqual(debug_a["state"], "u_decode")
-        self.assertEqual(debug_b["state"], "g_denoise")
-
-        runtime.close_session(handle_a)
-        self.assertEqual(tree_cache.released_sessions, ["ug-session-a"])
-        self.assertNotIn("ug-session-a", controller.sessions)
-        self.assertIn("ug-session-b", controller.sessions)
-        self.assertEqual(runtime.get_state(handle_b), UGSegmentState.G_DENOISE)
-
-        response_b = runtime.predict_velocity(
-            UGVelocityRequest(
-                session=handle_b,
-                latent_tokens=torch.zeros(1, 2, 4),
-                timestep=torch.tensor([0.25]),
-                latent_position_ids=torch.arange(2),
-                sampling_params=None,
-            )
-        )
-        self.assertEqual(response_b.session.session_id, "ug-session-b")
-        self.assertEqual(
-            runtime.get_debug_counters(handle_b)["velocity_count"],
-            2,
-        )
-
-    def test_close_session_releases_only_that_session_and_sidecars(self):
-        tree_cache = FakeTreeCache()
-        controller = SessionController(tree_cache)
-        runtime = UGSessionRuntime(
-            model_runner=SidecarUGModelRunner(),
-            session_controller=controller,
-            srt_request_executor=RecordingSRTRequestExecutor(),
-        )
-
-        handle_a = runtime.prefill_interleaved(
-            [
-                UGInterleavedMessage(type="image", content=object()),
-                UGInterleavedMessage(type="text", content="session a"),
-            ],
-            session_id="ug-sidecar-a",
-        )
-        handle_b = runtime.prefill_interleaved(
-            [
-                UGInterleavedMessage(type="image", content=object()),
-                UGInterleavedMessage(type="text", content="session b"),
-            ],
-            session_id="ug-sidecar-b",
-        )
-
-        debug_a = runtime.get_debug_counters(handle_a)
-        debug_b = runtime.get_debug_counters(handle_b)
-        self.assertEqual(debug_a["srt_sidecar_session_ids"], ["ug-sidecar-a:cfg_img"])
-        self.assertEqual(debug_b["srt_sidecar_session_ids"], ["ug-sidecar-b:cfg_img"])
-        self.assertEqual(
-            debug_a["ug_model_state"]["test"]["owner_session_id"],
-            "ug-sidecar-a",
-        )
-        self.assertEqual(
-            debug_b["ug_model_state"]["test"]["owner_session_id"],
-            "ug-sidecar-b",
-        )
-        self.assertIn("ug-sidecar-a", controller.sessions)
-        self.assertIn("ug-sidecar-a:cfg_img", controller.sessions)
-        self.assertIn("ug-sidecar-b", controller.sessions)
-        self.assertIn("ug-sidecar-b:cfg_img", controller.sessions)
-
-        runtime.close_session(handle_a)
-
-        self.assertEqual(
-            set(tree_cache.released_sessions),
-            {"ug-sidecar-a", "ug-sidecar-a:cfg_img"},
-        )
-        self.assertNotIn("ug-sidecar-a", controller.sessions)
-        self.assertNotIn("ug-sidecar-a:cfg_img", controller.sessions)
-        self.assertIn("ug-sidecar-b", controller.sessions)
-        self.assertIn("ug-sidecar-b:cfg_img", controller.sessions)
-        self.assertEqual(runtime.get_state(handle_b), UGSegmentState.U_DECODE)
-
-        handle_b = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="session b continues")],
-            session_id=handle_b.session_id,
-        )
-        self.assertEqual(handle_b.session_id, "ug-sidecar-b")
-        self.assertEqual(runtime.get_debug_counters(handle_b)["prefill_count"], 2)
-
-    def test_ug_non_causal_batch_guard_rejects_mixed_batches(self):
-        ordinary = SimpleNamespace()
-        non_causal = SimpleNamespace(ug_non_causal_query_attention=True)
-
-        self.assertEqual(get_ug_batch_compat_key(ordinary), UG_BATCH_COMPAT_CAUSAL)
-        self.assertEqual(
-            get_ug_batch_compat_key(non_causal),
-            UG_BATCH_COMPAT_NON_CAUSAL_QUERY,
-        )
-        self.assertTrue(is_ug_batch_compatible(ordinary, None))
-        self.assertTrue(
-            is_ug_batch_compatible(non_causal, UG_BATCH_COMPAT_NON_CAUSAL_QUERY)
-        )
-        self.assertFalse(
-            is_ug_batch_compatible(ordinary, UG_BATCH_COMPAT_NON_CAUSAL_QUERY)
-        )
-        self.assertEqual(
-            get_ug_batch_compat_key_for_reqs([ordinary, ordinary]),
-            UG_BATCH_COMPAT_CAUSAL,
-        )
-        self.assertEqual(
-            get_ug_batch_compat_key_for_reqs([non_causal, non_causal]),
-            UG_BATCH_COMPAT_NON_CAUSAL_QUERY,
-        )
-        self.assertFalse(check_ug_non_causal_batch_compat([ordinary, ordinary]))
-        self.assertTrue(check_ug_non_causal_batch_compat([non_causal, non_causal]))
-        with self.assertRaisesRegex(ValueError, "cannot be mixed"):
-            check_ug_non_causal_batch_compat([ordinary, non_causal])
-        with self.assertRaisesRegex(ValueError, "cannot be mixed"):
-            get_ug_batch_compat_key_for_reqs([ordinary, non_causal])
-
-    def test_schedule_batch_rejects_mixed_non_causal_extend_batch(self):
-        ordinary = SimpleNamespace(
-            fill_ids=[1, 2],
-            prefix_indices=[],
-            origin_input_ids=[1, 2],
-            extend_input_len=2,
-        )
-        non_causal = SimpleNamespace(
-            fill_ids=[3, 4],
-            prefix_indices=[],
-            origin_input_ids=[3, 4],
-            extend_input_len=2,
-            ug_non_causal_query_attention=True,
-        )
-        batch = ScheduleBatch(reqs=[ordinary, non_causal], device="cpu")
-
-        with self.assertRaisesRegex(ValueError, "cannot be mixed"):
-            batch.prepare_for_extend()
-
-    def test_interleave_minimal_loop_keeps_one_session(self):
-        runtime = UGSessionRuntime(model_runner=FakeUGModelRunner())
-        events = ["input_text", "input_image"]
-
-        handle = runtime.prefill_interleaved(
-            [
-                UGInterleavedMessage(type="image", content=object()),
-                UGInterleavedMessage(type="text", content="draw then explain"),
-            ],
-            session_id="ug-test-session",
-        )
-        self.assertEqual(runtime.get_state(handle), UGSegmentState.U_DECODE)
-
-        decode = runtime.decode_next_segment(handle)
-        self.assertEqual(decode.type, "image_marker")
-        self.assertEqual(runtime.get_state(handle), UGSegmentState.G_DENOISE)
-
-        latents = torch.zeros(1, 4, 8)
-        for step in range(3):
-            response = runtime.predict_velocity(
-                UGVelocityRequest(
-                    session=handle,
-                    latent_tokens=latents,
-                    timestep=torch.tensor([1.0 - step * 0.25]),
-                    latent_position_ids=torch.arange(4),
-                    sampling_params=None,
-                )
-            )
-            latents = response.velocity
-
-        events.append("generated_image")
-        handle_after_image = runtime.append_generated_image(handle, image=object())
-        self.assertEqual(handle_after_image.session_id, handle.session_id)
-        self.assertGreater(handle_after_image.context_version, handle.context_version)
-        self.assertEqual(runtime.get_state(handle_after_image), UGSegmentState.U_DECODE)
-
-        decode_after_image = runtime.decode_next_segment(handle_after_image)
-        self.assertEqual(decode_after_image.type, "text")
-        self.assertEqual(decode_after_image.text, "generated_text_after_image")
-        events.append("generated_text_after_image")
-
-        self.assertEqual(
-            events,
-            [
-                "input_text",
-                "input_image",
-                "generated_image",
-                "generated_text_after_image",
-            ],
-        )
-
-        counters = runtime.get_debug_counters(handle_after_image)
-        self.assertEqual(counters["session_id"], "ug-test-session")
-        self.assertEqual(counters["prefill_count"], 1)
-        self.assertEqual(counters["velocity_count"], 3)
-        self.assertEqual(counters["append_image_count"], 1)
-
-    def test_illegal_transitions_fail_early(self):
-        runtime = UGSessionRuntime(model_runner=FakeUGModelRunner())
-        handle = runtime.prefill_interleaved(
-            [UGInterleavedMessage(type="text", content="hello")],
-            session_id="illegal",
-        )
-
-        with self.assertRaisesRegex(ValueError, "Cannot predict UG velocity"):
+        self.assertEqual(runtime.records[handle.session_id].state, UGSegmentState.U_DECODE)
+        with self.assertRaisesRegex(ValueError, "Cannot enter G_DENOISE"):
             runtime.predict_velocity(
                 UGVelocityRequest(
                     session=handle,
-                    latent_tokens=torch.zeros(1, 1, 1),
+                    latent_tokens=torch.zeros(1, 2, 4),
                     timestep=torch.tensor([1.0]),
-                    latent_position_ids=torch.arange(1),
+                    latent_position_ids=torch.arange(2),
                     sampling_params=None,
                 )
             )
 
-        with self.assertRaisesRegex(ValueError, "Cannot append generated image"):
-            runtime.append_generated_image(handle, image=object())
+    def test_velocity_does_not_repeat_prefill(self):
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(),
+            session_controller=SessionController(FakeTreeCache()),
+        )
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="draw an image")]
+        )
+        self.assertEqual(runtime.decode_next_segment(handle).type, "image_marker")
 
-        runtime.decode_next_segment(handle)
-        handle_after_image = runtime.append_generated_image(handle, image=object())
-        with self.assertRaisesRegex(ValueError, "Stale UG session handle"):
-            runtime.decode_next_segment(handle)
+        velocity = runtime.predict_velocity(
+            UGVelocityRequest(
+                session=handle,
+                latent_tokens=torch.ones(1, 3, 4),
+                timestep=torch.tensor([0.5]),
+                latent_position_ids=torch.arange(3),
+                sampling_params=None,
+            )
+        )
 
-        self.assertEqual(runtime.get_state(handle_after_image), UGSegmentState.U_DECODE)
+        self.assertEqual(tuple(velocity.velocity.shape), (1, 3, 4))
+        counters = runtime.get_debug_counters(handle)
+        self.assertEqual(counters["prefill_count"], 1)
+        self.assertEqual(counters["velocity_count"], 1)
+
+    def test_close_releases_session(self):
+        tree_cache = FakeTreeCache()
+        runtime = UGSessionRuntime(
+            model_runner=FakeUGModelRunner(),
+            session_controller=SessionController(tree_cache),
+        )
+        handle = runtime.prefill_interleaved(
+            [UGInterleavedMessage(type="text", content="hello")]
+        )
+
+        runtime.close_session(handle)
+
+        self.assertEqual(tree_cache.released_sessions, [handle.session_id])
+        self.assertTrue(runtime.records[handle.session_id].closed)
 
 
 if __name__ == "__main__":

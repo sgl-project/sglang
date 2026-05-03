@@ -855,11 +855,7 @@ class PrefillAdder:
 
                 self._add_dllm_req(req, prefix_len)
                 self._req_inc_lock_ref(req)
-            elif (
-                self.rem_chunk_tokens is None
-                or input_tokens <= self.rem_chunk_tokens
-                or getattr(req, "ug_non_causal_query_attention", False)
-            ):
+            elif self.rem_chunk_tokens is None or input_tokens <= self.rem_chunk_tokens:
                 # Non-chunked prefill
                 self.can_run_list.append(req)
 

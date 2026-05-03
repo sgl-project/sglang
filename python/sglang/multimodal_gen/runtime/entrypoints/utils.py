@@ -8,9 +8,6 @@ This module provides a consolidated interface for generating videos using
 diffusion models.
 """
 
-import base64
-import dataclasses
-import io
 import os
 import shutil
 import subprocess
@@ -37,15 +34,10 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.srt.observability.trace import TraceReqContext
-from sglang.srt.ug.interleaved import (
-    UGInterleavedRequest,
-    UGInterleavedResponse,
-)
 
 logger = init_logger(__name__)
 
@@ -84,13 +76,6 @@ class GetDisaggStatsReq:
     """Request to get disagg pipeline metrics from the scheduler."""
 
     pass
-
-
-@dataclass
-class UGInterleavedGenerateReq:
-    """Scheduler transport request for the experimental UG interleaved API."""
-
-    request: UGInterleavedRequest
 
 
 def format_lora_message(
@@ -136,214 +121,6 @@ class GenerationResult:
     trajectory_decoded: Any = None
     prompt_index: int = 0
     output_file_path: str | None = None
-
-
-def build_ug_interleaved_generate_req(
-    payload: dict[str, Any] | UGInterleavedRequest,
-) -> UGInterleavedGenerateReq:
-    """Build a scheduler request from the public experimental UG payload."""
-    if isinstance(payload, UGInterleavedRequest):
-        return UGInterleavedGenerateReq(payload)
-    if not isinstance(payload, dict):
-        raise TypeError(f"UG interleaved request payload must be a dict: {payload!r}")
-
-    messages = payload.get("messages")
-    if messages is None:
-        raise ValueError("UG interleaved request is missing messages")
-    messages = _load_ug_input_images(messages)
-    sampling_params = _build_ug_sampling_params(payload.get("sampling_params"))
-    metadata = _build_ug_request_metadata(payload)
-    return UGInterleavedGenerateReq(
-        UGInterleavedRequest.from_segments(
-            messages,
-            sampling_params=sampling_params,
-            metadata=metadata,
-        )
-    )
-
-
-def build_ug_interleaved_generate_reqs(
-    payload: dict[str, Any] | list[Any] | UGInterleavedRequest,
-) -> UGInterleavedGenerateReq | list[UGInterleavedGenerateReq]:
-    """Normalize a single or batched UG interleaved payload."""
-    if isinstance(payload, UGInterleavedRequest):
-        return build_ug_interleaved_generate_req(payload)
-    if isinstance(payload, list):
-        return [build_ug_interleaved_generate_req(item) for item in payload]
-    if isinstance(payload, dict) and "requests" in payload:
-        requests = payload["requests"]
-        if not isinstance(requests, list):
-            raise TypeError("UG interleaved batch payload requests must be a list")
-        return [build_ug_interleaved_generate_req(item) for item in requests]
-    return build_ug_interleaved_generate_req(payload)
-
-
-def build_ug_vlm_generate_reqs(
-    payload: dict[str, Any] | list[Any] | UGInterleavedRequest,
-) -> UGInterleavedGenerateReq | list[UGInterleavedGenerateReq]:
-    """Normalize a single or batched experimental UG VLM-only payload."""
-    return build_ug_interleaved_generate_reqs(
-        _with_ug_request_metadata(payload, {"mode": "vlm"})
-    )
-
-
-def _build_ug_sampling_params(
-    payload: dict[str, Any] | UGSamplingParams | None,
-) -> UGSamplingParams:
-    if payload is None:
-        return UGSamplingParams()
-    if isinstance(payload, UGSamplingParams):
-        return payload
-    if not isinstance(payload, dict):
-        raise TypeError(f"UG interleaved sampling_params must be a dict: {payload!r}")
-    values = dict(payload)
-    for key in ("mode", "max_new_tokens", "max_length"):
-        values.pop(key, None)
-    return UGSamplingParams(**values)
-
-
-def _build_ug_request_metadata(payload: dict[str, Any]) -> dict[str, Any]:
-    metadata = dict(payload.get("metadata") or {})
-    sampling_params = payload.get("sampling_params")
-    if isinstance(sampling_params, dict):
-        for key in (
-            "mode",
-            "think",
-            "max_new_tokens",
-            "max_length",
-            "think_max_new_tokens",
-        ):
-            if key in sampling_params and sampling_params[key] is not None:
-                metadata[key] = sampling_params[key]
-    for key in (
-        "mode",
-        "think",
-        "max_new_tokens",
-        "max_length",
-        "think_max_new_tokens",
-    ):
-        if key in payload and payload[key] is not None:
-            metadata[key] = payload[key]
-    return metadata
-
-
-def _load_ug_input_images(messages: Any) -> Any:
-    if not isinstance(messages, list):
-        return messages
-    loaded = []
-    for message in messages:
-        if not isinstance(message, dict):
-            loaded.append(message)
-            continue
-        message_type = message.get("type")
-        if message_type != "image":
-            loaded.append(message)
-            continue
-        cloned = dict(message)
-        image = cloned.get("image", cloned.get("content"))
-        loaded_image = _load_ug_input_image(image)
-        if "image" in cloned:
-            cloned["image"] = loaded_image
-        else:
-            cloned["content"] = loaded_image
-        loaded.append(cloned)
-    return loaded
-
-
-def _load_ug_input_image(image: Any) -> Any:
-    if isinstance(image, dict) and "image" in image:
-        cloned = dict(image)
-        cloned["image"] = _load_ug_input_image(cloned["image"])
-        return cloned
-    if not isinstance(image, str):
-        return image
-    if image.startswith("data:image/"):
-        header, encoded = image.split(",", 1)
-        del header
-        return _open_ug_image(io.BytesIO(base64.b64decode(encoded)))
-    if os.path.exists(image):
-        return _open_ug_image(image)
-    return image
-
-
-def _open_ug_image(source: Any) -> Any:
-    from PIL import Image
-
-    with Image.open(source) as image:
-        return image.convert("RGB").copy()
-
-
-def _with_ug_request_metadata(
-    payload: dict[str, Any] | list[Any] | UGInterleavedRequest,
-    metadata_updates: dict[str, Any],
-) -> dict[str, Any] | list[Any] | UGInterleavedRequest:
-    if isinstance(payload, UGInterleavedRequest):
-        metadata = dict(payload.metadata)
-        metadata.update(metadata_updates)
-        return UGInterleavedRequest(
-            messages=payload.messages,
-            sampling_params=payload.sampling_params,
-            metadata=metadata,
-        )
-    if isinstance(payload, list):
-        return [_with_ug_request_metadata(item, metadata_updates) for item in payload]
-    if not isinstance(payload, dict):
-        return payload
-    if "requests" in payload:
-        cloned = dict(payload)
-        requests = cloned.get("requests")
-        if isinstance(requests, list):
-            cloned["requests"] = [
-                _with_ug_request_metadata(item, metadata_updates) for item in requests
-            ]
-        return cloned
-    cloned = dict(payload)
-    metadata = dict(cloned.get("metadata") or {})
-    metadata.update(metadata_updates)
-    cloned["metadata"] = metadata
-    return cloned
-
-
-def serialize_ug_interleaved_output(output: Any) -> Any:
-    """Convert UG interleaved scheduler output into a JSON-friendly payload."""
-    if isinstance(output, UGInterleavedResponse):
-        return _serialize_ug_interleaved_response(output)
-    if isinstance(output, list):
-        return [serialize_ug_interleaved_output(item) for item in output]
-    return output
-
-
-def _serialize_ug_interleaved_response(
-    response: UGInterleavedResponse,
-) -> dict[str, Any]:
-    return {
-        "segments": [
-            _serialize_ug_segment(segment) for segment in response.to_legacy_segments()
-        ],
-        "stats": dataclasses.asdict(response.stats) if response.stats else None,
-        "metadata": dict(response.metadata),
-    }
-
-
-def _serialize_ug_segment(segment: dict[str, Any]) -> dict[str, Any]:
-    serialized = dict(segment)
-    if serialized.get("type") == "image" and "image" in serialized:
-        serialized["image"] = _serialize_ug_image(serialized["image"])
-    return serialized
-
-
-def _serialize_ug_image(image: Any) -> Any:
-    if isinstance(image, str) or image is None:
-        return image
-
-    save = getattr(image, "save", None)
-    if callable(save):
-        buffer = io.BytesIO()
-        save(buffer, format="PNG")
-        encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
-        return f"data:image/png;base64,{encoded}"
-
-    return None
 
 
 def normalize_output_seeds(
@@ -869,6 +646,6 @@ def post_process_sample(
                     imageio.imwrite(save_file_path, frames[0], quality=quality)
             logger.info(f"Output saved to {CYAN}{save_file_path}{RESET}")
         else:
-            logger.info("No output path provided, output not saved")
+            logger.info(f"No output path provided, output not saved")
 
     return frames

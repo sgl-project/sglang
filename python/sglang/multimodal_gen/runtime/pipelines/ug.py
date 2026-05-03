@@ -16,8 +16,6 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.ug.adapter import UGModelRunnerAdapter
-from sglang.srt.ug.bagel import create_bagel_ug_model_adapter
 from sglang.srt.ug.denoiser import SRTBackedUGDenoiserBridge, UGDenoiserBridge
 from sglang.srt.ug.interleaved import (
     UGInterleavedRequest,
@@ -26,10 +24,7 @@ from sglang.srt.ug.interleaved import (
     normalize_ug_generation_mode,
 )
 from sglang.srt.ug.runtime import FakeUGModelRunner, UGSessionRuntime
-from sglang.srt.ug.srt_executor import (
-    UGSRTRequestBoundaryExecutor,
-    UGSRTSchedulerExecutor,
-)
+from sglang.srt.ug.srt_executor import UGSRTRequestBoundaryExecutor
 
 
 class _UGRuntimeTreeCache:
@@ -69,7 +64,10 @@ def _build_srt_owned_ug_runtime(
 
 def _build_srt_request_executor(scheduler=None):
     if scheduler is not None:
-        return UGSRTSchedulerExecutor(scheduler)
+        raise ValueError(
+            "Native UG scheduler execution is intentionally split out of the lean "
+            "interleave contract PR"
+        )
     return UGSRTRequestBoundaryExecutor()
 
 
@@ -89,28 +87,6 @@ def _load_ug_bridge(
                 scheduler=scheduler,
                 srt_request_executor=srt_request_executor,
                 srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
-            )
-        )
-    if "bagel" in model_path_lower:
-        native_srt_denoise_executor = None
-        native_srt_u_context = False
-        if scheduler is not None and "mock-bagel" not in model_path_lower:
-            native_srt_denoise_executor = (
-                srt_request_executor.create_bagel_native_srt_denoise_executor()
-            )
-            native_srt_u_context = True
-        adapter = create_bagel_ug_model_adapter(
-            model_path,
-            native_srt_denoise_executor=native_srt_denoise_executor,
-            native_srt_u_context=native_srt_u_context,
-        )
-        return SRTBackedUGDenoiserBridge(
-            _build_srt_owned_ug_runtime(
-                UGModelRunnerAdapter(adapter),
-                scheduler=scheduler,
-                srt_request_executor=srt_request_executor,
-                srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
-                srt_image_tokenization="multimodal",
             )
         )
     raise ValueError(f"Unsupported UG model path: {model_path}")

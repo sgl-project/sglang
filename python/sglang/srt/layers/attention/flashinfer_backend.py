@@ -476,22 +476,15 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             prefix_lens = forward_batch.extend_prefix_lens
-            ug_g_non_causal_query_attention = getattr(
-                forward_batch,
-                "ug_g_non_causal_query_attention",
-                False,
-            )
 
             # Disable ragged wrapper and ensure prefix handling for multimodal and multi-item scoring
-            if self.is_multimodal or self.enable_mis or ug_g_non_causal_query_attention:
+            if self.is_multimodal or self.enable_mis:
                 # use_ragged = False: Multi-item scoring requires the paged wrapper because:
                 # 1. Ragged wrapper doesn't support the specialized multi-item parameters
                 #    (prefix_len_ptr, token_pos_in_items_ptr, etc.)
                 # 2. Paged wrapper provides better control over attention masking needed
                 #    for respecting item boundaries in multi-item sequences
                 # 3. Custom masking logic conflicts with ragged wrapper's assumptions
-                # UG G non-causal query attention also uses the paged wrapper so
-                # its q x full-KV mask matches the official BAGEL flow block.
                 use_ragged = False
                 extend_no_prefix = False
             else:
@@ -812,11 +805,6 @@ class FlashInferAttnBackend(AttentionBackend):
             causal = (
                 not layer.is_cross_attention
                 and layer.attn_type != AttentionType.ENCODER_ONLY
-                and not getattr(
-                    forward_batch,
-                    "ug_g_non_causal_query_attention",
-                    False,
-                )
             )
             o = prefill_wrapper_paged.forward(
                 q.view(-1, layer.tp_q_head_num, layer.head_dim),
@@ -854,11 +842,6 @@ class FlashInferAttnBackend(AttentionBackend):
             if (
                 layer.is_cross_attention
                 or layer.attn_type == AttentionType.ENCODER_ONLY
-                or getattr(
-                    forward_batch,
-                    "ug_g_non_causal_query_attention",
-                    False,
-                )
             ):
                 causal = False
             if not self.is_dllm_model and layer.attn_type == AttentionType.ENCODER_ONLY:
@@ -1305,7 +1288,6 @@ class FlashInferIndicesUpdaterPrefill:
             spec_info,
             fixed_split_size=fixed_split_size,
             multi_item_params=multi_item_params,
-            cross_attention_custom_mask=cross_attention_custom_mask,
         )
 
     def update_sliding_window(

@@ -499,35 +499,6 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(req.extend_input_len, original_len)
         self.assertEqual(len(adder.can_run_list), 0)
 
-    def test_ug_non_causal_query_request_is_not_chunked(self):
-        adder = self.create_adder(
-            self.create_running_batch(),
-            page_size=1,
-            rem_chunk_tokens=256,
-        )
-        self.mock_token_allocator.full_available_size.return_value = 100_000
-        self.mock_token_allocator.available_size.return_value = 100_000
-
-        req = self.create_mock_req("ug-non-causal", priority=0, max_new_tokens=1)
-        req.extend_input_len = 3852
-        req.host_hit_length = 0
-        req.prefix_indices = []
-        req.fill_ids = list(range(req.extend_input_len))
-        req.last_node = MagicMock()
-        req.sampling_params.ignore_eos = False
-        req.set_extend_input_len = MagicMock()
-        req.ug_non_causal_query_attention = True
-
-        result = adder.add_one_req(
-            req, has_chunked_req=False, truncation_align_size=None
-        )
-
-        self.assertIs(adder.can_run_list[0], req)
-        self.assertIsNone(adder.new_chunked_req)
-        req.set_extend_input_len.assert_not_called()
-        self.assertEqual(req.extend_input_len, 3852)
-        self.assertEqual(result, AddReqResult.OTHER)
-
 
 if __name__ == "__main__":
     unittest.main()
