@@ -34,6 +34,8 @@ _stage_observer = _STAGE_OBSERVER_UNSET
 def _get_stage_observer():
     global _stage_observer
 
+    # StageProfiler may be constructed before metrics are initialized; only
+    # cache the observer once it is enabled.
     if _stage_observer is _STAGE_OBSERVER_UNSET:
         observer = get_diffusion_observer()
         if observer.enabled:

@@ -74,6 +74,7 @@ class PrometheusDiffusionObserver(DiffusionObserver):
             self.collector.set_running_reqs(0)
 
     def mark_requests_dispatched(self, reqs: list[Any]) -> None:
+        """Track original scheduler requests that have entered execution."""
         count = len(reqs)
         if count == 0:
             return
@@ -82,6 +83,7 @@ class PrometheusDiffusionObserver(DiffusionObserver):
             self.collector.set_running_reqs(self._running_reqs)
 
     def mark_requests_finished(self, reqs: list[Any]) -> None:
+        """Remove original scheduler requests from the running count."""
         count = len(reqs)
         if count == 0:
             return
@@ -131,6 +133,7 @@ def get_diffusion_observer(
     *,
     enabled: bool = True,
 ) -> DiffusionObserver:
+    """Return the process-wide observer, creating Prometheus metrics from ServerArgs."""
     global _diffusion_observer
 
     if not enabled or (server_args is not None and not server_args.enable_metrics):
