@@ -492,6 +492,7 @@ class ServerArgs:
     experts_shared_outer_loras: Optional[bool] = None
     lora_use_virtual_experts: bool = False
     lora_strict_loading: bool = False
+    lora_drain_wait_threshold: float = 0.0
 
     # Kernel backend
     attention_backend: Optional[str] = None
@@ -5258,6 +5259,12 @@ class ServerArgs:
             help="Enable strict loading for LoRA adapters. "
             "When set, mismatched or missing keys in the adapter weights will raise an error.",
         )
+        parser.add_argument(
+            "--lora-drain-wait-threshold",
+            type=float,
+            default=ServerArgs.lora_drain_wait_threshold,
+            help="When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).",
+        )
 
         # Kernel backend
         parser.add_argument(
@@ -7085,6 +7092,10 @@ class ServerArgs:
                     f"Got: {self.lora_backend}"
                 )
                 logger.info("Virtual expert computation enabled.")
+
+            assert (
+                self.lora_drain_wait_threshold >= 0.0
+            ), "--lora-drain-wait-threshold must be non-negative."
 
     def validate_buckets_rule(self, arg_name: str, buckets_rule: List[str]):
         if not buckets_rule:
