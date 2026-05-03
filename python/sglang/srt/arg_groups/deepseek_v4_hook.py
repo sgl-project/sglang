@@ -54,22 +54,24 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
 
 def validate_deepseek_v4_cp(server_args: "ServerArgs") -> None:
     """Validate DeepSeek V4 context-parallel configuration."""
-    if server_args.enable_nsa_prefill_context_parallel:
-        if server_args.nsa_prefill_cp_mode == "round-robin-split":
-            server_args.moe_dense_tp_size = 1
-            assert (
-                server_args.dp_size == 1
-            ), "For round-robin split mode, dp attention is not supported."
-            assert (
-                server_args.tp_size <= 8
-            ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
-            logger.warning(
-                f"Enable Context Parallel for DeepSeekV4, "
-                f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
-                f"ep_size={server_args.ep_size}, tp_size={server_args.tp_size}"
-            )
-        else:
-            raise ValueError(
-                f"DeepSeekV4 only supports round-robin-split CP mode, "
-                f"got {server_args.nsa_prefill_cp_mode}"
-            )
+    if not server_args.enable_nsa_prefill_context_parallel:
+        return
+
+    if server_args.nsa_prefill_cp_mode != "round-robin-split":
+        raise ValueError(
+            f"DeepSeekV4 only supports round-robin-split CP mode, "
+            f"got {server_args.nsa_prefill_cp_mode}"
+        )
+
+    server_args.moe_dense_tp_size = 1
+    assert (
+        server_args.dp_size == 1
+    ), "For round-robin split mode, dp attention is not supported."
+    assert (
+        server_args.tp_size <= 8
+    ), "Context parallel only supports single machine (tp_size <= 8). Cross-machine CP has precision issues."
+    logger.warning(
+        f"Enable Context Parallel for DeepSeekV4, "
+        f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
+        f"ep_size={server_args.ep_size}, tp_size={server_args.tp_size}"
+    )
