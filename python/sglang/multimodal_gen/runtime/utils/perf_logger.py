@@ -209,7 +209,13 @@ class StageProfiler:
         if self.log_stage_start_end:
             msg = f"[{self.stage_name}] started..."
             if self.logger.isEnabledFor(logging.DEBUG):
-                msg += f" ({round(current_platform.get_available_gpu_memory(), 2)} GB left)"
+                # This is only an informational debug log. Calling
+                # empty_cache() here would synchronize the device at every
+                # pipeline stage boundary and make request latency worse.
+                available_memory = current_platform.get_available_gpu_memory(
+                    empty_cache=False
+                )
+                msg += f" ({round(available_memory, 2)} GB left)"
             self.logger.info(msg)
 
         if (self.log_timing and self.metrics) or self.log_stage_start_end:

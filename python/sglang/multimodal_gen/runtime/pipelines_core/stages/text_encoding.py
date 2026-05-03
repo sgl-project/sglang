@@ -68,6 +68,7 @@ class TextEncodingStage(PipelineStage):
         super().__init__()
         self.tokenizers = tokenizers
         self.text_encoders = text_encoders
+        self._negative_text_cache = {}
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -123,12 +124,38 @@ class TextEncodingStage(PipelineStage):
         # Encode negative prompt if CFG is enabled
         if batch.do_classifier_free_guidance:
             assert isinstance(batch.negative_prompt, str)
-            neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
+            negative_cache_key = (
+                server_args.pipeline_class_name,
+                tuple(all_indices),
                 batch.negative_prompt,
-                server_args,
-                encoder_index=all_indices,
-                return_attention_mask=True,
+                batch.max_sequence_length,
             )
+            cached_negative = self._negative_text_cache.get(negative_cache_key)
+            if cached_negative is None:
+                neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = (
+                    self.encode_text(
+                        batch.negative_prompt,
+                        server_args,
+                        encoder_index=all_indices,
+                        return_attention_mask=True,
+                    )
+                )
+                if len(self._negative_text_cache) >= 2:
+                    self._negative_text_cache.clear()
+                # Negative prompts are often a long model default that warmup
+                # and later requests share. For the same pipeline, encoders,
+                # prompt text, and max length, encoding is deterministic, so the
+                # cached tensors are exactly the result of calling encode_text
+                # again.
+                self._negative_text_cache[negative_cache_key] = (
+                    tuple(neg_embeds_list),
+                    tuple(neg_masks_list),
+                    tuple(neg_pooler_embeds_list),
+                )
+            else:
+                neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = (
+                    cached_negative
+                )
 
             assert batch.negative_prompt_embeds is not None
 
