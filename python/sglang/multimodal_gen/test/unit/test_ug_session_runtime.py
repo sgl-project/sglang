@@ -7,12 +7,15 @@ import torch
 
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.context import UGSessionHandle
+from sglang.srt.ug.denoiser import SRTBackedUGDenoiserBridge
+from sglang.srt.ug.interleaved import DEFAULT_UG_TEXT_MAX_NEW_TOKENS
 from sglang.srt.ug.runtime import (
     FakeUGModelRunner,
     UGInterleavedMessage,
     UGSegmentState,
     UGSessionRuntime,
     UGVelocityRequest,
+    UGVLMTextGenerationResult,
 )
 
 
@@ -22,6 +25,16 @@ class FakeTreeCache:
 
     def release_session(self, session_id):
         self.released_sessions.append(session_id)
+
+
+class RecordingThinkRunner(FakeUGModelRunner):
+    def __init__(self):
+        self.think_max_new_tokens = []
+
+    def decode_vlm_text(self, *, runtime, session, max_new_tokens):
+        del runtime
+        self.think_max_new_tokens.append(max_new_tokens)
+        return UGVLMTextGenerationResult(session=session, text="thinking")
 
 
 class TestUGSessionRuntime(unittest.TestCase):
@@ -115,6 +128,22 @@ class TestUGSessionRuntime(unittest.TestCase):
 
         self.assertEqual(tree_cache.released_sessions, [handle.session_id])
         self.assertTrue(runtime.get_debug_counters(handle)["closed"])
+
+    def test_think_default_max_new_tokens_is_not_smoke_sized(self):
+        runner = RecordingThinkRunner()
+        runtime = UGSessionRuntime(
+            model_runner=runner,
+            session_controller=SessionController(FakeTreeCache()),
+        )
+        bridge = SRTBackedUGDenoiserBridge(runtime)
+
+        contexts = bridge.build_contexts(prompt="draw a cup", image=None, think=True)
+        bridge.release_contexts(contexts)
+
+        self.assertEqual(
+            runner.think_max_new_tokens,
+            [DEFAULT_UG_TEXT_MAX_NEW_TOKENS],
+        )
 
 
 if __name__ == "__main__":

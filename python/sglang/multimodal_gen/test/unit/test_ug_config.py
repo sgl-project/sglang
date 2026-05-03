@@ -5,6 +5,8 @@ import unittest
 
 from sglang.multimodal_gen.configs.pipeline_configs.ug import UGPipelineConfig
 from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
+from sglang.multimodal_gen.runtime.pipelines.ug import _resolve_vlm_max_new_tokens
+from sglang.srt.ug.interleaved import DEFAULT_UG_TEXT_MAX_NEW_TOKENS
 
 
 class TestUGSamplingParams(unittest.TestCase):
@@ -62,6 +64,17 @@ class TestUGPipelineConfig(unittest.TestCase):
             ),
             ["num_gpus", "enable_cfg_parallel", "disagg_mode"],
         )
+
+
+class TestUGTextGenerationDefaults(unittest.TestCase):
+    def test_vlm_default_max_new_tokens_is_not_smoke_sized(self):
+        self.assertEqual(
+            _resolve_vlm_max_new_tokens({}),
+            DEFAULT_UG_TEXT_MAX_NEW_TOKENS,
+        )
+
+    def test_vlm_max_new_tokens_can_be_overridden(self):
+        self.assertEqual(_resolve_vlm_max_new_tokens({"max_new_tokens": 16}), 16)
 
 
 if __name__ == "__main__":

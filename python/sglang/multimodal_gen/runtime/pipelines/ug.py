@@ -18,6 +18,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.denoiser import SRTBackedUGDenoiserBridge, UGDenoiserBridge
 from sglang.srt.ug.interleaved import (
+    DEFAULT_UG_TEXT_MAX_NEW_TOKENS,
     UGInterleavedRequest,
     UGInterleavedResponse,
     UGRuntimeStats,
@@ -297,7 +298,10 @@ def _resolve_vlm_max_new_tokens(
 ) -> int:
     value = explicit_max_new_tokens
     if value is None:
-        value = metadata.get("max_new_tokens", metadata.get("max_length", 8))
+        value = metadata.get(
+            "max_new_tokens",
+            metadata.get("max_length", DEFAULT_UG_TEXT_MAX_NEW_TOKENS),
+        )
     value = int(value)
     if value <= 0:
         raise ValueError(f"UG VLM max_new_tokens must be positive, got {value}")

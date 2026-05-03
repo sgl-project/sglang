@@ -7,6 +7,7 @@ from typing import Any, Protocol
 import torch
 
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle, UGSessionHandle
+from sglang.srt.ug.interleaved import DEFAULT_UG_TEXT_MAX_NEW_TOKENS
 from sglang.srt.ug.runtime import (
     FakeUGModelRunner,
     UGDecodeResult,
@@ -300,7 +301,7 @@ class SRTBackedUGDenoiserBridge:
                 "UG think text generation"
             )
         if max_new_tokens is None:
-            max_new_tokens = 8
+            max_new_tokens = DEFAULT_UG_TEXT_MAX_NEW_TOKENS
         max_new_tokens = int(max_new_tokens)
         if max_new_tokens <= 0:
             raise ValueError(
