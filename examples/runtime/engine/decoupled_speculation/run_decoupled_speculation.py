@@ -512,6 +512,14 @@ def load_prompt_samples(args: argparse.Namespace) -> tuple[str, list[PromptSampl
 
     if args.prompt is not None:
         prompt = args.prompt
+        if not args.disable_chat_template:
+            chat_template_renderer = _build_chat_template_renderer(
+                tokenizer_path, enable_thinking=args.enable_thinking
+            )
+            if chat_template_renderer is not None:
+                prompt = chat_template_renderer(
+                    [{"role": "user", "content": args.prompt}]
+                )
         prompt_input_ids = _encode_prompt_tokens(tokenizer, prompt)
         prompt_tokens = len(prompt_input_ids)
         if prompt_tokens == 0:
