@@ -1421,7 +1421,7 @@ class LTX2VideoTransformer3DModel(CachableDiT, OffloadableDiTMixin):
         )
         self.quantize_video_rope_coords_to_hidden_dtype = bool(
             hf_config.get("quantize_video_rope_coords_to_hidden_dtype", False)
-        )
+        ) and str(getattr(arch, "ltx_variant", "ltx_2")) != "ltx_2_3"
         causal_offset = int(hf_config.get("causal_offset", 1))
 
         pos_embed_max_pos = int(arch.positional_embedding_max_pos[0])
