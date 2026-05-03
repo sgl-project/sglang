@@ -865,6 +865,173 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
     }
 
 
+def build_relaykv_actual_host_backup_copy_report_for_smoke(
+    readonly_report: Mapping[str, Any],
+    actual_host_backup_copy_summary: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Build an isolated actual host backup copy report for smoke tests only.
+
+    This combines a readonly diagnostic report with an isolated actual-copy
+    smoke summary. It does not execute copy, read KV pools, snapshot KV,
+    connect attention, alter scheduler behavior, or write runtime state.
+    """
+
+    if not isinstance(readonly_report, Mapping):
+        raise TypeError("readonly_report must be a mapping")
+    if actual_host_backup_copy_summary is not None and not isinstance(
+        actual_host_backup_copy_summary, Mapping
+    ):
+        raise TypeError("actual_host_backup_copy_summary must be a mapping or None")
+
+    actual_summary_included = actual_host_backup_copy_summary is not None
+    actual_summary = actual_host_backup_copy_summary or {}
+
+    actual_safety_counts = {
+        key: actual_summary.get(key) if isinstance(actual_summary.get(key), int) else 0
+        for key in (*_REPORT_SAFETY_COUNTER_KEYS, *_MATERIALIZATION_REPORT_SAFETY_COUNTER_KEYS)
+    }
+    readonly_safety_counts = {
+        key: readonly_report.get(key) if isinstance(readonly_report.get(key), int) else 0
+        for key in (*_REPORT_SAFETY_COUNTER_KEYS, *_MATERIALIZATION_REPORT_SAFETY_COUNTER_KEYS)
+    }
+
+    actual_host_backup_copy_total = (
+        actual_summary.get("total_copy_results")
+        if isinstance(actual_summary.get("total_copy_results"), int)
+        else 0
+    )
+    actual_host_backup_copy_materialized_count = (
+        actual_summary.get("host_backup_copy_materialized_count")
+        if isinstance(actual_summary.get("host_backup_copy_materialized_count"), int)
+        else 0
+    )
+    actual_host_backup_copy_blocked_count = (
+        actual_summary.get("blocked_count")
+        if isinstance(actual_summary.get("blocked_count"), int)
+        else 0
+    )
+    actual_host_backup_copy_error_count = (
+        actual_summary.get("error_count")
+        if isinstance(actual_summary.get("error_count"), int)
+        else 0
+    )
+    actual_host_backup_copy_materialized_kv_count = (
+        actual_summary.get("materialized_kv_count")
+        if isinstance(actual_summary.get("materialized_kv_count"), int)
+        else 0
+    )
+    actual_host_backup_copy_materialized_token_count = (
+        actual_summary.get("materialized_token_count")
+        if isinstance(actual_summary.get("materialized_token_count"), int)
+        else 0
+    )
+    actual_host_backup_copy_executed_count = actual_safety_counts[
+        "host_backup_copy_executed_count"
+    ]
+    actual_host_backup_copy_kv_pool_read_count = actual_safety_counts[
+        "kv_pool_read_count"
+    ]
+    actual_host_backup_copy_kv_snapshot_count = actual_safety_counts[
+        "kv_snapshot_count"
+    ]
+
+    actual_copy_safety_reasons: list[str] = []
+    if readonly_report.get("overall_safety_status") != "pass":
+        actual_copy_safety_reasons.append("readonly_report_overall_safety_not_pass")
+    if not actual_summary_included:
+        actual_copy_safety_reasons.append("actual_host_backup_copy_summary_missing")
+    if actual_host_backup_copy_kv_pool_read_count != 0:
+        actual_copy_safety_reasons.append("kv_pool_read_observed")
+    if actual_host_backup_copy_kv_snapshot_count != 0:
+        actual_copy_safety_reasons.append("kv_snapshot_observed")
+    for key in _REPORT_SAFETY_COUNTER_KEYS:
+        if actual_safety_counts[key] != 0:
+            actual_copy_safety_reasons.append(key)
+    if actual_summary_included and not isinstance(
+        actual_summary.get("summary_type"), str
+    ):
+        actual_copy_safety_reasons.append("actual_host_backup_copy_summary_malformed")
+
+    actual_copy_safety_reasons = list(dict.fromkeys(actual_copy_safety_reasons))
+    actual_copy_safety_status = (
+        "pass" if not actual_copy_safety_reasons else "fail"
+    )
+
+    return {
+        "report_type": "relaykv_actual_host_backup_copy_report",
+        "source_report_type": readonly_report.get("report_type"),
+        "report_generated_from_readonly_inputs": (
+            readonly_report.get("report_generated_from_readonly_inputs") is True
+        ),
+        "overall_safety_status": readonly_report.get("overall_safety_status"),
+        "actual_copy_report_generated_from_isolated_smoke_inputs": True,
+        "actual_copy_safety_status": actual_copy_safety_status,
+        "actual_copy_safety_reasons": actual_copy_safety_reasons,
+        "readonly_report": dict(readonly_report),
+        "actual_host_backup_copy_summary": (
+            dict(actual_host_backup_copy_summary)
+            if actual_host_backup_copy_summary is not None
+            else None
+        ),
+        "policy_dry_run_included": readonly_report.get("policy_dry_run_included")
+        is True,
+        "policy_dry_run_total_events": (
+            readonly_report.get("policy_dry_run_total_events")
+            if isinstance(readonly_report.get("policy_dry_run_total_events"), int)
+            else 0
+        ),
+        "materialization_summary_included": (
+            readonly_report.get("materialization_summary_included") is True
+        ),
+        "materialization_result_count": (
+            readonly_report.get("materialization_result_count")
+            if isinstance(readonly_report.get("materialization_result_count"), int)
+            else 0
+        ),
+        "host_backup_copy_request_summary_included": (
+            readonly_report.get("host_backup_copy_request_summary_included") is True
+        ),
+        "host_backup_copy_request_ready_count": (
+            readonly_report.get("host_backup_copy_request_ready_count")
+            if isinstance(readonly_report.get("host_backup_copy_request_ready_count"), int)
+            else 0
+        ),
+        "host_backup_copy_boundary_result_summary_included": (
+            readonly_report.get("host_backup_copy_boundary_result_summary_included")
+            is True
+        ),
+        "host_backup_copy_boundary_noop_count": (
+            readonly_report.get("host_backup_copy_boundary_noop_count")
+            if isinstance(readonly_report.get("host_backup_copy_boundary_noop_count"), int)
+            else 0
+        ),
+        "actual_host_backup_copy_summary_included": actual_summary_included,
+        "actual_host_backup_copy_total": actual_host_backup_copy_total,
+        "actual_host_backup_copy_materialized_count": (
+            actual_host_backup_copy_materialized_count
+        ),
+        "actual_host_backup_copy_blocked_count": actual_host_backup_copy_blocked_count,
+        "actual_host_backup_copy_error_count": actual_host_backup_copy_error_count,
+        "actual_host_backup_copy_materialized_kv_count": (
+            actual_host_backup_copy_materialized_kv_count
+        ),
+        "actual_host_backup_copy_materialized_token_count": (
+            actual_host_backup_copy_materialized_token_count
+        ),
+        "actual_host_backup_copy_executed_count": (
+            actual_host_backup_copy_executed_count
+        ),
+        "actual_host_backup_copy_kv_pool_read_count": (
+            actual_host_backup_copy_kv_pool_read_count
+        ),
+        "actual_host_backup_copy_kv_snapshot_count": (
+            actual_host_backup_copy_kv_snapshot_count
+        ),
+        **readonly_safety_counts,
+        **actual_safety_counts,
+    }
+
+
 def assess_relaykv_readonly_materialization_readiness_for_smoke(
     report: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -1608,6 +1775,151 @@ def assess_relaykv_actual_host_backup_copy_readiness_for_smoke(
         ),
         "observed_kv_pool_read_count": observed_kv_pool_read_count,
         "observed_kv_snapshot_count": observed_kv_snapshot_count,
+        **safety_counts,
+    }
+
+
+def assess_relaykv_attention_connection_readiness_for_smoke(
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Assess isolated actual-copy report readiness for attention design only."""
+
+    if not isinstance(report, Mapping):
+        raise TypeError(
+            "RelayKV attention connection readiness report must be a mapping"
+        )
+
+    safety_counts = {
+        key: report.get(key) if isinstance(report.get(key), int) else 0
+        for key in (*_REPORT_SAFETY_COUNTER_KEYS, *_MATERIALIZATION_REPORT_SAFETY_COUNTER_KEYS)
+    }
+
+    observed_report_type = str(report.get("report_type", "unknown"))
+    observed_actual_copy_safety_status = str(
+        report.get("actual_copy_safety_status", "unknown")
+    )
+    observed_actual_host_backup_copy_summary_included = (
+        report.get("actual_host_backup_copy_summary_included") is True
+    )
+    observed_actual_host_backup_copy_materialized_count = (
+        report.get("actual_host_backup_copy_materialized_count")
+        if isinstance(report.get("actual_host_backup_copy_materialized_count"), int)
+        else 0
+    )
+    observed_actual_host_backup_copy_executed_count = (
+        report.get("actual_host_backup_copy_executed_count")
+        if isinstance(report.get("actual_host_backup_copy_executed_count"), int)
+        else 0
+    )
+    observed_actual_host_backup_copy_blocked_count = (
+        report.get("actual_host_backup_copy_blocked_count")
+        if isinstance(report.get("actual_host_backup_copy_blocked_count"), int)
+        else 0
+    )
+    observed_actual_host_backup_copy_error_count = (
+        report.get("actual_host_backup_copy_error_count")
+        if isinstance(report.get("actual_host_backup_copy_error_count"), int)
+        else 0
+    )
+    observed_actual_host_backup_copy_kv_pool_read_count = (
+        report.get("actual_host_backup_copy_kv_pool_read_count")
+        if isinstance(report.get("actual_host_backup_copy_kv_pool_read_count"), int)
+        else 0
+    )
+    observed_actual_host_backup_copy_kv_snapshot_count = (
+        report.get("actual_host_backup_copy_kv_snapshot_count")
+        if isinstance(report.get("actual_host_backup_copy_kv_snapshot_count"), int)
+        else 0
+    )
+
+    blocker_state_by_reason = {
+        "not_actual_copy_report": "blocked_not_actual_copy_report",
+        "actual_copy_safety_not_pass": "blocked_actual_copy_safety_not_pass",
+        "actual_copy_summary_missing": "blocked_actual_copy_summary_missing",
+        "no_actual_copy_materialized": "blocked_no_actual_copy_materialized",
+        "actual_copy_not_executed": "blocked_actual_copy_not_executed",
+        "actual_copy_blocked": "blocked_actual_copy_blocked",
+        "actual_copy_error": "blocked_actual_copy_error",
+        "kv_pool_read_observed": "blocked_kv_pool_read_observed",
+        "kv_snapshot_observed": "blocked_kv_snapshot_observed",
+        "safety_counter_nonzero": "blocked_safety_counter_nonzero",
+    }
+    blocking_reasons: list[str] = []
+    warning_reasons: list[str] = [
+        "design_only_readiness_does_not_connect_attention"
+    ]
+
+    if observed_report_type != "relaykv_actual_host_backup_copy_report":
+        blocking_reasons.append("not_actual_copy_report")
+    if observed_actual_copy_safety_status != "pass":
+        blocking_reasons.append("actual_copy_safety_not_pass")
+    if not observed_actual_host_backup_copy_summary_included:
+        blocking_reasons.append("actual_copy_summary_missing")
+    if observed_actual_host_backup_copy_materialized_count <= 0:
+        blocking_reasons.append("no_actual_copy_materialized")
+    if observed_actual_host_backup_copy_executed_count <= 0:
+        blocking_reasons.append("actual_copy_not_executed")
+    if observed_actual_host_backup_copy_blocked_count > 0:
+        blocking_reasons.append("actual_copy_blocked")
+    if observed_actual_host_backup_copy_error_count > 0:
+        blocking_reasons.append("actual_copy_error")
+    if observed_actual_host_backup_copy_kv_pool_read_count > 0:
+        blocking_reasons.append("kv_pool_read_observed")
+    if observed_actual_host_backup_copy_kv_snapshot_count > 0:
+        blocking_reasons.append("kv_snapshot_observed")
+    if any(
+        safety_counts[key] != 0
+        for key in (
+            "source_mutated_true_count",
+            "attention_override_true_count",
+            "kv_cache_mutation_true_count",
+            "runtime_writeback_true_count",
+            "scheduler_policy_noop_false_count",
+        )
+    ):
+        blocking_reasons.append("safety_counter_nonzero")
+
+    blocking_reasons = list(dict.fromkeys(blocking_reasons))
+    ready_for_attention_connection = not blocking_reasons
+    if ready_for_attention_connection:
+        readiness_state = "ready_for_attention_connection_design_only"
+        readiness_reasons = ["isolated_actual_copy_report_ready_for_design_only"]
+    elif len(blocking_reasons) == 1:
+        readiness_state = blocker_state_by_reason[blocking_reasons[0]]
+        readiness_reasons = []
+    else:
+        readiness_state = "blocked_multiple_reasons"
+        readiness_reasons = []
+
+    return {
+        "readiness_type": "relaykv_attention_connection_readiness",
+        "ready_for_attention_connection": ready_for_attention_connection,
+        "readiness_state": readiness_state,
+        "readiness_reasons": readiness_reasons,
+        "blocking_reasons": blocking_reasons,
+        "warning_reasons": warning_reasons,
+        "observed_actual_copy_safety_status": observed_actual_copy_safety_status,
+        "observed_actual_host_backup_copy_summary_included": (
+            observed_actual_host_backup_copy_summary_included
+        ),
+        "observed_actual_host_backup_copy_materialized_count": (
+            observed_actual_host_backup_copy_materialized_count
+        ),
+        "observed_actual_host_backup_copy_executed_count": (
+            observed_actual_host_backup_copy_executed_count
+        ),
+        "observed_actual_host_backup_copy_blocked_count": (
+            observed_actual_host_backup_copy_blocked_count
+        ),
+        "observed_actual_host_backup_copy_error_count": (
+            observed_actual_host_backup_copy_error_count
+        ),
+        "observed_actual_host_backup_copy_kv_pool_read_count": (
+            observed_actual_host_backup_copy_kv_pool_read_count
+        ),
+        "observed_actual_host_backup_copy_kv_snapshot_count": (
+            observed_actual_host_backup_copy_kv_snapshot_count
+        ),
         **safety_counts,
     }
 
