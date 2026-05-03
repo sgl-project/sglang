@@ -1924,6 +1924,124 @@ def assess_relaykv_attention_connection_readiness_for_smoke(
     }
 
 
+def assess_relaykv_attention_handoff_readiness_for_smoke(
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Assess metadata-only readiness for RelayKV attention handoff smoke."""
+
+    if not isinstance(report, Mapping):
+        raise TypeError("RelayKV attention handoff readiness report must be a mapping")
+
+    safety_counts = {
+        key: report.get(key) if isinstance(report.get(key), int) else 0
+        for key in (*_REPORT_SAFETY_COUNTER_KEYS, *_MATERIALIZATION_REPORT_SAFETY_COUNTER_KEYS)
+    }
+
+    observed_report_type = str(report.get("report_type", "unknown"))
+    observed_actual_copy_safety_status = str(
+        report.get("actual_copy_safety_status", "unknown")
+    )
+    observed_actual_host_backup_copy_summary_included = (
+        report.get("actual_host_backup_copy_summary_included") is True
+    )
+    observed_actual_host_backup_copy_materialized_count = (
+        report.get("actual_host_backup_copy_materialized_count")
+        if isinstance(report.get("actual_host_backup_copy_materialized_count"), int)
+        else 0
+    )
+    observed_actual_host_backup_copy_executed_count = (
+        report.get("actual_host_backup_copy_executed_count")
+        if isinstance(report.get("actual_host_backup_copy_executed_count"), int)
+        else 0
+    )
+    observed_actual_host_backup_copy_kv_pool_read_count = (
+        report.get("actual_host_backup_copy_kv_pool_read_count")
+        if isinstance(report.get("actual_host_backup_copy_kv_pool_read_count"), int)
+        else 0
+    )
+    observed_actual_host_backup_copy_kv_snapshot_count = (
+        report.get("actual_host_backup_copy_kv_snapshot_count")
+        if isinstance(report.get("actual_host_backup_copy_kv_snapshot_count"), int)
+        else 0
+    )
+
+    blocker_state_by_reason = {
+        "not_actual_copy_report": "blocked_not_actual_copy_report",
+        "actual_copy_safety_not_pass": "blocked_actual_copy_safety_not_pass",
+        "actual_copy_summary_missing": "blocked_actual_copy_summary_missing",
+        "no_actual_copy_materialized": "blocked_no_actual_copy_materialized",
+        "actual_copy_not_executed": "blocked_actual_copy_not_executed",
+        "kv_pool_read_observed": "blocked_kv_pool_read_observed",
+        "kv_snapshot_observed": "blocked_kv_snapshot_observed",
+        "attention_override_observed": "blocked_attention_override_observed",
+        "runtime_writeback_observed": "blocked_runtime_writeback_observed",
+        "scheduler_mutation_observed": "blocked_scheduler_mutation_observed",
+    }
+    blocking_reasons: list[str] = []
+    warning_reasons: list[str] = [
+        "metadata_only_handoff_does_not_connect_attention_backend"
+    ]
+
+    if observed_report_type != "relaykv_actual_host_backup_copy_report":
+        blocking_reasons.append("not_actual_copy_report")
+    if observed_actual_copy_safety_status != "pass":
+        blocking_reasons.append("actual_copy_safety_not_pass")
+    if not observed_actual_host_backup_copy_summary_included:
+        blocking_reasons.append("actual_copy_summary_missing")
+    if observed_actual_host_backup_copy_materialized_count <= 0:
+        blocking_reasons.append("no_actual_copy_materialized")
+    if observed_actual_host_backup_copy_executed_count <= 0:
+        blocking_reasons.append("actual_copy_not_executed")
+    if observed_actual_host_backup_copy_kv_pool_read_count > 0:
+        blocking_reasons.append("kv_pool_read_observed")
+    if observed_actual_host_backup_copy_kv_snapshot_count > 0:
+        blocking_reasons.append("kv_snapshot_observed")
+    if safety_counts["attention_override_true_count"] > 0:
+        blocking_reasons.append("attention_override_observed")
+    if safety_counts["runtime_writeback_true_count"] > 0:
+        blocking_reasons.append("runtime_writeback_observed")
+    if safety_counts["scheduler_policy_noop_false_count"] > 0:
+        blocking_reasons.append("scheduler_mutation_observed")
+
+    blocking_reasons = list(dict.fromkeys(blocking_reasons))
+    ready_for_attention_handoff = not blocking_reasons
+    if ready_for_attention_handoff:
+        readiness_state = "ready_for_attention_handoff_metadata_only"
+        readiness_reasons = ["actual_copy_report_ready_for_metadata_only_handoff"]
+    elif len(blocking_reasons) == 1:
+        readiness_state = blocker_state_by_reason[blocking_reasons[0]]
+        readiness_reasons = []
+    else:
+        readiness_state = "blocked_multiple_reasons"
+        readiness_reasons = []
+
+    return {
+        "readiness_type": "relaykv_attention_handoff_readiness",
+        "ready_for_attention_handoff": ready_for_attention_handoff,
+        "readiness_state": readiness_state,
+        "readiness_reasons": readiness_reasons,
+        "blocking_reasons": blocking_reasons,
+        "warning_reasons": warning_reasons,
+        "observed_actual_copy_safety_status": observed_actual_copy_safety_status,
+        "observed_actual_host_backup_copy_summary_included": (
+            observed_actual_host_backup_copy_summary_included
+        ),
+        "observed_actual_host_backup_copy_materialized_count": (
+            observed_actual_host_backup_copy_materialized_count
+        ),
+        "observed_actual_host_backup_copy_executed_count": (
+            observed_actual_host_backup_copy_executed_count
+        ),
+        "observed_actual_host_backup_copy_kv_pool_read_count": (
+            observed_actual_host_backup_copy_kv_pool_read_count
+        ),
+        "observed_actual_host_backup_copy_kv_snapshot_count": (
+            observed_actual_host_backup_copy_kv_snapshot_count
+        ),
+        **safety_counts,
+    }
+
+
 def _policy_dry_run_int_config(
     policy_config: Mapping[str, Any],
     key: str,
@@ -3191,6 +3309,197 @@ def summarize_relaykv_actual_host_backup_copy_results_for_smoke(
         "per_request_counts": dict(sorted(per_request.items())),
         "per_layer_counts": dict(sorted(per_layer.items())),
         "per_copy_state_counts": dict(sorted(per_copy_state.items())),
+        **dict(safety_counts),
+    }
+
+
+def build_relaykv_attention_handoff_candidates_for_smoke(
+    actual_copy_results: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    attention_handoff_readiness: Mapping[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build metadata-only attention handoff candidates from actual-copy results."""
+
+    if not isinstance(actual_copy_results, (list, tuple)):
+        raise TypeError("actual_copy_results must be a list or tuple")
+    if attention_handoff_readiness is not None and not isinstance(
+        attention_handoff_readiness, Mapping
+    ):
+        raise TypeError("attention_handoff_readiness must be a mapping or None")
+
+    if attention_handoff_readiness is None:
+        readiness_ready = False
+        readiness_state = "attention_handoff_readiness_not_provided"
+        readiness_blocking_reasons = ["attention_handoff_readiness_not_provided"]
+    else:
+        readiness_ready = (
+            attention_handoff_readiness.get("ready_for_attention_handoff") is True
+        )
+        readiness_state = str(
+            attention_handoff_readiness.get("readiness_state", "unknown")
+        )
+        readiness_blocking_reasons = []
+        blocking_reasons = attention_handoff_readiness.get("blocking_reasons")
+        if isinstance(blocking_reasons, (list, tuple)):
+            readiness_blocking_reasons = [str(reason) for reason in blocking_reasons]
+        if not readiness_ready and not readiness_blocking_reasons:
+            readiness_blocking_reasons = ["attention_handoff_readiness_not_met"]
+
+    candidates: list[dict[str, Any]] = []
+    for result in actual_copy_results:
+        if not isinstance(result, Mapping):
+            raise TypeError("RelayKV attention handoff inputs must be mappings")
+
+        materialized_block_ids = _host_backup_copy_request_block_ids(
+            result, "materialized_block_ids"
+        )
+        retrieved_block_ids = _host_backup_copy_request_block_ids(
+            result, "retrieved_block_ids"
+        )
+        candidate_block_ids = _host_backup_copy_request_block_ids(
+            result, "candidate_block_ids"
+        )
+        anchor_block_ids = _host_backup_copy_request_block_ids(
+            result, "anchor_block_ids"
+        )
+        recent_block_ids = _host_backup_copy_request_block_ids(
+            result, "recent_block_ids"
+        )
+
+        blocking_reasons: list[str] = []
+        if attention_handoff_readiness is None:
+            blocking_reasons.append("attention_handoff_readiness_not_provided")
+        elif not readiness_ready:
+            blocking_reasons.extend(readiness_blocking_reasons)
+        if _event_value(result, "event_type") != "relaykv_materialization_result":
+            blocking_reasons.append("not_materialization_result")
+        if _event_value(result, "materialization_state") != "host_backup_copy_materialized":
+            blocking_reasons.append("not_host_backup_copy_materialized")
+        if _event_value(result, "copy_state") != "copy_executed":
+            blocking_reasons.append("copy_not_executed")
+        if not materialized_block_ids:
+            blocking_reasons.append("no_materialized_blocks")
+
+        handoff_state = "blocked" if blocking_reasons else "handoff_ready"
+        materialized_token_count = _event_value(result, "materialized_token_count")
+        working_kv_token_count = (
+            materialized_token_count if isinstance(materialized_token_count, int) else 0
+        )
+        candidates.append(
+            {
+                "event_type": "relaykv_attention_handoff_candidate",
+                "handoff_state": handoff_state,
+                "handoff_mode": "metadata_only",
+                "source": "actual_host_backup_copy_result_to_attention_handoff_candidate",
+                "request_id": _event_value(result, "request_id"),
+                "req_pool_idx": _event_req_pool_idx_value(result),
+                "seq_len": _event_value(result, "seq_len"),
+                "layer_id": _event_layer_value(result),
+                "recent_block_ids": recent_block_ids,
+                "anchor_block_ids": anchor_block_ids,
+                "retrieved_block_ids": retrieved_block_ids,
+                "candidate_block_ids": candidate_block_ids,
+                "materialized_block_ids": materialized_block_ids,
+                "working_kv_block_ids": materialized_block_ids,
+                "working_kv_block_count": len(materialized_block_ids),
+                "working_kv_token_count": working_kv_token_count,
+                "attention_target_layer_id": _event_layer_value(result),
+                "attention_target_backend": "unconnected",
+                "attention_override_allowed": False,
+                "attention_connection_attempted": False,
+                "attention_override": False,
+                "attention_override_noop": False,
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "kv_cache_mutation": False,
+                "source_mutated": False,
+                "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
+                "warning_reasons": [],
+                "readiness_state": readiness_state,
+            }
+        )
+    return candidates
+
+
+def summarize_relaykv_attention_handoff_candidates_for_smoke(
+    candidates: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize metadata-only RelayKV attention handoff candidates."""
+
+    if not isinstance(candidates, (list, tuple)):
+        raise TypeError("RelayKV attention handoff candidates must be a list or tuple")
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_handoff_state: Counter[str] = Counter()
+    attention_connection_attempted_count = 0
+    attention_override_noop_count = 0
+    working_kv_block_count = 0
+    working_kv_token_count = 0
+    handoff_ready_count = 0
+    blocked_count = 0
+    safety_counts: Counter[str] = Counter(
+        {
+            "attention_override_true_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            raise TypeError("RelayKV attention handoff candidate must be a mapping")
+        handoff_state = str(_event_value(candidate, "handoff_state") or "unknown")
+        per_handoff_state[handoff_state] += 1
+        per_request[str(_event_value(candidate, "request_id"))] += 1
+        per_layer[str(_event_layer_value(candidate))] += 1
+        if handoff_state == "handoff_ready":
+            handoff_ready_count += 1
+        elif handoff_state == "blocked":
+            blocked_count += 1
+
+        block_count = _event_value(candidate, "working_kv_block_count")
+        if isinstance(block_count, int):
+            working_kv_block_count += block_count
+        token_count = _event_value(candidate, "working_kv_token_count")
+        if isinstance(token_count, int):
+            working_kv_token_count += token_count
+        if _event_value(candidate, "attention_connection_attempted") is True:
+            attention_connection_attempted_count += 1
+        if _event_value(candidate, "attention_override_noop") is True:
+            attention_override_noop_count += 1
+        if _event_value(candidate, "attention_override") is True:
+            safety_counts["attention_override_true_count"] += 1
+        if _event_value(candidate, "kv_pool_read") is True:
+            safety_counts["kv_pool_read_count"] += 1
+        if _event_value(candidate, "kv_snapshot") is True:
+            safety_counts["kv_snapshot_count"] += 1
+        if _event_value(candidate, "runtime_writeback") is True:
+            safety_counts["runtime_writeback_true_count"] += 1
+        if _event_value(candidate, "scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+        if _event_value(candidate, "kv_cache_mutation") is True:
+            safety_counts["kv_cache_mutation_true_count"] += 1
+        if _event_value(candidate, "source_mutated") is True:
+            safety_counts["source_mutated_true_count"] += 1
+
+    return {
+        "summary_type": "relaykv_attention_handoff_candidate_summary",
+        "total_handoff_candidates": len(candidates),
+        "handoff_ready_count": handoff_ready_count,
+        "blocked_count": blocked_count,
+        "working_kv_block_count": working_kv_block_count,
+        "working_kv_token_count": working_kv_token_count,
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_handoff_state_counts": dict(sorted(per_handoff_state.items())),
+        "attention_connection_attempted_count": attention_connection_attempted_count,
+        "attention_override_noop_count": attention_override_noop_count,
         **dict(safety_counts),
     }
 
