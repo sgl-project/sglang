@@ -45,7 +45,12 @@ MODEL_TO_CONFIG = {
     # Temporarily disable before this model is fixed
     # "jason9693/Qwen2.5-1.5B-apeach": (1, 1e-5),
 }
-MODELS = [(key, *MODEL_TO_CONFIG[key]) for key in MODEL_TO_CONFIG]
+# DIAGNOSTIC ONLY — DO NOT MERGE.
+# Pin test_prefill_logits to only marco/mcdse-2b-v1 to confirm reproducibility
+# of the 5090 (sm_120) flashinfer divergence we identified in PR #24279. If
+# this branch's CI shows the ~0.30 cosine diff failure on stage-b-test-1-gpu-small,
+# that confirms mcdse is the offender and the skip in #24279 is the correct fix.
+MODELS = [("marco/mcdse-2b-v1", *MODEL_TO_CONFIG["marco/mcdse-2b-v1"])]
 
 TORCH_DTYPES = [torch.float16]
 
