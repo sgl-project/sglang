@@ -559,6 +559,65 @@ class AnthropicServing:
 
             delta = choice.delta
 
+            # Handle reasoning content deltas (extended thinking).
+            #
+            # Models served with --reasoning-parser (e.g. qwen3,
+            # deepseek_r1) emit their <think>...</think> output as
+            # `delta.reasoning_content` on the underlying OpenAI stream.
+            # In Anthropic's protocol this maps to a `thinking` content
+            # block carrying `thinking_delta` events. Without this branch
+            # the entire reasoning trace is silently dropped on the
+            # /v1/messages streaming endpoint, even though the OpenAI
+            # endpoint surfaces it correctly.
+            reasoning_chunk = getattr(delta, "reasoning_content", None)
+            if reasoning_chunk:
+                # If a non-thinking block is open (e.g. a previous text
+                # block), close it before emitting the thinking block.
+                if content_block_open and content_block_type != "thinking":
+                    stop_event = AnthropicStreamEvent(
+                        type="content_block_stop",
+                        index=content_block_index,
+                    )
+                    yield _wrap_sse_event(
+                        stop_event.model_dump_json(exclude_none=True),
+                        "content_block_stop",
+                    )
+                    content_block_index += 1
+                    content_block_open = False
+                    content_block_type = None
+
+                if not content_block_open:
+                    start_event = AnthropicStreamEvent(
+                        type="content_block_start",
+                        index=content_block_index,
+                        content_block=AnthropicContentBlock(
+                            type="thinking", thinking=""
+                        ),
+                    )
+                    yield _wrap_sse_event(
+                        start_event.model_dump_json(exclude_none=True),
+                        "content_block_start",
+                    )
+                    content_block_open = True
+                    content_block_type = "thinking"
+
+                delta_event = AnthropicStreamEvent(
+                    type="content_block_delta",
+                    index=content_block_index,
+                    delta=AnthropicDelta(
+                        type="thinking_delta",
+                        thinking=reasoning_chunk,
+                    ),
+                )
+                yield _wrap_sse_event(
+                    delta_event.model_dump_json(exclude_none=True),
+                    "content_block_delta",
+                )
+                # If the chunk also carried text/tool_calls fall through;
+                # otherwise skip the empty branches below.
+                if not delta.tool_calls and not delta.content:
+                    continue
+
             # Handle tool call deltas
             if delta.tool_calls:
                 for tc in delta.tool_calls:
