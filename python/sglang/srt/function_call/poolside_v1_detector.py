@@ -236,7 +236,10 @@ class PoolsideV1Detector(BaseFormatDetector):
             args: dict = {}
             for raw_key, raw_val in self.arg_pair_regex.findall(body):
                 key = raw_key.strip()
-                val = raw_val.strip("\n")
+                # Strip at most one wrapping `\n` on each side (template adds
+                # them around the value); preserve newlines that are part of
+                # the value itself.
+                val = raw_val.removeprefix("\n").removesuffix("\n")
                 args[key] = self._convert_param_value(val, schema, key)
 
             calls.append(
@@ -375,7 +378,11 @@ class PoolsideV1Detector(BaseFormatDetector):
                     end = slice_.find(self.arg_value_end)
                     if end == -1:
                         break  # incomplete <arg_value> — no partial emission
-                    raw = slice_[len(self.arg_value_start) : end].strip("\n")
+                    raw = (
+                        slice_[len(self.arg_value_start) : end]
+                        .removeprefix("\n")
+                        .removesuffix("\n")
+                    )
                     # READING_VALUE is reachable only via READING_KEY
                     # consuming an <arg_key>...</arg_key>, so
                     # current_pending_key is set by construction.
