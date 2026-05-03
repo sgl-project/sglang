@@ -3504,6 +3504,180 @@ def summarize_relaykv_attention_handoff_candidates_for_smoke(
     }
 
 
+def build_relaykv_attention_connection_dry_run_results_for_smoke(
+    handoff_candidates: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+    execute_attention: bool = False,
+) -> list[dict[str, Any]]:
+    """Build metadata-only attention connection dry-run results."""
+
+    if not isinstance(handoff_candidates, (list, tuple)):
+        raise TypeError("handoff_candidates must be a list or tuple")
+    if not isinstance(execute_attention, bool):
+        raise TypeError("execute_attention must be a bool")
+
+    results: list[dict[str, Any]] = []
+    for candidate in handoff_candidates:
+        if not isinstance(candidate, Mapping):
+            raise TypeError(
+                "RelayKV attention connection dry-run inputs must be mappings"
+            )
+
+        working_kv_block_ids = _host_backup_copy_request_block_ids(
+            candidate, "working_kv_block_ids"
+        )
+        working_kv_block_count = _event_value(candidate, "working_kv_block_count")
+        if not isinstance(working_kv_block_count, int):
+            working_kv_block_count = len(working_kv_block_ids)
+        working_kv_token_count = _event_value(candidate, "working_kv_token_count")
+        if not isinstance(working_kv_token_count, int):
+            working_kv_token_count = 0
+
+        blocking_reasons: list[str] = []
+        warning_reasons: list[str] = ["metadata_only_attention_connection_dry_run"]
+        attention_connection_attempted = False
+
+        if execute_attention:
+            blocking_reasons.append("execute_attention_not_allowed_in_dry_run_smoke")
+        if _event_value(candidate, "event_type") != "relaykv_attention_handoff_candidate":
+            blocking_reasons.append("not_attention_handoff_candidate")
+        if _event_value(candidate, "handoff_state") != "handoff_ready":
+            blocking_reasons.append("handoff_not_ready")
+        if _event_value(candidate, "handoff_mode") != "metadata_only":
+            blocking_reasons.append("handoff_not_metadata_only")
+        if not working_kv_block_ids:
+            blocking_reasons.append("no_working_kv_blocks")
+
+        if not blocking_reasons:
+            attention_connection_attempted = True
+
+        results.append(
+            {
+                "event_type": "relaykv_attention_connection_dry_run_result",
+                "attention_connection_state": (
+                    "dry_run" if attention_connection_attempted else "blocked"
+                ),
+                "attention_connection_mode": "metadata_only",
+                "source": "attention_handoff_candidate_to_connection_dry_run_result",
+                "request_id": _event_value(candidate, "request_id"),
+                "req_pool_idx": _event_req_pool_idx_value(candidate),
+                "seq_len": _event_value(candidate, "seq_len"),
+                "layer_id": _event_layer_value(candidate),
+                "working_kv_block_ids": working_kv_block_ids,
+                "working_kv_block_count": working_kv_block_count,
+                "working_kv_token_count": working_kv_token_count,
+                "attention_target_layer_id": (
+                    _event_value(candidate, "attention_target_layer_id")
+                    if _event_value(candidate, "attention_target_layer_id") is not None
+                    else _event_layer_value(candidate)
+                ),
+                "attention_target_backend": "unconnected",
+                "attention_connection_attempted": attention_connection_attempted,
+                "attention_override": False,
+                "attention_override_noop": False,
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "kv_cache_mutation": False,
+                "source_mutated": False,
+                "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
+                "warning_reasons": warning_reasons,
+            }
+        )
+    return results
+
+
+def summarize_relaykv_attention_connection_dry_run_results_for_smoke(
+    results: list[Mapping[str, Any]] | tuple[Mapping[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize metadata-only attention connection dry-run results."""
+
+    if not isinstance(results, (list, tuple)):
+        raise TypeError(
+            "RelayKV attention connection dry-run results must be a list or tuple"
+        )
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_attention_connection_state: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "attention_override_true_count": 0,
+            "attention_override_noop_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    attention_connection_attempted_count = 0
+    attention_connection_dry_run_count = 0
+    blocked_count = 0
+    error_count = 0
+    working_kv_block_count = 0
+    working_kv_token_count = 0
+
+    for result in results:
+        if not isinstance(result, Mapping):
+            raise TypeError(
+                "RelayKV attention connection dry-run result must be a mapping"
+            )
+        state = str(_event_value(result, "attention_connection_state") or "unknown")
+        per_attention_connection_state[state] += 1
+        per_request[str(_event_value(result, "request_id"))] += 1
+        per_layer[str(_event_layer_value(result))] += 1
+        if state == "dry_run":
+            attention_connection_dry_run_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+
+        block_count = _event_value(result, "working_kv_block_count")
+        if isinstance(block_count, int):
+            working_kv_block_count += block_count
+        token_count = _event_value(result, "working_kv_token_count")
+        if isinstance(token_count, int):
+            working_kv_token_count += token_count
+        if _event_value(result, "attention_connection_attempted") is True:
+            attention_connection_attempted_count += 1
+        if _event_value(result, "attention_override") is True:
+            safety_counts["attention_override_true_count"] += 1
+        if _event_value(result, "attention_override_noop") is True:
+            safety_counts["attention_override_noop_count"] += 1
+        if _event_value(result, "kv_pool_read") is True:
+            safety_counts["kv_pool_read_count"] += 1
+        if _event_value(result, "kv_snapshot") is True:
+            safety_counts["kv_snapshot_count"] += 1
+        if _event_value(result, "runtime_writeback") is True:
+            safety_counts["runtime_writeback_true_count"] += 1
+        if _event_value(result, "scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+        if _event_value(result, "kv_cache_mutation") is True:
+            safety_counts["kv_cache_mutation_true_count"] += 1
+        if _event_value(result, "source_mutated") is True:
+            safety_counts["source_mutated_true_count"] += 1
+
+    return {
+        "summary_type": "relaykv_attention_connection_dry_run_result_summary",
+        "total_attention_connection_dry_run_results": len(results),
+        "attention_connection_dry_run_count": attention_connection_dry_run_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "working_kv_block_count": working_kv_block_count,
+        "working_kv_token_count": working_kv_token_count,
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_attention_connection_state_counts": dict(
+            sorted(per_attention_connection_state.items())
+        ),
+        "attention_connection_attempted_count": attention_connection_attempted_count,
+        **dict(safety_counts),
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
