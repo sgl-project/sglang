@@ -46,6 +46,7 @@ class PipelineExecutor(ABC):
     def __init__(self, server_args):
         self.server_args = server_args
         self.component_residency_manager = None
+        self._post_response_tasks = []
 
     def begin_component_residency_request(
         self,
@@ -71,7 +72,14 @@ class PipelineExecutor(ABC):
         self.component_residency_manager.after_stage(stage_index)
 
     def finish_component_residency_request(self) -> None:
-        self.component_residency_manager.finish_request()
+        self._post_response_tasks.extend(
+            self.component_residency_manager.finish_request()
+        )
+
+    def pop_post_response_tasks(self):
+        tasks = self._post_response_tasks
+        self._post_response_tasks = []
+        return tasks
 
     def execute_with_profiling(
         self,
