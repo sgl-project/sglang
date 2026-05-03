@@ -233,12 +233,14 @@ def select_component_source(
         override_path = component_paths.get(key)
         if override_path is None:
             continue
-        assert has_component_files(override_path), (
+        resolved_override_path = maybe_download_model(override_path)
+        component_paths[key] = resolved_override_path
+        assert has_component_files(resolved_override_path), (
             f"Component override for {component.value} must point directly to a "
             f"component directory: {override_path}"
         )
         if component == ComponentType.TEXT_ENCODER:
-            assert is_text_encoder_config(override_path), (
+            assert is_text_encoder_config(resolved_override_path), (
                 f"Text encoder override must point to a text encoder directory: "
                 f"{override_path}"
             )
@@ -246,7 +248,7 @@ def select_component_source(
             base_model_id=model_id,
             base_model_root=base_model_root,
             component_paths=component_paths,
-            source_path=override_path,
+            source_path=resolved_override_path,
         )
 
     source_path = resolve_component_path(
