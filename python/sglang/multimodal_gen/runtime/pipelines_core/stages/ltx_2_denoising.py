@@ -1487,15 +1487,16 @@ class LTX2DenoisingStage(DenoisingStage):
                 and int(getattr(batch, "ltx2_num_image_tokens", 0)) > 0
             )
         )
-        # expanded_batch_size = batch_size_local * len(pass_specs). One expanded
-        # item means one local batch element evaluated as cond, neg, perturbed,
-        # or modality. "Perturbation" means disabling selected attention paths
+        # "Perturbation" means disabling selected attention paths
         # for that item (self-attention blocks or audio/video cross-attention)
         # to compute STG/modality guidance.
         #
-        # HQ splits the expanded batch into one-item model calls. Since each
+
+        # Decide whether to use different pass kwargs for split model calls
+        # 1. HQ splits the expanded batch into one-item model calls. Since each
         # call has only one perturbation setting, pass the disable options
-        # directly as model arguments. TI2V/non-HQ may keep several expanded
+        # directly as model arguments.
+        # 2. TI2V/non-HQ may keep several expanded
         # items with different settings in one model call, so it needs
         # perturbation_configs: one config dict per expanded item.
         use_split_pass_kwargs = (
