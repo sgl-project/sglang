@@ -94,6 +94,41 @@ def _materialization_summary() -> dict[str, Any]:
     }
 
 
+def _host_backup_copy_request_summary() -> dict[str, Any]:
+    return {
+        "total_copy_requests": 2,
+        "request_ready_count": 2,
+        "blocked_count": 0,
+        "materialized_kv_count": 4,
+        "source_mutated_true_count": 0,
+        "attention_override_true_count": 0,
+        "kv_cache_mutation_true_count": 0,
+        "runtime_writeback_true_count": 0,
+        "scheduler_policy_noop_false_count": 0,
+        "host_backup_copy_executed_count": 0,
+        "kv_pool_read_count": 0,
+        "kv_snapshot_count": 0,
+    }
+
+
+def _host_backup_copy_boundary_result_summary() -> dict[str, Any]:
+    return {
+        "total_boundary_results": 2,
+        "boundary_noop_count": 2,
+        "blocked_count": 0,
+        "error_count": 0,
+        "materialized_kv_count": 4,
+        "source_mutated_true_count": 0,
+        "attention_override_true_count": 0,
+        "kv_cache_mutation_true_count": 0,
+        "runtime_writeback_true_count": 0,
+        "scheduler_policy_noop_false_count": 0,
+        "host_backup_copy_executed_count": 0,
+        "kv_pool_read_count": 0,
+        "kv_snapshot_count": 0,
+    }
+
+
 def _assert_safety_zero(report: dict[str, Any]) -> None:
     for key in (
         "source_mutated_true_count",
@@ -251,6 +286,71 @@ def _assert_materialization_summary_report() -> dict[str, Any]:
     return report
 
 
+def _assert_copy_boundary_summaries_report() -> dict[str, Any]:
+    request_summary = _host_backup_copy_request_summary()
+    boundary_summary = _host_backup_copy_boundary_result_summary()
+    request_before = copy.deepcopy(request_summary)
+    boundary_before = copy.deepcopy(boundary_summary)
+    report = build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
+        _runtime_summary(),
+        _host_backup_candidate_summary(),
+        _join_summary(),
+        policy_dry_run_summary=_policy_dry_run_summary(),
+        materialization_summary=_materialization_summary(),
+        host_backup_copy_request_summary=request_summary,
+        host_backup_copy_boundary_result_summary=boundary_summary,
+    )
+    if request_summary != request_before:
+        raise AssertionError("host backup copy request summary was mutated")
+    if boundary_summary != boundary_before:
+        raise AssertionError("host backup copy boundary result summary was mutated")
+    if report["host_backup_copy_request_summary_included"] is not True:
+        raise AssertionError(report)
+    if report["host_backup_copy_request_total"] != 2:
+        raise AssertionError(report)
+    if report["host_backup_copy_request_ready_count"] != 2:
+        raise AssertionError(report)
+    if report["host_backup_copy_request_blocked_count"] != 0:
+        raise AssertionError(report)
+    if report["host_backup_copy_request_materialized_kv_count"] != 4:
+        raise AssertionError(report)
+    if report["host_backup_copy_boundary_result_summary_included"] is not True:
+        raise AssertionError(report)
+    if report["host_backup_copy_boundary_result_total"] != 2:
+        raise AssertionError(report)
+    if report["host_backup_copy_boundary_noop_count"] != 2:
+        raise AssertionError(report)
+    if report["host_backup_copy_boundary_blocked_count"] != 0:
+        raise AssertionError(report)
+    if report["host_backup_copy_boundary_error_count"] != 0:
+        raise AssertionError(report)
+    if report["host_backup_copy_boundary_materialized_kv_count"] != 4:
+        raise AssertionError(report)
+    if report["overall_safety_status"] != "pass":
+        raise AssertionError(report)
+    _assert_safety_zero(report)
+    return report
+
+
+def _assert_copy_boundary_summaries_fail_report() -> dict[str, Any]:
+    boundary_summary = _host_backup_copy_boundary_result_summary()
+    boundary_summary["kv_pool_read_count"] = 1
+    report = build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
+        _runtime_summary(),
+        _host_backup_candidate_summary(),
+        _join_summary(),
+        policy_dry_run_summary=_policy_dry_run_summary(),
+        materialization_summary=_materialization_summary(),
+        host_backup_copy_request_summary=_host_backup_copy_request_summary(),
+        host_backup_copy_boundary_result_summary=boundary_summary,
+    )
+    if report["overall_safety_status"] != "fail":
+        raise AssertionError(report)
+    if report["kv_pool_read_count"] != 1:
+        raise AssertionError(report)
+    return report
+
+
 def _assert_materialization_summary_fail_report() -> dict[str, Any]:
     materialization_summary = _materialization_summary()
     materialization_summary["kv_pool_read_count"] = 1
@@ -322,6 +422,10 @@ def main() -> None:
         "policy_dry_run_report": _assert_policy_dry_run_report(),
         "policy_dry_run_fail_report": _assert_policy_dry_run_fail_report(),
         "materialization_summary_report": _assert_materialization_summary_report(),
+        "copy_boundary_summaries_report": _assert_copy_boundary_summaries_report(),
+        "copy_boundary_summaries_fail_report": (
+            _assert_copy_boundary_summaries_fail_report()
+        ),
         "materialization_summary_fail_report": (
             _assert_materialization_summary_fail_report()
         ),

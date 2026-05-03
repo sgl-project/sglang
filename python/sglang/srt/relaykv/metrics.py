@@ -530,7 +530,11 @@ def _readonly_report_safety_counter(
     key: str,
     *sources: Mapping[str, Any],
 ) -> int:
-    values = [source.get(key) for source in sources if isinstance(source.get(key), int)]
+    values = [
+        source.get(key)
+        for source in sources
+        if isinstance(source, Mapping) and isinstance(source.get(key), int)
+    ]
     if not values:
         missing_field_counts["missing_field_count"] += 1
         return 0
@@ -543,6 +547,8 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
     join_summary: Mapping[str, Any],
     policy_dry_run_summary: Mapping[str, Any] | None = None,
     materialization_summary: Mapping[str, Any] | None = None,
+    host_backup_copy_request_summary: Mapping[str, Any] | None = None,
+    host_backup_copy_boundary_result_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build a read-only runtime/candidate/join report for smoke tests.
 
@@ -565,6 +571,16 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
         materialization_summary, Mapping
     ):
         raise TypeError("materialization_summary must be a mapping or None")
+    if host_backup_copy_request_summary is not None and not isinstance(
+        host_backup_copy_request_summary, Mapping
+    ):
+        raise TypeError("host_backup_copy_request_summary must be a mapping or None")
+    if host_backup_copy_boundary_result_summary is not None and not isinstance(
+        host_backup_copy_boundary_result_summary, Mapping
+    ):
+        raise TypeError(
+            "host_backup_copy_boundary_result_summary must be a mapping or None"
+        )
 
     missing_field_counts: Counter[str] = Counter({"missing_field_count": 0})
     total_runtime_payloads = _readonly_report_value(
@@ -610,6 +626,8 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
             join_summary,
             policy_dry_run_summary or {},
             materialization_summary or {},
+            host_backup_copy_request_summary or {},
+            host_backup_copy_boundary_result_summary or {},
         )
         for key in _REPORT_SAFETY_COUNTER_KEYS
     }
@@ -619,12 +637,69 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
                 missing_field_counts,
                 key,
                 materialization_summary,
+                host_backup_copy_request_summary,
+                host_backup_copy_boundary_result_summary,
             )
             if materialization_summary is not None
+            or host_backup_copy_request_summary is not None
+            or host_backup_copy_boundary_result_summary is not None
             else 0
         )
         for key in _MATERIALIZATION_REPORT_SAFETY_COUNTER_KEYS
     }
+    host_backup_copy_request_summary_included = (
+        host_backup_copy_request_summary is not None
+    )
+    host_backup_copy_request_total = 0
+    host_backup_copy_request_ready_count = 0
+    host_backup_copy_request_blocked_count = 0
+    host_backup_copy_request_materialized_kv_count = 0
+    if host_backup_copy_request_summary is not None:
+        host_backup_copy_request_total = _readonly_report_value(
+            missing_field_counts,
+            (host_backup_copy_request_summary, ("total_copy_requests",)),
+        )
+        host_backup_copy_request_ready_count = _readonly_report_value(
+            missing_field_counts,
+            (host_backup_copy_request_summary, ("request_ready_count",)),
+        )
+        host_backup_copy_request_blocked_count = _readonly_report_value(
+            missing_field_counts,
+            (host_backup_copy_request_summary, ("blocked_count",)),
+        )
+        host_backup_copy_request_materialized_kv_count = _readonly_report_value(
+            missing_field_counts,
+            (host_backup_copy_request_summary, ("materialized_kv_count",)),
+        )
+    host_backup_copy_boundary_result_summary_included = (
+        host_backup_copy_boundary_result_summary is not None
+    )
+    host_backup_copy_boundary_result_total = 0
+    host_backup_copy_boundary_noop_count = 0
+    host_backup_copy_boundary_blocked_count = 0
+    host_backup_copy_boundary_error_count = 0
+    host_backup_copy_boundary_materialized_kv_count = 0
+    if host_backup_copy_boundary_result_summary is not None:
+        host_backup_copy_boundary_result_total = _readonly_report_value(
+            missing_field_counts,
+            (host_backup_copy_boundary_result_summary, ("total_boundary_results",)),
+        )
+        host_backup_copy_boundary_noop_count = _readonly_report_value(
+            missing_field_counts,
+            (host_backup_copy_boundary_result_summary, ("boundary_noop_count",)),
+        )
+        host_backup_copy_boundary_blocked_count = _readonly_report_value(
+            missing_field_counts,
+            (host_backup_copy_boundary_result_summary, ("blocked_count",)),
+        )
+        host_backup_copy_boundary_error_count = _readonly_report_value(
+            missing_field_counts,
+            (host_backup_copy_boundary_result_summary, ("error_count",)),
+        )
+        host_backup_copy_boundary_materialized_kv_count = _readonly_report_value(
+            missing_field_counts,
+            (host_backup_copy_boundary_result_summary, ("materialized_kv_count",)),
+        )
     policy_dry_run_included = policy_dry_run_summary is not None
     policy_dry_run_total_events = 0
     policy_dry_run_selected_event_count = 0
@@ -736,6 +811,45 @@ def build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
         "materialization_error_count": materialization_error_count,
         "materialized_kv_count": materialized_kv_count,
         "materialized_token_count": materialized_token_count,
+        "host_backup_copy_request_summary": (
+            dict(host_backup_copy_request_summary)
+            if host_backup_copy_request_summary is not None
+            else None
+        ),
+        "host_backup_copy_request_summary_included": (
+            host_backup_copy_request_summary_included
+        ),
+        "host_backup_copy_request_total": host_backup_copy_request_total,
+        "host_backup_copy_request_ready_count": host_backup_copy_request_ready_count,
+        "host_backup_copy_request_blocked_count": (
+            host_backup_copy_request_blocked_count
+        ),
+        "host_backup_copy_request_materialized_kv_count": (
+            host_backup_copy_request_materialized_kv_count
+        ),
+        "host_backup_copy_boundary_result_summary": (
+            dict(host_backup_copy_boundary_result_summary)
+            if host_backup_copy_boundary_result_summary is not None
+            else None
+        ),
+        "host_backup_copy_boundary_result_summary_included": (
+            host_backup_copy_boundary_result_summary_included
+        ),
+        "host_backup_copy_boundary_result_total": (
+            host_backup_copy_boundary_result_total
+        ),
+        "host_backup_copy_boundary_noop_count": (
+            host_backup_copy_boundary_noop_count
+        ),
+        "host_backup_copy_boundary_blocked_count": (
+            host_backup_copy_boundary_blocked_count
+        ),
+        "host_backup_copy_boundary_error_count": (
+            host_backup_copy_boundary_error_count
+        ),
+        "host_backup_copy_boundary_materialized_kv_count": (
+            host_backup_copy_boundary_materialized_kv_count
+        ),
         "overall_safety_status": overall_safety_status,
         "total_runtime_payloads": total_runtime_payloads,
         "total_host_backup_candidate_events": total_host_backup_candidate_events,
@@ -1277,6 +1391,218 @@ def assess_relaykv_host_backup_copy_readiness_for_smoke(
             observed_materialization_blocked_count
         ),
         "observed_materialization_error_count": observed_materialization_error_count,
+        "observed_host_backup_copy_executed_count": (
+            observed_host_backup_copy_executed_count
+        ),
+        "observed_kv_pool_read_count": observed_kv_pool_read_count,
+        "observed_kv_snapshot_count": observed_kv_snapshot_count,
+        **safety_counts,
+    }
+
+
+def assess_relaykv_actual_host_backup_copy_readiness_for_smoke(
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Assess read-only readiness for a future actual host backup copy smoke.
+
+    This consumes a precomputed report dictionary only. It does not execute
+    host backup copy, materialize KV data, read KV pools, snapshot KV, connect
+    attention, alter scheduler decisions, or write runtime state.
+    """
+
+    if not isinstance(report, Mapping):
+        raise TypeError(
+            "RelayKV actual host backup copy readiness report must be a mapping"
+        )
+
+    safety_counter_keys = (
+        *_REPORT_SAFETY_COUNTER_KEYS,
+        *_MATERIALIZATION_REPORT_SAFETY_COUNTER_KEYS,
+    )
+    safety_counts = {
+        key: report.get(key) if isinstance(report.get(key), int) else 0
+        for key in safety_counter_keys
+    }
+
+    observed_report_generated_from_readonly_inputs = (
+        report.get("report_generated_from_readonly_inputs") is True
+    )
+    observed_overall_safety_status = str(
+        report.get("overall_safety_status", "unknown")
+    )
+    observed_policy_dry_run_included = report.get("policy_dry_run_included") is True
+    observed_policy_dry_run_total_events = (
+        report.get("policy_dry_run_total_events")
+        if isinstance(report.get("policy_dry_run_total_events"), int)
+        else 0
+    )
+    observed_materialization_summary_included = (
+        report.get("materialization_summary_included") is True
+    )
+    observed_materialization_result_count = (
+        report.get("materialization_result_count")
+        if isinstance(report.get("materialization_result_count"), int)
+        else 0
+    )
+    observed_host_backup_copy_request_summary_included = (
+        report.get("host_backup_copy_request_summary_included") is True
+    )
+    observed_host_backup_copy_request_ready_count = (
+        report.get("host_backup_copy_request_ready_count")
+        if isinstance(report.get("host_backup_copy_request_ready_count"), int)
+        else 0
+    )
+    observed_host_backup_copy_request_blocked_count = (
+        report.get("host_backup_copy_request_blocked_count")
+        if isinstance(report.get("host_backup_copy_request_blocked_count"), int)
+        else 0
+    )
+    observed_host_backup_copy_boundary_result_summary_included = (
+        report.get("host_backup_copy_boundary_result_summary_included") is True
+    )
+    observed_host_backup_copy_boundary_noop_count = (
+        report.get("host_backup_copy_boundary_noop_count")
+        if isinstance(report.get("host_backup_copy_boundary_noop_count"), int)
+        else 0
+    )
+    observed_host_backup_copy_boundary_blocked_count = (
+        report.get("host_backup_copy_boundary_blocked_count")
+        if isinstance(report.get("host_backup_copy_boundary_blocked_count"), int)
+        else 0
+    )
+    observed_host_backup_copy_boundary_error_count = (
+        report.get("host_backup_copy_boundary_error_count")
+        if isinstance(report.get("host_backup_copy_boundary_error_count"), int)
+        else 0
+    )
+    observed_host_backup_copy_executed_count = safety_counts[
+        "host_backup_copy_executed_count"
+    ]
+    observed_kv_pool_read_count = safety_counts["kv_pool_read_count"]
+    observed_kv_snapshot_count = safety_counts["kv_snapshot_count"]
+
+    blocker_state_by_reason = {
+        "not_readonly_report": "blocked_not_readonly_report",
+        "overall_safety_not_pass": "blocked_overall_safety_not_pass",
+        "policy_dry_run_missing": "blocked_policy_dry_run_missing",
+        "materialization_summary_missing": "blocked_materialization_summary_missing",
+        "copy_request_summary_missing": "blocked_copy_request_summary_missing",
+        "no_copy_requests_ready": "blocked_no_copy_requests_ready",
+        "copy_request_blocked": "blocked_copy_request_blocked",
+        "boundary_result_summary_missing": "blocked_boundary_result_summary_missing",
+        "no_boundary_noop_results": "blocked_no_boundary_noop_results",
+        "boundary_result_blocked": "blocked_boundary_result_blocked",
+        "boundary_result_error": "blocked_boundary_result_error",
+        "host_backup_copy_already_executed": (
+            "blocked_host_backup_copy_already_executed"
+        ),
+        "kv_pool_read_observed": "blocked_kv_pool_read_observed",
+        "kv_snapshot_observed": "blocked_kv_snapshot_observed",
+        "safety_counter_nonzero": "blocked_safety_counter_nonzero",
+    }
+    blocking_reasons: list[str] = []
+    warning_reasons: list[str] = [
+        "readiness_only_does_not_execute_actual_host_backup_copy"
+    ]
+
+    if not observed_report_generated_from_readonly_inputs:
+        blocking_reasons.append("not_readonly_report")
+    if observed_overall_safety_status != "pass":
+        blocking_reasons.append("overall_safety_not_pass")
+    if (
+        not observed_policy_dry_run_included
+        or observed_policy_dry_run_total_events <= 0
+    ):
+        blocking_reasons.append("policy_dry_run_missing")
+    if (
+        not observed_materialization_summary_included
+        or observed_materialization_result_count <= 0
+    ):
+        blocking_reasons.append("materialization_summary_missing")
+    if not observed_host_backup_copy_request_summary_included:
+        blocking_reasons.append("copy_request_summary_missing")
+    if observed_host_backup_copy_request_ready_count <= 0:
+        blocking_reasons.append("no_copy_requests_ready")
+    if observed_host_backup_copy_request_blocked_count > 0:
+        blocking_reasons.append("copy_request_blocked")
+    if not observed_host_backup_copy_boundary_result_summary_included:
+        blocking_reasons.append("boundary_result_summary_missing")
+    if observed_host_backup_copy_boundary_noop_count <= 0:
+        blocking_reasons.append("no_boundary_noop_results")
+    if observed_host_backup_copy_boundary_blocked_count > 0:
+        blocking_reasons.append("boundary_result_blocked")
+    if observed_host_backup_copy_boundary_error_count > 0:
+        blocking_reasons.append("boundary_result_error")
+    if observed_host_backup_copy_executed_count > 0:
+        blocking_reasons.append("host_backup_copy_already_executed")
+    if observed_kv_pool_read_count > 0:
+        blocking_reasons.append("kv_pool_read_observed")
+    if observed_kv_snapshot_count > 0:
+        blocking_reasons.append("kv_snapshot_observed")
+    if any(
+        safety_counts[key] != 0
+        for key in (
+            "source_mutated_true_count",
+            "attention_override_true_count",
+            "kv_cache_mutation_true_count",
+            "runtime_writeback_true_count",
+            "scheduler_policy_noop_false_count",
+        )
+    ):
+        blocking_reasons.append("safety_counter_nonzero")
+
+    blocking_reasons = list(dict.fromkeys(blocking_reasons))
+    ready_for_actual_host_backup_copy = not blocking_reasons
+    if ready_for_actual_host_backup_copy:
+        readiness_state = "ready_for_actual_host_backup_copy_smoke_boundary_complete"
+        readiness_reasons = ["readonly_copy_boundary_report_ready"]
+    elif len(blocking_reasons) == 1:
+        readiness_state = blocker_state_by_reason[blocking_reasons[0]]
+        readiness_reasons = []
+    else:
+        readiness_state = "blocked_multiple_reasons"
+        readiness_reasons = []
+
+    return {
+        "readiness_type": "relaykv_actual_host_backup_copy_readiness",
+        "ready_for_actual_host_backup_copy": ready_for_actual_host_backup_copy,
+        "readiness_state": readiness_state,
+        "readiness_reasons": readiness_reasons,
+        "blocking_reasons": blocking_reasons,
+        "warning_reasons": warning_reasons,
+        "observed_overall_safety_status": observed_overall_safety_status,
+        "observed_report_generated_from_readonly_inputs": (
+            observed_report_generated_from_readonly_inputs
+        ),
+        "observed_policy_dry_run_included": observed_policy_dry_run_included,
+        "observed_policy_dry_run_total_events": observed_policy_dry_run_total_events,
+        "observed_materialization_summary_included": (
+            observed_materialization_summary_included
+        ),
+        "observed_materialization_result_count": (
+            observed_materialization_result_count
+        ),
+        "observed_host_backup_copy_request_summary_included": (
+            observed_host_backup_copy_request_summary_included
+        ),
+        "observed_host_backup_copy_request_ready_count": (
+            observed_host_backup_copy_request_ready_count
+        ),
+        "observed_host_backup_copy_request_blocked_count": (
+            observed_host_backup_copy_request_blocked_count
+        ),
+        "observed_host_backup_copy_boundary_result_summary_included": (
+            observed_host_backup_copy_boundary_result_summary_included
+        ),
+        "observed_host_backup_copy_boundary_noop_count": (
+            observed_host_backup_copy_boundary_noop_count
+        ),
+        "observed_host_backup_copy_boundary_blocked_count": (
+            observed_host_backup_copy_boundary_blocked_count
+        ),
+        "observed_host_backup_copy_boundary_error_count": (
+            observed_host_backup_copy_boundary_error_count
+        ),
         "observed_host_backup_copy_executed_count": (
             observed_host_backup_copy_executed_count
         ),

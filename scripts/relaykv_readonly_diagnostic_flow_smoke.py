@@ -5,12 +5,18 @@ import json
 from typing import Any
 
 from sglang.srt.relaykv.metrics import (
+    assess_relaykv_actual_host_backup_copy_readiness_for_smoke,
+    assess_relaykv_host_backup_copy_readiness_for_smoke,
     assess_relaykv_readonly_attention_readiness_for_smoke,
     assess_relaykv_readonly_materialization_readiness_for_smoke,
     build_relaykv_candidate_event_materialization_results_for_smoke,
+    build_relaykv_host_backup_copy_boundary_results_for_smoke,
+    build_relaykv_host_backup_copy_requests_for_smoke,
     build_relaykv_policy_dry_run_events_for_smoke,
     build_relaykv_readonly_runtime_candidate_join_report_for_smoke,
     join_runtime_observation_with_host_backup_candidates_for_smoke,
+    summarize_relaykv_host_backup_copy_boundary_results_for_smoke,
+    summarize_relaykv_host_backup_copy_requests_for_smoke,
     summarize_host_backup_copy_candidates_for_smoke,
     summarize_relaykv_materialization_results_for_smoke,
     summarize_relaykv_policy_dry_run_events_for_smoke,
@@ -204,12 +210,57 @@ def _assert_readonly_flow() -> dict[str, Any]:
         raise AssertionError(materialization_summary)
     _assert_safety_zero(materialization_summary)
 
+    copy_boundary_readiness = assess_relaykv_host_backup_copy_readiness_for_smoke(
+        build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
+            runtime_summary,
+            candidate_summary,
+            join_summary,
+            policy_dry_run_summary=dry_run_summary,
+            materialization_summary=materialization_summary,
+        )
+    )
+    if copy_boundary_readiness["ready_for_host_backup_copy_boundary"] is not True:
+        raise AssertionError(copy_boundary_readiness)
+
+    host_backup_copy_requests = build_relaykv_host_backup_copy_requests_for_smoke(
+        materialization_results,
+        copy_boundary_readiness,
+    )
+    host_backup_copy_request_summary = (
+        summarize_relaykv_host_backup_copy_requests_for_smoke(host_backup_copy_requests)
+    )
+    if host_backup_copy_request_summary["request_ready_count"] != 4:
+        raise AssertionError(host_backup_copy_request_summary)
+    if host_backup_copy_request_summary["blocked_count"] != 0:
+        raise AssertionError(host_backup_copy_request_summary)
+    _assert_safety_zero(host_backup_copy_request_summary)
+
+    host_backup_copy_boundary_results = (
+        build_relaykv_host_backup_copy_boundary_results_for_smoke(
+            host_backup_copy_requests
+        )
+    )
+    host_backup_copy_boundary_result_summary = (
+        summarize_relaykv_host_backup_copy_boundary_results_for_smoke(
+            host_backup_copy_boundary_results
+        )
+    )
+    if host_backup_copy_boundary_result_summary["boundary_noop_count"] != 4:
+        raise AssertionError(host_backup_copy_boundary_result_summary)
+    if host_backup_copy_boundary_result_summary["blocked_count"] != 0:
+        raise AssertionError(host_backup_copy_boundary_result_summary)
+    _assert_safety_zero(host_backup_copy_boundary_result_summary)
+
     report = build_relaykv_readonly_runtime_candidate_join_report_for_smoke(
         runtime_summary,
         candidate_summary,
         join_summary,
         policy_dry_run_summary=dry_run_summary,
         materialization_summary=materialization_summary,
+        host_backup_copy_request_summary=host_backup_copy_request_summary,
+        host_backup_copy_boundary_result_summary=(
+            host_backup_copy_boundary_result_summary
+        ),
     )
     if report["report_type"] != "relaykv_readonly_runtime_candidate_join_report":
         raise AssertionError(report)
@@ -222,6 +273,14 @@ def _assert_readonly_flow() -> dict[str, Any]:
     if report["materialization_candidate_event_count"] != 4:
         raise AssertionError(report)
     if report["materialized_kv_count"] <= 0:
+        raise AssertionError(report)
+    if report["host_backup_copy_request_summary_included"] is not True:
+        raise AssertionError(report)
+    if report["host_backup_copy_request_ready_count"] != 4:
+        raise AssertionError(report)
+    if report["host_backup_copy_boundary_result_summary_included"] is not True:
+        raise AssertionError(report)
+    if report["host_backup_copy_boundary_noop_count"] != 4:
         raise AssertionError(report)
     if report["overall_safety_status"] != "pass":
         raise AssertionError(report)
@@ -237,6 +296,17 @@ def _assert_readonly_flow() -> dict[str, Any]:
         != "ready_for_attention_connection_metadata_only"
     ):
         raise AssertionError(attention_readiness)
+
+    actual_copy_readiness = assess_relaykv_actual_host_backup_copy_readiness_for_smoke(
+        report
+    )
+    if actual_copy_readiness["ready_for_actual_host_backup_copy"] is not True:
+        raise AssertionError(actual_copy_readiness)
+    if (
+        actual_copy_readiness["readiness_state"]
+        != "ready_for_actual_host_backup_copy_smoke_boundary_complete"
+    ):
+        raise AssertionError(actual_copy_readiness)
 
     if runtime_payloads != runtime_before:
         raise AssertionError("runtime payloads were mutated")
@@ -254,8 +324,14 @@ def _assert_readonly_flow() -> dict[str, Any]:
         "dry_run_summary": dry_run_summary,
         "materialization_readiness": materialization_readiness,
         "materialization_summary": materialization_summary,
+        "copy_boundary_readiness": copy_boundary_readiness,
+        "host_backup_copy_request_summary": host_backup_copy_request_summary,
+        "host_backup_copy_boundary_result_summary": (
+            host_backup_copy_boundary_result_summary
+        ),
         "report": report,
         "attention_readiness": attention_readiness,
+        "actual_copy_readiness": actual_copy_readiness,
     }
 
 
@@ -454,6 +530,76 @@ def _assert_attention_readiness_cases() -> dict[str, Any]:
     }
 
 
+def _assert_actual_copy_readiness_cases() -> dict[str, Any]:
+    flow = _assert_readonly_flow()
+    report = flow["report"]
+    report_before = copy.deepcopy(report)
+    ready = assess_relaykv_actual_host_backup_copy_readiness_for_smoke(report)
+    if report != report_before:
+        raise AssertionError("actual copy readiness helper mutated report")
+    if ready["ready_for_actual_host_backup_copy"] is not True:
+        raise AssertionError(ready)
+    if (
+        ready["readiness_state"]
+        != "ready_for_actual_host_backup_copy_smoke_boundary_complete"
+    ):
+        raise AssertionError(ready)
+
+    cases = {
+        "copy_request_summary_missing": {
+            "host_backup_copy_request_summary_included": False,
+            "host_backup_copy_request_ready_count": 0,
+            "host_backup_copy_request_blocked_count": 0,
+        },
+        "no_copy_requests_ready": {
+            "host_backup_copy_request_ready_count": 0,
+        },
+        "copy_request_blocked": {
+            "host_backup_copy_request_blocked_count": 1,
+        },
+        "boundary_result_summary_missing": {
+            "host_backup_copy_boundary_result_summary_included": False,
+            "host_backup_copy_boundary_noop_count": 0,
+            "host_backup_copy_boundary_blocked_count": 0,
+            "host_backup_copy_boundary_error_count": 0,
+        },
+        "no_boundary_noop_results": {
+            "host_backup_copy_boundary_noop_count": 0,
+        },
+        "boundary_result_blocked": {
+            "host_backup_copy_boundary_blocked_count": 1,
+        },
+        "boundary_result_error": {
+            "host_backup_copy_boundary_error_count": 1,
+        },
+        "host_backup_copy_already_executed": {
+            "overall_safety_status": "fail",
+            "host_backup_copy_executed_count": 1,
+        },
+        "kv_pool_read_observed": {
+            "overall_safety_status": "fail",
+            "kv_pool_read_count": 1,
+        },
+        "kv_snapshot_observed": {
+            "overall_safety_status": "fail",
+            "kv_snapshot_count": 1,
+        },
+    }
+    observed: dict[str, dict[str, Any]] = {"ready": ready}
+    for reason, updates in cases.items():
+        failed_report = copy.deepcopy(report)
+        failed_report.update(updates)
+        readiness = assess_relaykv_actual_host_backup_copy_readiness_for_smoke(
+            failed_report
+        )
+        if readiness["ready_for_actual_host_backup_copy"] is not False:
+            raise AssertionError(readiness)
+        if reason not in readiness["blocking_reasons"]:
+            raise AssertionError(readiness)
+        observed[reason] = readiness
+    return observed
+
+
 def _assert_summary_only_candidate_flow() -> dict[str, Any]:
     runtime_payloads = _runtime_payloads()
     runtime_summary = summarize_runtime_observation_payloads(runtime_payloads)
@@ -484,6 +630,7 @@ def main() -> None:
         "fail_propagation": _assert_fail_propagation(),
         "readiness_cases": _assert_readiness_cases(),
         "attention_readiness_cases": _assert_attention_readiness_cases(),
+        "actual_copy_readiness_cases": _assert_actual_copy_readiness_cases(),
         "summary_only_candidate_flow": _assert_summary_only_candidate_flow(),
     }
     print("relaykv_readonly_diagnostic_flow_smoke=pass")
