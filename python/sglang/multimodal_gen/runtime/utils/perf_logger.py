@@ -209,7 +209,13 @@ class StageProfiler:
         if self.log_stage_start_end:
             msg = f"[{self.stage_name}] started..."
             if self.logger.isEnabledFor(logging.DEBUG):
-                msg += f" ({round(current_platform.get_available_gpu_memory(), 2)} GB left)"
+                # This debug-only memory snapshot must not flush the CUDA cache.
+                # The default query calls empty_cache(), which synchronizes the
+                # device at every pipeline stage boundary before real work starts.
+                available_memory = current_platform.get_available_gpu_memory(
+                    empty_cache=False
+                )
+                msg += f" ({round(available_memory, 2)} GB left)"
             self.logger.info(msg)
 
         if (self.log_timing and self.metrics) or self.log_stage_start_end:
