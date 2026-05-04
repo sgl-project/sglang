@@ -5,15 +5,6 @@ import triton
 import triton.language as tl
 
 
-def _is_hip() -> bool:
-    return hasattr(torch.version, "hip") and torch.version.hip is not None
-
-
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-
-fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
-
-
 # Triton implementation
 @triton.jit
 def _act_quant_kernel(
@@ -118,7 +109,7 @@ def act_quant(
     M = x_flat.size(0)
 
     # Allocate output tensors
-    y = torch.empty_like(x, dtype=fp8_dtype)
+    y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     y_flat = y.view(-1, N)
     s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
     s_flat = s.view(-1, N // block_size)
@@ -128,11 +119,6 @@ def act_quant(
     BLOCK_N = block_size
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, block_size))
     round_scale = scale_fmt is not None
-
-    if round_scale:
-        num_stages = 1 if _is_hip() else 0
-    else:
-        num_stages = 2
 
     _act_quant_kernel[grid](
         x_flat,
@@ -144,7 +130,7 @@ def act_quant(
         round_scale=round_scale,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_stages=num_stages,
+        num_stages=0 if round_scale else 2,
     )
 
     return y, s
