@@ -1,16 +1,22 @@
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
+)
+
+_GLOBAL_ARGS_PATCH = (
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.base.get_global_server_args"
 )
 
 
 class DummyTextEncodingStage(TextEncodingStage):
     def __init__(self):
-        super().__init__(text_encoders=[], tokenizers=[])
+        with patch(_GLOBAL_ARGS_PATCH) as mock_global_args:
+            mock_global_args.return_value = MagicMock()
+            super().__init__(text_encoders=[], tokenizers=[])
         self.calls = 0
 
     def encode_text(self, *args, **kwargs):
@@ -28,7 +34,7 @@ def make_req(**kwargs):
         "is_warmup": False,
     }
     defaults.update(kwargs)
-    return Req(**defaults)
+    return SimpleNamespace(**defaults)
 
 
 def test_negative_text_cache_key_tracks_encode_options():
