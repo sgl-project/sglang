@@ -40,7 +40,6 @@ DEFAULT_THRESHOLDS = {
 CASE_THRESHOLDS: Dict[str, Dict[ComponentType, float]] = {
     # Add overrides here when a specific model/component needs a different threshold.
     "flux_2_image_t2i": {ComponentType.TRANSFORMER: 0.99},
-    "flux_2_image_t2i_layerwise_offload": {ComponentType.TRANSFORMER: 0.99},
     "flux_2_image_t2i_2_gpus": {ComponentType.TRANSFORMER: 0.99},
     "flux_2_ti2i": {ComponentType.TRANSFORMER: 0.99},
     "flux_2_t2i_customized_vae_path": {ComponentType.TRANSFORMER: 0.99},
@@ -60,11 +59,6 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
     "flux_image_t2i": {
         ComponentType.TEXT_ENCODER: ComponentSkip(
             "Text encoder diverges from HF baseline despite 100% matched weights (CosSim ~0.47)"
-        )
-    },
-    "sana_image_t2i": {
-        ComponentType.VAE: ComponentSkip(
-            "HF AutoencoderDC checkpoint leaves required to_qkv_multiscale weights missing, so VAE transfer would compare against partially initialized reference weights"
         )
     },
     "qwen_image_t2i_cache_dit_enabled": {
@@ -103,6 +97,9 @@ SKIP_COMPONENTS: Dict[str, Dict[ComponentType, ComponentSkip]] = {
     "zimage_image_t2i_fp8": {
         ComponentType.VAE: ComponentSkip(
             "Representative VAE accuracy is already covered by zimage_image_t2i for the same source component and topology"
+        ),
+        ComponentType.TRANSFORMER: ComponentSkip(
+            "FP8 transformer override cannot be materialized by the Diffusers reference loader"
         ),
         ComponentType.TEXT_ENCODER: ComponentSkip(
             "Representative text encoder accuracy is already covered by zimage_image_t2i for the same source component and topology"
