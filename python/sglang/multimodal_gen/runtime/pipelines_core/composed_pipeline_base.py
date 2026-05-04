@@ -19,7 +19,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import (
     filter_modules_for_role,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
-    component_force_attn_backend_context_manager,
+    component_attn_backend_context_manager,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     PipelineComponentLoader,
@@ -425,7 +425,7 @@ class ComposedPipelineBase(ABC):
                     attn_backend.name.lower(),
                     matched_backend_key,
                 )
-            with component_force_attn_backend_context_manager(
+            with component_attn_backend_context_manager(
                 attn_backend, component_name=matched_backend_key or module_name
             ):
                 module, memory_usage = PipelineComponentLoader.load_component(

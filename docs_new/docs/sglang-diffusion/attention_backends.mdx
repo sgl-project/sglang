@@ -105,8 +105,8 @@ For SGLang-native pipelines, the CLI accepts the lowercase names of `AttentionBa
 
 The selection order in `runtime/layers/attention/selector.py` is:
 
-1. Component override from `--component-attention-backends` while that component is being constructed
-2. `global_force_attn_backend(...)` / `global_force_attn_backend_context_manager(...)`
+1. `global_force_attn_backend(...)` / `global_force_attn_backend_context_manager(...)`
+2. Component override from `--component-attention-backends` while that component is being constructed
 3. CLI `--attention-backend` (`ServerArgs.attention_backend`)
 4. Auto selection (platform capability, dtype, and installed packages)
 
