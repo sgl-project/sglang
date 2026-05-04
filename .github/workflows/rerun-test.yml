@@ -21,6 +21,7 @@ on:
           - 4-gpu-a10
           - 4-gpu-b200
           - 8-gpu-h200
+          - 8-gpu-h200-deepep
           - 8-gpu-h20
           - 8-gpu-b200
           - ubuntu-latest
@@ -49,6 +50,8 @@ env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
+  FORCE_REBUILD_DEEPEP: '1'
 
 permissions:
   actions: write

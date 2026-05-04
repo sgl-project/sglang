@@ -74,7 +74,7 @@ class InsertResult:
 class EvictParams:
     """Unified parameters for evict across different cache types"""
 
-    num_tokens: int
+    num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
 
