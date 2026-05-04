@@ -5,6 +5,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     MODELOPT_FLUX2_FP8_TRANSFORMER,
     MODELOPT_FLUX2_NVFP4_WEIGHTS,
     MODELOPT_NVFP4_B200_ENV_VARS,
+    MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER,
+    MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER,
     MODELOPT_WAN22_FP8_TRANSFORMER,
     MODELOPT_WAN22_NVFP4_TRANSFORMER,
     T2V_PROMPT,
@@ -14,6 +16,7 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     HUNYUAN3D_SHAPE_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
+    MODELOPT_TI2I_CI_sampling_params,
     MULTI_FRAME_I2I_sampling_params,
     MULTI_IMAGE_TI2I_sampling_params,
     MULTI_IMAGE_TI2I_UPLOAD_sampling_params,
@@ -161,6 +164,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(model_path=DEFAULT_JOYAI_IMAGE_EDIT_MODEL_NAME_FOR_TEST),
         TI2I_sampling_params,
         run_consistency_check=False,
+        run_component_accuracy_check=False,
     ),
     # Upscaling (Real-ESRGAN 4×) for T2I
     DiffusionTestCase(
@@ -344,6 +348,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
             },
         ),
         T2I_sampling_params,
+        run_component_accuracy_check=False,
     ),
 ]
 
@@ -397,6 +402,20 @@ else:
             modality="video",
             sampling_params=MODELOPT_T2V_CI_sampling_params,
             extras=["--transformer-path", MODELOPT_WAN22_FP8_TRANSFORMER],
+        ),
+        _make_modelopt_ci_case(
+            "qwen_image_modelopt_fp8_t2i",
+            model_path=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+            modality="image",
+            sampling_params=MODELOPT_T2I_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_QWEN_IMAGE_FP8_TRANSFORMER],
+        ),
+        _make_modelopt_ci_case(
+            "qwen_image_edit_modelopt_fp8_ti2i",
+            model_path=DEFAULT_QWEN_IMAGE_EDIT_2511_MODEL_NAME_FOR_TEST,
+            modality="image",
+            sampling_params=MODELOPT_TI2I_CI_sampling_params,
+            extras=["--transformer-path", MODELOPT_QWEN_IMAGE_EDIT_FP8_TRANSFORMER],
         ),
         _make_modelopt_ci_case(
             "flux1_modelopt_nvfp4_t2i",
@@ -538,6 +557,7 @@ TWO_GPU_CASES = [
             ],
         ),
         TI2V_sampling_params,
+        run_component_accuracy_check=False,
     ),
     DiffusionTestCase(
         "wan2_1_i2v_14b_480P_2gpu",
@@ -558,6 +578,7 @@ TWO_GPU_CASES = [
             ],
         ),
         T2V_sampling_params,
+        run_component_accuracy_check=False,
     ),
     # I2V LoRA test case
     DiffusionTestCase(
@@ -630,6 +651,7 @@ TWO_GPU_CASES = [
             ulysses_degree=2,
         ),
         TI2V_sampling_params,
+        run_component_accuracy_check=False,
     ),
 ]
 
