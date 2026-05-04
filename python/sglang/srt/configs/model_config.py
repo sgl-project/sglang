@@ -1043,10 +1043,10 @@ class ModelConfig:
             return "fp8"  # Default fallback
 
     def _get_sliding_window_size(self) -> Optional[int]:
-        key_list = ["sliding_window_size", "sliding_window", "window_size"]
-        for key in key_list:
-            if hasattr(self.hf_text_config, key):
-                return getattr(self.hf_text_config, key)
+        for key in ("sliding_window_size", "sliding_window", "window_size"):
+            value = getattr(self.hf_text_config, key, None)
+            if value is not None:
+                return value
         return None
 
     def _validate_quantize_and_serve_config(self):
