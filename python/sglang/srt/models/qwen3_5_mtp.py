@@ -14,6 +14,7 @@
 
 """Inference-only Qwen3_5 MTP model."""
 
+import copy
 import logging
 from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
@@ -73,10 +74,11 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
             config.hidden_size, config.rms_norm_eps
         )
         self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
-        config.num_hidden_layers = 1
-        config.full_attention_interval = 1
+        mtp_config = copy.deepcopy(config)
+        mtp_config.num_hidden_layers = 1
+        mtp_config.full_attention_interval = 1
         self.model = Qwen3_5ForCausalLM(
-            config,
+            mtp_config,
             quant_config,
             prefix=add_prefix("mtp", prefix),
             is_nextn=True,

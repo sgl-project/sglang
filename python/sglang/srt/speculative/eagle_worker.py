@@ -123,16 +123,6 @@ class EAGLEWorker(TpModelWorker):
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
-        # Do not capture cuda graph in `super().__init__()`
-        # It will be captured later.
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
-        # Share the allocator with a target worker.
-        # Draft and target worker own their own KV cache pools.
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-
         # Load hot token ids
         if self.speculative_algorithm.is_eagle3():
             if server_args.speculative_token_map is not None:
@@ -148,7 +138,7 @@ class EAGLEWorker(TpModelWorker):
         else:
             self.hot_token_id = None
 
-        # Init draft worker
+        # Load draft model weights only.
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
         else:
@@ -167,43 +157,8 @@ class EAGLEWorker(TpModelWorker):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
-        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
-
-        if self.speculative_algorithm.is_eagle3():
-            # most cases EAGLE3 models don't share lm_head
-            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
-            if (
-                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
-                and self.draft_model_runner.model.load_lm_head_from_target
-            ):
-                self.draft_model_runner.model.set_embed_and_head(embed, head)
-            else:
-                self.draft_model_runner.model.set_embed(embed)
-
-            # grab hot token ids
-            if self.draft_model_runner.model.hot_token_id is not None:
-                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
-                    embed.device
-                )
-
-        else:
-            if self.hot_token_id is not None:
-                head = head.clone()
-                self.hot_token_id = self.hot_token_id.to(head.device)
-                head.data = head.data[self.hot_token_id]
-
-            # Share the embedding and lm_head
-            self.draft_model_runner.model.set_embed_and_head(embed, head)
-
-        # Init attention backend and cuda graphs
-        self.draft_model_runner.server_args.disable_cuda_graph = (
-            backup_disable_cuda_graph
-        )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
@@ -216,31 +171,56 @@ class EAGLEWorker(TpModelWorker):
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            self.init_attention_backend()
-            self.init_cuda_graphs()
-            if self.adaptive_controller is not None:
-                self.adaptive_controller.register(
-                    SpecRuntimeState(
-                        speculative_num_steps=self.speculative_num_steps,
-                        speculative_num_draft_tokens=self.speculative_num_draft_tokens,
-                        draft_attn_backend=self.draft_attn_backend,
-                        cuda_graph_runner=self.cuda_graph_runner,
-                        target_attn_backend=self.target_worker.model_runner.attn_backend,
-                        target_graph_runner=self.target_worker.model_runner.graph_runner,
-                        draft_extend_attn_backend=self.draft_extend_attn_backend,
-                        cuda_graph_runner_for_draft_extend=self.cuda_graph_runner_for_draft_extend,
-                    )
-                )
-                self.adaptive_controller.init_states()
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        super().alloc_memory_pool(
+            memory_pool_config,
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+        )
+        # Share embeddings/lm_head
+        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
+        if self.speculative_algorithm.is_eagle3():
+            # most cases EAGLE3 models don't share lm_head
+            # but some models (e.g. nvidia/gpt-oss-120b-Eagle3) shares
+            if (
+                hasattr(self.draft_model_runner.model, "load_lm_head_from_target")
+                and self.draft_model_runner.model.load_lm_head_from_target
+            ):
+                self.draft_model_runner.model.set_embed_and_head(embed, head)
+            else:
+                self.draft_model_runner.model.set_embed(embed)
+            # grab hot token ids
+            if self.draft_model_runner.model.hot_token_id is not None:
+                self.hot_token_id = self.draft_model_runner.model.hot_token_id.to(
+                    embed.device
+                )
+        else:
+            if self.hot_token_id is not None:
+                head = head.clone()
+                self.hot_token_id = self.hot_token_id.to(head.device)
+                head.data = head.data[self.hot_token_id]
+            self.draft_model_runner.model.set_embed_and_head(embed, head)
+
+    def init_backends(self):
+        """Initialize draft attention backends and capture cuda graphs (called by scheduler)."""
+        with self.draft_tp_context(
+            self.draft_model_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            self.draft_model_runner.init_backends(disable_cuda_graph=True)
+            self.init_attention_backend()
+            self.init_cuda_graphs()
 
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
@@ -260,6 +240,9 @@ class EAGLEWorker(TpModelWorker):
         )
 
         self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
+        self.draft_model_runner.attn_backend = (
+            self.draft_extend_attn_backend or self.draft_attn_backend
+        )
 
     def init_cuda_graphs(self):
         """Capture cuda graphs."""

@@ -121,18 +121,7 @@ class EagleDraftWorker(BaseDraftWorker):
             server_args.speculative_algorithm
         )
 
-        # Do not capture cuda graph in `TpModelWorker` init,
-        # will capture later with init_cuda_graphs()
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
-
-        # Share the allocator with a target worker.
-        # Draft and target worker own their own KV cache pools.
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-
-        # Init draft worker
+        # Load draft model weights only.
         if server_args.enable_dp_attention and self.speculative_algorithm.is_eagle3():
             ctx = draft_tp_context(get_attention_tp_group())
         else:
@@ -140,7 +129,6 @@ class EagleDraftWorker(BaseDraftWorker):
         with (
             ctx
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            # Init draft worker
             self.draft_worker = TpModelWorker(
                 server_args=server_args,
                 gpu_id=gpu_id,
@@ -152,9 +140,6 @@ class EagleDraftWorker(BaseDraftWorker):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
         # Alias for better readability
@@ -167,23 +152,34 @@ class EagleDraftWorker(BaseDraftWorker):
             self.eagle_use_aux_hidden_state = eagle_config.get(
                 "use_aux_hidden_state", True
             )
-        self.init_token_map()
-        self.init_lm_head()
-
-        # Init attention backend and cuda graphs
-        self.draft_runner.server_args.disable_cuda_graph = backup_disable_cuda_graph
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
+        self.tree_mask_mode = TreeMaskMode.FULL_MASK
+        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        """Allocate draft KV cache pools (called by scheduler)."""
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        self.draft_worker.alloc_memory_pool(
+            memory_pool_config=memory_pool_config,
+            req_to_token_pool=req_to_token_pool,
+            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
+        )
+        self.init_token_map()
+        self.init_lm_head()
+
+    def init_backends(self):
         with self.draft_tp_context(
             self.draft_runner.tp_group
         ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            self.init_attention_backend()
-            self.init_cuda_graphs()
-
-        self.tree_mask_mode = TreeMaskMode.FULL_MASK
-
-        self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+            super().init_backends()
 
     def init_token_map(self):
         # Load hot token ids
@@ -251,6 +247,7 @@ class EagleDraftWorker(BaseDraftWorker):
         )
 
         self.draft_runner.draft_attn_backend = self.draft_attn_backend
+        self.draft_runner.attn_backend = self.draft_extend_attn_backend
         self.tree_mask_mode = TreeMaskMode.FULL_MASK
 
     def init_cuda_graphs(self):
@@ -659,10 +656,6 @@ class EAGLEWorkerV2(BaseSpecWorker):
             server_args.speculative_algorithm
         )
 
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
@@ -685,6 +678,21 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
 
         self.plan_stream, self.plan_stream_ctx = _get_plan_stream(self.device)
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        self._draft_worker.alloc_memory_pool(
+            memory_pool_config, req_to_token_pool, token_to_kv_pool_allocator
+        )
+        self.req_to_token_pool = req_to_token_pool
+        self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+
+    def init_backends(self):
+        self._draft_worker.init_backends()
 
     @property
     def target_worker(self):

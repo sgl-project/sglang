@@ -51,16 +51,6 @@ class StandaloneWorker(EAGLEWorker):
         # Override the context length of the draft model to be the same as the target model.
         server_args.context_length = target_worker.model_runner.model_config.context_len
 
-        # Do not capture cuda graph in `super().__init__()`
-        # It will be captured later.
-        backup_disable_cuda_graph = server_args.disable_cuda_graph
-        server_args.disable_cuda_graph = True
-        # Share the allocator with a target worker.
-        # Draft and target worker own their own KV cache pools.
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            target_worker.get_memory_pool()
-        )
-
         # Load hot token ids
         if server_args.speculative_token_map is not None:
             self.hot_token_id = load_token_map(server_args.speculative_token_map)
@@ -70,7 +60,7 @@ class StandaloneWorker(EAGLEWorker):
         else:
             self.hot_token_id = None
 
-        # Init draft worker
+        # Load draft model weights only.
         with empty_context(), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
             TpModelWorker.__init__(
                 self,
@@ -84,26 +74,27 @@ class StandaloneWorker(EAGLEWorker):
                 moe_dp_rank=moe_dp_rank,
                 nccl_port=nccl_port,
                 is_draft_worker=True,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                memory_pool_config=target_worker.model_runner.memory_pool_config,
             )
 
-        # Init attention backend and cuda graphs
-        self.draft_model_runner.server_args.disable_cuda_graph = (
-            backup_disable_cuda_graph
-        )
         self.draft_tp_context = (
             draft_tp_context if server_args.enable_dp_attention else empty_context
         )
-        with self.draft_tp_context(
-            self.draft_model_runner.tp_group
-        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-            self.init_attention_backend()
-            self.init_cuda_graphs()
 
         # Some dummy tensors
         self.num_new_pages_per_topk = torch.empty(
             (), dtype=torch.int64, device=self.device
         )
         self.extend_lens = torch.empty((), dtype=torch.int64, device=self.device)
+
+    def alloc_memory_pool(
+        self,
+        memory_pool_config=None,
+        req_to_token_pool=None,
+        token_to_kv_pool_allocator=None,
+    ):
+        TpModelWorker.alloc_memory_pool(
+            self,
+            memory_pool_config,
+            req_to_token_pool,
+            token_to_kv_pool_allocator,
+        )

@@ -160,7 +160,7 @@ class EAGLEDraftExtendCudaGraphRunner:
                     dtype=self.model_runner.dtype,
                 )
             self.seq_len_fill_value = (
-                self.model_runner.attn_backend.get_cuda_graph_seq_len_fill_value()
+                self.draft_extend_attn_backend.get_cuda_graph_seq_len_fill_value()
             )
             seq_lens = torch.full(
                 (self.max_bs,), self.seq_len_fill_value, dtype=torch.int32

@@ -14,6 +14,7 @@
 
 """Inference-only Qwen3Next MTP Speculative Decoding."""
 
+import copy
 import logging
 from contextlib import ExitStack
 from typing import Iterable, Optional, Tuple
@@ -67,10 +68,11 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
             config.hidden_size, config.rms_norm_eps
         )
         self.pre_fc_norm_hidden = RMSNorm_cls(config.hidden_size, config.rms_norm_eps)
-        config.num_hidden_layers = 1
-        config.full_attention_interval = 1
+        mtp_config = copy.deepcopy(config)
+        mtp_config.num_hidden_layers = 1
+        mtp_config.full_attention_interval = 1
         self.model = Qwen3NextModel(
-            config,
+            mtp_config,
             quant_config,
             prefix=add_prefix("model", prefix),
             is_nextn=True,
