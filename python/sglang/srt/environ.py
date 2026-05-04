@@ -554,7 +554,7 @@ class Envs:
     # ====================================================================
 
     # Identity / chat encoder
-    SGLANG_DSV4_ISOLATE = EnvInt(False)
+    SGLANG_DSV4_ISOLATE = EnvBool(False)
     # Set False when using FP4-to-FP8 converted DeepSeek V4 checkpoint.
     SGLANG_DSV4_FP4_EXPERTS = EnvBool(True)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
