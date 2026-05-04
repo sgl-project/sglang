@@ -15,8 +15,8 @@ from sglang.jit_kernel.deepseek_v4 import (
 )
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
 from sglang.srt.environ import envs
-from sglang.srt.layers.attention.compression.compressor import Compressor
-from sglang.srt.layers.attention.compression.metadata import PagedIndexerMetadata
+from sglang.srt.layers.attention.dsv4.compressor import Compressor
+from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 from sglang.srt.layers.attention.indexer_topk_capturer import (
     get_global_indexer_capturer,
 )
@@ -26,10 +26,10 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.utils import add_prefix, is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.compression.compressor import (
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+    from sglang.srt.layers.attention.dsv4.compressor import (
         CompressorBackendMixin,
     )
-    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
