@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     EvictResult,
     InsertParams,
     MatchPrefixParams,
+    MatchResult,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import available_and_evictable_str
@@ -1622,8 +1623,9 @@ class UnifiedRadixCacheSuite:
         xfer = transfers[0]
         self.assertEqual(xfer.name, PoolName.SWA)
         self.assertEqual(len(xfer.nodes_to_load), expected_pages)
-        self.assertEqual(xfer.swa_suffix_tokens, expected_pages * ps)
-        self.assertGreaterEqual(xfer.swa_suffix_tokens, sw)
+        # host_indices must cover exactly the expected suffix tokens (>= sw).
+        self.assertEqual(int(xfer.host_indices.numel()), expected_pages * ps)
+        self.assertGreaterEqual(int(xfer.host_indices.numel()), sw)
         self.assertEqual(xfer.nodes_to_load, chain[-expected_pages:])
 
     def test_hicache_swa_host_independent_of_full(self):
@@ -1663,6 +1665,148 @@ class UnifiedRadixCacheSuite:
         self.assertIsNone(cd_swa.host_value)
         self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(node))
         self.assertNotIn(node, tree.evictable_host_leaves)
+
+    def _swa_finalize_setup(self):
+        """Build a SWA chain long enough to fill at least the window
+        plus one extra page, and host-back every node so we can flip
+        SWA tombstones at will."""
+        ps = self.cfg.page_size
+        sw = self.cfg.sliding_window_size
+        window_pages = (sw + ps - 1) // ps
+        chain_pages = window_pages + 2
+        if chain_pages * ps > self.cfg.kv_size // 2:
+            self.skipTest("kv_size too small for the desired chain")
+
+        tree, allocator, req_to_token_pool = build_fixture(self.cfg)
+        chain = self._build_chain_pages(tree, allocator, req_to_token_pool, chain_pages)
+        if len(chain) <= window_pages:
+            self.skipTest("chain collapsed below the window length")
+        self._simulate_backup_tree(tree)
+        return tree, allocator, req_to_token_pool, chain, window_pages
+
+    def test_hicache_swa_finalize_match_result(self):
+        """finalize_match_result bumps host_hit_length to 1 iff some SWA node
+        within the trailing window is tombstoned (cd.value is None,
+        cd.host_value is not None). Out-of-window tombstones and chains fully
+        on device must leave host_hit_length untouched.
+
+        Sentinel only — never the real SWA token count, since SWA load-back
+        does not grow req.prefix_indices and any non-zero value gets
+        subtracted from extend_input_len in schedule_policy.
+        """
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+
+        tree, _, _, chain, window_pages = self._swa_finalize_setup()
+        leaf = chain[-1]
+        swa_comp = tree.components[ComponentType.SWA]
+
+        cases = [
+            ("all_on_device", None, 0),
+            ("tombstone_in_window", chain[-window_pages], 1),
+            ("tombstone_outside_window", chain[-(window_pages + 1)], 0),
+        ]
+        for name, victim, expected in cases:
+            with self.subTest(name):
+                # Reset SWA state for each subcase.
+                for n in chain:
+                    cd = n.component_data[ComponentType.SWA]
+                    if cd.value is None and cd.host_value is not None:
+                        cd.value = cd.host_value.clone()
+                if victim is not None:
+                    victim.component_data[ComponentType.SWA].value = None
+
+                result = MatchResult(
+                    device_indices=torch.empty(
+                        (0,), dtype=torch.int64, device=tree.device
+                    ),
+                    last_device_node=leaf,
+                    last_host_node=leaf,
+                    host_hit_length=0,
+                )
+                result = swa_comp.finalize_match_result(
+                    result=result,
+                    params=MatchPrefixParams(key=RadixKey(self._make_seq(1, 1))),
+                    value_chunks=[],
+                    best_value_len=0,
+                )
+                self.assertEqual(result.host_hit_length, expected)
+
+    def test_hicache_swa_commit_load_back_rebuilds_mapping(self):
+        """LOAD_BACK commit must:
+        (1) restore SWA cd.value via _restore_device_value (host LRU -> device LRU),
+        (2) rewrite full_to_swa_index_mapping[full_idx] = new_swa_idx for every
+            loaded chunk so subsequent SWA reads via translate_loc_from_full_to_swa
+            return the freshly allocated SWA slot."""
+        if not self.cfg.has_swa:
+            self.skipTest("requires SWA")
+        if self.cfg.has_mamba:
+            self.skipTest("SWA-only path keeps the chain construction simple")
+
+        tree, allocator, _, chain, window_pages = self._swa_finalize_setup()
+
+        # Tombstone every SWA node in the trailing window.
+        loaded_nodes = chain[-window_pages:]
+        for n in loaded_nodes:
+            n.component_data[ComponentType.SWA].value = None
+            # SWA LRU bookkeeping must reflect tombstone state for the
+            # _restore_device_value path to exercise the host->device move.
+            tree.lru_lists[ComponentType.SWA].remove_node(n)
+            tree.host_lru_lists[ComponentType.SWA].insert_mru(n)
+
+        # Build the LOAD_BACK transfer the same way load_back() would.
+        swa_comp = tree.components[ComponentType.SWA]
+        transfers = swa_comp.build_hicache_transfers(
+            chain[-1], CacheTransferPhase.LOAD_BACK
+        )
+        self.assertIsNotNone(transfers)
+        xfer = transfers[0]
+        self.assertEqual(xfer.nodes_to_load, loaded_nodes)
+
+        # Allocate SWA device slots from the inner allocator (mirrors how
+        # _resolve_pool_transfers_allocation routes via device_alloc_fn ->
+        # swa_attn_allocator.alloc on the load-back path).
+        n_swa = int(xfer.host_indices.numel())
+        new_swa = allocator.swa_attn_allocator.alloc(n_swa)
+        self.assertIsNotNone(new_swa)
+        xfer.device_indices = new_swa
+
+        # Snapshot pre-commit state for invariants checks.
+        pre_evictable = tree.component_evictable_size_[ComponentType.SWA]
+
+        swa_comp.commit_hicache_transfer(
+            chain[-1], CacheTransferPhase.LOAD_BACK, transfers=transfers
+        )
+
+        # (1) cd.value restored, host LRU -> device LRU swap done.
+        offset = 0
+        for n in loaded_nodes:
+            cd = n.component_data[ComponentType.SWA]
+            self.assertIsNotNone(cd.value)
+            chunk_len = int(cd.value.numel())
+            self.assertEqual(
+                cd.value.tolist(),
+                new_swa[offset : offset + chunk_len].tolist(),
+            )
+            offset += chunk_len
+            self.assertTrue(tree.lru_lists[ComponentType.SWA].in_list(n))
+            self.assertFalse(tree.host_lru_lists[ComponentType.SWA].in_list(n))
+        self.assertEqual(offset, n_swa)
+
+        # (2) full_to_swa_index_mapping rebuilt for every loaded chunk.
+        for n in loaded_nodes:
+            full_idx = n.component_data[ComponentType.FULL].value
+            swa_idx = n.component_data[ComponentType.SWA].value
+            translated = allocator.translate_loc_from_full_to_swa(full_idx)
+            self.assertEqual(translated.tolist(), swa_idx.tolist())
+
+        # Evictable size moved up by the restored token count.
+        self.assertEqual(
+            tree.component_evictable_size_[ComponentType.SWA] - pre_evictable,
+            n_swa,
+        )
 
     def test_hicache_mixed_backup_evict_insert(self):
         """Complex scenario: backup some, evict, insert new, verify invariants."""
