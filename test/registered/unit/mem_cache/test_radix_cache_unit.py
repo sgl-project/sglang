@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchPrefixParams,
 )
+from sglang.srt.mem_cache.hiradix_cache import HiRadixCache
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 # Test constants
@@ -233,6 +234,21 @@ class TestTreeNode(unittest.TestCase):
 
         self.assertTrue(node1 < node2)
         self.assertFalse(node2 < node1)
+
+
+class TestHiRadixCache(unittest.TestCase):
+    """Test cases for HiRadixCache-specific tree handling."""
+
+    def test_match_prefix_helper_skips_short_bigram_page(self):
+        """Short page-aligned EAGLE keys should not compute a full-page child key."""
+        root = TreeNode()
+        key = RadixKey([1, 2, 3], is_bigram=True).page_aligned(DEFAULT_PAGE_SIZE)
+        cache = type("FakeHiRadixCache", (), {"page_size": DEFAULT_PAGE_SIZE})()
+
+        value, last_node = HiRadixCache._match_prefix_helper(cache, root, key)
+
+        self.assertEqual(value, [])
+        self.assertIs(last_node, root)
 
 
 class TestRadixCache(unittest.TestCase):

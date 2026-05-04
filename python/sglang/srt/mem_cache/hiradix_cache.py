@@ -1318,13 +1318,13 @@ class HiRadixCache(RadixCache):
         self, node: TreeNode, key: RadixKey, host_value, hash_value
     ):
         node.last_access_time = time.monotonic()
-        if len(key) == 0:
+        if len(key) < self.page_size:
             return 0
 
         child_key = key.child_key(self.page_size)
 
         matched_length = 0
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) >= self.page_size and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             prefix_len = node.key.match(key, page_size=self.page_size)
@@ -1337,7 +1337,7 @@ class HiRadixCache(RadixCache):
                 new_node = self._split_node(node.key, node, prefix_len)
                 node = new_node
 
-            if len(key):
+            if len(key) >= self.page_size:
                 child_key = key.child_key(self.page_size)
 
         if len(key):
@@ -1359,10 +1359,12 @@ class HiRadixCache(RadixCache):
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
+        if len(key) < self.page_size:
+            return [], node
         child_key = key.child_key(self.page_size)
         value = []
 
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) >= self.page_size and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
             prefix_len = child.key.match(key, page_size=self.page_size)
@@ -1378,7 +1380,7 @@ class HiRadixCache(RadixCache):
                 node = child
                 key = key[prefix_len:]
 
-                if len(key):
+                if len(key) >= self.page_size:
                     child_key = key.child_key(self.page_size)
 
         return value, node
@@ -1425,14 +1427,14 @@ class HiRadixCache(RadixCache):
         if value is not None:
             value = value[: len(key)]
 
-        if len(key) == 0:
+        if len(key) < self.page_size:
             return InsertResult(prefix_len=0)
 
         node = self.root_node
         child_key = key.child_key(self.page_size)
         total_prefix_length = 0
 
-        while len(key) > 0 and child_key in node.children.keys():
+        while len(key) >= self.page_size and child_key in node.children.keys():
             node = node.children[child_key]
             node.last_access_time = time.monotonic()
             node.priority = max(node.priority, priority)
@@ -1471,7 +1473,7 @@ class HiRadixCache(RadixCache):
             key = key[prefix_len:]
             value = value[prefix_len:]
 
-            if len(key):
+            if len(key) >= self.page_size:
                 child_key = key.child_key(self.page_size)
 
         if len(key):
