@@ -65,13 +65,8 @@ jobs:
 
       - name: Build wheel
         run: |
-          chmod +x ./scripts/build_sgl_deep_gemm.sh
+          chmod +x ./scripts/build_sgl_deep_gemm.sh ./scripts/rename_sgl_deep_gemm_whl.sh
           ./scripts/build_sgl_deep_gemm.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/DeepGEMM" "${{ matrix.arch }}"
-
-      - name: Rename wheel
-        run: |
-          chmod +x ./scripts/rename_sgl_deep_gemm_whl.sh
-          ./scripts/rename_sgl_deep_gemm_whl.sh DeepGEMM/dist cu129 ${{ matrix.arch }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -149,6 +144,11 @@ jobs:
           path: DeepGEMM
           submodules: recursive
 
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
       - name: Set wheel version
         run: |
           echo -n "${{ inputs.version }}" > DeepGEMM/sgl_deep_gemm/VERSION
@@ -156,38 +156,8 @@ jobs:
 
       - name: Build wheel
         run: |
-          chmod +x ./scripts/build_sgl_deep_gemm.sh
+          chmod +x ./scripts/build_sgl_deep_gemm.sh ./scripts/rename_sgl_deep_gemm_whl.sh
           ./scripts/build_sgl_deep_gemm.sh "${{ matrix.python-version }}" "${{ matrix.cuda-version }}" "${{ github.workspace }}/DeepGEMM" "${{ matrix.arch }}"
-
-      - name: Rename wheel
-        run: |
-          chmod +x ./scripts/rename_sgl_deep_gemm_whl.sh
-          ./scripts/rename_sgl_deep_gemm_whl.sh DeepGEMM/dist cu130 ${{ matrix.arch }}
-
-      - name: Strip +cu130 local version for PyPI upload
-        working-directory: DeepGEMM
-        run: |
-          set -eux
-          pip install wheel
-          mkdir -p dist-pypi
-          for w in dist/*.whl; do
-            tmp=$(mktemp -d)
-            python3 -m wheel unpack "$w" --dest "$tmp"
-            unpacked=$(find "$tmp" -mindepth 1 -maxdepth 1 -type d | head -1)
-            info=$(find "$unpacked" -maxdepth 1 -type d -name "*.dist-info" | head -1)
-            meta="$info/METADATA"
-            orig=$(grep '^Version:' "$meta" | head -1 | sed 's/^Version:[[:space:]]*//')
-            new=$(echo "$orig" | sed 's/+cu[0-9]\+$//')
-            if [ "$orig" != "$new" ]; then
-              sed -i "s/^Version:.*/Version: ${new}/" "$meta"
-              old_base=$(basename "$info")
-              new_base="${old_base/${orig}/${new}}"
-              mv "$info" "$(dirname "$info")/${new_base}"
-            fi
-            python3 -m wheel pack "$unpacked" --dest-dir dist-pypi
-            rm -rf "$tmp"
-          done
-          ls -lh dist-pypi/
 
       - name: Upload to PyPI
         working-directory: DeepGEMM
