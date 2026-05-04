@@ -18,9 +18,10 @@ from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.layernorm import RMSNorm
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-    from sglang.srt.models.deepseek_v4 import Compressor, DeepseekRefRMSNorm
+    from sglang.srt.models.deepseek_v4 import Compressor
 
 
 class FusedCompressMetadata(NamedTuple):
@@ -50,7 +51,7 @@ class CompressorBackend:
         kv_score_input: torch.Tensor,
         ape: torch.Tensor,
         head_dim: int,
-        norm: DeepseekRefRMSNorm,
+        norm: RMSNorm,
         freqs_cis_cache: torch.Tensor,
         rotate: bool,
         forward_batch: ForwardBatch,
@@ -87,7 +88,7 @@ class CompressorBackend:
         compress_fused_norm_rope_inplace(
             kv_compressed,
             norm.weight,
-            norm.eps,
+            norm.variance_epsilon,
             freqs_cis_cache,
             plan,
         )

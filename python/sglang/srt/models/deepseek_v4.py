@@ -86,19 +86,6 @@ if TYPE_CHECKING:
     )
 
 
-class DeepseekRefRMSNorm(nn.Module):
-
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-
-    def forward(self, x: torch.Tensor):
-        out = rms_normalize_triton(x, self.eps, self.weight)
-        return out
-
-
 @triton.jit
 def _rms_normalize_kernel(
     x_ptr,
@@ -186,7 +173,9 @@ class Compressor(nn.Module):
             prefix=add_prefix("wkv_gate", prefix),
             params_dtype=wkv_gate_dtype,
         )
-        self.norm = DeepseekRefRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, weight_dtype=torch.float32
+        )
         self.freqs_cis = freqs_cis
 
         self.ape_converted = False
