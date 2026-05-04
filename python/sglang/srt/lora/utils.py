@@ -48,6 +48,16 @@ class LoRABatchInfo:
     # Computed from Python lists in prepare_lora_batch to avoid GPU sync.
     has_active_lora: bool = False
 
+    # Per-request segment indptrs, shape (bs + 1,). Required by MoE virtual
+    # experts which map tokens to requests regardless of the dense-LoRA
+    # backend's internal segmentation.  For the triton backend these are
+    # identical to seg_indptr/weight_indices; for csgmv they differ because
+    # its segments are chunked across adapters.
+    req_seg_indptr: Optional[torch.Tensor] = None
+
+    # Per-request adapter index, shape (bs,).
+    req_weight_indices: Optional[torch.Tensor] = None
+
 
 class LoRAType(Enum):
     LORA_A = 0
@@ -177,6 +187,7 @@ def get_normalized_target_modules(
         "v_proj": "qkv_proj",
         "gate_proj": "gate_up_proj",
         "up_proj": "gate_up_proj",
+        "out_proj": "out_proj",
         "embed_tokens": "embed_tokens",
         "vocab_emb": "embed_tokens",
         "embeddings": "embed_tokens",
@@ -196,14 +207,21 @@ def get_normalized_target_modules(
     return result
 
 
-def get_stacked_multiply(module_name: str) -> int:
+def get_stacked_multiply(
+    module_name: str, base_model: Optional[torch.nn.Module] = None
+) -> int:
     """
-    Mapping a lora module name to its magnification at output dimension
+    Mapping a lora module name to its magnification at output dimension.
+    Models can override via a get_stacked_multiply(module_name) method.
     """
+    if base_model is not None and hasattr(base_model, "get_stacked_multiply"):
+        return base_model.get_stacked_multiply(module_name)
     stacked_rank = {
         "qkv_proj": 3,
+        "in_proj_qkvz": 4,  # GDN packed input projection
         "gate_up_proj": 2,
         "gate_up_proj_moe": 2,
+        "in_proj": 2,
         "fused_qkv_a_proj_with_mqa": 2,
     }
     return stacked_rank[module_name] if module_name in stacked_rank else 1
@@ -215,18 +233,29 @@ def get_target_module_name(full_module_name: str, target_modules: Set[str]) -> s
 
     If there is a target module name in target_modules that can match full_module_name, return this name
     Else raise ValueError.
+
+    When multiple target modules match (e.g. both "up_proj" and "gate_up_proj"
+    are substrings), the longest match wins to avoid ambiguity.
     """
+    best = None
     for target_module in target_modules:
         if target_module in full_module_name:
-            return target_module
+            if best is None or len(target_module) > len(best):
+                best = target_module
+    if best is not None:
+        return best
     raise ValueError(
         f"Cannot find target module name for {full_module_name} in {target_modules}"
     )
 
 
 EMBEDDING_NAMES = ["embed_tokens", "lm_head"]
-ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "down_proj", "down_proj_moe"]
-REPLICATED_LINEAR_LORA_NAMES = ["fused_qkv_a_proj_with_mqa"]
+ROW_PARALLELISM_LINEAR_LORA_NAMES = ["o_proj", "out_proj", "down_proj", "down_proj_moe"]
+REPLICATED_LINEAR_LORA_NAMES = [
+    "fused_qkv_a_proj_with_mqa",
+    "fc1_latent_proj",
+    "fc2_latent_proj",
+]
 
 # Normalized module names that the LoRA system fully supports
 # (i.e. get_hidden_dim, init_buffers, and init_lora_modules can handle them).
@@ -234,8 +263,14 @@ _KNOWN_LORA_TARGET_MODULES = frozenset(
     {
         "qkv_proj",
         "o_proj",
+        "out_proj",
+        "in_proj",
+        "in_proj_qkvz",
+        "up_proj",
         "gate_up_proj",
         "down_proj",
+        "fc1_latent_proj",
+        "fc2_latent_proj",
         "embed_tokens",
         "lm_head",
         "fused_qkv_a_proj_with_mqa",
@@ -271,7 +306,15 @@ def auto_detect_lora_target_modules(model: "torch.nn.Module") -> set:
             raw_names.add(name.split(".")[-1])
 
     normalized = get_normalized_target_modules(raw_names)
-    return normalized & _KNOWN_LORA_TARGET_MODULES
+    result = normalized & _KNOWN_LORA_TARGET_MODULES
+
+    # Allow models to declare additional LoRA-compatible modules that
+    # cannot be auto-discovered or need to bypass normalization
+    # (e.g. Mamba in_proj, non-gated up_proj).
+    if hasattr(model, "supported_lora_modules"):
+        result.update(set(model.supported_lora_modules) & _KNOWN_LORA_TARGET_MODULES)
+
+    return result
 
 
 def get_lm_head_lora_b_shard_size(output_dim: int, shard_indices=None) -> int:
