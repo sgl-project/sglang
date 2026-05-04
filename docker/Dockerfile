@@ -244,6 +244,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
                | xargs -r python3 -m pip uninstall -y && \
            python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
                torch torchvision torchaudio --force-reinstall; \
+           python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_DEEP_GEMM_VERSION}/sgl_deep_gemm-${SGL_DEEP_GEMM_VERSION}+cu129-py3-none-manylinux2014_$(uname -m).whl --force-reinstall; \
        fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
@@ -554,13 +555,6 @@ elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
     && cd flash-mla && git submodule update --init --recursive \
     && pip install --no-build-isolation -v . ; \
 fi
-
-# Install DeepGEMM v4 (sgl-project/DeepGEMM @ dev-0426) under the import name
-# `deep_gemm_v4`, so it can coexist with the existing `deep_gemm` install.
-COPY scripts/install_deepgemm_v4.sh /tmp/install_deepgemm_v4.sh
-RUN --mount=type=cache,target=/root/.cache/pip \
-    bash /tmp/install_deepgemm_v4.sh /tmp/DeepGEMM_v4 \
-    && rm -rf /tmp/install_deepgemm_v4.sh /tmp/DeepGEMM_v4
 
 # Add yank script
 COPY --chown=root:root --chmod=755 docker/configs/yank /usr/local/bin/yank
