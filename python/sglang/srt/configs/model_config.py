@@ -343,6 +343,7 @@ class ModelConfig:
 
         if is_draft_model and self.hf_config.architectures[0] in [
             "DeepseekV3ForCausalLM",
+            "DeepseekV32ForCausalLM",
             "GlmMoeDsaForCausalLM",
         ]:
             self.hf_config.architectures[0] = "DeepseekV3ForCausalLMNextN"

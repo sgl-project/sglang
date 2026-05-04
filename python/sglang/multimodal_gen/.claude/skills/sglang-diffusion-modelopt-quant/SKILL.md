@@ -61,9 +61,9 @@ This repo now contains:
 - trajectory similarity validation:
   [`python/sglang/multimodal_gen/tools/compare_diffusion_trajectory_similarity.py`](../../../tools/compare_diffusion_trajectory_similarity.py)
 
-Validated documentation and CI coverage currently center on six ModelOpt diffusion transformer override families:
+Validated documentation and CI coverage currently center on these ModelOpt diffusion transformer override families:
 
-- FP8: FLUX.1-dev, FLUX.2-dev, Wan2.2
+- FP8: FLUX.1-dev, FLUX.2-dev, Wan2.2, Qwen Image, Qwen Image Edit
 - NVFP4: FLUX.1-dev, FLUX.2-dev, Wan2.2
 
 Treat a new family, a new precision, or a new checkpoint layout as unsupported until it has a documented matrix row and a matching validation story.
@@ -193,6 +193,33 @@ For `FLUX.1-dev`, the validated fallback set currently keeps these modules in BF
 - `single_transformer_blocks.*.proj_mlp`
 
 Use `--model-type flux1` to force that profile, or rely on `--model-type auto` when the export config identifies `FluxTransformer2DModel`.
+
+Qwen Image and Qwen Image Edit share `QwenImageTransformer2DModel`, so one
+ModelOpt FP8 fallback preset covers both. The validated Qwen Image fallback set
+keeps these modules in BF16:
+
+- `img_in`
+- `txt_in`
+- `time_text_embed.timestep_embedder.linear_1`
+- `time_text_embed.timestep_embedder.linear_2`
+- `norm_out.linear`
+- `proj_out`
+- `transformer_blocks.*.img_mlp.net.2`
+- `transformer_blocks.*.img_mod`
+- `transformer_blocks.*.txt_mod`
+
+Use `--model-type qwen-image` to force that profile, or rely on
+`--model-type auto` when the export config identifies
+`QwenImageTransformer2DModel`.
+
+Qwen modulation weights can appear in safetensors as `.img_mod.1.weight` and
+`.txt_mod.1.weight`. Canonicalize those module names to `.img_mod` and
+`.txt_mod` before fallback matching.
+
+For Qwen Image FP8, explicit BF16 fallback tensors must be written before
+honoring ModelOpt ignored weights. Otherwise converter stats can report a
+fallback while the output checkpoint still retains the source FP8 tensor, which
+causes severe image-quality regressions.
 
 For FLUX.1-dev NVFP4 model families that need a mixed BF16+NVFP4 checkpoint, build the merged transformer explicitly:
 
