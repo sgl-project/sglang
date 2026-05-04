@@ -53,6 +53,25 @@ def _jit_compress_module(
 
 
 @cache_once
+def _jit_compress_128_online_module(head_dim: int) -> Module:
+    assert head_dim == 512
+    args = make_cpp_args(head_dim, is_arch_support_pdl())
+    kernel_class = f"FlashCompress128OnlineKernel<{args}>"
+    return load_jit(
+        make_name(f"compress_128_online_v2"),
+        *args,
+        cuda_files=["deepseek_v4/c128_online_v2.cuh"],
+        cuda_wrappers=[
+            ("decode", f"{kernel_class}::run_decode"),
+            ("prefill", f"{kernel_class}::run_prefill"),
+            ("plan_decode", "plan_compress_128_online_decode"),
+            ("plan_prefill", "plan_compress_128_online_prefill"),
+        ],
+        extra_cuda_cflags=["-use_fast_math"],
+    )
+
+
+@cache_once
 def _jit_compress_plan_module() -> Module:
     return load_jit(
         make_name(f"compress_plan"),
@@ -117,12 +136,28 @@ class CompressorDecodePlan(NamedTuple):
         seq_lens: torch.Tensor,
     ) -> CompressorDecodePlan:
         module = _jit_compress_plan_module()
-        plan_d = module.plan_decode_legacy(
-            req_pool_indices,
-            seq_lens,
-            int(compress_ratio),
-        )
+        plan_d = module.plan_decode_legacy(req_pool_indices, seq_lens, compress_ratio)
         return CompressorDecodePlan(compress_ratio, torch.from_dlpack(plan_d))
+
+    @staticmethod
+    def generate_online(
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        full_to_swa: torch.Tensor,
+        swa_page_size: int,
+    ) -> CompressorDecodePlan:
+        batch_size = int(seq_lens.shape[0])
+        module = _jit_compress_128_online_module(512)
+        plan_d = torch.empty(
+            (batch_size, 16),
+            dtype=torch.uint8,
+            device=req_pool_indices.device,
+        )
+        module.plan_decode(
+            seq_lens, req_pool_indices, req_to_token, full_to_swa, plan_d, swa_page_size
+        )
+        return CompressorDecodePlan(128, plan_d)
 
     @property
     def is_decode(self) -> bool:
@@ -213,6 +248,48 @@ class CompressorPrefillPlan(NamedTuple):
             pin_buffer,
         )
 
+    @staticmethod
+    def generate_online(
+        seq_lens: torch.Tensor,
+        extend_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        full_to_swa: torch.Tensor,
+        num_q_tokens: int,
+        swa_page_size: int,
+    ) -> CompressorPrefillPlan:
+        seq_lens_cpu = seq_lens.to(torch.int64)
+        extend_lens_cpu = extend_lens.to(torch.int64)
+        rid_i64 = req_pool_indices.to(torch.int64)
+        r2t_i32 = req_to_token.to(torch.int32)
+        f2s_i64 = full_to_swa.to(torch.int64)
+        pin_buffer = torch.empty(
+            (2, num_q_tokens, 16), dtype=torch.uint8, pin_memory=True
+        )
+        plan_c_pin, plan_w_pin = pin_buffer[0], pin_buffer[1]
+        device = req_pool_indices.device
+        plan_c_dev = torch.empty((num_q_tokens, 16), dtype=torch.uint8, device=device)
+        plan_w_dev = torch.empty((num_q_tokens, 16), dtype=torch.uint8, device=device)
+        module = _jit_compress_128_online_module(512)  # NOTE: only support dim=512
+        num_c, num_w = module.plan_prefill(
+            seq_lens_cpu,
+            extend_lens_cpu,
+            rid_i64,
+            r2t_i32,
+            f2s_i64,
+            plan_c_pin,
+            plan_w_pin,
+            plan_c_dev,
+            plan_w_dev,
+            int(swa_page_size),
+        )
+        return CompressorPrefillPlan(
+            128,
+            plan_c_dev[: int(num_c)],
+            plan_w_dev[: int(num_w)],
+            pin_buffer,
+        )
+
     @property
     def is_decode(self) -> bool:
         return False
@@ -227,15 +304,18 @@ def compress_forward(
     head_dim: int,
     compress_ratio: Literal[4, 128],
     out: Optional[torch.Tensor] = None,
+    is_online: bool = False,
 ) -> torch.Tensor:
-    assert head_dim % 128 == 0
     if out is None:
         num_q_tokens = plan[1].shape[0]  # NOTE: decode = bs, prefill = dynamic
         out = kv_score_input.new_empty((num_q_tokens, head_dim))
-    assert plan.compress_ratio == compress_ratio, "Mismatched compress ratio in plan!"
-    module = _jit_compress_module(
-        head_dim, kv_score_input.dtype, out.dtype, compress_ratio
-    )
+    assert plan.compress_ratio == compress_ratio
+    if is_online:
+        assert compress_ratio == 128 and head_dim == 512
+        module = _jit_compress_128_online_module(512)
+    else:
+        dtype_in, dtype_out = kv_score_input.dtype, out.dtype
+        module = _jit_compress_module(head_dim, dtype_in, dtype_out, compress_ratio)
     fn = module.decode if plan.is_decode else module.prefill
     fn(kv_score_buffer, kv_score_input, out, ape, *plan[1:3])
     return out

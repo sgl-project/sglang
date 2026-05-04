@@ -132,6 +132,8 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
   }
   __syncwarp();
 
+  PDLTriggerSecondary<kUsePDL>();
+
   // part 2: RoPE on all 32 lanes -- one (real, imag) bf16x2 pair per lane.
   using DType2 = packed_t<DType>;
   const auto mem_elem = tile::Memory<DType2>{lane_id, kWarpThreads};
@@ -143,8 +145,6 @@ Q_KERNEL void fused_q_norm_rope(const __grid_constant__ FusedQNormRopeParams par
       x_real * freq_imag + x_imag * freq_real,
   };
   mem_elem.store(output_ptr + (kHeadDim - kRopeDim), cast<DType2>(rotated));
-
-  PDLTriggerSecondary<kUsePDL>();
 }
 
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
