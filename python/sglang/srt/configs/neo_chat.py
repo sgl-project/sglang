@@ -134,7 +134,7 @@ class NEOChatConfig(PretrainedConfig):
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:
         del decoder
-        return self.llm_config
+        return self.__dict__.get("llm_config", self)
 
     def to_dict(self):
         output = copy.deepcopy(self.__dict__)
