@@ -623,9 +623,12 @@ def _register_configs():
         pipeline_config_cls=UGPipelineConfig,
         hf_model_paths=[
             "ByteDance-Seed/BAGEL-7B-MoT",
+            "sensenova/SenseNova-U1-8B-MoT",
         ],
         model_detectors=[
             lambda hf_id: "bagel" in hf_id.lower(),
+            lambda hf_id: "sensenova-u1" in hf_id.lower(),
+            lambda hf_id: "sensenova_u1" in hf_id.lower(),
         ],
     )
 

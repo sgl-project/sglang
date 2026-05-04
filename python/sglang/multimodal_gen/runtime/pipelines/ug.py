@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_bagel import (
     BAGELLatentFlowGSegmentExecutor,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_u1 import (
+    U1PixelFlowGSegmentExecutor,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
@@ -32,6 +35,11 @@ from sglang.srt.ug.runtime import UGSessionRuntime
 from sglang.srt.ug.srt_executor import (
     UGSRTRequestBoundaryExecutor,
     UGSRTSchedulerExecutor,
+)
+from sglang.srt.ug.u1 import (
+    U1SRTBackedUGMiddleBridge,
+    U1UGModelAdapter,
+    is_sensenova_u1_ug_model,
 )
 
 
@@ -107,7 +115,31 @@ def _load_ug_bridge(
                 srt_image_tokenization="multimodal",
             )
         )
+    if is_sensenova_u1_ug_model(model_path):
+        if scheduler is not None:
+            raise NotImplementedError(
+                "SenseNova U1 native SRT scheduler wiring is not available yet. "
+                "This roadmap stage only installs the pixel_flow backend shell."
+            )
+        return U1SRTBackedUGMiddleBridge(
+            _build_srt_owned_ug_runtime(
+                UGModelRunnerAdapter(U1UGModelAdapter()),
+                scheduler=None,
+                srt_request_executor=srt_request_executor,
+                srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
+                srt_image_tokenization="multimodal",
+            )
+        )
     raise ValueError(f"Unsupported UG model path: {model_path}")
+
+
+def _build_ug_g_segment_executor(bridge: UGMiddleBridge):
+    g_kind = getattr(bridge, "g_kind", None)
+    if g_kind == "latent_flow":
+        return BAGELLatentFlowGSegmentExecutor()
+    if g_kind == "pixel_flow":
+        return U1PixelFlowGSegmentExecutor()
+    raise ValueError(f"Unsupported UG G kind: {g_kind!r}")
 
 
 class UGPipeline(ComposedPipelineBase):
@@ -119,10 +151,9 @@ class UGPipeline(ComposedPipelineBase):
         server_args: ServerArgs,
         loaded_modules: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        if loaded_modules and "ug_bridge" in loaded_modules:
-            return loaded_modules
-        return {
-            "ug_bridge": _load_ug_bridge(
+        modules = dict(loaded_modules or {})
+        if "ug_bridge" not in modules:
+            modules["ug_bridge"] = _load_ug_bridge(
                 self.model_path,
                 scheduler=getattr(server_args, "ug_srt_scheduler", None),
                 srt_u_decode_max_new_tokens=getattr(
@@ -131,12 +162,17 @@ class UGPipeline(ComposedPipelineBase):
                     None,
                 ),
             )
-        }
+        if "ug_g_segment_executor" not in modules:
+            modules["ug_g_segment_executor"] = _build_ug_g_segment_executor(
+                modules["ug_bridge"]
+            )
+        return modules
 
     def create_pipeline_stages(self, server_args: ServerArgs):
         bridge = self.get_module("ug_bridge")
+        g_segment_executor = self.get_module("ug_g_segment_executor")
         self.add_stage(UGContextStage(bridge))
-        self.add_stage(UGGSegmentStage(bridge, BAGELLatentFlowGSegmentExecutor()))
+        self.add_stage(UGGSegmentStage(bridge, g_segment_executor))
         self.add_stage(UGDecodeStage(bridge))
 
     def forward_interleaved(

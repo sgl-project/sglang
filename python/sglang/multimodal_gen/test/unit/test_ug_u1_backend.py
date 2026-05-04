@@ -5,6 +5,13 @@ from unittest.mock import patch
 import unittest
 
 from sglang.multimodal_gen.configs.pipeline_configs.ug import UGPipelineConfig
+from sglang.multimodal_gen.runtime.pipelines.ug import (
+    _build_ug_g_segment_executor,
+    _load_ug_bridge,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_bagel import (
+    BAGELLatentFlowGSegmentExecutor,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_u1 import (
     U1PixelFlowGSegmentExecutor,
 )
@@ -74,6 +81,24 @@ class TestU1UGBackendShell(unittest.TestCase):
                 batch=SimpleNamespace(),
                 server_args=_make_ug_server_args(),
             )
+
+    def test_pipeline_dispatch_selects_u1_executor_for_pixel_flow(self):
+        executor = _build_ug_g_segment_executor(PixelFlowBridge())
+
+        self.assertIsInstance(executor, U1PixelFlowGSegmentExecutor)
+
+    def test_pipeline_dispatch_selects_bagel_executor_for_latent_flow(self):
+        executor = _build_ug_g_segment_executor(LatentFlowBridge())
+
+        self.assertIsInstance(executor, BAGELLatentFlowGSegmentExecutor)
+
+    def test_load_u1_bridge_shell_from_model_path(self):
+        bridge = _load_ug_bridge("sensenova/SenseNova-U1-8B-MoT")
+
+        self.assertEqual(bridge.g_kind, "pixel_flow")
+        self.assertFalse(hasattr(bridge, "prepare_g_latents"))
+        with self.assertRaisesRegex(NotImplementedError, "SenseNova U1"):
+            bridge.prepare_u_context(prompt="draw a cup", image=None)
 
 
 class PixelFlowBridge:

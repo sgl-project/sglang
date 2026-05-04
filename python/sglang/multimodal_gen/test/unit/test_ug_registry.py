@@ -31,6 +31,20 @@ class TestUGRegistry(unittest.TestCase):
             "UGPipeline",
         )
 
+    def test_sensenova_u1_resolves_without_model_index(self):
+        info = get_model_info("sensenova/SenseNova-U1-8B-MoT", backend="sglang")
+
+        self.assertIsNotNone(info)
+        self.assertIs(info.pipeline_cls, UGPipeline)
+        self.assertIs(info.pipeline_config_cls, UGPipelineConfig)
+        self.assertIs(info.sampling_param_cls, UGSamplingParams)
+
+    def test_sensenova_u1_resolves_to_ug_pipeline_name(self):
+        self.assertEqual(
+            get_non_diffusers_pipeline_name("sensenova/SenseNova-U1-8B-MoT"),
+            "UGPipeline",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

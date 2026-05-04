@@ -4,7 +4,26 @@ from __future__ import annotations
 
 from typing import Any
 
+from sglang.srt.ug.context import UGContextBundle
+from sglang.srt.ug.denoiser import (
+    SRTBackedUGMiddleBridge,
+    UGGSegmentExecutor,
+)
 from sglang.srt.ug.interleaved import UGGKind
+from sglang.srt.ug.runtime import (
+    UGDecodeResult,
+    UGInterleavedMessage,
+    UGSessionRuntime,
+    UGVLMTextGenerationResult,
+)
+
+
+def is_sensenova_u1_ug_model(
+    model_path: str | None,
+    model_id: str | None = None,
+) -> bool:
+    identifier = f"{model_path or ''} {model_id or ''}".lower()
+    return "sensenova-u1" in identifier or "sensenova_u1" in identifier
 
 
 class U1UGModelAdapter:
@@ -70,6 +89,77 @@ class U1UGModelAdapter:
 
     def close_session(self, *, session_id: str) -> None:
         del session_id
+
+
+class U1SRTBackedUGMiddleBridge:
+    """Pixel-flow U1 bridge shell backed by the common SRT UG session runtime."""
+
+    g_kind: UGGKind = "pixel_flow"
+
+    def __init__(self, runtime: UGSessionRuntime) -> None:
+        self.runtime = runtime
+        self._bridge = SRTBackedUGMiddleBridge(runtime)
+
+    def prepare_u_context(
+        self,
+        *,
+        prompt: str | list[str] | None,
+        image: Any | None,
+        think: bool = False,
+        think_max_new_tokens: int | None = None,
+    ) -> UGContextBundle:
+        return self._bridge.prepare_u_context(
+            prompt=prompt,
+            image=image,
+            think=think,
+            think_max_new_tokens=think_max_new_tokens,
+        )
+
+    def prepare_u_context_from_messages(
+        self,
+        *,
+        messages: list[UGInterleavedMessage | dict[str, Any]],
+        think: bool = False,
+        think_max_new_tokens: int | None = None,
+    ) -> UGContextBundle:
+        return self._bridge.prepare_u_context_from_messages(
+            messages=messages,
+            think=think,
+            think_max_new_tokens=think_max_new_tokens,
+        )
+
+    def run_g_segment(
+        self,
+        *,
+        contexts: UGContextBundle,
+        executor: UGGSegmentExecutor,
+    ) -> Any:
+        return self._bridge.run_g_segment(contexts=contexts, executor=executor)
+
+    def commit_generated_segment(
+        self,
+        *,
+        contexts: UGContextBundle,
+        segment: Any,
+    ) -> None:
+        self._bridge.commit_generated_segment(contexts=contexts, segment=segment)
+
+    def release(self, contexts: UGContextBundle) -> None:
+        self._bridge.release(contexts)
+
+    def continue_u_decode(self, *, contexts: UGContextBundle) -> UGDecodeResult:
+        return self._bridge.continue_u_decode(contexts=contexts)
+
+    def generate_vlm_text(
+        self,
+        *,
+        messages: list[UGInterleavedMessage | dict[str, Any]],
+        max_new_tokens: int,
+    ) -> UGVLMTextGenerationResult:
+        return self._bridge.generate_vlm_text(
+            messages=messages,
+            max_new_tokens=max_new_tokens,
+        )
 
 
 def _not_wired() -> NotImplementedError:
