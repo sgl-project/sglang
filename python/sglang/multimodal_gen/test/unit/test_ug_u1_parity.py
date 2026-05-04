@@ -96,35 +96,8 @@ class TestU1OfficialParityHarness(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
-            official_repo = root / "official"
-            vqa_dir = official_repo / "examples/vqa"
-            vqa_dir.mkdir(parents=True)
-            fake_script = vqa_dir / "inference.py"
-            fake_script.write_text(
-                "\n".join(
-                    [
-                        "import argparse",
-                        "from pathlib import Path",
-                        "parser = argparse.ArgumentParser()",
-                        "parser.add_argument('--model_path')",
-                        "parser.add_argument('--image')",
-                        "parser.add_argument('--question')",
-                        "parser.add_argument('--output')",
-                        "parser.add_argument('--max_new_tokens')",
-                        "parser.add_argument('--device')",
-                        "parser.add_argument('--dtype')",
-                        "parser.add_argument('--attn_backend')",
-                        "args = parser.parse_args()",
-                        "Path(args.output).write_text('official answer')",
-                        "print('fake official u1 ok')",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            image_path = root / "image.png"
-            Image.fromarray(np.full((8, 8, 3), 23, dtype=np.uint8), "RGB").save(
-                image_path
-            )
+            official_repo = _write_fake_u1_vqa_repo(root, text="official answer")
+            image_path = _write_fake_image(root)
             output_dir = root / "bundle"
 
             bundle = run_from_env(
@@ -150,6 +123,38 @@ class TestU1OfficialParityHarness(unittest.TestCase):
             self.assertIn("not wired", candidate["error"])
             self.assertFalse(report["passed"])
             self.assertEqual(report["diffs"][0]["field"], "error")
+
+    def test_u1_vlm_official_reference_mode_can_run_sglang_candidate(self):
+        run_from_env = _load_u1_official_parity_harness()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            official_repo = _write_fake_u1_vqa_repo(root, text="aligned answer")
+            image_path = _write_fake_image(root)
+            output_dir = root / "bundle"
+
+            bundle = run_from_env(
+                {
+                    "SGLANG_TEST_U1_PARITY_MODE": "vlm_official_reference",
+                    "SGLANG_TEST_U1_PARITY_RUN_SGLANG_CANDIDATE": "1",
+                    "SGLANG_TEST_U1_PARITY_OUTPUT": str(output_dir),
+                    "SGLANG_TEST_U1_OFFICIAL_PY": sys.executable,
+                    "SGLANG_TEST_U1_OFFICIAL_REPO": str(official_repo),
+                    "SGLANG_TEST_U1_MODEL_PATH": "/fake/model",
+                    "SGLANG_TEST_U1_VLM_IMAGE": str(image_path),
+                    "SGLANG_TEST_U1_VLM_QUESTION": "what is here?",
+                    "SGLANG_TEST_U1_VLM_MAX_NEW_TOKENS": "4",
+                    "SGLANG_TEST_U1_VLM_DEVICE": "cpu",
+                }
+            )
+
+            candidate = json.loads((bundle / "candidate.json").read_text())
+            report = json.loads((bundle / "report.json").read_text())
+
+            self.assertEqual(candidate["text"], "aligned answer")
+            self.assertFalse(candidate["metadata"]["native_srt_model_runner"])
+            self.assertEqual(candidate["debug_counters"]["prefill_count"], 1)
+            self.assertTrue(report["passed"])
 
     def test_runtime_import_firewall_blocks_official_u1_imports(self):
         repo = Path(__file__).resolve().parents[5]
@@ -209,6 +214,41 @@ def _load_u1_official_parity_harness():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module.run_u1_official_parity_from_env
+
+
+def _write_fake_u1_vqa_repo(root: Path, *, text: str) -> Path:
+    official_repo = root / "official"
+    vqa_dir = official_repo / "examples/vqa"
+    vqa_dir.mkdir(parents=True)
+    fake_script = vqa_dir / "inference.py"
+    fake_script.write_text(
+        "\n".join(
+            [
+                "import argparse",
+                "from pathlib import Path",
+                "parser = argparse.ArgumentParser()",
+                "parser.add_argument('--model_path')",
+                "parser.add_argument('--image')",
+                "parser.add_argument('--question')",
+                "parser.add_argument('--output')",
+                "parser.add_argument('--max_new_tokens')",
+                "parser.add_argument('--device')",
+                "parser.add_argument('--dtype')",
+                "parser.add_argument('--attn_backend')",
+                "args = parser.parse_args()",
+                f"Path(args.output).write_text({text!r})",
+                "print('fake official u1 ok')",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return official_repo
+
+
+def _write_fake_image(root: Path) -> Path:
+    image_path = root / "image.png"
+    Image.fromarray(np.full((8, 8, 3), 23, dtype=np.uint8), "RGB").save(image_path)
+    return image_path
 
 
 if __name__ == "__main__":

@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
-from typing import Any
+import os
+import subprocess
+import tempfile
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Protocol
 
 from sglang.srt.ug.adapter import UGModelAppendImageResult, UGModelPrefillResult
 from sglang.srt.ug.context import UGContextBundle
@@ -19,6 +24,121 @@ from sglang.srt.ug.runtime import (
     UGSRTPreparedInput,
     UGVLMTextGenerationResult,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class U1VLMBackendResult:
+    text: str
+    token_ids: tuple[int, ...] = ()
+    next_token_ids: tuple[int, ...] = ()
+    position_ids: tuple[int, ...] = ()
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+class U1VLMBackend(Protocol):
+    def generate_text(
+        self,
+        *,
+        messages: list[UGInterleavedMessage],
+        max_new_tokens: int,
+    ) -> U1VLMBackendResult: ...
+
+
+class U1SubprocessVLMBackend:
+    """Opt-in external VLM runner for U1 parity.
+
+    This backend keeps the official/compatibility implementation out of the
+    SGLang runtime process. It is a parity bridge, not native SRT ModelRunner
+    execution.
+    """
+
+    def __init__(
+        self,
+        *,
+        python: str | Path,
+        repo: str | Path,
+        model_path: str | Path,
+        device: str = "cuda",
+        dtype: str = "bfloat16",
+        attn_backend: str = "sdpa",
+        timeout: int = 600,
+        cuda_visible_devices: str | None = None,
+        output_dir: str | Path | None = None,
+    ) -> None:
+        self.python = Path(python)
+        self.repo = Path(repo)
+        self.model_path = str(model_path)
+        self.device = device
+        self.dtype = dtype
+        self.attn_backend = attn_backend
+        self.timeout = int(timeout)
+        self.cuda_visible_devices = cuda_visible_devices
+        self.output_dir = Path(output_dir) if output_dir is not None else None
+
+    def generate_text(
+        self,
+        *,
+        messages: list[UGInterleavedMessage],
+        max_new_tokens: int,
+    ) -> U1VLMBackendResult:
+        image_path = _first_u1_image_path(messages)
+        question = _u1_question_text(messages)
+        output_dir = self._make_output_dir()
+        output_path = output_dir / "u1_vlm_candidate.txt"
+        cmd = [
+            str(self.python),
+            str(self.repo / "examples/vqa/inference.py"),
+            "--model_path",
+            self.model_path,
+            "--image",
+            str(image_path),
+            "--question",
+            question,
+            "--output",
+            str(output_path),
+            "--max_new_tokens",
+            str(int(max_new_tokens)),
+            "--device",
+            self.device,
+            "--dtype",
+            self.dtype,
+            "--attn_backend",
+            self.attn_backend,
+        ]
+        run_env = os.environ.copy()
+        if self.cuda_visible_devices is not None:
+            run_env["CUDA_VISIBLE_DEVICES"] = self.cuda_visible_devices
+        completed = subprocess.run(
+            cmd,
+            cwd=self.repo,
+            env=run_env,
+            text=True,
+            capture_output=True,
+            timeout=self.timeout,
+        )
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "U1 VLM subprocess backend failed: "
+                f"returncode={completed.returncode}, stderr={_tail(completed.stderr)}"
+            )
+        if not output_path.exists():
+            raise RuntimeError("U1 VLM subprocess backend did not write output text")
+        return U1VLMBackendResult(
+            text=output_path.read_text(),
+            metadata={
+                "backend": "external_subprocess",
+                "native_srt_model_runner": False,
+                "command": cmd,
+                "stdout_tail": _tail(completed.stdout),
+                "stderr_tail": _tail(completed.stderr),
+            },
+        )
+
+    def _make_output_dir(self) -> Path:
+        if self.output_dir is not None:
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            return self.output_dir
+        return Path(tempfile.mkdtemp(prefix="u1-vlm-backend-"))
 
 
 def is_sensenova_u1_ug_model(
@@ -43,9 +163,11 @@ class U1UGModelAdapter:
     image_token_id = 31001
     generated_image_token_id = 31003
 
-    def __init__(self) -> None:
+    def __init__(self, *, vlm_backend: U1VLMBackend | None = None) -> None:
         self.observed_u_forwards: list[dict[str, Any]] = []
         self._pending_segments_by_session: dict[str, list[dict[str, Any]]] = {}
+        self._messages_by_session: dict[str, list[UGInterleavedMessage]] = {}
+        self.vlm_backend = vlm_backend
 
     def prepare_srt_u_message_inputs(
         self,
@@ -91,6 +213,7 @@ class U1UGModelAdapter:
         messages: list[Any],
     ) -> UGModelPrefillResult:
         try:
+            self._remember_session_messages(session, messages)
             return UGModelPrefillResult(
                 added_tokens=self._added_tokens_from_srt_session_view(session, messages)
             )
@@ -109,8 +232,21 @@ class U1UGModelAdapter:
         session: Any,
         max_new_tokens: int,
     ) -> Any:
-        del runtime, session, max_new_tokens
-        raise _not_wired()
+        del runtime
+        if self.vlm_backend is None:
+            raise _not_wired()
+        messages = self._messages_for_session(session)
+        result = self.vlm_backend.generate_text(
+            messages=messages,
+            max_new_tokens=max_new_tokens,
+        )
+        return UGVLMTextGenerationResult(
+            session=session,
+            text=result.text,
+            token_ids=result.token_ids,
+            next_token_ids=result.next_token_ids,
+            position_ids=result.position_ids,
+        )
 
     def append_generated_image(
         self,
@@ -127,7 +263,8 @@ class U1UGModelAdapter:
             self._clear_pending_segments(session)
 
     def close_session(self, *, session_id: str) -> None:
-        del session_id
+        self._messages_by_session.pop(str(session_id), None)
+        self._pending_segments_by_session.pop(str(session_id), None)
 
     def _prepare_text_input(
         self,
@@ -256,6 +393,28 @@ class U1UGModelAdapter:
         if session_key is not None:
             self._pending_segments_by_session.pop(session_key, None)
 
+    def _remember_session_messages(
+        self,
+        session: Any,
+        messages: list[UGInterleavedMessage],
+    ) -> None:
+        session_key = self._session_key(session)
+        if session_key is None:
+            return
+        stored = self._messages_by_session.setdefault(session_key, [])
+        stored.extend(messages)
+
+    def _messages_for_session(self, session: Any) -> list[UGInterleavedMessage]:
+        session_key = getattr(session, "session_id", None)
+        if session_key is None:
+            session_key = self._session_key(session)
+        if session_key is None:
+            raise RuntimeError("U1 VLM decode requires a UG session id")
+        messages = self._messages_by_session.get(str(session_key), [])
+        if not messages:
+            raise RuntimeError(f"U1 VLM decode has no messages for session {session_key}")
+        return list(messages)
+
     @staticmethod
     def _session_key(session: Any) -> str | None:
         handle = getattr(session, "handle", None)
@@ -365,3 +524,40 @@ def _not_wired() -> NotImplementedError:
         "the pixel_flow capability; U path, G pixel-flow mechanics, and true "
         "weights are covered by later roadmap items."
     )
+
+
+def _first_u1_image_path(messages: list[UGInterleavedMessage]) -> Path:
+    for message in messages:
+        if message.type != "image":
+            continue
+        content = message.content
+        if isinstance(content, (str, Path)):
+            return Path(content)
+        save = getattr(content, "save", None)
+        if callable(save):
+            path = Path(tempfile.mkdtemp(prefix="u1-vlm-image-")) / "image.png"
+            save(path)
+            return path
+        raise TypeError(
+            "U1 VLM image message must be a path or PIL image, "
+            f"got {type(content)}"
+        )
+    raise ValueError("U1 VLM text generation requires an image message")
+
+
+def _u1_question_text(messages: list[UGInterleavedMessage]) -> str:
+    parts = [str(message.content) for message in messages if message.type == "text"]
+    question = "\n".join(part for part in parts if part)
+    if not question:
+        raise ValueError("U1 VLM text generation requires a text question")
+    return question
+
+
+def _tail(text: str | bytes | None, *, limit: int = 2000) -> str | None:
+    if text is None:
+        return None
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", errors="replace")
+    if len(text) <= limit:
+        return text
+    return text[-limit:]

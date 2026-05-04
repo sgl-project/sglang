@@ -20,6 +20,12 @@ from sglang.srt.ug.parity import (
     summarize_ug_image,
     write_ug_parity_bundle,
 )
+from sglang.srt.ug.runtime import UGInterleavedMessage
+from sglang.srt.ug.u1 import (
+    U1SubprocessVLMBackend,
+    U1UGModelAdapter,
+    U1SRTBackedUGMiddleBridge,
+)
 
 
 class TestU1OfficialParityHarness(unittest.TestCase):
@@ -140,6 +146,28 @@ def _run_vlm_official_reference_mode(env) -> Path:
     candidate_path = env.get("SGLANG_TEST_U1_PARITY_CANDIDATE_ARTIFACT")
     if candidate_path:
         candidate = UGParityArtifact.from_json(Path(candidate_path).read_text())
+    elif env.get("SGLANG_TEST_U1_PARITY_RUN_SGLANG_CANDIDATE") == "1":
+        candidate = _run_sglang_vlm_candidate(
+            case=case,
+            official_py=Path(
+                env.get("SGLANG_TEST_U1_CANDIDATE_PY") or str(official_py)
+            ),
+            official_repo=Path(
+                env.get("SGLANG_TEST_U1_CANDIDATE_REPO") or str(official_repo)
+            ),
+            model_path=env.get("SGLANG_TEST_U1_CANDIDATE_MODEL_PATH") or model_path,
+            image_path=image_path,
+            question=question,
+            max_new_tokens=max_new_tokens,
+            device=env.get("SGLANG_TEST_U1_CANDIDATE_DEVICE") or device,
+            dtype=env.get("SGLANG_TEST_U1_CANDIDATE_DTYPE") or dtype,
+            attn_backend=(
+                env.get("SGLANG_TEST_U1_CANDIDATE_ATTN_BACKEND") or attn_backend
+            ),
+            timeout=timeout,
+            cuda_visible_devices=env.get("SGLANG_TEST_U1_CUDA_VISIBLE_DEVICES"),
+            output_dir=output_dir / "candidate-work",
+        )
     else:
         candidate = _candidate_unavailable_artifact(case, image_path=image_path)
 
@@ -158,6 +186,70 @@ def _run_vlm_official_reference_mode(env) -> Path:
     if candidate_path and not report.passed:
         raise AssertionError(f"U1 VLM parity failed; report: {bundle / 'report.json'}")
     return bundle
+
+
+def _run_sglang_vlm_candidate(
+    *,
+    case: UGParityCase,
+    official_py: Path,
+    official_repo: Path,
+    model_path: str,
+    image_path: Path,
+    question: str,
+    max_new_tokens: int,
+    device: str,
+    dtype: str,
+    attn_backend: str,
+    timeout: int,
+    cuda_visible_devices: str | None,
+    output_dir: Path,
+) -> UGParityArtifact:
+    from sglang.srt.session.session_controller import SessionController
+    from sglang.srt.ug.adapter import UGModelRunnerAdapter
+    from sglang.srt.ug.runtime import UGSessionRuntime
+
+    backend = U1SubprocessVLMBackend(
+        python=official_py,
+        repo=official_repo,
+        model_path=model_path,
+        device=device,
+        dtype=dtype,
+        attn_backend=attn_backend,
+        timeout=timeout,
+        cuda_visible_devices=cuda_visible_devices,
+        output_dir=output_dir,
+    )
+    adapter = U1UGModelAdapter(vlm_backend=backend)
+    runtime = UGSessionRuntime(
+        model_runner=UGModelRunnerAdapter(adapter),
+        session_controller=SessionController(_HarnessTreeCache()),
+        srt_image_tokenization="text_placeholder",
+    )
+    bridge = U1SRTBackedUGMiddleBridge(runtime)
+    result = bridge.generate_vlm_text(
+        messages=[
+            UGInterleavedMessage(type="image", content=str(image_path)),
+            UGInterleavedMessage(type="text", content=question),
+        ],
+        max_new_tokens=max_new_tokens,
+    )
+    try:
+        debug_counters = runtime.get_debug_counters(result.session)
+    finally:
+        runtime.close_session(result.session)
+    return UGParityArtifact(
+        case_id=case.case_id,
+        model=case.model,
+        task=case.task,
+        runner="sglang",
+        text=result.text,
+        image=summarize_ug_image(image_path),
+        metadata={
+            "candidate_backend": "u1_external_vlm_backend",
+            "native_srt_model_runner": False,
+        },
+        debug_counters=debug_counters,
+    )
 
 
 def _run_official_vlm_reference(
@@ -344,6 +436,14 @@ def _case_from_artifact(artifact: UGParityArtifact) -> UGParityCase:
         task=artifact.task,
         metadata={"source": "artifact_env"},
     )
+
+
+class _HarnessTreeCache:
+    def __init__(self) -> None:
+        self.released_sessions: list[str] = []
+
+    def release_session(self, session_id: str) -> None:
+        self.released_sessions.append(session_id)
 
 
 if __name__ == "__main__":

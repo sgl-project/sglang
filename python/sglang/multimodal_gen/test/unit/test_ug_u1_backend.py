@@ -32,7 +32,7 @@ from sglang.srt.ug.runtime import (
     UGSegmentState,
     UGSessionRuntime,
 )
-from sglang.srt.ug.u1 import U1UGModelAdapter
+from sglang.srt.ug.u1 import U1UGModelAdapter, U1VLMBackendResult
 
 
 class TestU1UGBackendShell(unittest.TestCase):
@@ -53,6 +53,53 @@ class TestU1UGBackendShell(unittest.TestCase):
 
         with self.assertRaisesRegex(NotImplementedError, "SenseNova U1"):
             adapter.decode_vlm_text(runtime=None, session=None, max_new_tokens=1)
+
+    def test_u1_vlm_backend_generates_real_text_through_adapter(self):
+        adapter = U1UGModelAdapter(vlm_backend=FakeU1VLMBackend("real answer"))
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+        )
+        handle = runtime.prefill_interleaved(
+            [
+                UGInterleavedMessage(type="image", content="/tmp/u1-input.png"),
+                UGInterleavedMessage(type="text", content="what is in this image?"),
+            ],
+            session_id="u1-vlm-session",
+        )
+
+        result = adapter.decode_vlm_text(
+            runtime=runtime,
+            session=handle,
+            max_new_tokens=4,
+        )
+
+        self.assertEqual(result.text, "real answer")
+        self.assertEqual(adapter.vlm_backend.calls[0]["max_new_tokens"], 4)
+        self.assertEqual(
+            [message.type for message in adapter.vlm_backend.calls[0]["messages"]],
+            ["image", "text"],
+        )
+
+    def test_u1_bridge_vlm_uses_real_backend_text(self):
+        adapter = U1UGModelAdapter(vlm_backend=FakeU1VLMBackend("bridge answer"))
+        runtime = UGSessionRuntime(
+            model_runner=UGModelRunnerAdapter(adapter),
+            session_controller=SessionController(FakeTreeCache()),
+        )
+        bridge = _load_u1_bridge(runtime)
+
+        result = bridge.generate_vlm_text(
+            messages=[
+                UGInterleavedMessage(type="image", content="/tmp/u1-input.png"),
+                UGInterleavedMessage(type="text", content="describe"),
+            ],
+            max_new_tokens=3,
+        )
+
+        self.assertEqual(result.text, "bridge answer")
+        self.assertEqual(runtime.get_debug_counters(result.session)["prefill_count"], 1)
+        bridge.runtime.close_session(result.session)
 
     def test_u1_text_prepared_input_carries_causal_rows(self):
         adapter = U1UGModelAdapter()
@@ -305,6 +352,27 @@ class FakeTreeCache:
 
     def release_session(self, session_id):
         self.released_sessions.append(session_id)
+
+
+class FakeU1VLMBackend:
+    def __init__(self, text):
+        self.text = text
+        self.calls = []
+
+    def generate_text(self, *, messages, max_new_tokens):
+        self.calls.append(
+            {
+                "messages": list(messages),
+                "max_new_tokens": max_new_tokens,
+            }
+        )
+        return U1VLMBackendResult(text=self.text)
+
+
+def _load_u1_bridge(runtime):
+    from sglang.srt.ug.u1 import U1SRTBackedUGMiddleBridge
+
+    return U1SRTBackedUGMiddleBridge(runtime)
 
 
 def _make_contexts():
