@@ -66,6 +66,14 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
 
+OFFLOAD_DISABLE_RECOMMENDATION_ORDER = (
+    "vae",
+    "image_encoder",
+    "text_encoder",
+    "text_encoder_2",
+    "transformer",
+)
+
 
 @dataclass
 class _ExpandedOutputParts:
@@ -192,26 +200,7 @@ class GPUWorker:
             current_platform.get_device_total_memory() / (1024**3) - peak_reserved_gb
         )
         can_stay_resident = self.get_can_stay_resident_components(remaining_gpu_mem_gb)
-        suggested_args = set()
-        component_to_arg = {
-            "vae": "--vae-cpu-offload",
-            "text_encoder": "--text-encoder-cpu-offload",
-            "text_encoder_2": "--text-encoder-cpu-offload",
-            "image_encoder": "--image-encoder-cpu-offload",
-        }
-
-        for component in can_stay_resident:
-            if component == "transformer":
-                if self.server_args.dit_layerwise_offload:
-                    suggested_args.add("--dit-layerwise-offload")
-                elif self.server_args.dit_cpu_offload:
-                    suggested_args.add("--dit-cpu-offload")
-            elif component in component_to_arg:
-                suggested_args.add(component_to_arg[component])
-
-        suggested_args_str = (
-            ", ".join(sorted(suggested_args)) if suggested_args else "None"
-        )
+        suggested_args_str = self._format_offload_disable_suggestions(can_stay_resident)
 
         pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
 
@@ -223,6 +212,34 @@ class GPUWorker:
             f"Components that could stay resident (based on the last request workload): {can_stay_resident}. "
             f"Related offload server args to disable: {suggested_args_str}"
         )
+
+    def _format_offload_disable_suggestions(self, components: List[str]) -> str:
+        component_set = set(components)
+        suggestions = []
+        seen_args = set()
+
+        for component in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
+            if component not in component_set:
+                continue
+
+            arg = None
+            if component == "vae":
+                arg = "--vae-cpu-offload"
+            elif component == "image_encoder":
+                arg = "--image-encoder-cpu-offload"
+            elif component in ("text_encoder", "text_encoder_2"):
+                arg = "--text-encoder-cpu-offload"
+            elif component == "transformer":
+                if self.server_args.dit_layerwise_offload:
+                    arg = "--dit-layerwise-offload"
+                elif self.server_args.dit_cpu_offload:
+                    arg = "--dit-cpu-offload"
+
+            if arg is not None and arg not in seen_args:
+                suggestions.append(arg)
+                seen_args.add(arg)
+
+        return ", ".join(suggestions) if suggestions else "None"
 
     def execute_forward(
         self, batch: List[Req], return_req: bool = False
@@ -641,9 +658,9 @@ class GPUWorker:
         if not self.pipeline:
             return can_stay_resident
 
-        # Map memory_usage keys to server_args offload flags
-        # If the flag is False, the component is ALREADY resident, so we don't suggest it.
-        # If the flag is True, it is currently offloaded, so it's a candidate to "stay resident".
+        # Map memory_usage keys to server_args offload flags.
+        # If the flag is False, the component is already resident, so we do not suggest it.
+        # If the flag is True, it is currently offloaded, so it is a candidate to stay resident.
         offload_flags = {
             "transformer": self.server_args.dit_cpu_offload
             or self.server_args.dit_layerwise_offload,
@@ -653,10 +670,14 @@ class GPUWorker:
             "image_encoder": self.server_args.image_encoder_cpu_offload,
         }
 
-        for name, usage in self.pipeline.memory_usages.items():
+        for name in OFFLOAD_DISABLE_RECOMMENDATION_ORDER:
             # Only consider components that are currently configured to be offloaded
             is_offload_configured = offload_flags.get(name, False)
             if not is_offload_configured:
+                continue
+
+            usage = self.pipeline.memory_usages.get(name)
+            if usage is None:
                 continue
 
             if usage <= remaining_gpu_mem_gb:
