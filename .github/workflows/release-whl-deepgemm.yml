@@ -21,11 +21,6 @@ on:
         type: string
         required: false
         default: 'release-0426'
-      sglang_ref:
-        description: "sglang ref to run this workflow from (default: main). For testing workflow changes from a feature branch."
-        type: string
-        required: false
-        default: 'main'
 
 concurrency:
   group: release-sgl-deepgemm-${{ github.ref }}
@@ -54,8 +49,6 @@ jobs:
             sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
 
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sglang_ref }}
 
       - name: Checkout DeepGEMM
         uses: actions/checkout@v4
@@ -86,8 +79,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sglang_ref }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v4
@@ -144,8 +135,6 @@ jobs:
             sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
 
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sglang_ref }}
 
       - name: Checkout DeepGEMM
         uses: actions/checkout@v4
