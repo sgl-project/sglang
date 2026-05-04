@@ -676,7 +676,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         )
         return lora_output
 
-    def forward(self, input_: torch.Tensor, skip_all_reduce=False):
+    def forward(self, input_: torch.Tensor, skip_all_reduce=False, forward_batch=None):
         if self.base_layer.input_is_parallel:
             input_parallel = input_
         else:
@@ -925,25 +925,37 @@ class FusedMoEWithLoRA(BaseLayerWithLoRA):
         max_lora_rank = self.down_lora_a_weights.shape[2]
 
         cg_buffers = getattr(self.lora_backend, "moe_cg_buffers", None)
+        wi = (
+            batch_info.req_weight_indices
+            if batch_info.req_weight_indices is not None
+            else batch_info.weight_indices
+        )
         if cg_buffers is not None and batch_info.use_cuda_graph:
             adapter_enabled = cg_buffers["adapter_enabled"]
             adapter_enabled.zero_()
             idx_buf = cg_buffers["weight_indices_long"]
-            idx_buf[: batch_info.bs] = batch_info.weight_indices[: batch_info.bs]
+            idx_buf[: batch_info.bs] = wi[: batch_info.bs]
             adapter_enabled.index_fill_(0, idx_buf[: batch_info.bs], 1)
         else:
             adapter_enabled = torch.zeros(
                 len(lora_ranks), dtype=torch.int32, device=lora_ranks.device
             )
-            adapter_enabled.index_fill_(0, batch_info.weight_indices.long(), 1)
+            adapter_enabled.index_fill_(0, wi.long(), 1)
+
+        seg_indptr = (
+            batch_info.req_seg_indptr
+            if batch_info.req_seg_indptr is not None
+            else batch_info.seg_indptr
+        )
+        req_to_lora = wi
 
         return LoRAInfo(
             gate_up_lora_a_weights=self.gate_up_lora_a_weights,
             gate_up_lora_b_weights=self.gate_up_lora_b_weights,
             down_lora_a_weights=self.down_lora_a_weights,
             down_lora_b_weights=self.down_lora_b_weights,
-            seg_indptr=batch_info.seg_indptr,
-            req_to_lora=batch_info.weight_indices,
+            seg_indptr=seg_indptr,
+            req_to_lora=req_to_lora,
             lora_ranks=lora_ranks,
             adapter_enabled=adapter_enabled,
             max_lora_rank=max_lora_rank,
