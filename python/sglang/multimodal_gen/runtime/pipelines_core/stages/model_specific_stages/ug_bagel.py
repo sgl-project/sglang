@@ -23,6 +23,8 @@ class BAGELLatentFlowGSegmentExecutor:
     stay here on the BAGEL/diffusion side of the boundary.
     """
 
+    required_g_kind = "latent_flow"
+
     def __call__(
         self,
         *,

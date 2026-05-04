@@ -16,6 +16,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
     UGDecodeStage,
     UGGSegmentStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_bagel import (
+    BAGELLatentFlowGSegmentExecutor,
+)
 from sglang.srt.ug.context import UGSessionHandle
 from sglang.srt.ug.denoiser import SRTBackedUGMiddleBridge
 from sglang.srt.ug.interleaved import UGGSegmentResult
@@ -176,6 +179,30 @@ class TestSRTBackedUGMiddleBridge(unittest.TestCase):
             batch.extra["ug_output_segments"][1]["text"],
             "pixel_flow_text_after_image",
         )
+
+    def test_g_segment_stage_rejects_bagel_executor_for_pixel_flow_bridge(self):
+        bridge = TestOnlyPixelFlowBridge()
+        server_args = _make_ug_server_args()
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.base."
+            "get_global_server_args",
+            return_value=server_args,
+        ):
+            with self.assertRaisesRegex(ValueError, "latent_flow"):
+                UGGSegmentStage(bridge, BAGELLatentFlowGSegmentExecutor())
+
+    def test_g_segment_stage_rejects_pixel_executor_for_latent_flow_bridge(self):
+        bridge = _make_bridge()
+        server_args = _make_ug_server_args()
+
+        with patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.base."
+            "get_global_server_args",
+            return_value=server_args,
+        ):
+            with self.assertRaisesRegex(ValueError, "pixel_flow"):
+                UGGSegmentStage(bridge, TestOnlyPixelFlowStageExecutor())
 
     def test_common_middle_protocol_files_do_not_embed_bagel_g_mechanics(self):
         package_root = Path(__file__).resolve().parents[3]
@@ -346,6 +373,8 @@ class TestOnlyPixelFlowBridge:
 
 
 class TestOnlyPixelFlowStageExecutor:
+    required_g_kind = "pixel_flow"
+
     def __call__(self, *, bridge, contexts, batch, server_args):
         del bridge, contexts, batch, server_args
         return UGGSegmentResult(

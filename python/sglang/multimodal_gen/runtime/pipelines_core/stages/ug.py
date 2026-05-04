@@ -14,6 +14,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineSta
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.ug.denoiser import UGMiddleBridge
 from sglang.srt.ug.interleaved import (
+    UGGKind,
     UGGSegmentResult,
     UGGenerationMode,
     UGInputSegment,
@@ -25,6 +26,8 @@ from sglang.srt.ug.runtime import UGInterleavedMessage
 
 
 class UGPipelineGSegmentExecutor(Protocol):
+    required_g_kind: UGGKind | None
+
     def __call__(
         self,
         *,
@@ -115,6 +118,7 @@ class UGGSegmentStage(PipelineStage):
         super().__init__()
         self.bridge = bridge
         self.g_segment_executor = g_segment_executor
+        _validate_g_segment_capability(bridge, g_segment_executor)
 
     @property
     def role_affinity(self):
@@ -193,6 +197,21 @@ def _run_g_segment_executor(
         batch=batch,
         server_args=server_args,
     )
+
+
+def _validate_g_segment_capability(
+    bridge: UGMiddleBridge,
+    executor: UGPipelineGSegmentExecutor,
+) -> None:
+    required_g_kind = getattr(executor, "required_g_kind", None)
+    if required_g_kind is None:
+        return
+    bridge_g_kind = getattr(bridge, "g_kind", None)
+    if bridge_g_kind != required_g_kind:
+        raise ValueError(
+            "UG G executor requires "
+            f"g_kind={required_g_kind!r}, got {bridge_g_kind!r}"
+        )
 
 
 def _image_to_numpy_batch(image) -> np.ndarray:
