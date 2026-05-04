@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 
 try:
+    from lmcache.integration.sglang.multi_process_adapter import LMCacheMPConnector
     from lmcache.integration.sglang.sglang_adapter import (
         LMCacheLayerwiseConnector,
         LoadMetadata,
@@ -35,11 +36,12 @@ logger = logging.getLogger(__name__)
 
 
 class LayerTransferCounter:
-    """Minimal adapter that lets the memory pool notify LMCache per-layer.
+    """Per-layer hook the in-process layerwise connector uses to interleave
+    LMCache loads with model execution.
 
-    The KV pool calls `wait_until(layer_id)` after finishing a layer, which we
-    translate into a `load_kv_layerwise(layer_id)` call on the LMCache connector
-    within the provided CUDA stream.
+    The KV pool calls `wait_until(layer_id)` after finishing a layer, which
+    we translate into a `load_kv_layerwise(layer_id)` call on the LMCache
+    connector within the provided CUDA stream.
     """
 
     def __init__(
@@ -63,13 +65,10 @@ class LayerTransferCounter:
 class LMCRadixCache(RadixCache):
     """RadixCache + LMCache IO.
 
-    This subclass adds:
-      - LMCache connector setup (device/host buffers, TP rank/size)
-      - Two CUDA streams for async load/store
-      - Layer-wise transfer executor wiring to the KV cache
-      - Overridden `match_prefix` to fetch missing prefix chunks from LMCache
-      - Extended cache_finalization paths to store back into LMCache
-      - Eviction barrier that respects any in-flight host->device stores
+    In-process mode (no MP host) keeps the existing layerwise connector and
+    its per-layer transfer hook. MP mode uses the non-layerwise
+    `LMCacheMPConnector`: a single blocking retrieve completes in
+    `match_prefix` before the forward pass, so no per-layer hook is needed.
     """
 
     def __init__(
@@ -81,15 +80,15 @@ class LMCRadixCache(RadixCache):
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         super().__init__(params)
+        from sglang.srt.server_args import get_global_server_args
+
+        global_server_args = get_global_server_args()
 
         kvcache = self.token_to_kv_pool_allocator.get_kvcache()
-        self.lmcache_connector = LMCacheLayerwiseConnector(
+        connector_kwargs = dict(
             sgl_config=model_config,
             tp_size=tp_size,
             rank=rank,
-            # NOTE: The original implementation accessed private buffers via
-            # `_kvcache.k_buffer` / `.v_buffer`. We prefer public accessors when
-            # available; fall back to private fields if needed.
             k_pool=getattr(
                 kvcache,
                 "k_buffer",
@@ -102,18 +101,30 @@ class LMCRadixCache(RadixCache):
             ),
             tp_group=tp_group.device_group if tp_group is not None else None,
         )
+        self._mp_mode = global_server_args.lmcache_mp_host is not None
+        if self._mp_mode:
+            self.lmcache_connector = LMCacheMPConnector(
+                page_size=params.page_size,
+                host=global_server_args.lmcache_mp_host,
+                port=global_server_args.lmcache_mp_port,
+                **connector_kwargs,
+            )
+        else:
+            self.lmcache_connector = LMCacheLayerwiseConnector(**connector_kwargs)
 
         self.load_stream = torch.cuda.Stream()
         self.store_stream = torch.cuda.Stream()
 
-        self.layer_done_executor = LayerTransferCounter(
-            num_layers=(
-                model_config.num_hidden_layers if model_config is not None else 0
-            ),
-            load_stream=self.load_stream,
-            lmc_connector=self.lmcache_connector,
-        )
-        kvcache.register_layer_transfer_counter(self.layer_done_executor)
+        # Per-layer hook only matters for the in-process layerwise path.
+        if not self._mp_mode:
+            self.layer_done_executor = LayerTransferCounter(
+                num_layers=(
+                    model_config.num_hidden_layers if model_config is not None else 0
+                ),
+                load_stream=self.load_stream,
+                lmc_connector=self.lmcache_connector,
+            )
+            kvcache.register_layer_transfer_counter(self.layer_done_executor)
 
         self._in_flight_nodes: list[TreeNode] = []
         self._node_lock = threading.Lock()
@@ -124,15 +135,18 @@ class LMCRadixCache(RadixCache):
             with self._node_lock:
                 self._in_flight_nodes.clear()
 
-    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:  # type: ignore[override]
-        """Match cached prefix; if there's a tail miss, prefetch from LMCache.
+    def _load_into_slots(self, load_metadata: LoadMetadata) -> int:
+        with torch.cuda.stream(self.load_stream):
+            num = self.lmcache_connector.start_load_kv(load_metadata)
+        if self._mp_mode:
+            # MP non-layerwise: start_load_kv host-blocked until every layer
+            # was queued on load_stream. Make compute streams wait for those
+            # writes before reading the slots.
+            torch.cuda.current_stream().wait_stream(self.load_stream)
+        return num
 
-        Reuses the base matching logic to obtain (value, last_node). If there
-        remains a *page-aligned* uncached suffix and there is room (or after
-        eviction), we allocate token slots and trigger an async LMCache load
-        into those slots, then materialize a new child node for the retrieved
-        chunk.
-        """
+    def match_prefix(self, params: MatchPrefixParams) -> MatchResult:  # type: ignore[override]
+        """Match cached prefix; if there's a tail miss, prefetch from LMCache."""
         key = params.key
         if self.disable or not key:
             return super().match_prefix(params)
@@ -169,14 +183,14 @@ class LMCRadixCache(RadixCache):
             ]
         )
 
-        with torch.cuda.stream(self.load_stream):
-            num_retrieved = self.lmcache_connector.start_load_kv(
-                LoadMetadata(
-                    token_ids=key.token_ids,  # full page-aligned key
-                    slot_mapping=slot_mapping,
-                    offset=value.numel() - prefix_pad,  # LMCache offset convention
-                )
+        num_retrieved = self._load_into_slots(
+            LoadMetadata(
+                token_ids=key.token_ids,
+                slot_mapping=slot_mapping,
+                offset=value.numel() - prefix_pad,
+                prefix_pad=prefix_pad,
             )
+        )
         logger.debug("num_retrieved_tokens: %s", num_retrieved)
 
         if num_retrieved > 0:
@@ -185,31 +199,29 @@ class LMCRadixCache(RadixCache):
             )
         else:
             self.token_to_kv_pool_allocator.free(token_slots)
+            return base_res
 
-        if num_retrieved > 0:
-            fetched = num_retrieved - prefix_pad
-            new_node = TreeNode(priority=last_node.priority)
-            start = value.numel()
-            end = start + fetched
-            new_node.key = key[start:end]
-            new_node.value = token_slots[:fetched]
-            new_node.parent = last_node
-            last_node.children[new_node.key.child_key(self.page_size)] = new_node
-            last_node = new_node
+        fetched = num_retrieved - prefix_pad
+        new_node = TreeNode(priority=last_node.priority)
+        start = value.numel()
+        end = start + fetched
+        new_node.key = key[start:end]
+        new_node.value = token_slots[:fetched]
+        new_node.parent = last_node
+        last_node.children[new_node.key.child_key(self.page_size)] = new_node
+        last_node = new_node
 
-            value = torch.cat([value, token_slots[:fetched]])
-            self.evictable_size_ += fetched
+        value = torch.cat([value, token_slots[:fetched]])
+        self.evictable_size_ += fetched
 
-            self._record_store_event(new_node.parent)
-            self._record_store_event(new_node)
+        self._record_store_event(new_node.parent)
+        self._record_store_event(new_node)
 
-            return MatchResult(
-                device_indices=value,
-                last_device_node=last_node,
-                last_host_node=last_node,
-            )
-
-        return base_res
+        return MatchResult(
+            device_indices=value,
+            last_device_node=last_node,
+            last_host_node=last_node,
+        )
 
     def cache_finished_req(self, req: Req, is_insert: bool = True) -> None:  # type: ignore[override]
         """On request completion, insert device KV into radix and store to LMCache."""
