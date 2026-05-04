@@ -234,101 +234,13 @@ class UGSRTRequestExecutorProtocol(Protocol):
     ) -> None: ...
 
 
-class FakeUGModelRunner:
-    """Deterministic UG model shell used to prove session/KV ownership plumbing."""
-
-    def prepare_srt_u_message_inputs(
-        self,
-        *,
-        record: UGSessionRecord,
-        message: UGInterleavedMessage,
-        state: UGSegmentState,
-    ) -> list[UGSRTPreparedInput] | None:
-        del record, message, state
-        return None
-
-    def prefill_interleaved(
-        self, *, record: UGSessionRecord, messages: list[UGInterleavedMessage]
-    ) -> int:
-        del record
-        token_count = 0
-        for message in messages:
-            if message.type == "text":
-                token_count += len(str(message.content).split())
-            elif message.type == "image":
-                token_count += 2
-            else:
-                raise ValueError(f"Unsupported UG message type: {message.type}")
-        return token_count
-
-    def decode_next_segment(self, *, record: UGSessionRecord) -> UGDecodeResult:
-        if record.append_image_count == 0 and record.decode_count == 0:
-            return UGDecodeResult(type="image_marker")
-        if record.append_image_count > 0 and record.decode_count == 1:
-            return UGDecodeResult(type="text", text="generated_text_after_image")
-        return UGDecodeResult(type="done")
-
-    def decode_vlm_text(
-        self,
-        *,
-        runtime: Any,
-        session: UGSessionHandle,
-        max_new_tokens: int,
-    ) -> UGVLMTextGenerationResult:
-        del runtime
-        token_ids = tuple(range(1, max(1, int(max_new_tokens)) + 1))
-        return UGVLMTextGenerationResult(
-            session=session,
-            text="generated_text",
-            token_ids=token_ids,
-        )
-
-    def predict_velocity_from_session(
-        self, *, request: UGVelocityRequest, record: UGSessionRecord
-    ) -> torch.Tensor:
-        scale = 1.0 + record.context_length * 0.01 + record.context_version * 0.001
-        return request.latent_tokens + scale * request.timestep.reshape(-1, 1, 1).to(
-            request.latent_tokens
-        )
-
-    def prepare_latents_from_session(
-        self, *, request: UGLatentPrepareRequest, record: UGSessionRecord
-    ) -> UGLatentPrepareResult | None:
-        del request, record
-        return None
-
-    def append_generated_image(
-        self, *, record: UGSessionRecord, image: Any | None
-    ) -> int:
-        del record, image
-        return 2
-
-    def decode_latents_to_image(
-        self, *, request: UGLatentDecodeRequest, record: UGSessionRecord
-    ) -> Any | None:
-        del request, record
-        return None
-
-    def close_session(self, *, session_id: str) -> None:
-        del session_id
-
-    def observe_srt_u_forward(
-        self,
-        *,
-        record: UGSessionRecord,
-        request: UGSRTRequestView,
-        messages: list[UGInterleavedMessage],
-    ) -> None:
-        del record, request, messages
-
-
 class UGSessionRuntime:
     """Lightweight UG state machine layered on top of SRT sessions."""
 
     def __init__(
         self,
         *,
-        model_runner: UGModelRunnerProtocol | None = None,
+        model_runner: UGModelRunnerProtocol,
         session_controller: Any | None = None,
         srt_request_executor: UGSRTRequestExecutorProtocol | None = None,
         capacity_of_str_len: int = 4096,
@@ -339,7 +251,7 @@ class UGSessionRuntime:
             "multimodal", "text_placeholder"
         ] = "multimodal",
     ) -> None:
-        self.model_runner = model_runner or FakeUGModelRunner()
+        self.model_runner = model_runner
         self.session_controller = session_controller
         self.srt_request_executor = srt_request_executor
         self.capacity_of_str_len = capacity_of_str_len

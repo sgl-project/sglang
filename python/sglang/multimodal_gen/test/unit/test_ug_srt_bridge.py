@@ -7,42 +7,13 @@ import torch
 from PIL import Image
 
 from sglang.srt.ug.context import UGSessionHandle
-from sglang.srt.ug.denoiser import FakeUGDenoiserBridge, SRTBackedUGDenoiserBridge
+from sglang.srt.ug.denoiser import SRTBackedUGDenoiserBridge
 from sglang.srt.ug.runtime import UGDecodeResult, UGSessionRuntime
-
-
-class TestFakeUGDenoiserBridge(unittest.TestCase):
-    def test_build_contexts_splits_full_text_and_image_cfg(self):
-        bridge = FakeUGDenoiserBridge()
-        image = Image.new("RGB", (8, 8), color="white")
-
-        contexts = bridge.build_contexts(prompt="a small cat", image=image)
-
-        self.assertEqual(contexts.full.request_id, "full")
-        self.assertEqual(contexts.full.token_count, 5)
-        self.assertEqual(contexts.text_cfg.token_count, 2)
-        self.assertEqual(contexts.image_cfg.token_count, 3)
-
-    def test_predict_velocity_depends_on_full_context(self):
-        bridge = FakeUGDenoiserBridge()
-        contexts = bridge.build_contexts(prompt="hello world", image=None)
-        latents = torch.zeros(1, 2, 4)
-        timestep = torch.tensor([0.5])
-
-        velocity = bridge.predict_velocity(
-            contexts=contexts,
-            latent_tokens=latents,
-            timestep=timestep,
-            latent_position_ids=torch.arange(2),
-            sampling_params=None,
-        )
-
-        self.assertTrue(torch.allclose(velocity, torch.full_like(latents, 0.51)))
 
 
 class TestSRTBackedUGDenoiserBridge(unittest.TestCase):
     def test_bridge_uses_session_handle_without_kv_details(self):
-        bridge = SRTBackedUGDenoiserBridge()
+        bridge = _make_bridge()
         image = Image.new("RGB", (8, 8), color="white")
 
         contexts = bridge.build_contexts(prompt="a small cat", image=image)
@@ -57,7 +28,7 @@ class TestSRTBackedUGDenoiserBridge(unittest.TestCase):
         self.assertEqual(contexts.image_cfg.token_count, 3)
 
     def test_bridge_velocity_reuses_one_prefill_context(self):
-        bridge = SRTBackedUGDenoiserBridge()
+        bridge = _make_bridge()
         contexts = bridge.build_contexts(prompt="hello world", image=None)
         latents = torch.zeros(1, 2, 4)
 
@@ -77,7 +48,7 @@ class TestSRTBackedUGDenoiserBridge(unittest.TestCase):
         self.assertEqual(counters["state"], "g_denoise")
 
     def test_bridge_appends_generated_image_then_returns_to_u_decode(self):
-        bridge = SRTBackedUGDenoiserBridge()
+        bridge = _make_bridge()
         contexts = bridge.build_contexts(prompt="hello world", image=None)
         session_before_image = contexts.full.session
 
@@ -155,6 +126,52 @@ class TextOnlyUGModelRunner:
 
     def close_session(self, *, session_id):
         self.closed_sessions.append(session_id)
+
+
+class BridgeUGModelRunner:
+    def prefill_interleaved(self, *, record, messages):
+        del record
+        token_count = 0
+        for message in messages:
+            if message.type == "text":
+                token_count += len(str(message.content).split())
+            elif message.type == "image":
+                token_count += 2
+        return token_count
+
+    def decode_next_segment(self, *, record):
+        if record.append_image_count == 0 and record.decode_count == 0:
+            return UGDecodeResult(type="image_marker")
+        if record.append_image_count > 0 and record.decode_count == 1:
+            return UGDecodeResult(type="text", text="generated_text_after_image")
+        return UGDecodeResult(type="done")
+
+    def predict_velocity_from_session(self, *, request, record):
+        scale = 1.0 + record.context_length * 0.01 + record.context_version * 0.001
+        return request.latent_tokens + scale * request.timestep.reshape(-1, 1, 1).to(
+            request.latent_tokens
+        )
+
+    def prepare_latents_from_session(self, *, request, record):
+        del request, record
+        return None
+
+    def append_generated_image(self, *, record, image):
+        del record, image
+        return 2
+
+    def decode_latents_to_image(self, *, request, record):
+        del request, record
+        return None
+
+    def close_session(self, *, session_id):
+        del session_id
+
+
+def _make_bridge():
+    return SRTBackedUGDenoiserBridge(
+        UGSessionRuntime(model_runner=BridgeUGModelRunner())
+    )
 
 
 if __name__ == "__main__":

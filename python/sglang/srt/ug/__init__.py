@@ -18,7 +18,6 @@ from sglang.srt.ug.bagel import (
     BAGELSRTUForwardExecutor,
     BAGELUForwardBridge,
     BAGELUGModelAdapter,
-    MockBAGELBackend,
     create_bagel_ug_model_adapter,
 )
 from sglang.srt.ug.bagel_cache import (
@@ -37,7 +36,6 @@ from sglang.srt.ug.context import (
     UGSRTRequestView,
 )
 from sglang.srt.ug.denoiser import (
-    FakeUGDenoiserBridge,
     SRTBackedUGDenoiserBridge,
     UGDenoiserBridge,
 )
@@ -50,7 +48,6 @@ from sglang.srt.ug.interleaved import (
     UGRuntimeStats,
 )
 from sglang.srt.ug.runtime import (
-    FakeUGModelRunner,
     UGDecodeResult,
     UGInterleavedMessage,
     UGSegmentState,
@@ -72,8 +69,6 @@ from sglang.srt.ug.srt_server import (
 )
 
 __all__ = [
-    "FakeUGDenoiserBridge",
-    "FakeUGModelRunner",
     "BAGELAdapterError",
     "BAGELDenoiseStepError",
     "BAGELInterleaveContextBackend",
@@ -90,7 +85,6 @@ __all__ = [
     "BAGELUForwardBridge",
     "BAGELUGModelAdapter",
     "InMemoryBAGELSRTKVCacheBacking",
-    "MockBAGELBackend",
     "SRTBackedUGDenoiserBridge",
     "UGContextBundle",
     "UGContextHandle",

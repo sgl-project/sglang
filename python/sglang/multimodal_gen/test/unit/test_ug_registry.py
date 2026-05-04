@@ -17,32 +17,13 @@ class TestUGRegistry(unittest.TestCase):
         _get_config_info.cache_clear()
         get_model_info.cache_clear()
 
-    def test_fake_ug_resolves_without_model_index(self):
-        info = get_model_info("sglang-internal/fake-ug", backend="sglang")
+    def test_bagel_resolves_without_model_index(self):
+        info = get_model_info("ByteDance-Seed/BAGEL-7B-MoT", backend="sglang")
 
         self.assertIsNotNone(info)
         self.assertIs(info.pipeline_cls, UGPipeline)
         self.assertIs(info.pipeline_config_cls, UGPipelineConfig)
         self.assertIs(info.sampling_param_cls, UGSamplingParams)
-
-    def test_bagel_resolves_without_model_index(self):
-        for model_path in (
-            "sglang-internal/mock-bagel",
-            "ByteDance-Seed/BAGEL-7B-MoT",
-        ):
-            with self.subTest(model_path=model_path):
-                info = get_model_info(model_path, backend="sglang")
-
-                self.assertIsNotNone(info)
-                self.assertIs(info.pipeline_cls, UGPipeline)
-                self.assertIs(info.pipeline_config_cls, UGPipelineConfig)
-                self.assertIs(info.sampling_param_cls, UGSamplingParams)
-
-    def test_fake_ug_resolves_to_ug_pipeline_name(self):
-        self.assertEqual(
-            get_non_diffusers_pipeline_name("sglang-internal/fake-ug"),
-            "UGPipeline",
-        )
 
     def test_bagel_resolves_to_ug_pipeline_name(self):
         self.assertEqual(

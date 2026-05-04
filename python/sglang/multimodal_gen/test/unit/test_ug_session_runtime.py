@@ -10,7 +10,7 @@ from sglang.srt.ug.context import UGSessionHandle
 from sglang.srt.ug.denoiser import SRTBackedUGDenoiserBridge
 from sglang.srt.ug.interleaved import DEFAULT_UG_TEXT_MAX_NEW_TOKENS
 from sglang.srt.ug.runtime import (
-    FakeUGModelRunner,
+    UGDecodeResult,
     UGInterleavedMessage,
     UGSegmentState,
     UGSessionRuntime,
@@ -27,7 +27,48 @@ class FakeTreeCache:
         self.released_sessions.append(session_id)
 
 
-class RecordingThinkRunner(FakeUGModelRunner):
+class RecordingUGModelRunner:
+    def prefill_interleaved(self, *, record, messages):
+        del record
+        token_count = 0
+        for message in messages:
+            if message.type == "text":
+                token_count += len(str(message.content).split())
+            elif message.type == "image":
+                token_count += 2
+        return token_count
+
+    def decode_next_segment(self, *, record):
+        if record.append_image_count == 0 and record.decode_count == 0:
+            return UGDecodeResult(type="image_marker")
+        if record.append_image_count > 0 and record.decode_count == 1:
+            return UGDecodeResult(type="text", text="generated_text_after_image")
+
+        return UGDecodeResult(type="done")
+
+    def predict_velocity_from_session(self, *, request, record):
+        scale = 1.0 + record.context_length * 0.01 + record.context_version * 0.001
+        return request.latent_tokens + scale * request.timestep.reshape(-1, 1, 1).to(
+            request.latent_tokens
+        )
+
+    def prepare_latents_from_session(self, *, request, record):
+        del request, record
+        return None
+
+    def append_generated_image(self, *, record, image):
+        del record, image
+        return 2
+
+    def decode_latents_to_image(self, *, request, record):
+        del request, record
+        return None
+
+    def close_session(self, *, session_id):
+        del session_id
+
+
+class RecordingThinkRunner(RecordingUGModelRunner):
     def __init__(self):
         self.think_max_new_tokens = []
 
@@ -51,7 +92,7 @@ class TestUGSessionRuntime(unittest.TestCase):
 
     def test_prefill_reuses_existing_srt_session(self):
         runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(),
+            model_runner=RecordingUGModelRunner(),
             session_controller=SessionController(FakeTreeCache()),
         )
 
@@ -70,7 +111,7 @@ class TestUGSessionRuntime(unittest.TestCase):
 
     def test_state_machine_rejects_invalid_g_transition(self):
         runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(),
+            model_runner=RecordingUGModelRunner(),
             session_controller=SessionController(FakeTreeCache()),
         )
         handle = runtime.prefill_interleaved(
@@ -91,7 +132,7 @@ class TestUGSessionRuntime(unittest.TestCase):
 
     def test_velocity_does_not_repeat_prefill(self):
         runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(),
+            model_runner=RecordingUGModelRunner(),
             session_controller=SessionController(FakeTreeCache()),
         )
         handle = runtime.prefill_interleaved(
@@ -117,7 +158,7 @@ class TestUGSessionRuntime(unittest.TestCase):
     def test_close_releases_session(self):
         tree_cache = FakeTreeCache()
         runtime = UGSessionRuntime(
-            model_runner=FakeUGModelRunner(),
+            model_runner=RecordingUGModelRunner(),
             session_controller=SessionController(tree_cache),
         )
         handle = runtime.prefill_interleaved(

@@ -9,7 +9,6 @@ import torch
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle, UGSessionHandle
 from sglang.srt.ug.interleaved import DEFAULT_UG_TEXT_MAX_NEW_TOKENS
 from sglang.srt.ug.runtime import (
-    FakeUGModelRunner,
     UGDecodeResult,
     UGInterleavedMessage,
     UGLatentDecodeRequest,
@@ -81,115 +80,12 @@ class UGDenoiserBridge(Protocol):
     ) -> UGVLMTextGenerationResult: ...
 
 
-class FakeUGDenoiserBridge:
-    def build_contexts(
-        self,
-        *,
-        prompt: str | list[str] | None,
-        image: Any | None,
-        think: bool = False,
-        think_max_new_tokens: int | None = None,
-    ) -> UGContextBundle:
-        del think, think_max_new_tokens
-        messages = UGSessionRuntime.normalize_messages(prompt=prompt, image=image)
-        return self.build_contexts_from_messages(messages=messages)
-
-    def build_contexts_from_messages(
-        self,
-        *,
-        messages: list[UGInterleavedMessage | dict[str, Any]],
-        think: bool = False,
-        think_max_new_tokens: int | None = None,
-    ) -> UGContextBundle:
-        del think, think_max_new_tokens
-        normalized = normalize_ug_interleaved_messages(messages)
-        text_tokens = sum(
-            len(str(message.content).split())
-            for message in normalized
-            if message.type == "text"
-        )
-        image_tokens = sum(2 for message in normalized if message.type == "image")
-        return UGContextBundle(
-            full=UGContextHandle("full", text_tokens + image_tokens),
-            text_cfg=UGContextHandle("text_cfg", image_tokens),
-            image_cfg=UGContextHandle("image_cfg", text_tokens),
-        )
-
-    def predict_velocity(
-        self,
-        *,
-        contexts: UGContextBundle,
-        latent_tokens: torch.Tensor,
-        timestep: torch.Tensor,
-        latent_position_ids: torch.Tensor,
-        sampling_params: Any,
-    ) -> torch.Tensor:
-        del latent_position_ids, sampling_params
-        scale = 1.0 + contexts.full.token_count * 0.01
-        return latent_tokens + scale * timestep.reshape(-1, 1, 1).to(latent_tokens)
-
-    def release_contexts(self, contexts: UGContextBundle) -> None:
-        del contexts
-
-    def prepare_latents(
-        self,
-        *,
-        contexts: UGContextBundle,
-        sampling_params: Any,
-        seed: int | None,
-    ) -> UGLatentPrepareResult | None:
-        del contexts, sampling_params, seed
-        return None
-
-    def append_generated_image(
-        self, *, contexts: UGContextBundle, image: Any | None
-    ) -> None:
-        del contexts, image
-
-    def decode_latents(
-        self,
-        *,
-        contexts: UGContextBundle,
-        latent_tokens: torch.Tensor,
-        sampling_params: Any,
-    ) -> Any | None:
-        del contexts, latent_tokens, sampling_params
-        return None
-
-    def decode_next_segment(self, *, contexts: UGContextBundle) -> UGDecodeResult:
-        del contexts
-        return UGDecodeResult(type="done")
-
-    def generate_vlm_text(
-        self,
-        *,
-        messages: list[UGInterleavedMessage | dict[str, Any]],
-        max_new_tokens: int,
-    ) -> UGVLMTextGenerationResult:
-        normalized = normalize_ug_interleaved_messages(messages)
-        token_ids = tuple(range(1, max(1, int(max_new_tokens)) + 1))
-        token_count = sum(
-            len(str(message.content).split()) if message.type == "text" else 2
-            for message in normalized
-        )
-        return UGVLMTextGenerationResult(
-            session=UGSessionHandle(
-                session_id="fake-vlm",
-                anchor_request_id="fake-vlm:u0",
-                context_length=token_count,
-                context_version=0,
-            ),
-            text="generated_text",
-            token_ids=token_ids,
-        )
-
-
 class SRTBackedUGDenoiserBridge:
     """Diffusion-side bridge that delegates UG model work to SRT runtime state."""
 
     def __init__(
         self,
-        runtime: UGSessionRuntime | None = None,
+        runtime: UGSessionRuntime,
         *,
         max_pre_image_decode_steps: int = 16,
     ) -> None:
@@ -198,7 +94,7 @@ class SRTBackedUGDenoiserBridge:
                 "max_pre_image_decode_steps must be positive, got "
                 f"{max_pre_image_decode_steps}"
             )
-        self.runtime = runtime or UGSessionRuntime(model_runner=FakeUGModelRunner())
+        self.runtime = runtime
         self.max_pre_image_decode_steps = max_pre_image_decode_steps
 
     def build_contexts(

@@ -26,7 +26,7 @@ from sglang.srt.ug.interleaved import (
     UGRuntimeStats,
     normalize_ug_generation_mode,
 )
-from sglang.srt.ug.runtime import FakeUGModelRunner, UGSessionRuntime
+from sglang.srt.ug.runtime import UGSessionRuntime
 from sglang.srt.ug.srt_executor import (
     UGSRTRequestBoundaryExecutor,
     UGSRTSchedulerExecutor,
@@ -58,7 +58,7 @@ def _build_srt_owned_ug_runtime(
     )
     model_config = getattr(scheduler, "model_config", None)
     return UGSessionRuntime(
-        model_runner=model_runner or FakeUGModelRunner(),
+        model_runner=model_runner,
         session_controller=session_controller,
         srt_request_executor=srt_request_executor,
         tokenizer=getattr(scheduler, "tokenizer", None),
@@ -83,19 +83,10 @@ def _load_ug_bridge(
     if srt_u_decode_max_new_tokens is None:
         srt_u_decode_max_new_tokens = 1 if scheduler is not None else 0
     srt_request_executor = _build_srt_request_executor(scheduler)
-    model_path_lower = model_path.lower()
-    if "fake-ug" in model_path_lower:
-        return SRTBackedUGDenoiserBridge(
-            _build_srt_owned_ug_runtime(
-                scheduler=scheduler,
-                srt_request_executor=srt_request_executor,
-                srt_u_decode_max_new_tokens=srt_u_decode_max_new_tokens,
-            )
-        )
-    if "bagel" in model_path_lower:
+    if "bagel" in model_path.lower():
         native_srt_denoise_executor = None
         native_srt_u_context = False
-        if scheduler is not None and "mock-bagel" not in model_path_lower:
+        if scheduler is not None:
             native_srt_denoise_executor = (
                 srt_request_executor.create_bagel_native_srt_denoise_executor()
             )

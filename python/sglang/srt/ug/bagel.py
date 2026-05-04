@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib
-from collections import defaultdict
 from contextlib import contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -1725,8 +1724,7 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
             raise BAGELAdapterError(
                 "BAGELUGModelAdapter requires a local BAGEL checkpoint directory. "
                 "Download ByteDance-Seed/BAGEL-7B-MoT first, then pass the local "
-                "directory path; use sglang-internal/mock-bagel for adapter smoke "
-                "tests."
+                "directory path."
             )
         missing_files = [
             name
@@ -1757,121 +1755,12 @@ class BAGELUGModelAdapter(UGModelAdapterProtocol):
         )
 
 
-class MockBAGELBackend:
-    """Deterministic BAGEL-shaped backend for adapter and pipeline smoke tests."""
-
-    def __init__(self) -> None:
-        self.events: list[tuple[str, str]] = []
-        self.decode_counts: defaultdict[str, int] = defaultdict(int)
-        self.closed_sessions: list[str] = []
-
-    def prefill_interleaved(
-        self, *, session, messages: list[UGInterleavedMessage]
-    ) -> UGModelPrefillResult:
-        self._record("prefill", session)
-        token_count = 0
-        for message in messages:
-            if message.type == "text":
-                token_count += len(str(message.content).split())
-            elif message.type == "image":
-                token_count += 2
-            else:
-                raise ValueError(f"Unsupported BAGEL message type: {message.type}")
-        return UGModelPrefillResult(added_tokens=token_count)
-
-    def prepare_srt_u_message_inputs(
-        self,
-        *,
-        session,
-        message: UGInterleavedMessage,
-        state: UGSegmentState,
-    ) -> list[UGSRTPreparedInput] | None:
-        del session, message, state
-        return None
-
-    def observe_srt_u_forward(
-        self,
-        *,
-        session,
-        request: UGSRTRequestView,
-        messages: list[UGInterleavedMessage],
-    ) -> None:
-        del messages
-        self.events.append((f"srt_{request.state}", session.handle.session_id))
-
-    def decode_next_segment(self, *, session) -> UGDecodeResult:
-        self._record("decode", session)
-        session_id = session.handle.session_id
-        decode_count = self.decode_counts[session_id]
-        self.decode_counts[session_id] += 1
-        if decode_count == 0:
-            return UGDecodeResult(type="image_marker")
-        if decode_count == 1:
-            return UGDecodeResult(type="text", text="bagel_mock_text_after_image")
-        return UGDecodeResult(type="done")
-
-    def decode_vlm_text(
-        self,
-        *,
-        runtime: Any,
-        session: Any,
-        max_new_tokens: int,
-    ) -> UGVLMTextGenerationResult:
-        del runtime
-        self.events.append(("decode_vlm_text", session.session_id))
-        token_ids = tuple(range(1, max(1, int(max_new_tokens)) + 1))
-        return UGVLMTextGenerationResult(
-            session=session,
-            text="bagel_mock_vlm_text",
-            token_ids=token_ids,
-        )
-
-    def predict_velocity_from_session(
-        self, *, session, request: UGVelocityRequest
-    ) -> torch.Tensor:
-        self._record("velocity", session)
-        scale = 2.0 + session.srt_request_count * 0.1
-        return request.latent_tokens + scale * request.timestep.reshape(-1, 1, 1).to(
-            request.latent_tokens
-        )
-
-    def prepare_latents_from_session(
-        self, *, session, request: UGLatentPrepareRequest
-    ) -> UGLatentPrepareResult | None:
-        del request
-        self._record("prepare_latents", session)
-        return None
-
-    def append_generated_image(
-        self, *, session, image: Any | None
-    ) -> UGModelAppendImageResult:
-        del image
-        self._record("append_image", session)
-        return UGModelAppendImageResult(added_tokens=2)
-
-    def decode_latents_to_image(
-        self, *, session, request: UGLatentDecodeRequest
-    ) -> Any | None:
-        del request
-        self._record("decode_latents", session)
-        return None
-
-    def close_session(self, *, session_id: str) -> None:
-        self.events.append(("close", session_id))
-        self.closed_sessions.append(session_id)
-
-    def _record(self, event: str, session) -> None:
-        self.events.append((event, session.handle.session_id))
-
-
 def create_bagel_ug_model_adapter(
     model_path: str,
     *,
     native_srt_denoise_executor: BAGELNativeSRTDenoiseExecutor | None = None,
     native_srt_u_context: bool | None = None,
 ) -> BAGELUGModelAdapter:
-    if "mock-bagel" in model_path.lower():
-        return BAGELUGModelAdapter(model_path, backend=MockBAGELBackend())
     if native_srt_u_context is None:
         native_srt_u_context = native_srt_denoise_executor is not None
     return BAGELUGModelAdapter(

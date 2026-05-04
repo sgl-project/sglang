@@ -37,7 +37,7 @@ class _NoopSender:
 
 def is_real_bagel_ug_model(model_path: str | None, model_id: str | None = None) -> bool:
     identifier = " ".join(str(value or "") for value in (model_path, model_id)).lower()
-    return "bagel" in identifier and "mock-bagel" not in identifier
+    return "bagel" in identifier
 
 
 def build_bagel_language_model_view(
