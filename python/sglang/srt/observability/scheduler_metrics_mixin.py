@@ -60,13 +60,16 @@ class PrefillStats:
         running_reqs: List[Req],
         enable_priority_scheduling: bool = False,
         num_pending_tokens: int = 0,
+        priority_label_bucket_size: int = 1,
     ):
         return cls(
             log_input_tokens=adder.log_input_tokens,
             log_hit_tokens=adder.log_hit_tokens,
             new_token_ratio=adder.new_token_ratio,
             num_running_reqs=QueueCount.from_reqs(
-                running_reqs, enable_priority_scheduling
+                running_reqs,
+                enable_priority_scheduling,
+                priority_label_bucket_size=priority_label_bucket_size,
             ),
             num_new_seqs=len(adder.can_run_list),
             num_pending_tokens=num_pending_tokens,
@@ -415,6 +418,7 @@ class SchedulerMetricsMixin:
                 )
 
             priority_enabled = self.enable_priority_scheduling
+            bucket_size = self.priority_label_bucket_size
             total_tokens = prefill_stats.log_input_tokens + prefill_stats.log_hit_tokens
             cache_hit_rate = (
                 prefill_stats.log_hit_tokens / total_tokens if total_tokens > 0 else 0.0
@@ -423,7 +427,9 @@ class SchedulerMetricsMixin:
             # Basics
             self.stats.num_running_reqs = prefill_stats.num_running_reqs
             self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.waiting_queue, priority_enabled
+                self.waiting_queue,
+                priority_enabled,
+                priority_label_bucket_size=bucket_size,
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.cache_hit_rate = cache_hit_rate
@@ -439,19 +445,27 @@ class SchedulerMetricsMixin:
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
+                    self.disagg_prefill_bootstrap_queue.queue,
+                    priority_enabled,
+                    priority_label_bucket_size=bucket_size,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_inflight_queue, priority_enabled
+                    self.disagg_prefill_inflight_queue,
+                    priority_enabled,
+                    priority_label_bucket_size=bucket_size,
                 )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, priority_enabled
+                    self.disagg_decode_prealloc_queue.queue,
+                    priority_enabled,
+                    priority_label_bucket_size=bucket_size,
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_transfer_queue.queue, priority_enabled
+                    self.disagg_decode_transfer_queue.queue,
+                    priority_enabled,
+                    priority_label_bucket_size=bucket_size,
                 )
 
             # Utilization / LoRA / HiCache
@@ -588,13 +602,16 @@ class SchedulerMetricsMixin:
             logger.info(msg)
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.enable_priority_scheduling
+            bucket_size = self.priority_label_bucket_size
 
             # Basics
             self.stats.num_running_reqs = QueueCount.from_reqs(
-                batch.reqs, priority_enabled
+                batch.reqs, priority_enabled, priority_label_bucket_size=bucket_size
             )
             self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.waiting_queue, priority_enabled
+                self.waiting_queue,
+                priority_enabled,
+                priority_label_bucket_size=bucket_size,
             )
             self.stats.num_grammar_queue_reqs = len(self.grammar_manager)
             self.stats.gen_throughput = self.last_gen_throughput
@@ -616,17 +633,25 @@ class SchedulerMetricsMixin:
             # PD disaggregation
             if self.disaggregation_mode == DisaggregationMode.PREFILL:
                 self.stats.num_prefill_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_bootstrap_queue.queue, priority_enabled
+                    self.disagg_prefill_bootstrap_queue.queue,
+                    priority_enabled,
+                    priority_label_bucket_size=bucket_size,
                 )
                 self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_prefill_inflight_queue, priority_enabled
+                    self.disagg_prefill_inflight_queue,
+                    priority_enabled,
+                    priority_label_bucket_size=bucket_size,
                 )
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_prealloc_queue.queue, priority_enabled
+                    self.disagg_decode_prealloc_queue.queue,
+                    priority_enabled,
+                    priority_label_bucket_size=bucket_size,
                 )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
-                    self.disagg_decode_transfer_queue.queue, priority_enabled
+                    self.disagg_decode_transfer_queue.queue,
+                    priority_enabled,
+                    priority_label_bucket_size=bucket_size,
                 )
 
             # Streaming session metrics

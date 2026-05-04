@@ -368,6 +368,7 @@ class Scheduler(
         self.nccl_port = port_args.nccl_port
         self.schedule_policy = server_args.schedule_policy
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
+        self.priority_label_bucket_size = server_args.priority_label_bucket_size
         self.abort_on_priority_when_disabled = (
             server_args.abort_on_priority_when_disabled
         )
@@ -2795,6 +2796,7 @@ class Scheduler(
             adder,
             self.running_batch.reqs,
             self.enable_priority_scheduling,
+            priority_label_bucket_size=self.priority_label_bucket_size,
             num_pending_tokens=self._get_num_pending_tokens(
                 chunk_deduct=(
                     self.chunked_req.extend_input_len

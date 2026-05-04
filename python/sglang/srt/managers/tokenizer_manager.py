@@ -81,7 +81,10 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
-from sglang.srt.observability.metrics_collector import TokenizerMetricsCollector
+from sglang.srt.observability.metrics_collector import (
+    TokenizerMetricsCollector,
+    fold_priority_label,
+)
 from sglang.srt.observability.req_time_stats import (
     APIServerReqTimeStats,
     convert_time_to_realtime,
@@ -271,6 +274,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.max_req_input_len = None  # Will be set later in engine.py
         self.enable_priority_scheduling = server_args.enable_priority_scheduling
         self.default_priority_value = server_args.default_priority_value
+        self.priority_label_bucket_size = server_args.priority_label_bucket_size
         speculative_algorithm = SpeculativeAlgorithm.from_string(
             server_args.speculative_algorithm
         )
@@ -2141,7 +2145,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if self.enable_priority_scheduling:
             priority = getattr(state.obj, "priority", None)
             if priority is not None:
-                labels["priority"] = str(priority)
+                labels["priority"] = str(
+                    fold_priority_label(priority, self.priority_label_bucket_size)
+                )
         if (
             not state.ttft_observed
             and self.disaggregation_mode != DisaggregationMode.PREFILL

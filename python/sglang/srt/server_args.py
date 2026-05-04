@@ -373,6 +373,7 @@ class ServerArgs:
     abort_on_priority_when_disabled: bool = False
     schedule_low_priority_values_first: bool = False
     priority_scheduling_preemption_threshold: int = 10
+    priority_label_bucket_size: int = 1
     schedule_conservativeness: float = 1.0
     page_size: Optional[int] = None
     swa_full_tokens_ratio: float = 0.8
@@ -4549,6 +4550,16 @@ class ServerArgs:
             help="If specified with --enable-priority-scheduling, the scheduler will schedule requests with lower priority integer values first.",
         )
         parser.add_argument(
+            "--priority-label-bucket-size",
+            type=int,
+            default=ServerArgs.priority_label_bucket_size,
+            help="Bucket size K for folding integer priorities into Prometheus label "
+            "values. Each priority p is mapped to (p // K) * K, so K=10 collapses "
+            "0..9 into priority='0', 10..19 into priority='10', etc. Default 1 = no "
+            "folding (label values are identical to raw priorities). Increase K to "
+            "bound metric cardinality when priorities span a wide range.",
+        )
+        parser.add_argument(
             "--priority-scheduling-preemption-threshold",
             type=int,
             default=ServerArgs.priority_scheduling_preemption_threshold,
@@ -6854,6 +6865,9 @@ class ServerArgs:
                 logger.warning(
                     "--default-priority-value has no effect without --enable-priority-scheduling"
                 )
+        assert (
+            self.priority_label_bucket_size >= 1
+        ), f"--priority-label-bucket-size must be >= 1, got {self.priority_label_bucket_size}"
 
         # Check hisparse
         if self.enable_hisparse:
