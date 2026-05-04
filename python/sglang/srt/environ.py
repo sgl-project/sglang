@@ -561,7 +561,7 @@ class Envs:
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
 
-    # HiSparse / compressor (HC = HiSparse compressor, MHC = HiSparse hash kernel)
+    # CUDA kernels
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_PRE = EnvBool(True)
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
@@ -574,7 +574,6 @@ class Envs:
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
 
     # SWA radix cache
-    SGLANG_OPT_USE_TILELANG_SWA_PREPARE = EnvBool(True)
     SGLANG_OPT_CACHE_SWA_TRANSLATION = EnvBool(True)
     # TODO(DSV4): @ispobock this has bug on main branch when retract
     SGLANG_OPT_SWA_RADIX_CACHE_COMPACT = EnvBool(False)
@@ -589,9 +588,6 @@ class Envs:
     # DeepGemm Mega MoE
     SGLANG_OPT_USE_DEEPGEMM_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK = EnvInt(1024)
-    SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH = EnvBool(True)
-    SGLANG_OPT_FIX_HASH_MEGA_MOE = EnvBool(False)
-    SGLANG_OPT_FIX_NEXTN_MEGA_MOE = EnvBool(False)
     SGLANG_OPT_FIX_MEGA_MOE_MEMORY = EnvBool(False)
 
     # TopK

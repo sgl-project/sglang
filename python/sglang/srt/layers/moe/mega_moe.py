@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.jit_kernel.deepseek_v4 import mega_moe_pre_dispatch
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.dp_attention import get_dp_global_num_tokens
@@ -74,15 +75,6 @@ def should_use_mega_moe(moe: "DeepseekV2MoE", hidden_states: torch.Tensor) -> bo
         return False
     if not getattr(moe.experts, "_mega_moe_weights_built", False):
         return False
-
-    if not envs.SGLANG_OPT_FIX_NEXTN_MEGA_MOE.get():
-        if moe.is_nextn:
-            return False
-
-    if not envs.SGLANG_OPT_FIX_HASH_MEGA_MOE.get():
-        if moe.is_hash:
-            return False
-
     if get_is_capture_mode():
         return True
 
@@ -142,9 +134,6 @@ def _run_mega_routed(
     import deep_gemm
 
     from sglang.srt.distributed.parallel_state import get_moe_ep_group
-    from sglang.srt.layers.quantization.fp8_kernel import (
-        sglang_per_token_group_quant_fp8_ue8m0,
-    )
 
     hidden_size = moe.config.hidden_size
 
@@ -193,38 +182,22 @@ def _run_mega_routed(
         intermediate_hidden=intermediate_size,
     )
 
-    padded_max = buf.topk_idx.shape[0]
-    if envs.SGLANG_OPT_MEGA_MOE_FUSED_PRE_DISPATCH.get():
-        from sglang.jit_kernel.deepseek_v4 import mega_moe_pre_dispatch
-
-        if num_tokens > 0:
-            topk_ids_in = topk_ids
-            topk_weights_in = topk_weights
-        else:
-            topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
-            topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
-        mega_moe_pre_dispatch(
-            hidden_states,
-            topk_ids_in,
-            topk_weights_in,
-            buf.x,
-            buf.x_sf,
-            buf.topk_idx,
-            buf.topk_weights,
-            quant_group_size=32,
-        )
+    if num_tokens > 0:
+        topk_ids_in = topk_ids
+        topk_weights_in = topk_weights
     else:
-        if num_tokens > 0:
-            x_fp8, x_sf = sglang_per_token_group_quant_fp8_ue8m0(
-                hidden_states, group_size=32
-            )
-            buf.x[:num_tokens].copy_(x_fp8)
-            buf.x_sf[:num_tokens].copy_(x_sf)
-            buf.topk_idx[:num_tokens].copy_(topk_ids)
-            buf.topk_weights[:num_tokens].copy_(topk_weights)
-        if num_tokens < padded_max:
-            buf.topk_idx[num_tokens:].fill_(-1)
-            buf.topk_weights[num_tokens:].zero_()
+        topk_ids_in = hidden_states.new_empty((0, top_k), dtype=torch.int32)
+        topk_weights_in = hidden_states.new_empty((0, top_k), dtype=torch.float32)
+    mega_moe_pre_dispatch(
+        hidden_states,
+        topk_ids_in,
+        topk_weights_in,
+        buf.x,
+        buf.x_sf,
+        buf.topk_idx,
+        buf.topk_weights,
+        quant_group_size=32,
+    )
 
     y = torch.empty(
         (num_tokens, hidden_size),
