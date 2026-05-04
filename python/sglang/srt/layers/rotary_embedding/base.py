@@ -89,7 +89,7 @@ class RotaryEmbedding(MultiPlatformOp):
 
         self._apply_rotary_emb_wrapped = apply_rotary_emb
 
-        if get_global_server_args().rl_on_policy_target is not None or _is_musa:
+        if get_global_server_args().rl_on_policy_target is not None:
             self._forward_method = self.forward_native
             self._apply_rotary_emb_wrapped = torch.compile(dynamic=True)(
                 apply_rotary_emb
