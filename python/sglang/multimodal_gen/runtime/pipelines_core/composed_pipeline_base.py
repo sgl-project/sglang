@@ -421,7 +421,7 @@ class ComposedPipelineBase(ABC):
             )
             if attn_backend is not None:
                 logger.info(
-                    "Using component attention_backend=%s for %s",
+                    "Using %s backend for component %s",
                     attn_backend.name.lower(),
                     matched_backend_key,
                 )
