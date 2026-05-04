@@ -37,9 +37,14 @@ from sglang.srt.ug.context import (
 )
 from sglang.srt.ug.denoiser import (
     SRTBackedUGDenoiserBridge,
+    SRTBackedUGMiddleBridge,
     UGDenoiserBridge,
+    UGLatentFlowMiddleBridge,
+    UGMiddleBridge,
 )
 from sglang.srt.ug.interleaved import (
+    UGGKind,
+    UGGSegmentResult,
     UGGeneratedImage,
     UGInputSegment,
     UGInterleavedRequest,
@@ -86,11 +91,14 @@ __all__ = [
     "BAGELUGModelAdapter",
     "InMemoryBAGELSRTKVCacheBacking",
     "SRTBackedUGDenoiserBridge",
+    "SRTBackedUGMiddleBridge",
     "UGContextBundle",
     "UGContextHandle",
     "UGDecodeResult",
     "UGDenoiserBridge",
     "UGGeneratedImage",
+    "UGGKind",
+    "UGGSegmentResult",
     "UGInputSegment",
     "UGInterleavedMessage",
     "UGInterleavedRequest",
@@ -100,6 +108,8 @@ __all__ = [
     "UGModelPrefillResult",
     "UGModelRunnerAdapter",
     "UGModelSessionView",
+    "UGLatentFlowMiddleBridge",
+    "UGMiddleBridge",
     "UGSRTPreparedInput",
     "UGSRTKVTokenBinding",
     "UGSRTRequestView",

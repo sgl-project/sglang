@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any, Protocol
 
 import torch
 
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle, UGSessionHandle
-from sglang.srt.ug.interleaved import DEFAULT_UG_TEXT_MAX_NEW_TOKENS
+from sglang.srt.ug.interleaved import (
+    DEFAULT_UG_TEXT_MAX_NEW_TOKENS,
+    UGGKind,
+    UGGSegmentResult,
+)
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
     UGInterleavedMessage,
@@ -19,9 +24,13 @@ from sglang.srt.ug.runtime import (
     UGVLMTextGenerationResult,
 )
 
+UGGSegmentExecutor = Callable[[UGContextBundle], UGGSegmentResult]
 
-class UGDenoiserBridge(Protocol):
-    def build_contexts(
+
+class UGMiddleBridge(Protocol):
+    g_kind: UGGKind
+
+    def prepare_u_context(
         self,
         *,
         prompt: str | list[str] | None,
@@ -30,7 +39,7 @@ class UGDenoiserBridge(Protocol):
         think_max_new_tokens: int | None = None,
     ) -> UGContextBundle: ...
 
-    def build_contexts_from_messages(
+    def prepare_u_context_from_messages(
         self,
         *,
         messages: list[UGInterleavedMessage | dict[str, Any]],
@@ -38,39 +47,20 @@ class UGDenoiserBridge(Protocol):
         think_max_new_tokens: int | None = None,
     ) -> UGContextBundle: ...
 
-    def predict_velocity(
+    def run_g_segment(
         self,
         *,
         contexts: UGContextBundle,
-        latent_tokens: torch.Tensor,
-        timestep: torch.Tensor,
-        latent_position_ids: torch.Tensor,
-        sampling_params: Any,
-    ) -> torch.Tensor: ...
+        executor: UGGSegmentExecutor,
+    ) -> UGGSegmentResult: ...
 
-    def release_contexts(self, contexts: UGContextBundle) -> None: ...
-
-    def prepare_latents(
-        self,
-        *,
-        contexts: UGContextBundle,
-        sampling_params: Any,
-        seed: int | None,
-    ) -> UGLatentPrepareResult | None: ...
-
-    def append_generated_image(
-        self, *, contexts: UGContextBundle, image: Any | None
+    def commit_generated_segment(
+        self, *, contexts: UGContextBundle, segment: UGGSegmentResult
     ) -> None: ...
 
-    def decode_latents(
-        self,
-        *,
-        contexts: UGContextBundle,
-        latent_tokens: torch.Tensor,
-        sampling_params: Any,
-    ) -> Any | None: ...
+    def release(self, contexts: UGContextBundle) -> None: ...
 
-    def decode_next_segment(self, *, contexts: UGContextBundle) -> UGDecodeResult: ...
+    def continue_u_decode(self, *, contexts: UGContextBundle) -> UGDecodeResult: ...
 
     def generate_vlm_text(
         self,
@@ -80,8 +70,40 @@ class UGDenoiserBridge(Protocol):
     ) -> UGVLMTextGenerationResult: ...
 
 
-class SRTBackedUGDenoiserBridge:
-    """Diffusion-side bridge that delegates UG model work to SRT runtime state."""
+class UGLatentFlowMiddleBridge(UGMiddleBridge, Protocol):
+    """Optional narrow surface for latent-flow G mechanics."""
+
+    def prepare_g_latents(
+        self,
+        *,
+        contexts: UGContextBundle,
+        sampling_params: Any,
+        seed: int | None,
+    ) -> UGLatentPrepareResult | None: ...
+
+    def predict_g_velocity(
+        self,
+        *,
+        contexts: UGContextBundle,
+        latent_tokens: torch.Tensor,
+        timestep: torch.Tensor,
+        latent_position_ids: torch.Tensor,
+        sampling_params: Any,
+    ) -> torch.Tensor: ...
+
+    def decode_g_latents(
+        self,
+        *,
+        contexts: UGContextBundle,
+        latent_tokens: torch.Tensor,
+        sampling_params: Any,
+    ) -> Any | None: ...
+
+
+class SRTBackedUGMiddleBridge:
+    """UG middle bridge that keeps SRT as the session/KV owner."""
+
+    g_kind: UGGKind = "latent_flow"
 
     def __init__(
         self,
@@ -97,7 +119,7 @@ class SRTBackedUGDenoiserBridge:
         self.runtime = runtime
         self.max_pre_image_decode_steps = max_pre_image_decode_steps
 
-    def build_contexts(
+    def prepare_u_context(
         self,
         *,
         prompt: str | list[str] | None,
@@ -106,13 +128,13 @@ class SRTBackedUGDenoiserBridge:
         think_max_new_tokens: int | None = None,
     ) -> UGContextBundle:
         messages = self.runtime.normalize_messages(prompt=prompt, image=image)
-        return self.build_contexts_from_messages(
+        return self.prepare_u_context_from_messages(
             messages=messages,
             think=think,
             think_max_new_tokens=think_max_new_tokens,
         )
 
-    def build_contexts_from_messages(
+    def prepare_u_context_from_messages(
         self,
         *,
         messages: list[UGInterleavedMessage | dict[str, Any]],
@@ -147,12 +169,12 @@ class SRTBackedUGDenoiserBridge:
                     )
                     continue
                 raise ValueError(
-                    "UG denoise bridge expected U decode to request an image segment, "
+                    "UG middle bridge expected U decode to request an image segment, "
                     f"got {segment.type}"
                 )
             else:
                 raise ValueError(
-                    "UG denoise bridge did not receive an image marker within "
+                    "UG middle bridge did not receive an image marker within "
                     f"{self.max_pre_image_decode_steps} U decode steps"
                 )
         except Exception:
@@ -183,6 +205,35 @@ class SRTBackedUGDenoiserBridge:
                 session=session,
             ),
         )
+
+    def run_g_segment(
+        self,
+        *,
+        contexts: UGContextBundle,
+        executor: UGGSegmentExecutor,
+    ) -> UGGSegmentResult:
+        if contexts.full.session is None:
+            raise ValueError("SRT-backed UG contexts require a session handle")
+        segment = executor(contexts)
+        if segment.type != "image":
+            raise ValueError(f"UG G segment expected image output, got {segment.type}")
+        return segment
+
+    def commit_generated_segment(
+        self, *, contexts: UGContextBundle, segment: UGGSegmentResult
+    ) -> None:
+        if segment.type != "image":
+            raise ValueError(f"UG commit expects image segment, got {segment.type}")
+        self._commit_generated_image(contexts=contexts, image=segment.image)
+
+    def release(self, contexts: UGContextBundle) -> None:
+        if contexts.full.session is not None:
+            self.runtime.close_session(contexts.full.session)
+
+    def continue_u_decode(self, *, contexts: UGContextBundle) -> UGDecodeResult:
+        if contexts.full.session is None:
+            raise ValueError("SRT-backed UG contexts require a session handle")
+        return self.runtime.decode_next_segment(contexts.full.session)
 
     def _decode_thinking_text(
         self,
@@ -247,7 +298,7 @@ class SRTBackedUGDenoiserBridge:
             self.runtime.close_session(session)
             raise
 
-    def predict_velocity(
+    def predict_g_velocity(
         self,
         *,
         contexts: UGContextBundle,
@@ -272,7 +323,7 @@ class SRTBackedUGDenoiserBridge:
         contexts.image_cfg.session = response.session
         return response.velocity
 
-    def prepare_latents(
+    def prepare_g_latents(
         self,
         *,
         contexts: UGContextBundle,
@@ -289,11 +340,7 @@ class SRTBackedUGDenoiserBridge:
             )
         )
 
-    def release_contexts(self, contexts: UGContextBundle) -> None:
-        if contexts.full.session is not None:
-            self.runtime.close_session(contexts.full.session)
-
-    def append_generated_image(
+    def _commit_generated_image(
         self, *, contexts: UGContextBundle, image: Any | None
     ) -> None:
         if contexts.full.session is None:
@@ -307,7 +354,7 @@ class SRTBackedUGDenoiserBridge:
         contexts.text_cfg.session = session
         contexts.image_cfg.session = session
 
-    def decode_latents(
+    def decode_g_latents(
         self,
         *,
         contexts: UGContextBundle,
@@ -325,9 +372,34 @@ class SRTBackedUGDenoiserBridge:
         )
 
     def decode_next_segment(self, *, contexts: UGContextBundle) -> UGDecodeResult:
-        if contexts.full.session is None:
-            raise ValueError("SRT-backed UG contexts require a session handle")
-        return self.runtime.decode_next_segment(contexts.full.session)
+        return self.continue_u_decode(contexts=contexts)
+
+    # Compatibility wrappers for code that still imports the old denoiser names.
+    def build_contexts(self, **kwargs) -> UGContextBundle:
+        return self.prepare_u_context(**kwargs)
+
+    def build_contexts_from_messages(self, **kwargs) -> UGContextBundle:
+        return self.prepare_u_context_from_messages(**kwargs)
+
+    def predict_velocity(self, **kwargs) -> torch.Tensor:
+        return self.predict_g_velocity(**kwargs)
+
+    def prepare_latents(self, **kwargs) -> UGLatentPrepareResult | None:
+        return self.prepare_g_latents(**kwargs)
+
+    def decode_latents(self, **kwargs) -> Any | None:
+        return self.decode_g_latents(**kwargs)
+
+    def append_generated_image(
+        self, *, contexts: UGContextBundle, image: Any | None
+    ) -> None:
+        self.commit_generated_segment(
+            contexts=contexts,
+            segment=UGGSegmentResult(type="image", image=image),
+        )
+
+    def release_contexts(self, contexts: UGContextBundle) -> None:
+        self.release(contexts)
 
 
 def normalize_ug_interleaved_messages(
@@ -355,3 +427,7 @@ def normalize_ug_interleaved_messages(
     if not normalized:
         raise ValueError("UG interleaved messages must not be empty")
     return normalized
+
+
+UGDenoiserBridge = UGMiddleBridge
+SRTBackedUGDenoiserBridge = SRTBackedUGMiddleBridge

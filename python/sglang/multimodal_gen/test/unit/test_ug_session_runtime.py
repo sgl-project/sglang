@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.context import UGSessionHandle
-from sglang.srt.ug.denoiser import SRTBackedUGDenoiserBridge
+from sglang.srt.ug.denoiser import SRTBackedUGMiddleBridge
 from sglang.srt.ug.interleaved import DEFAULT_UG_TEXT_MAX_NEW_TOKENS
 from sglang.srt.ug.runtime import (
     UGDecodeResult,
@@ -176,10 +176,10 @@ class TestUGSessionRuntime(unittest.TestCase):
             model_runner=runner,
             session_controller=SessionController(FakeTreeCache()),
         )
-        bridge = SRTBackedUGDenoiserBridge(runtime)
+        bridge = SRTBackedUGMiddleBridge(runtime)
 
-        contexts = bridge.build_contexts(prompt="draw a cup", image=None, think=True)
-        bridge.release_contexts(contexts)
+        contexts = bridge.prepare_u_context(prompt="draw a cup", image=None, think=True)
+        bridge.release(contexts)
 
         self.assertEqual(
             runner.think_max_new_tokens,

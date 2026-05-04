@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from typing import Protocol
+
 import numpy as np
-import torch
 from PIL import Image
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -11,19 +12,31 @@ from sglang.multimodal_gen.runtime.models.vision_utils import load_image
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.srt.ug.denoiser import UGDenoiserBridge
+from sglang.srt.ug.denoiser import UGMiddleBridge
 from sglang.srt.ug.interleaved import (
+    UGGSegmentResult,
     UGGenerationMode,
     UGInputSegment,
     UGInterleavedRequest,
     normalize_ug_generation_mode,
 )
+from sglang.srt.ug.context import UGContextBundle
 from sglang.srt.ug.runtime import UGInterleavedMessage
-from sglang.srt.ug.sampling import build_bagel_denoise_schedule
+
+
+class UGPipelineGSegmentExecutor(Protocol):
+    def __call__(
+        self,
+        *,
+        bridge: UGMiddleBridge,
+        contexts: UGContextBundle,
+        batch: Req,
+        server_args: ServerArgs,
+    ) -> UGGSegmentResult: ...
 
 
 class UGContextStage(PipelineStage):
-    def __init__(self, bridge: UGDenoiserBridge) -> None:
+    def __init__(self, bridge: UGMiddleBridge) -> None:
         super().__init__()
         self.bridge = bridge
 
@@ -56,7 +69,7 @@ class UGContextStage(PipelineStage):
         if interleaved_messages is not None:
             messages = _normalize_pipeline_interleaved_messages(interleaved_messages)
             batch.extra["ug_interleaved_messages"] = messages
-            batch.extra["ug_contexts"] = self.bridge.build_contexts_from_messages(
+            batch.extra["ug_contexts"] = self.bridge.prepare_u_context_from_messages(
                 messages=messages,
                 think=think,
                 think_max_new_tokens=think_max_new_tokens,
@@ -81,7 +94,7 @@ class UGContextStage(PipelineStage):
                 f"UGPipeline expects a PIL image input, got {type(batch.condition_image)}"
             )
 
-        batch.extra["ug_contexts"] = self.bridge.build_contexts(
+        batch.extra["ug_contexts"] = self.bridge.prepare_u_context(
             prompt=batch.prompt,
             image=batch.condition_image,
             think=think,
@@ -93,106 +106,42 @@ class UGContextStage(PipelineStage):
         return batch
 
 
-class UGLatentStage(PipelineStage):
-    def __init__(self, bridge: UGDenoiserBridge) -> None:
+class UGGSegmentStage(PipelineStage):
+    def __init__(
+        self,
+        bridge: UGMiddleBridge,
+        g_segment_executor: UGPipelineGSegmentExecutor,
+    ) -> None:
         super().__init__()
         self.bridge = bridge
+        self.g_segment_executor = g_segment_executor
 
     @property
     def role_affinity(self):
         return RoleType.DENOISER
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        cfg = server_args.pipeline_config
         contexts = batch.extra.get("ug_contexts")
-        if contexts is not None:
-            prepared = self.bridge.prepare_latents(
-                contexts=contexts,
-                sampling_params=batch.sampling_params,
-                seed=batch.seed,
-            )
-            if prepared is not None:
-                batch.latents = prepared.latent_tokens
-                batch.extra["ug_latent_position_ids"] = prepared.latent_position_ids
-                batch.extra["ug_latent_shape"] = prepared.latent_shape
-                return batch
+        if contexts is None:
+            return batch
 
-        height = int(batch.height)
-        width = int(batch.width)
-        latent_height = height // cfg.latent_downsample
-        latent_width = width // cfg.latent_downsample
-        if latent_height <= 0 or latent_width <= 0:
-            raise ValueError(
-                f"UG latent shape is empty for height={height}, width={width}, "
-                f"latent_downsample={cfg.latent_downsample}"
-            )
-
-        num_tokens = latent_height * latent_width
-        latent_dim = cfg.latent_channel * cfg.latent_patch_size * cfg.latent_patch_size
-        generator = torch.Generator(device="cpu").manual_seed(int(batch.seed))
-        batch.latents = torch.randn(
-            1,
-            num_tokens,
-            latent_dim,
-            generator=generator,
-            dtype=torch.float32,
+        segment = self.bridge.run_g_segment(
+            contexts=contexts,
+            executor=lambda run_contexts: _run_g_segment_executor(
+                self.g_segment_executor,
+                self.bridge,
+                run_contexts,
+                batch,
+                server_args,
+            ),
         )
-        batch.extra["ug_latent_position_ids"] = torch.arange(num_tokens)
-        batch.extra["ug_latent_shape"] = (latent_height, latent_width, latent_dim)
-        return batch
-
-
-class UGDenoiseStage(PipelineStage):
-    def __init__(self, bridge: UGDenoiserBridge) -> None:
-        super().__init__()
-        self.bridge = bridge
-
-    @property
-    def role_affinity(self):
-        return RoleType.DENOISER
-
-    def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        params = batch.sampling_params
-        x_t = batch.latents
-        if x_t is None:
-            raise ValueError("UGDenoiseStage requires latents from UGLatentStage")
-        num_steps = int(params.num_inference_steps)
-        if num_steps <= 0:
-            raise ValueError(f"num_inference_steps must be positive, got {num_steps}")
-
-        schedule = build_bagel_denoise_schedule(
-            num_inference_steps=num_steps,
-            timestep_shift=params.timestep_shift,
-            device=x_t.device,
-        )
-        trajectory_latents = []
-        trajectory_timesteps = []
-
-        for i, timestep in enumerate(schedule.timesteps):
-            trajectory_latents.append(x_t)
-            trajectory_timesteps.append(timestep)
-            velocity = self.bridge.predict_velocity(
-                contexts=batch.extra["ug_contexts"],
-                latent_tokens=x_t,
-                timestep=timestep.reshape(1),
-                latent_position_ids=batch.extra["ug_latent_position_ids"],
-                sampling_params=params,
-            )
-            x_t = x_t - velocity.to(x_t) * schedule.dts[i].to(x_t)
-
-        batch.latents = x_t
-        if batch.return_trajectory_latents:
-            if trajectory_latents:
-                batch.trajectory_latents = torch.stack(trajectory_latents)
-                batch.trajectory_timesteps = torch.stack(trajectory_timesteps)
-            else:
-                batch.trajectory_latents = x_t[:0]
-                batch.trajectory_timesteps = schedule.timesteps[:0]
+        batch.extra["ug_generated_segment"] = segment
+        batch.output = _image_to_numpy_batch(segment.image)
         return batch
 
 
 class UGDecodeStage(PipelineStage):
-    def __init__(self, bridge: UGDenoiserBridge) -> None:
+    def __init__(self, bridge: UGMiddleBridge) -> None:
         super().__init__()
         self.bridge = bridge
 
@@ -203,34 +152,17 @@ class UGDecodeStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         contexts = batch.extra.get("ug_contexts")
         mode = normalize_ug_generation_mode(batch.extra.get("ug_mode"), default="t2i")
-        image = None
-        if contexts is not None:
-            image = self.bridge.decode_latents(
-                contexts=contexts,
-                latent_tokens=batch.latents,
-                sampling_params=batch.sampling_params,
-            )
-        if image is None:
-            value = int(batch.latents.mean().abs().item() * 255) % 255
-            image = Image.fromarray(
-                np.full(
-                    (int(batch.height), int(batch.width), 3),
-                    value,
-                    dtype=np.uint8,
-                )
-            )
-        batch.output = _image_to_numpy_batch(image)
-        image_for_append = (
-            image
-            if isinstance(image, Image.Image)
-            else Image.fromarray(batch.output[0])
-        )
+        generated_segment = batch.extra.get("ug_generated_segment")
+        if generated_segment is None:
+            raise ValueError("UGDecodeStage requires a generated G segment")
+        else:
+            image_for_append = generated_segment.image
         if contexts is not None and mode == "interleave":
-            self.bridge.append_generated_image(
+            self.bridge.commit_generated_segment(
                 contexts=contexts,
-                image=image_for_append,
+                segment=generated_segment,
             )
-            batch.extra["ug_post_image_segment"] = self.bridge.decode_next_segment(
+            batch.extra["ug_post_image_segment"] = self.bridge.continue_u_decode(
                 contexts=contexts
             )
             batch.extra["ug_output_segments"] = _build_ug_output_segments(
@@ -246,6 +178,21 @@ class UGDecodeStage(PipelineStage):
                 }
             ]
         return batch
+
+
+def _run_g_segment_executor(
+    executor: UGPipelineGSegmentExecutor,
+    bridge: UGMiddleBridge,
+    contexts: UGContextBundle,
+    batch: Req,
+    server_args: ServerArgs,
+) -> UGGSegmentResult:
+    return executor(
+        bridge=bridge,
+        contexts=contexts,
+        batch=batch,
+        server_args=server_args,
+    )
 
 
 def _image_to_numpy_batch(image) -> np.ndarray:

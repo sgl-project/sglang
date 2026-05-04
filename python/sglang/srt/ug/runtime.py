@@ -72,8 +72,8 @@ class UGSRTPreparedInput:
     replace_positions: list[int] | None = None
     position_ids: list[int] | None = None
     non_causal_query_attention: bool = False
-    bagel_text_token_indices: list[int] | None = None
-    bagel_vae_token_indices: list[int] | None = None
+    mot_text_token_indices: list[int] | None = None
+    mot_image_token_indices: list[int] | None = None
     mm_inputs: Any | None = None
     srt_sidecar_role: str | None = None
     srt_sidecar_session_id: str | None = None
@@ -791,16 +791,16 @@ class UGSessionRuntime:
         if prepared.non_causal_query_attention:
             req.ug_non_causal_query_attention = True
 
-        if prepared.bagel_text_token_indices is not None:
-            req.ug_bagel_text_token_indices = [
+        if prepared.mot_text_token_indices is not None:
+            req.ug_mot_text_token_indices = [
                 prefix_len + index - stripped
-                for index in prepared.bagel_text_token_indices
+                for index in prepared.mot_text_token_indices
                 if index >= stripped
             ]
-        if prepared.bagel_vae_token_indices is not None:
-            req.ug_bagel_vae_token_indices = [
+        if prepared.mot_image_token_indices is not None:
+            req.ug_mot_image_token_indices = [
                 prefix_len + index - stripped
-                for index in prepared.bagel_vae_token_indices
+                for index in prepared.mot_image_token_indices
                 if index >= stripped
             ]
         return adapter_metadata
@@ -868,7 +868,7 @@ class UGSessionRuntime:
             "ug_srt_added_token_count": len(input_ids),
         }
         if position_ids is not None:
-            adapter_metadata["ug_srt_bagel_rope_delta"] = len(input_ids)
+            adapter_metadata["ug_srt_rope_delta"] = len(input_ids)
         if model_state_updates is not None:
             adapter_metadata["ug_model_state_updates"] = model_state_updates
             self._merge_ug_model_state_updates(record, model_state_updates)

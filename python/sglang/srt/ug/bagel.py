@@ -1095,7 +1095,7 @@ class BAGELInterleaveContextBackend:
                     adapter_metadata={
                         "bagel_u_text": True,
                         "ug_srt_added_token_count": len(input_ids),
-                        "ug_srt_bagel_rope_delta": 0,
+                        "ug_srt_rope_delta": 0,
                         "ug_model_state_updates": self._bagel_model_state_updates(
                             kv_lens=session_state.gen_context["kv_lens"],
                             ropes=session_state.gen_context["ropes"],
@@ -1124,7 +1124,7 @@ class BAGELInterleaveContextBackend:
             adapter_metadata={
                 "bagel_u_text": True,
                 "ug_srt_added_token_count": len(input_ids),
-                "ug_srt_bagel_rope_delta": 0,
+                "ug_srt_rope_delta": 0,
                 "ug_model_state_updates": self._bagel_model_state_updates(
                     kv_lens=session_state.gen_context["kv_lens"],
                     ropes=session_state.gen_context["ropes"],
@@ -1189,7 +1189,7 @@ class BAGELInterleaveContextBackend:
         metadata = {
             "bagel_u_image_stage": stage,
             "ug_srt_added_token_count": seq_len,
-            "ug_srt_bagel_rope_delta": 0,
+            "ug_srt_rope_delta": 0,
         }
         if model_state_updates is not None:
             metadata["ug_model_state_updates"] = model_state_updates
@@ -1206,8 +1206,8 @@ class BAGELInterleaveContextBackend:
                 .tolist()
             ],
             non_causal_query_attention=True,
-            bagel_text_token_indices=text_indices,
-            bagel_vae_token_indices=vae_indices,
+            mot_text_token_indices=text_indices,
+            mot_image_token_indices=vae_indices,
             adapter_metadata=metadata,
         )
 
@@ -1403,7 +1403,9 @@ class BAGELInterleaveContextBackend:
         request: UGSRTRequestView,
         messages: list[UGInterleavedMessage],
     ) -> int:
-        explicit = request.metadata.get("ug_srt_bagel_rope_delta")
+        explicit = request.metadata.get("ug_srt_rope_delta")
+        if explicit is None:
+            explicit = request.metadata.get("ug_srt_bagel_rope_delta")
         if explicit is not None:
             return int(explicit)
         if request.state == UGSegmentState.U_DECODE.value:

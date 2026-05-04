@@ -10,15 +10,17 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
     UGContextStage,
     UGDecodeStage,
-    UGDenoiseStage,
-    UGLatentStage,
+    UGGSegmentStage,
     _normalize_pipeline_interleaved_messages,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ug_bagel import (
+    BAGELLatentFlowGSegmentExecutor,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
 from sglang.srt.ug.bagel import create_bagel_ug_model_adapter
-from sglang.srt.ug.denoiser import SRTBackedUGDenoiserBridge, UGDenoiserBridge
+from sglang.srt.ug.denoiser import SRTBackedUGMiddleBridge, UGMiddleBridge
 from sglang.srt.ug.interleaved import (
     DEFAULT_UG_TEXT_MAX_NEW_TOKENS,
     UGInterleavedRequest,
@@ -79,7 +81,7 @@ def _load_ug_bridge(
     *,
     scheduler=None,
     srt_u_decode_max_new_tokens: int | None = None,
-) -> UGDenoiserBridge:
+) -> UGMiddleBridge:
     if srt_u_decode_max_new_tokens is None:
         srt_u_decode_max_new_tokens = 1 if scheduler is not None else 0
     srt_request_executor = _build_srt_request_executor(scheduler)
@@ -96,7 +98,7 @@ def _load_ug_bridge(
             native_srt_denoise_executor=native_srt_denoise_executor,
             native_srt_u_context=native_srt_u_context,
         )
-        return SRTBackedUGDenoiserBridge(
+        return SRTBackedUGMiddleBridge(
             _build_srt_owned_ug_runtime(
                 UGModelRunnerAdapter(adapter),
                 scheduler=scheduler,
@@ -134,8 +136,7 @@ class UGPipeline(ComposedPipelineBase):
     def create_pipeline_stages(self, server_args: ServerArgs):
         bridge = self.get_module("ug_bridge")
         self.add_stage(UGContextStage(bridge))
-        self.add_stage(UGLatentStage(bridge))
-        self.add_stage(UGDenoiseStage(bridge))
+        self.add_stage(UGGSegmentStage(bridge, BAGELLatentFlowGSegmentExecutor()))
         self.add_stage(UGDecodeStage(bridge))
 
     def forward_interleaved(
@@ -186,7 +187,7 @@ class UGPipeline(ComposedPipelineBase):
         finally:
             contexts = batch.extra.get("ug_contexts")
             if contexts is not None:
-                self.get_module("ug_bridge").release_contexts(contexts)
+                self.get_module("ug_bridge").release(contexts)
 
     def forward_interleaved_batch(
         self,
@@ -350,7 +351,7 @@ def _resolve_vlm_max_new_tokens(
 
 
 def _collect_interleaved_runtime_stats(
-    bridge: UGDenoiserBridge,
+    bridge: UGMiddleBridge,
     contexts: Any | None,
 ) -> UGRuntimeStats | None:
     if contexts is None or contexts.full.session is None:
@@ -364,7 +365,7 @@ def _collect_interleaved_runtime_stats(
 
 
 def _collect_runtime_stats_from_session(
-    bridge: UGDenoiserBridge,
+    bridge: UGMiddleBridge,
     session: Any | None,
 ) -> UGRuntimeStats | None:
     if session is None:

@@ -1841,11 +1841,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             local_bagel_text_indices = []
             local_bagel_vae_indices = []
-            for index in getattr(req, "ug_bagel_text_token_indices", []) or []:
+            for index in getattr(req, "ug_mot_text_token_indices", []) or []:
                 extend_pos = index - pre_len
                 if 0 <= extend_pos < req.extend_input_len:
                     local_bagel_text_indices.append(extend_pos)
-            for index in getattr(req, "ug_bagel_vae_token_indices", []) or []:
+            for index in getattr(req, "ug_mot_image_token_indices", []) or []:
                 extend_pos = index - pre_len
                 if 0 <= extend_pos < req.extend_input_len:
                     local_bagel_vae_indices.append(extend_pos)

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, cast
 
 UGGenerationMode = Literal["t2i", "edit", "interleave", "vlm"]
+UGGKind = Literal["latent_flow", "pixel_flow", "native_ar_image"]
 DEFAULT_UG_TEXT_MAX_NEW_TOKENS = 128
 
 _UG_MODE_ALIASES = {
@@ -134,6 +135,13 @@ class UGInterleavedRequest:
 
 @dataclass(frozen=True, slots=True)
 class UGGeneratedImage:
+    image: Any
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True, slots=True)
+class UGGSegmentResult:
+    type: Literal["image"]
     image: Any
     metadata: dict[str, Any] = field(default_factory=dict)
 

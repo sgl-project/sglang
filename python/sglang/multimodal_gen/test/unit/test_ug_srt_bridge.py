@@ -2,21 +2,23 @@
 
 import unittest
 from dataclasses import fields
+from pathlib import Path
 
 import torch
 from PIL import Image
 
 from sglang.srt.ug.context import UGSessionHandle
-from sglang.srt.ug.denoiser import SRTBackedUGDenoiserBridge
+from sglang.srt.ug.denoiser import SRTBackedUGMiddleBridge
+from sglang.srt.ug.interleaved import UGGSegmentResult
 from sglang.srt.ug.runtime import UGDecodeResult, UGSessionRuntime
 
 
-class TestSRTBackedUGDenoiserBridge(unittest.TestCase):
-    def test_bridge_uses_session_handle_without_kv_details(self):
+class TestSRTBackedUGMiddleBridge(unittest.TestCase):
+    def test_prepare_u_context_uses_session_handle_without_kv_details(self):
         bridge = _make_bridge()
         image = Image.new("RGB", (8, 8), color="white")
 
-        contexts = bridge.build_contexts(prompt="a small cat", image=image)
+        contexts = bridge.prepare_u_context(prompt="a small cat", image=image)
 
         self.assertIsInstance(contexts.full.session, UGSessionHandle)
         handle_fields = {field.name for field in fields(contexts.full.session)}
@@ -27,13 +29,13 @@ class TestSRTBackedUGDenoiserBridge(unittest.TestCase):
         self.assertEqual(contexts.text_cfg.token_count, 2)
         self.assertEqual(contexts.image_cfg.token_count, 3)
 
-    def test_bridge_velocity_reuses_one_prefill_context(self):
+    def test_g_velocity_reuses_one_prefill_context(self):
         bridge = _make_bridge()
-        contexts = bridge.build_contexts(prompt="hello world", image=None)
+        contexts = bridge.prepare_u_context(prompt="hello world", image=None)
         latents = torch.zeros(1, 2, 4)
 
         for i in range(3):
-            latents = bridge.predict_velocity(
+            latents = bridge.predict_g_velocity(
                 contexts=contexts,
                 latent_tokens=latents,
                 timestep=torch.tensor([1.0 - i * 0.25]),
@@ -47,20 +49,23 @@ class TestSRTBackedUGDenoiserBridge(unittest.TestCase):
         self.assertEqual(counters["decode_count"], 1)
         self.assertEqual(counters["state"], "g_denoise")
 
-    def test_bridge_appends_generated_image_then_returns_to_u_decode(self):
+    def test_commit_generated_segment_then_returns_to_u_decode(self):
         bridge = _make_bridge()
-        contexts = bridge.build_contexts(prompt="hello world", image=None)
+        contexts = bridge.prepare_u_context(prompt="hello world", image=None)
         session_before_image = contexts.full.session
 
-        bridge.predict_velocity(
+        bridge.predict_g_velocity(
             contexts=contexts,
             latent_tokens=torch.zeros(1, 2, 4),
             timestep=torch.tensor([1.0]),
             latent_position_ids=torch.arange(2),
             sampling_params=None,
         )
-        bridge.append_generated_image(contexts=contexts, image=object())
-        post_image_segment = bridge.decode_next_segment(contexts=contexts)
+        bridge.commit_generated_segment(
+            contexts=contexts,
+            segment=UGGSegmentResult(type="image", image=object()),
+        )
+        post_image_segment = bridge.continue_u_decode(contexts=contexts)
 
         self.assertEqual(
             contexts.full.session.session_id, session_before_image.session_id
@@ -80,18 +85,69 @@ class TestSRTBackedUGDenoiserBridge(unittest.TestCase):
         self.assertEqual(counters["decode_count"], 2)
         self.assertEqual(counters["state"], "u_decode")
 
+    def test_run_g_segment_wraps_model_specific_executor(self):
+        bridge = _make_bridge()
+        contexts = bridge.prepare_u_context(prompt="hello world", image=None)
+        image = Image.new("RGB", (8, 8), color="black")
+
+        segment = bridge.run_g_segment(
+            contexts=contexts,
+            executor=lambda _: UGGSegmentResult(
+                type="image",
+                image=image,
+                metadata={"g_kind": "pixel_flow"},
+            ),
+        )
+
+        counters = bridge.runtime.get_debug_counters(contexts.full.session)
+        self.assertIs(segment.image, image)
+        self.assertEqual(segment.metadata["g_kind"], "pixel_flow")
+        self.assertEqual(counters["append_image_count"], 0)
+        self.assertEqual(counters["state"], "g_denoise")
+
     def test_bridge_bounds_pre_image_decode_loop_and_closes_session(self):
         runner = TextOnlyUGModelRunner()
-        bridge = SRTBackedUGDenoiserBridge(
+        bridge = SRTBackedUGMiddleBridge(
             UGSessionRuntime(model_runner=runner),
             max_pre_image_decode_steps=2,
         )
 
         with self.assertRaisesRegex(ValueError, "image marker"):
-            bridge.build_contexts(prompt="never image", image=None)
+            bridge.prepare_u_context(prompt="never image", image=None)
 
         self.assertEqual(runner.decode_count, 2)
         self.assertEqual(len(runner.closed_sessions), 1)
+
+    def test_test_only_pixel_flow_backend_runs_text_image_text_protocol(self):
+        bridge = TestOnlyPixelFlowBridge()
+        contexts = bridge.prepare_u_context(prompt="draw a cup", image=None)
+
+        segment = bridge.run_g_segment(contexts=contexts, executor=None)
+        bridge.commit_generated_segment(contexts=contexts, segment=segment)
+        text = bridge.continue_u_decode(contexts=contexts)
+
+        self.assertEqual(bridge.g_kind, "pixel_flow")
+        self.assertEqual(segment.type, "image")
+        self.assertEqual(text.type, "text")
+        self.assertEqual(text.text, "pixel_flow_text_after_image")
+        self.assertEqual(contexts.full.session.session_id, "pixel-flow-session")
+
+    def test_common_middle_protocol_files_do_not_embed_bagel_g_mechanics(self):
+        package_root = Path(__file__).resolve().parents[3]
+        common_files = [
+            package_root / "srt/ug/context.py",
+            package_root / "srt/ug/denoiser.py",
+            package_root / "srt/ug/interleaved.py",
+            package_root / "srt/ug/runtime.py",
+            package_root / "multimodal_gen/runtime/pipelines_core/stages/ug.py",
+        ]
+        forbidden = ("bagel", "vae", "ug_srt_bagel", "build_bagel")
+
+        for path in common_files:
+            text = path.read_text(encoding="utf-8").lower()
+            for token in forbidden:
+                with self.subTest(path=path.name, token=token):
+                    self.assertNotIn(token, text)
 
 
 class TextOnlyUGModelRunner:
@@ -169,9 +225,61 @@ class BridgeUGModelRunner:
 
 
 def _make_bridge():
-    return SRTBackedUGDenoiserBridge(
-        UGSessionRuntime(model_runner=BridgeUGModelRunner())
-    )
+    return SRTBackedUGMiddleBridge(UGSessionRuntime(model_runner=BridgeUGModelRunner()))
+
+
+class TestOnlyPixelFlowBridge:
+    g_kind = "pixel_flow"
+
+    def __init__(self):
+        self.committed = False
+
+    def prepare_u_context(
+        self, *, prompt, image, think=False, think_max_new_tokens=None
+    ):
+        del prompt, image, think, think_max_new_tokens
+        session = UGSessionHandle(
+            session_id="pixel-flow-session",
+            anchor_request_id="pixel-flow-session:u1",
+            context_length=3,
+            context_version=1,
+        )
+        from sglang.srt.ug.context import UGContextBundle, UGContextHandle
+
+        return UGContextBundle(
+            full=UGContextHandle("pixel-flow-session:u1", 3, session=session),
+            text_cfg=UGContextHandle("text-cfg", 0, session=session),
+            image_cfg=UGContextHandle("image-cfg", 0, session=session),
+        )
+
+    def run_g_segment(self, *, contexts, executor):
+        del contexts, executor
+        return UGGSegmentResult(
+            type="image",
+            image=Image.new("RGB", (4, 4), color="blue"),
+            metadata={"g_kind": self.g_kind},
+        )
+
+    def commit_generated_segment(self, *, contexts, segment):
+        self.committed = True
+        session = UGSessionHandle(
+            session_id=contexts.full.session.session_id,
+            anchor_request_id="pixel-flow-session:u2",
+            context_length=5,
+            context_version=2,
+        )
+        contexts.full.session = session
+        contexts.full.request_id = session.anchor_request_id
+        contexts.full.token_count = session.context_length
+
+    def continue_u_decode(self, *, contexts):
+        del contexts
+        if not self.committed:
+            return UGDecodeResult(type="done")
+        return UGDecodeResult(type="text", text="pixel_flow_text_after_image")
+
+    def release(self, contexts):
+        del contexts
 
 
 if __name__ == "__main__":
