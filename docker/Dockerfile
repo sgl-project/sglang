@@ -613,15 +613,24 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     cd /sgl-workspace/sglang \
     && python3 -m pip install --no-deps -e "python[${BUILD_TYPE}]" \
     && kernels lock python \
-    && ( success=0; for i in 1 2 3; do \
-    echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
-    kernels download python && \
-    success=1 && break; \
-    echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
-    done; [ "$success" = "1" ] ) \
-    && mkdir -p /root/.cache/sglang \
-    && mv python/kernels.lock /root/.cache/sglang/ \
-    && find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+    && ( success=0; \
+         # aarch64: kernels-community/sgl-flash-attn3 ships no arm variants; JIT-compile at runtime.
+         # Remove this branch once arm cubins are published upstream.
+         if [ "$(uname -m)" = "aarch64" ]; then \
+             echo "Skipping kernels-community/sgl-flash-attn3 cubin download on aarch64 (no variants published upstream); kernels will be JIT-compiled at runtime"; \
+             success=1; \
+         else \
+             for i in 1 2 3; do \
+                 echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
+                 kernels download python && \
+                 success=1 && break; \
+                 echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
+             done; \
+         fi; \
+         [ "$success" = "1" ] ) \
+    && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
+    && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
+    && ( find /usr/local/lib/python3.12/dist-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
 
 # Install pre-built gateway artifacts from parallel builder
