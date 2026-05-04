@@ -24,9 +24,14 @@ export SGLANG_OPT_USE_TILELANG_INDEXER=true
 export SGLANG_HACK_FLASHMLA_BACKEND=tilelang
 export SGLANG_REASONING_EFFORT=max
 export SGLANG_FORCE_TRITON_MOE_FP8=0
+export SGLANG_OPT_USE_AITER_MHC_PRE=true
+export SGLANG_OPT_USE_AITER_MHC_POST=true
+
+MODEL=/dockerx/data/deepseek-ai/DeepSeek-V4-Pro
+MODEL=/dockerx/data/sgl-project/DeepSeek-V4-Flash-FP8/
 
 python3 -m sglang.launch_server \
-    --model-path /dockerx/data/deepseek-ai/DeepSeek-V4-Pro \
+    --model-path ${MODEL} \
     --trust-remote-code \
     --tp 8 \
     --disable-radix-cache \

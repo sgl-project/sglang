@@ -589,6 +589,8 @@ class Envs:
     SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvBool(False)
     SGLANG_FORCE_TRITON_MOE_FP8 = EnvBool(False)
+    SGLANG_OPT_USE_AITER_MHC_PRE= EnvBool(True)
+    SGLANG_OPT_USE_AITER_MHC_POST= EnvBool(True)
     # fmt: on
 
     # EPD
