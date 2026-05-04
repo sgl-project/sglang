@@ -29,11 +29,6 @@ class KVAndScore:
     def __post_init__(self):
         self._item_size = self.kv_score.shape[-1] // 2
 
-    @staticmethod
-    def from_kv_score(*, kv: torch.Tensor, score: torch.Tensor) -> KVAndScore:
-        assert kv.shape == score.shape
-        return KVAndScore(torch.cat([kv, score], dim=-1))
-
     def new_empty(self, new_shape) -> KVAndScore:
         assert new_shape[-1] == self._item_size
         new_shape = list(new_shape)
@@ -152,18 +147,3 @@ class CompressStatePool:
                 )
                 if not online:
                     self.kv_score_buffer[-1].clear()
-
-    def translate_from_swa_loc_to_state_loc(
-        self, swa_loc: torch.Tensor
-    ) -> torch.Tensor:
-        swa_pages = swa_loc // self.swa_page_size
-        state_loc = swa_pages * self.ring_size + (swa_loc % self.ring_size)
-        state_loc = torch.where(swa_loc < 0, -1, state_loc)
-        return state_loc
-
-    def get_state_by_state_loc(self, state_loc: torch.Tensor) -> KVAndScore:
-        return self.kv_score_buffer[state_loc]
-
-    def set_state_by_state_loc(self, state_loc: torch.Tensor, value: KVAndScore):
-        self.kv_score_buffer[state_loc] = value
-        self.kv_score_buffer[-1].clear()

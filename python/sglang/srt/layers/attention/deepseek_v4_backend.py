@@ -1206,9 +1206,6 @@ class DeepseekV4AttnBackend(AttentionBackend, C4IndexerBackend, CompressorBacken
         swa_indices = self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_indices)
         return swa_indices
 
-    def extract_metadata(self, forward_batch: ForwardBatch):
-        return self.forward_metadata
-
 
 class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
     def __init__(
