@@ -344,9 +344,6 @@ class DSV4RawDecodeMetadata:
         self.out_cache_loc.copy_(other.out_cache_loc)
 
 
-_DSV4_RAW_TYPES = (DSV4RawVerifyMetadata, DSV4RawDecodeMetadata)
-
-
 class _GraphBucket(enum.Enum):
     DECODE_OR_IDLE = "decode_or_idle"
     TARGET_VERIFY = "target_verify"
