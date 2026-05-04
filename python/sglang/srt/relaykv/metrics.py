@@ -4167,6 +4167,275 @@ def summarize_relaykv_attention_comparison_plans_for_smoke(
     }
 
 
+def build_relaykv_attention_shadow_capture_results_for_smoke(
+    attention_comparison_plans: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    capture_attention_output: bool = False,
+) -> list[dict[str, Any]]:
+    """Build metadata-only RelayKV attention shadow capture results."""
+
+    if not isinstance(attention_comparison_plans, (list, tuple)):
+        raise TypeError("attention_comparison_plans must be a list or tuple")
+    if not isinstance(capture_attention_output, bool):
+        raise TypeError("capture_attention_output must be a bool")
+
+    results: list[dict[str, Any]] = []
+    for plan in attention_comparison_plans:
+        if not isinstance(plan, dict):
+            raise TypeError(
+                "RelayKV attention shadow capture inputs must be dict comparison plans"
+            )
+
+        relaykv_working_kv_block_ids = _host_backup_copy_request_block_ids(
+            plan, "relaykv_working_kv_block_ids"
+        )
+        full_kv_block_ids = _host_backup_copy_request_block_ids(plan, "full_kv_block_ids")
+
+        relaykv_working_kv_block_count = _event_value(
+            plan, "relaykv_working_kv_block_count"
+        )
+        if not isinstance(relaykv_working_kv_block_count, int):
+            relaykv_working_kv_block_count = len(relaykv_working_kv_block_ids)
+
+        full_kv_block_count = _event_value(plan, "full_kv_block_count")
+        if not isinstance(full_kv_block_count, int):
+            full_kv_block_count = len(full_kv_block_ids)
+
+        reduced_block_count = _event_value(plan, "reduced_block_count")
+        if not isinstance(reduced_block_count, int):
+            reduced_block_count = max(
+                full_kv_block_count - relaykv_working_kv_block_count, 0
+            )
+
+        working_to_full_block_ratio = _event_value(plan, "working_to_full_block_ratio")
+        if not isinstance(working_to_full_block_ratio, (int, float)):
+            if full_kv_block_count > 0:
+                working_to_full_block_ratio = (
+                    relaykv_working_kv_block_count / full_kv_block_count
+                )
+            else:
+                working_to_full_block_ratio = None
+
+        coverage_ratio = _event_value(plan, "coverage_ratio")
+        if not isinstance(coverage_ratio, (int, float)):
+            coverage_block_count = _event_value(plan, "coverage_block_count")
+            if isinstance(coverage_block_count, int) and full_kv_block_count > 0:
+                coverage_ratio = coverage_block_count / full_kv_block_count
+            elif full_kv_block_count > 0:
+                coverage_ratio = relaykv_working_kv_block_count / full_kv_block_count
+            else:
+                coverage_ratio = None
+
+        blocking_reasons: list[str] = []
+        warning_reasons: list[str] = [
+            "metadata_only_attention_shadow_capture",
+            "no_attention_output_tensor_captured",
+        ]
+
+        if capture_attention_output:
+            blocking_reasons.append(
+                "capture_attention_output_not_allowed_in_metadata_smoke"
+            )
+        if _event_value(plan, "event_type") != "relaykv_attention_comparison_plan":
+            blocking_reasons.append("not_attention_comparison_plan")
+        if _event_value(plan, "comparison_state") != "plan_ready":
+            blocking_reasons.append("comparison_plan_not_ready")
+        if _event_value(plan, "comparison_mode") != "metadata_only":
+            blocking_reasons.append("comparison_plan_not_metadata_only")
+        if _event_value(plan, "attention_comparison_executed") is True:
+            blocking_reasons.append("attention_comparison_already_executed")
+        if _event_value(plan, "attention_override") is True:
+            blocking_reasons.append("attention_override_true_not_allowed")
+        if _event_value(plan, "attention_override_noop") is not True:
+            blocking_reasons.append("attention_override_noop_not_true")
+        if not relaykv_working_kv_block_ids:
+            blocking_reasons.append("no_relaykv_working_kv_blocks")
+        if not full_kv_block_ids:
+            blocking_reasons.append("no_full_kv_blocks")
+
+        shadow_capture_attempted = not blocking_reasons
+        shadow_capture_count = 1 if shadow_capture_attempted else 0
+
+        results.append(
+            {
+                "event_type": "relaykv_attention_shadow_capture_result",
+                "shadow_capture_state": (
+                    "metadata_shadow_captured"
+                    if shadow_capture_attempted
+                    else "blocked"
+                ),
+                "shadow_capture_mode": "metadata_only",
+                "source": "attention_comparison_plan_to_shadow_capture_result",
+                "request_id": _event_value(plan, "request_id"),
+                "req_pool_idx": _event_req_pool_idx_value(plan),
+                "seq_len": _event_value(plan, "seq_len"),
+                "layer_id": _event_layer_value(plan),
+                "full_kv_block_ids": list(full_kv_block_ids),
+                "relaykv_working_kv_block_ids": list(relaykv_working_kv_block_ids),
+                "full_kv_block_count": full_kv_block_count,
+                "relaykv_working_kv_block_count": relaykv_working_kv_block_count,
+                "reduced_block_count": reduced_block_count,
+                "working_to_full_block_ratio": working_to_full_block_ratio,
+                "coverage_ratio": coverage_ratio,
+                "shadow_capture_attempted": shadow_capture_attempted,
+                "attention_shadow_capture_count": shadow_capture_count,
+                "attention_output_captured": False,
+                "attention_comparison_executed": False,
+                "attention_connection_attempted": shadow_capture_attempted,
+                "attention_override": False,
+                "attention_override_noop": True if shadow_capture_attempted else False,
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+                "tensor_read": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "kv_cache_mutation": False,
+                "source_mutated": False,
+                "blocking_reasons": list(dict.fromkeys(blocking_reasons)),
+                "warning_reasons": warning_reasons,
+            }
+        )
+    return results
+
+
+def summarize_relaykv_attention_shadow_capture_results_for_smoke(
+    results: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize metadata-only RelayKV attention shadow capture results."""
+
+    if not isinstance(results, (list, tuple)):
+        raise TypeError(
+            "RelayKV attention shadow capture results must be a list or tuple"
+        )
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_shadow_capture_state: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "attention_override_true_count": 0,
+            "attention_override_noop_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    shadow_capture_count = 0
+    blocked_count = 0
+    error_count = 0
+    full_kv_block_count = 0
+    relaykv_working_kv_block_count = 0
+    reduced_block_count = 0
+    working_to_full_ratio_sum = 0.0
+    working_to_full_ratio_count = 0
+    coverage_ratio_sum = 0.0
+    coverage_ratio_count = 0
+    shadow_capture_attempted_count = 0
+    attention_shadow_capture_count = 0
+    attention_output_captured_count = 0
+    attention_comparison_executed_count = 0
+    attention_connection_attempted_count = 0
+
+    for result in results:
+        if not isinstance(result, dict):
+            raise TypeError(
+                "RelayKV attention shadow capture result must be a dict"
+            )
+
+        state = str(_event_value(result, "shadow_capture_state") or "unknown")
+        per_shadow_capture_state[state] += 1
+        per_request[str(_event_value(result, "request_id"))] += 1
+        per_layer[str(_event_layer_value(result))] += 1
+        if state == "metadata_shadow_captured":
+            shadow_capture_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+
+        value = _event_value(result, "full_kv_block_count")
+        if isinstance(value, int):
+            full_kv_block_count += value
+        value = _event_value(result, "relaykv_working_kv_block_count")
+        if isinstance(value, int):
+            relaykv_working_kv_block_count += value
+        value = _event_value(result, "reduced_block_count")
+        if isinstance(value, int):
+            reduced_block_count += value
+        value = _event_value(result, "working_to_full_block_ratio")
+        if isinstance(value, (int, float)):
+            working_to_full_ratio_sum += float(value)
+            working_to_full_ratio_count += 1
+        value = _event_value(result, "coverage_ratio")
+        if isinstance(value, (int, float)):
+            coverage_ratio_sum += float(value)
+            coverage_ratio_count += 1
+        if _event_value(result, "shadow_capture_attempted") is True:
+            shadow_capture_attempted_count += 1
+        value = _event_value(result, "attention_shadow_capture_count")
+        if isinstance(value, int):
+            attention_shadow_capture_count += value
+        if _event_value(result, "attention_output_captured") is True:
+            attention_output_captured_count += 1
+        if _event_value(result, "attention_comparison_executed") is True:
+            attention_comparison_executed_count += 1
+        if _event_value(result, "attention_connection_attempted") is True:
+            attention_connection_attempted_count += 1
+        if _event_value(result, "attention_override") is True:
+            safety_counts["attention_override_true_count"] += 1
+        if _event_value(result, "attention_override_noop") is True:
+            safety_counts["attention_override_noop_count"] += 1
+        if _event_value(result, "kv_pool_read") is True:
+            safety_counts["kv_pool_read_count"] += 1
+        if _event_value(result, "kv_snapshot") is True:
+            safety_counts["kv_snapshot_count"] += 1
+        if _event_value(result, "tensor_read") is True:
+            safety_counts["tensor_read_count"] += 1
+        if _event_value(result, "runtime_writeback") is True:
+            safety_counts["runtime_writeback_true_count"] += 1
+        if _event_value(result, "scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+        if _event_value(result, "kv_cache_mutation") is True:
+            safety_counts["kv_cache_mutation_true_count"] += 1
+        if _event_value(result, "source_mutated") is True:
+            safety_counts["source_mutated_true_count"] += 1
+
+    return {
+        "summary_type": "relaykv_attention_shadow_capture_result_summary",
+        "total_attention_shadow_capture_results": len(results),
+        "shadow_capture_count": shadow_capture_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "full_kv_block_count": full_kv_block_count,
+        "relaykv_working_kv_block_count": relaykv_working_kv_block_count,
+        "reduced_block_count": reduced_block_count,
+        "mean_working_to_full_block_ratio": (
+            working_to_full_ratio_sum / working_to_full_ratio_count
+            if working_to_full_ratio_count > 0
+            else None
+        ),
+        "mean_coverage_ratio": (
+            coverage_ratio_sum / coverage_ratio_count
+            if coverage_ratio_count > 0
+            else None
+        ),
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_shadow_capture_state_counts": dict(
+            sorted(per_shadow_capture_state.items())
+        ),
+        "shadow_capture_attempted_count": shadow_capture_attempted_count,
+        "attention_shadow_capture_count": attention_shadow_capture_count,
+        "attention_output_captured_count": attention_output_captured_count,
+        "attention_comparison_executed_count": attention_comparison_executed_count,
+        "attention_connection_attempted_count": attention_connection_attempted_count,
+        **dict(safety_counts),
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
