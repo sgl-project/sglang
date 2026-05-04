@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Any, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
@@ -23,7 +23,6 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolHitPolicy,
-    PoolName,
     PoolTransfer,
     PoolTransferResult,
 )
@@ -296,32 +295,17 @@ class HybridCacheController(BaseHiCacheController):
         node_id: int = -1,
         extra_pools: Optional[list[PoolTransfer]] = None,
     ) -> Optional[torch.Tensor]:
-        # SWA needs FULL+SWA device alloc coupled in one call so that
-        # full_to_swa_index_mapping is written atomically. Other pools fall
-        # through to the generic per pool alloc below.
-        swa_xfer = None
-        if extra_pools:
-            for p in extra_pools:
-                if (
-                    p.name == PoolName.SWA
-                    and p.device_indices is None
-                    and p.host_indices is not None
-                ):
-                    swa_xfer = p
-                    break
-
         need_load_kv = host_indices.numel() > 0
+
+        full_allocator = getattr(
+            self.mem_pool_device_allocator,
+            "full_attn_allocator",
+            self.mem_pool_device_allocator,
+        )
         if not need_load_kv:
             device_indices = torch.empty((0,), dtype=torch.int64, device=self.device)
-        elif swa_xfer is not None:
-            result = self.mem_pool_device_allocator.alloc_full_with_suffix_swa(
-                len(host_indices), swa_xfer.swa_suffix_tokens
-            )
-            if result is None:
-                return None
-            device_indices, swa_xfer.device_indices = result
         else:
-            device_indices = self.mem_pool_device_allocator.alloc(len(host_indices))
+            device_indices = full_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
 
@@ -333,7 +317,7 @@ class HybridCacheController(BaseHiCacheController):
         )
         if pool_transfers is None and extra_pools:
             if need_load_kv:
-                self.mem_pool_device_allocator.free(device_indices)
+                full_allocator.free(device_indices)
             return None
 
         self.load_queue.append(
@@ -557,7 +541,8 @@ class HybridCacheController(BaseHiCacheController):
         """Auto-alloc host or device indices for PoolTransfers where they are None."""
         if not extra_pools:
             return None
-        newly_allocated: list[tuple[PoolTransfer, Any, torch.Tensor]] = []
+        # (pool, free_fn, indices) for atomic rollback on failure.
+        newly_allocated: list[tuple[PoolTransfer, Callable, torch.Tensor]] = []
         for pool in extra_pools:
             entry = self.mem_pool_host.entry_map.get(pool.name)
             if entry is None:
@@ -569,27 +554,28 @@ class HybridCacheController(BaseHiCacheController):
             if alloc_host:
                 if pool.host_indices is not None or pool.device_indices is None:
                     continue
-                entry_pool, evict_fn, size = (
-                    entry.host_pool,
-                    entry.host_evict_fn,
-                    len(pool.device_indices),
-                )
+                alloc_fn = entry.host_pool.alloc
+                free_fn = entry.host_pool.free
+                evict_fn = entry.host_evict_fn
+                size = len(pool.device_indices)
             else:
                 if pool.device_indices is not None or pool.host_indices is None:
                     continue
-                entry_pool, evict_fn, size = (
-                    entry.device_pool,
-                    entry.device_evict_fn,
-                    len(pool.host_indices),
-                )
-            indices = entry_pool.alloc(size)
+                # device_alloc_fn / device_free_fn override entry.device_pool's
+                # methods for pools whose device_pool is a raw KV pool (layout)
+                # rather than an allocator (e.g. SWA).
+                alloc_fn = entry.device_alloc_fn or entry.device_pool.alloc
+                free_fn = entry.device_free_fn or entry.device_pool.free
+                evict_fn = entry.device_evict_fn
+                size = len(pool.host_indices)
+            indices = alloc_fn(size)
             if indices is None and evict_fn:
                 evict_fn(size)
-                indices = entry_pool.alloc(size)
+                indices = alloc_fn(size)
             if indices is None:
-                # Roll back all previous allocations using each pool's own entry_pool.
-                for prev_pool, prev_entry_pool, prev_indices in newly_allocated:
-                    prev_entry_pool.free(prev_indices)
+                # Atomic rollback: free everything we successfully allocated.
+                for prev_pool, prev_free_fn, prev_indices in newly_allocated:
+                    prev_free_fn(prev_indices)
                     if alloc_host:
                         prev_pool.host_indices = None
                     else:
@@ -599,5 +585,5 @@ class HybridCacheController(BaseHiCacheController):
                 pool.host_indices = indices
             else:
                 pool.device_indices = indices
-            newly_allocated.append((pool, entry_pool, indices))
+            newly_allocated.append((pool, free_fn, indices))
         return extra_pools

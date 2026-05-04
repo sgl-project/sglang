@@ -474,51 +474,22 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         assert self.swa_attn_allocator.available_size() <= self.swa_attn_allocator.size
 
-    def alloc_full_with_suffix_swa(
-        self,
-        n_full: int,
-        n_swa_suffix: int,
-    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """HiCache load-back alloc: full slot for every token, SWA slot only
-        for the trailing ``n_swa_suffix`` tokens.
+    def set_full_to_swa_mapping(
+        self, full_indices: torch.Tensor, swa_indices: torch.Tensor
+    ) -> None:
+        """Write full_to_swa_index_mapping[full_indices[i]] = swa_indices[i].
 
-        Returns (full_indices, swa_indices) on success, None on OOM.
-        Mapping invariant after this call:
-          full_to_swa_index_mapping[full_indices[:-n_swa_suffix]] == 0  (VOID)
-          full_to_swa_index_mapping[full_indices[-n_swa_suffix:]] == swa_indices
+        Used by HiCache load-back path to rebuild the mapping after FULL and SWA device alloc.
         """
-        assert 0 <= n_swa_suffix <= n_full
-        if n_full > self.full_attn_allocator.available_size():
-            return None
-        if n_swa_suffix > self.swa_attn_allocator.available_size():
-            return None
-
-        full_indices = self.full_attn_allocator.alloc(n_full)
-        if full_indices is None:
-            return None
-
-        if n_swa_suffix == 0:
-            return full_indices, torch.empty(
-                (0,), dtype=torch.int64, device=self.device
-            )
-
-        swa_indices = self.swa_attn_allocator.alloc(n_swa_suffix)
-        if swa_indices is None:
-            self.full_attn_allocator.free(full_indices)
-            return None
-
-        # Prefix slots have no SWA pair. Write 0 into the mapping for them.
-        # free_swa filters out the 0 entries to skip them on free.
+        if full_indices.numel() == 0:
+            return
+        assert full_indices.numel() == swa_indices.numel()
         if _is_npu:
-            full_idx64 = full_indices.to(torch.int64)
-            self.full_to_swa_index_mapping[full_idx64[:-n_swa_suffix]] = 0
-            self.full_to_swa_index_mapping[full_idx64[-n_swa_suffix:]] = swa_indices.to(
-                torch.int64
+            self.full_to_swa_index_mapping[full_indices.to(torch.int64)] = (
+                swa_indices.to(torch.int64)
             )
         else:
-            self.full_to_swa_index_mapping[full_indices[:-n_swa_suffix]] = 0
-            self.full_to_swa_index_mapping[full_indices[-n_swa_suffix:]] = swa_indices
-        return full_indices, swa_indices
+            self.full_to_swa_index_mapping[full_indices] = swa_indices
 
     def free_swa(self, free_index: torch.Tensor):
         swa_indices = self.full_to_swa_index_mapping[free_index]

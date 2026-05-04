@@ -74,6 +74,8 @@ def build_pool_entry(
     share_indices_with_anchor: bool = False,
     host_evict_fn: Optional[Callable[[int], Any]] = None,
     device_evict_fn: Optional[Callable[[int], Any]] = None,
+    device_alloc_fn: Optional[Callable[[int], Any]] = None,
+    device_free_fn: Optional[Callable[[Any], Any]] = None,
 ) -> PoolEntry:
     return PoolEntry(
         name=name,
@@ -84,6 +86,8 @@ def build_pool_entry(
         share_indices_with_anchor=share_indices_with_anchor,
         host_evict_fn=host_evict_fn,
         device_evict_fn=device_evict_fn,
+        device_alloc_fn=device_alloc_fn,
+        device_free_fn=device_free_fn,
     )
 
 
@@ -190,6 +194,9 @@ def build_hybrid_swa_stack(
         server_args=server_args,
         use_mla=use_mla,
     )
+
+    # For SWA hybrid, the device alloc/free goes through the inner swa_attn_allocator
+    swa_attn_allocator = params.token_to_kv_pool_allocator.swa_attn_allocator
     entries = [
         build_pool_entry(
             name=PoolName.KV,
@@ -206,10 +213,9 @@ def build_hybrid_swa_stack(
             layer_mapping=swa_layer_mapping,
             transfer_layer_num=transfer_layer_num,
             host_evict_fn=host_swa_evict_fn,
-            # SWA device alloc happens in alloc_full_with_suffix_swa before
-            # the controller resolves entries, so this hook is only a
-            # defensive fallback.
             device_evict_fn=device_swa_evict_fn,
+            device_alloc_fn=swa_attn_allocator.alloc,
+            device_free_fn=swa_attn_allocator.free,
         ),
     ]
     host_pool_group = HostPoolGroup(entries)

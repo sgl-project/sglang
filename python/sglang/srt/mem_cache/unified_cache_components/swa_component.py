@@ -238,10 +238,9 @@ class SWAComponent(TreeComponent):
             host_lru = self.cache.host_lru_lists[self.component_type]
             if new_parent.component_data[self.component_type].value is None:
                 host_lru.insert_mru(new_parent)
-            if (
-                child.component_data[self.component_type].value is None
-                and not host_lru.in_list(child)
-            ):
+            if child.component_data[
+                self.component_type
+            ].value is None and not host_lru.in_list(child):
                 host_lru.insert_mru(child)
 
         # parent inherits the swa_uuid from child for swa lock ref
@@ -412,34 +411,34 @@ class SWAComponent(TreeComponent):
             ]
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            # Walk the evicted chain leaf to root, collecting SWA host_values
-            # until they cover sliding_window_size. SWA host data is always a
-            # contiguous suffix, so the first None ends the walk.
-            collected_leaf_first: list[torch.Tensor] = []
-            nodes_leaf_first: list = []
             n_swa = 0
-            cur = node
-            while cur.evicted:
-                cd = cur.component_data[ct]
-                if cd.host_value is None:
-                    break
-                collected_leaf_first.append(cd.host_value)
-                nodes_leaf_first.append(cur)
-                n_swa += len(cd.host_value)
-                if n_swa >= self.sliding_window_size:
-                    break
-                cur = cur.parent
-            if not collected_leaf_first:
+            backed_up: list[torch.Tensor] = []
+            nodes: list = []
+            while node is not self.cache.root_node and n_swa < self.sliding_window_size:
+                cd = node.component_data[ct]
+                assert cd.host_value is not None or cd.value is not None
+                if cd.value is not None:
+                    # device exists, skip it
+                    n_swa += len(cd.value)
+                else:
+                    # host only, collect it
+                    backed_up.append(cd.host_value)
+                    nodes.append(node)
+                    n_swa += len(cd.host_value)
+                node = node.parent
+
+            if not backed_up:
                 return None
-            collected_leaf_first.reverse()
-            nodes_leaf_first.reverse()
+
+            backed_up.reverse()
+            nodes.reverse()
+
             return [
                 PoolTransfer(
                     name=PoolName.SWA,
-                    host_indices=torch.cat(collected_leaf_first),
+                    host_indices=torch.cat(backed_up),
                     device_indices=None,
-                    swa_suffix_tokens=n_swa,
-                    nodes_to_load=nodes_leaf_first,
+                    nodes_to_load=nodes,
                 )
             ]
 
@@ -461,19 +460,23 @@ class SWAComponent(TreeComponent):
             return
 
         if phase == CacheTransferPhase.LOAD_BACK:
-            if not transfers or transfers[0].device_indices is None:
-                return
+            assert transfers and transfers[0].device_indices is not None
             xfer = transfers[0]
             device_indices = xfer.device_indices
+            allocator = self.cache.token_to_kv_pool_allocator
+
             offset = 0
             for n in xfer.nodes_to_load or []:
                 cd_n = n.component_data[ct]
+                cd_full_n = n.component_data[BASE_COMPONENT_TYPE]
                 n_tokens = len(cd_n.host_value)
-                self._restore_device_value(
-                    n, device_indices[offset : offset + n_tokens].clone()
-                )
+                swa_chunk = device_indices[offset : offset + n_tokens].clone()
+                self._restore_device_value(n, swa_chunk)
+                assert cd_full_n.value is not None and len(cd_full_n.value) == n_tokens
+                # rebuild the mapping for the loaded SWA chunk
+                allocator.set_full_to_swa_mapping(cd_full_n.value, swa_chunk)
                 offset += n_tokens
-            assert offset == xfer.swa_suffix_tokens
+            assert offset == len(xfer.host_indices)
             return
 
     def drive_host_eviction(
