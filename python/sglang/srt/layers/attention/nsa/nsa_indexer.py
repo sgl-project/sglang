@@ -71,9 +71,6 @@ _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
 
-from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
-
-fp8_dtype = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
 
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
@@ -844,7 +841,7 @@ class Indexer(MultiPlatformOp):
                 actual_seq_q_list.append(actual_seq_q)
                 batch_idx_list.append(batch_idx)
 
-            k_fp8 = torch.cat(k_fp8_list, dim=0).view(fp8_dtype)
+            k_fp8 = torch.cat(k_fp8_list, dim=0).view(torch.float8_e4m3fn)
             k_scale = torch.cat(k_scale_list, dim=0).view(torch.float32).squeeze(-1)
             kv_fp8 = (k_fp8, k_scale)
             ks = torch.cat(ks_list, dim=0)
@@ -885,7 +882,7 @@ class Indexer(MultiPlatformOp):
                 block_tables[0],
             )
 
-            k_fp8 = k_fp8.view(fp8_dtype)
+            k_fp8 = k_fp8.view(torch.float8_e4m3fn)
             k_scale = k_scale.view(torch.float32).squeeze(-1)
             kv_fp8 = (k_fp8, k_scale)
             ks = torch.full((actual_seq_q,), offset, dtype=torch.int32, device="cuda")
@@ -978,7 +975,7 @@ class Indexer(MultiPlatformOp):
                 block_tables[i],
             )
 
-            k_fp8 = k_fp8.view(fp8_dtype).unsqueeze(0).contiguous()
+            k_fp8 = k_fp8.view(torch.float8_e4m3fn).unsqueeze(0).contiguous()
             k_scale = k_scale.view(torch.float32).squeeze(-1).unsqueeze(0).contiguous()
 
             index_score = fp8_index(
