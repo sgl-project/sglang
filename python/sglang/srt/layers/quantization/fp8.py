@@ -2023,7 +2023,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             AiterQuantType,
         )
 
-        if _use_aiter and self.block_quant:
+        w13_weight = layer.w13_weight
+        w2_weight = layer.w2_weight
+
+        if self.block_quant:
             quant_type = (
                 AiterQuantType.PER_1X32
                 if self.is_fp4_expert
@@ -2044,8 +2047,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             w13_scale = layer.w13_weight_scale1
             w2_scale = layer.w2_weight_scale1
         return AiterMoeQuantInfo(
-            w13_weight=layer.w13_weight,
-            w2_weight=layer.w2_weight,
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
             quant_type=quant_type,
             w13_scale=w13_scale,
             w2_scale=w2_scale,
