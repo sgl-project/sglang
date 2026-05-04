@@ -130,8 +130,12 @@ class NPUPlatformBase(Platform):
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn.LaserAttentionBackend"
             except ImportError as e:
-                logger.error("Failed to import Laser Attention backend: %s", str(e))
-                raise ImportError("Laser Attention backend is not installed.") from e
+                logger.error(f"Failed to import Laser Attention backend: {e}")
+                raise ImportError(
+                    "Laser Attention backend is not installed. "
+                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
+                    "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
+                ) from e
 
         elif selected_backend == AttentionBackendEnum.BLOCK_SPARSE_ATTN:
             try:
@@ -143,11 +147,11 @@ class NPUPlatformBase(Platform):
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.block_sparse_attn.BlockSparseAttentionBackend"
             except ImportError as e:
-                logger.error(
-                    "Failed to import Block Sparse Attention backend: %s", str(e)
-                )
+                logger.error(f"Failed to import Block Sparse Attention backend: {e}")
                 raise ImportError(
-                    "Block Sparse Attention backend is not installed."
+                    "Block Sparse Attention backend is not installed. "
+                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
+                    "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
                 ) from e
 
         elif selected_backend == AttentionBackendEnum.RAIN_FUSION_ATTN:
@@ -160,11 +164,11 @@ class NPUPlatformBase(Platform):
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn.RainFusionAttentionBackend"
             except ImportError as e:
-                logger.error(
-                    "Failed to import Rain Fusion Attention backend: %s", str(e)
-                )
+                logger.error(f"Failed to import Rain Fusion Attention backend: {e}")
                 raise ImportError(
-                    " Rain Fusion Attention backend is not installed."
+                    "Rain Fusion Attention backend is not installed. "
+                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
+                    "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
                 ) from e
 
         logger.info("Using Torch SDPA backend.")

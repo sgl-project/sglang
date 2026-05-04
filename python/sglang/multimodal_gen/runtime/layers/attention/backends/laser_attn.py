@@ -4,8 +4,8 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionBackend,
     AttentionImpl,
     AttentionMetadata,
-    AttentionMetadataBuilder,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -39,14 +39,6 @@ class LaserAttentionBackend(AttentionBackend):
     def get_impl_cls() -> type["LaserAttentionImpl"]:
         return LaserAttentionImpl
 
-    @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        return AttentionMetadata
-
-    @staticmethod
-    def get_builder_cls() -> type["AttentionMetadataBuilder"]:
-        raise NotImplementedError("LA do not have special metadata builder.")
-
 
 class LaserAttentionImpl(AttentionImpl):
 
@@ -62,26 +54,52 @@ class LaserAttentionImpl(AttentionImpl):
     ) -> None:
         self.softmax_scale = softmax_scale
 
+        # After preprocess input layout should be BNSD.
         self.seqlen_base = 256
-        self.seqlen_index = -2
-        self.dim_index = -1
+        self.seqlen_index = 2
+        self.dim_index = 3
         self.dim_base = 128
         self.max_token = 2**31 - 1
         self.seq_len_pad_base = 256
 
-    def _pad(self, input_tensor: torch.Tensor, base: int, dim: int) -> torch.Tensor:
+        # the laser attention operator has issues with small seq_len
+        self.min_seqlen = 2048
+        self.sdpa_impl = SDPABackend.get_impl_cls()(
+            num_heads,
+            head_size,
+            causal,
+            softmax_scale,
+            num_kv_heads,
+            prefix,
+            **extra_impl_args,
+        )
 
-        shape_value = input_tensor.size(dim)
-        if shape_value % base != 0:
-            pad_size = ((shape_value // base) + 1) * base - shape_value
-            padding_shape = list(input_tensor.shape)
-            padding_shape[dim] = pad_size
-            padding = torch.zeros(
-                padding_shape, dtype=input_tensor.dtype, device=input_tensor.device
-            )
-            return torch.cat([input_tensor, padding], dim=dim)
+    def _pad(self, input_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Pad the input tensor along the sequence length and head dimension.
+        to multiples of base values. self.seqlen_index and self.dim_index should be positive integers.
+        """
 
-        return input_tensor
+        seq_len = input_tensor.size(self.seqlen_index)
+        head_dim = input_tensor.size(self.dim_index)
+
+        pad_seq = 0
+        if seq_len % self.seqlen_base != 0:
+            pad_seq = ((seq_len // self.seqlen_base) + 1) * self.seqlen_base - seq_len
+
+        pad_dim = 0
+        if head_dim % self.dim_base != 0:
+            pad_dim = ((head_dim // self.dim_base) + 1) * self.dim_base - head_dim
+
+        if pad_seq == 0 and pad_dim == 0:
+            return input_tensor
+
+        pad_list = [0] * (2 * input_tensor.ndim)
+
+        pad_list[len(pad_list) - 2 * self.seqlen_index - 1] = pad_seq
+        pad_list[len(pad_list) - 2 * self.dim_index - 1] = pad_dim
+
+        return torch.nn.functional.pad(input_tensor, pad_list)
 
     def _la_preprocess_input(
         self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
@@ -95,14 +113,9 @@ class LaserAttentionImpl(AttentionImpl):
             k = k.to(torch.float16)
             v = v.to(torch.float16)
 
-        q = self._pad(q, self.seqlen_base, self.seqlen_index)
-        q = self._pad(q, self.dim_base, self.dim_index)
-
-        k = self._pad(k, self.seqlen_base, self.seqlen_index)
-        k = self._pad(k, self.dim_base, self.dim_index)
-
-        v = self._pad(v, self.seqlen_base, self.seqlen_index)
-        v = self._pad(v, self.dim_base, self.dim_index)
+        q = self._pad(q)
+        k = self._pad(k)
+        v = self._pad(v)
 
         return q, k, v
 
@@ -128,7 +141,7 @@ class LaserAttentionImpl(AttentionImpl):
         head_num: int,
         pre_tokens: int,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return getattr(torch.ops.attentions, "la")(
+        return torch.ops.attentions.la(
             query=query,
             key=key,
             value=value,
@@ -154,14 +167,24 @@ class LaserAttentionImpl(AttentionImpl):
         q_seqlen, head_dim = query.shape[1], query.shape[3]
         kv_seqlen = key.shape[1]
 
-        pre_tokens = self.max_token
-        if kv_seqlen % self.seq_len_pad_base != 0:
-            pre_tokens = (
-                kv_seqlen // self.seq_len_pad_base + 1
-            ) * self.seq_len_pad_base - kv_seqlen
+        if q_seqlen < self.min_seqlen or kv_seqlen != q_seqlen:
+            output = self.sdpa_impl.forward(
+                query,
+                key,
+                value,
+                attn_metadata,
+            )
+        else:
+            pre_tokens = self.max_token
+            if kv_seqlen % self.seq_len_pad_base != 0:
+                pre_tokens = (
+                    kv_seqlen // self.seq_len_pad_base + 1
+                ) * self.seq_len_pad_base - kv_seqlen
 
-        q, k, v = self._la_preprocess_input(query, key, value)
-        _, la_output = self._laser_attention(q, k, v, q.shape[1], pre_tokens)
-        output = self._la_postprocess_output(la_output, query.dtype, q_seqlen, head_dim)
+            q, k, v = self._la_preprocess_input(query, key, value)
+            _, la_output = self._laser_attention(q, k, v, q.shape[1], pre_tokens)
+            output = self._la_postprocess_output(
+                la_output, query.dtype, q_seqlen, head_dim
+            )
 
         return output

@@ -69,6 +69,26 @@ class BlockSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
         patch_size: tuple[int, int, int],
         **kwargs: dict[str, Any],
     ) -> BlockSparseAttentionMetadata:
+        """
+        Builds BlockSparseAttention metadata.
+
+        Args:
+            current_timestep: The current diffusion timestep.
+            skip_first_steps: Number of initial timesteps to skip before applying
+                sparsity. Must be non‑negative.
+            sparsity: Fraction of tokens to drop (block‑wise) in the block sparse
+                attention mechanism. Must be in the range [0.0, 1.0).
+            raw_latent_shape: Shape of the latent tensor before patching.
+            patch_size: Patch size as (T, height, width). Only the height
+                and width components are used to divide the latent dimensions.
+            **kwargs: Additional keyword arguments (ignored, but accepted for
+                compatibility with base class or calling conventions).
+
+        Returns:
+            BlockSparseAttentionMetadata
+        Note:
+            The `block_frame_stride` is needed to set the first blocks to be non‑sparse.
+        """
         if not (skip_first_steps >= 0 and 0.0 <= sparsity < 1.0):
             raise ValueError(
                 (
@@ -82,7 +102,7 @@ class BlockSparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             logger.warning(
                 (
                     "Sparsity is set to 0.0, which means no tokens will be dropped."
-                    "For better perfomance use Laser Attention or increase sparsity."
+                    "For better performance use Laser Attention or increase sparsity."
                 )
             )
 
@@ -141,7 +161,7 @@ class BlockSparseAttentionImpl(AttentionImpl):
         key: torch.Tensor,
         sparsity: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return getattr(torch.ops.attentions, "sparse_block_estimate")(
+        return torch.ops.attentions.sparse_block_estimate(
             query=query,
             key=key,
             actual_seq_lengths=None,
@@ -167,7 +187,7 @@ class BlockSparseAttentionImpl(AttentionImpl):
         smask: torch.Tensor,
         sct: torch.Tensor,
     ) -> torch.Tensor:
-        return getattr(torch.ops.attentions, "block_sparse_attention")(
+        return torch.ops.attentions.block_sparse_attention(
             query=query,
             key=key,
             value=value,

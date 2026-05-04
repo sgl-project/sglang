@@ -112,7 +112,7 @@ Some backends require additional configuration. You can pass these parameters vi
 | `aiter` | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | Requires `aiter`. |
 | `aiter_sage` | ❌ | ✅ | ❌ | ❌ | ❌ | ❌ | Requires `aiter`. |
 | `sparse_video_gen_2_attn` | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | CUDA-only. Requires `svg`. |
-| `laser_attn` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | NPU-only. Requires `attentions` from `sgl_kernel_npu`. |
+| `laser_attn` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | NPU-only. Requires `attentions` from `sgl_kernel_npu`. Uses SDPA if seqlen is less than 2048. |
 | `block_sparse_attn` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | NPU-only. Requires `attentions` from `sgl_kernel_npu`.  Configure via `--attention-backend-config`. |
 | `rain_fusion_attn` | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | NPU-only. Requires `attentions` from `sgl_kernel_npu`. Configure via `--attention-backend-config`. |
 

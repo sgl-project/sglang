@@ -83,7 +83,7 @@ class RainFusionAttentionMetadataBuilder(AttentionMetadataBuilder):
             logger.warning(
                 (
                     "Sparsity is set to 0.0, which means no tokens will be dropped."
-                    "For better perfomance use Laser Attention or increase sparsity."
+                    "For better performance use Laser Attention or increase sparsity."
                 )
             )
 
@@ -113,6 +113,7 @@ class RainFusionAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.block_size = 128
+        self.inner_precise = 0
 
         self.laser_attn_impl = LaserAttentionBackend.get_impl_cls()(
             num_heads,
@@ -127,84 +128,60 @@ class RainFusionAttentionImpl(AttentionImpl):
     def _avgpool(
         self, input_tensor: torch.Tensor, pool_size: int = 128
     ) -> torch.Tensor:
-        batch, seqlen, headnum, dim = input_tensor.shape
+        batch, seqlen, heads, dim = input_tensor.shape
+        x = input_tensor.permute(0, 2, 3, 1).reshape(batch * heads, dim, seqlen)
 
-        num_full_blocks = seqlen // pool_size
-        tail_size = seqlen % pool_size
+        pooled = torch.nn.functional.avg_pool1d(
+            x, kernel_size=pool_size, stride=pool_size, ceil_mode=True
+        )
+        out = pooled.reshape(batch, heads, dim, -1).permute(0, 3, 1, 2).contiguous()
 
-        if num_full_blocks > 0:
-            full_blocks = input_tensor[:, : num_full_blocks * pool_size, :, :]
-            full_blocks_reshaped = full_blocks.view(
-                batch, num_full_blocks, pool_size, headnum, dim
-            )
-            full_pooled = full_blocks_reshaped.mean(dim=2)
-        else:
-            full_pooled = torch.empty(0, device=input_tensor.device)
-        if tail_size > 0:
-            tail_block = input_tensor[:, num_full_blocks * pool_size :, :, :]
-            tail_reshaped = tail_block.view(batch, 1, tail_size, headnum, dim)
-            tail_pooled = tail_reshaped.mean(dim=2)
-        else:
-            tail_pooled = torch.empty(0, device=input_tensor.device)
-
-        if num_full_blocks > 0 and tail_size > 0:
-            output_tensor = torch.cat([full_pooled, tail_pooled], dim=1)
-        elif num_full_blocks > 0:
-            output_tensor = full_pooled
-        else:
-            output_tensor = tail_pooled
-
-        return output_tensor
+        return out
 
     def _get_mask_index(self, mask: torch.Tensor) -> torch.Tensor:
-        b, n, s, _ = mask.shape
-        device = mask.device
+        batch_size, num_heads, seq_len, _ = mask.shape
 
-        mask_reshaped = mask.reshape(-1, s, s)
-        batch_size = mask_reshaped.shape[0]
+        mask_reshaped = mask.reshape(-1, seq_len)
+        row_indices = torch.arange(
+            seq_len, device=mask.device, dtype=torch.float32
+        ).unsqueeze(0)
 
-        row_indices = torch.arange(s, device=device).expand(batch_size, s, -1)
-        sorted_vals = torch.where(mask_reshaped, row_indices, 1e9).to(torch.float32)
+        sorted_vals = torch.where(mask_reshaped, row_indices, seq_len)
         sorted_vals, _ = torch.sort(sorted_vals, dim=-1)
         valid_count = mask_reshaped.sum(dim=-1, keepdim=True)
         keep_mask = row_indices < valid_count
         result = torch.where(keep_mask, sorted_vals, -1)
 
-        pos_matrix = result.reshape(b, n, s, s).to(torch.int64)
+        pos_matrix = result.reshape(batch_size, num_heads, seq_len, seq_len).to(
+            torch.int64
+        )
         return pos_matrix
 
     def _get_blockwise_mask(
         self,
         qkv_pool: torch.Tensor,
-        text_len: int,
         sparsity: float,
         scale: float,
         pool_size: int,
         latent_shape: tuple,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        tq, hq, wq = latent_shape
-        first_frame_len = hq * wq
+        first_frame_len = latent_shape[1] * latent_shape[2]
 
         query_pool, key_pool, value_pool = torch.chunk(qkv_pool, 3, dim=0)
-        attn_scores_head = torch.einsum("blnd,bsnd->bnls", query_pool, key_pool) * scale
-        score_matrix = torch.nn.functional.softmax(attn_scores_head, dim=-1)
+        attn_scores = (
+            query_pool.permute(0, 2, 1, 3) @ key_pool.permute(0, 2, 3, 1) * scale
+        )
 
-        cols = score_matrix.shape[-1]
+        keep_len = math.ceil(attn_scores.shape[-1] * (1 - sparsity))
 
-        keep_len = math.ceil(cols * (1 - sparsity))
-        topk_values, _ = torch.topk(score_matrix, k=keep_len, dim=-1)
-        thresholds = topk_values[..., -1:]
-        mask = score_matrix >= thresholds
-        text_block_num = (text_len + pool_size - 1) // pool_size
-
-        if text_block_num > 0:
-            mask[:, :, -text_block_num:, :] = True
-            mask[:, :, :, -text_block_num:] = True
+        topk_values, _ = torch.topk(attn_scores, k=keep_len, dim=-1)
+        mask = attn_scores >= topk_values[..., -1:]
 
         firstframe_block_num = (first_frame_len + pool_size - 1) // pool_size
         if firstframe_block_num > 0:
             mask[:, :, :firstframe_block_num, :] = True
             mask[:, :, :, :firstframe_block_num] = True
+
         select_idx = self._get_mask_index(mask)
         select_idx = select_idx[0].transpose(0, 1)
         select_num_idx = mask[0].transpose(0, 1).sum(dim=-1)
@@ -315,7 +292,6 @@ class RainFusionAttentionImpl(AttentionImpl):
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        text_len: int,
         pool_size: int,
         latent_shape: tuple[int, int, int],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -323,36 +299,12 @@ class RainFusionAttentionImpl(AttentionImpl):
         Tensor block rearrangement + pooling operation
         """
         tensor = torch.cat((query, key, value), dim=0)
-        if text_len != 0:
-            tensor_t = tensor[:, :text_len, :, :]
-            tensor_i = tensor[:, text_len:, :, :]
 
-            tensor_i_2 = self._rearrange_with_remaining(tensor_i, latent_shape)
-            tensor_i_pool = self._avgpool(tensor_i_2, pool_size)
-            tensor_t_pool = self._avgpool(tensor_t, pool_size)
-
-            tensor = torch.concat((tensor_i_2, tensor_t), dim=1)
-            tensor_pool = torch.concat((tensor_i_pool, tensor_t_pool), dim=1)
-        else:
-            tensor = self._rearrange_with_remaining(tensor, latent_shape)
-            tensor_pool = self._avgpool(tensor, pool_size)
+        tensor = self._rearrange_with_remaining(tensor, latent_shape)
+        tensor_pool = self._avgpool(tensor, pool_size)
 
         query_, key_, value_ = torch.chunk(tensor, 3, dim=0)
         return query_, key_, value_, tensor_pool
-
-    def _do_tensor_inv_rearrange(
-        self, tensor: torch.Tensor, text_len: int, latent_shape: tuple[int, int, int]
-    ):
-        if text_len != 0:
-            tensor_t = tensor[:, -text_len:, :, :]
-            tensor_i = tensor[:, :-text_len, :, :]
-
-            tensor_i = self._inv_rearrange_with_remaining(tensor_i, latent_shape)
-            tensor = torch.concat((tensor_t, tensor_i), dim=1)
-        else:
-            tensor = self._inv_rearrange_with_remaining(tensor, latent_shape)
-
-        return tensor
 
     def _rain_fusion_attention(
         self,
@@ -367,9 +319,8 @@ class RainFusionAttentionImpl(AttentionImpl):
         input_layout: str = "TND",
         actual_seq_lengths=Optional[torch.Tensor],
         actual_seq_lengths_kv=Optional[torch.Tensor],
-        inner_precise=0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return getattr(torch.ops.attentions, "rainfusionattention")(
+        return torch.ops.attentions.rainfusionattention(
             query=query,
             key=key,
             value=value,
@@ -385,7 +336,7 @@ class RainFusionAttentionImpl(AttentionImpl):
             head_num=head_num,
             mask_type=0,
             scale=scale,
-            inner_precise=inner_precise,
+            inner_precise=self.inner_precise,
             block_size=0,
         )
 
@@ -397,17 +348,12 @@ class RainFusionAttentionImpl(AttentionImpl):
         latent_shape: tuple[int, int, int],
         sparsity: float,
     ):
-
-        inner_precise = 0
-        text_len = 0
-
         q, k, v, qkv_pool = self._do_tensor_rearrange_pooling(
-            query, key, value, text_len, self.block_size, latent_shape
+            query, key, value, self.block_size, latent_shape
         )
 
         select_idx, select_num_idx = self._get_blockwise_mask(
             qkv_pool,
-            text_len,
             sparsity,
             self.softmax_scale,
             self.block_size,
@@ -422,8 +368,8 @@ class RainFusionAttentionImpl(AttentionImpl):
         k = k.reshape(-1, head_num, head_dim)
         v = v.reshape(-1, head_num, head_dim)
 
-        actual_seq_lengths = [seqlen_q for _ in range(batch_size)]
-        actual_seq_lengths_kv = [seqlen_kv for _ in range(batch_size)]
+        actual_seq_lengths = [seqlen_q] * batch_size
+        actual_seq_lengths_kv = [seqlen_kv] * batch_size
 
         out, _ = self._rain_fusion_attention(
             q,
@@ -437,11 +383,10 @@ class RainFusionAttentionImpl(AttentionImpl):
             blockshape=[self.block_size, self.block_size],
             actual_seq_lengths=actual_seq_lengths,
             actual_seq_lengths_kv=actual_seq_lengths_kv,
-            inner_precise=inner_precise,
         )
 
         out = out.reshape(batch_size, seqlen_q, head_num, head_dim)
-        out = self._do_tensor_inv_rearrange(out, text_len, latent_shape)
+        out = self._inv_rearrange_with_remaining(out, latent_shape)
         return out
 
     def forward(
