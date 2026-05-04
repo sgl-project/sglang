@@ -35,6 +35,14 @@ class DisaggregationMode(Enum):
     PREFILL = "prefill"
     DECODE = "decode"
 
+    @staticmethod
+    def to_engine_type(mode: str) -> str:
+        if mode == DisaggregationMode.PREFILL.value:
+            return "prefill"
+        elif mode == DisaggregationMode.DECODE.value:
+            return "decode"
+        return "unified"
+
 
 #########################
 # Synchronization
@@ -153,7 +161,7 @@ class MetadataBuffers:
             # TODO(shangming): Fix me (use 'cuda') when nvlink_transport of Mooncake is bug-free
             device = "cpu"
         elif envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() == "INTRA_NODE_NVLINK":
-            device = "cuda"
+            device = "cpu"
         with (
             torch.cuda.use_mem_pool(self.custom_mem_pool)
             if self.custom_mem_pool
@@ -431,26 +439,6 @@ def get_kv_class(
     raise ValueError(f"Unsupported transfer backend: {transfer_backend}")
 
 
-#########################
-# KV Pages
-#########################
-
-
-def kv_to_page_indices(kv_indices: np.ndarray, page_size: int):
-    # 1. The page is guaranteed to be full except the last page.
-    # 2. page index = kv_index // page_size
-    # The return vector is kv_indices[::page_size] // page_size
-    if page_size == 1:  # shortcut
-        return kv_indices
-
-    return kv_indices[::page_size] // page_size
-
-
-def kv_to_page_num(num_kv_indices: int, page_size: int):
-    # ceil(num_kv_indices / page_size)
-    return (num_kv_indices + page_size - 1) // page_size
-
-
 def page_indices_to_cp_rank_page_indices(
     page_indices: np.ndarray,
     total_pages: int,
@@ -541,6 +529,57 @@ def is_mla_backend(target_kv_pool) -> bool:
     from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
     return isinstance(target_kv_pool, MLATokenToKVPool)
+
+
+def setup_state_kv_args(
+    kv_args: KVArgs,
+    token_to_kv_pool,
+    draft_token_to_kv_pool=None,
+) -> None:
+    """Populate ``kv_args`` state-buffer fields from the given pool.
+
+    Shared by prefill and decode bootstrap paths so the state_type dispatch
+    lives in one place.
+    """
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    if not hasattr(token_to_kv_pool, "get_state_buf_infos"):
+        kv_args.state_data_ptrs = []
+        kv_args.state_data_lens = []
+        kv_args.state_item_lens = []
+        kv_args.state_type = "none"
+        return
+
+    state_data_ptrs, state_data_lens, state_item_lens = (
+        token_to_kv_pool.get_state_buf_infos()
+    )
+    kv_args.state_data_ptrs = state_data_ptrs
+    kv_args.state_data_lens = state_data_lens
+    kv_args.state_item_lens = state_item_lens
+
+    if isinstance(token_to_kv_pool, SWAKVPool):
+        kv_args.state_type = "swa"
+    elif isinstance(token_to_kv_pool, HybridLinearKVPool):
+        kv_args.state_type = "mamba"
+        # Get state dimension info for cross-TP slice transfer
+        if hasattr(token_to_kv_pool, "get_state_dim_per_tensor"):
+            kv_args.state_dim_per_tensor = token_to_kv_pool.get_state_dim_per_tensor()
+    elif isinstance(token_to_kv_pool, NSATokenToKVPool):
+        kv_args.state_type = "nsa"
+        if draft_token_to_kv_pool is not None and isinstance(
+            draft_token_to_kv_pool, NSATokenToKVPool
+        ):
+            (
+                draft_state_data_ptrs,
+                draft_state_data_lens,
+                draft_state_item_lens,
+            ) = draft_token_to_kv_pool.get_state_buf_infos()
+            kv_args.state_data_ptrs += draft_state_data_ptrs
+            kv_args.state_data_lens += draft_state_data_lens
+            kv_args.state_item_lens += draft_state_item_lens
+    else:
+        kv_args.state_type = "none"
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

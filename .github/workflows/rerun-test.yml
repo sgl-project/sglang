@@ -14,12 +14,14 @@ on:
         type: choice
         options:
           - 1-gpu-h100
+          - 1-gpu-h100-h200
           - 1-gpu-5090
           - 2-gpu-h100
           - 4-gpu-h100
           - 4-gpu-a10
           - 4-gpu-b200
           - 8-gpu-h200
+          - 8-gpu-h200-deepep
           - 8-gpu-h20
           - 8-gpu-b200
           - ubuntu-latest
@@ -38,11 +40,18 @@ on:
         required: false
         type: string
         default: "false"
+      install_diffusion:
+        description: "Install diffusion dependencies (for multimodal gen tests)"
+        required: false
+        type: string
+        default: "false"
 
 env:
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   SGLANG_JIT_DEEPGEMM_FAST_WARMUP: true
+  # TEMP: rebuild deepep against the new torch for torch-211-merge PR only — revert before merging to main.
+  FORCE_REBUILD_DEEPEP: '1'
 
 permissions:
   actions: write
@@ -73,6 +82,8 @@ jobs:
           fi
           if [[ "${{ inputs.use_deepep }}" == "true" ]]; then
             bash scripts/ci/cuda/ci_install_deepep.sh
+          elif [[ "${{ inputs.install_diffusion }}" == "true" ]]; then
+            bash scripts/ci/cuda/ci_install_dependency.sh diffusion
           else
             bash scripts/ci/cuda/ci_install_dependency.sh
           fi
@@ -83,7 +94,6 @@ jobs:
           if [[ "${{ inputs.runner_label }}" == "1-gpu-5090" ]]; then
             source /etc/profile.d/sglang-ci.sh
           fi
-          cd test/
           # Collect non-empty commands into an array for counting.
           cmds=()
           while IFS= read -r cmd; do
@@ -97,10 +107,17 @@ jobs:
             cmd="${cmds[$idx]}"
             echo ""
             echo "."
-            echo "Begin ($i/$total): python3 $cmd"
-            echo "."
-            file_start=$SECONDS
-            python3 $cmd -f || exit 1
+            if [[ "${{ inputs.install_diffusion }}" == "true" ]]; then
+              echo "Begin ($i/$total): python3 -m pytest $cmd -x"
+              echo "."
+              file_start=$SECONDS
+              python3 -m pytest $cmd -x || exit 1
+            else
+              echo "Begin ($i/$total): python3 $cmd"
+              echo "."
+              file_start=$SECONDS
+              (cd test/ && python3 $cmd -f) || exit 1
+            fi
             elapsed=$(( SECONDS - file_start ))
             echo "."
             echo "End ($i/$total): elapsed=${elapsed}s"
@@ -137,6 +154,12 @@ jobs:
 
       - name: Install uv
         uses: astral-sh/setup-uv@v5
+
+      # Needed by setuptools-rust to build the bundled native gRPC extension
+      # (rust/sglang-grpc) when installing the main `sglang` wheel from source.
+      - name: Install protoc + Rust toolchain
+        timeout-minutes: 10
+        run: bash scripts/ci/utils/install_rust_protoc.sh
 
       - name: Install dependencies
         timeout-minutes: 20

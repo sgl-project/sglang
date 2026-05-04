@@ -4,11 +4,10 @@ import torch
 
 from sglang.srt.managers.schedule_batch import FINISH_ABORT
 from sglang.srt.mem_cache.base_prefix_cache import MatchResult
-from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=12, suite="stage-a-test-cpu")
 
 
 class _FakeAllocator:
@@ -76,6 +75,7 @@ class _FakeReq:
         self.pop_overallocated_calls = 0
         self.to_finish = None
         self.finished_reason = None
+        self.finished_len = None
 
     def pop_committed_kv_cache(self):
         assert not self.kv_committed_freed
@@ -87,36 +87,6 @@ class _FakeReq:
         self.pop_overallocated_calls += 1
         self.kv_overallocated_freed = True
         return self.kv_committed_len, self.kv_allocated_len
-
-
-def test_streaming_release_kv_cache_defers_tail_free(monkeypatch):
-    """Spec tail is NOT trimmed in cache_finished_req; it is deferred to
-    match_prefix's orphan tail free on the next turn. cache_finished_req
-    only sets bookkeeping flags and saves the slot as-is."""
-    page_size = 16
-    req_to_token = torch.arange(128, dtype=torch.int32).reshape(1, 128)
-    req_to_token_pool = SimpleNamespace(req_to_token=req_to_token, free_slots=[])
-    allocator = _FakeAllocator()
-    tree_cache = StreamingSession(
-        _FakeInnerCache(req_to_token_pool, allocator, page_size)
-    )
-    req = _FakeReq("session-a", req_pool_idx=0, committed=17, allocated=40)
-
-    monkeypatch.setattr(
-        "sglang.srt.mem_cache.common.get_global_server_args",
-        lambda: SimpleNamespace(page_size=page_size, speculative_algorithm="eagle"),
-    )
-
-    release_kv_cache(req, tree_cache)
-
-    slot = tree_cache.slots["session-a"]
-    assert req.kv_committed_freed is True
-    assert req.kv_overallocated_freed is True
-    assert req.req_pool_idx is None
-    # Slot keeps the full allocation — tail free is deferred to match_prefix.
-    assert slot.kv_committed_len == 17
-    assert slot.kv_allocated_len == 40
-    assert len(allocator.freed) == 0
 
 
 def test_preabort_detaches_session_and_preserves_slot():
@@ -271,3 +241,11 @@ def test_trim_overshoot_postcondition():
     # Tail [38, 44) freed by _free_kv_aligned.
     assert len(allocator.freed) == 1
     assert allocator.freed[0].tolist() == list(range(38, 44))
+
+
+if __name__ == "__main__":
+    import sys
+
+    import pytest
+
+    sys.exit(pytest.main([__file__, "-v"]))

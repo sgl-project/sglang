@@ -77,6 +77,42 @@ IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD = int(
 IGNORE_EOS_RESERVE_TOKENS = 1
 
 
+def match_prefix_for_req(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    token_ids: Optional[List[int]] = None,
+    *,
+    cow_mamba: bool = False,
+    include_req: bool = False,
+):
+    if token_ids is None:
+        token_ids = req.origin_input_ids + req.output_ids
+
+    match_result = tree_cache.match_prefix(
+        MatchPrefixParams(
+            key=RadixKey(token_ids=token_ids, extra_key=req.extra_key),
+            cow_mamba=cow_mamba,
+            req=req if include_req else None,
+        )
+    )
+    (
+        req.prefix_indices,
+        req.last_node,
+        req.last_host_node,
+        req.host_hit_length,
+    ) = (
+        match_result.device_indices,
+        match_result.last_device_node,
+        match_result.last_host_node,
+        match_result.host_hit_length,
+    )
+    if match_result.mamba_branching_seqlen is not None:
+        req.mamba_branching_seqlen = match_result.mamba_branching_seqlen
+    if match_result.cache_protected_len is not None:
+        req.cache_protected_len = match_result.cache_protected_len
+    return match_result
+
+
 class CacheAwarePolicy(Enum):
     """Scheduling policies that are aware of the tree cache."""
 
@@ -195,23 +231,7 @@ class SchedulePolicy:
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
-            # NOTE: the prefix_indices must always be aligned with last_node
-            match_result = self.tree_cache.match_prefix(
-                MatchPrefixParams(
-                    key=RadixKey(token_ids=prefix_ids, extra_key=extra_key)
-                )
-            )
-            (
-                r.prefix_indices,
-                r.last_node,
-                r.last_host_node,
-                r.host_hit_length,
-            ) = (
-                match_result.device_indices,
-                match_result.last_device_node,
-                match_result.last_host_node,
-                match_result.host_hit_length,
-            )
+            match_result = match_prefix_for_req(self.tree_cache, r, prefix_ids)
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -382,7 +402,7 @@ class PrefillAdder:
         new_token_ratio: float,
         rem_input_tokens: int,
         rem_chunk_tokens: Optional[int],
-        mixed_with_decode_tokens: int = 0,
+        num_mixed_decode_tokens: int = 0,
         priority_scheduling_preemption_threshold: int = 0,
         max_prefill_bs: int = 0,
         max_running_requests: Optional[int] = None,
@@ -395,7 +415,7 @@ class PrefillAdder:
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.running_batch = running_batch
         self.new_token_ratio = new_token_ratio
-        self.rem_input_tokens = rem_input_tokens - mixed_with_decode_tokens
+        self.rem_input_tokens = rem_input_tokens - num_mixed_decode_tokens
         self.rem_chunk_tokens = rem_chunk_tokens
         self.dllm_config = dllm_config
 
@@ -403,9 +423,9 @@ class PrefillAdder:
             self._init_dllm_meta(dllm_config)
 
         if self.rem_chunk_tokens is not None:
-            self.rem_chunk_tokens -= mixed_with_decode_tokens
-        self.rem_total_token_offset = mixed_with_decode_tokens
-        self.cur_rem_token_offset = mixed_with_decode_tokens
+            self.rem_chunk_tokens -= num_mixed_decode_tokens
+        self.rem_total_token_offset = num_mixed_decode_tokens
+        self.cur_rem_token_offset = num_mixed_decode_tokens
 
         self.req_states = None
         self.can_run_list = []
@@ -416,6 +436,7 @@ class PrefillAdder:
         self.log_input_tokens = 0
 
         if running_batch is not None:
+            # Estimate the offset in the remaining token space
             self.rem_total_token_offset += sum(
                 [
                     self._get_running_request_total_token_offset(r)
@@ -631,10 +652,16 @@ class PrefillAdder:
         else:
             _rem_tokens = min(self.rem_chunk_tokens, int(self.rem_total_tokens))
             if self.is_hybrid_swa:
-                _rem_tokens = min(_rem_tokens, int(self.rem_swa_tokens))
+                # alloc_extend needs extend_num_tokens + page_size per request,
+                # so reserve one page here to avoid OOM
+                _rem_tokens = min(
+                    _rem_tokens, int(self.rem_swa_tokens) - self.page_size
+                )
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:
+                if self.is_hybrid_swa:
+                    return req
                 _rem_tokens = self.rem_chunk_tokens
 
         truncated = req.extend_input_len > _rem_tokens

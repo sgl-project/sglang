@@ -45,6 +45,7 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.mistral import MistralForCausalLMMistralFormat
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
 
 USE_XFORMERS_OPS = False
@@ -94,10 +95,21 @@ class PixtralForConditionalGeneration(nn.Module):
 
         self.vision_args = VisionEncoderArgs(**vision_args)
 
-        self.language_model = MistralLarge3ForCausalLM(
-            config=self.config.text_config,
-            quant_config=kwargs.get("quant_config"),
-        )
+        # Choose language model based on text architecture:
+        # MLA text configs use DeepSeek V3 backbone (model_type="deepseek_v3"),
+        # GQA text configs use the standard Llama-style Mistral backbone.
+        text_config = self.config.text_config
+        is_mla = getattr(text_config, "model_type", "") == "deepseek_v3"
+        if is_mla:
+            self.language_model = MistralLarge3ForCausalLM(
+                config=text_config,
+                quant_config=kwargs.get("quant_config"),
+            )
+        else:
+            self.language_model = MistralForCausalLMMistralFormat(
+                config=text_config,
+                quant_config=kwargs.get("quant_config"),
+            )
 
         self.vision_encoder = VisionTransformer(self.vision_args)
 

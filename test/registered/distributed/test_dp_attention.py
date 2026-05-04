@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=446, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=524, suite="stage-b-test-2-gpu-large")
 
 
 class TestDPAttentionDP2TP2(
@@ -66,6 +66,38 @@ class TestDPAttentionDP2TP2(
     def tearDownClass(cls):
         kill_process_tree(cls.process.pid)
         cls._env_override.__exit__(None, None, None)
+
+
+class TestDPAttentionMixedChunk(
+    CustomTestCase,
+    GSM8KMixin,
+):
+    gsm8k_accuracy_thres = 0.6
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = DEFAULT_MLA_MODEL_NAME_FOR_TEST
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=[
+                "--trust-remote-code",
+                "--tp",
+                "2",
+                "--enable-dp-attention",
+                "--dp",
+                "2",
+                "--enable-mixed-chunk",
+                "--chunked-prefill-size",
+                "256",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
 
 
 class TestDPRetract(
