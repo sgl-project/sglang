@@ -6192,6 +6192,247 @@ def summarize_relaykv_actual_req_to_token_pool_adapter_payloads_for_smoke(
     }
 
 
+def build_relaykv_req_to_token_runtime_inspection_payloads_for_smoke(
+    forward_batch_like: Any = None,
+    req_to_token_pool: Any = None,
+    inspect_req_to_token: bool = False,
+) -> list[dict[str, Any]]:
+    """Build metadata-only req_to_token runtime inspection payloads for smoke."""
+
+    request_id = None
+    layer_id = None
+    batch_id = None
+    blocking_reasons: list[str] = []
+
+    if forward_batch_like is not None and isinstance(forward_batch_like, dict):
+        request_id = forward_batch_like.get("request_id")
+        layer_id = forward_batch_like.get("layer_id")
+        batch_id = forward_batch_like.get("batch_id")
+        if forward_batch_like.get("token_to_kv_pool_read") is True:
+            blocking_reasons.append("token_to_kv_pool_read_not_allowed")
+        if forward_batch_like.get("kv_pool_read") is True:
+            blocking_reasons.append("kv_pool_read_not_allowed")
+        if forward_batch_like.get("tensor_read") is True:
+            blocking_reasons.append("tensor_read_not_allowed")
+        if forward_batch_like.get("attention_comparison_executed") is True:
+            blocking_reasons.append("attention_comparison_executed_not_allowed")
+        if forward_batch_like.get("attention_override") is True:
+            blocking_reasons.append("attention_override_true_not_allowed")
+
+    req_to_token_attr_present = False
+    req_to_token_attr_observed = False
+    req_to_token_type = None
+    req_to_token_module = None
+    req_to_token_qualname = None
+    req_to_token_shape = None
+    req_to_token_device = None
+    req_to_token_dtype = None
+
+    if inspect_req_to_token is not True:
+        blocking_reasons.append("inspect_req_to_token_not_enabled")
+    elif req_to_token_pool is None:
+        blocking_reasons.append("req_to_token_pool_missing")
+    else:
+        try:
+            req_to_token = getattr(req_to_token_pool, "req_to_token", None)
+        except Exception:
+            blocking_reasons.append("req_to_token_attr_access_failed")
+            req_to_token = None
+        else:
+            if req_to_token is None:
+                blocking_reasons.append("req_to_token_attr_missing")
+            else:
+                req_to_token_attr_present = True
+                req_to_token_attr_observed = True
+                req_to_token_type = type(req_to_token).__name__
+                req_to_token_module = type(req_to_token).__module__
+                req_to_token_qualname = type(req_to_token).__qualname__
+                req_to_token_shape = getattr(req_to_token, "shape", None)
+                req_to_token_device = getattr(req_to_token, "device", None)
+                req_to_token_dtype = getattr(req_to_token, "dtype", None)
+
+    blocking_reasons = list(dict.fromkeys(blocking_reasons))
+    inspection_state = "metadata_observed" if not blocking_reasons else "blocked"
+
+    payload = {
+        "event_type": "relaykv_req_to_token_runtime_inspection_payload",
+        "inspection_state": inspection_state,
+        "inspection_mode": "metadata_only",
+        "source": "req_to_token_pool_to_runtime_inspection_payload",
+        "request_id": request_id,
+        "layer_id": layer_id,
+        "batch_id": batch_id,
+        "metadata_observed": not blocking_reasons,
+        "req_to_token_attr_present": req_to_token_attr_present,
+        "req_to_token_attr_observed": req_to_token_attr_observed,
+        "actual_req_to_token_pool_inspection": not blocking_reasons,
+        "req_to_token_type": req_to_token_type,
+        "req_to_token_module": req_to_token_module,
+        "req_to_token_qualname": req_to_token_qualname,
+        "req_to_token_shape": req_to_token_shape,
+        "req_to_token_device": req_to_token_device,
+        "req_to_token_dtype": req_to_token_dtype,
+        "req_to_token_read": False,
+        "req_to_token_read_count": 0,
+        "actual_req_to_token_pool_read": False,
+        "actual_req_to_token_pool_read_count": 0,
+        "token_to_kv_pool_read": False,
+        "token_to_kv_pool_read_count": 0,
+        "kv_pool_read": False,
+        "kv_snapshot": False,
+        "tensor_read": False,
+        "attention_comparison_executed": False,
+        "attention_override": False,
+        "runtime_writeback": False,
+        "scheduler_policy_noop": True,
+        "kv_cache_mutation": False,
+        "source_mutated": False,
+        "blocking_reasons": blocking_reasons,
+        "warning_reasons": [
+            "req_to_token_metadata_only_inspection",
+            "no_req_to_token_values_read",
+            "no_token_to_kv_pool_read",
+        ],
+    }
+    return [payload]
+
+
+def summarize_relaykv_req_to_token_runtime_inspection_payloads_for_smoke(
+    payloads: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize metadata-only req_to_token runtime inspection payloads."""
+
+    if not isinstance(payloads, (list, tuple)):
+        raise TypeError(
+            "RelayKV req_to_token runtime inspection payloads must be a list or tuple"
+        )
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_inspection_state: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "metadata_observed_count": 0,
+            "req_to_token_attr_present_count": 0,
+            "actual_req_to_token_pool_inspection_count": 0,
+            "req_to_token_attr_observed_count": 0,
+            "req_to_token_read_count": 0,
+            "actual_req_to_token_pool_read_count": 0,
+            "token_to_kv_pool_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    blocked_count = 0
+    error_count = 0
+
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            raise TypeError(
+                "RelayKV req_to_token runtime inspection payload must be a dict"
+            )
+
+        state = str(payload.get("inspection_state") or "unknown")
+        per_inspection_state[state] += 1
+        per_request[str(payload.get("request_id"))] += 1
+        per_layer[str(payload.get("layer_id"))] += 1
+
+        if state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+
+        if payload.get("metadata_observed") is True:
+            safety_counts["metadata_observed_count"] += 1
+        if payload.get("req_to_token_attr_present") is True:
+            safety_counts["req_to_token_attr_present_count"] += 1
+        if payload.get("actual_req_to_token_pool_inspection") is True:
+            safety_counts["actual_req_to_token_pool_inspection_count"] += 1
+        if payload.get("req_to_token_attr_observed") is True:
+            safety_counts["req_to_token_attr_observed_count"] += 1
+
+        value = payload.get("req_to_token_read_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            safety_counts["req_to_token_read_count"] += value
+        value = payload.get("actual_req_to_token_pool_read_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            safety_counts["actual_req_to_token_pool_read_count"] += value
+        value = payload.get("token_to_kv_pool_read_count")
+        if isinstance(value, int) and not isinstance(value, bool):
+            safety_counts["token_to_kv_pool_read_count"] += value
+        if payload.get("kv_pool_read") is True:
+            safety_counts["kv_pool_read_count"] += 1
+        if payload.get("kv_snapshot") is True:
+            safety_counts["kv_snapshot_count"] += 1
+        if payload.get("tensor_read") is True:
+            safety_counts["tensor_read_count"] += 1
+        if payload.get("attention_comparison_executed") is True:
+            safety_counts["attention_comparison_executed_count"] += 1
+        if payload.get("attention_override") is True:
+            safety_counts["attention_override_true_count"] += 1
+        if payload.get("runtime_writeback") is True:
+            safety_counts["runtime_writeback_true_count"] += 1
+        if payload.get("scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+        if payload.get("kv_cache_mutation") is True:
+            safety_counts["kv_cache_mutation_true_count"] += 1
+        if payload.get("source_mutated") is True:
+            safety_counts["source_mutated_true_count"] += 1
+
+    return {
+        "summary_type": "relaykv_req_to_token_runtime_inspection_payload_summary",
+        "total_req_to_token_runtime_inspection_payloads": len(payloads),
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_inspection_state_counts": dict(sorted(per_inspection_state.items())),
+        "metadata_observed_count": safety_counts["metadata_observed_count"],
+        "req_to_token_attr_present_count": (
+            safety_counts["req_to_token_attr_present_count"]
+        ),
+        "actual_req_to_token_pool_inspection_count": (
+            safety_counts["actual_req_to_token_pool_inspection_count"]
+        ),
+        "req_to_token_attr_observed_count": (
+            safety_counts["req_to_token_attr_observed_count"]
+        ),
+        "req_to_token_read_count": safety_counts["req_to_token_read_count"],
+        "actual_req_to_token_pool_read_count": (
+            safety_counts["actual_req_to_token_pool_read_count"]
+        ),
+        "token_to_kv_pool_read_count": (
+            safety_counts["token_to_kv_pool_read_count"]
+        ),
+        "kv_pool_read_count": safety_counts["kv_pool_read_count"],
+        "kv_snapshot_count": safety_counts["kv_snapshot_count"],
+        "tensor_read_count": safety_counts["tensor_read_count"],
+        "attention_comparison_executed_count": (
+            safety_counts["attention_comparison_executed_count"]
+        ),
+        "attention_override_true_count": (
+            safety_counts["attention_override_true_count"]
+        ),
+        "runtime_writeback_true_count": (
+            safety_counts["runtime_writeback_true_count"]
+        ),
+        "scheduler_policy_noop_false_count": (
+            safety_counts["scheduler_policy_noop_false_count"]
+        ),
+        "kv_cache_mutation_true_count": (
+            safety_counts["kv_cache_mutation_true_count"]
+        ),
+        "source_mutated_true_count": safety_counts["source_mutated_true_count"],
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
