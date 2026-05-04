@@ -57,6 +57,8 @@ on:
           - nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp-rocm720
           - nightly-perf-8-gpu-mi35x-deepseek-v32-basic-rocm720
           - nightly-perf-8-gpu-mi35x-deepseek-v32-mtp-rocm720
+          - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
+          - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
           - nightly-8-gpu-mi35x-kimi-k25-rocm720
           - nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720
           - nightly-8-gpu-mi35x-qwen35-rocm720
@@ -92,13 +94,16 @@ on:
 
 env:
   AITER_COMMIT_OVERRIDE: ${{ inputs.aiter_ref }}
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
 
 concurrency:
   # When called via workflow_call with ref set, use a unique group per caller run to avoid
   # collisions with direct schedule/push triggers. We use inputs.ref (not github.event_name)
   # to detect this, because github.event_name inherits from the caller in workflow_call.
-  group: nightly-test-amd-rocm720-${{ inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
-  cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' }}
+  # Manual dispatch runs also get unique groups so they never cancel each other.
+  group: nightly-test-amd-rocm720-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || inputs.ref && format('caller-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: ${{ !inputs.ref && github.event_name != 'workflow_call' && github.event_name != 'workflow_dispatch' }}
 
 jobs:
   # ============================================== MI30x ROCm 7.2 Unit Tests ==============================================
@@ -110,7 +115,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -139,7 +144,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -167,7 +172,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -196,7 +201,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -226,7 +231,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -257,7 +262,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -287,7 +292,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -327,7 +332,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -370,7 +375,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -413,7 +418,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -456,7 +461,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -497,7 +502,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -538,7 +543,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -568,7 +573,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -598,7 +603,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -628,7 +633,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -672,7 +677,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -716,7 +721,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -760,7 +765,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -800,7 +805,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -829,7 +834,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -861,7 +866,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -907,7 +912,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -953,7 +958,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -997,7 +1002,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1041,7 +1046,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1085,7 +1090,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1118,7 +1123,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1151,7 +1156,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1184,7 +1189,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1217,7 +1222,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1250,7 +1255,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1295,7 +1300,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1339,7 +1344,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1385,7 +1390,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.ref || github.ref }}
+          ref: ${{ inputs.ref || github.sha }}
 
       - name: Setup docker (ROCm 7.2)
         run: |
@@ -1407,6 +1412,142 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-deepseek-v32-mtp --nightly --timeout-per-file 7200 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # MI35x 8-GPU DeepSeek-V4-Flash FP8 + FP4 (Accuracy + Performance combined) ROCm 7.2
+  # NOTE on runtime sourcing: the DSv4 docker image (tag suffix `-DSv4`) bakes
+  # in sglang built from a specific commit of the amd/deepseek_v4 branch (the
+  # 7-char sha in the image tag is that commit). To keep the runtime as exactly
+  # that image-frozen sglang/aiter, we pass `--skip-sglang-build` and
+  # `--skip-aiter-build` so install_dependency.sh does NOT `pip install -e
+  # /sglang-checkout/python` (which would override the image's sglang with
+  # whatever this checkout happens to be) and does NOT rebuild aiter from this
+  # checkout's docker/rocm.Dockerfile. The /sglang-checkout mount is still used
+  # for shell scripts and for run_suite.py discovering test files; it does not
+  # poison Python imports because the image's site-packages .pth points at
+  # /sgl-workspace/sglang/python (a different path).
+  nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Resolve DSv4 image tag
+        id: dsv4_image
+        run: |
+          # Pick the latest Docker Hub tag matching rocm720-mi35x-<sha7>-<YYYYMMDD>-DSv4.
+          # Docker Hub returns results sorted by last_updated DESC by default, so the
+          # first regex match is the most recent daily build.
+          AUTH_HEADER=()
+          if [[ -n "${DOCKERHUB_AMD_USERNAME:-}" && -n "${DOCKERHUB_AMD_TOKEN:-}" ]]; then
+            TOKEN=$(curl -s -H "Content-Type: application/json" \
+              -X POST -d "{\"username\":\"${DOCKERHUB_AMD_USERNAME}\",\"password\":\"${DOCKERHUB_AMD_TOKEN}\"}" \
+              https://hub.docker.com/v2/users/login/ | python3 -c "import json,sys; print(json.load(sys.stdin).get('token',''))")
+            if [[ -n "$TOKEN" ]]; then
+              AUTH_HEADER=(-H "Authorization: JWT $TOKEN")
+            fi
+          fi
+          TAG=$(curl -s "${AUTH_HEADER[@]}" \
+            "https://hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=DSv4" \
+            | grep -oE '"name":"rocm720-mi35x-[a-f0-9]{7}-[0-9]{8}-DSv4"' \
+            | head -n 1 | cut -d'"' -f4)
+          if [ -z "$TAG" ]; then
+            echo "::error::No DSv4 image found matching rocm720-mi35x-<sha7>-<YYYYMMDD>-DSv4 on Docker Hub"
+            exit 1
+          fi
+          echo "image=rocm/sgl-dev:$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved DSv4 image: rocm/sgl-dev:$TAG"
+
+      - name: Setup docker (ROCm 7.2 DSv4)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --custom-image ${{ steps.dsv4_image.outputs.image }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies (preserve DSv4 sglang/aiter from image)
+        run: |
+          # --skip-sglang-build: keep the image's pre-installed DSv4 sglang
+          #   (default would `pip install -e /sglang-checkout/python` and clobber it with main's source).
+          # --skip-aiter-build: keep the image's DSv4-tuned aiter
+          #   (default reads /sglang-checkout/docker/rocm.Dockerfile from main and rebuilds aiter to that commit).
+          # --skip-test-time-deps: GSM8K + bench_one_batch_server don't need lmms-eval / human-eval.
+          bash scripts/ci/amd/amd_ci_install_dependency.sh \
+            --skip-sglang-build --skip-aiter-build --skip-test-time-deps
+          # tabulate is the only thing run_suite.py imports that may not be in the DSv4 image.
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Flash FP8 + FP4)
+        timeout-minutes: 300
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-flash --nightly --timeout-per-file 7200 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
+          echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          exit ${TEST_EXIT_CODE:-0}
+
+  # MI35x 8-GPU DeepSeek-V4-Pro FP8 + FP4 (Accuracy + Performance combined) ROCm 7.2
+  # Pro is 1.6T (vs Flash 285B); load + warmup is much longer, so timeout-per-file
+  # and the job timeout are both larger than the Flash job.
+  # Same image / branch / install strategy as the Flash job above — see the comment
+  # block on `nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720` for the rationale.
+  nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720:
+    if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720,'))
+    runs-on: linux-mi35x-gpu-8
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+
+      - name: Resolve DSv4 image tag
+        id: dsv4_image
+        run: |
+          AUTH_HEADER=()
+          if [[ -n "${DOCKERHUB_AMD_USERNAME:-}" && -n "${DOCKERHUB_AMD_TOKEN:-}" ]]; then
+            TOKEN=$(curl -s -H "Content-Type: application/json" \
+              -X POST -d "{\"username\":\"${DOCKERHUB_AMD_USERNAME}\",\"password\":\"${DOCKERHUB_AMD_TOKEN}\"}" \
+              https://hub.docker.com/v2/users/login/ | python3 -c "import json,sys; print(json.load(sys.stdin).get('token',''))")
+            if [[ -n "$TOKEN" ]]; then
+              AUTH_HEADER=(-H "Authorization: JWT $TOKEN")
+            fi
+          fi
+          TAG=$(curl -s "${AUTH_HEADER[@]}" \
+            "https://hub.docker.com/v2/repositories/rocm/sgl-dev/tags?page_size=100&name=DSv4" \
+            | grep -oE '"name":"rocm720-mi35x-[a-f0-9]{7}-[0-9]{8}-DSv4"' \
+            | head -n 1 | cut -d'"' -f4)
+          if [ -z "$TAG" ]; then
+            echo "::error::No DSv4 image found matching rocm720-mi35x-<sha7>-<YYYYMMDD>-DSv4 on Docker Hub"
+            exit 1
+          fi
+          echo "image=rocm/sgl-dev:$TAG" >> "$GITHUB_OUTPUT"
+          echo "Resolved DSv4 image: rocm/sgl-dev:$TAG"
+
+      - name: Setup docker (ROCm 7.2 DSv4)
+        run: |
+          touch github_summary.md
+          bash scripts/ci/amd/amd_ci_start_container.sh --custom-image ${{ steps.dsv4_image.outputs.image }}
+        env:
+          GITHUB_WORKSPACE: ${{ github.workspace }}
+
+      - name: Install dependencies (preserve DSv4 sglang/aiter from image)
+        run: |
+          bash scripts/ci/amd/amd_ci_install_dependency.sh \
+            --skip-sglang-build --skip-aiter-build --skip-test-time-deps
+          bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
+
+      - name: Accuracy + Performance Test MI35x ROCm 7.2 (8-GPU DeepSeek-V4-Pro FP8 + FP4)
+        timeout-minutes: 480
+        run: |
+          > github_summary.md  # Clear summary file
+          bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
+            -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
+            python3 run_suite.py --hw amd --suite nightly-amd-8-gpu-mi35x-deepseek-v4-pro --nightly --timeout-per-file 14400 ${{ inputs.continue_on_error && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
@@ -1450,6 +1591,8 @@ jobs:
       - nightly-accuracy-8-gpu-mi35x-deepseek-v32-mtp-rocm720
       - nightly-perf-8-gpu-mi35x-deepseek-v32-basic-rocm720
       - nightly-perf-8-gpu-mi35x-deepseek-v32-mtp-rocm720
+      - nightly-8-gpu-mi35x-deepseek-v4-flash-rocm720
+      - nightly-8-gpu-mi35x-deepseek-v4-pro-rocm720
       - nightly-8-gpu-mi35x-kimi-k25-rocm720
       - nightly-8-gpu-mi35x-qwen3-235b-mxfp4-rocm720
       - nightly-8-gpu-mi35x-qwen35-rocm720
