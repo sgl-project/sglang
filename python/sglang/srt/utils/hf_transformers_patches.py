@@ -222,7 +222,19 @@ def _patch_removed_symbols():
     """
     # LlamaFlashAttention2
     try:
-        from transformers.models.llama import modeling_llama
+        import logging
+
+        # Importing modeling_llama triggers a deep import chain:
+        #   modeling_llama -> modeling_utils -> quantizers -> torchao
+        # torchao emits a noisy warning about incompatible torch versions
+        # that is irrelevant here — suppress it during this import.
+        _torchao_logger = logging.getLogger("torchao")
+        _prev_level = _torchao_logger.level
+        _torchao_logger.setLevel(logging.ERROR)
+        try:
+            from transformers.models.llama import modeling_llama
+        finally:
+            _torchao_logger.setLevel(_prev_level)
 
         if not hasattr(modeling_llama, "LlamaFlashAttention2"):
             if hasattr(modeling_llama, "LlamaAttention"):

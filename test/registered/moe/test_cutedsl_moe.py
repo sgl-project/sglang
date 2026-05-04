@@ -581,7 +581,7 @@ class TestCuteDslV2(unittest.TestCase):
 
         Also checks both match the pure-PyTorch reference, and that a second
         cuda_graph pass reuses buffers deterministically (subsumes the former
-        cuda_graph_smoke test).
+        cuda_graph check).
         """
         test_cases = [
             # (num_tokens, hidden_size, intermediate_size, num_experts, top_k)
