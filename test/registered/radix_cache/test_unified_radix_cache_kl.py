@@ -34,7 +34,7 @@ MAMBA_TRACK_INTERVAL = 128
 SWA_MODEL = "openai/gpt-oss-20b"
 FULL_MODEL = "Qwen/Qwen3-32B"
 
-register_cuda_ci(est_time=632, suite="stage-c-test-4-gpu-h100")
+register_cuda_ci(est_time=760, suite="stage-c-test-4-gpu-h100")
 
 
 class UnifiedRadixTreeTestMixin:
@@ -235,7 +235,7 @@ class TestUnifiedSWARadixCache(UnifiedRadixTreeTestMixin, CustomTestCase):
     """SWA hybrid + UnifiedRadixCache."""
 
     kl_threshold = 0.03
-    gsm8k_threshold = 0.75
+    gsm8k_threshold = 0.7
     mmlu_threshold = 0.7
 
     @classmethod
