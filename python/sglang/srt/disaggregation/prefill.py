@@ -54,7 +54,7 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 

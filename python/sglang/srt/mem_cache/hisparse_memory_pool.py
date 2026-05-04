@@ -10,7 +10,7 @@ from sglang.srt.mem_cache.allocator import (
     BaseTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.deepseekv4_memory_pool import (
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
     HiSparseC4DevicePool,
 )

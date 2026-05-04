@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
 from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v4 import Compressor, DeepseekRefRMSNorm
 

@@ -40,7 +40,7 @@ from sglang.srt.layers.attention.triton_ops.compressed_metadata import (
     init_compressed_metadata as _init_compressed_metadata_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
-from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import ceil_align
