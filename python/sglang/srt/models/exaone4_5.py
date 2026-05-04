@@ -74,6 +74,15 @@ _is_cuda = is_cuda()
 logger = logging.getLogger(__name__)
 
 
+# Aligned with HF's implementation, using sliding window inclusive with the last token
+# SGLang assumes exclusive
+def get_attention_sliding_window_size(config):
+    if getattr(config, "sliding_window", None) is not None:
+        return config.sliding_window - 1
+    else:
+        return None
+
+
 class Exaone4_5_MLP(nn.Module):
     def __init__(
         self,
@@ -779,6 +788,9 @@ class Exaone4_5_ForConditionalGeneration(nn.Module):
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
+
+    def get_attention_sliding_window_size(self):
+        return get_attention_sliding_window_size(self.config)
 
     def load_weights(
         self, weights: Iterable[Tuple[str, torch.Tensor]], is_mtp: bool = False
