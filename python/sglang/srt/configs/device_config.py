@@ -3,6 +3,8 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.platforms import current_platform
+
 logger = logging.getLogger(__name__)
 
 SUPPORTED_DEVICES = ["cuda", "xpu", "hpu", "cpu", "npu", "musa", "mps"]
@@ -16,8 +18,7 @@ class DeviceConfig:
         if device in SUPPORTED_DEVICES:
             self.device_type = device
         else:
-            from sglang.srt.platforms import current_platform
-
+            # TODO: Fold OOT device validation into the platform abstraction.
             if (
                 current_platform.is_out_of_tree()
                 and device == current_platform.device_name
