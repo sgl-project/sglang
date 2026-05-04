@@ -717,10 +717,24 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
 
     @classmethod
     def _init_visual(cls):
+        import glob
+        import os
+
         import torch.nn as nn
         import torch.nn.functional as F
         from transformers import AutoConfig
 
+        from sglang.srt.model_loader.weight_utils import (
+            download_weights_from_hf,
+            pt_weights_iterator,
+        )
+
+        # Construct a custom VisionTower class here because there is no remote code
+        # available on Huggingface Hub for (https://huggingface.co/deepseek-ai/Janus-Pro-7B/tree/main).
+        # Hence, ``AutoModel.from_pretrained`` can't be used.
+        #
+        # Reuse some components from ``sglang.srt.models.deepseek_janus_pro`` as
+        # some parts of the code are ported from the official repository.
         from sglang.srt.models.deepseek_janus_pro import (
             CLIPVisionTower,
             DropPath,
@@ -732,6 +746,13 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
             VisionTransformer,
         )
 
+        # Rewrite the embeddings computation parts that involve attention to
+        # make it not depend on QKVParallelLinear / RowParallelLinear /
+        # tensor-parallel state which are unavailable outside the engine
+        # runtime.
+        #
+        # The code is adapted from the official ``deepseek-ai/Janus`` repository
+        # (https://github.com/deepseek-ai/Janus/tree/main).
         class Attention(nn.Module):
             fused_attn: bool
 
@@ -790,7 +811,7 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
                 x = self.proj_drop(x)
                 return x
 
-        class Block(nn.Module):
+        class AttentionBlock(nn.Module):
             def __init__(
                 self,
                 dim: int,
@@ -847,7 +868,7 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
                 x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
                 return x
 
-        class CLIPVisionTowerWrapper(CLIPVisionTower):
+        class VisionTower(CLIPVisionTower):
             def __init__(
                 self,
                 model_name: str = "siglip_large_patch16_384",
@@ -873,6 +894,10 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
                 )
 
             def build_vision_tower(self, vision_tower_params):
+                # We already know that the configs from https://huggingface.co/deepseek-ai/Janus-Pro-7B/blob/main/config.json#L49
+                # SigLIP is used. For this test, to avoid unnecessary code,
+                # We override the ``build_vision_tower`` method to construct
+                # ``VisionTransformer``.
                 self.select_feature = "same"
                 model_name = vision_tower_params.get(
                     "model_name", "siglip_so400m_patch14_384"
@@ -899,22 +924,9 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
                     ignore_head=vision_tower_params.get("ignore_head", True),
                     weight_init=vision_tower_params.get("weight_init", "skip"),
                     num_classes=0,
-                    block_fn=Block,
+                    # Force to use testing custom ``AttentionBlock``
+                    block_fn=AttentionBlock,
                 )
-
-                ckpt_path = vision_tower_params.get("ckpt_path")
-                if ckpt_path:
-                    state_dict = torch.load(
-                        ckpt_path, map_location="cpu", weights_only=True
-                    )
-
-                    incompatible_keys = vision_tower.load_state_dict(
-                        state_dict, strict=False
-                    )
-                    print(
-                        f"SigLIP-ViT restores from {ckpt_path},\n"
-                        f"\tincompatible_keys:', {incompatible_keys}."
-                    )
 
                 forward_kwargs = dict()
                 return vision_tower, forward_kwargs
@@ -922,42 +934,24 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         config = AutoConfig.from_pretrained(cls.model_path)
         vision_config = config.vision_config
 
-        cls.vision_model = (
-            CLIPVisionTowerWrapper(**vision_config.params).eval().to(cls.device)
-        )
+        cls.vision_model = VisionTower(**vision_config.params).eval().to(cls.device)
 
         aligner_config = config.aligner_config
         cls.aligner = MlpProjector(aligner_config.params).eval().to(cls.device)
 
-        # Reuse SGLang's loader helpers so the test mirrors the engine's
-        # download path: HfFileSystem listing + pattern auto-selection +
-        # cache reuse. Janus-Pro ships only pytorch_model-*.bin on the Hub,
-        # so download_weights_from_hf will narrow allow_patterns to "*.bin".
-        # MultiModalityCausalLM stores vision_model.* and aligner.* at the
-        # top level (see deepseek_janus_pro.py:1933, 1937); strip the prefix
-        # and discard gen_*/language_model.*.
-        import glob
-        import os
-
-        from sglang.srt.model_loader.weight_utils import (
-            download_weights_from_hf,
-            pt_weights_iterator,
-            safetensors_weights_iterator,
-        )
+        # Load weights to vision tower and aligner
 
         hf_folder = download_weights_from_hf(
             cls.model_path,
             cache_dir=None,
-            allow_patterns=["*.safetensors", "*.bin"],
+            # Janus-Pro ships only *.bin on the hub
+            allow_patterns=["*.bin"],
         )
 
-        shard_files = sorted(glob.glob(os.path.join(hf_folder, "*.safetensors")))
-        if shard_files:
-            iterator = safetensors_weights_iterator(shard_files)
-        else:
-            shard_files = sorted(glob.glob(os.path.join(hf_folder, "*.bin")))
-            assert shard_files, f"No weight shards in {hf_folder}"
-            iterator = pt_weights_iterator(shard_files)
+        shard_files = sorted(glob.glob(os.path.join(hf_folder, "*.bin")))
+        if not shard_files:
+            raise RuntimeError(f"No .bin weight shards found in {hf_folder}")
+        iterator = pt_weights_iterator(shard_files)
 
         vision_state, aligner_state = {}, {}
         for name, tensor in iterator:
@@ -968,8 +962,11 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
 
         miss_v, _ = cls.vision_model.load_state_dict(vision_state, strict=False)
         miss_a, _ = cls.aligner.load_state_dict(aligner_state, strict=False)
-        assert not miss_v, f"vision_model missing weights: {miss_v[:5]}"
-        assert not miss_a, f"aligner missing weights: {miss_a[:5]}"
+
+        if miss_v:
+            raise RuntimeError(f"vision_model missing weights: {miss_v[:5]}")
+        if miss_a:
+            raise RuntimeError(f"aligner missing weights: {miss_a[:5]}")
 
         def visual_func(processor_output):
             pixel_values = processor_output["pixel_values"]
@@ -977,12 +974,9 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
             pixel_values = pixel_values.to(
                 device=cls.vision_model.device, dtype=cls.vision_model.dtype
             )
+
             images = rearrange(pixel_values, "b n c h w -> (b n) c h w")
-
-            # [b x n, T2, D]
             images_embeds = cls.aligner(cls.vision_model(images))
-
-            # [b x n, T2, D] -> [b, n x T2, D]
             images_embeds = rearrange(
                 images_embeds, "(b n) t d -> b (n t) d", b=bs, n=n
             )
@@ -1000,7 +994,8 @@ class TestJanusProUnderstandsImage(VLMInputTestBase, unittest.IsolatedAsyncioTes
         conv = generate_chat_conv(req, template_name=self.chat_template)
         text = conv.get_prompt()
 
-        # Process inputs using processor
+        # Unlike other processors, ``VLChatProcessor`` takes the argument ``prompt``
+        # instead of ``text``
         inputs = self.processor(
             prompt=text,
             images=self.main_image,
