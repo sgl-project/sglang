@@ -1889,7 +1889,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             # returned post should be [n, hc_mult]
             return y, post.squeeze(-1), comb
 
-        if envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
+        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
             from aiter.ops.mhc import mhc_pre
 
             post, comb, y = mhc_pre(
@@ -1962,7 +1962,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             result = mhc_post(x, residual, post, comb)
             return result
 
-        elif envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
+        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
             from aiter.ops.mhc import mhc_post
 
             result = torch.empty_like(residual)
