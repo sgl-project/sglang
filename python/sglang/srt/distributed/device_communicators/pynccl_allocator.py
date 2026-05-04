@@ -291,7 +291,7 @@ class SymmetricMemoryContext:
         _cuda_releasePool(self._device_index, self._pool_id)
         # Register all unregistered segments
         # with the current comm
-        self._register_segments_for_comm()    
+        self._register_segments_for_comm()
 
         if self.is_graph_capture:
             if after_2_8_0:
