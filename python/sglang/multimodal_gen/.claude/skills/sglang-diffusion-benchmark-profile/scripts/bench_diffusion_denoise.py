@@ -313,7 +313,8 @@ MODELS = {
             "--dit-cpu-offload",
             "false",
             "--num-gpus=2",
-            "--ulysses-degree=2",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=1",
         ],
     },
     # 17. Skill-only extra preset
@@ -332,7 +333,8 @@ MODELS = {
             "--dit-cpu-offload",
             "false",
             "--num-gpus=2",
-            "--ulysses-degree=2",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=1",
         ],
     },
     # 18. Skill-only extra preset
@@ -350,6 +352,9 @@ MODELS = {
             "false",
             "--dit-cpu-offload",
             "false",
+            "--num-gpus=2",
+            "--enable-cfg-parallel",
+            "--ulysses-degree=1",
         ],
     },
     # 19. Skill-only extra preset
@@ -383,6 +388,7 @@ def required_gpus_for_model(model_key: str) -> int:
         "ltx23-ti2v-two-stage",
         "ltx23-one-stage",
         "ltx23-two-stage",
+        "joyai-edit",
         "firered-edit-1.0",
         "firered-edit-1.1",
     }:

@@ -163,6 +163,7 @@ sglang generate --backend=sglang \
   --image-path "${ASSET_DIR}/cat.png" \
   --width 1024 --height 1024 \
   --num-inference-steps 40 --guidance-scale 4.0 \
+  --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 \
   --dit-layerwise-offload false --dit-cpu-offload false \
   --enable-torch-compile --warmup --save-output
 ```
@@ -174,16 +175,17 @@ sglang generate --backend=sglang \
   --image-path "${ASSET_DIR}/cat.png" \
   --width 1024 --height 1024 \
   --num-inference-steps 40 --guidance-scale 4.0 \
-  --num-gpus 2 --ulysses-degree 2 \
+  --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 \
   --dit-layerwise-offload false --dit-cpu-offload false \
   --enable-torch-compile --warmup --save-output
 ```
 
 Use `FireRedTeam/FireRed-Image-Edit-1.0` in the same command when comparing
 FireRed 1.0. These are native image-edit paths; keep the reference image, prompt,
-seed, and output size fixed when comparing denoise numbers. On H100, the
-2-GPU Ulysses command reduced FireRed 1.0 40-step denoise latency from
-22964.51 ms to 15768.81 ms compared with the otherwise matching 1-GPU command.
+seed, and output size fixed when comparing denoise numbers. On H100, 2-GPU CFG
+parallel was faster than the otherwise matching 2-GPU Ulysses command: FireRed
+1.0 improved from 13419.15 ms to 10955.90 ms, and FireRed 1.1 improved from
+13414.72 ms to 10934.21 ms.
 
 ### Hunyuan3D shape baseline
 
@@ -256,8 +258,8 @@ Use these as first commands to benchmark, not as universal winners.
 | Wan2.2 TI2V 5B | 720p, 81 frames, 1 GPU | `--enable-torch-compile --warmup` | Keep the input image and motion prompt fixed when comparing sparse attention or Cache-DiT. |
 | LTX-2 / LTX-2.3 | 768x512, 121 frames, 2 GPUs | `--pipeline-class-name LTX2TwoStagePipeline --enable-torch-compile --warmup`; LTX-2 nightly also uses `--enable-cfg-parallel` | Use the benchmark/profile skill presets for exact nightly alignment. PRs #22441, #24025, and #23736 track additional LTX2 perf/parallel work. |
 | HunyuanVideo | 848x480 or 720p class video | `--text-encoder-cpu-offload --pin-cpu-memory --enable-torch-compile --warmup` | Check VAE decode separately. GroupNorm+SiLU is default-eligible in mainline when wrapper guards pass; use `bench_group_norm_silu.py` when VAE residual blocks are hot. |
-| JoyAI-Image-Edit | 1024-class TI2I, 40 steps, guidance 4.0 | Start from the CI/default TI2I path for `jdopensource/JoyAI-Image-Edit-Diffusers`; add `--warmup`, pin `--dit-layerwise-offload false --dit-cpu-offload false`, and benchmark `--enable-torch-compile` separately | Newly supported image-edit path. Keep the input image, prompt, seed, and output size fixed; sequence shard is auto-enabled for Joy pipelines. |
-| FireRed-Image-Edit 1.0 / 1.1 | 1024x1024 image edit, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --ulysses-degree 2 --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Uses the native `QwenImageEditPlusPipeline` path. 2-GPU Ulysses is the validated H100 starting point; benchmark 1.0 and 1.1 separately because checkpoint differences can change denoise latency. |
+| JoyAI-Image-Edit | 1024-class TI2I, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Newly supported image-edit path. Keep the input image, prompt, seed, and output size fixed; 2-GPU CFG parallel is the validated H100 starting point. |
+| FireRed-Image-Edit 1.0 / 1.1 | 1024x1024 image edit, 40 steps, guidance 4.0 | `--backend=sglang --num-gpus 2 --enable-cfg-parallel --ulysses-degree 1 --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Uses the native `QwenImageEditPlusPipeline` path. 2-GPU CFG parallel is the validated H100 starting point; benchmark 1.0 and 1.1 separately because checkpoint differences can change denoise latency. |
 | Hunyuan3D-2 shape | Shape generation, 50 steps, guidance 5.0 | `--backend=sglang --enable-torch-compile --warmup --dit-layerwise-offload false --dit-cpu-offload false` | Focus on `Hunyuan3DShapeDenoisingStage`; keep mesh export/paint timings separate from denoise. |
 | MOVA / Helios | Use the benchmark/profile presets first | `--enable-torch-compile --warmup`; pin offload flags explicitly | PR #20530 tracks MOVA fused RMSNorm+RoPE; PR #24059 tracks Helios fused norm modulation. |
 
