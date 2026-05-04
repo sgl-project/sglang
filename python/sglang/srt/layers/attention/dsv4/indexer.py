@@ -468,8 +468,10 @@ class C4IndexerBackendMixin:
                     )
                 )
             else:
-                core_metadata.c4_sparse_page_indices = token_to_kv_pool.c4_kv_pool.translate_loc_from_compressed_to_hisparse_device(
-                    core_metadata.c4_sparse_page_indices
+                core_metadata.c4_sparse_page_indices = (
+                    token_to_kv_pool.c4_kv_pool.translate_loc_to_hisparse_device(
+                        core_metadata.c4_sparse_page_indices
+                    )
                 )
 
         if capture_enabled:

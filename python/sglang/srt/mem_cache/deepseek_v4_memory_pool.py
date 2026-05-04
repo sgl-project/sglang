@@ -198,20 +198,16 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         compressed_indices = full_indices[mask] // self.compress_ratio
         return compressed_indices
 
-    def translate_loc_from_compressed_to_hisparse_device(
-        self, compressed_indices: torch.Tensor
-    ):
+    def translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
         return self.full_to_hisparse_device_index_mapping[compressed_indices].to(
             torch.int32
         )
 
-    def _translate_loc_from_compressed_to_hisparse_device(
-        self, compressed_indices: torch.Tensor
-    ):
+    def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
         return self.full_to_hisparse_device_index_mapping[compressed_indices]
 
     def translate_loc_from_full_to_hisparse_device(self, full_indices: torch.Tensor):
-        return self._translate_loc_from_compressed_to_hisparse_device(
+        return self._translate_loc_to_hisparse_device(
             self.translate_loc_from_full_to_compressed(full_indices)
         )
 
@@ -221,7 +217,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         loc: torch.Tensor,
         cache_nope_fp8_rope_bf16_pack,
     ):
-        loc = self.translate_loc_from_compressed_to_hisparse_device(loc)
+        loc = self.translate_loc_to_hisparse_device(loc)
         super().set_key_buffer(layer_id, loc, cache_nope_fp8_rope_bf16_pack)
 
     def set_key_buffer_fused(
@@ -230,7 +226,7 @@ class HiSparseC4DevicePool(DeepSeekV4SingleKVPool):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
-        loc = self.translate_loc_from_compressed_to_hisparse_device(loc)
+        loc = self.translate_loc_to_hisparse_device(loc)
         return super().set_key_buffer_fused(layer_id, loc, cache_k)
 
     def get_cpu_copy(self, indices, mamba_indices=None):

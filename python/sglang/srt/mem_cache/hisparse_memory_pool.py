@@ -648,7 +648,7 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return (last_locs - 3) // self.compress_ratio
 
     def get_last_loc_hisparse_device(self, last_locs: torch.Tensor):
-        return self.hisparse_kvcache._translate_loc_from_compressed_to_hisparse_device(
+        return self.hisparse_kvcache._translate_loc_to_hisparse_device(
             self.get_last_loc_compressed(last_locs)
         )
 
@@ -724,10 +724,8 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def free_compressed(self, compressed_indices: torch.Tensor):
-        hisparse_indices = (
-            self.hisparse_kvcache.translate_loc_from_compressed_to_hisparse_device(
-                compressed_indices
-            )
+        hisparse_indices = self.hisparse_kvcache.translate_loc_to_hisparse_device(
+            compressed_indices
         )
         hisparse_indices = hisparse_indices[hisparse_indices > 0]
         self.free_hisparse_indices(hisparse_indices)
