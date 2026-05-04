@@ -292,7 +292,7 @@ def _initialize_model(
 
 def _post_load_weights(model: nn.Module) -> None:
     # Loaders that bypass `model.load_weights()` (dummy / sharded state / remote instance /
-    # remote fs) must trigger the model's post-load fixup explicitly — `model.load_weights()`
+    # remote fs) must trigger the model's post-load fixup explicitly; `model.load_weights()`
     # would normally do it internally. NextN subclasses override the method to fill in
     # `is_nextn=True`, so the loader doesn't need to know.
     if hasattr(model, "post_load_weights"):
