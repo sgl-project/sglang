@@ -254,3 +254,9 @@ class TestCodePatcher:
                 raise RuntimeError("test error")
 
         assert obj.greet("world") == "hello world"
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))

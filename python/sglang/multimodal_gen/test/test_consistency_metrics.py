@@ -10,6 +10,7 @@ from sglang.multimodal_gen.test.test_utils import (
     compute_mean_abs_diff,
     compute_psnr,
     compute_ssim,
+    save_consistency_failure_artifact,
 )
 
 
@@ -113,3 +114,50 @@ def test_compare_with_gt_uses_worst_frame_for_video(monkeypatch):
         or not metric.mean_abs_diff_passed
         for metric in result.frame_metrics
     )
+
+
+def test_save_consistency_failure_artifact(tmp_path, monkeypatch):
+    gt_image = _solid_image(128)
+    bad_image = _solid_image(0)
+
+    monkeypatch.setattr(
+        test_utils,
+        "compute_clip_embedding",
+        lambda image: np.array([1.0, 0.0], dtype=np.float32),
+    )
+
+    result = compare_with_gt(
+        output_frames=[bad_image],
+        gt_data=LoadedConsistencyGT(
+            images=[gt_image],
+            embeddings=[np.array([1.0, 0.0], dtype=np.float32)],
+        ),
+        thresholds=ConsistencyThresholds(
+            clip_threshold=0.92,
+            ssim_threshold=0.95,
+            psnr_threshold=28.0,
+            mean_abs_diff_threshold=8.0,
+        ),
+        case_id="unit_image_fail",
+    )
+
+    artifact_path = save_consistency_failure_artifact(
+        artifact_dir=tmp_path,
+        case_id="unit_image_fail",
+        num_gpus=1,
+        output_frames=[bad_image],
+        gt_data=LoadedConsistencyGT(
+            images=[gt_image],
+            embeddings=[np.array([1.0, 0.0], dtype=np.float32)],
+        ),
+        result=result,
+        is_video=False,
+        output_format="png",
+        gt_remote_files=[("unit_image_fail_1gpu.png", "https://example.com/gt.png")],
+    )
+
+    assert artifact_path is not None
+    assert artifact_path.exists()
+    assert artifact_path.suffix == ".png"
+    assert (tmp_path / "consistency_failures" / "summary.json").exists()
+    assert (tmp_path / "consistency_failures" / "index.html").exists()

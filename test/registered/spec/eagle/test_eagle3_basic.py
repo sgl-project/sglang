@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     DEFAULT_TARGET_MODEL_EAGLE3,
 )
 
-register_cuda_ci(est_time=70, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=88, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=50, suite="stage-b-test-1-gpu-small")
 
 _is_hip = is_hip()
