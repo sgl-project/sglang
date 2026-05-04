@@ -10,6 +10,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     IncLockRefResult,
     InsertParams,
     InsertResult,
+    MatchPrefixParams,
+    MatchResult,
 )
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
@@ -83,6 +85,30 @@ class SWAComponent(TreeComponent):
             return state["len"] >= sliding_window_size
 
         return validator
+
+    def finalize_match_result(
+        self,
+        result: MatchResult,
+        params: MatchPrefixParams,
+        value_chunks: list[torch.Tensor],
+        best_value_len: int,
+    ) -> MatchResult:
+        ct = self.component_type
+        n_swa = 0
+        node = result.last_device_node
+        root = self.cache.root_node
+        while node is not root and n_swa < self.sliding_window_size:
+            cd = node.component_data[ct]
+            if cd.value is None and cd.host_value is not None:
+                return result._replace(host_hit_length=max(result.host_hit_length, 1))
+            if cd.value is not None:
+                n_swa += len(cd.value)
+            elif cd.host_value is not None:
+                n_swa += len(cd.host_value)
+            else:
+                break
+            node = node.parent
+        return result
 
     def update_component_on_insert_overlap(
         self,
