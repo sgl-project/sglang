@@ -81,15 +81,6 @@ def copy_metadata(
     assert set(provided_fields) == all_fields, f"{provided_fields=} {all_fields=}"
 
 
-def create_flashmla_metadata():
-    if is_hip():
-        return None
-    else:
-        import flash_mla
-
-        return flash_mla.get_mla_metadata()[0]
-
-
 @dataclass
 class PagedIndexerMetadata:
     page_size: int
