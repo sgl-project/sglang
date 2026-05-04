@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib.util
 import json
 import re
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -89,6 +91,66 @@ class TestU1OfficialParityHarness(unittest.TestCase):
             report_json = json.loads((bundle / "report.json").read_text())
             self.assertTrue(report_json["passed"])
 
+    def test_u1_vlm_official_reference_mode_writes_candidate_error_bundle(self):
+        run_from_env = _load_u1_official_parity_harness()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            official_repo = root / "official"
+            vqa_dir = official_repo / "examples/vqa"
+            vqa_dir.mkdir(parents=True)
+            fake_script = vqa_dir / "inference.py"
+            fake_script.write_text(
+                "\n".join(
+                    [
+                        "import argparse",
+                        "from pathlib import Path",
+                        "parser = argparse.ArgumentParser()",
+                        "parser.add_argument('--model_path')",
+                        "parser.add_argument('--image')",
+                        "parser.add_argument('--question')",
+                        "parser.add_argument('--output')",
+                        "parser.add_argument('--max_new_tokens')",
+                        "parser.add_argument('--device')",
+                        "parser.add_argument('--dtype')",
+                        "parser.add_argument('--attn_backend')",
+                        "args = parser.parse_args()",
+                        "Path(args.output).write_text('official answer')",
+                        "print('fake official u1 ok')",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            image_path = root / "image.png"
+            Image.fromarray(np.full((8, 8, 3), 23, dtype=np.uint8), "RGB").save(
+                image_path
+            )
+            output_dir = root / "bundle"
+
+            bundle = run_from_env(
+                {
+                    "SGLANG_TEST_U1_PARITY_MODE": "vlm_official_reference",
+                    "SGLANG_TEST_U1_PARITY_OUTPUT": str(output_dir),
+                    "SGLANG_TEST_U1_OFFICIAL_PY": sys.executable,
+                    "SGLANG_TEST_U1_OFFICIAL_REPO": str(official_repo),
+                    "SGLANG_TEST_U1_MODEL_PATH": "/fake/model",
+                    "SGLANG_TEST_U1_VLM_IMAGE": str(image_path),
+                    "SGLANG_TEST_U1_VLM_QUESTION": "what is here?",
+                    "SGLANG_TEST_U1_VLM_MAX_NEW_TOKENS": "4",
+                    "SGLANG_TEST_U1_VLM_DEVICE": "cpu",
+                }
+            )
+
+            reference = json.loads((bundle / "reference.json").read_text())
+            candidate = json.loads((bundle / "candidate.json").read_text())
+            report = json.loads((bundle / "report.json").read_text())
+
+            self.assertEqual(reference["text"], "official answer")
+            self.assertIsNone(reference["error"])
+            self.assertIn("not wired", candidate["error"])
+            self.assertFalse(report["passed"])
+            self.assertEqual(report["diffs"][0]["field"], "error")
+
     def test_runtime_import_firewall_blocks_official_u1_imports(self):
         repo = Path(__file__).resolve().parents[5]
         runtime_root = repo / "python" / "sglang"
@@ -136,6 +198,17 @@ def _case():
         sampling_params={"num_inference_steps": 2},
         dump_points=("image", "u_logits"),
     )
+
+
+def _load_u1_official_parity_harness():
+    repo = Path(__file__).resolve().parents[5]
+    path = repo / "test/registered/scheduler/test_u1_official_parity_harness.py"
+    spec = importlib.util.spec_from_file_location("u1_official_parity_harness", path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.run_u1_official_parity_from_env
 
 
 if __name__ == "__main__":
