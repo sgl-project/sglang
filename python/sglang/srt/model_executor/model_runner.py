@@ -781,7 +781,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         if not self.is_hybrid_swa:
             return
 
-        # Consider PP, so use start_layer and end_layer.
         full_attention_layer_ids = [
             layer_idx
             for layer_idx in range(self.start_layer, self.end_layer + 1)
@@ -794,7 +793,6 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             if hasattr(self.model_config, "swa_attention_layer_ids")
             and layer_idx in self.model_config.swa_attention_layer_ids
         ]
-        # Update back to model_config.
         self.model_config.swa_attention_layer_ids = swa_attention_layer_ids
         self.model_config.full_attention_layer_ids = full_attention_layer_ids
 
