@@ -102,13 +102,9 @@ class TextEncodingStage(PipelineStage):
     def get_or_compute_negative_text_embedding(
         self, batch: Req, server_args: ServerArgs, all_indices: list[int]
     ):
-        """Get or compute the negative text embedding"""
-        negative_cache_key = (
-            server_args.pipeline_class_name,
-            tuple(all_indices),
-            batch.negative_prompt,
+        negative_cache_key = self._build_negative_text_cache_key(
+            batch, server_args, all_indices
         )
-        # warmup request will not try to cache this
         use_negative_cache = not batch.is_warmup
         cached_negative = None
         if use_negative_cache:
@@ -133,7 +129,6 @@ class TextEncodingStage(PipelineStage):
 
             if use_negative_cache:
                 self._negative_text_cache_key = negative_cache_key
-                # cache the negative text embedding, since most requests use the same default negative prompt
                 self._negative_text_cache_value = (
                     tuple(neg_embeds_list),
                     tuple(neg_masks_list),
@@ -155,6 +150,19 @@ class TextEncodingStage(PipelineStage):
             neg_pooler_embeds_list,
             neg_embeds_masks_list,
             neg_seq_lens_list,
+        )
+
+    def _build_negative_text_cache_key(
+        self, batch: Req, server_args: ServerArgs, encoder_indices: list[int]
+    ):
+        # Negative text encoding changes when the template or max length changes,
+        # even if the visible negative prompt string is the same.
+        return (
+            server_args.pipeline_class_name,
+            tuple(encoder_indices),
+            self.freeze_for_dedup(batch.negative_prompt),
+            self.freeze_for_dedup(batch.prompt_template),
+            batch.max_sequence_length,
         )
 
     @torch.no_grad()
