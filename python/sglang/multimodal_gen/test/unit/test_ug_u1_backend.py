@@ -3,6 +3,9 @@
 from unittest.mock import patch
 import unittest
 
+import torch
+from transformers import AutoConfig
+
 from sglang.multimodal_gen.configs.pipeline_configs.ug import UGPipelineConfig
 from sglang.multimodal_gen.configs.sample.ug import UGSamplingParams
 from sglang.multimodal_gen.runtime.pipelines.ug import (
@@ -25,6 +28,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
     UGGSegmentStage,
 )
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.configs.model_config import is_multimodal_model
+from sglang.srt.configs.neo_chat import NEOChatConfig, NEOVisionConfig
+from sglang.srt.models.neo_chat import (
+    NEOChatModel,
+    build_abs_positions_from_grid_hw,
+    build_u1_vlm_input_info,
+    build_u1_vlm_thw_indexes,
+    map_u1_language_model_weight_name,
+)
+from sglang.srt.models.registry import ModelRegistry
 from sglang.srt.ug.adapter import UGModelRunnerAdapter
 from sglang.srt.ug.context import UGContextBundle, UGContextHandle, UGSessionHandle
 from sglang.srt.ug.runtime import (
@@ -36,6 +49,104 @@ from sglang.srt.ug.u1 import U1UGModelAdapter, U1VLMBackendResult
 
 
 class TestU1UGBackendShell(unittest.TestCase):
+    def test_neo_chat_config_wraps_qwen3_text_and_vision_configs(self):
+        config = NEOChatConfig(
+            vision_config={
+                "architectures": ["NEOVisionModel"],
+                "patch_size": 16,
+                "hidden_size": 1024,
+                "llm_hidden_size": 4096,
+            },
+            llm_config={
+                "architectures": ["Qwen3ForCausalLM"],
+                "hidden_size": 32,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 2,
+                "num_hidden_layers": 1,
+                "vocab_size": 128,
+                "rope_theta_hw": 10000.0,
+            },
+            downsample_ratio=0.5,
+        )
+
+        self.assertIsInstance(config.vision_config, NEOVisionConfig)
+        self.assertEqual(config.model_type, "neo_chat")
+        self.assertEqual(config.llm_config.architectures, ["Qwen3ForCausalLM"])
+        self.assertEqual(config.llm_config.rope_theta_hw, 10000.0)
+        self.assertIs(config.get_text_config(), config.llm_config)
+        self.assertEqual(config.hidden_size, 32)
+
+    def test_auto_config_can_build_neo_chat_without_remote_code(self):
+        config = AutoConfig.for_model(
+            "neo_chat",
+            vision_config={"architectures": ["NEOVisionModel"]},
+            llm_config={
+                "architectures": ["Qwen3ForCausalLM"],
+                "hidden_size": 16,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "num_hidden_layers": 1,
+                "vocab_size": 64,
+            },
+        )
+
+        self.assertIsInstance(config, NEOChatConfig)
+        self.assertEqual(config.llm_config.architectures, ["Qwen3ForCausalLM"])
+
+    def test_neo_chat_is_registered_as_multimodal_srt_model(self):
+        model_cls, arch = ModelRegistry.resolve_model_cls(["NEOChatModel"])
+
+        self.assertIs(model_cls, NEOChatModel)
+        self.assertEqual(arch, "NEOChatModel")
+        self.assertTrue(is_multimodal_model(["NEOChatModel"]))
+
+    def test_u1_abs_positions_match_row_major_patch_grid(self):
+        abs_x, abs_y = build_abs_positions_from_grid_hw(
+            torch.tensor([[2, 3], [1, 2]], dtype=torch.long)
+        )
+
+        self.assertEqual(abs_x.tolist(), [0, 1, 2, 0, 1, 2, 0, 1])
+        self.assertEqual(abs_y.tolist(), [0, 0, 0, 1, 1, 1, 0, 0])
+
+    def test_u1_vlm_thw_indexes_match_official_context_semantics(self):
+        input_ids = torch.tensor(
+            [101, 151670, 151669, 151669, 151669, 151669, 151671, 102],
+            dtype=torch.long,
+        )
+
+        indexes = build_u1_vlm_thw_indexes(
+            input_ids,
+            grid_hw=torch.tensor([[4, 4]], dtype=torch.long),
+            downsample_ratio=0.5,
+        )
+
+        self.assertEqual(indexes.shape, (3, 8))
+        self.assertEqual(indexes[0].tolist(), [0, 1, 2, 2, 2, 2, 3, 4])
+        self.assertEqual(indexes[1].tolist(), [0, 0, 0, 0, 1, 1, 0, 0])
+        self.assertEqual(indexes[2].tolist(), [0, 0, 0, 1, 0, 1, 0, 0])
+
+    def test_u1_vlm_input_info_counts_context_tokens(self):
+        info = build_u1_vlm_input_info(
+            [151670, 151669, 151669, 151669, 151669, 151671],
+            grid_hw=[[4, 4]],
+        )
+
+        self.assertEqual(info.image_context_token_count, 4)
+        self.assertEqual(info.image_token_count, 5)
+        self.assertEqual(tuple(info.thw_indexes.shape), (3, 6))
+
+    def test_u1_language_weight_mapper_keeps_only_qwen3_u_path(self):
+        self.assertEqual(
+            map_u1_language_model_weight_name("language_model.model.layers.0.weight"),
+            "model.layers.0.weight",
+        )
+        self.assertEqual(
+            map_u1_language_model_weight_name("language_model.lm_head.weight"),
+            "lm_head.weight",
+        )
+        self.assertIsNone(map_u1_language_model_weight_name("vision_model.patch.weight"))
+        self.assertIsNone(map_u1_language_model_weight_name("fm_modules.fm_head.weight"))
+
     def test_u1_adapter_declares_pixel_flow_kind(self):
         adapter = U1UGModelAdapter()
 
