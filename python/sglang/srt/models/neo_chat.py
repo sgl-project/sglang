@@ -166,6 +166,8 @@ def iter_u1_language_model_weights(
 
 
 def map_u1_language_model_weight_name(name: str) -> str | None:
+    if "mot_gen" in name:
+        return None
     if name.startswith("language_model."):
         return name[len("language_model.") :]
     if name.startswith("model.") or name.startswith("lm_head."):

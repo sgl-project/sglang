@@ -144,6 +144,11 @@ class TestU1UGBackendShell(unittest.TestCase):
             map_u1_language_model_weight_name("language_model.lm_head.weight"),
             "lm_head.weight",
         )
+        self.assertIsNone(
+            map_u1_language_model_weight_name(
+                "language_model.model.layers.0.self_attn.q_proj_mot_gen.weight"
+            )
+        )
         self.assertIsNone(map_u1_language_model_weight_name("vision_model.patch.weight"))
         self.assertIsNone(map_u1_language_model_weight_name("fm_modules.fm_head.weight"))
 
