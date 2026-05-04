@@ -115,7 +115,7 @@ class RawTestParamForDecode:
 @dataclasses.dataclass
 class Testcase:
     p: TestParam
-    dOut: torch.Tensor  # [s_q, h_q, d_v]
+    doubt: torch.Tensor  # [s_q, h_q, d_v]
     q: torch.Tensor  # [s_q, h_q, d_qk]
     kv: torch.Tensor  # [s_kv, h_kv, d_qk]
     indices: torch.Tensor  # [s_q, h_kv, topk]
@@ -218,7 +218,7 @@ def generate_testcase(t: TestParam) -> Testcase:
 
     return Testcase(
         p=t,
-        dOut=do,
+        doubt=do,
         q=q,
         kv=kv,
         indices=indices,

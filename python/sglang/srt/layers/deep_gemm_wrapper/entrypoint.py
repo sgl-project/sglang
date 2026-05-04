@@ -4,6 +4,7 @@ from typing import Any, Optional, Tuple
 
 import torch
 
+from sglang.srt.configs.deepseek_v4 import get_fp4_experts
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper import compile_utils
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
@@ -55,10 +56,7 @@ def grouped_gemm_nt_f8f8bf16_masked(
         ):
 
             fp4_kwargs = (
-                dict(recipe_a=(1, 128), recipe_b=(1, 32))
-                if envs.SGLANG_DSV4_MODE.get() == "2604"
-                and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-                else {}
+                dict(recipe_a=(1, 128), recipe_b=(1, 32)) if get_fp4_experts() else {}
             )
 
             return deep_gemm.fp8_m_grouped_gemm_nt_masked(
@@ -108,11 +106,7 @@ def grouped_gemm_nt_f8f8bf16_contig(
     if envs.SGLANG_HACK_SKIP_FP4_FP8_GEMM.get():
         out.zero_()
         return
-    fp4_kwargs = (
-        dict(recipe_a=(1, 128), recipe_b=(1, 32))
-        if envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        else {}
-    )
+    fp4_kwargs = dict(recipe_a=(1, 128), recipe_b=(1, 32)) if get_fp4_experts() else {}
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(

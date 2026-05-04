@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch.nn import Module
 from torch.nn.parameter import Parameter
 
+from sglang.srt.configs.deepseek_v4 import get_fp4_experts
 from sglang.srt.distributed import get_tensor_model_parallel_world_size, get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -28,6 +29,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
+    get_moe_a2a_backend,
     get_moe_padding_size,
     get_moe_runner_backend,
     get_moe_weight_sizes,
@@ -98,8 +100,8 @@ from sglang.srt.utils import (
 )
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.moe.moe_runner.aiter import AiterMoeQuantInfo
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput
-    from sglang.srt.layers.moe.topk import TopKOutput
     from sglang.srt.layers.quantization.w4afp8 import W4AFp8Config
     from sglang.srt.models.utils import WeightsMapper
 
@@ -132,8 +134,6 @@ def _require_fp4_dtype():
 
 
 if _use_aiter or _use_hip_int4:
-    from aiter import ActivationType, QuantType
-    from aiter.fused_moe import fused_moe
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
 
@@ -821,9 +821,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.use_mxfp8 or self.quant_config.weight_block_size is not None
         )
         self.with_bias = False
-        self.is_fp4_expert = (
-            envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        )
+        self.is_fp4_expert = get_fp4_experts()
         if get_moe_runner_backend().is_cutlass():
             assert (
                 cutlass_fp8_supported()
@@ -1730,11 +1728,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_auto():
             if self.is_deepgemm_moe_runner_backend_enabled():
                 moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
+            elif (
+                _is_hip
+                and (_use_aiter or _use_hip_int4)
+                and get_moe_a2a_backend().is_none()
+            ):
+                # *EPMoE backends bypass self.runner via run_moe_core, and the
+                # AITER fused func is only registered for ("none", "aiter").
+                moe_runner_backend = MoeRunnerBackend.AITER
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
         if (
             moe_runner_backend.is_deep_gemm()
             or moe_runner_backend.is_triton()
+            or moe_runner_backend.is_aiter()
             or moe_runner_backend.is_flashinfer_trtllm()
             or moe_runner_backend.is_flashinfer_trtllm_routed()
         ):
@@ -1799,16 +1807,17 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
             return StandardCombineInput(hidden_states=output)
 
-        if _is_hip:
-            ret = self.maybe_apply_hip_fused_experts(
+        if (
+            _is_hip
+            and getattr(self, "runner", None) is not None
+            and self.runner.runner_backend.is_aiter()
+        ):
+            quant_info = self.maybe_get_hip_aiter_quant_info(
                 layer,
-                x,
-                dispatch_output.topk_output,
-                moe_runner_config.activation,
                 moe_runner_config.no_combine,
             )
-            if ret is not None:
-                return StandardCombineInput(hidden_states=ret)
+            if quant_info is not None:
+                return self.runner.run(dispatch_output, quant_info)
 
         if get_moe_runner_backend().is_cutlass():
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
@@ -1999,89 +2008,51 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         self._cutlass_buffers_ready = True
 
-    def maybe_apply_hip_fused_experts(
+    def maybe_get_hip_aiter_quant_info(
         self,
         layer: torch.nn.Module,
-        x: torch.Tensor,
-        topk_output: TopKOutput,
-        activation: str = "silu",
         no_combine: bool = False,
-    ) -> Optional[torch.Tensor]:
-        topk_weights, topk_ids, _ = topk_output
-        if _use_hip_int4:
-            # TODO: add triton kernel and add check _use_aiter
-            assert not no_combine, f"{no_combine=} is not supported."
-            return fused_moe(
-                x,
-                layer.w13_weight,
-                layer.w2_weight,
-                topk_weights,
-                topk_ids,
-                quant_type=QuantType.per_Token,
-                w1_scale=layer.w13_weight_scale1,
-                w2_scale=layer.w2_weight_scale1,
-                activation=(
-                    ActivationType.Silu if activation == "silu" else ActivationType.Gelu
-                ),
+    ) -> Optional["AiterMoeQuantInfo"]:
+        if not (_use_aiter or _use_hip_int4):
+            return None
+        assert not no_combine, f"{no_combine=} is not supported."
+
+        from sglang.srt.layers.moe.moe_runner.aiter import (
+            AiterMoeQuantInfo,
+            AiterQuantType,
+        )
+
+        w13_weight = layer.w13_weight
+        w2_weight = layer.w2_weight
+
+        if self.block_quant:
+            quant_type = (
+                AiterQuantType.PER_1X32
+                if self.is_fp4_expert
+                else AiterQuantType.PER_128X128
             )
 
-        if _use_aiter_moe():
-            assert not no_combine, f"{no_combine=} is not supported."
-            topk_weights = topk_weights.to(torch.float32)
-            if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
-                from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
-                    deepseek_v4_moe_code_path_checker,
-                )
-
-                deepseek_v4_moe_code_path_checker.observed += 1
-            if self.block_quant:
-                quant_type = (
-                    QuantType.per_1x32 if self.is_fp4_expert else QuantType.per_128x128
-                )
-                w13_weight = layer.w13_weight
-                w2_weight = layer.w2_weight
-                if self.is_fp4_expert:
-                    fp4_weight_dtype = _require_fp4_dtype()
-                    w13_weight = w13_weight.view(fp4_weight_dtype)
-                    w2_weight = w2_weight.view(fp4_weight_dtype)
-                    if getattr(layer.w13_weight, "is_shuffled", False):
-                        w13_weight.is_shuffled = True
-                        w2_weight.is_shuffled = True
-                return fused_moe(
-                    x,
-                    w13_weight,
-                    w2_weight,
-                    topk_weights,
-                    topk_ids,
-                    w1_scale=layer.w13_weight_scale_inv,
-                    w2_scale=layer.w2_weight_scale_inv,
-                    quant_type=quant_type,
-                    activation=(
-                        ActivationType.Silu
-                        if activation == "silu"
-                        else ActivationType.Gelu
-                    ),
-                    expert_mask=layer.dispatcher.expert_mask_gpu,
-                )
-            else:
-                return fused_moe(
-                    x,
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    topk_weights,
-                    topk_ids,
-                    quant_type=QuantType.per_Token,
-                    w1_scale=layer.w13_weight_scale1,
-                    w2_scale=layer.w2_weight_scale1,
-                    activation=(
-                        ActivationType.Silu
-                        if activation == "silu"
-                        else ActivationType.Gelu
-                    ),
-                    expert_mask=layer.dispatcher.expert_mask_gpu,
-                )
-
-        return None
+            if self.is_fp4_expert:
+                fp4_weight_dtype = _require_fp4_dtype()
+                w13_weight = w13_weight.view(fp4_weight_dtype)
+                w2_weight = w2_weight.view(fp4_weight_dtype)
+                if getattr(layer.w13_weight, "is_shuffled", False):
+                    w13_weight.is_shuffled = True
+                    w2_weight.is_shuffled = True
+            w13_scale = layer.w13_weight_scale_inv
+            w2_scale = layer.w2_weight_scale_inv
+        else:
+            quant_type = AiterQuantType.PER_TOKEN
+            w13_scale = layer.w13_weight_scale1
+            w2_scale = layer.w2_weight_scale1
+        return AiterMoeQuantInfo(
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            quant_type=quant_type,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            expert_mask=layer.dispatcher.expert_mask_gpu if _use_aiter else None,
+        )
 
 
 class Fp8KVCacheMethod(BaseKVCacheMethod):

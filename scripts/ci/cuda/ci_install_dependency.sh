@@ -34,9 +34,6 @@ configure_environment() {
     CU_STRIP="${CU_VERSION#cu}"
     CU_MAJOR="${CU_STRIP:0:2}"
 
-    # Nvidia package versions we pin (torch ships older versions).
-    NVIDIA_CUDNN_VERSION="9.16.0.29"
-    NVIDIA_NVSHMEM_VERSION="3.4.5"
     OPTIONAL_DEPS="${1:-}"
 
     # Whether to create a uv venv (set USE_VENV=1). Default: 0.
@@ -176,7 +173,7 @@ setup_pip_toolchain() {
 
     export UV_LINK_MODE=copy
     PIP_CMD="uv pip"
-    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match --prerelease allow"
+    PIP_INSTALL_SUFFIX="--index-strategy unsafe-best-match"
     PIP_UNINSTALL_CMD="uv pip uninstall"
     PIP_UNINSTALL_SUFFIX=""
 
@@ -234,6 +231,16 @@ install_sglang() {
     echo "Installing python extras: [${EXTRAS}]"
     $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
 
+    # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
+    # present but libcusparseLt.so.0 missing on disk, breaking any torch import.
+    # If the file is missing, force-reinstall the wheel before downstream steps.
+    SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])")
+    if [ ! -f "$SITE_PACKAGES/nvidia/cusparselt/lib/libcusparseLt.so.0" ] \
+       && pip show nvidia-cusparselt-cu13 >/dev/null 2>&1; then
+        echo "WARNING: nvidia-cusparselt-cu13 metadata present but libcusparseLt.so.0 missing — reinstalling"
+        $PIP_CMD install --reinstall nvidia-cusparselt-cu13 $PIP_INSTALL_SUFFIX
+    fi
+
     mark_step_done "${FUNCNAME[0]}"
 }
 
@@ -278,18 +285,14 @@ install_sglang_kernel() {
         $PIP_CMD install "torch==${TORCH_VER}" "torchaudio==${TORCHAUDIO_VER}" "torchvision==${TORCHVISION_VER}" --index-url "https://download.pytorch.org/whl/${CU_VERSION}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
     fi
 
-    # Reinstall sglang-kernel with matching CUDA version if needed
-    SGL_KERNEL_FULL_VER=$(pip show sglang-kernel 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    SGL_KERNEL_CUDA_VER=$(printf '%s' "$SGL_KERNEL_FULL_VER" | sed -n 's/.*+//p')
-    echo "Detected sglang-kernel version: ${SGL_KERNEL_FULL_VER} (CUDA tag: ${SGL_KERNEL_CUDA_VER:-none})"
-    if [ -n "$SGL_KERNEL_CUDA_VER" ] && [ "$SGL_KERNEL_CUDA_VER" != "$CU_VERSION" ]; then
-        SGL_KERNEL_VER="${SGL_KERNEL_FULL_VER%+*}"
-        echo "Reinstalling sglang-kernel==${SGL_KERNEL_VER} from ${CU_VERSION} index to match torch..."
-        if [ "$CU_MAJOR" = "13" ]; then
-            $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VER}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-        else
-            $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VER}" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
-        fi
+    if [ "${CUSTOM_BUILD_SGL_KERNEL:-}" != "true" ]; then
+        # install_sglang above pulls sglang-kernel from PyPI, whose default wheel
+        # tracks one CUDA version (currently cu130). Force-reinstall from the
+        # CU_VERSION-matched sglang wheel index so runners on a different CUDA
+        # (e.g. h20 / cu129) get a wheel linked against the right libnvrtc.
+        $PIP_CMD install "sglang-kernel==${SGL_KERNEL_VERSION_FROM_SRT}" --index-url "https://docs.sglang.ai/whl/${CU_VERSION}/" --force-reinstall --no-deps $PIP_INSTALL_SUFFIX
+    else
+        echo "CUSTOM_BUILD_SGL_KERNEL=true: keeping freshly built sgl-kernel wheel."
     fi
 
     mark_step_done "${FUNCNAME[0]}"
@@ -385,39 +388,14 @@ install_extra_deps() {
     fi
     $PIP_CMD install ${MOONCAKE_PKG} ${EXTRA_NVIDIA_SPECS} py-spy scipy huggingface_hub[hf_xet] pytest $PIP_INSTALL_SUFFIX
 
+    # Best-effort NIXL install for decode-radix disaggregation coverage.
+    $PIP_CMD install nixl $PIP_INSTALL_SUFFIX || echo "Warning: nixl install failed; continuing without nixl"
+
     if [ "$IS_BLACKWELL" != "1" ]; then
         git clone --branch v0.5 --depth 1 https://github.com/EvolvingLMMs-Lab/lmms-eval.git
         $PIP_CMD install -e lmms-eval/ $PIP_INSTALL_SUFFIX
     fi
     $PIP_CMD uninstall xformers || true
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
-fix_nvidia_deps() {
-    if [ "$CU_MAJOR" = "13" ]; then
-        NVSHMEM_PKG="nvidia-nvshmem-cu13"
-        CUDNN_PKG="nvidia-cudnn-cu13"
-    else
-        NVSHMEM_PKG="nvidia-nvshmem-cu12"
-        CUDNN_PKG="nvidia-cudnn-cu12"
-    fi
-
-    # DeepEP depends on nvshmem 3.4.5
-    INSTALLED_NVSHMEM=$(pip show ${NVSHMEM_PKG} 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    if [ "$INSTALLED_NVSHMEM" = "$NVIDIA_NVSHMEM_VERSION" ]; then
-        echo "${NVSHMEM_PKG}==${NVIDIA_NVSHMEM_VERSION} already installed, skipping reinstall"
-    else
-        $PIP_CMD install ${NVSHMEM_PKG}==${NVIDIA_NVSHMEM_VERSION} $PIP_INSTALL_SUFFIX
-    fi
-
-    # cudnn < 9.16.0.29 causes Conv3D performance regression
-    INSTALLED_CUDNN=$(pip show ${CUDNN_PKG} 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "")
-    if [ "$INSTALLED_CUDNN" = "$NVIDIA_CUDNN_VERSION" ]; then
-        echo "${CUDNN_PKG}==${NVIDIA_CUDNN_VERSION} already installed, skipping reinstall"
-    else
-        $PIP_CMD install ${CUDNN_PKG}==${NVIDIA_CUDNN_VERSION} $PIP_INSTALL_SUFFIX
-    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -493,7 +471,6 @@ main() {
     download_flashinfer_cache
     stabilize_flashinfer_jit_paths
     install_extra_deps
-    fix_nvidia_deps
     install_test_tools
     prepare_runner
     setup_ld_library_path

@@ -116,7 +116,6 @@ def get_config(
                     config._name_or_path = model
                 else:
                     raise
-
     if (
         config.architectures is not None
         and config.architectures[0] == "Phi4MMForCausalLM"

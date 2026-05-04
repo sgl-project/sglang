@@ -14,7 +14,10 @@ import triton.language as tl
 
 import sglang.srt.models.deepseek_v2 as deepseek_v2
 from sglang.jit_kernel.deepseek_v4 import fused_rope, linear_bf16_fp32
-from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.configs.deepseek_v4 import (
+    DeepSeekV4Config,
+    set_fp4_experts,
+)
 from sglang.srt.debug_utils.deepseek_v4_debug_utils import (
     deepseek_v4_moe_code_path_checker,
 )
@@ -1886,6 +1889,23 @@ class DeepseekV4DecoderLayer(nn.Module):
             # returned post should be [n, hc_mult]
             return y, post.squeeze(-1), comb
 
+        if _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_PRE.get():
+            from aiter.ops.mhc import mhc_pre
+
+            post, comb, y = mhc_pre(
+                residual=x,
+                fn=hc_fn,
+                hc_scale=hc_scale,
+                hc_base=hc_base,
+                rms_eps=self.rms_norm_eps,
+                hc_pre_eps=self.hc_eps,
+                hc_sinkhorn_eps=self.hc_eps,
+                hc_post_mult_value=2.0,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+            )
+            # returned post should be [n, hc_mult]
+            return y, post.squeeze(-1), comb
+
         if envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get():
             # DeepGEMM implementation
             import deep_gemm
@@ -1940,6 +1960,14 @@ class DeepseekV4DecoderLayer(nn.Module):
             from sglang.srt.layers.mhc import mhc_post
 
             result = mhc_post(x, residual, post, comb)
+            return result
+
+        elif _is_hip and envs.SGLANG_OPT_USE_AITER_MHC_POST.get():
+            from aiter.ops.mhc import mhc_post
+
+            result = torch.empty_like(residual)
+            mhc_post(result, x, residual, post, comb)
+
             return result
 
         assert residual.shape == (x.shape[0], self.hc_mult, x.shape[-1])
@@ -2224,6 +2252,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
+        set_fp4_experts(getattr(config, "expert_dtype", None) == "fp4")
         self.tp_size = get_tensor_model_parallel_world_size()
         self.quant_config = quant_config
         self.determine_num_fused_shared_experts()
@@ -2287,10 +2316,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             disable_reason = "Deepseek V3/R1 can not use shared experts fusion optimization under deepep expert parallelism."
         elif self.quant_config and self.quant_config.get_name() == "w4afp8":
             disable_reason = "Deepseek V3/R1 W4AFP8 model uses different quant method for routed experts and shared experts."
-        elif (
-            envs.SGLANG_DSV4_MODE.get() == "2604" and envs.SGLANG_DSV4_FP4_EXPERTS.get()
-        ):
-            disable_reason = "2604 routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
+        elif getattr(self.config, "expert_dtype", None) == "fp4":
+            disable_reason = "Routed experts use FP4 while shared experts remain FP8; fusion would incorrectly apply FP4 to shared experts."
 
         if envs.SGLANG_DSV4_2604_SUBMODE.get() == "2604B":
             disable_reason = "2604B checkpoint requires different clamping for shared and routed experts"
@@ -2492,7 +2519,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             envs.SGLANG_DSV4_MODE.get() == "2604"
             and not envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
         ):
-            if envs.SGLANG_DSV4_FP4_EXPERTS.get():
+            if getattr(self.config, "expert_dtype", None) == "fp4":
                 weights = _dequant_fp8_wo_a(weights)
             else:
                 # Converted FP8 checkpoint: wo_a is already bf16; drop stale wo_a.scale if present

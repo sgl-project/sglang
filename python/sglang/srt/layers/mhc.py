@@ -543,11 +543,21 @@ def mhc_pre(
 
     if num_tokens <= 2048:
         assert n_splits == 1
+        if hc_hidden_size == 16384:
+            hidden_block = 256
+        elif hc_hidden_size == 28672:
+            hidden_block = 128
+        else:
+            raise NotImplementedError(
+                f"mhc_pre splitk kernel only supports hc_hidden_size in {{16384, 28672}}, "
+                f"got {hc_hidden_size}"
+            )
         kernel_0, kernel_1 = mhc_pre_gemm_sqrsum_splitk_kernel(
             hc_mult3,
             hc_hidden_size,
             split_k=n_splits_pre,
             token_block=32,
+            hidden_block=hidden_block,
         )
         partial_out = gemm_out_mul.new_empty(n_splits_pre, num_tokens, 32)
         partial_sqrsum = gemm_out_sqrsum.new_empty(n_splits_pre, num_tokens)

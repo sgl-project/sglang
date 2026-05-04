@@ -787,6 +787,13 @@ class ImageData:
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
     max_dynamic_patch: Optional[int] = None
+    preprocess_kwargs: Optional[Dict] = None
+
+
+@dataclass
+class VideoData:
+    url: str
+    preprocess_kwargs: Optional[Dict] = None
 
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
@@ -924,7 +931,11 @@ def _normalize_video_input(
         return None
 
 
-def load_video(video_file: Union[str, bytes], use_gpu: bool = True):
+def load_video(video_file: Union[str, bytes, VideoData], use_gpu: bool = True):
+    if isinstance(video_file, VideoData):
+        # preprocess_kwargs is consumed by the multimodal processor, not here.
+        video_file = video_file.url
+
     if isinstance(video_file, (list, tuple, torch.Tensor, np.ndarray)):
         return video_file
 
