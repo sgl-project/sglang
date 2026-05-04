@@ -1,4 +1,15 @@
 # Byte-compiled / optimized / DLL files
+sgl-kernel/csrc/allreduce/quick_all_reduce_hip.h
+sgl-kernel/csrc/elementwise/activation.hip
+sgl-kernel/csrc/elementwise/deepseek_v4_topk.hip
+sgl-kernel/csrc/elementwise/pos_enc.hip
+sgl-kernel/csrc/elementwise/topk.hip
+sgl-kernel/csrc/grammar/apply_token_bitmask_inplace_hip.hip
+sgl-kernel/csrc/kvcacheio/transfer.hip
+sgl-kernel/csrc/speculative/eagle_utils.hip
+sgl-kernel/include/hip/hip_act_and_mul_hip.cuh
+sgl-kernel/include/utils_hip.h
+skills-lock.json
 __pycache__/
 *.py[cod]
 *$py.class
