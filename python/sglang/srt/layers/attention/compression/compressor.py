@@ -69,7 +69,10 @@ class CompressorBackendMixin:
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.nsa.nsa_indexer import rotate_activation
 
-        assert compress_ratio == 4 or compress_ratio == 128
+        assert compress_ratio in (
+            4,
+            128,
+        ), f"DSv4 supports CSA(4x) and HCA(128x) only, got {compress_ratio=}"
         if is_paged:
             metadata = self.get_paged_compress_metadata(compress_ratio)
             coff = 2 if is_overlap_compress(compress_ratio) else 1

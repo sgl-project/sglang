@@ -374,7 +374,9 @@ class DeepseekV4AttnBackend(
         super().__init__()
         self.device = torch.device(model_runner.device)
         head_dim = model_runner.model_config.head_dim
-        assert head_dim == 512
+        assert (
+            head_dim == 512
+        ), "DSv4 MQA head_dim = qk_nope_head_dim(448) + qk_rope_head_dim(64) = 512"
         self.softmax_scale: float = head_dim**-0.5
         self.head_dim_v: int = model_runner.model_config.v_head_dim
         self.cuda_int32_kwargs = {"device": self.device, "dtype": torch.int32}

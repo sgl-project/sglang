@@ -134,7 +134,7 @@ class PagedIndexerMetadata:
         else:
             self.topk_metadata = torch.empty((0,))
 
-        assert self.page_size == 256
+        assert self.page_size == 256, "the system hardcodes page_size=256"
 
     @property
     def c4_page_size(self) -> int:

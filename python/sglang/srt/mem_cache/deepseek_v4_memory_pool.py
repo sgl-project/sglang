@@ -100,7 +100,10 @@ class DeepSeekV4SingleKVPool(KVCache):
         bytes_per_page_non_padded = self.page_size * bytes_per_token
         self.bytes_per_page_padded = ceil_div(bytes_per_page_non_padded, 576) * 576
 
-        assert bytes_per_token == 448 + 64 * 2 + 8
+        assert bytes_per_token == 448 + 64 * 2 + 8, (
+            "DSv4 KV layout: qk_nope_head_dim FP8 (448) + qk_rope_head_dim BF16 "
+            "(64*2) + nope FP8 scales + scale_pad = 584 bytes/token"
+        )
         assert self.store_dtype == torch.uint8
 
         return torch.zeros(
