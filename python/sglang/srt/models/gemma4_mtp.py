@@ -279,7 +279,7 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
         )
 
     def _apply_centroid_masking(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """HF-style dense-scatter centroid logits (E2B/E4B)."""
+        """Centroid-masked logits for E2B/E4B assistant heads."""
         if self.centroids is None or self.token_ordering is None:
             raise RuntimeError(
                 "Frozen-KV MTP centroid head invoked but centroid weights "
@@ -287,31 +287,36 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
             )
         prefix_shape = hidden_states.shape[:-1]
         flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+        num_tokens = flat_hidden.shape[0]
 
-        centroid_logits = self.centroids(flat_hidden)
         _, top_k_indices = torch.topk(
-            centroid_logits, k=self.centroid_intermediate_top_k, dim=-1
-        )
-        canonical_positions_per_cluster = self.token_ordering.long().view(
-            self.num_centroids, self.vocab_size_per_centroid
-        )
-        selected_canonical = canonical_positions_per_cluster[top_k_indices]
-        selected_flat = selected_canonical.reshape(-1)
-        selected_embeddings = self.lm_head.weight[selected_flat].view(
-            flat_hidden.shape[0],
-            self.centroid_intermediate_top_k * self.vocab_size_per_centroid,
-            self.hidden_size,
-        )
-        selected_logits = (
-            flat_hidden.unsqueeze(1) @ selected_embeddings.transpose(-1, -2)
-        ).squeeze(1)
-        mask_value = selected_logits.min() - 1.0
-        output = mask_value.expand(flat_hidden.shape[0], self.vocab_size).clone()
-        output.scatter_(
+            self.centroids(flat_hidden),
+            k=self.centroid_intermediate_top_k,
             dim=-1,
-            index=selected_canonical.view(flat_hidden.shape[0], -1),
-            src=selected_logits,
         )
+
+        # Contiguous gather: [C, vpc, H] indexed by centroid IDs.
+        num_selected = self.centroid_intermediate_top_k * self.vocab_size_per_centroid
+        selected_embeddings = self.lm_head.weight.view(
+            self.num_centroids,
+            self.vocab_size_per_centroid,
+            self.hidden_size,
+        )[top_k_indices].reshape(num_tokens, num_selected, self.hidden_size)
+
+        selected_logits = torch.bmm(
+            flat_hidden.unsqueeze(1),
+            selected_embeddings.transpose(1, 2),
+        ).squeeze(1)
+
+        # Scatter to real vocab positions via token_ordering.
+        centroid_vocab_indices = (
+            self.token_ordering.long()
+            .view(self.num_centroids, self.vocab_size_per_centroid)[top_k_indices]
+            .view(num_tokens, -1)
+        )
+        mask_value = selected_logits.min() - 1.0
+        output = mask_value.expand(num_tokens, self.vocab_size).clone()
+        output.scatter_(dim=-1, index=centroid_vocab_indices, src=selected_logits)
         return output.view(*prefix_shape, self.vocab_size)
 
     def _centroid_logits_processor(
