@@ -7055,10 +7055,6 @@ class ServerArgs:
                 ), "--max-lora-chunk-size must be a power of 2 between 16 and 128."
 
             if self.lora_use_virtual_experts:
-                assert self.lora_backend == "triton", (
-                    "--lora-use-virtual-experts requires --lora-backend triton. "
-                    f"Got: {self.lora_backend}"
-                )
                 logger.info("Virtual expert computation enabled.")
 
             assert (
