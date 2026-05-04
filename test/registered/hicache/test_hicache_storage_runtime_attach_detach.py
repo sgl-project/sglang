@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import wait_for_http_ready
 
-register_cuda_ci(est_time=139, suite="stage-b-test-2-gpu-large")
+register_cuda_ci(est_time=156, suite="stage-b-test-2-gpu-large")
 
 
 class TestHiCacheStorageRuntimeAttachDetach(CustomTestCase):

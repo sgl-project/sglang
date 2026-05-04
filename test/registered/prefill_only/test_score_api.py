@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=71, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=84, suite="stage-b-test-1-gpu-small")
 
 _MODEL = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 

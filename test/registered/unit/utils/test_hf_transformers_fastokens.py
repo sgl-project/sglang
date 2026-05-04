@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
 
 TOKENIZER_MODEL = DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN
 
-register_cpu_ci(est_time=30, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=13, suite="stage-a-test-cpu")
 
 
 try:

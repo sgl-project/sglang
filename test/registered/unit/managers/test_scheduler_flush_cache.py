@@ -9,7 +9,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.io_struct import FlushCacheReqInput
 from sglang.srt.managers.scheduler import Scheduler
 
-register_cpu_ci(est_time=14, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=13, suite="stage-a-test-cpu")
 
 
 class TestSchedulerFlushCache(unittest.TestCase):

@@ -27,7 +27,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
 )
 
-register_cuda_ci(est_time=211, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=221, suite="stage-b-test-1-gpu-small")
 
 TEST_MODEL_NAME = os.environ.get("TEST_MODEL_NAME", DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 TEST_CLASSIFICATION_BASE_MODEL = os.environ.get(

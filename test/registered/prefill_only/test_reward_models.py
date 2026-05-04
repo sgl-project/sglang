@@ -24,7 +24,7 @@ from sglang.test.test_utils import CustomTestCase
 # ==============================================================================
 
 
-register_cuda_ci(est_time=166, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=170, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=132, suite="stage-b-test-1-gpu-small-amd-nondeterministic")
 
 MODELS = [

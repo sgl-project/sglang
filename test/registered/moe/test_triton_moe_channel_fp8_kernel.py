@@ -11,7 +11,7 @@ from sglang.srt.server_args import ServerArgs, set_global_server_args_for_schedu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=17, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=18, suite="stage-b-test-1-gpu-large")
 
 
 def native_w8a8_per_token_matmul(A, B, As, Bs, output_dtype=torch.float16):

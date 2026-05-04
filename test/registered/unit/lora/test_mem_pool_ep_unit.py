@@ -16,7 +16,7 @@ Usage:
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # CPU-only unit test; no CUDA/distributed dependencies.
-register_cuda_ci(est_time=9, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=8, suite="stage-b-test-1-gpu-small")
 
 import types
 import unittest

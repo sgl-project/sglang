@@ -6,7 +6,7 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 MODEL = "openai/gpt-oss-20b"
 
-register_cuda_ci(est_time=151, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=163, suite="stage-b-test-1-gpu-large")
 
 
 class TestSWARadixCacheKL(KLDivergenceMixin, DefaultServerBase):

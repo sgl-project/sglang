@@ -15,7 +15,7 @@ except ModuleNotFoundError:
         pass
 
 
-register_cpu_ci(est_time=5, suite="stage-a-test-cpu")
+register_cpu_ci(est_time=7, suite="stage-a-test-cpu")
 
 
 def _load_mmmu_eval_utils():

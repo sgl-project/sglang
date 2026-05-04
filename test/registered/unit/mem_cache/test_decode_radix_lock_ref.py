@@ -22,7 +22,7 @@ Usage:
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=12, suite="stage-b-test-1-gpu-small")
 
 import unittest
 from unittest.mock import MagicMock

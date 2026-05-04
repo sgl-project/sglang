@@ -24,7 +24,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=18, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=15, suite="stage-b-test-1-gpu-large")
 
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {
