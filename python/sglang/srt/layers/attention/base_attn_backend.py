@@ -58,7 +58,13 @@ class AttentionBackend(ABC):
         """Get the fill value for padded seq lens. Typically, it is 0 or 1."""
         raise NotImplementedError()
 
-    def on_after_cuda_graph_warmup_pass(self):
+    def on_after_cuda_graph_warmup(self):
+        """Hook between cuda graph warmup pass and the actual capture.
+
+        Override to undo state that warmup mutated or eagerly advanced
+        (e.g. dirty metadata buffers, raw->full upgrades) before capture
+        freezes the kernel pointers.
+        """
         pass
 
     def get_verify_buffers_to_fill_after_draft(self):

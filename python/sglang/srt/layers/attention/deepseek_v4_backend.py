@@ -912,21 +912,18 @@ class DeepseekV4AttnBackend(AttentionBackend, C4IndexerBackend, CompressorBacken
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
 
-    def on_after_cuda_graph_warmup_pass(self):
+    def on_after_cuda_graph_warmup(self):
         metadata = self.forward_metadata
         if isinstance(metadata, DSV4Metadata) and isinstance(
             metadata.core_attn_metadata, DSV4AttnMetadata
         ):
-            metadata.core_attn_metadata.c1_flashmla_metadata = (
-                _create_flashmla_metadata()
-            )
-            metadata.core_attn_metadata.c4_flashmla_metadata = (
-                _create_flashmla_metadata()
-            )
-            metadata.core_attn_metadata.c128_flashmla_metadata = (
-                _create_flashmla_metadata()
-            )
+            core = metadata.core_attn_metadata
+            core.c1_flashmla_metadata = _create_flashmla_metadata()
+            core.c4_flashmla_metadata = _create_flashmla_metadata()
+            core.c128_flashmla_metadata = _create_flashmla_metadata()
 
+        # PREP_IN_CUDA_GRAPH=True: warmup upgraded raw->full on the host;
+        # restore raw so capture re-runs the upgrade inside the graph.
         current_raw = getattr(self, "_current_capture_raw", None)
         if current_raw is not None:
             self.forward_metadata = current_raw
@@ -1252,9 +1249,9 @@ class DeepseekV4MultiStepBackend(DeepseekV4AttnBackend):
                 spec_info=forward_batch.spec_info,
             )
 
-    def on_after_cuda_graph_warmup_pass(self):
+    def on_after_cuda_graph_warmup(self):
         for backend in self.attn_backends:
-            backend.on_after_cuda_graph_warmup_pass()
+            backend.on_after_cuda_graph_warmup()
 
     def init_forward_metadata_replay_cuda_graph(
         self, forward_batch: ForwardBatch, bs: int
