@@ -22,10 +22,10 @@ on:
         required: false
         default: 'release-0426'
       sglang_ref:
-        description: "sglang ref to run this workflow from (default: dispatch ref). For testing workflow changes from a feature branch."
+        description: "sglang ref to run this workflow from (default: main). For testing workflow changes from a feature branch."
         type: string
         required: false
-        default: ''
+        default: 'main'
 
 concurrency:
   group: release-sgl-deepgemm-${{ github.ref }}
