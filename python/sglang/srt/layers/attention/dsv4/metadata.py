@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING, Any, List, Optional
 
@@ -67,18 +68,30 @@ def copy_metadata(
     for field_name in copy_fields:
         src_val = getattr(src, field_name)
         dst_val = getattr(dst, field_name)
+        if src_val is None and dst_val is None:
+            continue
         assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
-        dst_val.copy_(src_val)
+        if hasattr(dst_val, "copy_"):
+            dst_val.copy_(src_val)
+        else:
+            warnings.warn(
+                f"{field_name=} {type(dst_val)=} does not have copy_, use setattr"
+            )
+            setattr(dst, field_name, src_val)
 
     for field_name in assign_fields:
         setattr(dst, field_name, getattr(src, field_name))
 
     provided_fields = check_eq_fields + copy_fields + assign_fields
+    provided_fields_unique = set(provided_fields)
     assert len(provided_fields) == len(
-        set(provided_fields)
+        provided_fields_unique
     ), f"{provided_fields=} has dup"
     all_fields = {f.name for f in fields(src)}
-    assert set(provided_fields) == all_fields, f"{provided_fields=} {all_fields=}"
+    provided_fields = set(provided_fields)
+    assert (
+        provided_fields == all_fields
+    ), f"{provided_fields - all_fields=}, {all_fields - provided_fields=}"
 
 
 @dataclass

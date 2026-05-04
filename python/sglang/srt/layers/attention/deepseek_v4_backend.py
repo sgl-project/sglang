@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import dataclasses
 import enum
 import functools
 import logging
-import warnings
 from dataclasses import dataclass, field
 from typing import (
     TYPE_CHECKING,
@@ -30,6 +28,7 @@ from sglang.srt.layers.attention.dsv4.compressor import (
 from sglang.srt.layers.attention.dsv4.indexer import C4IndexerBackendMixin
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
+    copy_metadata,
     maybe_copy_inplace,
 )
 from sglang.srt.layers.attention.dsv4.metadata_kernel import (
@@ -67,49 +66,6 @@ def _pad_last_dim(x: T, multiples_of: int = PAGE_INDEX_ALIGNED_SIZE) -> T:
     curr_size = x.shape[-1]
     target_size = ceil_align(curr_size, multiples_of)
     return F.pad(x, pad=(0, target_size - curr_size), mode="constant", value=-1)
-
-
-def _copy_metadata(
-    src,
-    dst,
-    check_eq_fields: List[str],
-    copy_fields: List[str],
-    assign_fields: Optional[List[str]] = None,
-):
-    assign_fields = assign_fields or []
-
-    for field_name in check_eq_fields:
-        src_val = getattr(src, field_name)
-        dst_val = getattr(dst, field_name)
-        assert src_val == dst_val, f"{field_name=} {src_val=} {dst_val=}"
-
-    for field_name in copy_fields:
-        src_val = getattr(src, field_name)
-        dst_val = getattr(dst, field_name)
-        if src_val is None and dst_val is None:
-            continue
-        assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
-        if hasattr(dst_val, "copy_"):
-            dst_val.copy_(src_val)
-        else:
-            warnings.warn(
-                f"{field_name=} {type(dst_val)=} does not have copy_, use setattr"
-            )
-            setattr(dst, field_name, src_val)
-
-    for field_name in assign_fields:
-        setattr(dst, field_name, getattr(src, field_name))
-
-    provided_fields = check_eq_fields + copy_fields + assign_fields
-    provided_fields_unique = set(provided_fields)
-    assert len(provided_fields) == len(
-        provided_fields_unique
-    ), f"{provided_fields=} has dup"
-    all_fields = {f.name for f in dataclasses.fields(src)}
-    provided_fields = set(provided_fields)
-    assert (
-        provided_fields == all_fields
-    ), f"{provided_fields - all_fields=}, {all_fields - provided_fields=}"
 
 
 def _create_flashmla_metadata():
@@ -165,7 +121,7 @@ class DSV4AttnMetadata:
             raise ValueError(f"invalid {compress_ratio=}")
 
     def copy_(self, other: DSV4AttnMetadata) -> None:
-        _copy_metadata(
+        copy_metadata(
             src=other,
             dst=self,
             check_eq_fields=[
