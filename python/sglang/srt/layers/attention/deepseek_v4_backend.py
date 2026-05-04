@@ -32,13 +32,13 @@ from sglang.srt.layers.attention.compressed.metadata import (
     PagedIndexerMetadata,
     maybe_copy_inplace,
 )
+from sglang.srt.layers.attention.compressed.metadata_kernel import (
+    init_compressed_metadata as _init_compressed_metadata_triton,
+)
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
-from sglang.srt.layers.attention.triton_ops.compressed_metadata import (
-    init_compressed_metadata as _init_compressed_metadata_triton,
-)
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
