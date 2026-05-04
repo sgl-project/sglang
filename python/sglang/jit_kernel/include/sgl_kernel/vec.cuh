@@ -82,11 +82,11 @@ struct AlignedVector {
 
  public:
   /// \brief Vectorized load from `ptr` at the given element `offset`.
-  SGL_DEVICE void load(const void* ptr, int64_t offset = 0) {
+  SGL_DEVICE void load(const void* ptr, std::size_t offset = 0) {
     m_storage = reinterpret_cast<const storage_t*>(ptr)[offset];
   }
   /// \brief Vectorized store to `ptr` at the given element `offset`.
-  SGL_DEVICE void store(void* ptr, int64_t offset = 0) const {
+  SGL_DEVICE void store(void* ptr, std::size_t offset = 0) const {
     reinterpret_cast<storage_t*>(ptr)[offset] = m_storage;
   }
   /// \brief Fill all N elements with the same `value`.
