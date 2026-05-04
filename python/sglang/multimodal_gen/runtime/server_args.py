@@ -477,8 +477,10 @@ class ServerArgs(DisaggArgsMixin):
     def _adjust_attention_backend(self):
         if self.attention_backend in ["fa3", "fa4"]:
             self.attention_backend = "fa"
-        self.component_attention_backends = self._normalize_component_attention_backends(
-            self.component_attention_backends
+        self.component_attention_backends = (
+            self._normalize_component_attention_backends(
+                self.component_attention_backends
+            )
         )
 
         # attention_backend_config
@@ -1409,8 +1411,8 @@ class ServerArgs(DisaggArgsMixin):
 
         # extract dynamic --<component>-path from unknown args
         dynamic_paths, remaining = cls._extract_component_paths(unknown_args)
-        dynamic_attention_backends, remaining = cls._extract_component_attention_backends(
-            remaining
+        dynamic_attention_backends, remaining = (
+            cls._extract_component_attention_backends(remaining)
         )
         if remaining:
             raise SystemExit(f"error: unrecognized arguments: {' '.join(remaining)}")
