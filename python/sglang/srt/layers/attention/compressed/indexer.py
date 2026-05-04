@@ -326,11 +326,11 @@ class C4IndexerBackend:
         indexer_metadata = metadata.indexer_metadata
         core_metadata = metadata.core_metadata
 
-        from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
-            DSV4AttnMetadataRadix,
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DSV4AttnMetadata,
         )
 
-        assert isinstance(core_metadata, DSV4AttnMetadataRadix)
+        assert isinstance(core_metadata, DSV4AttnMetadata)
         assert isinstance(indexer_metadata, PagedIndexerMetadata)
 
         if enable_multi_stream:

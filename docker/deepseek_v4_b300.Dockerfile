@@ -36,7 +36,7 @@ RUN pip install nvidia-cuda-cccl && \
     ln -sf $CCCL_INC/cuda /usr/local/cuda/include/cuda && \
     mv /usr/local/cuda/targets/x86_64-linux/include/cccl /usr/local/cuda/targets/x86_64-linux/include/cccl.bak && \
     ln -sf $CCCL_INC /usr/local/cuda/targets/x86_64-linux/include/cccl
-# FlashMLA — required by deepseek_v4_backend_radix.py
+# FlashMLA — required by deepseek_v4_backend.py
 RUN cd /tmp && rm -rf flash-mla && \
     git clone https://github.com/deepseek-ai/FlashMLA.git flash-mla && \
     cd flash-mla && git submodule update --init --recursive && \

@@ -102,9 +102,9 @@ class CompressorBackend:
     ) -> None:
         if forward_batch.forward_mode.is_idle():
             return
-        # PREP_IN_CG lazy upgrade: the concrete backend (DeepseekV4BackendRadix)
+        # PREP_IN_CG lazy upgrade: the concrete backend (DeepseekV4AttnBackend)
         # owns this helper. MQALayer._forward_prepare calls us before
-        # attn_backend.forward(), so Raw -> Radix must happen here too
+        # attn_backend.forward(), so Raw -> DSV4Metadata must happen here too
         # (e.g. 1.6T layer 0 has compress_ratio=128 and needs cX_compress_metadata).
         self._maybe_upgrade_forward_metadata()
         token_to_kv_pool = forward_batch.token_to_kv_pool

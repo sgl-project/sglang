@@ -76,8 +76,8 @@ _FP8_WO_A_GEMM = envs.SGLANG_OPT_FP8_WO_A_GEMM.get()
 
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
-        DeepseekV4BackendRadix,
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        DeepseekV4AttnBackend,
     )
     from sglang.srt.layers.quantization import QuantizationConfig
     from sglang.srt.model_executor.forward_batch_info import (
@@ -228,7 +228,7 @@ class Compressor(nn.Module):
 
         backend = forward_batch.attn_backend
         if TYPE_CHECKING:
-            assert isinstance(backend, DeepseekV4BackendRadix)
+            assert isinstance(backend, DeepseekV4AttnBackend)
         kv_score_buffer = self._get_state_pool(forward_batch)
         kv_score_buffer = kv_score_buffer.kv_score_buffer.kv_score
         return backend.forward_compress(
@@ -321,7 +321,7 @@ class C4Indexer(nn.Module):
         q_lora_ready: Optional[torch.cuda.Event] = None,
     ) -> None:
         if TYPE_CHECKING:
-            assert isinstance(forward_batch.attn_backend, DeepseekV4BackendRadix)
+            assert isinstance(forward_batch.attn_backend, DeepseekV4AttnBackend)
         return forward_batch.attn_backend.forward_c4_indexer(
             x=x,
             q_lora=q_lora,
@@ -574,7 +574,7 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: DeepseekV4BackendRadix,
+        attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         assert self.alt_streams is not None
@@ -642,7 +642,7 @@ class MQALayer(nn.Module):
         x: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        attn_backend: DeepseekV4BackendRadix,
+        attn_backend: DeepseekV4AttnBackend,
         q_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.fuse_wqa_wkv:
@@ -714,7 +714,7 @@ class MQALayer(nn.Module):
 
         attn_backend = forward_batch.attn_backend
         if TYPE_CHECKING:
-            assert isinstance(attn_backend, DeepseekV4BackendRadix)
+            assert isinstance(attn_backend, DeepseekV4AttnBackend)
 
         enable_multi_stream = (
             envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()

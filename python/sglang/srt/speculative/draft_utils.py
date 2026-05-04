@@ -208,7 +208,7 @@ class DraftBackendFactory:
         )
 
     def _create_compressed_decode_backend(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
             DeepseekV4MultiStepBackend,
         )
 
@@ -288,8 +288,8 @@ class DraftBackendFactory:
         return None
 
     def _create_compressed_prefill_backend(self):
-        from sglang.srt.layers.attention.deepseek_v4_backend_radix import (
-            DeepseekV4BackendRadix,
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            DeepseekV4AttnBackend,
         )
 
-        return DeepseekV4BackendRadix(self.draft_model_runner, skip_prefill=False)
+        return DeepseekV4AttnBackend(self.draft_model_runner, skip_prefill=False)
