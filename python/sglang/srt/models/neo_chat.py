@@ -9,7 +9,17 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.neo_chat import NEOChatConfig
+from sglang.srt.distributed import get_pp_group
+from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
+from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
+from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -21,8 +31,10 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.models.qwen3 import Qwen3ForCausalLM
-from sglang.srt.utils import add_prefix
+from sglang.srt.models.qwen2 import Qwen2Model
+from sglang.srt.models.qwen3 import Qwen3DecoderLayer, Qwen3ForCausalLM
+from sglang.srt.server_args import get_global_server_args
+from sglang.srt.utils import add_prefix, is_cuda
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,6 +402,230 @@ class NEOVisionModel(nn.Module):
         )()
 
 
+class NEOQwen3Attention(nn.Module):
+    """U1 understanding attention with temporal and HW RoPE halves."""
+
+    def __init__(
+        self,
+        config,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__()
+        self.hidden_size = int(config.hidden_size)
+        self.total_num_heads = int(config.num_attention_heads)
+        self.total_num_kv_heads = int(config.num_key_value_heads)
+        self.head_dim = int(getattr(config, "head_dim", None) or (
+            self.hidden_size // self.total_num_heads
+        ))
+        if self.head_dim % 4 != 0:
+            raise ValueError(f"U1 head_dim must be divisible by 4, got {self.head_dim}")
+        self.t_head_dim = self.head_dim // 2
+        self.hw_head_dim = self.head_dim // 2
+        self.spatial_head_dim = self.head_dim // 4
+
+        attn_tp_rank = get_attention_tp_rank()
+        attn_tp_size = get_attention_tp_size()
+        self.num_heads = self.total_num_heads // attn_tp_size
+        if self.total_num_kv_heads >= attn_tp_size:
+            self.num_kv_heads = self.total_num_kv_heads // attn_tp_size
+        else:
+            self.num_kv_heads = 1
+        self.q_size = self.num_heads * self.head_dim
+        self.kv_size = self.num_kv_heads * self.head_dim
+        self.scaling = self.head_dim**-0.5
+
+        self.qkv_proj = QKVParallelLinear(
+            self.hidden_size,
+            self.head_dim,
+            self.total_num_heads,
+            self.total_num_kv_heads,
+            bias=bool(config.attention_bias),
+            quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            prefix=add_prefix("qkv_proj", prefix),
+        )
+        self.o_proj = RowParallelLinear(
+            self.total_num_heads * self.head_dim,
+            self.hidden_size,
+            bias=bool(config.attention_bias),
+            quant_config=quant_config,
+            tp_rank=attn_tp_rank,
+            tp_size=attn_tp_size,
+            reduce_results=False,
+            prefix=add_prefix("o_proj", prefix),
+        )
+
+        self.q_norm = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
+        self.k_norm = RMSNorm(self.t_head_dim, eps=config.rms_norm_eps)
+        self.q_norm_hw = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
+        self.k_norm_hw = RMSNorm(self.hw_head_dim, eps=config.rms_norm_eps)
+
+        self.rotary_emb = get_rope(
+            self.t_head_dim,
+            rotary_dim=self.t_head_dim,
+            max_position=getattr(config, "max_position_embeddings", 32768),
+            base=getattr(config, "rope_theta", 1000000),
+            rope_scaling=getattr(config, "rope_scaling", None),
+        )
+        self.rotary_emb_hw = get_rope(
+            self.spatial_head_dim,
+            rotary_dim=self.spatial_head_dim,
+            max_position=getattr(config, "max_position_embeddings_hw", 4096),
+            base=getattr(config, "rope_theta_hw", 10000.0),
+            rope_scaling=None,
+        )
+        self.attn = RadixAttention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            layer_id=layer_id,
+            prefix=add_prefix("attn", prefix),
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if positions.ndim != 2 or positions.shape[0] != 3:
+            positions = _u1_text_only_thw_positions(positions)
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+
+        q = self._split_u1_heads(q, self.num_heads, self.q_norm, self.q_norm_hw)
+        k = self._split_u1_heads(k, self.num_kv_heads, self.k_norm, self.k_norm_hw)
+        q_t, q_h, q_w = q
+        k_t, k_h, k_w = k
+
+        q_t, k_t = self.rotary_emb(positions[0], q_t, k_t)
+        q_h, k_h = self.rotary_emb_hw(positions[1], q_h, k_h)
+        q_w, k_w = self.rotary_emb_hw(positions[2], q_w, k_w)
+
+        num_tokens = hidden_states.shape[0]
+        q = torch.cat(
+            [
+                q_t.view(num_tokens, self.num_heads, self.t_head_dim),
+                q_h.view(num_tokens, self.num_heads, self.spatial_head_dim),
+                q_w.view(num_tokens, self.num_heads, self.spatial_head_dim),
+            ],
+            dim=-1,
+        ).reshape(num_tokens, self.q_size)
+        k = torch.cat(
+            [
+                k_t.view(num_tokens, self.num_kv_heads, self.t_head_dim),
+                k_h.view(num_tokens, self.num_kv_heads, self.spatial_head_dim),
+                k_w.view(num_tokens, self.num_kv_heads, self.spatial_head_dim),
+            ],
+            dim=-1,
+        ).reshape(num_tokens, self.kv_size)
+
+        attn_output = self.attn(q, k, v, forward_batch)
+        output, _ = self.o_proj(attn_output)
+        return output
+
+    def _split_u1_heads(
+        self,
+        x: torch.Tensor,
+        num_heads: int,
+        norm_t: RMSNorm,
+        norm_hw: RMSNorm,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        num_tokens = x.shape[0]
+        x = x.view(num_tokens, num_heads, self.head_dim)
+        x_t, x_hw = x.split([self.t_head_dim, self.hw_head_dim], dim=-1)
+        x_t = norm_t(x_t.reshape(-1, self.t_head_dim)).view_as(x_t)
+        x_hw = norm_hw(x_hw.reshape(-1, self.hw_head_dim)).view_as(x_hw)
+        x_h, x_w = x_hw.split([self.spatial_head_dim, self.spatial_head_dim], dim=-1)
+        return (
+            x_t.reshape(num_tokens, num_heads * self.t_head_dim),
+            x_h.reshape(num_tokens, num_heads * self.spatial_head_dim),
+            x_w.reshape(num_tokens, num_heads * self.spatial_head_dim),
+        )
+
+
+class NEOQwen3DecoderLayer(Qwen3DecoderLayer):
+    def __init__(
+        self,
+        config,
+        layer_id: int = 0,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+        alt_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        del alt_stream
+        super().__init__(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self.self_attn = NEOQwen3Attention(
+            config=config,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=add_prefix("self_attn", prefix),
+        )
+
+
+class NEOQwen3Model(Qwen2Model):
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        alt_stream = torch.cuda.Stream() if is_cuda() else None
+        super().__init__(
+            config=config,
+            quant_config=quant_config,
+            prefix=prefix,
+            decoder_layer_type=NEOQwen3DecoderLayer,
+            alt_stream=alt_stream,
+        )
+
+
+class NEOQwen3ForCausalLM(Qwen3ForCausalLM):
+    def __init__(
+        self,
+        config,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> None:
+        nn.Module.__init__(self)
+        self.pp_group = get_pp_group()
+        self.config = config
+        self.quant_config = quant_config
+        self.model = NEOQwen3Model(
+            config,
+            quant_config=quant_config,
+            prefix=add_prefix("model", prefix),
+        )
+
+        if self.pp_group.is_last_rank:
+            if self.pp_group.world_size == 1 and config.tie_word_embeddings:
+                self.lm_head = self.model.embed_tokens
+            else:
+                self.lm_head = ParallelLMHead(
+                    config.vocab_size,
+                    config.hidden_size,
+                    quant_config=quant_config,
+                    use_attn_tp_group=get_global_server_args().enable_dp_lm_head,
+                    prefix=add_prefix("lm_head", prefix),
+                )
+        else:
+            self.lm_head = PPMissingLayer()
+
+        self.logits_processor = LogitsProcessor(config)
+        self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
+        self.capture_aux_hidden_states = False
+
+
 class NEOChatModel(nn.Module):
     """Native SenseNova U1 model shell.
 
@@ -414,7 +650,7 @@ class NEOChatModel(nn.Module):
         self.img_start_token_id = config.img_start_token_id
         self.img_end_token_id = config.img_end_token_id
         self.vision_model = NEOVisionModel(config.vision_config)
-        self.language_model = Qwen3ForCausalLM(
+        self.language_model = NEOQwen3ForCausalLM(
             config=config.llm_config,
             quant_config=quant_config,
             prefix=add_prefix("language_model", prefix),
@@ -432,6 +668,15 @@ class NEOChatModel(nn.Module):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         del input_embeds
+        positions = self._resolve_u1_thw_positions(
+            input_ids=input_ids,
+            positions=positions,
+            forward_batch=forward_batch,
+        )
+        self._maybe_install_u1_block_causal_mask(
+            positions=positions,
+            forward_batch=forward_batch,
+        )
         return general_mm_embed_routine(
             input_ids=input_ids,
             forward_batch=forward_batch,
@@ -445,6 +690,16 @@ class NEOChatModel(nn.Module):
     def pad_input_ids(self, input_ids: list[int], mm_inputs: MultimodalInputs):
         if getattr(mm_inputs, "im_token_id", None) is None:
             mm_inputs.im_token_id = self.img_context_token_id
+        image_grid_hw = _u1_grid_hw_from_mm_inputs(mm_inputs)
+        if image_grid_hw is not None:
+            mm_inputs.mrope_positions = self.get_thw_indexes(
+                torch.tensor(input_ids, dtype=torch.long),
+                grid_hw=image_grid_hw,
+            )
+            mm_inputs.mrope_position_delta = mm_inputs.mrope_positions[:, -1:].max(
+                dim=0,
+                keepdim=True,
+            ).values
         pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
@@ -530,6 +785,129 @@ class NEOChatModel(nn.Module):
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         self.language_model.load_kv_cache_scales(quantization_param_path)
+
+    def _resolve_u1_thw_positions(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        if positions.ndim == 2 and positions.shape[0] == 3:
+            return positions.to(dtype=torch.int64, device=input_ids.device)
+
+        mm_positions = _u1_thw_positions_from_mm_inputs(
+            forward_batch=forward_batch,
+            device=input_ids.device,
+        )
+        if mm_positions is not None:
+            return mm_positions
+
+        return _u1_text_only_thw_positions(positions).to(
+            dtype=torch.int64,
+            device=input_ids.device,
+        )
+
+    def _maybe_install_u1_block_causal_mask(
+        self,
+        *,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> None:
+        if getattr(forward_batch, "cross_attention_custom_mask", None) is not None:
+            return
+        if getattr(forward_batch, "extend_seq_lens_cpu", None) is None:
+            return
+        if getattr(forward_batch, "extend_prefix_lens_cpu", None) is None:
+            return
+
+        masks = []
+        position_start = 0
+        for prefix_len, extend_len in zip(
+            forward_batch.extend_prefix_lens_cpu,
+            forward_batch.extend_seq_lens_cpu,
+        ):
+            prefix_len = int(prefix_len)
+            extend_len = int(extend_len)
+            seq_len = prefix_len + extend_len
+            req_positions = positions[0, position_start : position_start + seq_len]
+            if req_positions.numel() < seq_len:
+                return
+            masks.append(
+                build_u1_block_causal_allowed_mask(
+                    req_positions,
+                    query_start=prefix_len,
+                    query_len=extend_len,
+                ).reshape(-1)
+            )
+            position_start += extend_len
+        if masks:
+            forward_batch.cross_attention_custom_mask = torch.cat(masks, dim=0).to(
+                device=positions.device,
+                dtype=torch.bool,
+            )
+
+
+def build_u1_block_causal_allowed_mask(
+    t_indexes: torch.Tensor,
+    *,
+    query_start: int = 0,
+    query_len: int | None = None,
+) -> torch.Tensor:
+    """Return U1's block-causal keep mask for one request."""
+
+    t_indexes = t_indexes.to(dtype=torch.long)
+    if query_len is None:
+        query_len = int(t_indexes.numel()) - int(query_start)
+    key_len = int(query_start) + int(query_len)
+    key_t = t_indexes[:key_len]
+    query_t = t_indexes[int(query_start) : key_len]
+    key_order = torch.arange(key_len, device=t_indexes.device)
+    query_order = torch.arange(int(query_start), key_len, device=t_indexes.device)
+    return (key_t.unsqueeze(0) == query_t.unsqueeze(1)) | (
+        key_order.unsqueeze(0) <= query_order.unsqueeze(1)
+    )
+
+
+def _u1_text_only_thw_positions(positions: torch.Tensor) -> torch.Tensor:
+    positions = positions.to(dtype=torch.long)
+    zeros = torch.zeros_like(positions)
+    return torch.stack([positions, zeros, zeros], dim=0)
+
+
+def _u1_grid_hw_from_mm_inputs(mm_inputs: MultimodalInputs) -> torch.Tensor | None:
+    image_items = [item for item in mm_inputs.mm_items if item.is_image()]
+    if not image_items:
+        return None
+    return torch.cat([_u1_item_grid_hw(item) for item in image_items], dim=0)
+
+
+def _u1_thw_positions_from_mm_inputs(
+    *,
+    forward_batch: ForwardBatch,
+    device: torch.device,
+) -> torch.Tensor | None:
+    mm_inputs = getattr(forward_batch, "mm_inputs", None)
+    if not mm_inputs:
+        return None
+    extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
+    prefix_lens = getattr(forward_batch, "extend_prefix_lens_cpu", None)
+    if extend_lens is None or prefix_lens is None:
+        return None
+
+    chunks = []
+    for mm_input, prefix_len, extend_len in zip(mm_inputs, prefix_lens, extend_lens):
+        if mm_input is None or mm_input.mrope_positions is None:
+            return None
+        start = int(prefix_len)
+        end = start + int(extend_len)
+        chunk = mm_input.mrope_positions[:, start:end]
+        if chunk.numel() == 0:
+            return None
+        chunks.append(chunk)
+    if not chunks:
+        return None
+    return torch.cat(chunks, dim=1).to(device=device, dtype=torch.int64)
 
 
 def _merge_size_from_downsample_ratio(downsample_ratio: float) -> int:

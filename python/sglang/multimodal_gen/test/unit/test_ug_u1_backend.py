@@ -37,8 +37,11 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.models.neo_chat import (
     NEOChatModel,
+    NEOQwen3ForCausalLM,
+    NEOQwen3Model,
     NEOVisionModel,
     build_abs_positions_from_grid_hw,
+    build_u1_block_causal_allowed_mask,
     build_u1_vlm_input_info,
     build_u1_vlm_thw_indexes,
     map_u1_language_model_weight_name,
@@ -173,6 +176,8 @@ class TestU1UGBackendShell(unittest.TestCase):
         mm_item = MultimodalDataItem(
             modality=Modality.IMAGE,
             pad_value=999001,
+            feature=torch.zeros(8, 12),
+            model_specific_data={"image_grid_hws": torch.tensor([[2, 4]])},
             offsets=[(1, 2)],
         )
         mm_inputs = MultimodalInputs(mm_items=[mm_item])
@@ -182,6 +187,30 @@ class TestU1UGBackendShell(unittest.TestCase):
 
         self.assertEqual(padded, [151670, 999001, 999001, 151671])
         self.assertEqual(mm_inputs.im_token_id, 151669)
+        self.assertEqual(mm_inputs.mrope_positions[0].tolist(), [0, 1, 1, 2])
+        self.assertEqual(mm_inputs.mrope_positions[1].tolist(), [0, 0, 0, 0])
+        self.assertEqual(mm_inputs.mrope_positions[2].tolist(), [0, 0, 1, 0])
+
+    def test_u1_block_causal_mask_matches_same_t_bidirectional_rows(self):
+        mask = build_u1_block_causal_allowed_mask(
+            torch.tensor([0, 1, 2, 2, 2, 2, 3], dtype=torch.long)
+        )
+
+        self.assertTrue(mask[2, 5])
+        self.assertTrue(mask[5, 2])
+        self.assertFalse(mask[1, 2])
+        self.assertTrue(mask[6, 5])
+
+    def test_neo_chat_uses_u1_specific_qwen3_language_path(self):
+        with patch("sglang.srt.models.neo_chat.NEOQwen3ForCausalLM") as language_cls:
+            language_cls.return_value.model = object()
+            model = NEOChatModel(_tiny_neo_chat_config())
+
+        language_cls.assert_called_once()
+        self.assertIs(model.language_model, language_cls.return_value)
+        self.assertIs(model.model, language_cls.return_value.model)
+        self.assertTrue(issubclass(NEOQwen3ForCausalLM, torch.nn.Module))
+        self.assertTrue(issubclass(NEOQwen3Model, torch.nn.Module))
 
     def test_u1_language_weight_mapper_keeps_only_qwen3_u_path(self):
         self.assertEqual(
@@ -680,6 +709,9 @@ def _tiny_neo_chat_model_without_language_model():
     torch.nn.Module.__init__(model)
     model.config = _tiny_neo_chat_config()
     model.img_context_token_id = model.config.img_context_token_id
+    model.img_start_token_id = model.config.img_start_token_id
+    model.img_end_token_id = model.config.img_end_token_id
+    model.downsample_ratio = model.config.downsample_ratio
     model.vision_model = NEOVisionModel(model.config.vision_config)
     return model
 
