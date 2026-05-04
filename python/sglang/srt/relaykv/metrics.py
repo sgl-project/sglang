@@ -4436,6 +4436,407 @@ def summarize_relaykv_attention_shadow_capture_results_for_smoke(
     }
 
 
+def _resolve_block_metadata_entry_for_smoke(
+    block_metadata_by_id: dict[Any, Any] | None,
+    request_id: Any,
+    layer_id: Any,
+    block_id: Any,
+) -> tuple[Any, str | None]:
+    if block_metadata_by_id is None:
+        return None, None
+
+    lookup_items = (
+        ((request_id, layer_id, block_id), "request_layer_block_tuple"),
+        (f"{request_id}:{layer_id}:{block_id}", "request_layer_block_string"),
+        (block_id, "block_id"),
+        (str(block_id), "block_id_string"),
+    )
+    for lookup_key, source_name in lookup_items:
+        if lookup_key in block_metadata_by_id:
+            return block_metadata_by_id[lookup_key], source_name
+    return None, None
+
+
+def _normalize_block_span_for_smoke(
+    metadata_value: Any,
+    request_id: Any,
+    layer_id: Any,
+    block_id: Any,
+    seq_len: int,
+    span_source: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    token_start: Any = None
+    token_end: Any = None
+
+    if isinstance(metadata_value, dict):
+        if (
+            isinstance(metadata_value.get("token_start"), int)
+            and isinstance(metadata_value.get("token_end"), int)
+        ):
+            token_start = metadata_value.get("token_start")
+            token_end = metadata_value.get("token_end")
+            span_source = f"{span_source}:token_start_token_end"
+        elif (
+            isinstance(metadata_value.get("start_token"), int)
+            and isinstance(metadata_value.get("end_token"), int)
+        ):
+            token_start = metadata_value.get("start_token")
+            token_end = metadata_value.get("end_token")
+            span_source = f"{span_source}:start_token_end_token"
+        else:
+            token_span = metadata_value.get("token_span")
+            if (
+                isinstance(token_span, (list, tuple))
+                and len(token_span) == 2
+                and isinstance(token_span[0], int)
+                and isinstance(token_span[1], int)
+            ):
+                token_start = token_span[0]
+                token_end = token_span[1]
+                span_source = f"{span_source}:token_span"
+    elif (
+        isinstance(metadata_value, (list, tuple))
+        and len(metadata_value) == 2
+        and isinstance(metadata_value[0], int)
+        and isinstance(metadata_value[1], int)
+    ):
+        token_start = metadata_value[0]
+        token_end = metadata_value[1]
+        span_source = f"{span_source}:sequence_span"
+
+    if not isinstance(token_start, int) or not isinstance(token_end, int):
+        return None, "invalid_block_span"
+    if token_start < 0 or token_end <= token_start:
+        return None, "invalid_block_span"
+    if token_end > seq_len:
+        return None, "block_span_out_of_seq_len"
+
+    return (
+        {
+            "block_id": block_id,
+            "token_start": token_start,
+            "token_end": token_end,
+            "token_count": token_end - token_start,
+            "request_id": request_id,
+            "layer_id": layer_id,
+            "span_source": span_source,
+        },
+        None,
+    )
+
+
+def _resolve_block_spans_for_smoke(
+    block_ids: list[int],
+    *,
+    request_id: Any,
+    layer_id: Any,
+    seq_len: int,
+    block_metadata_by_id: dict[Any, Any] | None,
+) -> tuple[list[dict[str, Any]], list[int], list[int], list[str]]:
+    spans: list[dict[str, Any]] = []
+    missing_block_ids: list[int] = []
+    invalid_block_ids: list[int] = []
+    blocking_reasons: list[str] = []
+
+    for block_id in block_ids:
+        metadata_value, key_source = _resolve_block_metadata_entry_for_smoke(
+            block_metadata_by_id,
+            request_id,
+            layer_id,
+            block_id,
+        )
+        if metadata_value is None or key_source is None:
+            missing_block_ids.append(block_id)
+            continue
+
+        span, span_error = _normalize_block_span_for_smoke(
+            metadata_value,
+            request_id,
+            layer_id,
+            block_id,
+            seq_len,
+            key_source,
+        )
+        if span_error is not None:
+            invalid_block_ids.append(block_id)
+            blocking_reasons.append(span_error)
+            continue
+        if span is not None:
+            spans.append(span)
+
+    if missing_block_ids:
+        blocking_reasons.append("missing_block_metadata")
+    if invalid_block_ids and "invalid_block_span" not in blocking_reasons:
+        blocking_reasons.append("invalid_block_span")
+
+    return (
+        spans,
+        missing_block_ids,
+        invalid_block_ids,
+        list(dict.fromkeys(blocking_reasons)),
+    )
+
+
+def build_relaykv_kv_index_resolution_plans_for_smoke(
+    attention_shadow_capture_results: list[dict[str, Any]]
+    | tuple[dict[str, Any], ...],
+    block_metadata_by_id: dict[Any, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """Build metadata-only KV index resolution plans from shadow capture results."""
+
+    if not isinstance(attention_shadow_capture_results, (list, tuple)):
+        raise TypeError(
+            "attention_shadow_capture_results must be a list or tuple"
+        )
+    if block_metadata_by_id is not None and not isinstance(block_metadata_by_id, dict):
+        raise TypeError("block_metadata_by_id must be a dict or None")
+
+    plans: list[dict[str, Any]] = []
+    for result in attention_shadow_capture_results:
+        if not isinstance(result, dict):
+            raise TypeError(
+                "RelayKV KV index resolution plan inputs must be dict results"
+            )
+
+        request_id = _event_value(result, "request_id")
+        req_pool_idx = _event_req_pool_idx_value(result)
+        seq_len = _event_value(result, "seq_len")
+        layer_id = _event_layer_value(result)
+        relaykv_working_kv_block_ids = _host_backup_copy_request_block_ids(
+            result, "relaykv_working_kv_block_ids"
+        )
+        full_kv_block_ids = _host_backup_copy_request_block_ids(result, "full_kv_block_ids")
+
+        blocking_reasons: list[str] = []
+        warning_reasons: list[str] = [
+            "metadata_only_kv_index_resolution_plan",
+            "no_req_to_token_pool_read",
+        ]
+
+        if _event_value(result, "event_type") != "relaykv_attention_shadow_capture_result":
+            blocking_reasons.append("not_attention_shadow_capture_result")
+        if _event_value(result, "shadow_capture_state") != "metadata_shadow_captured":
+            blocking_reasons.append("shadow_capture_not_metadata_captured")
+        if _event_value(result, "shadow_capture_mode") != "metadata_only":
+            blocking_reasons.append("shadow_capture_not_metadata_only")
+        if _event_value(result, "attention_output_captured") is True:
+            blocking_reasons.append("attention_output_captured_not_allowed")
+        if _event_value(result, "attention_comparison_executed") is True:
+            blocking_reasons.append("attention_comparison_executed_not_allowed")
+        if _event_value(result, "attention_override") is True:
+            blocking_reasons.append("attention_override_true_not_allowed")
+        if not relaykv_working_kv_block_ids:
+            blocking_reasons.append("no_relaykv_working_kv_blocks")
+        if not full_kv_block_ids:
+            blocking_reasons.append("no_full_kv_blocks")
+        if not isinstance(seq_len, int) or seq_len <= 0:
+            blocking_reasons.append("seq_len_missing_or_invalid")
+
+        relaykv_working_block_spans: list[dict[str, Any]] = []
+        full_kv_block_spans: list[dict[str, Any]] = []
+        missing_block_ids: list[int] = []
+        invalid_block_ids: list[int] = []
+
+        if not blocking_reasons:
+            (
+                full_kv_block_spans,
+                full_missing_block_ids,
+                full_invalid_block_ids,
+                full_blocking_reasons,
+            ) = _resolve_block_spans_for_smoke(
+                full_kv_block_ids,
+                request_id=request_id,
+                layer_id=layer_id,
+                seq_len=seq_len,
+                block_metadata_by_id=block_metadata_by_id,
+            )
+            (
+                relaykv_working_block_spans,
+                working_missing_block_ids,
+                working_invalid_block_ids,
+                working_blocking_reasons,
+            ) = _resolve_block_spans_for_smoke(
+                relaykv_working_kv_block_ids,
+                request_id=request_id,
+                layer_id=layer_id,
+                seq_len=seq_len,
+                block_metadata_by_id=block_metadata_by_id,
+            )
+
+            missing_block_ids = list(
+                dict.fromkeys(full_missing_block_ids + working_missing_block_ids)
+            )
+            invalid_block_ids = list(
+                dict.fromkeys(full_invalid_block_ids + working_invalid_block_ids)
+            )
+            blocking_reasons.extend(full_blocking_reasons)
+            blocking_reasons.extend(working_blocking_reasons)
+
+        blocking_reasons = list(dict.fromkeys(blocking_reasons))
+        resolution_state = (
+            "block_span_resolved" if not blocking_reasons else "blocked"
+        )
+
+        if blocking_reasons:
+            relaykv_working_block_spans = []
+            full_kv_block_spans = []
+            resolved_block_count = 0
+            token_span_count = 0
+            total_token_count = 0
+        else:
+            resolved_block_count = len(full_kv_block_spans)
+            token_span_count = len(full_kv_block_spans)
+            total_token_count = sum(
+                span["token_count"] for span in full_kv_block_spans
+            )
+
+        plans.append(
+            {
+                "event_type": "relaykv_kv_index_resolution_plan",
+                "resolution_state": resolution_state,
+                "resolution_mode": "metadata_only",
+                "source": "attention_shadow_capture_result_to_kv_index_resolution_plan",
+                "request_id": request_id,
+                "req_pool_idx": req_pool_idx,
+                "seq_len": seq_len,
+                "layer_id": layer_id,
+                "relaykv_working_kv_block_ids": list(relaykv_working_kv_block_ids),
+                "full_kv_block_ids": list(full_kv_block_ids),
+                "relaykv_working_block_spans": relaykv_working_block_spans,
+                "full_kv_block_spans": full_kv_block_spans,
+                "resolved_block_count": resolved_block_count,
+                "missing_block_ids": missing_block_ids,
+                "invalid_block_ids": invalid_block_ids,
+                "token_span_count": token_span_count,
+                "total_token_count": total_token_count,
+                "req_to_token_read": False,
+                "token_to_kv_pool_read": False,
+                "kv_pool_read": False,
+                "kv_snapshot": False,
+                "tensor_read": False,
+                "attention_comparison_executed": False,
+                "attention_override": False,
+                "runtime_writeback": False,
+                "scheduler_policy_noop": True,
+                "kv_cache_mutation": False,
+                "source_mutated": False,
+                "blocking_reasons": blocking_reasons,
+                "warning_reasons": warning_reasons,
+            }
+        )
+    return plans
+
+
+def summarize_relaykv_kv_index_resolution_plans_for_smoke(
+    plans: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+) -> dict[str, Any]:
+    """Summarize metadata-only KV index resolution plans."""
+
+    if not isinstance(plans, (list, tuple)):
+        raise TypeError(
+            "RelayKV KV index resolution plans must be a list or tuple"
+        )
+
+    per_request: Counter[str] = Counter()
+    per_layer: Counter[str] = Counter()
+    per_resolution_state: Counter[str] = Counter()
+    safety_counts: Counter[str] = Counter(
+        {
+            "req_to_token_read_count": 0,
+            "token_to_kv_pool_read_count": 0,
+            "kv_pool_read_count": 0,
+            "kv_snapshot_count": 0,
+            "tensor_read_count": 0,
+            "attention_comparison_executed_count": 0,
+            "attention_override_true_count": 0,
+            "runtime_writeback_true_count": 0,
+            "scheduler_policy_noop_false_count": 0,
+            "kv_cache_mutation_true_count": 0,
+            "source_mutated_true_count": 0,
+        }
+    )
+    block_span_resolved_count = 0
+    blocked_count = 0
+    error_count = 0
+    resolved_block_count = 0
+    missing_block_count = 0
+    invalid_block_count = 0
+    token_span_count = 0
+    total_token_count = 0
+
+    for plan in plans:
+        if not isinstance(plan, dict):
+            raise TypeError("RelayKV KV index resolution plan must be a dict")
+
+        state = str(_event_value(plan, "resolution_state") or "unknown")
+        per_resolution_state[state] += 1
+        per_request[str(_event_value(plan, "request_id"))] += 1
+        per_layer[str(_event_layer_value(plan))] += 1
+
+        if state == "block_span_resolved":
+            block_span_resolved_count += 1
+        elif state == "blocked":
+            blocked_count += 1
+        elif state == "error":
+            error_count += 1
+
+        value = _event_value(plan, "resolved_block_count")
+        if isinstance(value, int):
+            resolved_block_count += value
+        value = _event_value(plan, "missing_block_ids")
+        if isinstance(value, (list, tuple)):
+            missing_block_count += len(value)
+        value = _event_value(plan, "invalid_block_ids")
+        if isinstance(value, (list, tuple)):
+            invalid_block_count += len(value)
+        value = _event_value(plan, "token_span_count")
+        if isinstance(value, int):
+            token_span_count += value
+        value = _event_value(plan, "total_token_count")
+        if isinstance(value, int):
+            total_token_count += value
+
+        if _event_value(plan, "req_to_token_read") is True:
+            safety_counts["req_to_token_read_count"] += 1
+        if _event_value(plan, "token_to_kv_pool_read") is True:
+            safety_counts["token_to_kv_pool_read_count"] += 1
+        if _event_value(plan, "kv_pool_read") is True:
+            safety_counts["kv_pool_read_count"] += 1
+        if _event_value(plan, "kv_snapshot") is True:
+            safety_counts["kv_snapshot_count"] += 1
+        if _event_value(plan, "tensor_read") is True:
+            safety_counts["tensor_read_count"] += 1
+        if _event_value(plan, "attention_comparison_executed") is True:
+            safety_counts["attention_comparison_executed_count"] += 1
+        if _event_value(plan, "attention_override") is True:
+            safety_counts["attention_override_true_count"] += 1
+        if _event_value(plan, "runtime_writeback") is True:
+            safety_counts["runtime_writeback_true_count"] += 1
+        if _event_value(plan, "scheduler_policy_noop") is False:
+            safety_counts["scheduler_policy_noop_false_count"] += 1
+        if _event_value(plan, "kv_cache_mutation") is True:
+            safety_counts["kv_cache_mutation_true_count"] += 1
+        if _event_value(plan, "source_mutated") is True:
+            safety_counts["source_mutated_true_count"] += 1
+
+    return {
+        "summary_type": "relaykv_kv_index_resolution_plan_summary",
+        "total_kv_index_resolution_plans": len(plans),
+        "block_span_resolved_count": block_span_resolved_count,
+        "blocked_count": blocked_count,
+        "error_count": error_count,
+        "resolved_block_count": resolved_block_count,
+        "missing_block_count": missing_block_count,
+        "invalid_block_count": invalid_block_count,
+        "token_span_count": token_span_count,
+        "total_token_count": total_token_count,
+        "per_request_counts": dict(sorted(per_request.items())),
+        "per_layer_counts": dict(sorted(per_layer.items())),
+        "per_resolution_state_counts": dict(sorted(per_resolution_state.items())),
+        **dict(safety_counts),
+    }
+
+
 def log_policy_summary(
     events: Iterable[RelayKVPlan | Mapping[str, Any]],
     *,
