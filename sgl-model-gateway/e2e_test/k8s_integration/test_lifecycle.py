@@ -148,10 +148,11 @@ def _wait_for_pod_gone(name: str, timeout: int = 60):
     Uses `kubectl get -o name --ignore-not-found`: empty stdout means the pod
     is gone (no need to substring-match "NotFound" against stderr, which is
     locale- and version-fragile). Any non-zero rc is a real cluster error
-    (apiserver unreachable, RBAC drift) and propagates immediately.
+    (apiserver unreachable, RBAC drift) and propagates immediately via
+    `_poll_until` (it only retries transient network errors, not RuntimeError).
     """
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+
+    def _gone() -> bool:
         result = _kubectl(
             "get",
             "pod",
@@ -168,10 +169,9 @@ def _wait_for_pod_gone(name: str, timeout: int = 60):
                 f"kubectl get pod {name} failed unexpectedly "
                 f"(rc={result.returncode}): {result.stderr.strip()}"
             )
-        if not result.stdout.strip():
-            return
-        time.sleep(2)
-    raise TimeoutError(f"Pod {name} still exists after {timeout}s")
+        return not result.stdout.strip()
+
+    _poll_until(_gone, f"pod {name} gone", timeout=timeout, interval=2)
 
 
 def _get_pod_ip(name: str) -> str:
@@ -244,14 +244,22 @@ class TestGatewayRestart:
             assert len(urls_before) == len(worker_names)
 
             # Kill the gateway pod. The Deployment's ReplicaSet restarts it.
-            old_pod = _kubectl_json(
+            # Guard against an empty list — `_wait_for_deployment_ready` above
+            # gates on the rollout, but a controller race could in principle
+            # leave the selector momentarily empty, and an IndexError here
+            # would mask the real problem.
+            res = _kubectl_json(
                 "get",
                 "pod",
                 "-n",
                 NAMESPACE,
                 "-l",
                 "app=smg-gateway-restart",
-            )["items"][0]["metadata"]["name"]
+            )
+            assert res.get(
+                "items"
+            ), "No pods found for selector app=smg-gateway-restart"
+            old_pod = res["items"][0]["metadata"]["name"]
             _kubectl(
                 "delete",
                 "pod",
@@ -516,21 +524,27 @@ class TestGracefulDrain:
             # has roughly grace_secs - elapsed seconds left. This guards
             # against a lucky-pass where the test runs so slowly that the
             # pod is gone by the time we check, which would no longer prove
-            # the deletionTimestamp path. Inspect stderr explicitly so an
-            # unrelated kubectl failure (apiserver blip, RBAC drift) doesn't
-            # masquerade as "pod is gone".
+            # the deletionTimestamp path. Use `--ignore-not-found` so a
+            # genuinely-missing pod yields rc=0 with empty stdout; any other
+            # non-zero rc is a real cluster error (apiserver blip, RBAC
+            # drift) and must not masquerade as "pod is gone".
             get_result = _kubectl(
-                "get", "pod", pod_name, "-n", NAMESPACE, "-o", "name", check=False
+                "get",
+                "pod",
+                pod_name,
+                "-n",
+                NAMESPACE,
+                "-o",
+                "name",
+                "--ignore-not-found",
+                check=False,
             )
-            if get_result.returncode == 0 and get_result.stdout.strip():
-                still_exists = True
-            elif get_result.returncode != 0 and "NotFound" not in get_result.stderr:
+            if get_result.returncode != 0:
                 pytest.fail(
                     f"kubectl get pod {pod_name} failed unexpectedly "
                     f"(rc={get_result.returncode}): {get_result.stderr.strip()}"
                 )
-            else:
-                still_exists = False
+            still_exists = bool(get_result.stdout.strip())
             assert still_exists, (
                 f"Pod {pod_name} is already gone — the test ran too slowly "
                 f"to distinguish the deletionTimestamp event from pod-gone "
