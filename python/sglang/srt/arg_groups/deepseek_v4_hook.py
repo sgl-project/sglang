@@ -12,10 +12,10 @@ def apply_deepseek_v4_defaults(server_args: "ServerArgs", model_arch: str) -> No
     from sglang.srt.environ import envs
     from sglang.srt.server_args import ServerArgs
 
-    server_args.attention_backend = "compressed"
+    server_args.attention_backend = "dsv4"
     server_args.page_size = 256
     logger.info(
-        f"Use compressed attention backend for {model_arch}, setting page_size to 256."
+        f"Use dsv4 attention backend for {model_arch}, setting page_size to 256."
     )
 
     if server_args.max_running_requests is None:

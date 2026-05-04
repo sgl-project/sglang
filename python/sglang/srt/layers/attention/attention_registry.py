@@ -92,8 +92,8 @@ def create_nsa_backend(runner):
     return NativeSparseAttnBackend(runner)
 
 
-@register_attention_backend("compressed")
-def create_compressed_backend(runner):
+@register_attention_backend("dsv4")
+def create_dsv4_backend(runner):
     from sglang.srt.layers.attention.deepseek_v4_backend import (
         DeepseekV4AttnBackend,
     )

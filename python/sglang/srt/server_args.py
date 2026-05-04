@@ -143,7 +143,8 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "nsa",
-    "compressed",
+    "dsv4",
+    "compressed",  # Deprecated alias for "dsv4"
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
@@ -1037,6 +1038,20 @@ class ServerArgs:
             )
             envs.SGLANG_SPEC_NAN_DETECTION.set(True)
             envs.SGLANG_SPEC_OOB_DETECTION.set(True)
+
+        # Deprecated attention-backend alias: "compressed" -> "dsv4".
+        for attr in (
+            "attention_backend",
+            "decode_attention_backend",
+            "prefill_attention_backend",
+            "speculative_draft_attention_backend",
+        ):
+            if getattr(self, attr, None) == "compressed":
+                logger.warning(
+                    "--%s=compressed is deprecated; use 'dsv4' instead.",
+                    attr.replace("_", "-"),
+                )
+                setattr(self, attr, "dsv4")
 
         # Native gRPC flags — env-only for now, not exposed as CLI args.
         # Set as instance attributes (not dataclass fields) to avoid
