@@ -55,7 +55,6 @@ from sglang.srt.mem_cache.common import (
     maybe_cache_unfinished_req,
     release_kv_cache,
 )
-from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, NSATokenToKVPool
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
 
@@ -177,18 +176,6 @@ class PrefillBootstrapQueue:
         )
         kv_args.ib_device = self.scheduler.server_args.disaggregation_ib_device
         kv_args.gpu_id = self.scheduler.gpu_id
-
-        if isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool):
-            assert self.pp_size == 1, (
-                "V4 PD disaggregation requires PP=1 "
-                "(get_mla_kv_ptrs_with_pp cannot slice V4's buffer-type-organized flat list)"
-            )
-            # V4 also requires matching attn_tp_size on prefill/decode (the
-            # SWA state pool item_len is sliced by attn_tp and there is no
-            # V4 SWA TP-slice transfer path yet). Prefill cannot know decode
-            # TP at init time, so the check is deferred to the transfer
-            # backend: nixl `send_state` and mooncake `maybe_send_extra`
-            # raise on item_len / attn_tp_size mismatch.
 
         setup_state_kv_args(kv_args, self.token_to_kv_pool, self.draft_token_to_kv_pool)
 
