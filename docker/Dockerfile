@@ -1,4 +1,4 @@
-ARG CUDA_VERSION=12.9.1
+ARG CUDA_VERSION=13.0.1
 FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 
 ARG TARGETARCH
@@ -40,11 +40,11 @@ RUN if [ -n "$UBUNTU_MIRROR" ]; then \
 fi
 
 # Python setup (combined with apt update to reduce layers)
+# Ubuntu 24.04 ships Python 3.12 in main, so we no longer need the deadsnakes
+# PPA. Dropping it avoids transient Launchpad 504s in `add-apt-repository`.
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     apt update && apt install -y --no-install-recommends wget software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt install -y --no-install-recommends python3.12-full python3.12-dev python3.10-venv \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.10 1 \
+    && apt install -y --no-install-recommends python3.12-full python3.12-dev \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 2 \
     && update-alternatives --set python3 /usr/bin/python3.12 \
     && wget -q https://bootstrap.pypa.io/get-pip.py \
@@ -54,7 +54,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     && python3 -m pip config set global.break-system-packages true \
     # Fix for apt-add-repository
     && cd /usr/lib/python3/dist-packages/ \
-    && ln -s apt_pkg.cpython-310-*-linux-gnu.so apt_pkg.so
+    && ln -s apt_pkg.cpython-312-*-linux-gnu.so apt_pkg.so
 
 # Install system dependencies (organized by category for better caching)
 RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
@@ -202,10 +202,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         python3 -m pip install https://${GITHUB_ARTIFACTORY}/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu124-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "12.8.1" ] || [ "$CUDA_VERSION" = "12.9.1" ]; then \
-        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} \
+        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu129-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
     ; \
     elif [ "$CUDA_VERSION" = "13.0.1" ]; then \
-        python3 -m pip install https://github.com/sgl-project/whl/releases/download/v${SGL_KERNEL_VERSION}/sglang_kernel-${SGL_KERNEL_VERSION}+cu130-cp310-abi3-manylinux2014_$(uname -m).whl --force-reinstall --no-deps \
+        # --no-deps prevents pip from pulling torch from default PyPI
+        python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
     ; \
     else \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
@@ -238,6 +239,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && touch README.md \
     && touch LICENSE \
     && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
+           pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
+               | xargs -r python3 -m pip uninstall -y && \
+           python3 -m pip install --index-url https://download.pytorch.org/whl/cu${CUINDEX} \
+               torch torchvision torchaudio --force-reinstall; \
+       fi \
     && cd /sgl-workspace \
     && rm -rf /tmp/sglang_deps \
     && pip freeze | grep -v "^sglang==" > /sgl-workspace/constraints.txt
@@ -519,7 +526,6 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     uv \
     wheel \
     scikit-build-core \
-    nixl \
     py-spy \
     cubloaty \
     google-cloud-storage \
@@ -529,19 +535,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     termplotlib \
     "runai-model-streamer[s3,gcs,azure]>=0.15.7"
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-   python3 -m pip install "nvidia-cutlass-dsl>=4.4.1" "nvidia-cutlass-dsl-libs-base>=4.4.1" --force-reinstall --no-deps;
-
-# Patching packages for CUDA 12/13 compatibility
-# TODO: Remove when torch version covers these packages
+# Per-CUDA-major package installs. The `nixl` stub package is needed (it owns
+# the `nixl` import path) but unconditionally requires nixl-cu12, so we install
+# it with --no-deps and pair it with the matching nixl-cu12 / nixl-cu13 binary
+# to avoid shipping wrong-CUDA libs on cu13 images.
 RUN --mount=type=cache,target=/root/.cache/pip if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
-    python3 -m pip install nvidia-nccl-cu12==2.28.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cudnn-cu12==9.16.0.29 --force-reinstall --no-deps ; \
+    python3 -m pip install nixl-cu12 --no-deps ; \
     python3 -m pip install cuda-python==12.9 ; \
 elif [ "${CUDA_VERSION%%.*}" = "13" ]; then \
-    python3 -m pip install nvidia-nccl-cu13==2.28.3 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cudnn-cu13==9.16.0.29 --force-reinstall --no-deps ; \
-    python3 -m pip install nvidia-cublas==13.1.0.3 --force-reinstall --no-deps ; \
     python3 -m pip install nixl-cu13 --no-deps ; \
     python3 -m pip install cuda-python==13.2.0 ; \
 fi
@@ -556,12 +557,6 @@ COPY docker/configs/opt/.gitconfig /opt/sglang/.gitconfig
 
 # Configure development environment
 COPY docker/configs/.zshrc /root/.zshrc
-
-# Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
-RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
-        rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
-        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
-    fi
 
 # Fix Trivy-reported CVEs
 # pip:             urllib3 (CVE-2025-43859), pillow (CVE-2026-25990)
@@ -687,12 +682,10 @@ ENV PATH="${PATH}:/usr/local/nvidia/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm
     LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/local/nvidia/lib:/usr/local/nvidia/lib64"
 
 # Install runtime dependencies (devel base provides gcc/g++/build tools)
+# Python 3.12 ships in Ubuntu 24.04 main, so no deadsnakes PPA needed.
 RUN --mount=type=cache,target=/var/cache/apt,id=runtime-apt \
-    apt-get update && apt-get install -y --no-install-recommends \
+    apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     # Python runtime
-    software-properties-common \
-    && add-apt-repository ppa:deadsnakes/ppa -y \
-    && apt-get update && apt-get install -y --no-install-recommends --allow-change-held-packages \
     python3.12-full \
     python3.12-dev \
     wget \
@@ -780,12 +773,6 @@ COPY --from=framework_final /usr/local/bin/py-spy /usr/local/bin/py-spy
 # Copy cache for kernels from kernels community
 COPY --from=framework_final /root/.cache/huggingface /root/.cache/huggingface
 COPY --from=framework_final /root/.cache/sglang /root/.cache/sglang
-
-# Fix Triton to use system ptxas for Blackwell (sm_103a) support (CUDA 13+ only)
-RUN if [ "${CUDA_VERSION%%.*}" = "13" ] && [ -d /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin ]; then \
-        rm -f /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas && \
-        ln -s /usr/local/cuda/bin/ptxas /usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/bin/ptxas; \
-    fi
 
 # Copy GDRCopy runtime libraries (but not the build artifacts)
 COPY --from=framework_final /usr/lib/libgdrapi.so* /usr/lib/
