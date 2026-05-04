@@ -30,8 +30,14 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.ug import (
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.configs.model_config import is_multimodal_model
 from sglang.srt.configs.neo_chat import NEOChatConfig, NEOVisionConfig
+from sglang.srt.managers.schedule_batch import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
 from sglang.srt.models.neo_chat import (
     NEOChatModel,
+    NEOVisionModel,
     build_abs_positions_from_grid_hw,
     build_u1_vlm_input_info,
     build_u1_vlm_thw_indexes,
@@ -134,6 +140,49 @@ class TestU1UGBackendShell(unittest.TestCase):
         self.assertEqual(info.image_context_token_count, 4)
         self.assertEqual(info.image_token_count, 5)
         self.assertEqual(tuple(info.thw_indexes.shape), (3, 6))
+
+    def test_u1_native_vision_model_returns_dense_image_embeddings(self):
+        config = NEOVisionConfig(
+            patch_size=2,
+            hidden_size=8,
+            llm_hidden_size=16,
+            downsample_ratio=0.5,
+            max_position_embeddings_vision=16,
+        )
+        vision_model = NEOVisionModel(config)
+        pixel_values = torch.arange(8 * 3 * 2 * 2, dtype=torch.float32).view(8, -1)
+        grid_hw = torch.tensor([[2, 2], [2, 2]], dtype=torch.long)
+
+        image_embeds = vision_model(pixel_values=pixel_values, grid_hw=grid_hw).last_hidden_state
+
+        self.assertEqual(tuple(image_embeds.shape), (2, 16))
+
+    def test_neo_chat_get_image_feature_uses_u1_vision_grid_metadata(self):
+        config = _tiny_neo_chat_config()
+        model = NEOChatModel(config)
+        item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            feature=torch.arange(4 * 3 * 2 * 2, dtype=torch.float32).view(4, -1),
+            model_specific_data={"image_grid_hws": torch.tensor([[2, 2]])},
+        )
+
+        image_embeds = model.get_image_feature([item])
+
+        self.assertEqual(tuple(image_embeds.shape), (1, 16))
+
+    def test_neo_chat_pad_input_ids_replaces_img_context_tokens(self):
+        mm_item = MultimodalDataItem(
+            modality=Modality.IMAGE,
+            pad_value=999001,
+            offsets=[(1, 2)],
+        )
+        mm_inputs = MultimodalInputs(mm_items=[mm_item])
+        model = NEOChatModel(_tiny_neo_chat_config())
+
+        padded = model.pad_input_ids([151670, 151669, 151669, 151671], mm_inputs)
+
+        self.assertEqual(padded, [151670, 999001, 999001, 151671])
+        self.assertEqual(mm_inputs.im_token_id, 151669)
 
     def test_u1_language_weight_mapper_keeps_only_qwen3_u_path(self):
         self.assertEqual(
@@ -601,6 +650,30 @@ def _sampling(**kwargs):
     }
     values.update(kwargs)
     return UGSamplingParams(**values)
+
+
+def _tiny_neo_chat_config():
+    return NEOChatConfig(
+        vision_config={
+            "architectures": ["NEOVisionModel"],
+            "patch_size": 2,
+            "hidden_size": 8,
+            "llm_hidden_size": 16,
+            "downsample_ratio": 0.5,
+            "max_position_embeddings_vision": 16,
+        },
+        llm_config={
+            "architectures": ["Qwen3ForCausalLM"],
+            "hidden_size": 16,
+            "intermediate_size": 32,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "num_hidden_layers": 1,
+            "vocab_size": 128,
+            "head_dim": 8,
+        },
+        downsample_ratio=0.5,
+    )
 
 
 class FakeServerArgs:
